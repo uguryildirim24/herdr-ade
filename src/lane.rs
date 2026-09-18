@@ -208,6 +208,10 @@ pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
             acknowledge_bootstrap(&binding)?;
             print!(
                 "{}",
+                crate::thread::commands_line(&crate::coordinator::current_prefix(&ctx.root)?)
+            );
+            print!(
+                "{}",
                 match role {
                     "reviewer" => include_str!("../skill/REVIEWER.md"),
                     "critic" => include_str!("../skill/CRITIC.md"),

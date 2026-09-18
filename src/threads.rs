@@ -349,7 +349,11 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
         ..placed.clone()
     };
     let task = std::fs::read_to_string(thread::task_path(project, &placed.id)).unwrap_or_default();
-    let brief = thread::with_lane_skill(&thread::brief_for(project, &with_dir, &task, restart)?);
+    let prefix = crate::coordinator::current_prefix(&ctx.root)?;
+    let brief = thread::with_lane_skill(
+        &prefix,
+        &thread::brief_for(project, &with_dir, &task, restart)?,
+    );
     let target = remote::ssh_target(
         ctx.runner,
         &ctx.env.herdr_bin(),

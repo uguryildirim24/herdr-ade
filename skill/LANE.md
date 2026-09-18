@@ -12,13 +12,13 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 Commit the finished work, write the report named by your brief, then run:
 
 ```text
-ha done --report <report path> --sha <commit sha>
+hp done --report <report path> --sha <commit sha>
 ```
 
 If you must stop for input, keep your work and run:
 
 ```text
-ha waiting "<what is missing>"
+hp waiting "<what is missing>"
 ```
 
 Both commands create a durable event. Do not type a separate DONE or WAITING line.

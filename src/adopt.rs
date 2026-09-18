@@ -153,7 +153,11 @@ pub fn adopt(
             thread_dir: dir.clone(),
             ..created.clone()
         };
-        let brief = thread::with_lane_skill(&thread::brief_for(&project, &with_dir, &task, false)?);
+        let prefix = crate::coordinator::current_prefix(&ctx.root)?;
+        let brief = thread::with_lane_skill(
+            &prefix,
+            &thread::brief_for(&project, &with_dir, &task, false)?,
+        );
         std::fs::create_dir_all(Path::new(&dir).join("library"))
             .with_context(|| format!("could not create {dir}"))?;
         threads::exclude_from_git(ctx.runner, &agent.cwd)?;
