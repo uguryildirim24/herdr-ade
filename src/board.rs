@@ -183,10 +183,10 @@ pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
                 .filter(|m| m.pin.is_some())
                 .count();
             let phase = match merge.map(|m| m.phase) {
-                Some(MergePhase::Checkpointed) => format!("round {n} is merged"),
+                Some(MergePhase::Checkpointed) => format!("round {n} has landed"),
                 Some(MergePhase::MergeDiverged) => format!("round {n} stopped and needs a look"),
                 Some(_) => format!("round {n} is being merged"),
-                None if r.expected_head.is_some() => format!("round {n} is being reviewed"),
+                None if r.expected_head.is_some() => format!("round {n} is in review"),
                 None if members == 0 => format!("round {n} is open with no lanes yet"),
                 None if done == members => format!("round {n} has all {members} lanes done"),
                 None => format!("round {n} has {} lanes working", members - done),
