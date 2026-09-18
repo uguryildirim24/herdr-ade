@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::herdr::Herdr;
@@ -47,6 +47,117 @@ pub fn load_state(project: &Project) -> State {
 pub fn save_state(project: &Project, state: &State) -> Result<()> {
     let _lock = project.lock()?;
     project::write_json(&project.state_dir().join("ticker.json"), state)
+}
+
+/// Delivers every sealed event whose first transport submission is not yet in
+/// its journal. The event, not the typed line or report hash, is authoritative.
+#[allow(dead_code)] // called by the A1-wired operation ticker pass
+pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
+    for event in crate::events::list(project) {
+        let states = crate::events::states(project, &event.id)?;
+        if !states.contains(&crate::contracts::DeliveryState::Acknowledged)
+            && !states.contains(&crate::contracts::DeliveryState::Submitted)
+        {
+            deliver_event(ctx, project, &event)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Event) -> Result<()> {
+    let coordinator = project
+        .coordinator()
+        .ok_or_else(|| anyhow::anyhow!("recipient_unavailable: project has no coordinator"))?;
+    if coordinator.pane_id != event.recipient.pane
+        || coordinator.launch_attempts.max(1) != event.recipient.coordinator_attempt
+    {
+        inbox::write(
+            project,
+            "recipient-changed",
+            &event.thread,
+            "a sealed lane event belongs to an earlier coordinator binding",
+            "",
+        )?;
+        return Ok(());
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
+    let lane = thread::load(project, &event.thread)?;
+    if lane.launch_attempts.max(1) != event.attempt {
+        bail!(
+            "stale_attempt: event {} is not for the current lane attempt",
+            event.id
+        );
+    }
+    let kind = if event.payload.done.is_some() {
+        "done"
+    } else {
+        "waiting"
+    };
+    let summary = match (&event.payload.done, &event.payload.waiting) {
+        (Some(done), None) => format!(
+            "{} completed with report {} at {}",
+            event.thread, done.report_path, done.sha
+        ),
+        (None, Some(waiting)) => format!("{} is waiting: {}", event.thread, waiting.text),
+        _ => bail!("event_payload_invalid: {}", event.id),
+    };
+    inbox::write_event(project, event, kind, &summary)?;
+
+    if !lane.pane_id.is_empty() {
+        let _ = herdr.pane_clear_tokens(&lane.pane_id, &["done", "waiting"]);
+        let value = event
+            .payload
+            .waiting
+            .as_ref()
+            .map(|waiting| waiting.text.chars().take(80).collect::<String>())
+            .unwrap_or_else(|| "1".into());
+        let token = if event.payload.done.is_some() {
+            "done"
+        } else {
+            "waiting"
+        };
+        let _ = herdr.pane_report_tokens(
+            &lane.pane_id,
+            &[("lane", &event.thread), (token, &value)],
+            crate::coordinator::TOKEN_TTL,
+        );
+    }
+
+    let agent = herdr.agent_list()?.into_iter().find(|agent| {
+        agent.pane_id == event.recipient.pane
+            && agent.name == coordinator.agent_name
+            && agent.ready()
+    });
+    let Some(_agent) = agent else {
+        return Ok(());
+    };
+    herdr.agent_prompt(&event.recipient.pane, &crate::events::typed_line(event)?)?;
+    crate::events::append_delivery(
+        project,
+        &event.id,
+        crate::contracts::DeliveryState::Submitted,
+    )
+}
+
+/// Named item writers used by A1's ticker integration.
+#[allow(dead_code)] // named seam for A1's ticker
+pub fn config_changed(project: &Project, subject: &str, summary: &str) -> Result<()> {
+    inbox::write(project, "config-changed", subject, summary, "").map(|_| ())
+}
+
+#[allow(dead_code)] // named seam for A1's ticker
+pub fn report_available(project: &Project, lane: &Thread, path: &str) -> Result<()> {
+    inbox::write(
+        project,
+        "report-available",
+        &lane.id,
+        &format!(
+            "{} has report bytes at {path}; this is not a completion",
+            lane.id
+        ),
+        "",
+    )
+    .map(|_| ())
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
@@ -273,6 +384,8 @@ pub fn write_thread_items(
                 notes.join("; ")
             ));
         }
+        // A0's legacy ticker reaches this function directly. A1 replaces this
+        // call with `report_available`, whose item is explicitly non-completion.
         inbox::write(project, "thread-state", &t.id, &summary, "")?;
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
