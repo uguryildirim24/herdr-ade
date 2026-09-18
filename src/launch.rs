@@ -833,21 +833,7 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
 
     // The pair filter runs before the picker, in every mode (§2 Pairs).
     let allowed = pair_filter(&role.allowed, &config.recipes, input.sibling);
-    let default_id = if allowed.contains(&default_id) {
-        default_id
-    } else {
-        allowed.first().cloned().with_context(|| {
-            format!(
-                "dialogue_same_model: only the drafter's model remains for role `{}`",
-                input.role
-            )
-        })?
-    };
-    let default_recipe = config
-        .recipes
-        .get(&default_id)
-        .with_context(|| format!("recipe_unknown: `{default_id}`"))?
-        .clone();
+    let (default_id, default_recipe) = role_default(&config, &role, input.role, input.sibling)?;
 
     // Step 4: off, not opted in, one row or no gates never call Jev.
     if config.resolver == ResolverMode::Off {
@@ -1030,24 +1016,53 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
             });
     }
 
-    // Step 8: the config moved while the call was in flight.
-    let after = parse_picker_config(&ctx.config_dir, input.opted_in)?;
+    // Step 8: retake the project lock and re-read the config; if it moved
+    // while the call was in flight, discard the answer and launch the new
+    // table's default, validated like any other.
+    let after = {
+        let _lock = project.lock()?;
+        parse_picker_config(&ctx.config_dir, input.opted_in)?
+    };
     if after.policy_hash != config.policy_hash {
-        let recipe = after
+        validate_config(&after, &kinds)?;
+        let role = after
             .roles
             .get(input.role)
-            .and_then(|role| after.recipes.get(&role.default))
-            .cloned()
-            .unwrap_or(default_recipe);
+            .with_context(|| format!("role_unknown: `{}`", input.role))?;
+        let (id, recipe) = role_default(&after, role, input.role, input.sibling)?;
         return Ok(fallback_launch(
             &recipe,
-            &default_id,
+            &id,
             &after,
             input.role,
             FALLBACK_CONFIG_CHANGED,
         ));
     }
     Ok(launch)
+}
+
+/// The role's default after the pair filter: the first remaining allowed row
+/// in file order when the filter removed it (SPEC-jev-picker v2 §2 Pairs).
+fn role_default(
+    config: &PickerConfig,
+    role: &RolePicker,
+    name: &str,
+    sibling: Option<&Launch>,
+) -> Result<(String, Recipe)> {
+    let allowed = pair_filter(&role.allowed, &config.recipes, sibling);
+    let id = if allowed.contains(&role.default) {
+        role.default.clone()
+    } else {
+        allowed.first().cloned().with_context(|| {
+            format!("dialogue_same_model: only the drafter's model remains for role `{name}`")
+        })?
+    };
+    let recipe = config
+        .recipes
+        .get(&id)
+        .with_context(|| format!("recipe_unknown: `{id}`"))?
+        .clone();
+    Ok((id, recipe))
 }
 
 fn accepted_launch(
@@ -1741,6 +1756,37 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             assert_eq!(launch.recipe_id, "cursor_grok_xhigh", "{name}");
             assert_eq!(launch.fallback.as_deref(), Some(fallback), "{name}");
         }
+    }
+
+    #[test]
+    fn a_config_change_during_the_call_launches_the_new_default() {
+        let (world, project, task) = world("shadow", "read the vendor pages");
+        with_help(&world);
+        let config = world.home.path().join("cfg/config.toml");
+        let changed = config_text("shadow")
+            .replace(
+                "default = \"cursor_grok_xhigh\"\nallowed = [\"cursor_grok_xhigh\", \"agy_gemini_flash\"]",
+                "default = \"cursor_grok_xhigh\"\nallowed = [\"cursor_grok_xhigh\", \"agy_gemini_flash\", \"claude_opus_high\"]",
+            )
+            .replace(
+                "default = \"cursor_grok_xhigh\"",
+                "default = \"claude_opus_high\"",
+            );
+        assert_ne!(changed, config_text("shadow"));
+        let body = answers_body(0.91);
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("/usr/bin/curl"),
+            move |_| {
+                // Rolf edits the table while the call is in flight.
+                std::fs::write(&config, &changed).unwrap();
+                Ok(ok(&body))
+            },
+        );
+        let launch = run(&world, &project, &task).unwrap();
+        assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_CONFIG_CHANGED));
+        assert_eq!(launch.recipe_id, "claude_opus_high");
+        assert_eq!(launch.kind, "claude");
+        assert_eq!(launch.jev_pick, None);
     }
 
     #[test]
