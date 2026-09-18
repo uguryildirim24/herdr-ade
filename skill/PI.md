@@ -69,7 +69,7 @@ done. The guard reports the pane `blocked` and sends one
   `herdr pane send-text <pane> "<your line>"` and then
   `herdr pane send-keys <pane> enter`. A blocked pane refuses
   `herdr agent prompt` (`agent_blocked`).
-- The guard never sends `DONE`. Only `ha done` does.
+- The guard never sends `DONE`. Only `hp done` does.
 
 If you see the trust question or the missing-folder question on screen, type
 nothing. That is not a lane: it is a broken start. A trusted folder runs

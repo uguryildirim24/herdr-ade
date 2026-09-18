@@ -231,9 +231,19 @@ pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
 
 // ---------------------------------------------------------------- briefs
 
-/// A brief read without `ha skill` (adopted, remote) carries the lane skill.
-pub fn with_lane_skill(brief: &str) -> String {
-    format!("{}\n\n{brief}", include_str!("../skill/LANE.md").trim_end())
+/// The line that opens every thread skill: the skills write `hp`, and this
+/// names the prefix `hp` stands for.
+pub fn commands_line(prefix: &str) -> String {
+    format!("Commands: `{prefix}`. Every `hp` command below means that prefix.\n\n")
+}
+
+/// A brief read without `hp skill` (adopted, remote) carries the lane skill.
+pub fn with_lane_skill(prefix: &str, brief: &str) -> String {
+    format!(
+        "{}{}\n\n{brief}",
+        commands_line(prefix),
+        include_str!("../skill/LANE.md").trim_end()
+    )
 }
 
 pub struct BriefInput<'a> {
