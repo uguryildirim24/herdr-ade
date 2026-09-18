@@ -1,0 +1,656 @@
+//! Coordinator correction-hook lifecycle, budget, and typed envelope parsing.
+
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::contracts::{Ask, HumanMessage};
+use crate::paths::Ctx;
+use crate::plain::{self, Glossary};
+use crate::project::{self, Project};
+use crate::remote::quote;
+use crate::runner::Cmd;
+
+pub const FIXED_FAILURE_NOTICE: &str =
+    "The coordinator could not say this plainly. Open its pane to read it.";
+const INPUT_LIMIT: usize = 64 * 1024;
+const MAX_CORRECTIONS: u32 = 3;
+const DEADLINE_SECS: i64 = 10 * 60;
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Binding {
+    kind: String,
+    project: String,
+    pane: String,
+    #[serde(default)]
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Budget {
+    turn: String,
+    corrections: u32,
+    translator_runs: u32,
+    started: String,
+    started_second: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Publication {
+    pub id: String,
+    pub session: String,
+    pub turn: String,
+    pub message: HumanMessage,
+}
+
+fn binding_path(project: &Project) -> PathBuf {
+    project.state_dir().join("plain").join("hook-binding.json")
+}
+
+fn settings_path(project: &Project, kind: &str) -> Option<PathBuf> {
+    match kind {
+        "claude" => Some(project.dir().join(".claude").join("settings.local.json")),
+        // These are intentionally not installed before their installed-version
+        // probes qualify their exact schema and continuation behavior.
+        "cursor" | "codex" => None,
+        _ => None,
+    }
+}
+
+pub fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<bool> {
+    let Some(path) = settings_path(project, kind) else {
+        return Ok(false);
+    };
+    let binary = std::env::current_exe().context("could not locate herdr-ade")?;
+    let command = format!(
+        "{} --root {} plain hook --kind {} --project {} --binding {}",
+        quote(&binary.to_string_lossy()),
+        quote(&ctx.root.to_string_lossy()),
+        quote(kind),
+        quote(&project.slug),
+        quote(pane)
+    );
+    let _lock = project.lock()?;
+    let mut value = read_json_object(&path)?;
+    let hooks = value
+        .as_object_mut()
+        .expect("read_json_object returns an object")
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks = hooks
+        .as_object_mut()
+        .context("hook_config_invalid: `hooks` is not an object")?;
+    let stop = hooks.entry("Stop").or_insert_with(|| serde_json::json!([]));
+    let stop = stop
+        .as_array_mut()
+        .context("hook_config_invalid: `hooks.Stop` is not an array")?;
+    stop.retain(|entry| !owned_hook(entry));
+    stop.push(serde_json::json!({
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": command }]
+    }));
+    write_json_atomic(&path, &value)?;
+    let dir = project.state_dir().join("plain");
+    std::fs::create_dir_all(&dir)?;
+    project::write_json(
+        &binding_path(project),
+        &Binding {
+            kind: kind.to_string(),
+            project: project.slug.clone(),
+            pane: pane.to_string(),
+            session_id: String::new(),
+        },
+    )?;
+    verify_owned_entry(&path, pane)?;
+    Ok(true)
+}
+
+pub fn remove(project: &Project) -> Result<()> {
+    let _lock = project.lock()?;
+    let binding: Option<Binding> = project::read_json(&binding_path(project));
+    if let Some(binding) = binding
+        && let Some(path) = settings_path(project, &binding.kind)
+        && path.exists()
+    {
+        let mut value = read_json_object(&path)?;
+        if let Some(stop) = value
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut("Stop"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            stop.retain(|entry| !owned_hook(entry));
+        }
+        write_json_atomic(&path, &value)?;
+    }
+    let _ = std::fs::remove_file(binding_path(project));
+    Ok(())
+}
+
+fn owned_hook(value: &serde_json::Value) -> bool {
+    value["hooks"].as_array().into_iter().flatten().any(|hook| {
+        hook["command"]
+            .as_str()
+            .is_some_and(|command| command.contains(" plain hook --kind "))
+    })
+}
+
+fn verify_owned_entry(path: &Path, pane: &str) -> Result<()> {
+    let value = read_json_object(path)?;
+    let found = value["hooks"]["Stop"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| owned_hook(entry))
+        .count();
+    if found != 1 || !value.to_string().contains(pane) {
+        bail!("hook_install_failed: owned Stop entry did not verify");
+    }
+    Ok(())
+}
+
+/// Runs from a native CLI hook. Non-matching pane/session invocations are out
+/// of scope and exit successfully without checking or publishing.
+pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let inherited = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+    if inherited != pane {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take((INPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > INPUT_LIMIT {
+        return correction(kind, "plain_input_too_large: reply exceeds 64 KiB");
+    }
+    let input: serde_json::Value =
+        serde_json::from_slice(&bytes).context("hook input is not JSON")?;
+    let session = input["session_id"].as_str().unwrap_or_default();
+    if !scope_binding(&project, kind, pane, session)? {
+        return Ok(());
+    }
+    let text = reply_text(kind, &input).unwrap_or_default();
+    let turn = turn_key(&input, text);
+    let messages = match parse_envelopes(text) {
+        Ok(messages) => messages,
+        Err(error) => {
+            return failed_check(
+                ctx,
+                &project,
+                kind,
+                session,
+                &turn,
+                text,
+                &error.to_string(),
+            );
+        }
+    };
+    if let Some(reason) = messages.iter().find_map(|message| {
+        validate_message(&project, message)
+            .err()
+            .map(|error| error.to_string())
+    }) {
+        return failed_check(ctx, &project, kind, session, &turn, text, &reason);
+    }
+    for message in messages {
+        publish(&project, session, &turn, message)?;
+    }
+    Ok(())
+}
+
+fn scope_binding(project: &Project, kind: &str, pane: &str, session: &str) -> Result<bool> {
+    let _lock = project.lock()?;
+    let Some(mut binding) = project::read_json::<Binding>(&binding_path(project)) else {
+        return Ok(false);
+    };
+    if binding.kind != kind || binding.pane != pane || binding.project != project.slug {
+        return Ok(false);
+    }
+    if binding.session_id.is_empty() && !session.is_empty() {
+        binding.session_id = session.to_string();
+        project::write_json(&binding_path(project), &binding)?;
+    } else if binding.session_id != session {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn reply_text<'a>(kind: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    match kind {
+        "claude" => input["last_assistant_message"].as_str(),
+        "cursor" => input["text"]
+            .as_str()
+            .or_else(|| input["response"].as_str()),
+        "codex" => input["last_assistant_message"]
+            .as_str()
+            .or_else(|| input["text"].as_str()),
+        _ => None,
+    }
+}
+
+fn turn_key(input: &serde_json::Value, text: &str) -> String {
+    for field in ["turn_id", "last_user_message_id", "prompt_id"] {
+        if let Some(value) = input[field].as_str().filter(|value| !value.is_empty()) {
+            return value.to_string();
+        }
+    }
+    // Continuations keep the same transcript path. This fallback does not
+    // reset on `stop_hook_active`; a fresh native human turn should supply one
+    // of the identifiers above on qualified adapters.
+    input["transcript_path"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("text-{:x}", Sha256::digest(text.as_bytes())))
+}
+
+fn failed_check(
+    ctx: &Ctx,
+    project: &Project,
+    kind: &str,
+    session: &str,
+    turn: &str,
+    text: &str,
+    reason: &str,
+) -> Result<()> {
+    let mut budget = load_budget(project, session, turn)?;
+    let now = jiff::Timestamp::now().as_second();
+    let expired = now - budget.started_second >= DEADLINE_SECS;
+    if !expired && budget.corrections < MAX_CORRECTIONS {
+        budget.corrections += 1;
+        save_budget(project, session, &budget)?;
+        return correction(kind, reason);
+    }
+    if !expired && budget.translator_runs == 0 {
+        if let Some(command) = translator_command(&ctx.config_dir)? {
+            budget.translator_runs = 1;
+            save_budget(project, session, &budget)?;
+            if let Some(rewrite) = run_translator(ctx, &command, text, reason)? {
+                if let Ok(messages) = parse_envelopes(&rewrite)
+                    && messages
+                        .iter()
+                        .all(|message| validate_message(project, message).is_ok())
+                {
+                    for message in messages {
+                        publish(project, session, turn, message)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+    publish(
+        project,
+        session,
+        turn,
+        HumanMessage::Notice {
+            id: "plain-budget-exhausted".into(),
+        },
+    )?;
+    Ok(())
+}
+
+fn correction(kind: &str, reason: &str) -> Result<()> {
+    let reason = format!("Rewrite the reply for the plain-language check: {reason}");
+    let value = match kind {
+        "cursor" => serde_json::json!({ "followup_message": reason }),
+        "claude" | "codex" => serde_json::json!({ "decision": "block", "reason": reason }),
+        _ => return Ok(()),
+    };
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
+}
+
+fn parse_envelopes(text: &str) -> Result<Vec<HumanMessage>> {
+    let mut messages = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("```ade-") {
+        rest = &rest[start + 3..];
+        let Some((header, body_and_tail)) = rest.split_once('\n') else {
+            bail!("plain_envelope: envelope fence has no body");
+        };
+        let Some((body, tail)) = body_and_tail.split_once("```") else {
+            bail!("plain_envelope: envelope fence is not closed");
+        };
+        let fields: BTreeMap<String, String> = body
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+            .collect();
+        match header.trim() {
+            "ade-say" => messages.push(HumanMessage::Say {
+                what: fields.get("what").cloned().unwrap_or_default(),
+                means: fields
+                    .get("means")
+                    .cloned()
+                    .filter(|value| !value.is_empty()),
+            }),
+            "ade-ask" => {
+                let ask = fields.get("ask").map(String::as_str).unwrap_or_default();
+                let (id, revision) = ask
+                    .rsplit_once('@')
+                    .context("plain_envelope: ask must be <id>@<revision>")?;
+                messages.push(HumanMessage::Ask {
+                    id: id.to_string(),
+                    revision: revision
+                        .parse()
+                        .context("plain_envelope: ask revision is not a number")?,
+                });
+            }
+            _ => {}
+        }
+        rest = tail;
+    }
+    if messages.is_empty() {
+        bail!("plain_envelope: end your reply with an `ade-say` block");
+    }
+    Ok(messages)
+}
+
+fn validate_message(project: &Project, message: &HumanMessage) -> Result<()> {
+    let glossary = glossary(project);
+    let result = plain::check_message(message, &glossary);
+    if let Some(violation) = result.violations.first() {
+        bail!("{}: {}", violation.rule.code(), violation.fix);
+    }
+    if let HumanMessage::Ask { id, revision } = message {
+        let path = project.dir().join("asks").join(format!("{id}.toml"));
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("plain_envelope: unknown ask {id}@{revision}"))?;
+        let ask: Ask = toml::from_str(&text)?;
+        if ask.revision != *revision {
+            bail!(
+                "ask_revision_stale: expected {}, got {revision}",
+                ask.revision
+            );
+        }
+        let result = plain::check_ask(&ask.question, &ask.choices, &glossary);
+        if let Some(violation) = result.violations.first() {
+            bail!("{}: {}", violation.rule.code(), violation.fix);
+        }
+    }
+    if let HumanMessage::Notice { id } = message
+        && id == "plain-budget-exhausted"
+    {
+        let result = plain::check(FIXED_FAILURE_NOTICE, &glossary);
+        if let Some(violation) = result.violations.first() {
+            bail!("{}: {}", violation.rule.code(), violation.fix);
+        }
+    }
+    Ok(())
+}
+
+fn glossary(project: &Project) -> Glossary {
+    let mut glossary = Glossary::default();
+    for lane in crate::thread::list(project) {
+        glossary.names.insert(
+            lane.id,
+            if lane.title.is_empty() {
+                "This lane".into()
+            } else {
+                lane.title
+            },
+        );
+    }
+    glossary
+}
+
+/// The only hook publication entry point. It accepts a typed value, dedupes a
+/// repeated native reply, and leaves A3 a durable checked queue to render.
+pub fn publish(project: &Project, session: &str, turn: &str, message: HumanMessage) -> Result<()> {
+    let serialized = serde_json::to_vec(&message)?;
+    let id = format!(
+        "{:x}",
+        Sha256::digest([session.as_bytes(), turn.as_bytes(), &serialized].concat())
+    );
+    let path = project.state_dir().join("plain").join("publications.jsonl");
+    let _lock = project.lock()?;
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Publication>(line).ok())
+            .any(|p| p.id == id)
+    {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(
+        &mut file,
+        &Publication {
+            id,
+            session: session.to_string(),
+            turn: turn.to_string(),
+            message,
+        },
+    )?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn budget_path(project: &Project, session: &str) -> PathBuf {
+    let hash = format!("{:x}", Sha256::digest(session.as_bytes()));
+    project
+        .state_dir()
+        .join("plain")
+        .join("budget")
+        .join(format!("{hash}.json"))
+}
+
+fn load_budget(project: &Project, session: &str, turn: &str) -> Result<Budget> {
+    let path = budget_path(project, session);
+    if let Some(budget) = project::read_json::<Budget>(&path)
+        && budget.turn == turn
+    {
+        return Ok(budget);
+    }
+    Ok(Budget {
+        turn: turn.to_string(),
+        corrections: 0,
+        translator_runs: 0,
+        started: project::now(),
+        started_second: jiff::Timestamp::now().as_second(),
+    })
+}
+
+fn save_budget(project: &Project, session: &str, budget: &Budget) -> Result<()> {
+    let path = budget_path(project, session);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    project::write_json(&path, budget)
+}
+
+#[derive(Deserialize, Default)]
+struct PlainConfig {
+    model: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    plain: PlainConfig,
+}
+
+fn translator_command(config_dir: &Path) -> Result<Option<String>> {
+    let path = config_dir.join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let config: Config = toml::from_str(&text)?;
+    Ok(config
+        .plain
+        .model
+        .filter(|command| !command.trim().is_empty()))
+}
+
+fn run_translator(ctx: &Ctx, command: &str, text: &str, reason: &str) -> Result<Option<String>> {
+    let input = format!("{reason}\n\n{text}");
+    let output = ctx.runner.run(
+        &Cmd::new("/bin/sh", SUBPROCESS_TIMEOUT)
+            .args(["-lc", command])
+            .stdin(input)
+            .own_group(),
+    )?;
+    if output.success() {
+        Ok(Some(output.stdout))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_json_object(path: &Path) -> Result<serde_json::Value> {
+    let value = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("{} does not parse", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    if !value.is_object() {
+        bail!("hook_config_invalid: {} is not an object", path.display());
+    }
+    Ok(value)
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let parent = path.parent().context("hook path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    project::write_atomic(path, &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::Env;
+    use crate::runner::fake::FakeRunner;
+
+    #[test]
+    fn raw_question_does_not_bypass_the_typed_envelope() {
+        assert!(
+            parse_envelopes("Keep it running, or stop it now?")
+                .unwrap_err()
+                .to_string()
+                .contains("ade-say")
+        );
+    }
+
+    #[test]
+    fn prose_question_is_private_when_say_envelope_exists() {
+        let messages = parse_envelopes(
+            "Keep it running, or stop it now?\n```ade-say\nwhat: The work is ready.\n```",
+        )
+        .unwrap();
+        assert_eq!(
+            messages,
+            vec![HumanMessage::Say {
+                what: "The work is ready.".into(),
+                means: None
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_publication_appends_once() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let message = HumanMessage::Say {
+            what: "The work is ready.".into(),
+            means: None,
+        };
+        publish(&project, "s", "t", message.clone()).unwrap();
+        publish(&project, "s", "t", message).unwrap();
+        let text =
+            std::fs::read_to_string(project.state_dir().join("plain").join("publications.jsonl"))
+                .unwrap();
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn claude_install_is_idempotent_and_preserves_unrelated_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let path = project.dir().join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other"}]}]}}"#,
+        )
+        .unwrap();
+        install(&ctx, &project, "claude", "w1:p1").unwrap();
+        install(&ctx, &project, "claude", "w1:p1").unwrap();
+        let value = read_json_object(&path).unwrap();
+        assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        remove(&project).unwrap();
+        let value = read_json_object(&path).unwrap();
+        assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn correction_budget_persists_across_continuations_and_exhausts_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        for _ in 0..5 {
+            failed_check(
+                &ctx,
+                &project,
+                "claude",
+                "session-one",
+                "same-turn",
+                "bad",
+                "plain_unknown_word: replace it",
+            )
+            .unwrap();
+        }
+        let budget = load_budget(&project, "session-one", "same-turn").unwrap();
+        assert_eq!(budget.corrections, 3);
+        assert_eq!(budget.translator_runs, 0);
+        let text =
+            std::fs::read_to_string(project.state_dir().join("plain").join("publications.jsonl"))
+                .unwrap();
+        let publications: Vec<Publication> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(
+            publications[0].message,
+            HumanMessage::Notice {
+                id: "plain-budget-exhausted".into()
+            }
+        );
+    }
+}
