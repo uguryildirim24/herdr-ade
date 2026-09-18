@@ -123,6 +123,9 @@ pub struct PickerConfig {
     /// redaction and excerpt rules, and `jev_model` (SPEC-jev-picker v2
     /// Design norm 8, SPEC-ADE D11).
     pub policy_hash: String,
+    /// Inline D2 roles written without `plain`: they get the shipped phrase
+    /// and `doctor` warns (SPEC-ADE §6 item 47), never a refusal.
+    pub inline_without_plain: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,13 +195,25 @@ pub fn parse_picker_config(config_dir: &Path, opted_in: bool) -> Result<PickerCo
     }
     let mut recipes = raw.recipes;
     let mut roles = BTreeMap::new();
+    let mut inline_without_plain = Vec::new();
     for (name, value) in role_tables {
         let raw_role: RawRole = value
             .try_into()
             .with_context(|| format!("[roles.{name}] does not parse"))?;
+        if raw_role.kind.is_some()
+            && raw_role
+                .plain
+                .as_deref()
+                .is_none_or(|p| p.trim().is_empty())
+            && !NEVER_RESOLVED.contains(&name.as_str())
+        {
+            inline_without_plain.push(name.clone());
+        }
         roles.insert(name.clone(), parse_role(&name, raw_role, &mut recipes)?);
     }
-    finish(settings, recipes, roles, opted_in)
+    let mut config = finish(settings, recipes, roles, opted_in)?;
+    config.inline_without_plain = inline_without_plain;
+    Ok(config)
 }
 
 fn finish(
@@ -229,6 +244,7 @@ fn finish(
         roles,
         opted_in,
         policy_hash,
+        inline_without_plain: Vec::new(),
     })
 }
 
@@ -1270,10 +1286,30 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
             config.roles.len()
         ),
     });
+    for name in &config.inline_without_plain {
+        rows.push(DoctorRow {
+            ok: None,
+            label: format!("role {name}"),
+            detail: format!(
+                "[roles.{name}] has no plain phrase; the board says \"the usual helper\" until you add one"
+            ),
+        });
+    }
     if config.resolver == ResolverMode::Off && config.recipes.is_empty() {
         return Ok(rows);
     }
 
+    // The key, its mode, curl and the live probe matter only when the picker
+    // calls out: `doctor` checks them when the resolver is not off
+    // (SPEC-jev-picker v2 §5).
+    if config.resolver != ResolverMode::Off {
+        key_rows(ctx, &mut rows);
+    }
+    table_rows(ctx, &config, &mut rows);
+    Ok(rows)
+}
+
+fn key_rows(ctx: &Ctx, rows: &mut Vec<DoctorRow>) {
     let key = jev::key_report(ctx.env);
     match key.source {
         jev::KeySource::Env => rows.push(DoctorRow {
@@ -1337,35 +1373,25 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
         }),
     }
 
-    if config.resolver != ResolverMode::Off {
-        let live_key = jev::load_key(ctx.env);
-        if let Some(key) = live_key {
-            let (status, body) = jev::models_probe(ctx.runner, &key, Duration::from_secs(3));
-            if status == 200 {
-                rows.push(DoctorRow {
-                    ok: Some(true),
-                    label: "picker models".into(),
-                    detail: "GET /v1/models answered 200".into(),
-                });
-            } else {
-                rows.push(DoctorRow {
-                    ok: None,
-                    label: "picker models".into(),
-                    detail: format!(
-                        "GET /v1/models answered {status}{}",
-                        if body.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {body}")
-                        }
-                    ),
-                });
-            }
-        }
+    if let Some(key) = jev::load_key(ctx.env) {
+        let (status, body) = jev::models_probe(ctx.runner, &key, Duration::from_secs(3));
+        let detail = match (status, body.is_empty()) {
+            (200, _) => "GET /v1/models answered 200".to_string(),
+            (0, _) => format!("GET /v1/models did not answer: {body}"),
+            (_, true) => format!("GET /v1/models answered {status}"),
+            (_, false) => format!("GET /v1/models answered {status}: {body}"),
+        };
+        rows.push(DoctorRow {
+            ok: if status == 200 { Some(true) } else { None },
+            label: "picker models".into(),
+            detail,
+        });
     }
+}
 
+fn table_rows(ctx: &Ctx, config: &PickerConfig, rows: &mut Vec<DoctorRow>) {
     match agent_kinds(ctx.env, ctx.runner) {
-        Ok(kinds) => match validate_config(&config, &kinds) {
+        Ok(kinds) => match validate_config(config, &kinds) {
             Ok(()) => rows.push(DoctorRow {
                 ok: Some(true),
                 label: "picker recipes".into(),
@@ -1437,7 +1463,6 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
             });
         }
     }
-    Ok(rows)
 }
 
 /// Print the rows with `doctor`'s three marks and fail when one is a FAIL.
@@ -2192,6 +2217,41 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         assert_ne!(base.policy_hash, moved.policy_hash);
         let same = parse_picker_config(dir, true).unwrap();
         assert_eq!(moved.policy_hash, same.policy_hash);
+    }
+
+    #[test]
+    fn doctor_warns_on_an_inline_role_without_plain_and_skips_the_key_when_off() {
+        let world = World::new();
+        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
+        std::fs::write(
+            world.home.path().join("cfg/config.toml"),
+            "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\n\n[roles.pro]\nkind = \"chatgpt\"\n",
+        )
+        .unwrap();
+        with_help(&world);
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("zsh -lic"),
+            |_| Ok(ok("/usr/local/bin/claude\n")),
+        );
+        let ctx = world.ctx();
+        // The config loads and resolves: a missing phrase is not a refusal.
+        let config = parse_picker_config(&ctx.config_dir, false).unwrap();
+        assert_eq!(config.inline_without_plain, ["lane"]);
+        let rows = doctor_rows(&ctx).unwrap();
+        let lane = rows.iter().find(|row| row.label == "role lane").unwrap();
+        assert_eq!(lane.ok, None, "{lane:?}");
+        assert!(!rows.iter().any(|row| row.label == "role pro"), "{rows:?}");
+        // Resolver off: no key, curl or probe rows, and no curl run.
+        assert!(
+            !rows.iter().any(|row| row.label.starts_with("picker key")),
+            "{rows:?}"
+        );
+        assert_eq!(world.runner.count("/usr/bin/curl"), 0);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "picker recipes" && row.ok == Some(true)),
+            "{rows:?}"
+        );
     }
 
     #[test]
