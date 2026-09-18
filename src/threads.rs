@@ -1039,6 +1039,7 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
     if live.agent_state.as_deref() == Some("working") {
         bail!("{} is working; not removing the worktree", record.id);
     }
+    removal_gate(project, &view.herdr, record, &panes)?;
     if let Err(error) = crate::git::worktree_remove(ctx.runner, &record.repo, &record.worktree_path)
     {
         let _ = thread::update(project, &record.id, |t| {
@@ -1046,13 +1047,79 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
         });
         return Err(error);
     }
-    if !record.tab_id.is_empty()
-        && let Err(error) = view.herdr.tab_close(&record.tab_id)
-    {
+    let own_tab = panes
+        .iter()
+        .any(|p| p.tab_id == record.tab_id && p.pane_id == record.pane_id);
+    if own_tab && let Err(error) = view.herdr.tab_close(&record.tab_id) {
         let _ = thread::update(project, &record.id, |t| {
             t.partial = Some("tab_close".into());
         });
         return Err(anyhow::anyhow!("{error}"));
+    }
+    Ok(())
+}
+
+/// The D4 gate before a lane's worktree goes: the lane released it (a sealed
+/// `done` for the current attempt whose artifact still hashes to its name,
+/// or the thread was resolved before), no program runs in it, and the tab
+/// that would close is the one the record created.
+fn removal_gate(
+    project: &Project,
+    herdr: &Herdr,
+    record: &Thread,
+    panes: &[crate::herdr::Pane],
+) -> Result<()> {
+    let attempt = record.attempt.max(1);
+    let done = crate::events::list(project)
+        .into_iter()
+        .filter(|e| e.thread == record.id && e.attempt == attempt)
+        .find_map(|e| e.payload.done);
+    match done {
+        Some(done) => {
+            let path = crate::round::artifacts_dir(project).join(&done.artifact);
+            let bytes = std::fs::read(&path).map_err(|e| {
+                anyhow::anyhow!("artifact_missing: {} ({e}); not removing", path.display())
+            })?;
+            if thread::sha256_hex(&bytes) != done.artifact {
+                bail!(
+                    "artifact_mismatch: {} does not hash to its name; not removing",
+                    path.display()
+                );
+            }
+        }
+        None if record.status == Status::Resolved => {}
+        None => bail!(
+            "worktree_not_released: {} has no sealed done for attempt {attempt}; not removing",
+            record.id
+        ),
+    }
+    for pane in panes
+        .iter()
+        .filter(|p| Path::new(&p.cwd).starts_with(&record.worktree_path))
+    {
+        let busy = herdr
+            .pane_process_info(&pane.pane_id)
+            .map_err(|e| anyhow::anyhow!("pane {}: {e}", pane.pane_id))?
+            .foreground_processes
+            .iter()
+            .any(|p| !matches!(p.name.as_str(), "zsh" | "-zsh" | "bash" | "sh" | "fish"));
+        if busy {
+            bail!(
+                "worktree_in_use: a program runs in {} (pane {}); not removing",
+                record.worktree_path,
+                pane.pane_id
+            );
+        }
+    }
+    if panes
+        .iter()
+        .any(|p| p.tab_id == record.tab_id && p.pane_id != record.pane_id)
+    {
+        bail!(
+            "wrong_tab: tab {} holds a pane that is not {}; not removing",
+            record.tab_id,
+            record.pane_id
+        );
     }
     Ok(())
 }
@@ -1070,12 +1137,23 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
         let Some(agent) = agents.iter().find(|a| thread::agent_matches(&record, a)) else {
             continue;
         };
-        let process = herdr
+        // An unverified pane is never reparented (D3).
+        let Some(stored) = &record.identity.process else {
+            continue;
+        };
+        let live = herdr
             .pane_process_info(&record.pane_id)
-            .ok()
-            .and_then(|info| info.identity());
-        if record.identity.process.is_some() {
-            if !thread::identity_verifies(&record, agent, process.as_ref()) {
+            .map(|info| info.identities())
+            .unwrap_or_default();
+        if !thread::identity_verifies(&record, agent, &live) {
+            // Said once per thread attempt and stored process, not per tick.
+            let marker = project.state_dir().join("lineage").join(format!(
+                "{}-{}-{}",
+                record.id,
+                record.attempt.max(1),
+                stored.pid
+            ));
+            if !marker.exists() {
                 let _ = crate::inbox::write(
                     project,
                     "lineage-mismatch",
@@ -1083,9 +1161,9 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
                     "the live process does not match the stored identity; parent was not repaired",
                     "",
                 );
-                continue;
+                let _ = std::fs::create_dir_all(project.state_dir().join("lineage"));
+                let _ = std::fs::write(&marker, "");
             }
-        } else if record.kind != Kind::Adopted {
             continue;
         }
         if agent.parent() != Some(coordinator.pane_id.as_str()) {

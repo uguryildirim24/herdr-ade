@@ -217,16 +217,32 @@ pub struct ForegroundProcess {
 
 impl ProcessInfo {
     /// First foreground process, used as identity evidence (SPEC-ADE D3).
-    pub fn identity(&self) -> Option<crate::contracts::ProcessIdentity> {
-        let proc = self.foreground_processes.first()?;
-        Some(crate::contracts::ProcessIdentity {
-            pid: proc.pid,
-            argv0: proc
-                .argv0
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| proc.name.clone()),
-        })
+    /// Every foreground process: while the agent runs a tool, the tool is
+    /// in the foreground beside it.
+    pub fn identities(&self) -> Vec<crate::contracts::ProcessIdentity> {
+        self.foreground_processes
+            .iter()
+            .map(|proc| crate::contracts::ProcessIdentity {
+                pid: proc.pid,
+                argv0: proc
+                    .argv0
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| proc.name.clone()),
+            })
+            .collect()
+    }
+
+    /// The process to bind for an agent of `kind`: the one whose program is
+    /// named for the kind, else the first (A1 review M2).
+    pub fn identity(&self, kind: &str) -> Option<crate::contracts::ProcessIdentity> {
+        let all = self.identities();
+        all.iter()
+            .find(|p| {
+                !kind.is_empty() && p.argv0.rsplit('/').next().is_some_and(|b| b.contains(kind))
+            })
+            .cloned()
+            .or_else(|| all.into_iter().next())
     }
 }
 
@@ -789,7 +805,7 @@ mod tests {
                 argv0: Some("/bin/cursor-agent".into()),
             }],
         };
-        let id = info.identity().unwrap();
+        let id = info.identity("cursor").unwrap();
         assert_eq!(id.pid, 9);
         assert_eq!(id.argv0, "/bin/cursor-agent");
     }

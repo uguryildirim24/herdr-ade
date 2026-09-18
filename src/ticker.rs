@@ -573,7 +573,7 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
                 .on_machine(&t.machine)
                 .pane_process_info(&t.pane_id)
                 .ok()
-                .and_then(|info| info.identity());
+                .and_then(|info| info.identity(&t.launch.kind));
             let socket = pass
                 .project
                 .coordinator()

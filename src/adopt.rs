@@ -195,7 +195,7 @@ pub fn adopt(
             herdr
                 .pane_process_info(pane)
                 .ok()
-                .and_then(|p| p.identity()),
+                .and_then(|p| p.identity(&agent.agent)),
         );
     })?;
     threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
