@@ -1082,7 +1082,7 @@ fn accepted_launch(
         let mut launch = launch_from(default_recipe, config, ResolverMode::Shadow, input.role);
         launch.recipe_id = default_id.to_string();
         launch.gate = Some(question.id.clone());
-        launch.gate_p = Some(question.threshold);
+        launch.gate_p = answers.nouls.get(&question.id).copied();
         launch.jev_pick = Some(question.id.clone());
         launch.reason = shadow_reason(input.role, &default_recipe.plain, picked_plain);
         launch.fallback = Some(FALLBACK_SHADOW.to_string());
@@ -1106,7 +1106,7 @@ fn accepted_launch(
     let mut launch = launch_from(recipe, config, ResolverMode::Jev, input.role);
     launch.recipe_id = question.id.clone();
     launch.gate = Some(question.id.clone());
-    launch.gate_p = Some(question.threshold);
+    launch.gate_p = answers.nouls.get(&question.id).copied();
     launch.jev_pick = Some(question.id.clone());
     launch.reason = reason_clause(&question.id)
         .map(|clause| picked_reason(input.role, clause, picked_plain))
@@ -1623,6 +1623,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         assert_eq!(launch.resolver, ResolverMode::Jev);
         assert_eq!(launch.gate.as_deref(), Some("agy_gemini_flash"));
         assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
+        assert_eq!(launch.gate_p, Some(0.91), "the Noul, not the threshold");
         assert_eq!(launch.fallback, None);
         assert_eq!(
             launch.reason,
@@ -1643,6 +1644,8 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
         assert_eq!(launch.kind, "cursor");
         assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
+        assert_eq!(launch.gate.as_deref(), Some("agy_gemini_flash"));
+        assert_eq!(launch.gate_p, Some(0.91), "the Noul, not the threshold");
         assert_eq!(launch.jev_input_tokens, Some(356));
         assert_eq!(launch.jev_model.as_deref(), Some(jev::JEV_MODEL));
         assert_eq!(world.runner.count("/usr/bin/curl"), 1);
