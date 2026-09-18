@@ -653,19 +653,36 @@ fn curl_args(timeout: Duration) -> Vec<String> {
     ]
 }
 
+/// curl's exit code for `--max-time` running out.
+pub const CURL_TIMEOUT_EXIT: i32 = 28;
+
 fn classify(output: &Output) -> Transport {
-    if output.timed_out {
+    if output.timed_out || output.code == Some(CURL_TIMEOUT_EXIT) {
         return Transport::Timeout;
+    }
+    // curl still prints `write-out` when the transfer fails, so a refused
+    // connection or a DNS failure ends in `\n000` with a non-zero exit. Only a
+    // clean exit carries an HTTP status; anything else is a transport failure
+    // (a connect error is then retried once).
+    if output.code != Some(0) {
+        return Transport::Failed {
+            code: output.code,
+            detail: output.error_text(),
+        };
     }
     let stdout = output.stdout.trim_end_matches(['\n', '\r']);
     if let Some((body, status)) = stdout.rsplit_once('\n') {
-        if let Ok(status) = status.trim().parse::<u16>() {
+        if let Ok(status) = status.trim().parse::<u16>()
+            && status != 0
+        {
             return Transport::Response {
                 status,
                 body: body.to_string(),
             };
         }
-    } else if let Ok(status) = stdout.trim().parse::<u16>() {
+    } else if let Ok(status) = stdout.trim().parse::<u16>()
+        && status != 0
+    {
         return Transport::Response {
             status,
             body: String::new(),
@@ -1071,17 +1088,25 @@ mod tests {
         let result = call(&runner, "k", "{}", Duration::from_secs(3));
         assert_eq!(result.attempts, 2);
 
+        for status in [401, 402, 422, 500] {
+            let runner = FakeRunner::new();
+            runner.on_fn(
+                |cmd| cmd.display().contains("--config"),
+                move |_| Ok(ok(&format!("{{}}\n{status}"))),
+            );
+            let result = call(&runner, "k", "{}", Duration::from_secs(3));
+            assert_eq!(result.attempts, 1, "{status}");
+            match result.transport {
+                Transport::Response { status: got, .. } => assert_eq!(got, status),
+                other => panic!("{other:?}"),
+            }
+        }
         let runner = FakeRunner::new();
         runner.on_fn(
             |cmd| cmd.display().contains("--config"),
-            |_| Ok(fail(0, "")),
+            |_| Ok(ok("{}\n529")),
         );
-        let result = call(&runner, "k", "{}", Duration::from_secs(3));
-        assert_eq!(result.attempts, 1);
-        match result.transport {
-            Transport::Failed { code, .. } => assert_eq!(code, Some(0)),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(call(&runner, "k", "{}", Duration::from_secs(3)).attempts, 2);
     }
 
     #[test]
@@ -1105,6 +1130,68 @@ mod tests {
         );
         let result = call(&runner, "k", "{}", Duration::from_secs(3));
         assert_eq!(result.attempts, 2);
+    }
+
+    #[test]
+    fn real_curl_failures_print_000_and_are_not_http_answers() {
+        // What /usr/bin/curl really prints with `write-out = "\n%{http_code}"`
+        // on a refused connection (exit 7) and on `--max-time` (exit 28).
+        let refused = Output {
+            code: Some(7),
+            stdout: "\n000".into(),
+            stderr: "curl: (7) Failed to connect to api.typesafe.ai port 443".into(),
+            timed_out: false,
+        };
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.display().contains("--config"),
+            move |_| Ok(refused.clone()),
+        );
+        let result = call(&runner, "k", "{}", Duration::from_secs(3));
+        assert_eq!(result.attempts, 2, "a connect error is retried once");
+        assert!(
+            matches!(result.transport, Transport::Failed { code: Some(7), .. }),
+            "{:?}",
+            result.transport
+        );
+
+        let slow = Output {
+            code: Some(28),
+            stdout: "\n000".into(),
+            stderr: "curl: (28) Operation timed out after 3000 milliseconds".into(),
+            timed_out: false,
+        };
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.display().contains("--config"),
+            move |_| Ok(slow.clone()),
+        );
+        let result = call(&runner, "k", "{}", Duration::from_secs(3));
+        assert_eq!(result.attempts, 1);
+        assert_eq!(result.transport, Transport::Timeout);
+    }
+
+    #[test]
+    fn the_models_probe_times_out_cleanly() {
+        for output in [
+            timeout(),
+            Output {
+                code: Some(28),
+                stdout: "\n000".into(),
+                stderr: "curl: (28) Operation timed out".into(),
+                timed_out: false,
+            },
+        ] {
+            let runner = FakeRunner::new();
+            runner.on_fn(
+                |cmd| cmd.display().contains("--config"),
+                move |_| Ok(output.clone()),
+            );
+            assert_eq!(
+                models_probe(&runner, "k", Duration::from_secs(3)),
+                (0, "timed out".to_string())
+            );
+        }
     }
 
     #[test]
