@@ -159,6 +159,11 @@ enum Command {
         #[command(subcommand)]
         command: TickerCommand,
     },
+    // ade-picker begin
+    /// Print the picker's health rows (hidden; `doctor` will print them)
+    #[command(hide = true)]
+    PickerDoctor,
+    // ade-picker end
 }
 
 #[derive(Subcommand)]
@@ -526,5 +531,8 @@ pub fn run() -> Result<()> {
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
+        // ade-picker begin
+        Command::PickerDoctor => crate::launch::picker_doctor(&ctx),
+        // ade-picker end
     }
 }
