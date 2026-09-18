@@ -130,6 +130,10 @@ pub struct Launch {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub jev_probabilities: std::collections::BTreeMap<String, f64>,
     pub reason: String,
+    /// The compact `<job> runs on <plain>` sentence for the board's
+    /// `ade_last` token (D17 item 14), stored on the record so the ticker
+    /// never rereads live config.
+    pub compact_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -696,6 +700,7 @@ mod tests {
             jev_probabilities,
             reason: "this task looks like web research, so it runs on the web research helper."
                 .into(),
+            compact_reason: "this task runs on the web research helper".into(),
             fallback: None,
             jev_model: Some("jev-1.13.0".into()),
             jev_input_tokens: Some(356),

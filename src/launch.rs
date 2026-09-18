@@ -766,7 +766,7 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
                 input.role
             );
         }
-        let mut launch = launch_from(recipe, &config, ResolverMode::Pin);
+        let mut launch = launch_from(recipe, &config, ResolverMode::Pin, input.role);
         launch.recipe_id = id.to_string();
         launch.reason = pinned_reason(input.role, &recipe.plain);
         launch.fallback = Some(FALLBACK_OVERRIDE.to_string());
@@ -805,11 +805,24 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
                 pin.kind
             );
         }
-        let mut launch = launch_from(pin, &config, ResolverMode::Pin);
+        let plain = if pin.plain.trim().is_empty() {
+            &default_recipe.plain
+        } else {
+            &pin.plain
+        };
+        let mut launch = launch_from(pin, &config, ResolverMode::Pin, input.role);
         launch.recipe_id = format!("{}_project", input.role);
-        launch.reason = pinned_reason(input.role, &pin.plain);
+        launch.reason = pinned_reason(input.role, plain);
+        launch.compact_reason = compact_reason(input.role, plain);
         launch.fallback = Some(FALLBACK_PROJECT.to_string());
         return Ok(launch);
+    }
+
+    // The task may name a model; the plugin warns and resolves as usual
+    // (question 16), never silently following it.
+    let scrub = jev::ScrubList::new(&config.recipes);
+    if scrub.names_a_model(input.task).is_some() {
+        eprintln!("task names a model; pass --recipe to pin it");
     }
 
     // The pair filter runs before the picker, in every mode (§2 Pairs).
@@ -894,7 +907,6 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
         ));
     }
 
-    let scrub = jev::ScrubList::new(&config.recipes);
     let questions = gate_questions(&gates, &config.floor);
     let state = jev::build_state(&jev::StateInput {
         task: jev::transform_task(input.task, &scrub),
@@ -1042,7 +1054,7 @@ fn accepted_launch(
 ) -> Launch {
     let shadow = config.resolver == ResolverMode::Shadow;
     let Some(question) = jev::fired_gate(questions, &answers.nouls) else {
-        let mut launch = launch_from(default_recipe, config, config.resolver);
+        let mut launch = launch_from(default_recipe, config, config.resolver, input.role);
         launch.recipe_id = default_id.to_string();
         launch.reason = default_reason(input.role, &default_recipe.plain);
         launch.fallback = Some(
@@ -1061,7 +1073,7 @@ fn accepted_launch(
         .map(|recipe| recipe.plain.as_str())
         .unwrap_or_default();
     if shadow {
-        let mut launch = launch_from(default_recipe, config, ResolverMode::Shadow);
+        let mut launch = launch_from(default_recipe, config, ResolverMode::Shadow, input.role);
         launch.recipe_id = default_id.to_string();
         launch.gate = Some(question.id.clone());
         launch.gate_p = Some(question.threshold);
@@ -1085,7 +1097,7 @@ fn accepted_launch(
         );
     }
     let recipe = config.recipes.get(&question.id).unwrap_or(default_recipe);
-    let mut launch = launch_from(recipe, config, ResolverMode::Jev);
+    let mut launch = launch_from(recipe, config, ResolverMode::Jev, input.role);
     launch.recipe_id = question.id.clone();
     launch.gate = Some(question.id.clone());
     launch.gate_p = Some(question.threshold);
@@ -1125,7 +1137,12 @@ fn gate_questions(gates: &[Gate], floor: &Floor) -> Vec<Question> {
         .collect()
 }
 
-fn launch_from(recipe: &Recipe, config: &PickerConfig, resolver: ResolverMode) -> Launch {
+fn launch_from(
+    recipe: &Recipe,
+    config: &PickerConfig,
+    resolver: ResolverMode,
+    role: &str,
+) -> Launch {
     Launch {
         kind: recipe.kind.clone(),
         args: recipe.args.clone(),
@@ -1137,6 +1154,7 @@ fn launch_from(recipe: &Recipe, config: &PickerConfig, resolver: ResolverMode) -
         recipe_id: String::new(),
         resolver,
         reason: String::new(),
+        compact_reason: compact_reason(role, &recipe.plain),
         jev_prompt_hash: String::new(),
         excerpt_version: jev::EXCERPT_VERSION,
         ..Launch::default()
@@ -1150,7 +1168,7 @@ fn default_launch(
     role: &str,
     fallback: &str,
 ) -> Launch {
-    let mut launch = launch_from(recipe, config, config.resolver);
+    let mut launch = launch_from(recipe, config, config.resolver, role);
     launch.recipe_id = id.to_string();
     launch.reason = fallback_reason(role, &recipe.plain);
     launch.fallback = Some(fallback.to_string());
@@ -1164,7 +1182,7 @@ fn fallback_launch(
     role: &str,
     fallback: &str,
 ) -> Launch {
-    let mut launch = launch_from(recipe, config, config.resolver);
+    let mut launch = launch_from(recipe, config, config.resolver, role);
     launch.recipe_id = id.to_string();
     launch.reason = fallback_reason(role, &recipe.plain);
     launch.fallback = Some(fallback.to_string());
@@ -1541,6 +1559,10 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             launch.reason,
             "this task runs on the usual coding helper, the usual choice, because the picker did not answer."
         );
+        assert_eq!(
+            launch.compact_reason,
+            "this task runs on the usual coding helper"
+        );
     }
 
     #[test]
@@ -1562,6 +1584,10 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         );
         assert_eq!(launch.jev_input_tokens, Some(356));
         assert_eq!(launch.jev_model.as_deref(), Some(jev::JEV_MODEL));
+        assert_eq!(
+            launch.compact_reason,
+            "this task runs on the web research helper"
+        );
         assert_eq!(world.runner.count("/usr/bin/curl"), 1);
     }
 
@@ -1684,6 +1710,10 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             launch.reason,
             "this task runs on the usual coding helper; the picker would have chosen the web research helper."
         );
+        assert_eq!(
+            launch.compact_reason,
+            "this task runs on the usual coding helper"
+        );
     }
 
     #[test]
@@ -1740,6 +1770,66 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         assert_eq!(launch.resolver, ResolverMode::Pin);
         assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_PROJECT));
         assert_eq!(launch.kind, "claude");
+    }
+
+    #[test]
+    fn a_project_pin_keeps_the_default_plain_and_refuses_an_unknown_kind() {
+        let (world, project, task) = world("jev", "x");
+        with_help(&world);
+        let ctx = world.ctx();
+        let pin = Recipe {
+            kind: "claude".into(),
+            args: vec![
+                "--model".into(),
+                "claude-opus-5".into(),
+                "--effort".into(),
+                "high".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+            ..Recipe::default()
+        };
+        let launch = resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                role: "lane",
+                task: &task,
+                project_pin: Some(pin),
+                opted_in: true,
+                ..ResolveInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            launch.reason,
+            "You chose the usual coding helper for this task."
+        );
+        assert_eq!(
+            launch.compact_reason,
+            "this task runs on the usual coding helper"
+        );
+
+        let pin = Recipe {
+            kind: "nope".into(),
+            args: vec!["--x".into()],
+            ..Recipe::default()
+        };
+        let error = resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                role: "lane",
+                task: &task,
+                project_pin: Some(pin),
+                opted_in: true,
+                ..ResolveInput::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("recipe_kind_unknown"),
+            "{error:#}"
+        );
     }
 
     #[test]

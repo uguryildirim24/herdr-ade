@@ -53,13 +53,18 @@ pub const FIXED_SCRUB_TERMS: [&str; 19] = [
     "xhigh",
     "extra-high",
 ];
-pub const EFFORT_TERMS: [&str; 6] = [
+pub const EFFORT_TERMS: [&str; 11] = [
     "extra high",
     "high effort",
     "effort high",
     "model_reasoning_effort",
     "effort",
     "--effort",
+    "high",
+    "xhigh",
+    "max",
+    "medium",
+    "minimal",
 ];
 pub const PERMISSION_FLAGS: [&str; 8] = [
     "--dangerously-skip-permissions",
@@ -103,19 +108,25 @@ pub struct StateInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubList {
     patterns: Vec<String>,
+    /// Only the recipe-derived names: kinds and model ids and their words.
+    /// Used to warn when the raw task names a model (question 16).
+    named: Vec<String>,
 }
 
 impl ScrubList {
     pub fn new(recipes: &BTreeMap<String, Recipe>) -> Self {
-        let mut set: BTreeSet<String> = FIXED_SCRUB_TERMS
+        let fixed: BTreeSet<String> = FIXED_SCRUB_TERMS
             .iter()
             .chain(EFFORT_TERMS.iter())
             .chain(PERMISSION_FLAGS.iter())
             .map(|term| term.to_ascii_lowercase())
             .collect();
+        let mut kinds: BTreeSet<String> = BTreeSet::new();
+        let mut words: BTreeSet<String> = BTreeSet::new();
+        let mut phrases: BTreeSet<String> = BTreeSet::new();
         for recipe in recipes.values() {
             if !recipe.kind.trim().is_empty() {
-                set.insert(recipe.kind.trim().to_ascii_lowercase());
+                kinds.insert(recipe.kind.trim().to_ascii_lowercase());
             }
             for (index, arg) in recipe.args.iter().enumerate() {
                 let value = if arg == "--model" || arg == "-m" {
@@ -124,28 +135,49 @@ impl ScrubList {
                     arg.strip_prefix("model=").map(|value| value.to_string())
                 };
                 if let Some(value) = value {
-                    add_model_words(&mut set, &value);
+                    add_model_words(&mut words, &value);
                 }
                 // A `key=value` pair such as the codex `-c` flags.
                 if !arg.starts_with('-')
                     && let Some((key, value)) = arg.split_once('=')
                 {
-                    set.insert(arg.to_ascii_lowercase());
+                    words.insert(arg.to_ascii_lowercase());
                     if !key.is_empty() {
-                        set.insert(key.to_ascii_lowercase());
+                        words.insert(key.to_ascii_lowercase());
                     }
-                    add_model_words(&mut set, value);
+                    add_model_words(&mut words, value);
                 }
             }
             let plain = recipe.plain.trim();
             if !plain.is_empty() {
-                set.insert(plain.to_ascii_lowercase());
+                phrases.insert(plain.to_ascii_lowercase());
             }
         }
-        let mut patterns: Vec<String> = set.into_iter().filter(|p| !p.is_empty()).collect();
+        // Words that are effort settings or permission flags warn nobody.
+        let generic: BTreeSet<String> = EFFORT_TERMS
+            .iter()
+            .chain(PERMISSION_FLAGS.iter())
+            .map(|term| term.to_ascii_lowercase())
+            .collect();
+        let mut named: BTreeSet<String> = kinds.iter().cloned().collect();
+        named.extend(
+            words
+                .iter()
+                .filter(|word| word.len() >= 3 && !generic.contains(*word))
+                .cloned(),
+        );
+        let mut patterns: Vec<String> = fixed
+            .iter()
+            .chain(kinds.iter())
+            .chain(words.iter())
+            .chain(phrases.iter())
+            .cloned()
+            .collect();
         // Longest first, so a whole model id wins over one of its words.
         patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        ScrubList { patterns }
+        let mut named: Vec<String> = named.into_iter().collect();
+        named.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        ScrubList { patterns, named }
     }
 
     /// The fixed list alone, for callers that build the state before the table
@@ -156,6 +188,20 @@ impl ScrubList {
 
     pub fn patterns(&self) -> &[String] {
         &self.patterns
+    }
+
+    /// The longest recipe kind or model word the raw task names, if any
+    /// (SPEC-jev-picker v2 §2 question 16).
+    pub fn names_a_model(&self, text: &str) -> Option<&str> {
+        let mut best: Option<&str> = None;
+        for pattern in &self.named {
+            if find_whole(text, pattern).is_some()
+                && best.is_none_or(|current: &str| pattern.len() > current.len())
+            {
+                best = Some(pattern);
+            }
+        }
+        best
     }
 
     /// Replace every whole occurrence with `[agent]` and collapse runs.
@@ -191,25 +237,50 @@ fn add_model_words(set: &mut BTreeSet<String>, value: &str) {
 /// and after are not name characters. Case-insensitive.
 fn replace_whole(text: &str, pattern: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        let rest = &text[i..];
-        if starts_with_ignore_case(rest, pattern) {
-            let before_ok = i == 0 || !is_name_at(bytes, i - 1);
-            let end = i + pattern.len();
-            let after_ok = end >= bytes.len() || !is_name_at(bytes, end);
-            if before_ok && after_ok {
-                out.push_str("[agent]");
-                i = end;
-                continue;
-            }
+    while i < text.len() {
+        if let Some(end) = match_whole_at(text, i, pattern) {
+            out.push_str("[agent]");
+            i = end;
+            continue;
         }
-        let Some(ch) = rest.chars().next() else { break };
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// The byte after a whole match of `pattern` starting at `i`, when `i` is a
+/// character boundary and neither neighbour is a name character.
+fn match_whole_at(text: &str, i: usize, pattern: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !starts_with_ignore_case(&text[i..], pattern) {
+        return None;
+    }
+    let before_ok = i == 0 || !is_name_at(bytes, i - 1);
+    let end = i + pattern.len();
+    let after_ok = end >= bytes.len() || !is_name_at(bytes, end);
+    if before_ok && after_ok {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+/// The first whole occurrence of `pattern`, case-insensitive.
+fn find_whole(text: &str, pattern: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(end) = match_whole_at(text, i, pattern) {
+            return Some(end);
+        }
+        let ch = text[i..].chars().next()?;
+        i += ch.len_utf8();
+    }
+    None
 }
 
 fn starts_with_ignore_case(text: &str, pattern: &str) -> bool {
@@ -891,6 +962,21 @@ mod tests {
         assert!(excerpt.starts_with("word word"));
         let single = "x".repeat(EXCERPT_LIMIT + 50);
         assert_eq!(transform_task(&single, &scrub).len(), EXCERPT_LIMIT);
+    }
+
+    #[test]
+    fn the_scrub_list_names_the_models_in_a_task() {
+        let scrub = ScrubList::new(&recipes());
+        assert_eq!(
+            scrub.names_a_model("please use gemini for this"),
+            Some("gemini")
+        );
+        assert_eq!(
+            scrub.names_a_model("run it on model=gpt-5.6-sol"),
+            Some("model=gpt-5.6-sol")
+        );
+        assert_eq!(scrub.names_a_model("a high stack of papers"), None);
+        assert_eq!(scrub.names_a_model("the web research helper"), None);
     }
 
     #[test]
