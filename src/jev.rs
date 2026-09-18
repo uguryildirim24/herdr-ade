@@ -137,15 +137,18 @@ impl ScrubList {
                 if let Some(value) = value {
                     add_model_words(&mut words, &value);
                 }
-                // A `key=value` pair such as the codex `-c` flags.
+                // A `key=value` pair such as the codex `-c` flags: the whole
+                // pair and its key. Only a model value is split into its
+                // words (above); splitting `approval_policy=never` or
+                // `sandbox_mode=danger-full-access` would scrub "never" and
+                // "access" from every task and warn on them.
                 if !arg.starts_with('-')
-                    && let Some((key, value)) = arg.split_once('=')
+                    && let Some((key, _)) = arg.split_once('=')
                 {
                     words.insert(arg.to_ascii_lowercase());
                     if !key.is_empty() {
                         words.insert(key.to_ascii_lowercase());
                     }
-                    add_model_words(&mut words, value);
                 }
             }
             let plain = recipe.plain.trim();
@@ -865,6 +868,10 @@ mod tests {
                     "model=gpt-5.6-sol".into(),
                     "-c".into(),
                     "model_reasoning_effort=high".into(),
+                    "-c".into(),
+                    "approval_policy=never".into(),
+                    "-c".into(),
+                    "sandbox_mode=danger-full-access".into(),
                 ],
                 cost: CostClass::Upgrade,
                 plain: "the careful number helper".into(),
@@ -993,6 +1000,19 @@ mod tests {
             Some("model=gpt-5.6-sol")
         );
         assert_eq!(scrub.names_a_model("a high stack of papers"), None);
+        // Codex setting values are not model names.
+        assert_eq!(
+            scrub.names_a_model("never widen full access to the danger zone"),
+            None
+        );
+        assert_eq!(
+            scrub.scrub("never widen full access"),
+            "never widen full access"
+        );
+        assert_eq!(
+            scrub.scrub("set approval_policy=never and go"),
+            "set [agent] and go"
+        );
         assert_eq!(scrub.names_a_model("the web research helper"), None);
     }
 
