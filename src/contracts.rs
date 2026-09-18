@@ -569,6 +569,11 @@ mod tests {
             },
             expected_head: Some("bbb".into()),
             manifest_hash: Some("mh".into()),
+            opened: "2026-09-18T00:00:00Z".into(),
+            repo: "/repo".into(),
+            frozen_revision: Some(2),
+            review_branch: Some("review/r1".into()),
+            reviewer: Some("t-0003".into()),
         });
         both(&MergeIntent {
             op: "merge-r1".into(),
