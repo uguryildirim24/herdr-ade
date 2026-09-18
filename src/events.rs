@@ -56,10 +56,18 @@ pub fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
     std::fs::create_dir_all(events_dir(project))?;
     let path = event_path(project, &event.id)?;
     let expected = bytes(event)?;
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&expected)?;
-            file.sync_all()?;
+    // Written whole beside the target, then linked into place: a reader never
+    // sees a half-written event (the dot name is skipped by every lister).
+    let tmp = events_dir(project).join(format!(".{}.{}.tmp", event.id, std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&expected)?;
+        file.sync_all()?;
+    }
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
             sync_parent(&path)?;
             Ok(())
         }

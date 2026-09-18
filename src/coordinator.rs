@@ -312,7 +312,10 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
 
 pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    acknowledge_bootstrap(&project)?;
+    // A peek reads; it is not the coordinator's receipt (D14).
+    if !peek {
+        acknowledge_bootstrap(&project)?;
+    }
     let prefix = current_prefix(&ctx.root)?;
     let (text, shown) = digest(ctx, &project, &prefix)?;
     print!("{text}");

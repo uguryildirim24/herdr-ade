@@ -17,6 +17,10 @@ struct Binding {
 }
 
 pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
+    // The path goes verbatim into the typed DONE line (D10).
+    if report.is_empty() || report.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("report_path_invalid: a report path has no spaces or control characters");
+    }
     let binding = current_lane(ctx)?;
     let recipient = recipient(&binding.project)?;
     let attempt = binding.thread.attempt.max(1);

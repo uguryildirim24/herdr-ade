@@ -82,6 +82,9 @@ pub fn check_value(project: &Project, value: &str) -> Result<()> {
     if value.chars().any(char::is_control) {
         bail!("board_refused: control characters");
     }
+    if let Some(name) = crate::glossary::name_in(project, value) {
+        bail!("board_refused: the value names `{name}`");
+    }
     crate::glossary::gate(project, value).context("board_refused")
 }
 

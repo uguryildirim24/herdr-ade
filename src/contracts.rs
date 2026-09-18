@@ -270,7 +270,7 @@ pub struct DeliveryLine {
     pub state: DeliveryState,
 }
 
-/// Durable `asks/<ask id>.toml` written before any publication
+/// Durable `asks/<ask id>/r<revision>.toml` written before any publication
 /// (SPEC-ADE D17 item 4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Ask {

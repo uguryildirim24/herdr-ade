@@ -345,23 +345,34 @@ pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkR
         let Some((h, pane)) = coordinator_herdr(ctx, project) else {
             break;
         };
+        let mark = |state| {
+            append(
+                project,
+                None,
+                Entry::Inbound(TalkInbound {
+                    request: inbound.request.clone(),
+                    state,
+                    recipient: inbound.recipient.clone(),
+                }),
+            )
+        };
+        // Uncertain is journalled before the line is typed: a crash after
+        // typing leaves a request that is never sent again (D18).
+        mark(TalkRequestState::Uncertain)?;
         let state = match h.agent_prompt(&pane, &text) {
             Ok(()) => TalkRequestState::Submitted,
             Err(e) if matches!(e.code.as_str(), "timeout" | "unreachable" | "failed") => {
                 TalkRequestState::Uncertain
             }
             // herdr refused before typing (blocked, not found): still queued.
-            Err(_) => break,
+            Err(_) => {
+                mark(TalkRequestState::Queued)?;
+                break;
+            }
         };
-        append(
-            project,
-            None,
-            Entry::Inbound(TalkInbound {
-                request: inbound.request.clone(),
-                state,
-                recipient: inbound.recipient.clone(),
-            }),
-        )?;
+        if state == TalkRequestState::Submitted {
+            mark(state)?;
+        }
         if state == TalkRequestState::Uncertain {
             notice(ctx, project, "talk_uncertain");
         }
@@ -599,6 +610,15 @@ impl<'a> Surface<'a> {
                 }
             };
         }
+        // A number typed while an ask appeared under an unbound prompt is not
+        // chat: the prompt is drawn again with the question (D18).
+        if !trimmed.is_empty()
+            && trimmed.chars().all(|c| c.is_ascii_digit())
+            && crate::ask::newest_open(project).is_some()
+        {
+            notice(ctx, project, "ask_redrawn");
+            return Ok(Vec::new());
+        }
         // `/...` passes through unchanged for CLI slash commands.
         submit(ctx, project, line)?;
         Ok(Vec::new())
@@ -824,9 +844,17 @@ mod tests {
             .filter(|l| l.contains("\"inbound\""))
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(inbound.len(), 2);
-        assert_eq!(inbound[0].inbound.state, TalkRequestState::Queued);
-        assert_eq!(inbound[1].inbound.state, TalkRequestState::Submitted);
+        // Queued, uncertain before typing (a crash there never re-sends),
+        // then submitted (review defect: re-send after a crash).
+        let states: Vec<_> = inbound.iter().map(|r| r.inbound.state).collect();
+        assert_eq!(
+            states,
+            [
+                TalkRequestState::Queued,
+                TalkRequestState::Uncertain,
+                TalkRequestState::Submitted
+            ]
+        );
         assert_eq!(inbound[0].inbound.recipient.pane, "w1:p1");
     }
 
