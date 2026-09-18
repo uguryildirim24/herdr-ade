@@ -524,7 +524,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         repo,
                         integration: branch,
                     },
-                    &dialogue::AnyPair,
+                    &crate::launch::PickerPair(crate::launch::parse_picker_config(
+                        &ctx.config_dir,
+                        false,
+                    )?),
                 )?;
                 println!("dialogue {} recorded on {}", d.topic, d.branch);
                 print!("{next}");

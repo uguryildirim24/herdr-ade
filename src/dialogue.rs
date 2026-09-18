@@ -22,23 +22,21 @@ use crate::round::Git;
 use crate::round::repo::{commit_files_on_branch, repo_lock};
 use crate::thread::sha256_hex;
 
-/// Lane A4 plugs its picker in here. `Err` carries the refusal to print.
+/// The picker checks the pair (`crate::launch::PickerPair`). `Ok(Some(id))`
+/// pins the critic's recipe so its `thread start` line cannot land on the
+/// drafter's model; `Err` carries the refusal to print.
 pub trait PairFilter {
-    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String>;
+    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<Option<String>, String>;
 }
 
-/// The default: any two roles may pair, except a role with itself.
-pub struct AnyPair;
-
-impl PairFilter for AnyPair {
-    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String> {
-        if drafter == critic {
-            return Err(format!(
-                "dialogue_pair: the drafter and the critic are both `{drafter}`"
-            ));
-        }
-        Ok(())
+/// A role never pairs with itself.
+pub fn same_role(drafter: &str, critic: &str) -> std::result::Result<(), String> {
+    if drafter == critic {
+        return Err(format!(
+            "dialogue_pair: the drafter and the critic are both `{drafter}`"
+        ));
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,7 +146,7 @@ pub fn start(
         );
     };
     crate::glossary::check_birth(&project, &plain)?;
-    filter
+    let critic_recipe = filter
         .check(&args.drafter, &args.critic)
         .map_err(|e| anyhow::anyhow!(e))?;
     let repo = match args.repo {
@@ -201,8 +199,12 @@ pub fn start(
         ));
     } else {
         next.push_str(&format!(
-            "critic:  {prefix} thread start {slug} --role {} --plain \"<sentence>\" --task-file <brief>, then\n         {prefix} dialogue critic {slug} {} --pane <its pane>\n",
-            d.critic, d.topic
+            "critic:  {prefix} thread start {slug} --role {}{} --plain \"<sentence>\" --task-file <brief>, then\n         {prefix} dialogue critic {slug} {} --pane <its pane>\n",
+            d.critic,
+            critic_recipe
+                .map(|id| format!(" --recipe {id}"))
+                .unwrap_or_default(),
+            d.topic
         ));
     }
     Ok((d, next))
@@ -374,13 +376,24 @@ mod tests {
     use crate::runner::Output;
     use crate::runner::fake::{fail, ok};
 
+    struct AnyPair;
+    impl PairFilter for AnyPair {
+        fn check(
+            &self,
+            drafter: &str,
+            critic: &str,
+        ) -> std::result::Result<Option<String>, String> {
+            same_role(drafter, critic).map(|()| None)
+        }
+    }
+
     struct NoCodexPair;
     impl PairFilter for NoCodexPair {
-        fn check(&self, drafter: &str, _: &str) -> std::result::Result<(), String> {
+        fn check(&self, drafter: &str, _: &str) -> std::result::Result<Option<String>, String> {
             if drafter == "codex" {
                 Err("dialogue_pair: not this pair".into())
             } else {
-                Ok(())
+                Ok(None)
             }
         }
     }
