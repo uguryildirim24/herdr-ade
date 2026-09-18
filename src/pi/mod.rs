@@ -195,8 +195,8 @@ pub fn resolve_root(env: &Env) -> Result<PathBuf> {
     } else {
         env.home.join(".herdr-ade")
     };
-    let root = std::path::absolute(&root)
-        .with_context(|| format!("bad path {}", root.display()))?;
+    let root =
+        std::path::absolute(&root).with_context(|| format!("bad path {}", root.display()))?;
     Ok(root.join("pi"))
 }
 

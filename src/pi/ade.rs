@@ -142,7 +142,12 @@ mod tests {
                     result.violations
                 );
             }
-            assert!(format!("this second opinion runs on {plain}").chars().count() <= 80);
+            assert!(
+                format!("this second opinion runs on {plain}")
+                    .chars()
+                    .count()
+                    <= 80
+            );
         }
     }
 }

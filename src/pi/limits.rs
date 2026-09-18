@@ -239,7 +239,10 @@ mod tests {
         );
         assert_eq!(classify("stream timed out", None), LimitClass::Unreachable);
         assert_eq!(
-            classify("This model's maximum context length is 128000 tokens", Some(400)),
+            classify(
+                "This model's maximum context length is 128000 tokens",
+                Some(400)
+            ),
             LimitClass::Error
         );
         assert_eq!(

@@ -161,7 +161,10 @@ mod tests {
         }
         assert!(!strip.contains(&"-s"), "pi has no -s");
         for (flag, _) in R2_STRIP_RULES {
-            assert!(strip.contains(&flag), "{flag} is in the rules but not the list");
+            assert!(
+                strip.contains(&flag),
+                "{flag} is in the rules but not the list"
+            );
         }
         let takes_value = |flag: &str| R2_STRIP_RULES.iter().find(|(f, _)| *f == flag).map(|r| r.1);
         assert_eq!(takes_value("--session"), Some(true));
