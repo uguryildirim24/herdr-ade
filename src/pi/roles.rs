@@ -11,7 +11,7 @@ use anyhow::Result;
 use super::launch;
 
 /// One ready-made recipe row. Fields line up with Jev v2's `Recipe` plus
-/// `model_family` and the D17 birth sentence; A4 maps them into its table.
+/// `model_family` and the D17 `plain` phrase; A4 maps them into its table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PiRecipe {
     /// Jev recipe id.
@@ -31,7 +31,9 @@ pub struct PiRecipe {
     pub enabled: bool,
     /// May a start-time `allowed` list carry it?
     pub start_time_allowed: bool,
-    /// The D17 birth sentence.
+    /// The D17 `plain` phrase: a noun phrase A4's reason templates slot in
+    /// ("<job> runs on <plain>"), so no product name and no full sentence.
+    /// A row that replaces a native twin keeps the twin's phrase.
     pub plain: &'static str,
 }
 
@@ -87,7 +89,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "low",
             true,
             true,
-            "DeepSeek flash runs a lane on the cheap DeepSeek key.",
+            "the cheap coding helper",
         ),
         recipe(
             "pi_codex_sol_high",
@@ -96,7 +98,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "high",
             true,
             false,
-            "ChatGPT Sol runs a lane on the ChatGPT coding plan.",
+            "the careful number helper",
         ),
         recipe(
             "pi_codex_astra_xhigh",
@@ -105,7 +107,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "xhigh",
             false,
             false,
-            "ChatGPT Astra runs a lane on the ChatGPT coding plan.",
+            "the hardest problem helper",
         ),
         recipe(
             "pi_opencode_muse",
@@ -114,7 +116,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "high",
             true,
             true,
-            "OpenCode Muse runs a lane on the OpenCode plan.",
+            "the second coding helper",
         ),
         recipe(
             "pi_kimi_k3",
@@ -123,7 +125,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "high",
             true,
             true,
-            "Kimi k3 runs a lane on the Kimi coding plan.",
+            "the long task helper",
         ),
     ]
 }
