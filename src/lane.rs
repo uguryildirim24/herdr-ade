@@ -87,8 +87,8 @@ fn recipient(project: &Project) -> Result<Recipient> {
         bail!("recipient_unavailable: coordinator pane is empty");
     }
     Ok(Recipient {
+        coordinator_attempt: coordinator.attempt(),
         pane: coordinator.pane_id,
-        coordinator_attempt: coordinator.launch_attempts.max(1),
     })
 }
 

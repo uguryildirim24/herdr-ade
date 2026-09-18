@@ -295,6 +295,17 @@ pub struct Coordinator {
     pub prime_sent: bool,
     /// `"acknowledged"` after the matching bootstrap call (D14).
     pub bootstrap: String,
+    /// Counts coordinator agent starts for this project and never resets:
+    /// `open` and the ticker's relaunch each start a new incarnation, and a
+    /// sealed event is bound to the one it was sealed for (D5 X5).
+    pub generation: u32,
+}
+
+impl Coordinator {
+    /// The recipient attempt events and receipts bind (D5 `coordinator_attempt`).
+    pub fn attempt(&self) -> u32 {
+        self.generation.max(1)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

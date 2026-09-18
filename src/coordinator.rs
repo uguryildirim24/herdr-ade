@@ -203,6 +203,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // Ids are recorded before the agent is started, so a command killed midway
     // still leaves a record the ticker and a later `open` can act on.
     let name = agent_name(slug);
+    let generation = previous.as_ref().map_or(0, |r| r.generation);
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
             socket: socket.clone(),
@@ -218,6 +219,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             launch: launch.clone(),
             prime_sent: false,
             bootstrap: String::new(),
+            generation: generation + 1,
         }
     })?;
 
@@ -305,7 +307,7 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
                 &project,
                 &shown,
                 &record.pane_id,
-                record.launch_attempts.max(1),
+                record.attempt(),
             )?;
         }
     }

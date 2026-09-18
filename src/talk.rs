@@ -218,8 +218,8 @@ pub fn surface_label(kind: &str) -> &'static str {
 fn recipient(project: &Project) -> Recipient {
     let coord = project.coordinator().unwrap_or_default();
     Recipient {
+        coordinator_attempt: coord.attempt(),
         pane: coord.pane_id,
-        coordinator_attempt: coord.launch_attempts,
     }
 }
 

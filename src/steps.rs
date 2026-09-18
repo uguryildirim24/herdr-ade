@@ -51,17 +51,32 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 
 /// Delivers every sealed event whose first transport submission is not yet in
 /// its journal. The event, not the typed line or report hash, is authoritative.
-#[allow(dead_code)] // called by the A1-wired operation ticker pass
+/// Each event is independent: one that cannot be delivered never holds back
+/// the others. An event with any journal line (submitted, acknowledged or
+/// handled) is not typed again, and one for a superseded lane attempt is
+/// left as it is, sealed and undelivered.
 pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
+    let mut first: Option<anyhow::Error> = None;
     for event in crate::events::list(project) {
-        let states = crate::events::states(project, &event.id)?;
-        if !states.contains(&crate::contracts::DeliveryState::Acknowledged)
-            && !states.contains(&crate::contracts::DeliveryState::Submitted)
+        let states = match crate::events::states(project, &event.id) {
+            Ok(states) => states,
+            Err(error) => {
+                first.get_or_insert(error);
+                continue;
+            }
+        };
+        if !states.is_empty() {
+            continue;
+        }
+        if thread::load(project, &event.thread).is_ok_and(|lane| lane.attempt.max(1) != event.attempt)
         {
-            deliver_event(ctx, project, &event)?;
+            continue;
+        }
+        if let Err(error) = deliver_event(ctx, project, &event) {
+            first.get_or_insert(error.context(format!("event {}", event.id)));
         }
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Event) -> Result<()> {
@@ -69,7 +84,7 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
         .coordinator()
         .ok_or_else(|| anyhow::anyhow!("recipient_unavailable: project has no coordinator"))?;
     if coordinator.pane_id != event.recipient.pane
-        || coordinator.launch_attempts.max(1) != event.recipient.coordinator_attempt
+        || coordinator.attempt() != event.recipient.coordinator_attempt
     {
         inbox::write_event(
             project,

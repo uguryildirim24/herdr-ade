@@ -86,7 +86,6 @@ pub fn load(project: &Project, id: &str) -> Result<Event> {
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
-#[allow(dead_code)] // called by the A1-wired operation ticker pass
 pub fn list(project: &Project) -> Vec<Event> {
     let Ok(entries) = std::fs::read_dir(events_dir(project)) else {
         return Vec::new();
