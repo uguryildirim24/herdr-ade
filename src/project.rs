@@ -157,9 +157,10 @@ pub struct Settings {
     pub repos: Vec<Repo>,
 }
 
-/// Project override of one role. Only `kind` and `args` (SPEC-ADE D2).
+/// Project override of one role. Only `kind` and `args` (SPEC-ADE D2): a
+/// misspelt key is refused, not dropped.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RoleOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -1001,6 +1002,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("role_args_missing"), "{err}");
+        // A1 review M6: a misspelt override key was dropped silently.
+        let bad = toml::from_str::<RoleOverride>("agrs = [\"--x\"]").unwrap_err();
+        assert!(bad.to_string().contains("unknown field"), "{bad}");
 
         settings.roles.insert(
             "lane".into(),
