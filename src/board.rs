@@ -163,14 +163,11 @@ fn agent_states(ctx: &Ctx, project: &Project) -> Option<BTreeMap<String, String>
     )
 }
 
-/// The five templated values, before the check.
-pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
-    let events = crate::round::sealed_events(project).unwrap_or_default();
-    let mut out = Vec::new();
-
-    // ade_stage: the newest round's phase, with its birth sentence if it fits.
+/// `ade_stage`: the newest round's phase, with its birth sentence if it
+/// fits. Also the stage line of `ha overview`.
+pub fn stage(project: &Project) -> String {
     let rounds = crate::round::list(project);
-    let stage = match rounds.last() {
+    match rounds.last() {
         None => "no round is open yet".to_string(),
         Some(r) => {
             let n = crate::round::round_number(&r.round);
@@ -198,8 +195,15 @@ pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
                 phase
             }
         }
-    };
-    out.push(("ade_stage".to_string(), stage));
+    }
+}
+
+/// The five templated values, before the check.
+pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
+    let events = crate::round::sealed_events(project).unwrap_or_default();
+    let mut out = Vec::new();
+
+    out.push(("ade_stage".to_string(), stage(project)));
 
     // ade_lanes: done and waiting from sealed events, working and stuck from
     // runtime state, as separate counts.
