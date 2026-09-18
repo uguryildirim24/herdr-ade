@@ -520,9 +520,11 @@ pub fn render(st: &Value, prefix: &str) -> String {
                         .join(" ")
                 })
                 .filter(|f| !f.is_empty())
-                .unwrap_or_else(|| "<no flags recorded>".into());
+                .map(|f| format!(" -- {f}"))
+                // No flags recorded: the line starts the agent without any.
+                .unwrap_or_default();
             o.push_str(&format!(
-                "herdr agent start {} --kind {} --pane <new pane> --parent \"$HERDR_PANE_ID\" -- {flags}\n",
+                "herdr agent start {} --kind {} --pane <new pane> --parent \"$HERDR_PANE_ID\"{flags}\n",
                 text_or(w.get("name"), "-"),
                 text_or(w.get("kind"), "")
             ));
@@ -1304,5 +1306,147 @@ fn launch_of(project: &Project, id: &str) -> LaunchSeen {
             .get("ready_timeout_ms")
             .and_then(toml::Value::as_integer)
             .and_then(|n| u64::try_from(n).ok()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::round::testkit::{Fx, commit_file, fixture, git};
+    use crate::runner::fake::{fail, ok};
+
+    const HANDOFF: &str = "# HANDOFF\n\n## Goal\n\nShip the rounds.\n\n## Authority\n\nRolf.\n\n## Settled\n\n## In flight\n\nThe worker lane-one writes `src/lane1.rs` (expected).\n\n## Open\n\n## Next\n\n- Review round one.\n\n## Traps\n\n";
+
+    fn snapshot(fx: &Fx) {
+        let repo = fx.repo.display();
+        fx.world.runner.on(
+            "api snapshot",
+            ok(&format!(
+                r#"{{"result":{{"snapshot":{{"version":"0.9.1",
+                "workspaces":[{{"workspace_id":"w1","label":"demo"}}],
+                "tabs":[{{"tab_id":"w1:t1","workspace_id":"w1","label":"coord"}},{{"tab_id":"w1:t2","workspace_id":"w1","label":"lane"}}],
+                "panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{repo}"}},{{"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","cwd":"{repo}"}}],
+                "agents":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"}},
+                          {{"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","name":"lane-one","agent":"claude","agent_status":"working","tokens":{{"parent":"w1:p1"}}}}]}}}}}}"#
+            )),
+        );
+        fx.world.runner.on("pane process-info", fail(1, "no"));
+    }
+
+    fn args(fx: &Fx) -> CheckpointArgs {
+        CheckpointArgs {
+            pane: Some("w1:p1".into()),
+            repo: Some(fx.repo.to_string_lossy().into_owned()),
+            branch: Some("main".into()),
+            print: false,
+            check_only: false,
+        }
+    }
+
+    #[test]
+    fn the_payload_hash_binds_both_files_and_their_order() {
+        assert_ne!(payload_hash("a", "b"), payload_hash("b", "a"));
+        assert_ne!(payload_hash("ab", ""), payload_hash("a", "b"));
+        assert_eq!(payload_hash("a", "b"), payload_hash("a", "b"));
+    }
+
+    #[test]
+    fn splice_replaces_the_herdr_section_or_appends_it() {
+        let doc = "# H\n\n## Goal\n\ng\n\n## Herdr\n\nold\n\n## Next\n\n- n\n";
+        let out = splice_herdr(doc, "## Herdr (new)\n\nfresh\n");
+        assert_eq!(out, "# H\n\n## Goal\n\ng\n\n## Herdr (new)\n\nfresh\n\n## Next\n\n- n\n");
+        assert_eq!(splice_herdr(&out, "## Herdr (new)\n\nfresh\n"), out, "idempotent");
+        assert_eq!(splice_herdr("# H\n", "## Herdr\n"), "# H\n\n## Herdr\n");
+    }
+
+    #[test]
+    fn check_finds_dead_ids_missing_paths_placeholders_sections_and_two_nexts() {
+        let fx = fixture();
+        let st = json!({
+            "coordinator": {"pane_id": "w1:p1", "tab_id": "w1:t1"},
+            "workers": [{"pane_id": "w1:p11", "tab_id": "w1:t2", "name": "lane-one"}],
+            "git": {"branches": ["main", "lane/1"]},
+        });
+        let good = format!("{HANDOFF}## Herdr\n\nPane w1:p1 and lane-one in w1:p11, pane w1:p5 is closed. Branch `lane/1`, `README.md`.\n");
+        let problems = check_document(&good, &st, &fx.repo);
+        assert!(problems.is_empty(), "{problems:?}");
+        let bad = "# H\n\n## Next\n\n- one\n- two\n\nPane w1:p5 and `tasks/nope.md`, `lane/9`, <fill me>.\n";
+        let problems = check_document(bad, &st, &fx.repo);
+        let classes: Vec<&str> = problems.keys().map(String::as_str).collect();
+        assert_eq!(
+            classes,
+            [
+                "Next must be exactly one action",
+                "branches that do not exist",
+                "herdr ids not live and not marked closed",
+                "live nested workers the document never mentions",
+                "repo paths that do not exist (say 'absent' or 'expected' on the line if that is intended)",
+                "required sections missing",
+                "template placeholders left in the document",
+            ]
+        );
+        assert!(problems["herdr ids not live and not marked closed"].contains("w1:p5"));
+    }
+
+    #[test]
+    fn checkpoint_commits_both_files_as_one_commit_or_nothing() {
+        let fx = fixture();
+        snapshot(&fx);
+        let ctx = fx.world.ctx();
+        commit_file(&fx.repo, "HANDOFF.md", "# HANDOFF\n\n## Next\n\n- a\n- b\n", "bad handoff");
+        let before = git(&fx.repo, &["rev-parse", "main"]);
+        let e = format!("{:#}", checkpoint(&ctx, "demo", args(&fx)).unwrap_err());
+        assert!(e.starts_with("checkpoint_check_failed") && e.contains("Next must be exactly one action"), "{e}");
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), before, "nothing was committed");
+
+        commit_file(&fx.repo, "HANDOFF.md", HANDOFF, "handoff");
+        let before = git(&fx.repo, &["rev-parse", "main"]);
+        let printed = checkpoint(&ctx, "demo", CheckpointArgs { print: true, ..args(&fx) }).unwrap();
+        assert!(printed.starts_with("## Herdr (generated ") && printed.contains("lane-one"), "{printed}");
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), before, "--print writes nothing");
+        let out = checkpoint(&ctx, "demo", args(&fx)).unwrap();
+        let h = git(&fx.repo, &["rev-parse", "main"]);
+        assert!(out.starts_with(&format!("checkpoint H {h} on `main`")), "{out}");
+        assert_eq!(git(&fx.repo, &["rev-parse", "main^"]), before);
+        assert_eq!(git(&fx.repo, &["diff", "--name-only", &before, &h]), "HANDOFF.json\nHANDOFF.md");
+        let md = git(&fx.repo, &["show", "main:HANDOFF.md"]);
+        assert!(md.contains("## Herdr (generated ") && md.contains("## Traps"));
+        let sidecar: Value = serde_json::from_str(&git(&fx.repo, &["show", "main:HANDOFF.json"])).unwrap();
+        assert_eq!(sidecar["coordinator"]["pane_id"], "w1:p1");
+        assert_eq!(sidecar["workers"][0]["name"], "lane-one");
+        let checked = checkpoint(&ctx, "demo", CheckpointArgs { check_only: true, ..args(&fx) }).unwrap();
+        assert!(checked.starts_with("OK HANDOFF.md: 1 nested workers"), "{checked}");
+    }
+
+    #[test]
+    fn pickup_relinks_live_threads_and_prints_start_lines_but_never_starts() {
+        let fx = fixture();
+        let (live, _) = fx.lane(1);
+        let (linked, _) = fx.lane(2);
+        let (gone, _) = fx.lane(3);
+        let path = thread::record_path(&fx.project, &gone);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{text}\n[launch]\nkind = \"codex\"\nargs = [\"--full-auto\"]\nenv = [\"HERDR_ADE_LAUNCH=1\"]\nready_timeout_ms = 30000\n"),
+        )
+        .unwrap();
+        *fx.world.agents.borrow_mut() = r#"[
+            {"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"working"},
+            {"pane_id":"w1:p12","tab_id":"w1:t3","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
+            .into();
+        let ctx = fx.world.ctx();
+        let dry = pickup(&ctx, "demo", Some("w1:p1"), true).unwrap();
+        assert!(dry.contains(&format!("re-linked:      {live} (dry-run)")), "{dry}");
+        assert_eq!(fx.world.runner.count("pane report-metadata"), 0);
+        let out = pickup(&ctx, "demo", Some("w1:p1"), false).unwrap();
+        assert!(out.contains(&format!("already linked: {linked}\n")), "{out}");
+        assert!(out.contains(&format!("re-linked:      {live}\n")), "{out}");
+        assert_eq!(fx.world.runner.count("pane report-metadata w1:p11 --source herdr-ade --token parent=w1:p1"), 1);
+        assert!(out.contains(&format!("--label {gone} --no-focus --env HERDR_ADE_LAUNCH=1")), "{out}");
+        assert!(out.contains("--kind codex --pane <root_pane.pane_id from that JSON> --parent w1:p1 --timeout 30000 -- --full-auto"), "{out}");
+        for verb in ["agent start", "agent prompt", "tab create", "pane run"] {
+            assert_eq!(fx.world.runner.count(verb), 0, "pickup ran `{verb}`");
+        }
     }
 }
