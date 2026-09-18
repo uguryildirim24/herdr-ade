@@ -794,6 +794,38 @@ pub fn pair_filter(
         .collect()
 }
 
+/// The picker as `dialogue start`'s pair filter: the critic role must keep
+/// an allowed row whose model differs from the drafter's default, and that
+/// row is pinned on the critic's start line (SPEC-jev-picker v2 §2 Pairs).
+/// Pro is adopted, never launched, so it pairs with any drafter.
+pub struct PickerPair(pub PickerConfig);
+
+impl crate::dialogue::PairFilter for PickerPair {
+    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<Option<String>, String> {
+        crate::dialogue::same_role(drafter, critic)?;
+        if NEVER_RESOLVED.contains(&critic) {
+            return Ok(None);
+        }
+        let config = &self.0;
+        let row = |name: &str| {
+            config
+                .roles
+                .get(name)
+                .ok_or_else(|| format!("role_unknown: `{name}`"))
+        };
+        let (_, drafted) =
+            role_default(config, row(drafter)?, drafter, None).map_err(|e| format!("{e:#}"))?;
+        let sibling = Launch {
+            kind: drafted.kind,
+            args: drafted.args,
+            ..Launch::default()
+        };
+        role_default(config, row(critic)?, critic, Some(&sibling))
+            .map(|(id, _)| Some(id))
+            .map_err(|e| format!("{e:#}"))
+    }
+}
+
 /// What `resolve_launch` needs from the verb.
 #[derive(Debug, Default, Clone)]
 pub struct ResolveInput<'a> {
@@ -2084,6 +2116,33 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             ["claude_opus_high"]
         );
         assert_eq!(pair_filter(&allowed, &recipes, None), allowed);
+
+        // `dialogue start` pins the critic off the drafter's model.
+        use crate::dialogue::PairFilter;
+        let row = |default: &str| RolePicker {
+            default: default.into(),
+            allowed: allowed.clone(),
+            ..RolePicker::default()
+        };
+        let mut config = parse_picker_config(Path::new("/nonexistent"), false).unwrap();
+        config.recipes = recipes;
+        config
+            .roles
+            .insert("drafter".into(), row("cursor_grok_xhigh"));
+        config
+            .roles
+            .insert("critic".into(), row("cursor_grok_xhigh"));
+        let pair = PickerPair(config);
+        assert_eq!(
+            pair.check("drafter", "critic").unwrap().as_deref(),
+            Some("claude_opus_high")
+        );
+        assert_eq!(pair.check("drafter", "pro").unwrap(), None);
+        assert!(
+            pair.check("drafter", "ghost")
+                .unwrap_err()
+                .contains("role_unknown")
+        );
     }
 
     #[test]
