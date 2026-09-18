@@ -27,12 +27,15 @@ pub const PROVIDERS: [&str; 6] = [
 ];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
-/// `pi_args_forbidden`.
-pub const FORBIDDEN_ARGS: [&str; 13] = [
+/// `pi_args_forbidden`. `-na` is `--no-approve`'s short form (§1) and
+/// `--no-session` is a session flag the r2 strip list also drops (§3.8).
+pub const FORBIDDEN_ARGS: [&str; 15] = [
     "--approve",
     "-a",
     "--no-approve",
+    "-na",
     "--session",
+    "--no-session",
     "--fork",
     "-c",
     "--continue",
@@ -267,7 +270,7 @@ pub fn validate_args(args: &[String]) -> Result<()> {
     }
     let provider = flag_value(args, "--provider")
         .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `--provider` is required"))?;
-    if provider == "cursor" {
+    if provider.eq_ignore_ascii_case("cursor") {
         bail!("pi_cursor_forbidden: Cursor stays outside pi (decision 18:30)");
     }
     if args.iter().any(|a| {
@@ -276,12 +279,12 @@ pub fn validate_args(args: &[String]) -> Result<()> {
     }) {
         bail!("pi_cursor_forbidden: no Cursor SDK or community add-on under pi");
     }
-    if PROVIDERS.contains(&provider.as_str()) {
-        for required in ["--model", "--no-skills"] {
-            if !args.iter().any(|a| a == required) {
-                bail!("pi_args_forbidden: `{required}` is required on a pi row");
-            }
-        }
+    // Every pi row, a known provider or not (the T3 mock row too).
+    if flag_value(args, "--model").is_none_or(|model| model.is_empty()) {
+        bail!("pi_args_forbidden: `--model` is required on a pi row");
+    }
+    if !args.iter().any(|a| a == "--no-skills") {
+        bail!("pi_args_forbidden: `--no-skills` is required on a pi row");
     }
     Ok(())
 }
@@ -405,13 +408,16 @@ mod tests {
             let error = validate_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{flag}: {error}");
         }
-        let cursor = args(&["--provider", "cursor", "--model", "grok-4.6", "--no-skills"]);
-        assert!(
-            validate_args(&cursor)
-                .unwrap_err()
-                .to_string()
-                .contains("pi_cursor_forbidden")
-        );
+        for provider in ["cursor", "Cursor", "CURSOR"] {
+            let cursor = args(&["--provider", provider, "--model", "grok-4.6", "--no-skills"]);
+            assert!(
+                validate_args(&cursor)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pi_cursor_forbidden"),
+                "{provider}"
+            );
+        }
         let sdk = args(&[
             "--provider",
             "deepseek",
@@ -422,6 +428,28 @@ mod tests {
         ]);
         let error = validate_args(&sdk).unwrap_err().to_string();
         assert!(error.contains("pi_cursor_forbidden") || error.contains("pi_args_forbidden"));
+    }
+
+    #[test]
+    fn model_and_no_skills_are_required_for_every_provider() {
+        let mock = args(&[
+            "--provider",
+            "mock-provider",
+            "--model",
+            "mock-model",
+            "--thinking",
+            "low",
+            "--no-skills",
+        ]);
+        assert!(validate_args(&mock).is_ok());
+        for bad in [
+            args(&["--provider", "mock-provider", "--no-skills"]),
+            args(&["--provider", "mock-provider", "--model", "m"]),
+            args(&["--provider", "deepseek", "--model", "", "--no-skills"]),
+        ] {
+            let error = validate_args(&bad).unwrap_err().to_string();
+            assert!(error.contains("pi_args_forbidden"), "{bad:?}: {error}");
+        }
     }
 
     #[test]

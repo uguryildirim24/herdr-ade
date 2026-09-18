@@ -363,7 +363,7 @@ pub fn doctor_rows_with(
 
 /// The `--provider` a `check <provider>` call must refuse before any start.
 pub fn check_provider_allowed(provider: &str) -> Result<()> {
-    if provider == "cursor" {
+    if provider.eq_ignore_ascii_case("cursor") {
         anyhow::bail!("pi_cursor_forbidden: Cursor stays outside pi (decision 18:30)");
     }
     if !launch::PROVIDERS.contains(&provider) {
