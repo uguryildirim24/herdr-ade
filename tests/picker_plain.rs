@@ -19,7 +19,8 @@ use plain::{Glossary, check};
 const PICKED: &str = "{job} looks like {clause}, so it runs on {plain}.";
 const DEFAULT: &str = "{job} looks like ordinary work, so it runs on {plain}.";
 const PINNED: &str = "You chose {plain} for {job}.";
-const FALLBACK: &str = "{job} runs on {plain}, the usual choice, because the picker did not answer.";
+const FALLBACK: &str =
+    "{job} runs on {plain}, the usual choice, because the picker did not answer.";
 const SHADOW: &str = "{job} runs on {plain}; the picker would have chosen {pick}.";
 
 /// The spec's day-one recipe phrases.

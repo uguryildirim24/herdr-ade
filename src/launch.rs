@@ -798,6 +798,13 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
                 input.role
             );
         }
+        if !kinds.contains(pin.kind.trim()) {
+            bail!(
+                "recipe_kind_unknown: the PROJECT.md pin for role `{}` uses kind {:?}",
+                input.role,
+                pin.kind
+            );
+        }
         let mut launch = launch_from(pin, &config, ResolverMode::Pin);
         launch.recipe_id = format!("{}_project", input.role);
         launch.reason = pinned_reason(input.role, &pin.plain);
@@ -1354,11 +1361,16 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
         }
     }
 
-    if config
-        .recipes
-        .keys()
-        .any(|id| id.starts_with("codex_") || id.contains("codex"))
-    {
+    let codex_in_a_list = config.roles.values().any(|role| {
+        role.default.starts_with("codex_")
+            || role.escalate.iter().any(|id| id.starts_with("codex_"))
+            || role.allowed.iter().any(|id| id.starts_with("codex_"))
+            || role
+                .gates
+                .iter()
+                .any(|gate| gate.recipe.starts_with("codex_"))
+    });
+    if codex_in_a_list {
         rows.push(DoctorRow {
             ok: None,
             label: "codex quota".into(),
