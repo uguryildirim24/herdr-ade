@@ -319,6 +319,8 @@ enum PlainCommand {
         project: String,
         #[arg(long)]
         binding: String,
+        #[arg(long, default_value = "complete")]
+        phase: String,
     },
 }
 
@@ -606,7 +608,8 @@ pub fn run() -> Result<()> {
                 kind,
                 project,
                 binding,
-            } => crate::hook::run(&ctx, &kind, &project, &binding),
+                phase,
+            } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         },
         Command::Dialogue { command } => match command {
             DialogueCommand::Start {
