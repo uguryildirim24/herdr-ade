@@ -37,6 +37,7 @@ handoff
 helper
 hook
 hooks
+i
 identity
 inbox
 intent
@@ -49,6 +50,7 @@ lookup
 manifest
 means
 merge
+merged
 message
 native
 notice
@@ -71,6 +73,7 @@ report
 reports
 reserved
 review
+reviewed
 reviewer
 reviewers
 revision
@@ -81,6 +84,7 @@ say
 sealed
 sentence
 skill
+skipped
 staged
 strongest
 submitted
@@ -99,6 +103,7 @@ tokens
 turn
 turns
 uncertain
+unfinished
 verdict
 waiting
 web

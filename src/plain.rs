@@ -336,7 +336,10 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
             continue;
         }
         let lower = token.raw.to_ascii_lowercase();
-        if lower == "rolf" || admitted.contains(&lower) {
+        // A possessive is its word: "the coordinator's pane" (SPEC-ADE item 73).
+        let base = lower.strip_suffix("'s").unwrap_or(&lower);
+        let raw_base = token.raw.strip_suffix("'s").unwrap_or(token.raw);
+        if base == "rolf" || admitted.contains(base) || glossary.is_known_name(raw_base) {
             continue;
         }
         if lower.chars().all(|c| c.is_ascii_alphabetic() || c == '\'') {
@@ -655,6 +658,18 @@ mod tests {
         g.names
             .insert("F-cap".into(), "The failing choice form.".into());
         g
+    }
+
+    /// SPEC-ADE item 73: a possessive is checked as its word.
+    #[test]
+    fn a_possessive_is_checked_as_its_word() {
+        let g = glossary_acronym();
+        assert!(check("The coordinator's pane is open.", &g).passed());
+        assert!(check("Rolf's lane is done.", &g).passed());
+        assert_eq!(
+            codes(&check("The zorbl's pane is open.", &g)),
+            ["plain_unknown_word"]
+        );
     }
 
     fn codes(result: &CheckResult) -> Vec<&'static str> {

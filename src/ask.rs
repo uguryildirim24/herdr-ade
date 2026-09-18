@@ -31,7 +31,7 @@ pub const NOTICES: &[(&str, &str)] = &[
     ),
     (
         "talk_uncertain",
-        "Your last message may not have arrived. The own pane of the coordinator shows whether it did.",
+        "Your last message may not have arrived. The coordinator's own pane shows whether it did.",
     ),
     (
         "needs_you_in_pane",
@@ -601,12 +601,10 @@ pub fn publish_keyed(
 
 /// A plugin notification whose title and body are checked texts.
 fn notify(ctx: &Ctx, project: &Project, title: &str, body: &str) -> bool {
-    if glossary::gate(project, title).is_err() || glossary::gate(project, body).is_err() {
+    let body = format!("{body}0. {NOT_UNDERSTOOD}");
+    if glossary::gate(project, title).is_err() || glossary::gate(project, &body).is_err() {
         return false;
     }
-    // The standing choice is the spec's fixed text; R4 has no entry for "I",
-    // so it is appended after the check (open question in the report).
-    let body = format!("{body}0. {NOT_UNDERSTOOD}");
     let Some(coord) = project.coordinator().filter(|c| !c.socket.is_empty()) else {
         return false;
     };
@@ -677,9 +675,8 @@ mod tests {
             let r = plain::check(text, &g);
             assert!(r.passed(), "{id}: {}", format_check(text, &r));
         }
-        // The spec's standing choice fails R4 on "I" (not in words.txt); it
-        // is fixed text and bypasses the gate. Pin that so a word-list fix shows.
-        assert!(!plain::check(NOT_UNDERSTOOD, &g).passed());
+        let r = plain::check(NOT_UNDERSTOOD, &g);
+        assert!(r.passed(), "{}", format_check(NOT_UNDERSTOOD, &r));
     }
 
     #[test]
