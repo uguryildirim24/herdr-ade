@@ -561,9 +561,7 @@ impl<'a> Surface<'a> {
         match line.trim() {
             "!stop" => {
                 if let Some((h, pane)) = coordinator_herdr(ctx, project) {
-                    crate::round::herdr_quiet(
-                        ctx,
-                        &h,
+                    h.call(
                         &["agent", "send-keys", &pane, "esc"],
                         Duration::from_secs(10),
                     )
@@ -745,9 +743,7 @@ pub fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceTab>> {
     };
     let prefix = crate::coordinator::current_prefix(&ctx.root)?;
     let command = format!("{prefix} talk {}", project.slug);
-    crate::round::herdr_quiet(
-        ctx,
-        &h,
+    h.call(
         &["pane", "run", &tab.pane_id, &command],
         Duration::from_secs(10),
     )

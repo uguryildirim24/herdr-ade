@@ -1195,9 +1195,7 @@ pub fn pickup(ctx: &Ctx, slug: &str, pane: Option<&str>, dry_run: bool) -> Resul
                     relinked.push(format!("{} (dry-run)", t.id));
                 } else {
                     let token = format!("parent={coord_pane}");
-                    crate::round::herdr_quiet(
-                        ctx,
-                        &h,
+                    h.call(
                         &[
                             "pane",
                             "report-metadata",
