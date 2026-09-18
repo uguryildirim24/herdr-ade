@@ -26,7 +26,9 @@ pub struct Adapter<'a>(pub &'a dyn crate::runner::Runner);
 
 impl sh::Runner for Adapter<'_> {
     fn run(&self, cmd: &sh::Cmd) -> Result<sh::Output> {
-        let mut adapted = crate::runner::Cmd::new(cmd.program.clone(), cmd.timeout);
+        // Own group, like `sh::RealRunner`: a timeout on `zsh -lic` must
+        // reach its children.
+        let mut adapted = crate::runner::Cmd::new(cmd.program.clone(), cmd.timeout).own_group();
         adapted = adapted.args(cmd.args.clone());
         for (key, value) in &cmd.env {
             adapted = adapted.env(key.clone(), value.clone());
@@ -109,6 +111,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].display(), "zsh -lic node --version");
         assert!(calls[0].env.iter().any(|(k, _)| k == "PI_CODING_AGENT_DIR"));
+        assert!(calls[0].own_group, "a timeout must reach zsh's children");
         drop(calls);
         let _ = (&env, &layout);
     }
