@@ -1,6 +1,8 @@
 mod actions;
 mod adopt;
 mod cli;
+#[allow(dead_code)]
+mod contracts;
 mod coordinator;
 mod doctor;
 mod herdr;
@@ -8,6 +10,8 @@ mod inbox;
 mod lifecycle;
 mod overview;
 mod paths;
+#[allow(dead_code)]
+mod plain;
 mod pr;
 mod project;
 mod remote;
@@ -32,7 +36,11 @@ fn extend_path() {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let mut extra: Vec<std::path::PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].iter().map(Into::into).collect();
+    let mut extra: Vec<std::path::PathBuf> =
+        ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+            .iter()
+            .map(Into::into)
+            .collect();
     if let Some(home) = home {
         extra.push(home.join(".local/bin"));
         extra.push(home.join(".cargo/bin"));
@@ -51,7 +59,7 @@ fn extend_path() {
 fn main() {
     extend_path();
     if let Err(error) = cli::run() {
-        eprintln!("herdr-projects: {error:#}");
+        eprintln!("herdr-ade: {error:#}");
         std::process::exit(1);
     }
 }

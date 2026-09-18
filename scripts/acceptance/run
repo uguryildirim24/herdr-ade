@@ -1,0 +1,46 @@
+#!/bin/sh
+# Acceptance skeleton for SPEC-ADE §4.3. A0 does not execute rows.
+# Every required row is present with its id and title and marked NOT-RUN.
+# Exit 0 only when every required row is PASS.
+
+set -eu
+
+status=NOT-RUN
+required_pass=0
+required_total=0
+required_failed=0
+
+row() {
+  id=$1
+  required=$2
+  title=$3
+  printf '%s\t%s\t%s\n' "$status" "$id" "$title"
+  if [ "$required" = "required" ]; then
+    required_total=$((required_total + 1))
+    required_failed=$((required_failed + 1))
+  fi
+}
+
+echo "ADE acceptance (SPEC-ADE §4.3) — skeleton, rows not executed"
+
+# Required: every row whose kind is claude, cursor or chatgpt, plus every
+# deterministic row. Optional kind rows stay named here as NOT-RUN.
+row 1 required "ha new and open with claude coordinator: hook before launch, bootstrap acknowledged"
+row 2 required "round open r1; claude and cursor lanes admitted: tabs, parent, briefs committed first"
+row 3 required "each lane ha done seals events; peek does not acknowledge; unadmitted ha waiting from a dirty tree"
+row 4 required "representative-topology handoff continuity and blocked-then-submitted delivery"
+row 5 required "ha round review: brief commit B precedes review worktree; verdict V; ha done --sha V"
+row 6 required "ha round merge stop after merged; resume to H; item 32-34 fixtures"
+row 7 required "negative rows: dirty done, wrong sha, unstable report, incomplete review, stale merge verdicts"
+row 8 required "pro-mcp start, passive adopt, one TURN, one artifact event, ha dialogue commit"
+row 9 required "kind rows: claude and cursor required; others NOT-RUN when unavailable"
+row 10 required "plain-language rows: --plain, hook rewrite, talk captures, ha ask, board tokens, GLOSSARY.md"
+row 11 required "throwaway server stop; ha doctor reports unreachable; records intact"
+
+if [ "$required_pass" -eq "$required_total" ]; then
+  printf 'REQUIRED\tPASS\t%s/%s pass\n' "$required_pass" "$required_total"
+  exit 0
+fi
+
+printf 'REQUIRED\tFAIL\t%s/%s pass (%s NOT-RUN)\n' "$required_pass" "$required_total" "$required_failed"
+exit 1
