@@ -66,6 +66,28 @@ pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
             }
         };
         if !states.is_empty() {
+            // Typed to a coordinator that has since been replaced and never
+            // acknowledged: the current one gets a recipient-changed item.
+            let settled = states.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::contracts::DeliveryState::Acknowledged
+                        | crate::contracts::DeliveryState::Handled
+                )
+            });
+            if !settled
+                && let Some(current) = project.coordinator()
+                && (current.pane_id != event.recipient.pane
+                    || current.attempt() != event.recipient.coordinator_attempt)
+                && let Err(error) = inbox::write_event(
+                    project,
+                    &event,
+                    "recipient-changed",
+                    "a lane event was typed to an earlier coordinator binding",
+                )
+            {
+                first.get_or_insert(error);
+            }
             continue;
         }
         if thread::load(project, &event.thread)

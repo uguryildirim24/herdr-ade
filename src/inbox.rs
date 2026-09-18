@@ -263,7 +263,11 @@ pub fn done_bound(
     }
     let _lock = project.lock()?;
     let dir = inbox_dir(project);
-    let mut moved = 0;
+    let current = project
+        .coordinator()
+        .map(|record| (record.pane_id.clone(), record.attempt()));
+    // Every item is checked before any moves: a refusal moves nothing.
+    let mut checked = Vec::new();
     for id in &ids {
         let from = dir.join(format!("{id}.md"));
         if !from.is_file() {
@@ -280,17 +284,26 @@ pub fn done_bound(
             let Some((pane, attempt)) = binding else {
                 bail!("coordinator_binding_required: event item `{id}` needs its coordinator");
             };
+            let is_current = current
+                .as_ref()
+                .is_some_and(|(p, a)| p == pane && *a == attempt);
+            let own =
+                event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt;
+            // The current coordinator also handles items of a binding it
+            // replaced; nobody else can.
             let binding_matches = if item.kind == "recipient-changed" {
-                project
-                    .coordinator()
-                    .is_some_and(|record| record.pane_id == pane && record.attempt() == attempt)
+                is_current
             } else {
-                event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt
+                own || is_current
             };
             if !binding_matches {
                 bail!("coordinator_binding_mismatch: event item `{id}` belongs to another binding");
             }
         }
+        checked.push((from, id, item));
+    }
+    let mut moved = 0;
+    for (from, id, item) in checked {
         std::fs::rename(&from, dir.join("done").join(format!("{id}.md")))?;
         if let Some(item) = item
             && !item.event.is_empty()
@@ -451,6 +464,30 @@ mod tests {
                 crate::contracts::DeliveryState::Acknowledged,
                 crate::contracts::DeliveryState::Handled
             ]
+        );
+
+        // A2 review M2: after a replacement the new coordinator handles the
+        // old binding's item; a refusal moves nothing.
+        let old = crate::contracts::Event {
+            id: "t-0001-1-2".into(),
+            op: "t-0001-1-2".into(),
+            ..event.clone()
+        };
+        crate::events::seal_create_if_absent(&project, &old).unwrap();
+        let old_item = write_event(&project, &old, "waiting", "lane waits").unwrap();
+        write_item(&project, "routine-1", "body");
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "w1:p3".into();
+                c.generation = 3;
+            })
+            .unwrap();
+        let both = ["routine-1".to_string(), old_item.clone()];
+        assert!(done_bound(&project, &both, false, Some(("w1:p9", 1))).is_err());
+        assert_eq!(unhandled(&project).len(), 2);
+        assert_eq!(
+            done_bound(&project, &both, false, Some(("w1:p3", 3))).unwrap(),
+            2
         );
     }
 
