@@ -216,6 +216,17 @@ need_verb() { # prints the NOT-RUN line when a verb or flag is missing
   fi
 }
 
+answer_trust() { # answer_trust PANE: Claude's first-run folder dialog in a throwaway pane
+  i=0
+  while [ $i -lt 20 ]; do
+    if H pane read "$1" 2>/dev/null | grep -q 'Yes, I trust this folder'; then
+      H pane send-keys "$1" down enter >/dev/null 2>&1
+      return 0
+    fi
+    sleep 2; i=$((i + 1))
+  done
+}
+
 wait_for() { # wait_for SECONDS command...
   s=$1; shift
   end=$(($(date +%s) + s))
@@ -302,6 +313,7 @@ live_new_open() {
   # `new --plain` is a later lane (SPEC-ADE item 70).
   ha new acc --repo "$REPO_LIVE" >/dev/null || { echo "ha new failed"; return; }
   ha open acc --session "$ACC_SESSION" >"$ACC_DIR/open.txt" 2>&1 || { echo "ha open failed: $(tail -1 "$ACC_DIR/open.txt")"; return; }
+  answer_trust "$(grep -o 'pane w[0-9]*:p[0-9]*' "$ACC_DIR/open.txt" | head -1 | cut -d' ' -f2)"
   coord="$HERDR_ADE_ROOT/acc/.state/coordinator.json"
   grep -q 'plain hook --kind claude' "$HERDR_ADE_ROOT/acc/.claude/settings.local.json" 2>/dev/null ||
     { echo "no hook in the project's own .claude/settings.local.json"; return; }
@@ -319,11 +331,12 @@ live_round_lanes() {
       ha thread start acc --title "note $n" --repo "$REPO_LIVE" --role lane --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$n.txt" 2>&1 ||
       { echo "thread start --role lane failed: $(tail -1 "$ACC_DIR/start-$n.txt")"; return; }
     id=$(grep -o 't-[0-9]*' "$ACC_DIR/start-$n.txt" | head -1)
+    answer_trust "$(grep -o '"pane_id":"[^"]*"' "$ACC_DIR/start-$n.txt" | cut -d'"' -f4)"
     ha round admit acc r1 "$id" >/dev/null || { echo "round admit $id failed"; return; }
     echo "$id" >>"$ACC_DIR/lanes.txt"
   done
   for id in $(cat "$ACC_DIR/lanes.txt"); do
-    H api snapshot | grep -q "\"parent\"" || { echo "no parent token on the lanes"; return; }
+    H agent list | grep -q '"parent":"' || { echo "no parent token on the lanes"; return; }
     git -C "$REPO_LIVE" log --format=%s main | grep -q "$id" || { echo "the brief for $id is not a commit on main"; return; }
   done
   echo PASS
