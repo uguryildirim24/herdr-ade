@@ -140,6 +140,13 @@ impl Runner for RealRunner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Every command runs in its own process group, so a timeout reaches
+        // what `zsh -lic` or npm started too (same rule as `crate::runner`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
 
         let mut child = command
             .spawn()
@@ -165,7 +172,7 @@ impl Runner for RealRunner {
             }
             if Instant::now() >= deadline {
                 timed_out = true;
-                let _ = child.kill();
+                kill_group(&mut child);
                 break child.wait().ok();
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -188,6 +195,23 @@ impl Runner for RealRunner {
             timed_out,
         })
     }
+}
+
+/// The child leads its own group, so its pid is the pgid. Grandchildren hold
+/// the pipes open; killing only the child would leave the readers hanging.
+fn kill_group(child: &mut std::process::Child) {
+    for signal in ["-TERM", "-KILL"] {
+        let _ = Command::new("/bin/kill")
+            .args([signal, "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if signal == "-TERM" {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let _ = child.kill();
 }
 
 fn read_all<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
@@ -342,6 +366,21 @@ mod tests {
             .unwrap();
         assert_eq!(out.code, Some(0));
         assert_eq!(out.stdout, "");
+    }
+
+    #[test]
+    fn a_timeout_kills_the_grandchildren_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let script = format!("(sleep 2; touch '{}') & wait", marker.display());
+        let start = Instant::now();
+        let out = RealRunner
+            .run(&Cmd::new("sh", Duration::from_millis(300)).args(["-c", &script]))
+            .unwrap();
+        assert!(out.timed_out);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(2300));
+        assert!(!marker.exists(), "a grandchild outlived the timeout");
     }
 
     #[test]
