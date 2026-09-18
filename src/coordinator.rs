@@ -86,7 +86,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             crate::project::BODY_WARN_CHARS
         );
     }
-    let safety = project.safety(&ctx.config_dir)?;
+    // The coordinator runs on the `coordinator` role (SPEC-ADE D2), resolved
+    // and validated before any tab exists.
+    let spec = project::resolve_role(&ctx.config_dir, &settings, "coordinator")?;
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
 
@@ -125,7 +127,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if let Some(record) = &previous
         && let Some(agent) = agents.iter().find(|a| agent_matches(record, a))
     {
-        crate::hook::install(ctx, &project, &agent.agent, &record.pane_id)?;
+        crate::hook::install(ctx, &project, &record_kind(record, &spec), &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
         report_tokens(&herdr, slug, &record.pane_id);
@@ -149,6 +151,22 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         panes.iter().any(|p| pane_matches(record, p))
             && !agents.iter().any(|a| a.pane_id == record.pane_id)
     });
+    // A reused pane keeps the environment it was created with, so it keeps
+    // its attempt and brief hash; a new tab is the next attempt (D14).
+    let previous_launch = previous.as_ref().map(|r| r.launch.clone()).unwrap_or_default();
+    let brief_hash = crate::thread::sha256_hex(
+        &std::fs::read(project.project_md()).unwrap_or_default(),
+    );
+    let launch = match reusable {
+        Some(record) if !record.launch.brief_hash.is_empty() => record.launch.clone(),
+        _ => project::launch_recipe(
+            &spec,
+            previous_launch.attempt + 1,
+            brief_hash,
+            project::policy_hash(&ctx.config_dir),
+        ),
+    };
+    let env = project::tab_env(slug, "coordinator", launch.attempt, &launch.brief_hash, &spec);
     let (workspace_id, tab_id, pane_id) = if let Some(record) = reusable {
         sync_label(&herdr, &record.workspace_id, &label);
         (
@@ -168,10 +186,10 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         let created = match workspace {
             Some(id) => {
                 sync_label(&herdr, &id, &label);
-                herdr.tab_create(&id, &dir, "coordinator", true)?
+                herdr.tab_create_env(&id, &dir, "coordinator", true, &env)?
             }
             None => {
-                let created = herdr.workspace_create(&dir, &label, true)?;
+                let created = herdr.workspace_create_env(&dir, &label, true, &env)?;
                 let _ = herdr.call(
                     &["tab", "rename", &created.tab_id, "coordinator"],
                     crate::herdr::CALL_TIMEOUT,
@@ -197,19 +215,24 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             prime_pending: true,
             launch_attempts: 1,
             updated: String::new(),
+            launch: launch.clone(),
+            prime_sent: false,
+            bootstrap: String::new(),
         }
     })?;
 
     // Hook installation and verification precede the coordinator launch. An
     // unsupported kind remains honestly unqualified and installs nothing.
-    crate::hook::install(ctx, &project, &settings.coordinator_agent, &record.pane_id)?;
+    crate::hook::install(ctx, &project, &launch.kind, &record.pane_id)?;
 
-    match herdr.agent_start(
-        &name,
-        &settings.coordinator_agent,
-        &record.pane_id,
-        &safety.coordinator_agent_args,
-    ) {
+    match herdr.agent_start_opts(&crate::herdr::AgentStart {
+        name: &name,
+        kind: &launch.kind,
+        pane: &record.pane_id,
+        agent_args: &launch.args,
+        parent: None,
+        ready_timeout_ms: launch.ready_timeout_ms,
+    }) {
         Ok(agent) => deliver_or_defer(&project, &herdr, &agent, &prompt)?,
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",
@@ -251,9 +274,12 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
                 false
             }
         };
-    // Transport is not the bootstrap receipt. A1 clears this only after the
-    // matching `ha context` call projects `bootstrap = acknowledged`.
-    project.update_coordinator(|c| c.prime_pending = true)?;
+    // Transport is not the bootstrap receipt: `prime_pending` clears only when
+    // the matching `ha context` call records `bootstrap = acknowledged`.
+    project.update_coordinator(|c| {
+        c.prime_pending = true;
+        c.prime_sent = sent;
+    })?;
     if sent {
         println!("priming prompt sent");
     } else {
@@ -495,35 +521,57 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
         return Ok(());
     };
     let pane = std::env::var("HERDR_PANE_ID").unwrap_or_default();
-    if pane != record.pane_id {
+    if pane.is_empty() || pane != record.pane_id {
         return Ok(());
     }
-    let Ok(raw) = std::env::var("HERDR_ADE_LAUNCH") else {
-        // A0 does not yet set the receipt input. A1's integration does; do not
-        // invent a self-comparison on this standalone branch.
+    if record.launch.brief_hash.is_empty() {
+        // A binding opened before launch receipts existed has none to match.
         return Ok(());
-    };
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).context("bootstrap_mismatch: HERDR_ADE_LAUNCH is not JSON")?;
-    let expected_attempt = record.launch_attempts.max(1);
-    if value["project"].as_str() != Some(project.slug.as_str())
-        || value["thread"].as_str() != Some("coordinator")
-        || value["attempt"].as_u64() != Some(u64::from(expected_attempt))
-        || value["brief_hash"].as_str().unwrap_or_default().is_empty()
-        || value["pane"]
-            .as_str()
-            .is_some_and(|expected| expected != pane)
+    }
+    let launch = project::LaunchEnv::from_process()
+        .context("bootstrap_mismatch: HERDR_ADE_LAUNCH is missing or malformed")?;
+    if launch.project != project.slug
+        || launch.thread != "coordinator"
+        || launch.attempt != record.launch.attempt.max(1)
+        || launch.brief_hash != record.launch.brief_hash
     {
         bail!("bootstrap_mismatch: coordinator launch receipt does not match");
+    }
+    if record.bootstrap == "acknowledged" && !record.prime_pending {
+        return Ok(());
     }
     let path = project
         .state_dir()
         .join("bootstrap")
         .join("coordinator.json");
-    std::fs::create_dir_all(path.parent().expect("bootstrap path has a parent"))?;
-    project::write_json(&path, &value)?;
-    project.update_coordinator(|coordinator| coordinator.prime_pending = false)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    project::write_json(
+        &path,
+        &serde_json::json!({
+            "project": launch.project,
+            "thread": launch.thread,
+            "attempt": launch.attempt,
+            "brief_hash": launch.brief_hash,
+            "pane": pane,
+            "acknowledged": project::now(),
+        }),
+    )?;
+    project.update_coordinator(|coordinator| {
+        coordinator.prime_pending = false;
+        coordinator.bootstrap = "acknowledged".into();
+    })?;
     Ok(())
+}
+
+/// The recorded coordinator kind, else the role's (a pre-ADE binding).
+fn record_kind(record: &Coordinator, spec: &crate::contracts::RoleSpec) -> String {
+    if record.launch.kind.is_empty() {
+        spec.kind.clone()
+    } else {
+        record.launch.kind.clone()
+    }
 }
 
 #[cfg(test)]

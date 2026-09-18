@@ -81,7 +81,7 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
     let lane = thread::load(project, &event.thread)?;
-    if lane.launch_attempts.max(1) != event.attempt {
+    if lane.attempt.max(1) != event.attempt {
         bail!(
             "stale_attempt: event {} is not for the current lane attempt",
             event.id

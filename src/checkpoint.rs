@@ -1276,38 +1276,17 @@ struct LaunchSeen {
     ready_timeout_ms: Option<u64>,
 }
 
-/// The launch recipe on A1's record (`launch = {...}`), read tolerantly.
+/// The launch recipe on A1's record (`[launch]`, SPEC-ADE D2).
 fn launch_of(project: &Project, id: &str) -> LaunchSeen {
-    let Some(value) = std::fs::read_to_string(thread::record_path(project, id))
-        .ok()
-        .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
-    else {
+    let Ok(t) = thread::load(project, id) else {
         return LaunchSeen::default();
     };
-    let Some(l) = value.get("launch") else {
-        return LaunchSeen::default();
-    };
-    let strings = |k: &str| -> Vec<String> {
-        l.get(k)
-            .and_then(toml::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let l = t.launch;
     LaunchSeen {
-        kind: l
-            .get("kind")
-            .and_then(toml::Value::as_str)
-            .map(str::to_string),
-        args: strings("args"),
-        env: strings("env"),
-        ready_timeout_ms: l
-            .get("ready_timeout_ms")
-            .and_then(toml::Value::as_integer)
-            .and_then(|n| u64::try_from(n).ok()),
+        kind: Some(l.kind).filter(|k| !k.is_empty()),
+        args: l.args,
+        env: l.env,
+        ready_timeout_ms: Some(l.ready_timeout_ms).filter(|ms| *ms > 0),
     }
 }
 
@@ -1481,12 +1460,12 @@ mod tests {
         let (live, _) = fx.lane(1);
         let (linked, _) = fx.lane(2);
         let (gone, _) = fx.lane(3);
-        let path = thread::record_path(&fx.project, &gone);
-        let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(
-            &path,
-            format!("{text}\n[launch]\nkind = \"codex\"\nargs = [\"--full-auto\"]\nenv = [\"HERDR_ADE_LAUNCH=1\"]\nready_timeout_ms = 30000\n"),
-        )
+        thread::update(&fx.project, &gone, |t| {
+            t.launch.kind = "codex".into();
+            t.launch.args = vec!["--full-auto".into()];
+            t.launch.env = vec!["HERDR_ADE_LAUNCH=1".into()];
+            t.launch.ready_timeout_ms = 30000;
+        })
         .unwrap();
         *fx.world.agents.borrow_mut() = r#"[
             {"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"working"},

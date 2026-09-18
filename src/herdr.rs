@@ -319,26 +319,32 @@ impl<'a> Herdr<'a> {
         }
     }
 
-    pub fn workspace_create(
+    /// `workspace create` with `--env KEY=VALUE` for its first pane (the
+    /// coordinator's `HERDR_ADE_LAUNCH`, SPEC-ADE D14).
+    pub fn workspace_create_env(
         &self,
         cwd: &Path,
         label: &str,
         focus: bool,
+        env: &[String],
     ) -> Result<Created, HerdrError> {
         let cwd = cwd.to_string_lossy();
         let focus = if focus { "--focus" } else { "--no-focus" };
-        let result = self.call(
-            &[
-                "workspace",
-                "create",
-                "--cwd",
-                &cwd,
-                "--label",
-                label,
-                focus,
-            ],
-            CALL_TIMEOUT,
-        )?;
+        let mut args = vec![
+            "workspace".to_string(),
+            "create".to_string(),
+            "--cwd".to_string(),
+            cwd.into_owned(),
+            "--label".to_string(),
+            label.to_string(),
+            focus.to_string(),
+        ];
+        for pair in env {
+            args.push("--env".into());
+            args.push(pair.clone());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = self.call(&borrowed, CALL_TIMEOUT)?;
         Self::created(&result)
     }
 

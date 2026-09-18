@@ -181,27 +181,22 @@ pub fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Opti
 
 /// `talk` in `PROJECT.md` front matter, else on for a `claude` coordinator.
 pub fn enabled(project: &Project) -> bool {
-    let front = std::fs::read_to_string(project.project_md())
-        .ok()
-        .and_then(|t| {
-            t.strip_prefix("+++\n")?
-                .split_once("\n+++")
-                .map(|(f, _)| f.to_string())
-        })
-        .unwrap_or_default();
-    let value: toml::Value =
-        toml::from_str(&front).unwrap_or(toml::Value::Table(Default::default()));
-    if let Some(on) = value.get("talk").and_then(toml::Value::as_bool) {
+    if let Ok((settings, _)) = project.read_project_md()
+        && let Some(on) = settings.talk
+    {
         return on;
     }
     coordinator_kind(project) == "claude"
 }
 
+/// The kind the coordinator was launched with (the `coordinator` role at
+/// `open`, SPEC-ADE D2); `claude`, the plugin default, before the first open.
 pub fn coordinator_kind(project: &Project) -> String {
     project
-        .read_project_md()
-        .map(|(s, _)| s.coordinator_agent)
-        .unwrap_or_else(|_| "claude".into())
+        .coordinator()
+        .map(|c| c.launch.kind)
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or_else(|| "claude".into())
 }
 
 /// Per-kind labels (D17 item 2, D18 item 5). The shipped capability table is
@@ -1139,16 +1134,9 @@ mod tests {
         let h = header(&fx.project);
         assert!(h.contains("chat there is checked after display"), "{h}");
         assert!(enabled(&fx.project));
-        let md = std::fs::read_to_string(fx.project.project_md()).unwrap();
-        std::fs::write(
-            fx.project.project_md(),
-            md.replacen(
-                "coordinator_agent = \"claude\"",
-                "coordinator_agent = \"codex\"",
-                1,
-            ),
-        )
-        .unwrap();
+        fx.project
+            .update_coordinator(|c| c.launch.kind = "codex".into())
+            .unwrap();
         let h = header(&fx.project);
         assert!(
             h.contains("chat there is not checked; chat: shown only through say and ask"),
