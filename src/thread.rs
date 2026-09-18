@@ -93,11 +93,6 @@ impl Thread {
         !self.machine.is_empty()
     }
 
-    /// Started through the ADE role/plain path (SPEC-ADE D2–D4).
-    pub fn is_ade(&self) -> bool {
-        !self.role.is_empty() || !self.plain.is_empty() || !self.launch.kind.is_empty()
-    }
-
     pub fn report_path(&self) -> String {
         format!("{}/report.md", self.thread_dir)
     }
@@ -214,13 +209,32 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
     format!("{}/.herdr-project/{slug}-{id}", cwd.trim_end_matches('/'))
 }
 
-/// The one line the agent is prompted with; the relative path is the same for
-/// every kind. Nothing from outside is ever placed in a prompt.
-pub fn launch_prompt(slug: &str, id: &str) -> String {
-    format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says.")
+/// The one line the agent is prompted with. Nothing from outside is ever
+/// placed in a prompt. A launched lane's first instruction is its role skill,
+/// which is also the bootstrap receipt (D12, D14); its brief is the committed
+/// `tasks/<id>.md` in a worktree (D9) or `brief.md` in a tab's folder. An
+/// adopted pane has no launch receipt and a remote one no `ha` (D13): they
+/// read `brief.md`, which carries the lane skill.
+pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
+    let id = &t.id;
+    let role = if t.role.is_empty() { "lane" } else { &t.role };
+    match t.kind {
+        Kind::Worktree if !t.is_remote() => {
+            format!("Run {prefix} skill {role}, then read tasks/{id}.md and do what it says.")
+        }
+        Kind::Tab => format!(
+            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
+        ),
+        _ => format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says."),
+    }
 }
 
 // ---------------------------------------------------------------- briefs
+
+/// A brief read without `ha skill` (adopted, remote) carries the lane skill.
+pub fn with_lane_skill(brief: &str) -> String {
+    format!("{}\n\n{brief}", include_str!("../skill/LANE.md").trim_end())
+}
 
 pub struct BriefInput<'a> {
     pub instructions: &'a str,
@@ -234,8 +248,7 @@ pub struct BriefInput<'a> {
 }
 
 pub fn compose_brief(input: &BriefInput) -> String {
-    let mut brief = String::from(include_str!("../skill/THREAD.md").trim_end());
-    brief.push_str("\n\n");
+    let mut brief = String::new();
     if input.restart {
         brief.push_str(
             "**A previous attempt at this task exists on this branch.** Read its report at the report path below first, look at what is already on the branch, and continue from there.\n\n",
@@ -1188,9 +1201,15 @@ mod tests {
             thread_dir("/wt/", "demo", "t-0001"),
             "/wt/.herdr-project/demo-t-0001"
         );
+        // A1 H2: a launched lane is primed with its role skill (D9, D14).
+        let lane = Thread {
+            id: "t-0001".into(),
+            role: "reviewer".into(),
+            ..placed_thread(Kind::Worktree)
+        };
         assert_eq!(
-            launch_prompt("demo", "t-0001"),
-            "Read .herdr-project/demo-t-0001/brief.md and do what it says."
+            launch_prompt("ha", "demo", &lane),
+            "Run ha skill reviewer, then read tasks/t-0001.md and do what it says."
         );
     }
 
@@ -1253,7 +1272,7 @@ mod tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}"))
         };
-        assert!(pos("# Thread brief") < pos("previous attempt"));
+        assert!(brief.starts_with("**A previous attempt"));
         assert!(pos("previous attempt") < pos("Always run the tests."));
         assert!(pos("Always run the tests.") < pos("# Memory"));
         assert!(pos("# Memory") < pos("alpha fact"));

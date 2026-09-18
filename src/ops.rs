@@ -67,18 +67,29 @@ fn write_op(project: &Project, op: &Op) -> Result<()> {
     project::write_atomic(&op_path(project, &op.op)?, toml::to_string(op)?.as_bytes())
 }
 
+/// The complete payload of one `ha done` or `ha waiting`.
+pub struct Reservation<'a> {
+    pub thread: &'a str,
+    pub attempt: u32,
+    pub kind: OpKind,
+    pub recipient: Recipient,
+    pub round: Option<String>,
+    pub requested: Requested,
+    pub helper_pid: u32,
+}
+
 /// Reserve the complete payload under the project lock. Same-payload retries
 /// resume one op. A changed payload abandons it and allocates the next id.
-pub fn reserve(
-    project: &Project,
-    thread: &str,
-    attempt: u32,
-    kind: OpKind,
-    recipient: Recipient,
-    round: Option<String>,
-    requested: Requested,
-    helper_pid: u32,
-) -> Result<Op> {
+pub fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
+    let Reservation {
+        thread,
+        attempt,
+        kind,
+        recipient,
+        round,
+        requested,
+        helper_pid,
+    } = r;
     let _lock = project.lock()?;
     let mut existing: Vec<Op> = list(project)
         .into_iter()
@@ -425,16 +436,18 @@ mod tests {
         std::fs::write(&report, b"result\n").unwrap();
         let op = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Done,
-            recipient,
-            None,
-            Requested::Done {
-                sha: "abc".into(),
-                report_path: "report.md".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient,
+                round: None,
+                requested: Requested::Done {
+                    sha: "abc".into(),
+                    report_path: "report.md".into(),
+                },
+                helper_pid: 999_999,
             },
-            999_999,
         )
         .unwrap();
         stage_done(&project, &op.op, root.path(), &runner).unwrap();
@@ -451,25 +464,29 @@ mod tests {
         };
         let first = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Waiting,
-            recipient.clone(),
-            None,
-            requested.clone(),
-            1,
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient: recipient.clone(),
+                round: None,
+                requested: requested.clone(),
+                helper_pid: 1,
+            },
         )
         .unwrap();
         assert_eq!(
             reserve(
                 &project,
-                "t-0001",
-                1,
-                OpKind::Waiting,
-                recipient.clone(),
-                None,
-                requested,
-                2,
+                Reservation {
+                    thread: "t-0001",
+                    attempt: 1,
+                    kind: OpKind::Waiting,
+                    recipient: recipient.clone(),
+                    round: None,
+                    requested,
+                    helper_pid: 2
+                }
             )
             .unwrap()
             .op,
@@ -477,15 +494,17 @@ mod tests {
         );
         let second = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Waiting,
-            recipient,
-            None,
-            Requested::Waiting {
-                text: "different".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient,
+                round: None,
+                requested: Requested::Waiting {
+                    text: "different".into(),
+                },
+                helper_pid: 3,
             },
-            3,
         )
         .unwrap();
         assert_ne!(first.op, second.op);
@@ -497,15 +516,17 @@ mod tests {
         let (_root, project, _runner, recipient) = fixture();
         let op = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Waiting,
-            recipient,
-            None,
-            Requested::Waiting {
-                text: "wait".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient,
+                round: None,
+                requested: Requested::Waiting {
+                    text: "wait".into(),
+                },
+                helper_pid: 1,
             },
-            1,
         )
         .unwrap();
         let staged = stage_waiting(&project, &op.op).unwrap();
@@ -521,15 +542,17 @@ mod tests {
         let (_root, project, _runner, recipient) = fixture();
         let op = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Waiting,
-            recipient,
-            None,
-            Requested::Waiting {
-                text: "blocked".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient,
+                round: None,
+                requested: Requested::Waiting {
+                    text: "blocked".into(),
+                },
+                helper_pid: 1,
             },
-            1,
         )
         .unwrap();
         assert_eq!(
@@ -551,16 +574,18 @@ mod tests {
         std::fs::write(root.path().join("report.md"), b"result\n").unwrap();
         let op = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Done,
-            recipient.clone(),
-            None,
-            Requested::Done {
-                sha: "abc".into(),
-                report_path: "report.md".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient: recipient.clone(),
+                round: None,
+                requested: Requested::Done {
+                    sha: "abc".into(),
+                    report_path: "report.md".into(),
+                },
+                helper_pid: 1,
             },
-            1,
         )
         .unwrap();
         assert!(
@@ -579,16 +604,18 @@ mod tests {
             .on("git rev-parse HEAD", ok("different\n"));
         let op2 = reserve(
             &project2,
-            "t-0001",
-            1,
-            OpKind::Done,
-            recipient,
-            None,
-            Requested::Done {
-                sha: "abc".into(),
-                report_path: "report.md".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient,
+                round: None,
+                requested: Requested::Done {
+                    sha: "abc".into(),
+                    report_path: "report.md".into(),
+                },
+                helper_pid: 1,
             },
-            1,
         )
         .unwrap();
         assert!(
@@ -621,16 +648,18 @@ mod tests {
         runner.on("git rev-parse HEAD", ok("abc\n"));
         let op = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Done,
-            recipient,
-            None,
-            Requested::Done {
-                sha: "abc".into(),
-                report_path: "report.md".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient,
+                round: None,
+                requested: Requested::Done {
+                    sha: "abc".into(),
+                    report_path: "report.md".into(),
+                },
+                helper_pid: 1,
             },
-            1,
         )
         .unwrap();
         assert!(
@@ -646,15 +675,17 @@ mod tests {
         let (_root, project, _runner, recipient) = fixture();
         let op = reserve(
             &project,
-            "t-0001",
-            1,
-            OpKind::Waiting,
-            recipient,
-            None,
-            Requested::Waiting {
-                text: "wait".into(),
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient,
+                round: None,
+                requested: Requested::Waiting {
+                    text: "wait".into(),
+                },
+                helper_pid: 1,
             },
-            1,
         )
         .unwrap();
         stage_waiting(&project, &op.op).unwrap();
@@ -695,15 +726,17 @@ mod tests {
             .on("agent prompt", ok(r#"{"result":{}}"#));
         let op = reserve(
             &project,
-            &lane.id,
-            1,
-            OpKind::Waiting,
-            recipient,
-            None,
-            Requested::Waiting {
-                text: "wait".into(),
+            Reservation {
+                thread: &lane.id,
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient,
+                round: None,
+                requested: Requested::Waiting {
+                    text: "wait".into(),
+                },
+                helper_pid: 999_999,
             },
-            999_999,
         )
         .unwrap();
         stage_waiting(&project, &op.op).unwrap();

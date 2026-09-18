@@ -127,6 +127,9 @@ enum Command {
         name: String,
         #[arg(long, default_value = "")]
         goal: String,
+        /// The adopted thread's birth sentence (SPEC-ADE D17 item 6)
+        #[arg(long)]
+        plain: Option<String>,
         /// The agent pane to adopt
         #[arg(long)]
         pane: String,
@@ -147,7 +150,6 @@ enum Command {
         #[command(subcommand)]
         command: SafetyCommand,
     },
-    // ade-outbox begin
     /// Seal and deliver this lane's completion
     Done {
         #[arg(long, value_name = "PATH")]
@@ -169,13 +171,11 @@ enum Command {
         #[command(subcommand)]
         command: PlainCommand,
     },
-    // ade-outbox end
     /// Check the setup: versions, tools, root, ticker and each project's session
     Doctor {
         #[command(flatten)]
         session: SessionArgs,
     },
-    // ade-rounds begin
     /// Rounds: open, admit lanes, review, merge with its checkpoint (SPEC-ADE D6)
     Round {
         #[command(subcommand)]
@@ -272,7 +272,6 @@ enum Command {
         #[arg(long)]
         print: bool,
     },
-    // ade-rounds end
     /// The background ticker
     Ticker {
         #[command(subcommand)]
@@ -280,7 +279,6 @@ enum Command {
     },
 }
 
-// ade-rounds begin
 #[derive(Subcommand)]
 enum RoundCommand {
     /// Open a round: its record, gate list and policy hash
@@ -702,7 +700,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
         _ => unreachable!("run_rounds only receives this lane's commands"),
     }
 }
-// ade-rounds end
 
 #[derive(Subcommand)]
 enum InboxCommand {
@@ -727,22 +724,18 @@ enum ThreadCommand {
         repo: Option<String>,
         #[arg(long, value_name = "LABEL")]
         machine: Option<String>,
-        /// Agent kind (default: thread_agent in PROJECT.md)
-        #[arg(long, value_name = "KIND")]
-        agent: Option<String>,
-        #[arg(long, value_name = "REF")]
+        /// The integration branch the brief is committed on (default: the checked-out branch)
+        #[arg(long, value_name = "BRANCH")]
         base: Option<String>,
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
-        // ade-core begin
         /// Birth sentence (SPEC-ADE D17 item 6)
         #[arg(long)]
         plain: Option<String>,
         /// Role from the roles table (default: lane)
         #[arg(long, value_name = "ROLE")]
         role: Option<String>,
-        // ade-core end
     },
     /// Bring back a thread whose pane is gone or whose start failed
     Restart { slug: String, id: String },
@@ -768,7 +761,6 @@ enum ThreadCommand {
         /// Optional task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: Option<String>,
-        // ade-core begin
         /// Birth sentence (SPEC-ADE D17 item 6)
         #[arg(long)]
         plain: Option<String>,
@@ -777,7 +769,6 @@ enum ThreadCommand {
         /// Do not send a primer (SPEC-ADE D7)
         #[arg(long)]
         passive: bool,
-        // ade-core end
     },
     /// Record that the user has seen the current report
     Ack { slug: String, id: String },
@@ -837,7 +828,6 @@ enum TickerCommand {
     Status,
 }
 
-// ade-outbox begin
 #[derive(Subcommand)]
 enum PlainCommand {
     /// Check text using the deterministic identifier and vocabulary rules
@@ -858,8 +848,6 @@ enum PlainCommand {
         phase: String,
     },
 }
-
-// ade-outbox end
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -961,33 +949,25 @@ pub fn run() -> Result<()> {
                 title,
                 repo,
                 machine,
-                agent,
                 base,
                 task_file,
-                // ade-core begin
                 plain,
                 role,
-                // ade-core end
             } => {
                 let task = read_text(&task_file)?;
-                // ade-core begin
-                let thread = threads::start_with_ade(
+                let thread = threads::start(
                     &ctx,
                     &slug,
                     StartArgs {
                         title,
                         repo,
                         machine,
-                        agent,
                         base,
                         task,
-                    },
-                    threads::AdeStart {
                         plain: plain.unwrap_or_default(),
                         role,
                     },
                 )?;
-                // ade-core end
                 println!(
                     "{}",
                     serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id })
@@ -1017,15 +997,12 @@ pub fn run() -> Result<()> {
                 pane,
                 title,
                 task_file,
-                // ade-core begin
                 plain,
                 role,
                 passive,
-                // ade-core end
             } => {
                 let task = task_file.map(|file| read_text(&file)).transpose()?;
-                // ade-core begin
-                let thread = adopt::adopt_with_ade(
+                let thread = adopt::adopt(
                     &ctx,
                     &slug,
                     &pane,
@@ -1037,7 +1014,6 @@ pub fn run() -> Result<()> {
                         passive,
                     },
                 )?;
-                // ade-core end
                 println!(
                     "{}",
                     serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id, "prompt_pending": thread.prompt_pending })
@@ -1091,6 +1067,7 @@ pub fn run() -> Result<()> {
         Command::AdoptWorkspace {
             name,
             goal,
+            plain,
             pane,
             workspace_cwd,
             session,
@@ -1099,6 +1076,7 @@ pub fn run() -> Result<()> {
             &adopt::AdoptWorkspace {
                 name,
                 goal,
+                plain: plain.unwrap_or_default(),
                 pane,
                 workspace_cwd,
                 session: session.into(),
@@ -1112,11 +1090,6 @@ pub fn run() -> Result<()> {
                 let safety = project.safety(&ctx.config_dir)?;
                 println!("Effective safety settings for `{slug}`:");
                 println!("  start_threads = {:?}", safety.start_threads);
-                println!(
-                    "  coordinator_agent_args = {:?}",
-                    safety.coordinator_agent_args
-                );
-                println!("  thread_agent_args = {:?}", safety.thread_agent_args);
                 println!("  routine_commands = {}", safety.routine_commands);
                 println!();
                 println!(
@@ -1128,7 +1101,6 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
-        // ade-outbox begin
         Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
         Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
         Command::Skill { role } => crate::lane::skill(&ctx, &role),
@@ -1160,14 +1132,12 @@ pub fn run() -> Result<()> {
                 phase,
             } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         },
-        // ade-outbox end
         Command::Doctor { session } => {
             if !doctor::run(&ctx, &session.into())? {
                 bail!("some checks failed");
             }
             Ok(())
         }
-        // ade-rounds begin
         command @ (Command::Round { .. }
         | Command::Dialogue { .. }
         | Command::Checkpoint { .. }
@@ -1178,7 +1148,6 @@ pub fn run() -> Result<()> {
         | Command::Term { .. }
         | Command::Talk { .. }
         | Command::Board { .. }) => run_rounds(&ctx, command),
-        // ade-rounds end
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),

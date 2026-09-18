@@ -22,16 +22,18 @@ pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     let attempt = binding.thread.attempt.max(1);
     let op = ops::reserve(
         &binding.project,
-        &binding.thread.id,
-        attempt,
-        OpKind::Done,
-        recipient,
-        None,
-        Requested::Done {
-            sha: sha.to_string(),
-            report_path: report.to_string(),
+        ops::Reservation {
+            thread: &binding.thread.id,
+            attempt,
+            kind: OpKind::Done,
+            recipient,
+            round: None,
+            requested: Requested::Done {
+                sha: sha.to_string(),
+                report_path: report.to_string(),
+            },
+            helper_pid: std::process::id(),
         },
-        std::process::id(),
     )?;
     let cwd = Path::new(&binding.thread.cwd);
     ops::stage_done(&binding.project, &op.op, cwd, ctx.runner)?;
@@ -56,13 +58,15 @@ pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
     let attempt = binding.thread.attempt.max(1);
     let op = ops::reserve(
         &binding.project,
-        &binding.thread.id,
-        attempt,
-        OpKind::Waiting,
-        recipient,
-        None,
-        Requested::Waiting { text },
-        std::process::id(),
+        ops::Reservation {
+            thread: &binding.thread.id,
+            attempt,
+            kind: OpKind::Waiting,
+            recipient,
+            round: None,
+            requested: Requested::Waiting { text },
+            helper_pid: std::process::id(),
+        },
     )?;
     ops::stage_waiting(&binding.project, &op.op)?;
     let event = ops::seal(&binding.project, &op.op, |candidate| {

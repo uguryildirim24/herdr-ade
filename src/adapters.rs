@@ -101,16 +101,6 @@ pub fn capability_label(project: &crate::project::Project, kind: &str) -> &'stat
     }
 }
 
-/// An empty composer is ambiguous. Only the kind-specific positive evidence
-/// listed by D15 permits a retry of the same bootstrap attempt.
-#[allow(dead_code)] // A1 calls this from its bootstrap retry decision
-pub fn may_retry_bootstrap(kind: &str, evidence: &str) -> bool {
-    matches!(
-        (kind, evidence),
-        ("claude" | "codex", "submission-rejected") | ("cursor", "unsubmitted-pasted-block")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,13 +113,5 @@ mod tests {
                 "claude", "cursor", "codex", "opencode", "agy", "chatgpt", "dsh"
             ]
         );
-    }
-
-    #[test]
-    fn resend_requires_positive_kind_specific_evidence() {
-        assert!(!may_retry_bootstrap("cursor", "empty-composer"));
-        assert!(may_retry_bootstrap("cursor", "unsubmitted-pasted-block"));
-        assert!(may_retry_bootstrap("codex", "submission-rejected"));
-        assert!(!may_retry_bootstrap("agy", "submission-rejected"));
     }
 }

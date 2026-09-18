@@ -24,19 +24,6 @@ const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
-/// State handed to each lane's `tick` pass (SPEC-ADE §4.2).
-///
-/// A2, A3 and A4 expose `pub fn tick(t: &mut Ticker) -> anyhow::Result<()>`.
-/// The round's reviewer wires those calls next to `crate::threads::tick`.
-#[allow(dead_code)]
-pub struct Ticker<'a> {
-    pub ctx: &'a Ctx<'a>,
-    pub project: &'a Project,
-    pub herdr: Option<&'a Herdr<'a>>,
-    pub agents: &'a [Agent],
-    pub panes: &'a [Pane],
-}
-
 fn lock_path(root: &Path) -> PathBuf {
     root.join(".ticker.lock")
 }
@@ -392,6 +379,7 @@ struct Pass {
 
 fn thread_pass(
     project: &Project,
+    prefix: &str,
     herdr: &Herdr,
     threads: &[thread::Thread],
     agents: &[Agent],
@@ -438,7 +426,7 @@ fn thread_pass(
                 .as_deref()
                 .is_some_and(crate::herdr::ready_state)
         {
-            match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(slug, &t.id)) {
+            match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(prefix, slug, t)) {
                 Ok(()) => delivered = true,
                 Err(error) => {
                     pass.error = pass
@@ -542,46 +530,43 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
         *may_start = false;
         let launched = (|| -> Result<()> {
             thread::update(pass.project, &t.id, |t| t.launch_attempts += 1)?;
-            let parent = pass.project.coordinator().map(|c| c.pane_id);
-            if t.is_ade() && !t.launch.kind.is_empty() {
-                let timeout = if t.launch.ready_timeout_ms == 0 {
-                    crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
-                } else {
-                    t.launch.ready_timeout_ms
-                };
-                let agent = pass.herdr.on_machine(&t.machine).agent_start_opts(
-                    &crate::herdr::AgentStart {
+            // The coordinator's pane is on the project's server; a remote
+            // thread has no parent there (D13).
+            let parent = pass
+                .project
+                .coordinator()
+                .filter(|_| !t.is_remote())
+                .map(|c| c.pane_id);
+            let timeout = if t.launch.ready_timeout_ms == 0 {
+                crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
+            } else {
+                t.launch.ready_timeout_ms
+            };
+            let agent =
+                pass.herdr
+                    .on_machine(&t.machine)
+                    .agent_start_opts(&crate::herdr::AgentStart {
                         name: &t.agent_name,
                         kind: &t.launch.kind,
                         pane: &t.pane_id,
                         agent_args: &t.launch.args,
                         parent: parent.as_deref(),
                         ready_timeout_ms: timeout,
-                    },
-                )?;
-                let process = pass
-                    .herdr
-                    .on_machine(&t.machine)
-                    .pane_process_info(&t.pane_id)
-                    .ok()
-                    .and_then(|info| info.identity());
-                let socket = pass
-                    .project
-                    .coordinator()
-                    .map(|c| c.socket)
-                    .unwrap_or_default();
-                thread::update(pass.project, &t.id, |rec| {
-                    thread::bind_identity(rec, &socket, &agent, process);
-                })?;
-            } else {
-                let safety = pass.project.safety(&pass.ctx.config_dir)?;
-                pass.herdr.on_machine(&t.machine).agent_start(
-                    &t.agent_name,
-                    &t.agent,
-                    &t.pane_id,
-                    &safety.thread_agent_args,
-                )?;
-            }
+                    })?;
+            let process = pass
+                .herdr
+                .on_machine(&t.machine)
+                .pane_process_info(&t.pane_id)
+                .ok()
+                .and_then(|info| info.identity());
+            let socket = pass
+                .project
+                .coordinator()
+                .map(|c| c.socket)
+                .unwrap_or_default();
+            thread::update(pass.project, &t.id, |rec| {
+                thread::bind_identity(rec, &socket, &agent, process);
+            })?;
             Ok(())
         })();
         errors.extend(
@@ -619,6 +604,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         return Ok(None);
     };
     let slug = &project.slug;
+    let prefix = coordinator::current_prefix(&ctx.root)?;
     let mut first_error = None;
 
     // The coordinator: deliver a pending priming prompt, refresh its tokens.
@@ -630,16 +616,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         // binding clears `prime_pending` only on its `ha context` receipt, and
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
         if record.prime_pending && !record.prime_sent && agent.ready() {
-            let prefix = coordinator::current_prefix(&ctx.root)?;
-            let receipted = !record.launch.brief_hash.is_empty();
             match herdr.agent_prompt(&record.pane_id, &coordinator::priming_prompt(&prefix, slug)) {
                 Ok(()) => {
-                    project.update_coordinator(|c| {
-                        c.prime_sent = true;
-                        if !receipted {
-                            c.prime_pending = false;
-                        }
-                    })?;
+                    project.update_coordinator(|c| c.prime_sent = true)?;
                 }
                 Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
             }
@@ -649,6 +628,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
 
     let pass = thread_pass(
         project,
+        &prefix,
         &herdr,
         &open_threads(project, false),
         &agents,
@@ -656,14 +636,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         None,
     )?;
     first_error = first_error.or(pass.error);
-    let mut ticker = Ticker {
-        ctx,
-        project,
-        herdr: Some(&herdr),
-        agents: &agents,
-        panes: &panes,
-    };
-    if let Err(error) = crate::threads::tick(&mut ticker) {
+    if let Err(error) = crate::threads::tick(project, &herdr, &agents) {
         first_error = first_error.or(Some(error));
     }
     // The ops pass (A2) and the rounds pass (A3) run in the slow pass,
@@ -732,8 +705,17 @@ fn remote_pass(
     let hashes =
         crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes))
-        .map_err(|e| format!("{e:#}"))?;
+    let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
+    let pass = thread_pass(
+        project,
+        &prefix,
+        &remote,
+        threads,
+        &agents,
+        &panes,
+        Some(&hashes),
+    )
+    .map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
     for t in threads {
@@ -786,6 +768,12 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let mut may_start = true;
     let mut transitions = seen.transitions.clone();
 
+    errors.extend(
+        crate::steps::config_changed(project, &crate::project::policy_hash(&ctx.config_dir))
+            .err()
+            .map(|e| e.context("config digest")),
+    );
+
     if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
         let pane_alive = seen
             .panes
@@ -802,14 +790,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
                 })?;
                 // The recipe stored at `open`, never rebuilt from settings
                 // that may have changed since (SPEC-ADE D2).
-                let launch = if record.launch.kind.is_empty() {
-                    let (settings, _) = project.read_project_md()?;
-                    let spec =
-                        crate::project::resolve_role(&ctx.config_dir, &settings, "coordinator")?;
-                    crate::project::launch_recipe(&spec, 0, String::new(), String::new())
-                } else {
-                    record.launch.clone()
-                };
+                let launch = &record.launch;
                 herdr.agent_start_opts(&crate::herdr::AgentStart {
                     name: &record.agent_name,
                     kind: &launch.kind,
@@ -1119,7 +1100,9 @@ mod tests {
         };
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 1);
-        assert!(!f.project.coordinator().unwrap().prime_pending);
+        // Transport is not the receipt: only `ha context` clears it (D14).
+        let record = f.project.coordinator().unwrap();
+        assert!(record.prime_sent && record.prime_pending);
         // The prompt went to the recorded socket.
         let calls = runner.calls.borrow();
         let prompt = calls

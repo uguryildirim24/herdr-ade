@@ -353,16 +353,6 @@ impl<'a> Herdr<'a> {
         Self::created(&result)
     }
 
-    pub fn tab_create(
-        &self,
-        workspace: &str,
-        cwd: &Path,
-        label: &str,
-        focus: bool,
-    ) -> Result<Created, HerdrError> {
-        self.tab_create_env(workspace, cwd, label, focus, &[])
-    }
-
     /// `tab create` with `--env KEY=VALUE` (SPEC-ADE D4).
     pub fn tab_create_env(
         &self,
@@ -514,25 +504,6 @@ impl<'a> Herdr<'a> {
         serde_json::from_value(result["process_info"].clone()).map_err(|e| HerdrError {
             code: "failed".into(),
             message: format!("`herdr pane process-info` reply changed: {e}"),
-        })
-    }
-
-    /// Starts an agent in a pane that is at a shell prompt. Success means herdr
-    /// detected the agent and it is ready for input.
-    pub fn agent_start(
-        &self,
-        name: &str,
-        kind: &str,
-        pane: &str,
-        agent_args: &[String],
-    ) -> Result<Agent, HerdrError> {
-        self.agent_start_opts(&AgentStart {
-            name,
-            kind,
-            pane,
-            agent_args,
-            parent: None,
-            ready_timeout_ms: AGENT_START_TIMEOUT.as_millis() as u64,
         })
     }
 

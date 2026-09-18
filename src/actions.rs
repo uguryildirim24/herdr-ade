@@ -254,11 +254,13 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
             if name.is_empty() {
                 bail!("no name given");
             }
+            let plain = ask("One plain sentence: what this work is for", "")?;
             adopt::adopt_workspace(
                 ctx,
                 &AdoptWorkspace {
                     name,
                     goal: String::new(),
+                    plain,
                     pane: handoff.pane_id.clone(),
                     workspace_cwd: handoff.workspace_cwd.clone(),
                     session: SessionFlags {

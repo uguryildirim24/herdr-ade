@@ -51,23 +51,6 @@ pub struct IdentityBinding {
     pub agent_session: Option<String>,
 }
 
-/// ADE fields on a thread record: role, launch, attempt, partial, bootstrap,
-/// plain, identity binding (SPEC-ADE D2, D3, D4, D14, D17 item 6).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ThreadRecord {
-    pub role: String,
-    pub launch: LaunchRecipe,
-    pub attempt: u32,
-    /// Set to the failed step on a partial create or remove (SPEC-ADE D4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partial: Option<String>,
-    /// `"acknowledged"` after a matching bootstrap call (SPEC-ADE D14).
-    #[serde(default)]
-    pub bootstrap: String,
-    pub plain: String,
-    pub identity: IdentityBinding,
-}
-
 /// One `[roles.<name>]` row (SPEC-ADE D2). Unknown fields are refused.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
@@ -380,39 +363,6 @@ mod tests {
     {
         json_roundtrip(value);
         toml_roundtrip(value);
-    }
-
-    #[test]
-    fn thread_record_roundtrip() {
-        both(&ThreadRecord {
-            role: "lane".into(),
-            launch: LaunchRecipe {
-                kind: "cursor".into(),
-                args: vec!["--force".into()],
-                env: vec!["HERDR_ADE_LAUNCH=demo/t-0001/1/abcd".into()],
-                ready_timeout_ms: 20_000,
-                policy_hash: "aa".into(),
-                attempt: 1,
-                brief_hash: "bb".into(),
-            },
-            attempt: 1,
-            partial: Some("tab_create".into()),
-            bootstrap: "acknowledged".into(),
-            plain: "The lane writes the shared types.".into(),
-            identity: IdentityBinding {
-                socket: "/tmp/a.sock".into(),
-                workspace_id: "w1".into(),
-                tab_id: "w1:t2".into(),
-                pane_id: "w1:p2".into(),
-                cwd: "/wt".into(),
-                agent_name: Some("hp-demo-t-0001".into()),
-                process: Some(ProcessIdentity {
-                    pid: 9,
-                    argv0: "cursor-agent".into(),
-                }),
-                agent_session: Some("s1".into()),
-            },
-        });
     }
 
     #[test]
