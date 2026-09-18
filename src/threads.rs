@@ -389,14 +389,8 @@ fn place_and_brief(
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
     };
     write_brief(ctx, project, &placed, restart)?;
-    if placed.is_ade() {
-        let hash = thread::sha256_hex(
-            std::fs::read(Path::new(&placed.thread_dir).join("brief.md"))
-                .unwrap_or_default()
-                .as_slice(),
-        );
-        thread::update(project, id, |t| t.launch.brief_hash = hash)?;
-    }
+    // An ADE lane's hash was fixed before its tab existed and is in the tab's
+    // HERDR_ADE_LAUNCH; the local brief copy never replaces it (D9, D14).
     finish_placement(project, view, id)
 }
 
@@ -424,6 +418,11 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
     Ok(())
 }
 
+/// SPEC-ADE D4 and D9, in order: under one repository lock, keep the plugin's
+/// folders out of git, commit the brief `tasks/<id>.md` on the integration
+/// branch (item 55), record its hash, then `git worktree add` the lane from
+/// that commit so the brief is in its checkout; then the tab, whose
+/// `HERDR_ADE_LAUNCH` carries the same hash as the record.
 fn place_ade_worktree(
     ctx: &Ctx,
     project: &Project,
@@ -445,28 +444,30 @@ fn place_ade_worktree(
         GIT_TIMEOUT,
     )
     .unwrap_or_default();
-    let base = if record.base.is_empty() {
+    // The integration branch is a local branch: `--base`, else the branch
+    // the repository has checked out. A remote-tracking ref or a bare sha
+    // cannot take the brief commit (D9).
+    let integration = if record.base.is_empty() {
         git(
             runner,
             &record.repo,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            &["symbolic-ref", "--short", "HEAD"],
             GIT_TIMEOUT,
         )
-        .or_else(|_| {
-            git(
-                runner,
-                &record.repo,
-                &["rev-parse", "--abbrev-ref", "HEAD"],
-                GIT_TIMEOUT,
-            )
-        })
-        .and_then(|base| match base.as_str() {
-            "HEAD" => git(runner, &record.repo, &["rev-parse", "HEAD"], GIT_TIMEOUT),
-            _ => Ok(base),
-        })?
+        .context("integration_branch_required: the repository is on a detached HEAD; pass --base <branch>")?
     } else {
         record.base.clone()
     };
+    if git(
+        runner,
+        &record.repo,
+        &["rev-parse", "--verify", "-q", &format!("refs/heads/{integration}")],
+        GIT_TIMEOUT,
+    )
+    .is_err()
+    {
+        bail!("integration_branch_required: `{integration}` is not a local branch");
+    }
     let branch = thread::branch_name(&project.slug, &record.id, &record.title);
     let task = std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
     let planned = Path::new(&record.repo).join(".worktrees").join(&record.id);
@@ -477,31 +478,39 @@ fn place_ade_worktree(
     let brief = thread::brief_for(project, &stub, &task, false)?;
     let committed = format!("plain: {}\n\n{brief}", record.plain);
     let rel = format!("tasks/{}.md", record.id);
-    let sha = crate::git::commit_file_from_parent(
-        runner,
-        &record.repo,
-        &base,
-        &rel,
-        committed.as_bytes(),
-        &format!("docs(tasks): {}", record.id),
-    )?;
     let brief_hash = thread::sha256_hex(committed.as_bytes());
-    if let Err(error) = crate::git::exclude_plugin_paths(runner, &record.repo) {
-        eprintln!("warning: {error:#}");
-    }
-    let path = match crate::git::worktree_add(runner, &record.repo, &record.id, &branch, &sha) {
-        Ok(path) => path,
-        Err(error) => {
-            let _ = thread::update(project, &record.id, |t| {
-                t.partial = Some("worktree_add".into());
-                t.launch.brief_hash = brief_hash.clone();
-                t.base = sha.clone();
-                t.branch = branch.clone();
-            });
-            return Err(error);
+
+    let placed = {
+        let repo_lock = crate::git::lock(runner, &record.repo)?;
+        if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
+            eprintln!("warning: {error:#}");
         }
+        let head = crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
+        let sha = crate::git::commit_files_locked(
+            runner,
+            Path::new(&record.repo),
+            &integration,
+            &[(rel.as_str(), committed.as_str())],
+            &format!("docs(tasks): {}", record.id),
+            &head,
+            &repo_lock.common_dir.join("herdr-ade-tmp"),
+        )?;
+        // The hash is on the record before the lane branch exists (D9).
+        thread::update(project, &record.id, |t| {
+            t.launch.brief_hash = brief_hash.clone();
+            t.base = sha.clone();
+            t.branch = branch.clone();
+            t.partial = Some("worktree_add".into());
+        })?;
+        let path = crate::git::worktree_add(runner, &record.repo, &record.id, &branch, &sha)?;
+        (sha, path)
     };
+    let (sha, path) = placed;
     let cwd = path.to_string_lossy().into_owned();
+    thread::update(project, &record.id, |t| {
+        t.worktree_path = cwd.clone();
+        t.partial = Some("tab_create".into());
+    })?;
     let coordinator = project
         .coordinator()
         .context("the project has never been opened")?;
@@ -542,13 +551,8 @@ fn place_ade_worktree(
         }
         Err(error) => {
             let _ = thread::update(project, &record.id, |t| {
-                t.partial = Some("tab_create".into());
                 t.origin = origin;
-                t.base = sha;
-                t.branch = branch;
-                t.worktree_path = cwd.clone();
                 t.cwd = cwd;
-                t.launch.brief_hash = brief_hash;
             });
             Err(anyhow::anyhow!("{error}"))
         }
@@ -591,8 +595,18 @@ fn place_ade_tab(
         env: record.launch.env.clone(),
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
+    // No repository, so no committed brief: the hash is of the brief this
+    // tab will read, fixed before the tab exists and stored on the record.
     let brief_hash = if record.launch.brief_hash.is_empty() {
-        "0".to_string()
+        let task =
+            std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
+        let stub = Thread {
+            thread_dir: thread::thread_dir(&folder.to_string_lossy(), &project.slug, &record.id),
+            ..record.clone()
+        };
+        let hash = thread::sha256_hex(thread::brief_for(project, &stub, &task, false)?.as_bytes());
+        thread::update(project, &record.id, |t| t.launch.brief_hash = hash.clone())?;
+        hash
     } else {
         record.launch.brief_hash.clone()
     };
@@ -1606,13 +1620,42 @@ mod tests {
         assert_eq!(started.attempt, 1);
         let wt = Path::new(&repo_s).join(".worktrees").join(&started.id);
         assert!(wt.is_dir(), "git worktree should exist");
+        // D9: the brief is a commit on the integration branch, the lane
+        // branches from it, and its hash is on the record and in the env.
+        let git_out = |args: &[&str]| {
+            crate::runner::RealRunner
+                .run(
+                    &crate::runner::Cmd::new("git", Duration::from_secs(5))
+                        .args(["-C", &repo_s])
+                        .args(args.iter().copied()),
+                )
+                .unwrap()
+                .stdout
+                .trim()
+                .to_string()
+        };
+        let rel = format!("tasks/{}.md", started.id);
+        let committed = git_out(&["show", &format!("main:{rel}")]);
+        assert!(committed.starts_with("plain: The lane does the work."), "{committed}");
+        assert_eq!(git_out(&["rev-parse", "main"]), started.base);
+        assert!(wt.join(&rel).is_file(), "the brief is in the lane checkout");
+        assert_eq!(
+            started.launch.brief_hash,
+            crate::thread::sha256_hex(format!("{committed}\n").as_bytes())
+        );
+        let exclude = std::fs::read_to_string(Path::new(&repo_s).join(".git/info/exclude")).unwrap();
+        assert!(exclude.lines().any(|l| l == ".worktrees/"), "{exclude}");
         let calls = world.runner.calls.borrow();
+        let env = format!(
+            "HERDR_ADE_LAUNCH=demo/{}/1/{}",
+            started.id, started.launch.brief_hash
+        );
         assert!(
             calls.iter().any(|c| {
                 let line = c.display();
-                line.contains("tab create") && line.contains("HERDR_ADE_LAUNCH=")
+                line.contains("tab create") && line.contains(&env)
             }),
-            "expected tab create --env HERDR_ADE_LAUNCH"
+            "expected tab create --env {env}"
         );
         assert!(
             !calls

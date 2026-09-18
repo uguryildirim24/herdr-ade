@@ -188,12 +188,8 @@ pub fn branch_checkout(runner: &dyn Runner, repo: &str, branch: &str) -> Result<
     Ok(None)
 }
 
-/// Commit one file on `branch` under the repository lock (SPEC-ADE D9).
-///
-/// - Branch checked out clean: write, add, commit in that checkout.
-/// - Branch not checked out: temporary-index recipe plus `update-ref` with the
-///   expected old value.
-/// - Branch checked out dirty: `integration_checkout_dirty`.
+/// Commit one file on `branch` under the repository lock (SPEC-ADE D9). See
+/// [`commit_files_locked`] for the three checkout cases.
 pub fn commit_file_on_branch(
     runner: &dyn Runner,
     repo: &str,
@@ -202,151 +198,149 @@ pub fn commit_file_on_branch(
     contents: &[u8],
     message: &str,
 ) -> Result<String> {
-    let _lock = lock(runner, repo)?;
+    let text = std::str::from_utf8(contents)
+        .with_context(|| format!("{relative_path} is not text; only text files are committed"))?;
+    let lock = lock(runner, repo)?;
+    let head = rev_parse(runner, repo, &branch_ref(branch))
+        .with_context(|| format!("branch_missing: `{branch}` does not exist"))?;
+    commit_files_locked(
+        runner,
+        Path::new(repo),
+        branch,
+        &[(relative_path, text)],
+        message,
+        &head,
+        &lock.common_dir.join("herdr-ade-tmp"),
+    )
+}
+
+/// The one D9 commit: `files` (path, text) on `branch`, whose head must be
+/// `expected_old`. The caller holds the repository lock ([`lock`]); git runs
+/// outside the project lock.
+///
+/// - Branch checked out clean: write, add, commit in that checkout. An
+///   untracked copy of a file being committed (a turn file the critic wrote)
+///   is allowed; a modified tracked copy is someone's edit and refuses.
+/// - Branch checked out dirty: `integration_checkout_dirty`.
+/// - Branch not checked out: a temporary index in `tmp_dir` plus
+///   `update-ref <branch> <new> <expected_old>`.
+pub fn commit_files_locked(
+    runner: &dyn Runner,
+    repo: &Path,
+    branch: &str,
+    files: &[(&str, &str)],
+    message: &str,
+    expected_old: &str,
+    tmp_dir: &Path,
+) -> Result<String> {
+    let repo_s = repo.to_string_lossy().into_owned();
     let git_ref = branch_ref(branch);
-    match branch_checkout(runner, repo, branch)? {
-        Some(checkout) => commit_in_checkout(runner, &checkout, relative_path, contents, message),
-        None => commit_detached(runner, repo, &git_ref, relative_path, contents, message),
-    }
-}
-
-fn dirty(runner: &dyn Runner, cwd: &Path) -> Result<bool> {
-    let out = runner.run(
-        &Cmd::new("git", Duration::from_secs(5))
-            .args(["status", "--porcelain"])
-            .cwd(cwd),
-    )?;
-    if !out.success() {
-        bail!("git status --porcelain: {}", out.error_text());
-    }
-    Ok(!out.stdout.trim().is_empty())
-}
-
-fn commit_in_checkout(
-    runner: &dyn Runner,
-    checkout: &Path,
-    relative_path: &str,
-    contents: &[u8],
-    message: &str,
-) -> Result<String> {
-    if dirty(runner, checkout)? {
-        bail!("integration_checkout_dirty");
-    }
-    let dest = checkout.join(relative_path);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
-    crate::project::write_atomic(&dest, contents)?;
-    let cwd = checkout.to_string_lossy().into_owned();
-    git(runner, &cwd, &["add", "--", relative_path], GIT_TIMEOUT)?;
-    git(
+    let head = git(
         runner,
-        &cwd,
-        &["commit", "-m", message, "--", relative_path],
-        WRITE_TIMEOUT,
-    )?;
-    git(runner, &cwd, &["rev-parse", "HEAD"], Duration::from_secs(5))
-}
-
-/// Commit `relative_path` with parent `parent` and do not update a ref.
-/// Used when the new lane branch does not exist yet (SPEC-ADE D4, D9).
-pub fn commit_file_from_parent(
-    runner: &dyn Runner,
-    repo: &str,
-    parent: &str,
-    relative_path: &str,
-    contents: &[u8],
-    message: &str,
-) -> Result<String> {
-    let _lock = lock(runner, repo)?;
-    let parent_sha = rev_parse(runner, repo, parent)?;
-    write_commit_with_file(runner, repo, &parent_sha, relative_path, contents, message)
-}
-
-fn commit_detached(
-    runner: &dyn Runner,
-    repo: &str,
-    git_ref: &str,
-    relative_path: &str,
-    contents: &[u8],
-    message: &str,
-) -> Result<String> {
-    let old = git(
-        runner,
-        repo,
-        &["rev-parse", git_ref],
+        &repo_s,
+        &["rev-parse", "--verify", "-q", &format!("{git_ref}^{{commit}}")],
         Duration::from_secs(5),
-    )?;
-    let new = write_commit_with_file(runner, repo, &old, relative_path, contents, message)?;
-    update_ref(runner, repo, git_ref, &new, &old)?;
-    Ok(new)
+    )
+    .with_context(|| format!("branch_missing: `{branch}` does not exist"))?;
+    if head != expected_old {
+        bail!("head_moved: `{branch}` is at {head}, expected {expected_old}");
+    }
+    let own: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    match branch_checkout(runner, &repo_s, branch)? {
+        Some(dir) => {
+            let dir_s = dir.to_string_lossy().into_owned();
+            let status = git(
+                runner,
+                &dir_s,
+                &["status", "--porcelain", "--untracked-files=all"],
+                Duration::from_secs(10),
+            )?;
+            let dirty: Vec<String> = status
+                .lines()
+                .filter(|l| l.len() > 3)
+                .filter(|l| {
+                    let path = l[3..].trim().trim_matches('"');
+                    !(l.starts_with("??") && own.contains(&path))
+                })
+                .map(|l| l[3..].trim().to_string())
+                .collect();
+            if !dirty.is_empty() {
+                bail!(
+                    "integration_checkout_dirty: {} has uncommitted changes ({})",
+                    dir.display(),
+                    dirty.join(", ")
+                );
+            }
+            for (path, text) in files {
+                let target = dir.join(path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::project::write_atomic(&target, text.as_bytes())?;
+            }
+            let mut add = vec!["add", "--"];
+            add.extend(own.iter().copied());
+            git(runner, &dir_s, &add, GIT_TIMEOUT)?;
+            let mut commit = vec!["commit", "-q", "--no-verify", "-m", message, "--"];
+            commit.extend(own.iter().copied());
+            git(runner, &dir_s, &commit, WRITE_TIMEOUT)?;
+            git(runner, &dir_s, &["rev-parse", "HEAD"], Duration::from_secs(5))
+        }
+        None => {
+            std::fs::create_dir_all(tmp_dir)
+                .with_context(|| format!("could not create {}", tmp_dir.display()))?;
+            let index = tmp_dir.join(format!(
+                "index-{}-{}",
+                std::process::id(),
+                jiff::Timestamp::now().as_nanosecond()
+            ));
+            let index_s = index.to_string_lossy().into_owned();
+            let with_index = |args: &[&str], stdin: Option<&str>| -> Result<String> {
+                let mut cmd = Cmd::new("git", WRITE_TIMEOUT)
+                    .args(["-C", repo_s.as_str()])
+                    .args(args.iter().copied())
+                    .env("GIT_INDEX_FILE", index_s.as_str());
+                if let Some(text) = stdin {
+                    cmd = cmd.stdin(text);
+                }
+                let out = runner.run(&cmd)?;
+                if !out.success() {
+                    bail!("git {}: {}", args.join(" "), out.error_text());
+                }
+                Ok(out.stdout.trim().to_string())
+            };
+            let result = (|| -> Result<String> {
+                with_index(&["read-tree", expected_old], None)?;
+                for (path, text) in files {
+                    let blob = with_index(&["hash-object", "-w", "--stdin"], Some(text))?;
+                    let cacheinfo = format!("100644,{blob},{path}");
+                    with_index(&["update-index", "--add", "--cacheinfo", &cacheinfo], None)?;
+                }
+                let tree = with_index(&["write-tree"], None)?;
+                let commit = git(
+                    runner,
+                    &repo_s,
+                    &["commit-tree", &tree, "-p", expected_old, "-m", message],
+                    WRITE_TIMEOUT,
+                )?;
+                update_ref(runner, &repo_s, &git_ref, &commit, expected_old)?;
+                Ok(commit)
+            })();
+            let _ = std::fs::remove_file(&index);
+            result
+        }
+    }
 }
 
-fn write_commit_with_file(
-    runner: &dyn Runner,
-    repo: &str,
-    parent_sha: &str,
-    relative_path: &str,
-    contents: &[u8],
-    message: &str,
-) -> Result<String> {
-    let blob = {
-        let out = runner.run(
-            &Cmd::new("git", WRITE_TIMEOUT)
-                .args(["-C", repo, "hash-object", "-w", "--stdin"])
-                .stdin(String::from_utf8_lossy(contents).into_owned()),
-        )?;
-        if !out.success() {
-            bail!("git hash-object: {}", out.error_text());
-        }
-        out.stdout.trim().to_string()
-    };
-    let tmp_index = std::env::temp_dir().join(format!(
-        "herdr-ade-index.{}.{}",
-        std::process::id(),
-        jiff::Timestamp::now().as_nanosecond()
-    ));
-    let index_s = tmp_index.to_string_lossy().into_owned();
-    let run_index = |args: &[&str]| -> Result<String> {
-        let out = runner.run(
-            &Cmd::new("git", WRITE_TIMEOUT)
-                .args(["-C", repo])
-                .args(args.iter().copied())
-                .env("GIT_INDEX_FILE", &index_s),
-        )?;
-        if !out.success() {
-            bail!("git {}: {}", args.join(" "), out.error_text());
-        }
-        Ok(out.stdout.trim().to_string())
-    };
-    let result = (|| -> Result<String> {
-        run_index(&["read-tree", parent_sha])?;
-        let cacheinfo = format!("100644,{blob},{relative_path}");
-        run_index(&["update-index", "--add", "--cacheinfo", &cacheinfo])?;
-        let tree = run_index(&["write-tree"])?;
-        let out = runner.run(&Cmd::new("git", WRITE_TIMEOUT).args([
-            "-C",
-            repo,
-            "commit-tree",
-            &tree,
-            "-p",
-            parent_sha,
-            "-m",
-            message,
-        ]))?;
-        if !out.success() {
-            bail!("git commit-tree: {}", out.error_text());
-        }
-        Ok(out.stdout.trim().to_string())
-    })();
-    let _ = std::fs::remove_file(&tmp_index);
-    result
-}
-
-/// Adds `.herdr-project/` and `.worktrees/` to `info/exclude` when missing.
+/// Adds `.herdr-project/` and `.worktrees/` to `info/exclude` when missing,
+/// under the repository lock (D4).
 pub fn exclude_plugin_paths(runner: &dyn Runner, repo: &str) -> Result<()> {
     let _lock = lock(runner, repo)?;
+    exclude_plugin_paths_locked(runner, repo)
+}
+
+/// [`exclude_plugin_paths`] for a caller that holds the repository lock.
+pub fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Result<()> {
     let exclude = git(
         runner,
         repo,
@@ -512,37 +506,6 @@ mod tests {
         assert!(!wt.exists());
         // Branch is kept.
         assert!(rev_parse(&RealRunner, &repo_s, "refs/heads/lane/t-0001").is_ok());
-    }
-
-    #[test]
-    fn commit_file_from_parent_does_not_move_main() {
-        let (_dir, repo) = repo_with_commit();
-        let repo_s = repo.to_string_lossy().into_owned();
-        let main = rev_parse(&RealRunner, &repo_s, "refs/heads/main").unwrap();
-        let sha = commit_file_from_parent(
-            &RealRunner,
-            &repo_s,
-            "main",
-            "tasks/t-0001.md",
-            b"# brief\n",
-            "docs(tasks): t-0001",
-        )
-        .unwrap();
-        assert_ne!(sha, main);
-        assert_eq!(
-            rev_parse(&RealRunner, &repo_s, "refs/heads/main").unwrap(),
-            main
-        );
-        let show = RealRunner
-            .run(&Cmd::new("git", Duration::from_secs(5)).args([
-                "-C",
-                &repo_s,
-                "show",
-                &format!("{sha}:tasks/t-0001.md"),
-            ]))
-            .unwrap();
-        assert!(show.success());
-        assert_eq!(show.stdout, "# brief\n");
     }
 
     #[test]

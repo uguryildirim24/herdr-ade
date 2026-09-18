@@ -274,6 +274,11 @@ impl<'a> Herdr<'a> {
                     .unwrap_or(serde_json::Value::Null));
             }
         }
+        // `pane report-metadata`, `workspace report-metadata`, `pane run` and
+        // `send-keys` print nothing on success (SPEC-ADE item 71).
+        if out.success() && out.stdout.trim().is_empty() && out.stderr.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
         Err(HerdrError {
             code: "failed".into(),
             message: format!("`herdr {}`: {}", args.join(" "), out.error_text()),
@@ -705,6 +710,31 @@ impl<'a> Herdr<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_reply_with_exit_zero_is_success_and_an_error_reply_is_not() {
+        use crate::runner::fake::{FakeRunner, fail, ok};
+        let runner = FakeRunner::new();
+        runner.on("pane run w1:p1", ok(""));
+        runner.on(
+            "agent send-keys",
+            fail(
+                1,
+                r#"{"error":{"code":"agent_not_found","message":"agent target w1:p1 not found"}}"#,
+            ),
+        );
+        runner.on("pane send-keys", fail(1, ""));
+        let h = Herdr::new("herdr", "/nonexistent.sock", &runner);
+        let t = Duration::from_secs(1);
+        assert_eq!(
+            h.call(&["pane", "run", "w1:p1", "echo"], t).unwrap(),
+            serde_json::Value::Null
+        );
+        let e = h.call(&["agent", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        assert_eq!(e.code, "agent_not_found");
+        let e = h.call(&["pane", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        assert_eq!(e.code, "failed");
+    }
 
     #[test]
     fn parses_versions() {

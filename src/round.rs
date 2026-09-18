@@ -24,15 +24,13 @@ use crate::thread::{self, sha256_hex};
 
 pub use repo::Git;
 
-/// Git helpers for the round's ref writes. A stand-in for A1's `src/git.rs`
-/// (repository lock, `commit_file_on_branch`, `update_ref`, ancestry); the
-/// reviewer swaps these calls for A1's once both lanes are merged.
+/// Git reads for rounds, dialogue and checkpoint. Every lock and ref write
+/// goes through A1's `crate::git`: one repository lock, one D9 commit.
 pub mod repo {
-    use std::fs::File;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use anyhow::{Context, Result, bail};
+    use anyhow::{Result, bail};
 
     use crate::runner::{Cmd, Output, Runner};
 
@@ -126,7 +124,7 @@ pub mod repo {
         }
 
         pub fn diff_names(&self, from: &str, to: &str) -> Result<Vec<String>> {
-            let text = self.run(&["diff", "--name-only", from, to])?;
+            let text = self.run(&["diff", "--no-renames", "--name-only", from, to])?;
             let mut names: Vec<String> = text
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -172,31 +170,14 @@ pub mod repo {
         }
     }
 
-    /// The repository boundary lock, keyed by `git rev-parse --git-common-dir`
-    /// (SPEC-ADE D4). Held for every ref write this plugin performs.
-    pub struct RepoLock {
-        _file: File,
+    /// The repository boundary lock: A1's one lock at
+    /// `<git-common-dir>/herdr-ade.lock` (SPEC-ADE D4).
+    pub fn repo_lock(git: &Git) -> Result<crate::git::RepoLock> {
+        crate::git::lock(git.runner, &git.repo.to_string_lossy())
     }
 
-    pub fn repo_lock(git: &Git) -> Result<RepoLock> {
-        let path = git.common_dir()?.join("herdr-ade.lock");
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("could not open the repository lock {}", path.display()))?;
-        file.lock()?;
-        Ok(RepoLock { _file: file })
-    }
-
-    /// Commits `files` on `branch`, whose head must be `expected_old`
-    /// (SPEC-ADE D9). The caller holds the repository lock.
-    ///
-    /// - checked out clean: commit there;
-    /// - checked out dirty: `integration_checkout_dirty` (the files being
-    ///   committed may themselves be the only dirty paths);
-    /// - not checked out: a temporary index plus `update-ref <new> <old>`.
+    /// A1's D9 commit (`crate::git::commit_files_locked`). The caller holds
+    /// the repository lock.
     pub fn commit_files_on_branch(
         git: &Git,
         branch: &str,
@@ -205,93 +186,15 @@ pub mod repo {
         expected_old: &str,
         tmp_dir: &Path,
     ) -> Result<String> {
-        let head = git
-            .branch_head(branch)?
-            .with_context(|| format!("branch_missing: `{branch}` does not exist"))?;
-        if head != expected_old {
-            bail!("head_moved: `{branch}` is at {head}, expected {expected_old}");
-        }
-        let own: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
-        match git.checkout_of(branch)? {
-            Some(dir) => {
-                let dirty: Vec<String> = git
-                    .dirty_paths(&dir)?
-                    .into_iter()
-                    .filter(|p| !own.contains(&p.as_str()))
-                    .collect();
-                if !dirty.is_empty() {
-                    bail!(
-                        "integration_checkout_dirty: {} has uncommitted changes ({})",
-                        dir.display(),
-                        dirty.join(", ")
-                    );
-                }
-                for (path, bytes) in files {
-                    let target = dir.join(path);
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&target, bytes)?;
-                }
-                let mut add = vec!["add", "--"];
-                add.extend(own.iter().copied());
-                git.run_in(&dir, &add)?;
-                let mut commit = vec!["commit", "-q", "--no-verify", "-m", message, "--"];
-                commit.extend(own.iter().copied());
-                git.run_in(&dir, &commit)?;
-                git.head_in(&dir)
-            }
-            None => {
-                std::fs::create_dir_all(tmp_dir)?;
-                let index = tmp_dir.join(format!(
-                    "index-{}-{}",
-                    std::process::id(),
-                    jiff::Timestamp::now().as_nanosecond()
-                ));
-                let index_s = index.to_string_lossy().into_owned();
-                let result = (|| -> Result<String> {
-                    let with_index = |args: &[&str]| -> Result<String> {
-                        let out = git.runner.run(
-                            &git.cmd_in(&git.repo, args)
-                                .env("GIT_INDEX_FILE", index_s.clone()),
-                        )?;
-                        if !out.success() {
-                            bail!("`git {}` failed: {}", args.join(" "), out.error_text());
-                        }
-                        Ok(out.stdout.trim().to_string())
-                    };
-                    with_index(&["read-tree", expected_old])?;
-                    for (path, bytes) in files {
-                        let out = git.runner.run(
-                            &git.cmd_in(&git.repo, &["hash-object", "-w", "--stdin"])
-                                .stdin(*bytes),
-                        )?;
-                        if !out.success() {
-                            bail!("`git hash-object` failed: {}", out.error_text());
-                        }
-                        let blob = out.stdout.trim().to_string();
-                        with_index(&[
-                            "update-index",
-                            "--add",
-                            "--cacheinfo",
-                            &format!("100644,{blob},{path}"),
-                        ])?;
-                    }
-                    let tree = with_index(&["write-tree"])?;
-                    let commit =
-                        git.run(&["commit-tree", &tree, "-p", expected_old, "-m", message])?;
-                    git.run(&[
-                        "update-ref",
-                        &format!("refs/heads/{branch}"),
-                        &commit,
-                        expected_old,
-                    ])?;
-                    Ok(commit)
-                })();
-                let _ = std::fs::remove_file(&index);
-                result
-            }
-        }
+        crate::git::commit_files_locked(
+            git.runner,
+            &git.repo,
+            branch,
+            files,
+            message,
+            expected_old,
+            tmp_dir,
+        )
     }
 }
 
@@ -623,49 +526,6 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
 }
 
 /// A herdr call whose success prints nothing: `workspace|pane
-/// report-metadata`, `pane run` and `pane send-keys` on the fork build exit 0
-/// with an empty stdout, which `Herdr::call` reads as a failure. An empty
-/// reply with exit 0 is success here; a JSON `error` is still an error. Stand-in
-/// until `Herdr::call` accepts it (left for the reviewer).
-pub fn herdr_quiet(
-    ctx: &Ctx,
-    herdr: &crate::herdr::Herdr,
-    args: &[&str],
-    timeout: std::time::Duration,
-) -> std::result::Result<(), crate::herdr::HerdrError> {
-    let cmd = herdr.cmd(timeout).args(args.iter().copied());
-    let fail = |code: &str, message: String| crate::herdr::HerdrError {
-        code: code.into(),
-        message,
-    };
-    let out = ctx
-        .runner
-        .run(&cmd)
-        .map_err(|e| fail("unreachable", format!("{e:#}")))?;
-    if out.timed_out {
-        return Err(fail(
-            "timeout",
-            format!("`herdr {}` timed out", args.join(" ")),
-        ));
-    }
-    let reply = [&out.stdout, &out.stderr]
-        .into_iter()
-        .find_map(|t| serde_json::from_str::<serde_json::Value>(t.trim()).ok());
-    if let Some(error) = reply.as_ref().and_then(|r| r.get("error")) {
-        return Err(fail(
-            error["code"].as_str().unwrap_or("failed"),
-            error["message"].as_str().unwrap_or("").to_string(),
-        ));
-    }
-    if out.success() {
-        return Ok(());
-    }
-    Err(fail(
-        "failed",
-        format!("`herdr {}`: {}", args.join(" "), out.error_text()),
-    ))
-}
-
 /// Agent-plane workspace tokens `round` and `branch`, no TTL (restored by the
 /// fork's `[session] restore_tokens`). Best effort: the record is the authority.
 fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
@@ -678,9 +538,7 @@ fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
     let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &coord.socket, ctx.runner);
     let round = format!("round={}", record.round);
     let branch = format!("branch={}", record.branch);
-    if let Err(e) = herdr_quiet(
-        ctx,
-        &herdr,
+    if let Err(e) = herdr.call(
         &[
             "workspace",
             "report-metadata",
@@ -2376,36 +2234,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod quiet_tests {
-    use std::time::Duration;
-
-    use crate::runner::fake::{fail, ok};
-    use crate::scenarios::World;
-
-    #[test]
-    fn an_empty_reply_with_exit_zero_is_success_and_an_error_reply_is_not() {
-        let world = World::new();
-        world.runner.on("pane run w1:p1", ok(""));
-        world.runner.on(
-            "agent send-keys",
-            fail(
-                1,
-                r#"{"error":{"code":"agent_not_found","message":"agent target w1:p1 not found"}}"#,
-            ),
-        );
-        world.runner.on("pane send-keys", fail(1, ""));
-        let ctx = world.ctx();
-        let h = crate::herdr::Herdr::new("herdr", "/nonexistent.sock", ctx.runner);
-        let t = Duration::from_secs(1);
-        assert!(super::herdr_quiet(&ctx, &h, &["pane", "run", "w1:p1", "echo"], t).is_ok());
-        // `Herdr::call` reads the same empty success as a failure.
-        assert!(h.call(&["pane", "run", "w1:p1", "echo"], t).is_err());
-        let e =
-            super::herdr_quiet(&ctx, &h, &["agent", "send-keys", "w1:p1", "esc"], t).unwrap_err();
-        assert_eq!(e.code, "agent_not_found");
-        let e =
-            super::herdr_quiet(&ctx, &h, &["pane", "send-keys", "w1:p1", "esc"], t).unwrap_err();
-        assert_eq!(e.code, "failed");
-    }
-}
