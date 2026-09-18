@@ -7,6 +7,12 @@ mod coordinator;
 mod doctor;
 mod herdr;
 mod inbox;
+// ade-picker begin
+#[allow(dead_code)]
+mod jev;
+#[allow(dead_code)]
+mod launch;
+// ade-picker end
 mod lifecycle;
 mod overview;
 mod paths;
