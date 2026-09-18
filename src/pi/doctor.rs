@@ -589,12 +589,9 @@ fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row 
         .stdout
         .lines()
         .chain(output.stderr.lines())
-        .filter_map(|line| {
-            line.trim()
-                .split(" is ")
-                .nth(1)
-                .map(|p| p.trim().to_string())
-        })
+        // Only `pi is ...` lines: a login shell's rc files may print their
+        // own lines, and one with " is " in it is not a resolution of pi.
+        .filter_map(|line| line.trim().strip_prefix("pi is ").map(|p| p.trim().to_string()))
         .filter(|p| !p.is_empty())
         .collect();
     let first = list.first().cloned().unwrap_or_default();
@@ -790,6 +787,30 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("[ok  ] Cursor")), "{text:?}");
         assert!(!text.iter().any(|l| l.contains("[FAIL]")), "{text:?}");
         assert!(healthy(&rows));
+    }
+
+    #[test]
+    fn login_shell_chatter_is_not_a_pi_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[]);
+        link_into(&env, &layout);
+        let link = env.home.join(".local/bin/pi");
+        let runner = FakeRunner::new();
+        runner.on(
+            "zsh -lic whence -va pi",
+            ok(&format!(
+                "fnm: this shell is ready\npi is {}\n",
+                link.display()
+            )),
+        );
+        assert_eq!(wrapper_path_row(&runner, &env, &layout).level, Level::Ok);
+        let runner = FakeRunner::new();
+        runner.on(
+            "zsh -lic whence -va pi",
+            ok(&format!("pi is /opt/homebrew/bin/pi\npi is {}\n", link.display())),
+        );
+        assert_eq!(wrapper_path_row(&runner, &env, &layout).level, Level::Fail);
     }
 
     #[test]
