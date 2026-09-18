@@ -1859,6 +1859,22 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
     }
 
     #[test]
+    fn every_call_counts_against_the_daily_cap_once() {
+        let (world, project, task) = world("shadow", "read the vendor pages");
+        with_help(&world);
+        // A 429 then a 429: two attempts, one call.
+        single_response(&world, "{}\n429");
+        let launch = run(&world, &project, &task).unwrap();
+        assert_eq!(launch.fallback.as_deref(), Some("http_429"));
+        assert_eq!(world.runner.count("/usr/bin/curl"), 2);
+        let day = jiff::Timestamp::now().as_second() / 86_400;
+        let path = project.dir().join(format!(".state/jev-calls/{day}.count"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+        run(&world, &project, &task).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "2");
+    }
+
+    #[test]
     fn the_daily_cap_stops_the_call() {
         let (world, project, task) = world("shadow", "read the vendor pages");
         with_help(&world);
