@@ -375,7 +375,16 @@ live_pro() {
   echo "NOT-RUN: needs a logged-in ChatGPT Pro pane; start it with pro-mcp start --name pro --parent <coordinator pane>, then dialogue start/critic/turn/commit"
 }
 
-live_kind_claude() { need_verb "thread start" "--role" A1 || return; echo "NOT-RUN: covered by row 2's claude lane once it passes"; }
+live_kind_claude() {
+  need_verb "thread start" "--role" A1 || return
+  [ -s "$ACC_DIR/lanes.txt" ] || { echo "NOT-RUN: row 2 did not start lanes"; return; }
+  for id in $(cat "$ACC_DIR/lanes.txt"); do
+    t="$HERDR_ADE_ROOT/acc/threads/$id.toml"
+    grep -q '^bootstrap = "acknowledged"' "$t" || { echo "$id: no receipt"; return; }
+    sed -n '/^\[launch\]/,/^\[/p' "$t" | grep -q '^kind = "claude"' || { echo "$id: not a claude lane"; return; }
+  done
+  echo PASS
+}
 live_kind_cursor() { echo "NOT-RUN: no Cursor pane in the reviewer's throwaway (brief); Cursor's row runs on install day"; }
 live_kind_other() { echo "NOT-RUN: unqualified kind, not started this round"; }
 
