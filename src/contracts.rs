@@ -1,0 +1,616 @@
+//! Shared ADE record types. Every field is named in SPEC-ADE; none is added.
+
+use serde::{Deserialize, Serialize};
+
+/// Day-one roles in `~/.config/herdr-ade/config.toml` (SPEC-ADE D2).
+pub const DAY_ONE_ROLES: [&str; 6] = [
+    "coordinator",
+    "lane",
+    "reviewer",
+    "critic",
+    "drafter",
+    "pro",
+];
+
+/// Launch recipe stored on the thread, never rebuilt from mutable settings
+/// (SPEC-ADE D2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LaunchRecipe {
+    pub kind: String,
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub ready_timeout_ms: u64,
+    pub policy_hash: String,
+    pub attempt: u32,
+    pub brief_hash: String,
+}
+
+/// Process identity from `pane process-info` once the agent is ready
+/// (SPEC-ADE D3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub argv0: String,
+}
+
+/// Identity binding compared on live reads. `terminal_id` is never stored
+/// or compared (SPEC-ADE D3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IdentityBinding {
+    pub socket: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub cwd: String,
+    /// Absent on an adopted thread (SPEC-ADE D3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
+}
+
+/// ADE fields on a thread record: role, launch, attempt, partial, bootstrap,
+/// plain, identity binding (SPEC-ADE D2, D3, D4, D14, D17 item 6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ThreadRecord {
+    pub role: String,
+    pub launch: LaunchRecipe,
+    pub attempt: u32,
+    /// Set to the failed step on a partial create or remove (SPEC-ADE D4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<String>,
+    /// `"acknowledged"` after a matching bootstrap call (SPEC-ADE D14).
+    #[serde(default)]
+    pub bootstrap: String,
+    pub plain: String,
+    pub identity: IdentityBinding,
+}
+
+/// One `[roles.<name>]` row (SPEC-ADE D2). Unknown fields are refused.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub ready_timeout_ms: u64,
+}
+
+/// The roles table (SPEC-ADE D2). Arrays replace, never merge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RolesTable {
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<String, RoleSpec>,
+}
+
+/// `done` or `waiting` (SPEC-ADE D5).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpKind {
+    Done,
+    Waiting,
+}
+
+/// Complete requested payload stored at reserve so a later seal needs no
+/// helper memory (SPEC-ADE D5, item 32).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Requested {
+    Done { sha: String, report_path: String },
+    Waiting { text: String },
+}
+
+/// Coordinator pane and attempt that must receive the sealed event
+/// (SPEC-ADE D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Recipient {
+    pub pane: String,
+    pub coordinator_attempt: u32,
+}
+
+/// Op state machine (SPEC-ADE D5).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpState {
+    Reserved,
+    Staged,
+    Sealed,
+    Abandoned,
+}
+
+/// `ops/<op id>.toml`. Op id is `<thread>-<attempt>-<n>`. The event id is
+/// this op id, fixed at reserve (SPEC-ADE D5, item 32).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Op {
+    pub op: String,
+    pub revision: u32,
+    pub thread: String,
+    pub attempt: u32,
+    pub kind: OpKind,
+    pub recipient: Recipient,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<String>,
+    pub helper_pid: u32,
+    pub requested: Requested,
+    /// Fixed event id: equal to `op` (SPEC-ADE D5, item 32).
+    pub event: String,
+    pub state: OpState,
+    pub created: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+}
+
+/// Sealed `done` payload (SPEC-ADE D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DonePayload {
+    pub sha: String,
+    pub report_path: String,
+    pub artifact: String,
+}
+
+/// Sealed `waiting` payload (SPEC-ADE D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WaitingPayload {
+    pub text: String,
+}
+
+/// Tagged event payload: `payload.done` or `payload.waiting` (SPEC-ADE D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EventPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<DonePayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<WaitingPayload>,
+}
+
+/// Immutable sealed event `events/<event id>.toml` (SPEC-ADE D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Event {
+    pub id: String,
+    pub op: String,
+    pub thread: String,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<String>,
+    pub recipient: Recipient,
+    pub created: String,
+    pub payload: EventPayload,
+}
+
+/// Delivery journal states appended to `deliveries/<event id>.jsonl`
+/// (SPEC-ADE D5).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Submitted,
+    Acknowledged,
+    Handled,
+}
+
+/// One line of the delivery journal (SPEC-ADE D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryLine {
+    pub event: String,
+    pub state: DeliveryState,
+}
+
+/// Durable `asks/<ask id>.toml` written before any publication
+/// (SPEC-ADE D17 item 4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Ask {
+    pub id: String,
+    pub revision: u32,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<String>,
+    pub question: String,
+    pub choices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub what: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub means: Option<String>,
+    pub asked: String,
+    pub coordinator_binding: String,
+}
+
+/// The only values `publish()` accepts (SPEC-ADE D17 item 3, item 35).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanMessage {
+    Say {
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        means: Option<String>,
+    },
+    Ask {
+        id: String,
+        revision: u32,
+    },
+    Notice {
+        id: String,
+    },
+}
+
+/// Completion pin projected onto a manifest member from a sealed `done`
+/// event (SPEC-ADE D6, item 33).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CompletionPin {
+    pub event: String,
+    pub attempt: u32,
+    pub sha: String,
+    pub artifact: String,
+}
+
+/// One admitted lane in the round manifest (SPEC-ADE D6, item 33).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManifestMember {
+    pub thread: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<CompletionPin>,
+}
+
+/// Authoritative admitted set. Membership is never inferred from completions
+/// (SPEC-ADE D6, item 33).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AdmissionManifest {
+    pub revision: u64,
+    #[serde(default)]
+    pub members: Vec<ManifestMember>,
+}
+
+/// `.state/rounds/r<n>.toml` (SPEC-ADE D6, item 33).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RoundRecord {
+    pub round: String,
+    pub branch: String,
+    pub plain: String,
+    #[serde(default)]
+    pub gates: Vec<String>,
+    pub policy_hash: String,
+    pub manifest: AdmissionManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
+}
+
+/// Checkpoint intent bound to `V` and the HANDOFF payload hash
+/// (SPEC-ADE D6, item 34).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CheckpointIntent {
+    pub parent: String,
+    pub op: String,
+    pub payload_hash: String,
+}
+
+/// Merge transaction phase (SPEC-ADE D6, item 34).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MergePhase {
+    Intent,
+    Merged,
+    Checkpointed,
+    MergeDiverged,
+}
+
+/// `.state/rounds/r<n>/merge.toml` (SPEC-ADE D6, item 34).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeIntent {
+    pub op: String,
+    pub expected_old: String,
+    pub candidate: String,
+    pub verdict: String,
+    pub phase: MergePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+}
+
+/// Talk inbound request states (SPEC-ADE D18 item 2, item 35).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TalkRequestState {
+    Queued,
+    Submitted,
+    Uncertain,
+    Accepted,
+}
+
+/// `inbound { request, state }` on the talk journal (SPEC-ADE D18 item 2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TalkInbound {
+    pub request: String,
+    pub state: TalkRequestState,
+    pub recipient: Recipient,
+}
+
+/// One JSON object on `talk/journal.jsonl` (SPEC-ADE D18 items 2 and 6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TalkJournalRecord {
+    pub seq: u64,
+    pub inbound: TalkInbound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn json_roundtrip<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(value).unwrap();
+        let back: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(&back, value, "{json}");
+    }
+
+    fn toml_roundtrip<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let text = toml::to_string(value).unwrap();
+        let back: T = toml::from_str(&text).unwrap();
+        assert_eq!(&back, value, "{text}");
+    }
+
+    fn both<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        json_roundtrip(value);
+        toml_roundtrip(value);
+    }
+
+    #[test]
+    fn thread_record_roundtrip() {
+        both(&ThreadRecord {
+            role: "lane".into(),
+            launch: LaunchRecipe {
+                kind: "cursor".into(),
+                args: vec!["--force".into()],
+                env: vec!["HERDR_ADE_LAUNCH=demo/t-0001/1/abcd".into()],
+                ready_timeout_ms: 20_000,
+                policy_hash: "aa".into(),
+                attempt: 1,
+                brief_hash: "bb".into(),
+            },
+            attempt: 1,
+            partial: Some("tab_create".into()),
+            bootstrap: "acknowledged".into(),
+            plain: "The lane writes the shared types.".into(),
+            identity: IdentityBinding {
+                socket: "/tmp/a.sock".into(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t2".into(),
+                pane_id: "w1:p2".into(),
+                cwd: "/wt".into(),
+                agent_name: Some("hp-demo-t-0001".into()),
+                process: Some(ProcessIdentity {
+                    pid: 9,
+                    argv0: "cursor-agent".into(),
+                }),
+                agent_session: Some("s1".into()),
+            },
+        });
+    }
+
+    #[test]
+    fn roles_table_roundtrip_and_unknown_field_refused() {
+        let mut table = RolesTable::default();
+        table.roles.insert(
+            "lane".into(),
+            RoleSpec {
+                kind: "claude".into(),
+                args: vec!["--dangerously-skip-permissions".into()],
+                env: vec!["DSH_TUI_LANG=en".into()],
+                ready_timeout_ms: 20_000,
+            },
+        );
+        both(&table);
+        let err = toml::from_str::<RoleSpec>("kind = \"claude\"\nbootstrap = true\n").unwrap_err();
+        assert!(err.to_string().contains("bootstrap"), "{err}");
+        assert_eq!(
+            DAY_ONE_ROLES,
+            [
+                "coordinator",
+                "lane",
+                "reviewer",
+                "critic",
+                "drafter",
+                "pro"
+            ]
+        );
+    }
+
+    #[test]
+    fn op_and_event_roundtrip() {
+        let op = Op {
+            op: "t-0001-1-1".into(),
+            revision: 2,
+            thread: "t-0001".into(),
+            attempt: 1,
+            kind: OpKind::Done,
+            recipient: Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            round: Some("r1".into()),
+            helper_pid: 4242,
+            requested: Requested::Done {
+                sha: "abc".into(),
+                report_path: ".reports/a.md".into(),
+            },
+            event: "t-0001-1-1".into(),
+            state: OpState::Staged,
+            created: "2026-09-18T00:00:00Z".into(),
+            artifact: Some("deadbeef".into()),
+        };
+        both(&op);
+        both(&Event {
+            id: op.op.clone(),
+            op: op.op.clone(),
+            thread: op.thread.clone(),
+            attempt: op.attempt,
+            round: op.round.clone(),
+            recipient: op.recipient.clone(),
+            created: op.created.clone(),
+            payload: EventPayload {
+                done: Some(DonePayload {
+                    sha: "abc".into(),
+                    report_path: ".reports/a.md".into(),
+                    artifact: "deadbeef".into(),
+                }),
+                waiting: None,
+            },
+        });
+        both(&Event {
+            id: "t-0002-1-1".into(),
+            op: "t-0002-1-1".into(),
+            thread: "t-0002".into(),
+            attempt: 1,
+            round: None,
+            recipient: Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            created: "2026-09-18T00:00:00Z".into(),
+            payload: EventPayload {
+                done: None,
+                waiting: Some(WaitingPayload {
+                    text: "need a look".into(),
+                }),
+            },
+        });
+    }
+
+    #[test]
+    fn delivery_line_roundtrip() {
+        json_roundtrip(&DeliveryLine {
+            event: "t-0001-1-1".into(),
+            state: DeliveryState::Submitted,
+        });
+        json_roundtrip(&DeliveryLine {
+            event: "t-0001-1-1".into(),
+            state: DeliveryState::Acknowledged,
+        });
+        json_roundtrip(&DeliveryLine {
+            event: "t-0001-1-1".into(),
+            state: DeliveryState::Handled,
+        });
+    }
+
+    #[test]
+    fn ask_and_human_message_roundtrip() {
+        both(&Ask {
+            id: "a-1".into(),
+            revision: 1,
+            project: "demo".into(),
+            round: Some("r1".into()),
+            question: "keep the experiment running another hour?".into(),
+            choices: vec!["keep it running another hour".into(), "stop it now".into()],
+            what: Some("A lane is waiting.".into()),
+            means: Some("You choose whether it continues.".into()),
+            asked: "2026-09-18T00:00:00Z".into(),
+            coordinator_binding: "w1:p1".into(),
+        });
+        json_roundtrip(&HumanMessage::Say {
+            what: "A lane is done.".into(),
+            means: None,
+        });
+        json_roundtrip(&HumanMessage::Ask {
+            id: "a-1".into(),
+            revision: 1,
+        });
+        json_roundtrip(&HumanMessage::Notice {
+            id: "plain_exhausted".into(),
+        });
+    }
+
+    #[test]
+    fn round_merge_checkpoint_and_talk_roundtrip() {
+        both(&RoundRecord {
+            round: "r1".into(),
+            branch: "main".into(),
+            plain: "The first round lands the contracts.".into(),
+            gates: vec!["cargo test --locked".into()],
+            policy_hash: "cc".into(),
+            manifest: AdmissionManifest {
+                revision: 2,
+                members: vec![ManifestMember {
+                    thread: "t-0001".into(),
+                    pin: Some(CompletionPin {
+                        event: "t-0001-1-1".into(),
+                        attempt: 1,
+                        sha: "abc".into(),
+                        artifact: "deadbeef".into(),
+                    }),
+                }],
+            },
+            expected_head: Some("bbb".into()),
+            manifest_hash: Some("mh".into()),
+        });
+        both(&MergeIntent {
+            op: "merge-r1".into(),
+            expected_old: "B".into(),
+            candidate: "C".into(),
+            verdict: "V".into(),
+            phase: MergePhase::Merged,
+            checkpoint: Some(CheckpointIntent {
+                parent: "V".into(),
+                op: "merge-r1".into(),
+                payload_hash: "hh".into(),
+            }),
+            head: None,
+        });
+        json_roundtrip(&TalkJournalRecord {
+            seq: 3,
+            inbound: TalkInbound {
+                request: "req-1".into(),
+                state: TalkRequestState::Queued,
+                recipient: Recipient {
+                    pane: "w1:p1".into(),
+                    coordinator_attempt: 1,
+                },
+            },
+        });
+        json_roundtrip(&TalkJournalRecord {
+            seq: 4,
+            inbound: TalkInbound {
+                request: "req-1".into(),
+                state: TalkRequestState::Uncertain,
+                recipient: Recipient {
+                    pane: "w1:p1".into(),
+                    coordinator_attempt: 1,
+                },
+            },
+        });
+        json_roundtrip(&TalkJournalRecord {
+            seq: 5,
+            inbound: TalkInbound {
+                request: "req-1".into(),
+                state: TalkRequestState::Submitted,
+                recipient: Recipient {
+                    pane: "w1:p1".into(),
+                    coordinator_attempt: 1,
+                },
+            },
+        });
+        json_roundtrip(&TalkJournalRecord {
+            seq: 6,
+            inbound: TalkInbound {
+                request: "req-1".into(),
+                state: TalkRequestState::Accepted,
+                recipient: Recipient {
+                    pane: "w1:p1".into(),
+                    coordinator_attempt: 1,
+                },
+            },
+        });
+    }
+}
