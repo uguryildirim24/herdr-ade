@@ -13,6 +13,9 @@ mod paths;
 // ade-pi begin
 #[allow(dead_code)]
 mod pi;
+#[allow(dead_code)]
+#[path = "pi/ade.rs"]
+mod pi_ade;
 // ade-pi end
 #[allow(dead_code)]
 mod plain;
