@@ -1,0 +1,135 @@
+//! Per-kind launch, receipt, trap, and correction capability facts.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectionAdapter {
+    ClaudeStop,
+    CursorFollowup,
+    CodexStop,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adapter {
+    pub kind: &'static str,
+    pub receipt: &'static str,
+    pub positive_resend_evidence: &'static str,
+    pub required: &'static str,
+    pub correction: CorrectionAdapter,
+    pub documented_label: &'static str,
+}
+
+pub const ADAPTERS: [Adapter; 7] = [
+    Adapter {
+        kind: "claude",
+        receipt: "ha skill or ha context",
+        positive_resend_evidence: "explicit rejected submission only",
+        required: "coordinator and lane",
+        correction: CorrectionAdapter::ClaudeStop,
+        documented_label: "chat: checked after display; native pane shows the first version",
+    },
+    Adapter {
+        kind: "cursor",
+        receipt: "ha skill",
+        positive_resend_evidence: "observed unsubmitted pasted block for the same attempt",
+        required: "lane and reviewer",
+        correction: CorrectionAdapter::CursorFollowup,
+        documented_label: "chat: follow-up after display",
+    },
+    Adapter {
+        kind: "codex",
+        receipt: "ha skill",
+        positive_resend_evidence: "explicit rejected submission only",
+        required: "no",
+        correction: CorrectionAdapter::CodexStop,
+        documented_label: "chat: checked after display",
+    },
+    Adapter {
+        kind: "opencode",
+        receipt: "ha skill",
+        positive_resend_evidence: "none",
+        required: "no",
+        correction: CorrectionAdapter::None,
+        documented_label: "chat: not checked",
+    },
+    Adapter {
+        kind: "agy",
+        receipt: "ha skill",
+        positive_resend_evidence: "none",
+        required: "no",
+        correction: CorrectionAdapter::None,
+        documented_label: "chat: not checked",
+    },
+    Adapter {
+        kind: "chatgpt",
+        receipt: "artifact event from passive adoption",
+        positive_resend_evidence: "none",
+        required: "Pro attack turns",
+        correction: CorrectionAdapter::None,
+        documented_label: "chat: not checked",
+    },
+    Adapter {
+        kind: "dsh",
+        receipt: "ha skill",
+        positive_resend_evidence: "none",
+        required: "no",
+        correction: CorrectionAdapter::None,
+        documented_label: "chat: not checked",
+    },
+];
+
+pub fn get(kind: &str) -> Option<&'static Adapter> {
+    ADAPTERS.iter().find(|adapter| adapter.kind == kind)
+}
+
+/// Capability labels are evidence-based. Installation alone never promotes a
+/// row; acceptance writes the project-local qualification marker after its
+/// installed-CLI test passes.
+pub fn capability_label(project: &crate::project::Project, kind: &str) -> &'static str {
+    let _adapter = get(kind);
+    let qualified = project
+        .state_dir()
+        .join("capabilities")
+        .join(format!("{kind}.qualified"))
+        .is_file();
+    match (kind, qualified) {
+        ("claude", true) => {
+            "surface mediated; native chat checked after display; native pane shows the first version"
+        }
+        ("cursor", true) => "surface mediated; native chat gets a follow-up after display",
+        ("codex", true) => "surface mediated; native chat checked after display",
+        _ => "capability: unqualified; chat: shown only through say and ask",
+    }
+}
+
+/// An empty composer is ambiguous. Only the kind-specific positive evidence
+/// listed by D15 permits a retry of the same bootstrap attempt.
+#[allow(dead_code)] // A1 calls this from its bootstrap retry decision
+pub fn may_retry_bootstrap(kind: &str, evidence: &str) -> bool {
+    matches!(
+        (kind, evidence),
+        ("claude" | "codex", "submission-rejected") | ("cursor", "unsubmitted-pasted-block")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_has_the_seven_declared_kinds() {
+        assert_eq!(
+            ADAPTERS.map(|adapter| adapter.kind),
+            [
+                "claude", "cursor", "codex", "opencode", "agy", "chatgpt", "dsh"
+            ]
+        );
+    }
+
+    #[test]
+    fn resend_requires_positive_kind_specific_evidence() {
+        assert!(!may_retry_bootstrap("cursor", "empty-composer"));
+        assert!(may_retry_bootstrap("cursor", "unsubmitted-pasted-block"));
+        assert!(may_retry_bootstrap("codex", "submission-rejected"));
+        assert!(!may_retry_bootstrap("agy", "submission-rejected"));
+    }
+}

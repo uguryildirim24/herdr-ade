@@ -16,6 +16,8 @@ pub struct Item {
     pub subject: String,
     pub created: String,
     pub summary: String,
+    /// Sealed event id when this item is a delivery projection.
+    pub event: String,
     /// Empty except for `routine` items.
     #[serde(skip)]
     pub body: String,
@@ -27,7 +29,9 @@ fn inbox_dir(project: &Project) -> PathBuf {
 
 fn parse(text: &str) -> Option<Item> {
     let rest = text.strip_prefix("+++\n")?;
-    let (front, body) = rest.split_once("\n+++\n").or_else(|| Some((rest.strip_suffix("\n+++")?, "")))?;
+    let (front, body) = rest
+        .split_once("\n+++\n")
+        .or_else(|| Some((rest.strip_suffix("\n+++")?, "")))?;
     let mut item: Item = toml::from_str(front).ok()?;
     item.body = body.trim_matches('\n').to_string();
     Some(item)
@@ -37,22 +41,40 @@ fn parse(text: &str) -> Option<Item> {
 pub fn safe_subject(subject: &str) -> String {
     let cleaned: String = subject
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .take(40)
         .collect();
     let cleaned = cleaned.trim_matches('-').to_string();
-    if cleaned.is_empty() { "item".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        "item".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Writes one item. The id is `<UTC timestamp>-<kind>-<subject>-<n>`, where
 /// `<n>` is a counter allocated under the project lock, so two events in one
 /// tick never share a name. `body` is empty except for `routine` items.
-pub fn write(project: &Project, kind: &str, subject: &str, summary: &str, body: &str) -> Result<String> {
+pub fn write(
+    project: &Project,
+    kind: &str,
+    subject: &str,
+    summary: &str,
+    body: &str,
+) -> Result<String> {
     let _lock = project.lock()?;
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     project::write_json(&counter_path, &n)?;
-    let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+    let stamp = jiff::Timestamp::now()
+        .strftime("%Y%m%dT%H%M%SZ")
+        .to_string();
     let id = format!("{stamp}-{kind}-{}-{n}", safe_subject(subject));
     let item = Item {
         id: id.clone(),
@@ -60,7 +82,11 @@ pub fn write(project: &Project, kind: &str, subject: &str, summary: &str, body: 
         subject: subject.to_string(),
         created: project::now(),
         // One line, no control characters: summaries are printed in the digest.
-        summary: summary.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
+        summary: summary
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect(),
+        event: String::new(),
         body: String::new(),
     };
     let mut text = format!("+++\n{}+++\n", toml::to_string(&item)?);
@@ -69,7 +95,57 @@ pub fn write(project: &Project, kind: &str, subject: &str, summary: &str, body: 
         text.push_str(body.trim_end());
         text.push('\n');
     }
-    project::write_atomic(&inbox_dir(project).join(format!("{id}.md")), text.as_bytes())?;
+    project::write_atomic(
+        &inbox_dir(project).join(format!("{id}.md")),
+        text.as_bytes(),
+    )?;
+    Ok(id)
+}
+
+/// Writes the one stable inbox projection for a sealed event. A retry observes
+/// the existing item instead of allocating a second counter id.
+pub fn write_event(
+    project: &Project,
+    event: &crate::contracts::Event,
+    kind: &str,
+    summary: &str,
+) -> Result<String> {
+    let _lock = project.lock()?;
+    let id = if kind == "recipient-changed" {
+        format!("recipient-changed-{}", event.id)
+    } else {
+        format!("event-{}", event.id)
+    };
+    validate_id(&id)?;
+    let path = inbox_dir(project).join(format!("{id}.md"));
+    if path.exists()
+        || inbox_dir(project)
+            .join("done")
+            .join(format!("{id}.md"))
+            .exists()
+    {
+        return Ok(id);
+    }
+    let item = Item {
+        id: id.clone(),
+        kind: kind.to_string(),
+        subject: event.thread.clone(),
+        created: project::now(),
+        summary: summary
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect(),
+        event: event.id.clone(),
+        body: String::new(),
+    };
+    let text = format!("+++\n{}+++\n", toml::to_string(&item)?);
+    project::write_atomic(&path, text.as_bytes())?;
     Ok(id)
 }
 
@@ -125,6 +201,38 @@ pub fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
     project::write_json(&project.state_dir().join("inbox-seen.json"), &all)
 }
 
+/// A context read acknowledges only events shown to their exact coordinator
+/// pane and attempt. `--peek` never calls this function.
+pub fn acknowledge_events(
+    project: &Project,
+    ids: &[String],
+    pane: &str,
+    coordinator_attempt: u32,
+) -> Result<()> {
+    for item in unhandled(project)
+        .into_iter()
+        .filter(|item| ids.contains(&item.id) && !item.event.is_empty())
+    {
+        let event = crate::events::load(project, &item.event)?;
+        let binding_matches = if item.kind == "recipient-changed" {
+            project.coordinator().is_some_and(|record| {
+                record.pane_id == pane && record.launch_attempts.max(1) == coordinator_attempt
+            })
+        } else {
+            event.recipient.pane == pane
+                && event.recipient.coordinator_attempt == coordinator_attempt
+        };
+        if binding_matches {
+            crate::events::append_delivery(
+                project,
+                &event.id,
+                crate::contracts::DeliveryState::Acknowledged,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// An item id is also a file name, so it is checked before any path is built.
 fn validate_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
@@ -139,7 +247,18 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 /// Moves items to `inbox/done/`. Returns how many moved.
+#[allow(dead_code)] // compatibility wrapper used by existing callers and tests
 pub fn done(project: &Project, ids: &[String], all: bool) -> Result<usize> {
+    done_bound(project, ids, all, None)
+}
+
+/// Handles event-linked items only when the caller is their bound coordinator.
+pub fn done_bound(
+    project: &Project,
+    ids: &[String],
+    all: bool,
+    binding: Option<(&str, u32)>,
+) -> Result<usize> {
     let ids: Vec<String> = if all {
         unhandled(project).into_iter().map(|i| i.id).collect()
     } else {
@@ -157,7 +276,37 @@ pub fn done(project: &Project, ids: &[String], all: bool) -> Result<usize> {
             eprintln!("no unhandled item `{id}`");
             continue;
         }
+        let item = std::fs::read_to_string(&from)
+            .ok()
+            .and_then(|text| parse(&text));
+        if let Some(item) = &item
+            && !item.event.is_empty()
+        {
+            let event = crate::events::load(project, &item.event)?;
+            let Some((pane, attempt)) = binding else {
+                bail!("coordinator_binding_required: event item `{id}` needs its coordinator");
+            };
+            let binding_matches = if item.kind == "recipient-changed" {
+                project.coordinator().is_some_and(|record| {
+                    record.pane_id == pane && record.launch_attempts.max(1) == attempt
+                })
+            } else {
+                event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt
+            };
+            if !binding_matches {
+                bail!("coordinator_binding_mismatch: event item `{id}` belongs to another binding");
+            }
+        }
         std::fs::rename(&from, dir.join("done").join(format!("{id}.md")))?;
+        if let Some(item) = item
+            && !item.event.is_empty()
+        {
+            crate::events::append_delivery_locked(
+                project,
+                &item.event,
+                crate::contracts::DeliveryState::Handled,
+            )?;
+        }
         moved += 1;
     }
     Ok(moved)
@@ -190,7 +339,12 @@ mod tests {
 
         assert_eq!(done(&project, &[items[0].id.clone()], false).unwrap(), 1);
         assert_eq!(unhandled(&project).len(), 1);
-        assert!(inbox_dir(&project).join("done").join(format!("{}.md", items[0].id)).is_file());
+        assert!(
+            inbox_dir(&project)
+                .join("done")
+                .join(format!("{}.md", items[0].id))
+                .is_file()
+        );
         assert_eq!(done(&project, &[], true).unwrap(), 1);
         assert!(unhandled(&project).is_empty());
     }
@@ -218,8 +372,18 @@ mod tests {
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let id = write(&project, "outage", "Elias MacBook/../x", "down", "").unwrap();
         assert!(id.contains("-outage-elias-macbook----x-"), "{id}");
-        write(&project, "routine", "nightly", "due", "Check the build.\n\n```\nout\n```").unwrap();
-        let routine = unhandled(&project).into_iter().find(|i| i.kind == "routine").unwrap();
+        write(
+            &project,
+            "routine",
+            "nightly",
+            "due",
+            "Check the build.\n\n```\nout\n```",
+        )
+        .unwrap();
+        let routine = unhandled(&project)
+            .into_iter()
+            .find(|i| i.kind == "routine")
+            .unwrap();
         assert!(routine.body.starts_with("Check the build."));
         assert!(routine.body.ends_with("```"));
     }
@@ -231,5 +395,105 @@ mod tests {
         for bad in ["../PROJECT", "a/b", "", ".hidden", "x..y"] {
             assert!(done(&project, &[bad.to_string()], false).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn event_receipts_require_the_bound_coordinator() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let event = crate::contracts::Event {
+            id: "t-0001-1-1".into(),
+            op: "t-0001-1-1".into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 2,
+            },
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                done: None,
+                waiting: Some(crate::contracts::WaitingPayload {
+                    text: "wait".into(),
+                }),
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        let item = write_event(&project, &event, "waiting", "lane waits").unwrap();
+
+        // This is the `--peek` behavior: merely listing/showing writes no fact.
+        assert!(
+            crate::events::states(&project, &event.id)
+                .unwrap()
+                .is_empty()
+        );
+        acknowledge_events(&project, std::slice::from_ref(&item), "w1:p2", 2).unwrap();
+        acknowledge_events(&project, std::slice::from_ref(&item), "w1:p1", 1).unwrap();
+        assert!(
+            crate::events::states(&project, &event.id)
+                .unwrap()
+                .is_empty()
+        );
+        acknowledge_events(&project, std::slice::from_ref(&item), "w1:p1", 2).unwrap();
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![crate::contracts::DeliveryState::Acknowledged]
+        );
+        assert!(done_bound(&project, std::slice::from_ref(&item), false, None).is_err());
+        assert_eq!(
+            done_bound(&project, &[item], false, Some(("w1:p1", 2))).unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![
+                crate::contracts::DeliveryState::Acknowledged,
+                crate::contracts::DeliveryState::Handled
+            ]
+        );
+    }
+
+    #[test]
+    fn replacement_coordinator_acknowledges_recipient_changed_item() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        project
+            .update_coordinator(|record| {
+                record.pane_id = "w2:p1".into();
+                record.launch_attempts = 3;
+            })
+            .unwrap();
+        let event = crate::contracts::Event {
+            id: "t-0001-1-1".into(),
+            op: "t-0001-1-1".into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                done: None,
+                waiting: Some(crate::contracts::WaitingPayload {
+                    text: "wait".into(),
+                }),
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        let item = write_event(
+            &project,
+            &event,
+            "recipient-changed",
+            "an earlier event needs review",
+        )
+        .unwrap();
+        acknowledge_events(&project, &[item], "w2:p1", 3).unwrap();
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![crate::contracts::DeliveryState::Acknowledged]
+        );
     }
 }
