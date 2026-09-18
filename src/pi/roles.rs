@@ -114,7 +114,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "opencode-go",
             "muse-spark-1.3-contributor",
             "high",
-            false,
+            true,
             true,
             "the second coding helper",
         ),
@@ -205,7 +205,10 @@ mod tests {
     #[test]
     fn enabled_providers_are_deduped_and_keep_fable_out() {
         let providers = enabled_providers();
-        assert_eq!(providers, vec!["deepseek", "openai-codex", "kimi-coding"]);
+        assert_eq!(
+            providers,
+            vec!["deepseek", "openai-codex", "opencode-go", "kimi-coding"]
+        );
         assert!(!providers.contains(&"cursor"));
     }
 
