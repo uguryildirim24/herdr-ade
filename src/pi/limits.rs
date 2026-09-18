@@ -65,7 +65,15 @@ pub fn classify(message: &str, status: Option<u16>) -> LimitClass {
                 "credentials",
                 "api key",
                 "apikey",
-                "token",
+                // Not bare "token": "maximum context length is 128000
+                // tokens" is not a login problem.
+                "invalid token",
+                "invalid_token",
+                "expired token",
+                "token expired",
+                "token has expired",
+                "refresh token",
+                "access token",
                 "re-login",
                 "relogin",
                 "log in again",
@@ -230,6 +238,14 @@ mod tests {
             LimitClass::Unreachable
         );
         assert_eq!(classify("stream timed out", None), LimitClass::Unreachable);
+        assert_eq!(
+            classify("This model's maximum context length is 128000 tokens", Some(400)),
+            LimitClass::Error
+        );
+        assert_eq!(
+            classify("Failed to refresh OAuth: invalid refresh token", None),
+            LimitClass::Login
+        );
         assert_eq!(classify("something odd", None), LimitClass::Error);
     }
 
