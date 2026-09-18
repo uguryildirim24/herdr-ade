@@ -277,6 +277,9 @@ pub struct RoundRecord {
     pub expected_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<String>,
+    /// When `ha round open` wrote the record; orders `GLOSSARY.md` (A3).
+    #[serde(default)]
+    pub opened: String,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
