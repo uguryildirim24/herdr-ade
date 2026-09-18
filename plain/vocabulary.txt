@@ -26,6 +26,7 @@ delivery
 dialogue
 doctor
 done
+draft
 drafter
 envelope
 event
@@ -44,6 +45,7 @@ journal
 kind
 lane
 lanes
+lookup
 manifest
 means
 merge
@@ -55,6 +57,7 @@ pane
 panes
 parent
 payload
+picker
 pickup
 policy
 process
@@ -79,6 +82,7 @@ sealed
 sentence
 skill
 staged
+strongest
 submitted
 surface
 tab
@@ -97,6 +101,7 @@ turns
 uncertain
 verdict
 waiting
+web
 what
 workspace
 worktree

@@ -15,7 +15,11 @@ mod glossary;
 mod herdr;
 mod hook;
 mod inbox;
+#[allow(dead_code)]
+mod jev;
 mod lane;
+#[allow(dead_code)]
+mod launch;
 mod lifecycle;
 mod ops;
 mod overview;
