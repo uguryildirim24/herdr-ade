@@ -1,4 +1,4 @@
-// herdr-pi-guard:version=1
+// herdr-pi-guard:version=2
 // Plugin-owned pi extension (SPEC-pi v2 §3.7, §3.10). Written by
 // `herdr-pi setup`; doctor checks the marker on the first line.
 //
@@ -99,12 +99,11 @@ export default function (pi) {
     lastStatus = null;
   }
 
+  // An ADE lane (HERDR_ADE_LAUNCH set) runs `ha waiting`. Without it (a
+  // skill-driven lane before ADE lands, or a lane whose tab env was lost on
+  // a server bounce), or when `ha` fails, the parent token is the way.
   async function runWaiting(label, cls, provider) {
     const env = process.env || {};
-    const launch = env.HERDR_ADE_LAUNCH;
-    if (!launch) {
-      return;
-    }
     const now = Date.now();
     const sentAt = lastSentAt.get(cls) || 0;
     if (now - sentAt < THROTTLE_MS) {
@@ -112,13 +111,15 @@ export default function (pi) {
     }
     lastSentAt.set(cls, now);
     const text = `${provider} ${cls}: ${first120(label)}`;
-    try {
-      const result = await pi.exec("ha", ["waiting", text], { timeout: 5000 });
-      if (result && result.code === 0) {
-        return;
+    if (env.HERDR_ADE_LAUNCH) {
+      try {
+        const result = await pi.exec("ha", ["waiting", text], { timeout: 5000 });
+        if (result && result.code === 0) {
+          return;
+        }
+      } catch {
+        // `ha` is not on PATH; fall through to herdr.
       }
-    } catch {
-      // `ha` is not on PATH (before ADE lands); fall through to herdr.
     }
     try {
       await notifyParent(pi, text);
@@ -217,8 +218,8 @@ export default function (pi) {
   });
 }
 
-// Before ADE lands, read this pane's parent token and tell the coordinator
-// through herdr itself (SPEC-pi v2 §3.7).
+// Before ADE lands (no HERDR_ADE_LAUNCH, or no `ha`), read this pane's parent
+// token and tell the coordinator through herdr itself (SPEC-pi v2 §3.7).
 async function notifyParent(pi, text) {
   const paneId = process.env.HERDR_PANE_ID;
   if (!paneId) {
