@@ -188,10 +188,12 @@ pub fn doctor_rows_with(
     rows.push(wrapper_path_row(runner, env, layout));
 
     // prefix isolation: the global npm root must not carry the package.
+    // `npm root -g` prints the folder (for example
+    // `/opt/homebrew/lib/node_modules`); the package is a folder inside it.
     match sh::login_shell(runner, "npm root -g") {
         Ok(output) if output.success() => {
             let global_root = sh::first_line(&output);
-            if global_root.contains(super::PI_PACKAGE) {
+            if Path::new(&global_root).join(super::PI_PACKAGE).exists() {
                 rows.push(Row::fail(
                     "prefix",
                     format!(
@@ -730,7 +732,7 @@ mod tests {
         runner.on("zsh -lic command -v npm", ok("/opt/homebrew/bin/npm\n"));
         runner.on(
             "zsh -lic npm root -g",
-            ok("/opt/homebrew/lib/node_modules\n"),
+            ok(&format!("{}\n", env.home.join("global/node_modules").display())),
         );
         runner.on(
             "zsh -lic whence -va pi",
@@ -835,6 +837,33 @@ mod tests {
             text.iter().any(|l| l.contains("[ok  ] provider opencode")),
             "{text:?}"
         );
+    }
+
+    /// T9: a global install of the package is a failure; the root's path
+    /// string never contains the package name, so the folder is what counts.
+    #[test]
+    fn a_global_install_of_the_package_fails_the_prefix_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::for_test(dir.path(), &[]);
+        let layout = installed_layout(dir.path());
+        link_into(&env, &layout);
+        let runner = scripted(&env);
+        let prefix = |runner: &FakeRunner| {
+            doctor_rows_with(&env, &layout, runner, &[])
+                .into_iter()
+                .find(|r| r.label == "prefix")
+                .unwrap()
+        };
+        assert_eq!(prefix(&runner).level, Level::Ok);
+        std::fs::create_dir_all(
+            env.home
+                .join("global/node_modules")
+                .join(crate::pi::PI_PACKAGE),
+        )
+        .unwrap();
+        let row = prefix(&runner);
+        assert_eq!(row.level, Level::Fail, "{row:?}");
+        assert!(row.detail.contains("global npm root"));
     }
 
     #[test]
