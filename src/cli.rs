@@ -147,8 +147,34 @@ enum Command {
         #[command(subcommand)]
         command: SafetyCommand,
     },
-    /// Print the coordinator skill
-    Skill,
+    // ade-outbox begin
+    /// Seal and deliver this lane's completion
+    Done {
+        #[arg(long, value_name = "PATH")]
+        report: String,
+        #[arg(long)]
+        sha: String,
+    },
+    /// Seal and deliver why this lane must wait
+    Waiting { what: String },
+    /// Print a role skill and the runtime-only standing rules
+    Skill {
+        #[arg(default_value = "coordinator")]
+        role: String,
+    },
+    /// Retire a coordinator binding and remove its owned hook
+    Close { slug: String },
+    /// Plain-language checking and native correction hooks
+    Plain {
+        #[command(subcommand)]
+        command: PlainCommand,
+    },
+    /// Spec dialogue registration; ade-rounds supplies the implementation
+    Dialogue {
+        #[command(subcommand)]
+        command: DialogueCommand,
+    },
+    // ade-outbox end
     /// Check the setup: versions, tools, root, ticker and each project's session
     Doctor {
         #[command(flatten)]
@@ -276,6 +302,41 @@ enum TickerCommand {
     Status,
 }
 
+// ade-outbox begin
+#[derive(Subcommand)]
+enum PlainCommand {
+    /// Check text using the deterministic identifier and vocabulary rules
+    Check {
+        #[arg(long, value_name = "FILE")]
+        text_file: String,
+    },
+    /// Native CLI end-of-turn hook
+    #[command(hide = true)]
+    Hook {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        binding: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DialogueCommand {
+    /// Start a specification dialogue
+    Start {
+        topic: String,
+        #[arg(long)]
+        drafter: String,
+        #[arg(long)]
+        critic: String,
+        #[arg(long)]
+        plain: Option<String>,
+    },
+}
+// ade-outbox end
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let env = Env::from_process()?;
@@ -360,7 +421,13 @@ pub fn run() -> Result<()> {
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
                 let project = Project::load(&ctx.root, &slug)?;
-                let moved = inbox::done(&project, &ids, all)?;
+                let record = project.coordinator();
+                let pane = std::env::var("HERDR_PANE_ID").ok();
+                let binding = record.as_ref().and_then(|record| {
+                    pane.as_deref()
+                        .map(|pane| (pane, record.launch_attempts.max(1)))
+                });
+                let moved = inbox::done_bound(&project, &ids, all, binding)?;
                 println!("{moved} item(s) moved to inbox/done");
                 Ok(())
             }
@@ -510,10 +577,53 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
-        Command::Skill => {
-            print!("{}", include_str!("../skill/COORDINATOR.md"));
-            Ok(())
-        }
+        // ade-outbox begin
+        Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
+        Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
+        Command::Skill { role } => crate::lane::skill(&ctx, &role),
+        Command::Close { slug } => crate::coordinator::close(&ctx, &slug),
+        Command::Plain { command } => match command {
+            PlainCommand::Check { text_file } => {
+                let text = read_text(&text_file)?;
+                let result = crate::plain::check(&text, &crate::plain::Glossary::default());
+                if result.passed() {
+                    println!("pass");
+                    Ok(())
+                } else {
+                    for violation in result.violations {
+                        eprintln!(
+                            "{} {}..{}: {}",
+                            violation.rule.code(),
+                            violation.span.start,
+                            violation.span.end,
+                            violation.fix
+                        );
+                    }
+                    bail!("plain check failed")
+                }
+            }
+            PlainCommand::Hook {
+                kind,
+                project,
+                binding,
+            } => crate::hook::run(&ctx, &kind, &project, &binding),
+        },
+        Command::Dialogue { command } => match command {
+            DialogueCommand::Start {
+                topic,
+                drafter,
+                critic,
+                plain,
+            } => {
+                if plain.as_deref().is_none_or(str::is_empty) {
+                    bail!("plain_missing: dialogue start requires --plain");
+                }
+                bail!(
+                    "dialogue_unavailable: ade-rounds must handle `{topic}` with drafter `{drafter}` and critic `{critic}`"
+                )
+            }
+        },
+        // ade-outbox end
         Command::Doctor { session } => {
             if !doctor::run(&ctx, &session.into())? {
                 bail!("some checks failed");

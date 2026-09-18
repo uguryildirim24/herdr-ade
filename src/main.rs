@@ -1,6 +1,13 @@
 mod actions;
 mod adopt;
 mod cli;
+// ade-outbox begin
+mod adapters;
+mod events;
+mod hook;
+mod lane;
+mod ops;
+// ade-outbox end
 #[allow(dead_code)]
 mod contracts;
 mod coordinator;
