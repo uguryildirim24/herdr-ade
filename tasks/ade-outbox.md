@@ -5,7 +5,7 @@ lane says "done" or "waiting", the plugin records it durably in a way that survi
 halfway, delivers it to the coordinator's inbox, and the correction hook checks every
 message the coordinator writes for Rolf against the plain-language checker.
 
-Start line (for a restart after GONE): `herdr agent start a2 --kind <kind> --pane <pane> --parent w1F:p1 -- <flags per HANDOFF>`
+Start line (for a restart after GONE): `herdr agent start a2 --kind codex --pane w1F:p0 --parent w1F:p1 -- -c model=gpt-5.6-sol -c model_reasoning_effort=high --dangerously-bypass-approvals-and-sandbox`
 
 ## Owned files (SPEC-ADE §4.2, lane A2)
 
