@@ -77,7 +77,7 @@ pub struct Thread {
     pub resolved_reason: String,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub role: String,
-    pub launch: crate::contracts::LaunchRecipe,
+    pub launch: crate::contracts::Launch,
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<String>,

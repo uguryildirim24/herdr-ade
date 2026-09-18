@@ -100,19 +100,19 @@ fn run(cli: &Cli) -> Result<bool> {
 /// The one-time login per provider (SPEC-pi v2 §2). Never types `/login`,
 /// never reads or writes `auth.json`.
 fn login(layout: &pi::Layout, provider: Option<&str>) -> Result<bool> {
-    if let Some(provider) = provider {
-        if !pi::launch::PROVIDERS.contains(&provider) {
-            anyhow::bail!(
-                "unknown provider `{provider}`; expected one of {}",
-                pi::launch::PROVIDERS.join(", ")
-            );
-        }
+    if let Some(provider) = provider
+        && !pi::launch::PROVIDERS.contains(&provider)
+    {
+        anyhow::bail!(
+            "unknown provider `{provider}`; expected one of {}",
+            pi::launch::PROVIDERS.join(", ")
+        );
     }
     for (id, name, steps) in pi::login_instructions() {
-        if let Some(provider) = provider {
-            if provider != id {
-                continue;
-            }
+        if let Some(provider) = provider
+            && provider != id
+        {
+            continue;
         }
         println!("{name} ({id}):");
         println!("  {steps}");

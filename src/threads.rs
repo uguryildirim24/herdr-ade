@@ -99,6 +99,9 @@ pub struct StartArgs {
     pub plain: String,
     /// A roles-table row; `lane` when empty (SPEC-ADE D2).
     pub role: Option<String>,
+    /// `--recipe <id>`: pins one allowed recipe; the picker is skipped
+    /// (SPEC-jev-picker v2 §3 step 1).
+    pub recipe: Option<String>,
 }
 
 /// Birth sentence: required, one sentence, R1–R5 (SPEC-ADE D17 item 6).
@@ -202,8 +205,40 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("lane");
-    // Validation happens before any tab or worktree (SPEC-ADE D2).
-    let spec = project::resolve_role(&ctx.config_dir, &settings, role)?;
+    // The picker resolves and validates the launch before any tab or
+    // worktree exists, without the project lock (SPEC-jev-picker v2 §3 step
+    // 5, SPEC-ADE D2, item 48).
+    let project_pin = settings
+        .roles
+        .get(role)
+        .map(|over| crate::contracts::Recipe {
+            kind: over.kind.clone().unwrap_or_default(),
+            args: over.args.clone().unwrap_or_default(),
+            ..crate::contracts::Recipe::default()
+        });
+    let repo_name = Path::new(&repo)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let launch = crate::launch::resolve_launch(
+        ctx,
+        &project,
+        &crate::launch::ResolveInput {
+            role,
+            task: &args.task,
+            recipe: args.recipe.as_deref(),
+            project_pin,
+            sibling: None,
+            opted_in: settings.jev,
+            round: None,
+            title: Some(args.title.trim()),
+            sentence: Some(args.plain.trim()),
+            repo: repo_name.as_deref(),
+            policy: None,
+        },
+    )?;
+    if launch.kind == "pi" {
+        pi_ready(ctx, &launch)?;
+    }
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = if repo.is_empty() {
@@ -213,17 +248,12 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         };
         t.repo = repo.clone();
         t.machine = machine.clone();
-        t.agent = spec.kind.clone();
+        t.agent = launch.kind.clone();
         t.base = args.base.clone().unwrap_or_default();
         t.role = role.to_string();
         t.plain = args.plain.trim().to_string();
         t.attempt = 1;
-        t.launch = project::launch_recipe(
-            &spec,
-            1,
-            String::new(),
-            project::policy_hash(&ctx.config_dir),
-        );
+        t.launch = launch.clone();
     })?;
     let id = record.id.clone();
     {
@@ -245,6 +275,16 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             )))
         }
     }
+}
+
+/// A `kind = "pi"` launch is refused unless its provider is ready (SPEC-pi
+/// §3.4, T11): never a lane that waits for a first prompt it cannot answer.
+pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
+    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+        .context("pi_args_forbidden: a pi launch names no --provider")?;
+    crate::pi_ade::check_with(ctx.runner, &ctx.root, &provider)
+        .map(|_| ())
+        .with_context(|| format!("pi_not_ready: provider {provider}"))
 }
 
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
@@ -1002,13 +1042,13 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
         });
         return Err(error);
     }
-    if !record.tab_id.is_empty() {
-        if let Err(error) = view.herdr.tab_close(&record.tab_id) {
-            let _ = thread::update(project, &record.id, |t| {
-                t.partial = Some("tab_close".into());
-            });
-            return Err(anyhow::anyhow!("{error}"));
-        }
+    if !record.tab_id.is_empty()
+        && let Err(error) = view.herdr.tab_close(&record.tab_id)
+    {
+        let _ = thread::update(project, &record.id, |t| {
+            t.partial = Some("tab_close".into());
+        });
+        return Err(anyhow::anyhow!("{error}"));
     }
     Ok(())
 }
@@ -1438,6 +1478,11 @@ mod tests {
             .into_owned();
 
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        // Registered first: the first matching rule answers.
+        world.runner.on(
+            "agent start --help",
+            ok("      --kind <KIND>\n          [possible values: pi, claude, cursor]\n"),
+        );
         world.runner.on(
             "HERDR_ADE_LAUNCH",
             ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#),
@@ -1451,6 +1496,12 @@ mod tests {
             ok(r#"{"result":{"process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":42,"name":"claude","argv0":"/bin/claude"}]}}}"#),
         );
         world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
+        std::fs::write(
+            world.home.path().join("cfg/config.toml"),
+            "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+        )
+        .unwrap();
 
         let split = GitReal {
             fake: &world.runner,
@@ -1473,6 +1524,7 @@ mod tests {
                 task: "Do the thing.".into(),
                 plain: "The lane does the work.".into(),
                 role: None,
+                recipe: None,
             },
         )
         .unwrap();
@@ -1542,7 +1594,7 @@ mod tests {
         let calls = world.runner.calls.borrow();
         let launch = calls
             .iter()
-            .find(|c| c.display().contains("agent start"))
+            .find(|c| c.display().contains("agent start") && !c.display().contains("--help"))
             .map(|c| c.display())
             .expect("agent start");
         assert!(launch.contains("--parent w1:p1"), "{launch}");
@@ -1605,6 +1657,7 @@ mod tests {
                 task: "Do the thing.".into(),
                 plain: String::new(),
                 role: None,
+                recipe: None,
             },
         )
         .unwrap_err()
@@ -1622,6 +1675,7 @@ mod tests {
                 task: "Do the thing.".into(),
                 plain: "The lane does the work.".into(),
                 role: None,
+                recipe: None,
             },
         )
         .unwrap_err()

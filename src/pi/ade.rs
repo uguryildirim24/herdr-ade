@@ -1,24 +1,19 @@
 //! Crate-side seam for the pi library: the parts that need `crate::`.
 //!
 //! `src/pi/` itself never names `crate::` because it also compiles into the
-//! thin `herdr-pi` binary. This file is registered from `src/main.rs` inside
-//! the `ade-pi` markers and is compiled only into the `herdr-ade` binary.
+//! thin `herdr-pi` binary. This file is compiled only into `herdr-ade`.
 //!
-//! A1 uses [`check_with`] and [`doctor_rows_with`] when it has a
-//! `crate::runner::Runner` (the real one or a `FakeRunner`); plain
-//! [`crate::pi::check`] uses the process environment and the real runner.
-//!
-//! There is no `tick` entry point: SPEC-pi v2 gives the pi library no
-//! per-tick work. The guard is event-driven inside the pi process, and the
-//! pre-launch check runs at launch. If the round wants a call site anyway,
-//! add the function here; see the report's "Left for the reviewer".
+//! `thread start` and the ticker call [`check_with`] before a `kind = "pi"`
+//! launch; `doctor` prints [`doctor_rows_with`]. Both take the ADE root.
+//! There is no per-tick pi work (SPEC-pi v2).
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::Result;
 
+use crate::pi::doctor::{self, CheckReport};
 use crate::pi::sh;
-use crate::pi::{CheckReport, Env, Layout, doctor};
+use crate::pi::{Env, Layout};
 
 /// `crate::runner::Runner` as a `pi::sh::Runner`.
 pub struct Adapter<'a>(pub &'a dyn crate::runner::Runner);
@@ -51,35 +46,35 @@ impl sh::Runner for Adapter<'_> {
     }
 }
 
-/// The process layout and environment, once.
-pub fn from_process() -> Result<(Env, Layout)> {
+/// The pi folder under this ADE root (SPEC-ADE item 90): `herdr-ade --root`
+/// and the pi library agree on one place.
+fn layout(root: &Path) -> Layout {
+    Layout {
+        root: root.join("pi"),
+    }
+}
+
+/// Readiness for one provider before a `kind = "pi"` launch (SPEC-pi §3.4):
+/// every failing row in one refusal. Runs through the plugin's runner.
+pub fn check_with(
+    runner: &dyn crate::runner::Runner,
+    root: &Path,
+    provider: &str,
+) -> Result<CheckReport> {
     let env = Env::from_process()?;
-    let layout = Layout::from_env(&env)?;
-    Ok((env, layout))
+    doctor::check_with(&layout(root), &env, &Adapter(runner), provider)
 }
 
-/// Readiness for one provider through a plugin runner (A1's pre-launch
-/// refusal, scripted in tests). Equivalent to `crate::pi::check` but without
-/// touching the process's command execution.
-pub fn check_with(runner: &dyn crate::runner::Runner, provider: &str) -> Result<CheckReport> {
-    let (env, layout) = from_process()?;
-    doctor::check_with(&layout, &env, &Adapter(runner), provider)
-}
-
-/// The pi doctor rows through a plugin runner, for A1's `doctor`.
-pub fn doctor_rows_with(runner: &dyn crate::runner::Runner) -> Result<(Vec<doctor::Row>, bool)> {
-    let (env, layout) = from_process()?;
+/// The pi doctor rows through the plugin's runner, for `doctor`.
+pub fn doctor_rows_with(
+    runner: &dyn crate::runner::Runner,
+    root: &Path,
+) -> Result<(Vec<doctor::Row>, bool)> {
+    let env = Env::from_process()?;
     let providers = crate::pi::roles::enabled_providers();
-    let rows = doctor::doctor_rows_with(&env, &layout, &Adapter(runner), &providers);
+    let rows = doctor::doctor_rows_with(&env, &layout(root), &Adapter(runner), &providers);
     let ok = doctor::healthy(&rows);
     Ok((rows, ok))
-}
-
-/// The npm prefix a lane's pi process must live under (SPEC-pi v2 §3.4):
-/// `herdr pane process-info` output is checked against this.
-pub fn process_prefix() -> Result<PathBuf> {
-    let (_env, layout) = from_process()?;
-    Ok(layout.npm())
 }
 
 #[cfg(test)]
@@ -110,40 +105,5 @@ mod tests {
         assert!(calls[0].own_group, "a timeout must reach zsh's children");
         drop(calls);
         let _ = (&env, &layout);
-    }
-
-    /// A4's table slots each `plain` phrase into its reason templates and
-    /// refuses the config when one fails the plain check
-    /// (`recipe_reason_not_plain`). The templates are A4's, copied here
-    /// because A4's module is not on this branch; the words it adds
-    /// (`picker`) are left out.
-    #[test]
-    fn every_pi_plain_phrase_passes_the_plain_check_in_the_reason_templates() {
-        use crate::plain::{Glossary, check};
-        let glossary = Glossary::default();
-        for row in crate::pi::roles::pi_recipes() {
-            let plain = row.plain;
-            assert!(plain.starts_with("the "), "{}: `{plain}`", row.id);
-            for text in [
-                plain.to_string(),
-                format!("You chose {plain} for this task."),
-                format!("this task looks like ordinary work, so it runs on {plain}."),
-                format!("this task runs on {plain}"),
-            ] {
-                let result = check(&text, &glossary);
-                assert!(
-                    result.passed(),
-                    "{}: `{text}` fails: {:?}",
-                    row.id,
-                    result.violations
-                );
-            }
-            assert!(
-                format!("this second opinion runs on {plain}")
-                    .chars()
-                    .count()
-                    <= 80
-            );
-        }
     }
 }

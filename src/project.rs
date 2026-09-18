@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::contracts::{DAY_ONE_ROLES, LaunchRecipe, RoleSpec, RolesTable};
+use crate::contracts::{Launch, RoleSpec};
 
 pub const MAX_SLUG: usize = 40;
 pub const BODY_WARN_CHARS: usize = 16_000;
@@ -147,6 +147,10 @@ pub struct Settings {
     /// (`talk::enabled`). Never written by `new`, so the default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub talk: Option<bool>,
+    /// The project opts in to the picker's call out (SPEC-jev-picker v2
+    /// question 13). Off unless written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub jev: bool,
     /// Per-role `kind`/`args` overrides (SPEC-ADE D2). Arrays replace.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub roles: std::collections::BTreeMap<String, RoleOverride>,
@@ -175,6 +179,7 @@ impl Default for Settings {
             // `false` the ticker shows a herdr notification instead.
             nudge: false,
             talk: None,
+            jev: false,
             roles: std::collections::BTreeMap::new(),
             repos: Vec::new(),
         }
@@ -275,7 +280,7 @@ pub struct Coordinator {
     /// D2), stored at `open` and reused by the ticker's relaunch. `attempt`
     /// counts coordinator tabs; `brief_hash` is the SHA-256 of `PROJECT.md`
     /// at `open`. Both reach the pane in `HERDR_ADE_LAUNCH` (D14).
-    pub launch: crate::contracts::LaunchRecipe,
+    pub launch: Launch,
     /// The priming line was submitted for this binding. Transport is not the
     /// receipt: `prime_pending` clears only on the `ha context` receipt, and
     /// the ticker never re-sends a submitted line on its own (D14).
@@ -452,11 +457,6 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
     Ok(safety)
 }
 
-/// Kinds that need a permission flag in `args` (SPEC-ADE D2).
-pub fn kind_needs_permission_args(kind: &str) -> bool {
-    matches!(kind, "claude" | "cursor" | "agy")
-}
-
 /// Plugin default for a day-one role when the safety file has no row.
 pub fn default_role_spec(name: &str) -> RoleSpec {
     if name == "pro" {
@@ -470,51 +470,6 @@ pub fn default_role_spec(name: &str) -> RoleSpec {
             ..RoleSpec::default()
         }
     }
-}
-
-/// `[roles.<name>]` rows from `config.toml`.
-///
-/// SPEC-jev-picker v2 `[roles]`/`[recipes]` parsing is lane A4's. This loader
-/// keeps only tables that have a D2 `kind` field and skips scalar keys such as
-/// `resolver`. When A4 lands, `crate::picker::resolve_launch` runs first:
-/// `let spec = crate::picker::resolve_launch(project, role, task, sibling)?;`
-pub fn load_roles(config_dir: &Path) -> Result<RolesTable> {
-    #[derive(Deserialize)]
-    struct Config {
-        #[serde(default)]
-        roles: Option<toml::Value>,
-    }
-    let file = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(RolesTable::default());
-    };
-    let config: Config =
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
-    match config.roles {
-        Some(value) => parse_roles_value(&value)
-            .with_context(|| format!("{} [roles] does not parse", file.display())),
-        None => Ok(RolesTable::default()),
-    }
-}
-
-fn parse_roles_value(value: &toml::Value) -> Result<RolesTable> {
-    let Some(table) = value.as_table() else {
-        return Ok(RolesTable::default());
-    };
-    let mut roles = std::collections::BTreeMap::new();
-    for (name, inner) in table {
-        let Some(row) = inner.as_table() else {
-            continue;
-        };
-        if !row.contains_key("kind") {
-            continue;
-        }
-        let spec: RoleSpec = inner.clone().try_into().with_context(|| {
-            format!("[roles.{name}] has an unknown field or a bad type (SPEC-ADE D2)")
-        })?;
-        roles.insert(name.clone(), spec);
-    }
-    Ok(RolesTable { roles })
 }
 
 fn apply_override(base: RoleSpec, over: &RoleOverride) -> Result<RoleSpec> {
@@ -535,18 +490,29 @@ fn apply_override(base: RoleSpec, over: &RoleOverride) -> Result<RoleSpec> {
     Ok(out)
 }
 
-/// Resolve a role: defaults, then config table, then PROJECT.md override.
-/// Arrays replace, never merge (SPEC-ADE D2).
+/// A role's row for a launch the picker never resolves (the coordinator,
+/// an adopted pane): the `default` recipe of `[roles.<name>]` in the one
+/// roles table (SPEC-jev-picker v2 §2), else the plugin default, then the
+/// PROJECT.md override. Arrays replace, never merge (SPEC-ADE D2).
 pub fn resolve_role(config_dir: &Path, settings: &Settings, role: &str) -> Result<RoleSpec> {
     if role.is_empty() {
         bail!("a role name is required");
     }
-    let table = load_roles(config_dir)?;
-    let mut spec = table
-        .roles
-        .get(role)
-        .cloned()
-        .unwrap_or_else(|| default_role_spec(role));
+    let config = crate::launch::parse_picker_config(config_dir, false)?;
+    let mut spec = match config.roles.get(role) {
+        Some(row) => {
+            let recipe = config.recipes.get(&row.default).with_context(|| {
+                format!("recipe_unknown: [roles.{role}] default `{}`", row.default)
+            })?;
+            RoleSpec {
+                kind: recipe.kind.clone(),
+                args: recipe.args.clone(),
+                env: recipe.env.clone(),
+                ready_timeout_ms: recipe.ready_timeout_ms,
+            }
+        }
+        None => default_role_spec(role),
+    };
     if let Some(over) = settings.roles.get(role) {
         spec = apply_override(spec, over)?;
     }
@@ -569,13 +535,8 @@ pub fn policy_hash(config_dir: &Path) -> String {
 }
 
 /// Launch recipe stored on the thread, never rebuilt from mutable settings.
-pub fn launch_recipe(
-    spec: &RoleSpec,
-    attempt: u32,
-    brief_hash: String,
-    policy: String,
-) -> LaunchRecipe {
-    LaunchRecipe {
+pub fn launch_recipe(spec: &RoleSpec, attempt: u32, brief_hash: String, policy: String) -> Launch {
+    Launch {
         kind: spec.kind.clone(),
         args: spec.args.clone(),
         env: spec.env.clone(),
@@ -587,6 +548,7 @@ pub fn launch_recipe(
         policy_hash: policy,
         attempt,
         brief_hash,
+        ..Launch::default()
     }
 }
 
@@ -651,11 +613,6 @@ impl LaunchEnv {
             .ok()
             .and_then(|value| LaunchEnv::parse(&value))
     }
-}
-
-/// Day-one role names, for doctor.
-pub fn day_one_roles() -> &'static [&'static str] {
-    &DAY_ONE_ROLES
 }
 
 /// Slugs of the projects in `root`: folders that contain `PROJECT.md`. Entries
@@ -1060,24 +1017,25 @@ mod tests {
     #[test]
     fn unknown_role_field_is_refused_and_picker_keys_are_skipped() {
         let config = tempfile::tempdir().unwrap();
+        let settings = Settings::default();
         std::fs::write(
             config.path().join("config.toml"),
             "[roles]\nresolver = \"off\"\n\n[roles.lane]\nkind = \"claude\"\nbootstrap = true\n",
         )
         .unwrap();
-        let err = format!("{:#}", load_roles(config.path()).unwrap_err());
-        assert!(
-            err.contains("unknown") || err.contains("bootstrap"),
-            "{err}"
+        let err = format!(
+            "{:#}",
+            resolve_role(config.path(), &settings, "lane").unwrap_err()
         );
+        assert!(err.contains("bootstrap"), "{err}");
 
         std::fs::write(
             config.path().join("config.toml"),
             "[roles]\nresolver = \"off\"\n\n[roles.lane]\nkind = \"claude\"\n",
         )
         .unwrap();
-        let table = load_roles(config.path()).unwrap();
-        assert_eq!(table.roles["lane"].kind, "claude");
+        let spec = resolve_role(config.path(), &settings, "lane").unwrap();
+        assert_eq!(spec.kind, "claude");
     }
 
     #[test]

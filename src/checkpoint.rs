@@ -113,10 +113,10 @@ fn start_args(h: &Herdr, pane: &str, kind: &str) -> Vec<String> {
     let names = kind_binaries(kind);
     for p in &procs {
         let argv = argv_of(p);
-        if let Some(first) = argv.first() {
-            if names.contains(&base(first).as_str()) {
-                return clean_args(&argv[1..]);
-            }
+        if let Some(first) = argv.first()
+            && names.contains(&base(first).as_str())
+        {
+            return clean_args(&argv[1..]);
         }
     }
     let mut sorted = procs.clone();
@@ -801,12 +801,11 @@ pub fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, B
         let branch_like = ["lane/", "review/", "spec/", "track/", "feature/"]
             .iter()
             .any(|pre| p.starts_with(pre));
-        if branch_like {
-            if let Some(branches) = st["git"]["branches"].as_array() {
-                if !branches.iter().any(|b| b.as_str() == Some(p.as_str())) {
-                    add("branches that do not exist", p.clone());
-                }
-            }
+        if branch_like
+            && let Some(branches) = st["git"]["branches"].as_array()
+            && !branches.iter().any(|b| b.as_str() == Some(p.as_str()))
+        {
+            add("branches that do not exist", p.clone());
         }
     }
     for placeholder in angle_placeholders(text) {
@@ -819,13 +818,13 @@ pub fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, B
         }
     }
     for w in rows("workers") {
-        if let Some(name) = w["name"].as_str() {
-            if !text.contains(name) {
-                add(
-                    "live nested workers the document never mentions",
-                    name.to_string(),
-                );
-            }
+        if let Some(name) = w["name"].as_str()
+            && !text.contains(name)
+        {
+            add(
+                "live nested workers the document never mentions",
+                name.to_string(),
+            );
         }
     }
     for sec in [

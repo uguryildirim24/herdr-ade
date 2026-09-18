@@ -403,22 +403,22 @@ fn failed_check(
         save_budget(project, session, &budget)?;
         return correction(kind, reason);
     }
-    if !expired && budget.translator_runs == 0 {
-        if let Some(command) = translator_command(&ctx.config_dir)? {
-            budget.translator_runs = 1;
-            save_budget(project, session, &budget)?;
-            if let Some(rewrite) = run_translator(ctx, &command, text, reason)? {
-                if let Ok(messages) = parse_envelopes(&rewrite)
-                    && messages
-                        .iter()
-                        .all(|message| validate_message(project, message).is_ok())
-                {
-                    for message in messages {
-                        publish(project, session, turn, message)?;
-                    }
-                    return Ok(());
-                }
+    if !expired
+        && budget.translator_runs == 0
+        && let Some(command) = translator_command(&ctx.config_dir)?
+    {
+        budget.translator_runs = 1;
+        save_budget(project, session, &budget)?;
+        if let Some(rewrite) = run_translator(ctx, &command, text, reason)?
+            && let Ok(messages) = parse_envelopes(&rewrite)
+            && messages
+                .iter()
+                .all(|message| validate_message(project, message).is_ok())
+        {
+            for message in messages {
+                publish(project, session, turn, message)?;
             }
+            return Ok(());
         }
     }
     publish(
