@@ -5,7 +5,7 @@ runs on), starts a lane under its coordinator in its own git worktree, keeps the
 that say what each lane is and where it is, and ships the tested binary-swap script the
 migration needs.
 
-Start line (for a restart after GONE): `herdr agent start a1 --kind cursor --pane <pane> --parent w1F:p1 -- --model cursor-grok-4.6-xhigh --force`
+Start line (for a restart after GONE): `herdr agent start a1 --kind cursor --pane w1F:pZ --parent w1F:p1 -- --model cursor-grok-4.6-xhigh --force`
 
 ## Owned files (SPEC-ADE §4.2, lane A1)
 
