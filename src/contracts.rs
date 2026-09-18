@@ -727,7 +727,7 @@ mod tests {
             serde_json::from_str::<CostClass>("\"sideways\"").unwrap(),
             CostClass::Sideways
         );
-        assert_eq!(Recipe::default().enabled, true);
+        assert!(Recipe::default().enabled);
         assert_eq!(Recipe::default().ready_timeout_ms, 30_000);
     }
 
