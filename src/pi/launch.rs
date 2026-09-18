@@ -70,6 +70,12 @@ pub fn agent_dir_for(env_dir: Option<&str>, home: &Path, baked: &Path) -> Result
 /// The wrapper script written by setup and linked as `~/.local/bin/pi`
 /// (SPEC-pi v2 §3.2). `exec` keeps the pane's foreground process the node
 /// process, which herdr's process match and `agent prompt` need.
+///
+/// The `~/.pi` refusal checks the folder pi will really use: pi expands a
+/// leading `~` in `PI_CODING_AGENT_DIR` itself and resolves relative paths,
+/// so the wrapper expands `~`, makes the path absolute, squeezes `//`,
+/// refuses `.` and `..` parts, and compares both the path and its physical
+/// form (symlinks resolved on the nearest existing folder) against `~/.pi`.
 pub fn wrapper_script(agent_dir: &Path, cli_js: &Path) -> String {
     format!(
         r#"#!/bin/sh
@@ -81,18 +87,54 @@ fail() {{
 }}
 
 home=${{HOME:-}}
-saved=${{PI_CODING_AGENT_DIR:-}}
-
-if [ -n "$saved" ]; then
-  agent=$saved
+if [ -n "${{PI_CODING_AGENT_DIR:-}}" ]; then
+  agent=$PI_CODING_AGENT_DIR
 else
-  agent="{agent}"
+  agent={agent}
 fi
 
+# pi expands a leading ~ and resolves a relative path; do the same first.
 case "$agent" in
-  "$home/.pi" | "$home/.pi/"*)
-    fail "herdr-ade pi: refusing a config dir under ~/.pi; use PI_CODING_AGENT_DIR elsewhere" ;;
+  "~") agent=$home ;;
+  "~/"*) agent=$home/${{agent#"~/"}} ;;
 esac
+case "$agent" in
+  /*) ;;
+  *) agent=$PWD/$agent ;;
+esac
+agent=$(printf '%s\n' "$agent" | tr -s /)
+case "$agent" in
+  */./* | */. | */../* | */..)
+    fail "herdr-ade pi: refusing a config dir with . or .. in it: $agent" ;;
+esac
+
+physical() {{
+  dir=$1
+  rest=
+  while [ ! -d "$dir" ] && [ "$dir" != / ] && [ -n "$dir" ]; do
+    rest=/${{dir##*/}}$rest
+    dir=${{dir%/*}}
+    [ -n "$dir" ] || dir=/
+  done
+  base=$(cd "$dir" 2>/dev/null && pwd -P) || base=$dir
+  printf '%s\n' "$base$rest" | tr -s /
+}}
+
+pi_home() {{
+  case "$1" in
+    "$2/.pi" | "$2/.pi/"*) return 0 ;;
+  esac
+  return 1
+}}
+
+if [ -n "$home" ]; then
+  real_home=$(physical "$home")
+  real_agent=$(physical "$agent")
+  if pi_home "$agent" "$home" || pi_home "$real_agent" "$home" ||
+    pi_home "$agent" "$real_home" || pi_home "$real_agent" "$real_home"; then
+    fail "herdr-ade pi: refusing a config dir under ~/.pi; use PI_CODING_AGENT_DIR elsewhere"
+  fi
+fi
 
 case "${{1:-}}" in
   install | remove | uninstall | update | config)
@@ -112,14 +154,20 @@ PI_SKIP_VERSION_CHECK=1
 PI_TELEMETRY=0
 export PI_SKIP_VERSION_CHECK PI_TELEMETRY
 
-exec node "{cli}" "$@"
+exec node {cli} "$@"
 "#,
         package = super::PI_PACKAGE,
         version = super::PI_VERSION,
-        agent = agent_dir.display(),
-        cli = cli_js.display(),
+        agent = sh_quote(&agent_dir.display().to_string()),
+        cli = sh_quote(&cli_js.display().to_string()),
         min_node = min_node_string(),
     )
+}
+
+/// One single-quoted `sh` word, so a baked path with a quote, `$` or a
+/// backtick stays a path.
+pub fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
 pub fn min_node_string() -> String {
@@ -419,7 +467,7 @@ mod tests {
             Path::new("/state/ade/pi/npm/x/cli.js"),
         );
         for needle in [
-            "exec node \"/state/ade/pi/npm/x/cli.js\"",
+            "exec node '/state/ade/pi/npm/x/cli.js'",
             "/state/ade/pi/agent",
             "PI_SKIP_VERSION_CHECK=1",
             "PI_TELEMETRY=0",
@@ -430,6 +478,82 @@ mod tests {
         ] {
             assert!(script.contains(needle), "missing {needle}");
         }
+    }
+
+    /// The wrapper, run for real with `sh` and a fake `node` that prints
+    /// the folder it was handed: every spelling of `~/.pi` is refused, and
+    /// the baked folder and an outside folder pass.
+    #[test]
+    #[cfg(unix)]
+    fn the_wrapper_refuses_every_spelling_of_pi_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        std::os::unix::fs::symlink(&home, dir.path().join("homelink")).unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let node = bin.join("node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo v22.19.0; exit 0; }\nprintf '%s\\n' \"$PI_CODING_AGENT_DIR\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let baked = dir.path().join("it's $state/pi/agent");
+        let wrapper = dir.path().join("pi");
+        std::fs::write(&wrapper, wrapper_script(&baked, Path::new("/nowhere/cli.js"))).unwrap();
+
+        let run = |agent_dir: Option<&str>, cwd: &Path| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(&wrapper)
+                .arg("--version")
+                .current_dir(cwd)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+            if let Some(agent_dir) = agent_dir {
+                cmd.env("PI_CODING_AGENT_DIR", agent_dir);
+            }
+            cmd.output().unwrap()
+        };
+
+        let out = run(None, &home);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            baked.display().to_string()
+        );
+        let outside = dir.path().join("elsewhere");
+        let out = run(Some(&outside.display().to_string()), &home);
+        assert!(out.status.success(), "{out:?}");
+
+        let link = dir.path().join("homelink/.pi/agent").display().to_string();
+        let double = format!("{}//.pi/agent", home.display());
+        let dotted = format!("{}/work/../.pi/agent", home.display());
+        let absolute = home.join(".pi/new").display().to_string();
+        for bad in [
+            "~/.pi/agent",
+            "~/.pi",
+            ".pi/agent",
+            absolute.as_str(),
+            double.as_str(),
+            dotted.as_str(),
+            link.as_str(),
+        ] {
+            let out = run(Some(bad), &home);
+            assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+            assert!(out.stdout.is_empty(), "{bad} reached node");
+        }
+        let out = std::process::Command::new("sh")
+            .arg(&wrapper)
+            .arg("install")
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
     }
 
     #[test]
