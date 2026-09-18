@@ -280,6 +280,9 @@ pub struct RoundRecord {
     /// When `ha round open` wrote the record; orders `GLOSSARY.md` (A3).
     #[serde(default)]
     pub opened: String,
+    /// Repository the integration branch lives in, fixed at open (A3).
+    #[serde(default)]
+    pub repo: String,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
