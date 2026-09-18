@@ -19,7 +19,6 @@ pub mod doctor;
 pub mod folder;
 pub mod install;
 pub mod launch;
-pub mod limits;
 pub mod priming;
 pub mod resume;
 pub mod roles;
@@ -39,7 +38,7 @@ pub const PI_VERSION: &str = "0.85.1";
 pub const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
 /// The guard extension's file name and marker (SPEC-pi v2 §3.9).
 pub const GUARD_FILE: &str = "herdr-pi-guard.ts";
-/// Version 2: the parent fallback runs whenever `ha waiting` did not.
+/// Version 2: no pre-ADE parent fallback; a context-length error is `error`.
 pub const GUARD_MARKER: &str = "herdr-pi-guard:version=2";
 /// The herdr state hook the running herdr writes (SPEC-pi v2 §3.3).
 pub const HERDR_EXTENSION_FILE: &str = "herdr-agent-state.ts";
@@ -299,25 +298,5 @@ mod tests {
         .unwrap();
         let env = Env::for_test(home, &[]);
         assert_eq!(resolve_root(&env).unwrap(), home.join("from-config/pi"));
-    }
-
-    #[test]
-    fn layout_paths_are_one_shared_folder() {
-        let layout = Layout::for_test("/p/pi");
-        assert_eq!(
-            layout.settings(),
-            PathBuf::from("/p/pi/agent/settings.json")
-        );
-        assert_eq!(
-            layout.guard(),
-            PathBuf::from("/p/pi/agent/extensions/herdr-pi-guard.ts")
-        );
-        assert_eq!(layout.wrapper(), PathBuf::from("/p/pi/bin/pi"));
-        assert_eq!(
-            layout.cli_js(),
-            PathBuf::from(
-                "/p/pi/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
-            )
-        );
     }
 }

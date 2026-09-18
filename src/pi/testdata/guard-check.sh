@@ -56,34 +56,20 @@ printf '%s\n' "$*" >> "$HERDR_ADE_GUARD_LOG"
 SH
 chmod +x "$ROOT/bin/ha"
 
-# A fake herdr for the parent fallback. Every case points HERDR_BIN_PATH at
-# it, so the guard can never reach a real herdr server from this check.
-cat > "$ROOT/bin/herdr" <<'SH'
-#!/bin/sh
-if [ "$1 $2" = "agent list" ]; then
-  printf '%s\n' '{"result":{"agents":[{"name":"guard-lane","pane_id":"wG:p9","tokens":{"parent":"wG:p1"}}]}}'
-  exit 0
-fi
-printf '%s\n' "$*" >> "$HERDR_ADE_GUARD_LOG"
-SH
-chmod +x "$ROOT/bin/herdr"
-
 fail=0
 say() {
   printf '%s\n' "$1"
 }
 
 # $1 mode, $2 label, $3 expected class, $4 expected mock hits (pi's v2
-# retry cap: 2 for a 429, 1 for a 401), $5 `ade` (HERDR_ADE_LAUNCH set, a
-# fake `ha`) or `parent` (no HERDR_ADE_LAUNCH, the herdr parent fallback)
+# retry cap: 2 for a 429, 1 otherwise)
 run_case() {
   mode=$1
   label=$2
   class=$3
   want_hits=$4
-  route=$5
-  hits_file="$ROOT/log/hits-$mode-$route.log"
-  guard_log="$ROOT/log/ha-$mode-$route.log"
+  hits_file="$ROOT/log/hits-$mode.log"
+  guard_log="$ROOT/log/ha-$mode.log"
   : > "$hits_file"
   : > "$guard_log"
 
@@ -91,49 +77,35 @@ run_case() {
   mock_pid=$!
   sleep 1
 
-  if [ "$route" = ade ]; then
-    PIPATH="$ROOT/bin:$PATH"
-    launch="guard/lane/1/abc"
-    want="^waiting mock-provider $class: "
-  else
-    # No `ha` on this PATH: only the fake herdr.
-    mkdir -p "$ROOT/herdr-only"
-    ln -sf "$ROOT/bin/herdr" "$ROOT/herdr-only/herdr"
-    PIPATH="$ROOT/herdr-only:$PATH"
-    launch=""
-    want="^agent prompt wG:p1 WAITING guard-lane mock-provider $class: "
-  fi
-  env -u HERDR_SOCKET_PATH -u HERDR_SESSION \
+  env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
     HERDR_ADE_GUARD_LOG="$guard_log" \
-    HERDR_ADE_LAUNCH="$launch" \
-    HERDR_PANE_ID="wG:p9" \
-    HERDR_BIN_PATH="$ROOT/bin/herdr" \
+    HERDR_ADE_LAUNCH="guard/lane/1/abc" \
     PI_CODING_AGENT_DIR="$ROOT/agent" \
-    PATH="$PIPATH" \
+    PATH="$ROOT/bin:$PATH" \
     "$NODE" "$PI_JS" --provider mock-provider --model mock-model -p "hello" --no-skills \
-    >"$ROOT/log/pi-$mode-$route.out" 2>&1 </dev/null || true
+    >"$ROOT/log/pi-$mode.out" 2>&1 </dev/null || true
   kill "$mock_pid" 2>/dev/null || true
   wait "$mock_pid" 2>/dev/null || true
 
   hits=$(wc -l < "$hits_file" | tr -d ' ')
-  waits=$(grep -c "$want" "$guard_log" 2>/dev/null || true)
+  waits=$(grep -c "^waiting mock-provider $class: " "$guard_log" 2>/dev/null || true)
   lines=$(wc -l < "$guard_log" | tr -d ' ')
   dones=$(grep -ci "done" "$guard_log" 2>/dev/null || true)
   if [ "$hits" -eq "$want_hits" ] && [ "$waits" -eq 1 ] && [ "$lines" -eq 1 ] && [ "$dones" -eq 0 ]; then
-    say "PASS $label: mock hits $hits, one WAITING (class $class, $route), no done"
+    say "PASS $label: mock hits $hits, one WAITING (class $class), no done"
     sed 's/^/  /' "$guard_log"
   else
     say "FAIL $label: mock hits $hits (want $want_hits), matching lines $waits, lines $lines, done lines $dones"
     sed 's/^/  log: /' "$guard_log"
     say "  --- pi output ---"
-    sed 's/^/  /' "$ROOT/log/pi-$mode-$route.out" | tail -30
+    sed 's/^/  /' "$ROOT/log/pi-$mode.out" | tail -30
     fail=1
   fi
 }
 
-run_case limit "T7a 429 becomes blocked + WAITING limit" limit 2 ade
-run_case login "T7b 401 becomes blocked + WAITING login" login 1 ade
-run_case limit "T7c 429 without ADE: WAITING to the parent" limit 2 parent
+run_case limit "T7a 429 becomes blocked + WAITING limit" limit 2
+run_case login "T7b 401 becomes blocked + WAITING login" login 1
+run_case context "T7c context length is an error, not a login" error 1
 
 if [ "$fail" -eq 0 ]; then
   say "GUARD PASS"

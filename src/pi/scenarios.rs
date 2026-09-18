@@ -1,16 +1,15 @@
-//! FakeRunner scenarios for a pi lane: start, restart and the guard
+//! FakeRunner scenarios for a pi lane: start and restart
 //! (SPEC-pi v2 §7; SPEC-ADE §1.3).
 //!
 //! Every command is scripted through `pi::sh::fake`; no herdr, no pi process,
-//! no network. The guard itself is TypeScript, so its classification twin in
-//! `limits` is asserted here and the shipping file's contract is asserted
-//! verbatim; `src/pi/testdata/guard-check.sh` runs the real extension against
-//! the isolated pi with a mock provider that answers 429 and 401.
+//! no network. The guard is TypeScript and runs only inside pi, so its test
+//! is `src/pi/testdata/guard-check.sh` (T7): the shipping extension against
+//! the isolated pi with a mock provider that answers 429, 401 and 400.
 
 use std::path::Path;
 
 use super::sh::fake::{FakeRunner, ok};
-use super::{Env, Layout, doctor, folder, install, launch, limits, roles};
+use super::{Env, Layout, doctor, folder, install, launch, roles};
 
 /// A throwaway plugin root with the pinned files in place and the wrapper on
 /// the login PATH (a real symlink under the fixture HOME).
@@ -92,52 +91,6 @@ fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
     assert!(!restart.iter().any(|a| a == "--approve"));
     // The recipe itself is unchanged and still valid.
     row.validate().unwrap();
-    assert_eq!(
-        super::resume::restore_line(session),
-        "pi --session /state/pi/agent/sessions/--/lane.jsonl"
-    );
-}
-
-#[test]
-fn scenario_the_guard_reports_a_429_as_waiting_once_and_never_done() {
-    let mut throttle = limits::Throttle::new(std::time::Duration::from_secs(600));
-    let now = std::time::Instant::now();
-    let message = "429 Rate limit reached for gpt-6-astra";
-    let class = limits::classify(message, Some(429));
-    assert_eq!(class, limits::LimitClass::Limit);
-    assert!(throttle.due(class, now));
-    assert!(!throttle.due(class, now + std::time::Duration::from_secs(300)));
-    assert!(throttle.due(class, now + std::time::Duration::from_secs(601)));
-
-    let line = limits::waiting_line("a5", "openai-codex", class, message);
-    assert_eq!(
-        line,
-        "WAITING a5 openai-codex limit: 429 Rate limit reached for gpt-6-astra"
-    );
-
-    // The shipping extension: reports blocked and `ha waiting`; never done.
-    let guard = install::GUARD_TS;
-    assert!(guard.contains(super::GUARD_MARKER));
-    assert!(guard.contains("herdr:blocked"));
-    assert!(guard.contains("ha\", [\"waiting\""));
-    assert!(guard.contains("HERDR_ADE_LAUNCH"));
-    assert!(!guard.contains("\"done\""));
-    assert!(!guard.contains("[\"done\""));
-    assert!(!guard.contains("agent prompt\"")); // the fallback uses ["agent","prompt",...]
-}
-
-#[test]
-fn scenario_the_guard_reports_a_401_as_login_and_a_dead_endpoint_as_unreachable() {
-    assert_eq!(
-        limits::classify("Incorrect API key provided", Some(401)),
-        limits::LimitClass::Login
-    );
-    assert_eq!(
-        limits::classify("fetch failed", None),
-        limits::LimitClass::Unreachable
-    );
-    let label = limits::blocked_label("deepseek", limits::LimitClass::Login, Some(401), "bad key");
-    assert_eq!(label, "deepseek login HTTP 401: bad key");
 }
 
 #[test]

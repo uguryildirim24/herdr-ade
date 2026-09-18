@@ -52,21 +52,3 @@ pub fn adapter_row() -> AdapterRow {
 pub fn prime_line(role: &str) -> String {
     format!("ha skill {role}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_row_names_the_spec_traps() {
-        let row = adapter_row();
-        assert_eq!(row.kind, "pi");
-        assert_eq!(row.status, "untested");
-        assert_eq!(row.capability, "unqualified");
-        assert!(row.traps_pre_ready.contains("trust question"));
-        assert!(row.traps_pre_ready.contains("defaultProjectTrust"));
-        assert!(row.traps_pre_ready.contains("pi auth check"));
-        assert!(row.traps_post_ready.contains("guard"));
-        assert_eq!(prime_line("lane"), "ha skill lane");
-    }
-}

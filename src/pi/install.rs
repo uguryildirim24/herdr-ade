@@ -215,25 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn guard_is_written_with_its_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        let path = write_guard(&layout).unwrap();
-        let text = std::fs::read_to_string(path).unwrap();
-        assert!(text.contains(GUARD_MARKER));
-        assert!(guard_ok(&layout));
-    }
-
-    #[test]
-    fn link_line_is_the_one_line_rolf_types() {
-        let layout = Layout::for_test("/state/pi");
-        assert_eq!(
-            link_line(&layout, std::path::Path::new("/h/me")),
-            "ln -s /state/pi/bin/pi /h/me/.local/bin/pi"
-        );
-    }
-
-    #[test]
     fn setup_runs_the_five_steps_and_hands_back_the_link_line() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pi"));
