@@ -289,6 +289,9 @@ pub struct RoundRecord {
     /// `review/r<n>`, created from `B` (SPEC-ADE D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_branch: Option<String>,
+    /// The reviewer thread whose sealed `done` sha is `V` (SPEC-ADE D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
