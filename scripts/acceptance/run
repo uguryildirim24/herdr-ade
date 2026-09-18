@@ -23,6 +23,7 @@
 # Environment:
 #   HA            the plugin binary (default: <checkout>/target/release/herdr-ade,
 #                 or $CARGO_TARGET_DIR/release/herdr-ade)
+#   HP            the pi helper (default: next to HA)
 #   HERDR_BIN_PATH the qualified herdr binary C (live rows)
 #   ACC_LIVE=1    run the live parts (throwaway session, real agent CLIs)
 #   ACC_SESSION   throwaway session name (default acc-<pid>; must start with acc-)
@@ -35,6 +36,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 checkout=$(cd "$here/../.." && pwd)
 target=${CARGO_TARGET_DIR:-$checkout/target}
 HA=${HA:-$target/release/herdr-ade}
+HP=${HP:-$target/release/herdr-pi}
 ACC_DIR=${ACC_DIR:-/var/tmp/ade-acc-$$}
 ACC_SESSION=${ACC_SESSION:-acc-$$}
 ACC_LIVE=${ACC_LIVE:-0}
@@ -264,14 +266,45 @@ echo "ADE acceptance (SPEC-ADE §4.3)"
 
 # Live parts run in subshells; what they share lives in files under ACC_DIR.
 REPO_LIVE="$ACC_DIR/repo-live"
+
+# Every Claude pane this script starts runs Haiku with the permission flag:
+# the throwaway roles table pins it for every Claude role.
+mkdir -p "$XDG_CONFIG_HOME/herdr-ade"
+cat >"$XDG_CONFIG_HOME/herdr-ade/config.toml" <<'TOML'
+[roles.coordinator]
+kind = "claude"
+args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
+plain = "the quick helper"
+
+[roles.lane]
+kind = "claude"
+args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
+plain = "the quick helper"
+
+[roles.reviewer]
+kind = "claude"
+args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
+plain = "the quick helper"
+
+[roles.critic]
+kind = "claude"
+args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
+plain = "the quick helper"
+
+[roles.drafter]
+kind = "claude"
+args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
+plain = "the quick helper"
+TOML
 live_new_open() {
-  need_verb "new" "--plain" A1 || return
   need_verb "open" "--session" A2 || return
   fixture_repo live >/dev/null
-  ha new acc --repo "$REPO_LIVE" --plain "The test project for the first round." >/dev/null || { echo "ha new failed"; return; }
+  # `new --plain` is a later lane (SPEC-ADE item 70).
+  ha new acc --repo "$REPO_LIVE" >/dev/null || { echo "ha new failed"; return; }
   ha open acc --session "$ACC_SESSION" >"$ACC_DIR/open.txt" 2>&1 || { echo "ha open failed: $(tail -1 "$ACC_DIR/open.txt")"; return; }
   coord="$HERDR_ADE_ROOT/acc/.state/coordinator.json"
-  grep -q '"hook' "$coord" 2>/dev/null || { echo "no hook entry on the coordinator record before launch"; return; }
+  grep -q 'plain hook --kind claude' "$HERDR_ADE_ROOT/acc/.claude/settings.json" 2>/dev/null ||
+    { echo "no hook in the project's own .claude/settings.json"; return; }
   wait_for 120 grep -q '"bootstrap": *"acknowledged"' "$coord" || { echo "bootstrap not acknowledged within 120 s"; return; }
   echo PASS
 }
@@ -280,11 +313,12 @@ live_round_lanes() {
   need_verb "thread start" "--role" A1 || return
   [ -f "$HERDR_ADE_ROOT/acc/PROJECT.md" ] || { echo "NOT-RUN: row 1 did not create the project"; return; }
   ha round open acc r1 --branch main --plain "The first round of the test." --repo "$REPO_LIVE" >/dev/null || { echo "round open failed"; return; }
-  for role in lane-claude lane-cursor; do
-    printf 'Write the file notes/%s.txt with one line, commit it, then finish with ha done.\n' "$role" |
-      ha thread start acc --role "$role" --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$role.txt" 2>&1 ||
-      { echo "thread start --role $role failed: $(tail -1 "$ACC_DIR/start-$role.txt")"; return; }
-    id=$(grep -o 't-[0-9]*' "$ACC_DIR/start-$role.txt" | head -1)
+  # Two Claude lanes; no Cursor pane in a throwaway (row 9 says why).
+  for n in one two; do
+    printf 'Write the file notes/%s.txt with one line and commit it, then finish as your brief says.\n' "$n" |
+      ha thread start acc --title "note $n" --role lane --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$n.txt" 2>&1 ||
+      { echo "thread start --role lane failed: $(tail -1 "$ACC_DIR/start-$n.txt")"; return; }
+    id=$(grep -o 't-[0-9]*' "$ACC_DIR/start-$n.txt" | head -1)
     ha round admit acc r1 "$id" >/dev/null || { echo "round admit $id failed"; return; }
     echo "$id" >>"$ACC_DIR/lanes.txt"
   done
@@ -300,7 +334,7 @@ live_done_events() {
   need_verb "waiting" "" A2 || return
   [ -s "$ACC_DIR/lanes.txt" ] || { echo "NOT-RUN: row 2 did not start lanes"; return; }
   for id in $(cat "$ACC_DIR/lanes.txt"); do
-    wait_for 900 sh -c "ls '$HERDR_ADE_ROOT/acc/events/'*.json 2>/dev/null | xargs grep -l '\"$id\"' | xargs grep -q '\"done\"'" ||
+    wait_for 900 sh -c "grep -l 'thread = \"$id\"' '$HERDR_ADE_ROOT/acc/events/'*.toml 2>/dev/null | xargs grep -q 'payload.done'" ||
       { echo "no sealed done event for $id within 15 minutes"; return; }
   done
   ha context acc --peek >"$ACC_DIR/peek.txt" 2>&1
@@ -329,7 +363,7 @@ live_pro() {
 }
 
 live_kind_claude() { need_verb "thread start" "--role" A1 || return; echo "NOT-RUN: covered by row 2's claude lane once it passes"; }
-live_kind_cursor() { need_verb "thread start" "--role" A1 || return; echo "NOT-RUN: covered by row 2's cursor lane once it passes"; }
+live_kind_cursor() { echo "NOT-RUN: no Cursor pane in the reviewer's throwaway (brief); Cursor's row runs on install day"; }
 live_kind_other() { echo "NOT-RUN: unqualified kind, not started this round"; }
 
 live_plain_hook() {
@@ -351,7 +385,7 @@ live_stop() {
   [ -f "$ACC_DIR/server.pid" ] || { echo "NOT-RUN: no throwaway server was started"; return; }
   sock_dir="$XDG_CONFIG_HOME/herdr"
   # The wrapper validated the session name and XDG dir at the top; stop only this one.
-  H server stop >/dev/null 2>&1 || H session stop "$ACC_SESSION" >/dev/null 2>&1
+  H session stop "$ACC_SESSION" >/dev/null 2>&1
   rm -f "$ACC_DIR/server.pid"
   out=$(ha doctor 2>&1)
   printf '%s' "$out" | grep -qi 'unreachable\|not running\|FAIL' || { echo "doctor did not report the session unreachable"; return; }
@@ -364,7 +398,7 @@ live_stop() {
 
 row_begin
 live "ha new and open, hook before launch, bootstrap acknowledged within 120 s" live_new_open
-mod "coordinator receipt and hook install" A2 "(coordinator|hook)::[a-z_:]*(bootstrap|receipt|hook_before)"
+mod "priming held until the receipt, and hook install" A2 "ticker::tests::(pending_prime|rejected_prime)|hook::tests::claude_install"
 row_end 1 "ha new and open with claude coordinator: hook before launch, bootstrap acknowledged"
 
 row_begin
@@ -376,7 +410,7 @@ cli "round open with --plain records the round" ok "" -- \
   "$HA" round open cli r1 --branch main --plain "The first round of the test." --repo "$REPO_CLI"
 cli "the round's sentence is in GLOSSARY.md" ok "r1: The first round of the test." -- \
   cat "$HERDR_ADE_ROOT/cli/GLOSSARY.md"
-live "claude and cursor lanes admitted: tabs, parent, briefs committed first" live_round_lanes
+live "two claude lanes admitted: tabs, parent, briefs committed first" live_round_lanes
 mod "brief committed before the worktree, launch record" A1 "git::|threads::[a-z_:]*(brief_committed|brief_before|launch_record)"
 row_end 2 "round open r1; claude and cursor lanes admitted: tabs, parent, briefs committed first"
 
@@ -394,7 +428,7 @@ det "delivery: blocked keeps the request queued, then submitted in order" \
   talk::tests::a_blocked_coordinator_keeps_the_request_queued_and_gets_one_notice \
   talk::tests::a_refusal_before_typing_stays_queued_and_is_sent_later_in_order \
   talk::tests::a_timeout_is_uncertain_and_never_resent
-mod "outbox delivery, duplicate typed line consumed once by id" A2 "(steps|events)::[a-z_:]*(duplicate|once_by_id|consumed_once)"
+mod "outbox delivery, duplicate typed line consumed once by id" A2 "events::tests::delivery_journal|inbox::tests::event_receipts"
 row_end 4 "representative-topology handoff continuity and blocked-then-submitted delivery"
 
 row_begin
@@ -422,11 +456,11 @@ det "item 33: a removed or stale manifest fails closed" \
 det "D9 commit mechanics under the repository lock" \
   round::tests::unchecked_out_branch_uses_update_ref_with_the_expected_old_value \
   round::tests::the_repository_lock_is_exclusive
-mod "item 32: helper death after staging is sealed by the ticker, a changed sha supersedes" A2 "(ops|events)::[a-z_:]*(item32|supersede)"
+mod "item 32: helper death after staging is sealed by the ticker, a changed sha supersedes" A2 "ops::tests::(item_32|dead_helper)"
 row_end 6 "ha round merge stop after merged; resume to H; item 32-34 fixtures"
 
 row_begin
-mod "ha done with a dirty tree, a wrong sha, an unstable report" A2 "lane::[a-z_:]*(dirty|wrong_sha|unstable)"
+mod "ha done with a dirty tree, a wrong sha, an unstable report" A2 "ops::tests::done_refuses_(dirty|report)"
 det "round review with an admitted lane not done" \
   round::tests::review_refuses_an_admitted_lane_without_a_sealed_done
 det "merge: MERGE-AFTER-DECISION, moved head, earlier round, parent not C, C..V touches code, lane not in C" \
@@ -493,6 +527,79 @@ row_end 10 "plain-language rows: --plain, hook rewrite, talk captures, ha ask, b
 row_begin
 live "throwaway server stop; ha doctor reports unreachable; records intact" live_stop
 row_end 11 "throwaway server stop; ha doctor reports unreachable; records intact"
+
+# ------------------------------------------------------------- pi rows (SPEC-pi v2 §7)
+# All under the throwaway root: setup installs the pinned pi into
+# $HERDR_ADE_ROOT/pi and never links ~/.local/bin/pi (that line is Rolf's).
+
+PI_LOGIN_REASON="no provider login in a throwaway; /login is Rolf's install-day step"
+PI_JS="$HERDR_ADE_ROOT/pi/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+
+pi_doctor_install_day_only() { # every failing row is a login or the ~/.local/bin/pi link
+  out=$("$HP" doctor 2>&1)
+  printf '%s\n' "$out" | grep -q '^\[ok  \] pin: 0.85.1' || { echo "no pin row at 0.85.1"; return 1; }
+  bad=$(printf '%s\n' "$out" | grep '^\[FAIL\]' | grep -v 'missing login' | grep -v 'wrapper on PATH')
+  [ -z "$bad" ] || { echo "$bad"; return 1; }
+}
+
+pi_no_global_package() {
+  groot=$(zsh -lic 'npm root -g' 2>/dev/null | tail -1)
+  [ -n "$groot" ] && [ ! -e "$groot/@earendil-works/pi-coding-agent" ]
+}
+
+pi_guard() {
+  [ -f "$PI_JS" ] || { echo "no pinned pi at $PI_JS"; return 1; }
+  ROOT="$ACC_DIR/guard" PI_JS="$PI_JS" sh "$checkout/src/pi/testdata/guard-check.sh" | tail -1 | grep -q '^GUARD PASS'
+}
+
+pi_mock_lane() {
+  echo "NOT-RUN: a kind pi lane starts \`pi\` from the login PATH, which needs the ~/.local/bin/pi link (install day)"
+}
+
+row_begin
+cli "herdr-pi setup installs the pin into the throwaway root" ok "0.85.1" -- "$HP" setup
+cli "doctor: only the logins and the install-day PATH link fail" ok "" -- pi_doctor_install_day_only
+row_end pi-T1 "herdr-pi doctor: pin 0.85.1, pi: current, prefix isolated, trust never"
+
+row_begin
+mod "check refuses a missing guard, extension, trust, wrapper or login" A5 "pi::doctor::tests::(a_caret|a_missing_login|a_good_install|check_report|login_shell)|pi::scenarios::scenario_check"
+row_end pi-T2 "herdr-pi check refuses: guard, herdr extension, trust, wrapper, provider"
+
+row_begin
+live "mock lane in a repo with .pi/extensions: no trust question, repo extension did not run" pi_mock_lane
+row_end pi-T3 "mock pi lane: no trust question, kind pi idle at prompt"
+
+row_begin
+cli "the guard turns 429, 401 and a context error into one WAITING each, never done" ok "" -- pi_guard
+row_end pi-T7 "guard: mock 429 and 401 give blocked plus one WAITING, no done"
+
+row_begin
+cli "npm root -g does not hold the package" ok "" -- pi_no_global_package
+mod "npm argv is pinned, never global" A5 "pi::install::tests::npm_argv|pi::doctor::tests::a_global_install"
+row_end pi-T9 "no global npm install of pi"
+
+row_begin
+mod "a wrong pi earlier on PATH fails doctor and refuses the start" A5 "pi::doctor::tests::login_shell_chatter|pi::launch::tests::the_wrapper"
+row_end pi-T10 "wrong pi earlier on PATH: doctor fails and start refuses"
+
+row_begin
+cli "check refuses and names the missing login" fail "credentials_not_configured" -- "$HP" check deepseek
+mod "a missing login refuses the start" A5 "pi::scenarios::scenario_check_refuses_a_missing_login|pi::doctor::tests::a_missing_login"
+row_end pi-T11 "missing login: the start is refused, never a lane waiting for its first prompt"
+
+row_begin
+cli "--provider cursor is refused" fail "pi_cursor_forbidden" -- "$HP" check cursor
+mod "no Cursor route in pi" A5 "pi::doctor::tests::(check_refuses_cursor|a_cursor_package)|pi::launch::tests::forbidden_flags_and_cursor|pi::roles::tests::there_is_no_cursor"
+row_end pi-T13 "no Cursor route: --provider cursor refused"
+
+for r in "pi-T4 one live lane per enabled provider" "pi-T5 ha done from a pi lane" \
+  "pi-T6a live handoff keeps the pi pid" "pi-T6b cold restore through ~/.local/bin/pi" \
+  "pi-T8 after r2: exactly one --session" "pi-T12 two lanes on one OAuth provider" \
+  "pi-T14 Pro pane restore after r2's args replay"; do
+  # Optional rows: shown, never counted toward REQUIRED.
+  printf 'NOT-RUN%s%s%s%s\n  NOT-RUN%slive%s%s (%s)\n' "$TAB" "${r%% *}" "$TAB" "${r#* }" \
+    "$TAB" "$TAB" "${r#* }" "$PI_LOGIN_REASON"
+done
 
 # A server this script started is never left running.
 if [ -f "$ACC_DIR/server.pid" ]; then
