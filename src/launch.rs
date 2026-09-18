@@ -539,8 +539,14 @@ fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
     let has = |flag: &str| args.contains(&flag);
     match recipe.kind.as_str() {
         "claude" | "agy" => {
-            let model = model_value(&args).unwrap_or_default().to_ascii_lowercase();
-            if model.contains("opus") || model.contains("fable") {
+            // "Names Opus or Fable" reads every arg, not only the `--model`
+            // value: `-m claude-opus-5` or `--model=claude-opus-5` names Opus
+            // too, and the CLI accepts both.
+            let names_capped = args.iter().any(|arg| {
+                let arg = arg.to_ascii_lowercase();
+                arg.contains("opus") || arg.contains("fable")
+            });
+            if names_capped {
                 if effort_value(&args).as_deref() != Some("high") {
                     bail!(
                         "recipe_effort_forbidden: `{id}` names Opus or Fable without `--effort high`"
@@ -2043,6 +2049,22 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             error.to_string().contains("recipe_effort_forbidden"),
             "{error:#}"
         );
+
+        // Opus named outside `--model <v>` still needs `--effort high`.
+        for args in [
+            ["-m", "claude-opus-5", "--effort", "xhigh"],
+            ["--model=claude-opus-5", "--effort", "xhigh", "--verbose"],
+        ] {
+            let mut bad = config.clone();
+            let recipe = bad.recipes.get_mut("claude_opus_high").unwrap();
+            recipe.args = args.iter().map(|arg| arg.to_string()).collect();
+            recipe.args.push("--dangerously-skip-permissions".into());
+            let error = validate_config(&bad, &kinds).unwrap_err();
+            assert!(
+                error.to_string().contains("recipe_effort_forbidden"),
+                "{args:?}: {error:#}"
+            );
+        }
 
         let mut bad = config.clone();
         bad.recipes.get_mut("cursor_grok_xhigh").unwrap().args =
