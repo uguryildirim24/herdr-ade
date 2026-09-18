@@ -300,11 +300,21 @@ impl Settings {
                 let table = value.as_table().with_context(|| {
                     format!("{}: [roles] floor must be a table", file.display())
                 })?;
-                if let Some(sideways) = table.get("sideways").and_then(|v| v.as_float()) {
-                    self.floor.sideways = sideways;
-                }
-                if let Some(upgrade) = table.get("upgrade").and_then(|v| v.as_float()) {
-                    self.floor.upgrade = upgrade;
+                for (name, value) in table {
+                    let number = value
+                        .as_float()
+                        .or_else(|| value.as_integer().map(|n| n as f64))
+                        .with_context(|| {
+                            format!("{}: [roles] floor.{name} must be a number", file.display())
+                        })?;
+                    match name.as_str() {
+                        "sideways" => self.floor.sideways = number,
+                        "upgrade" => self.floor.upgrade = number,
+                        other => bail!(
+                            "{}: unknown [roles] floor class `{other}` (sideways or upgrade)",
+                            file.display()
+                        ),
+                    }
                 }
             }
             _ => bail!("unknown [roles] setting `{key}`"),
@@ -1628,6 +1638,18 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             launch.compact_reason,
             "this task runs on the usual coding helper"
         );
+    }
+
+    #[test]
+    fn a_misspelt_floor_class_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let text = config_text("shadow").replace(
+            "floor = { sideways = 0.50, upgrade = 0.70 }",
+            "floor = { sideway = 0.40, upgrade = 1 }",
+        );
+        std::fs::write(home.path().join("config.toml"), text).unwrap();
+        let error = parse_picker_config(home.path(), true).unwrap_err();
+        assert!(format!("{error:#}").contains("sideway"), "{error:#}");
     }
 
     #[test]
