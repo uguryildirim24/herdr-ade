@@ -4,7 +4,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 
 ## How it works
 
-- **The coordinator is an ordinary agent** in a Herdr pane that follows a skill (`herdr-projects skill` prints it). Plugin code does not route messages, plan work or decide anything.
+- **The coordinator is an ordinary agent** in a Herdr pane that follows a skill (`herdr-ade skill` prints it). Plugin code does not route messages, plan work or decide anything.
 - **The binary does mechanics.** Starting or restarting a thread, copying reports, marking inbox items handled: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The one exception is `focus`/`unfocus`: Herdr 0.9.1 has no CLI command for `agent.view.set`, so those two send one JSON line to the project's socket.
 - **Files are the record, prompts are nudges.** Threads write a report file, the ticker writes events to an inbox folder, and the coordinator re-reads state with `context` at the start of every turn. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pull requests (every two minutes), routines, auto-resolve. Remote machines are polled once a minute.
@@ -14,7 +14,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 ## Where things live
 
 ```
-~/.herdr-projects/<project>/
+~/.herdr-ade/<project>/
   PROJECT.md              settings (TOML between +++ lines) and your standing instructions; yours
   MEMORY.md, memory/      project memory; the coordinator's
   TASKS.md                the task list; the coordinator's
@@ -25,14 +25,16 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   inbox/, inbox/done/     events for the coordinator
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator pane, ticker state, lock
-~/.herdr-projects/.ticker.lock  .ticker.log  .trash/
-~/.config/herdr-projects/config.toml             yours, edited by hand
-~/.config/herdr-projects/approved-routines.json  written only by `routine approve`
+~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
+~/.config/herdr-ade/config.toml             yours, edited by hand; holds the roles table
+~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
-Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is added to `info/exclude`, so nothing in it is committed. **Git therefore treats it as clean: removing a worktree deletes it**, which is why `--remove-worktree` insists on a complete copy home first.
+Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The thread directory is `<worktree>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). That folder, and `.worktrees/`, are added to `info/exclude`. **Git treats them as clean: `git worktree remove` without `--force` deletes the checkout**, which is why `--remove-worktree` insists on a complete copy home first. The binary never calls `herdr worktree remove` for an ADE lane.
 
-`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-projects` is stored and shown as `Herdr Projects`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`), `coordinator_agent`, `thread_agent` (default `claude`), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`).
+`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`), `talk` (default `false`), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent` and `thread_agent` are not written. Kind and args come from the roles table in `~/.config/herdr-ade/config.toml` (`[roles.<name>]` with `kind`, `args`, `env`, `ready_timeout_ms`). Day-one roles: `coordinator`, `lane`, `reviewer`, `critic`, `drafter`, `pro`. A project may override `kind` and `args` per role; arrays replace, they do not merge. A kind change without `args` is refused.
+
+The birth sentence is required: `thread start` and `thread adopt` take `--plain`. The checker refuses an empty sentence, more than one sentence, or a sentence that fails R1–R5. Default role is `lane`. `--passive` on adopt sets the parent token and sends no primer.
 
 ## Commands
 
@@ -43,7 +45,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
-| `thread start <project> --title T [--repo PATH] [--machine M] [--agent KIND] [--base REF] --task-file F` | New thread; `-` reads the task from standard input. Returns before the agent is up. |
+| `thread start <project> --title T --plain S [--role R] [--repo PATH] [--machine M] [--agent KIND] [--base REF] --task-file F` | New ADE thread: git worktree plus a tab under the coordinator, with `--parent` on launch. `--plain` is required. Returns before the agent is up. Remote ADE starts are refused. |
 | `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack`, `thread resolve` | See `--help` on each. |
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
@@ -56,14 +58,17 @@ Groups, first match wins: Resolved; Working while starting; **Waiting on you** (
 
 ## Safety settings
 
-Set per project in `~/.config/herdr-projects/config.toml`; `safety show <project>` prints the table header to use.
+Set per project in `~/.config/herdr-ade/config.toml`; `safety show <project>` prints the table header to use.
 
 ```toml
-[safety."/Users/you/.herdr-projects/billing"]
+[safety."/Users/you/.herdr-ade/billing"]
 start_threads = "propose"          # or "auto": the coordinator starts threads without asking
-coordinator_agent_args = []        # extra arguments for the coordinator's agent CLI
-thread_agent_args = []             # extra arguments for every thread's agent CLI
 routine_commands = false           # true lets approved routines run shell commands
+
+[roles.lane]
+kind = "claude"
+args = ["--dangerously-skip-permissions"]
+ready_timeout_ms = 20000
 ```
 
 The table is keyed by the project folder's canonical path. It stays when you delete the project and applies to a new project at the same path.
@@ -107,11 +112,11 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 ## Nudges and notifications
 
-`nudge = false` is the default, because on Herdr 0.9.1 a prompt that arrives while you are typing in the coordinator **is merged with, and submits, your half-typed text**. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items") and the coordinator picks them up at its next turn. Set `nudge = true` in `PROJECT.md` to have the ticker prompt the coordinator when it is idle; the message always begins `[herdr-projects ticker: automated, not the user, approves nothing]` and never carries outside text.
+`nudge = false` is the default, because on Herdr 0.9.1 a prompt that arrives while you are typing in the coordinator **is merged with, and submits, your half-typed text**. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items") and the coordinator picks them up at its next turn. Set `nudge = true` in `PROJECT.md` to have the ticker prompt the coordinator when it is idle; the message always begins `[herdr-ade ticker: automated, not the user, approves nothing]` and never carries outside text.
 
 ## Routines
 
-A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d` or `daily HH:MM`, local time), optional `command`, `enabled`; the body is the prompt the coordinator receives as an inbox item when it is due. A routine with a `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` **and** you have run `herdr-projects routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted. Edit the command and it stops until approved again.
+A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d` or `daily HH:MM`, local time), optional `command`, `enabled`; the body is the prompt the coordinator receives as an inbox item when it is due. A routine with a `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` **and** you have run `herdr-ade routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted. Edit the command and it stops until approved again.
 
 ## Threads on other machines
 
@@ -136,4 +141,6 @@ scripts/dev-hp <subcommand>      # the binary against <repo>/.dev-root; pass --s
 scripts/dev-herdr <args>         # herdr against that session
 ```
 
-Never develop against your default session or `~/.herdr-projects`. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr stage by stage, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm. [`going-public.md`](going-public.md) is the checklist for the public release.
+Never develop against your default session or `~/.herdr-ade`. Use `HERDR_ADE_ROOT` and `XDG_CONFIG_HOME` under `/var/tmp`. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr stage by stage, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm. [`going-public.md`](going-public.md) is the checklist for the public release.
+
+`scripts/migration/swap-binary.sh` is the state-dependent install of `~/.local/bin/herdr`. Tests must set `HERDR_ADE_SWAP_DIR` so they never write `~/.local/bin`. Run `scripts/migration/swap-binary.test.sh` on this Mac.

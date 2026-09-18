@@ -17,7 +17,9 @@ const DEFAULT_TASK: &str = "Continue the work you were already doing in this pan
 /// The refusals shared by `thread adopt` and `adopt-workspace`, checked before
 /// anything is created. Returns the agent herdr detects in the pane.
 pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Result<Agent> {
-    let agents = herdr.agent_list().map_err(|e| anyhow::anyhow!("the herdr session at {socket} is not reachable: {e}"))?;
+    let agents = herdr
+        .agent_list()
+        .map_err(|e| anyhow::anyhow!("the herdr session at {socket} is not reachable: {e}"))?;
     let agent = agents
         .into_iter()
         .find(|a| a.pane_id == pane)
@@ -37,33 +39,106 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
         if record.pane_id == pane && coordinator::agent_matches(&record, &agent) {
             bail!("pane {pane} is the coordinator of `{slug}`");
         }
-        if let Some(t) = thread::list(&other).iter().find(|t| !t.is_remote() && t.status != Status::Resolved && t.pane_id == pane && thread::agent_matches(t, &agent)) {
+        if let Some(t) = thread::list(&other).iter().find(|t| {
+            !t.is_remote()
+                && t.status != Status::Resolved
+                && t.pane_id == pane
+                && thread::agent_matches(t, &agent)
+        }) {
             bail!("pane {pane} is already thread {} of `{slug}`", t.id);
         }
     }
     Ok(agent)
 }
 
-pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String>) -> Result<Thread> {
+pub fn adopt(
+    ctx: &Ctx,
+    slug: &str,
+    pane: &str,
+    title: &str,
+    task: Option<String>,
+) -> Result<Thread> {
+    adopt_inner(ctx, slug, pane, title, task, None)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdeAdopt {
+    pub plain: String,
+    pub role: Option<String>,
+    pub passive: bool,
+}
+
+pub fn adopt_with_ade(
+    ctx: &Ctx,
+    slug: &str,
+    pane: &str,
+    title: &str,
+    task: Option<String>,
+    ade: AdeAdopt,
+) -> Result<Thread> {
+    adopt_inner(ctx, slug, pane, title, task, Some(ade))
+}
+
+fn adopt_inner(
+    ctx: &Ctx,
+    slug: &str,
+    pane: &str,
+    title: &str,
+    task: Option<String>,
+    ade: Option<AdeAdopt>,
+) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() != project::Status::Active {
-        bail!("`{slug}` is {}; adopting is refused until it is active again", project.status());
+        bail!(
+            "`{slug}` is {}; adopting is refused until it is active again",
+            project.status()
+        );
     }
     if title.trim().is_empty() {
         bail!("--title may not be empty");
     }
-    let record = project.coordinator().with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
+    let (settings, _) = project.read_project_md()?;
+    let mut ade_role = String::new();
+    let mut ade_plain = String::new();
+    let mut ade_spec = None;
+    let mut passive = false;
+    if let Some(ade) = &ade {
+        crate::threads::check_birth_plain(&ade.plain)?;
+        let role = ade
+            .role
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .unwrap_or("lane");
+        ade_spec = Some(project::resolve_role(&ctx.config_dir, &settings, role)?);
+        ade_role = role.to_string();
+        ade_plain = ade.plain.trim().to_string();
+        passive = ade.passive;
+    }
+    let record = project
+        .coordinator()
+        .with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
     ticker::start(ctx)?;
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let agent = adoptable_agent(ctx, &herdr, &record.socket, pane)?;
 
     // The pane's repository and branch, when it is in one.
     let git = |args: &[&str]| -> Option<String> {
-        let out = ctx.runner.run(&Cmd::new("git", Duration::from_secs(5)).args(["-C", &agent.cwd]).args(args.iter().copied())).ok()?;
-        out.success().then(|| out.stdout.trim().to_string()).filter(|s| !s.is_empty())
+        let out = ctx
+            .runner
+            .run(
+                &Cmd::new("git", Duration::from_secs(5))
+                    .args(["-C", &agent.cwd])
+                    .args(args.iter().copied()),
+            )
+            .ok()?;
+        out.success()
+            .then(|| out.stdout.trim().to_string())
+            .filter(|s| !s.is_empty())
     };
     let repo = git(&["rev-parse", "--show-toplevel"]).unwrap_or_default();
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD").unwrap_or_default();
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|b| b != "HEAD")
+        .unwrap_or_default();
     let origin = git(&["remote", "get-url", "origin"]).unwrap_or_default();
 
     let created = thread::allocate(&project, |t| {
@@ -79,9 +154,24 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
         t.workspace_id = agent.workspace_id.clone();
         t.tab_id = agent.tab_id.clone();
         t.pane_id = agent.pane_id.clone();
+        if let Some(spec) = &ade_spec {
+            t.role = ade_role.clone();
+            t.plain = ade_plain.clone();
+            t.passive = passive;
+            t.attempt = 1;
+            t.launch = project::launch_recipe(
+                spec,
+                1,
+                String::new(),
+                project::policy_hash(&ctx.config_dir),
+            );
+            t.agent = spec.kind.clone();
+        }
     })?;
     let id = created.id.clone();
-    let task = task.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| DEFAULT_TASK.to_string());
+    let task = task
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_TASK.to_string());
 
     let briefed = (|| -> Result<()> {
         {
@@ -90,9 +180,13 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
         }
         // Two adopted panes in one directory still get separate thread directories.
         let dir = thread::thread_dir(&agent.cwd, slug, &id);
-        let with_dir = Thread { thread_dir: dir.clone(), ..created.clone() };
+        let with_dir = Thread {
+            thread_dir: dir.clone(),
+            ..created.clone()
+        };
         let brief = thread::brief_for(&project, &with_dir, &task, false)?;
-        std::fs::create_dir_all(Path::new(&dir).join("library")).with_context(|| format!("could not create {dir}"))?;
+        std::fs::create_dir_all(Path::new(&dir).join("library"))
+            .with_context(|| format!("could not create {dir}"))?;
         threads::exclude_from_git(ctx.runner, &agent.cwd)?;
         project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
         thread::update(&project, &id, |t| t.thread_dir = dir)?;
@@ -109,12 +203,30 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
 
     // Prompt now when the agent is ready for one; otherwise the ticker's one
     // delivery path sends the line later (also when the agent ends in `done`).
-    let sent = agent.ready() && herdr.agent_prompt(pane, &thread::launch_prompt(slug, &id)).is_ok();
+    // Passive adopt (SPEC-ADE D7) sends nothing.
+    let _ = herdr.pane_set_parent(pane, &record.pane_id);
+    let sent = !passive
+        && agent.ready()
+        && herdr
+            .agent_prompt(pane, &thread::launch_prompt(slug, &id))
+            .is_ok();
     let adopted = thread::update(&project, &id, |t| {
         t.status = Status::Open;
-        t.prompt_pending = !sent;
+        t.prompt_pending = !passive && !sent;
         t.last_state = agent.agent_status.clone();
         t.last_state_change = project::now();
+        if let Some(spec) = &ade_spec {
+            thread::bind_identity(
+                t,
+                &record.socket,
+                &agent,
+                herdr
+                    .pane_process_info(pane)
+                    .ok()
+                    .and_then(|p| p.identity()),
+            );
+            t.agent = spec.kind.clone();
+        }
     })?;
     threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
     Ok(adopted)
@@ -141,21 +253,51 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
     }
 
     // repo = the workspace's directory when that is a git repository.
-    let cwd = if args.workspace_cwd.is_empty() { agent.cwd.clone() } else { args.workspace_cwd.clone() };
+    let cwd = if args.workspace_cwd.is_empty() {
+        agent.cwd.clone()
+    } else {
+        args.workspace_cwd.clone()
+    };
     let is_repo = ctx
         .runner
-        .run(&Cmd::new("git", Duration::from_secs(5)).args(["-C", &cwd, "rev-parse", "--show-toplevel"]))
+        .run(&Cmd::new("git", Duration::from_secs(5)).args([
+            "-C",
+            &cwd,
+            "rev-parse",
+            "--show-toplevel",
+        ]))
         .ok()
         .filter(|o| o.success())
         .map(|o| o.stdout.trim().to_string())
         .filter(|s| !s.is_empty());
-    let repos = is_repo.map(|path| vec![project::Repo { path, machine: None }]).unwrap_or_default();
+    let repos = is_repo
+        .map(|path| {
+            vec![project::Repo {
+                path,
+                machine: None,
+            }]
+        })
+        .unwrap_or_default();
 
     let project = project::create(&ctx.root, &args.name, &args.goal, repos)?;
     println!("created `{}` at {}", project.slug, project.dir().display());
-    coordinator::open(ctx, &project.slug, &coordinator::OpenOptions { session: SessionFlags { session: None, socket: Some(session.socket.clone()) }, reprime: false, rebind: false })?;
+    coordinator::open(
+        ctx,
+        &project.slug,
+        &coordinator::OpenOptions {
+            session: SessionFlags {
+                session: None,
+                socket: Some(session.socket.clone()),
+            },
+            reprime: false,
+            rebind: false,
+        },
+    )?;
     let adopted = adopt(ctx, &project.slug, &args.pane, &args.name, None)?;
-    println!("adopted pane {} as thread {} of `{}`", args.pane, adopted.id, project.slug);
+    println!(
+        "adopted pane {} as thread {} of `{}`",
+        args.pane, adopted.id, project.slug
+    );
     Ok(())
 }
 
@@ -184,8 +326,18 @@ mod tests {
     #[test]
     fn adopting_a_ready_agent_writes_a_brief_and_prompts_it() {
         let (world, project, cwd) = world_with_agent("idle", "my-agent");
-        let t = adopt(&world.ctx(), "demo", "w5:p1", "Adopted work", Some("Finish the refactor.".into())).unwrap();
-        assert_eq!((t.kind, t.status, t.prompt_pending), (Kind::Adopted, Status::Open, false));
+        let t = adopt(
+            &world.ctx(),
+            "demo",
+            "w5:p1",
+            "Adopted work",
+            Some("Finish the refactor.".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            (t.kind, t.status, t.prompt_pending),
+            (Kind::Adopted, Status::Open, false)
+        );
         assert_eq!(t.agent_name, "my-agent");
         assert_eq!(t.thread_dir, format!("{cwd}/.herdr-project/demo-t-0001"));
         let brief = std::fs::read_to_string(format!("{}/brief.md", t.thread_dir)).unwrap();
@@ -195,7 +347,10 @@ mod tests {
 
         // A second pane in the same directory gets its own thread directory.
         let second = adopt(&world.ctx(), "demo", "w5:p2", "Second", None).unwrap();
-        assert_eq!(second.thread_dir, format!("{cwd}/.herdr-project/demo-t-0002"));
+        assert_eq!(
+            second.thread_dir,
+            format!("{cwd}/.herdr-project/demo-t-0002")
+        );
         assert!(second.agent_name.is_empty());
         assert_ne!(t.thread_dir, second.thread_dir);
         let _ = project;
@@ -208,7 +363,10 @@ mod tests {
         assert!(t.prompt_pending);
         assert_eq!(world.runner.count("agent prompt"), 0);
 
-        *world.agents.borrow_mut() = format!("[{}]", agent_json("w5", "w5:t1", "w5:p1", &cwd, "my-agent", "done"));
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w5", "w5:t1", "w5:p1", &cwd, "my-agent", "done")
+        );
         crate::ticker::tick_project(&world.ctx(), &project).unwrap();
         assert_eq!(world.runner.count("agent prompt"), 1);
         assert!(!thread::load(&project, "t-0001").unwrap().prompt_pending);
@@ -221,10 +379,20 @@ mod tests {
         let (world, project, _) = world_with_agent("idle", "my-agent");
         let ctx = world.ctx();
         // No detected agent in that pane.
-        assert!(adopt(&ctx, "demo", "w9:p9", "x", None).unwrap_err().to_string().contains("no agent is detected"));
+        assert!(
+            adopt(&ctx, "demo", "w9:p9", "x", None)
+                .unwrap_err()
+                .to_string()
+                .contains("no agent is detected")
+        );
         // Already a thread.
         adopt(&ctx, "demo", "w5:p1", "first", None).unwrap();
-        assert!(adopt(&ctx, "demo", "w5:p1", "again", None).unwrap_err().to_string().contains("already thread t-0001"));
+        assert!(
+            adopt(&ctx, "demo", "w5:p1", "again", None)
+                .unwrap_err()
+                .to_string()
+                .contains("already thread t-0001")
+        );
         assert_eq!(thread::list(&project).len(), 1);
 
         // Same pane id recorded by a project in ANOTHER socket is a different pane.
@@ -240,8 +408,43 @@ mod tests {
     fn adopt_workspace_refuses_without_an_agent_and_creates_nothing() {
         let (world, _, _) = world_with_agent("idle", "my-agent");
         let socket = world.home.path().join("a.sock");
-        let args = AdoptWorkspace { name: "From Workspace".into(), goal: String::new(), pane: "w9:p9".into(), workspace_cwd: String::new(), session: SessionFlags { session: None, socket: Some(socket) } };
+        let args = AdoptWorkspace {
+            name: "From Workspace".into(),
+            goal: String::new(),
+            pane: "w9:p9".into(),
+            workspace_cwd: String::new(),
+            session: SessionFlags {
+                session: None,
+                socket: Some(socket),
+            },
+        };
         assert!(adopt_workspace(&world.ctx(), &args).is_err());
         assert!(!world.root.join("from-workspace").exists());
+    }
+
+    #[test]
+    fn passive_adopt_sends_no_prompt_and_sets_parent() {
+        let (world, _, _) = world_with_agent("idle", "pro");
+        let t = adopt_with_ade(
+            &world.ctx(),
+            "demo",
+            "w5:p1",
+            "Pro pane",
+            None,
+            AdeAdopt {
+                plain: "The critic reads the report.".into(),
+                role: Some("pro".into()),
+                passive: true,
+            },
+        )
+        .unwrap();
+        assert!(t.passive);
+        assert_eq!(t.role, "pro");
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        let calls = world.runner.calls.borrow();
+        let parent = calls
+            .iter()
+            .any(|c| c.display().contains("report-metadata") && c.display().contains("parent="));
+        assert!(parent, "expected parent token");
     }
 }

@@ -48,9 +48,13 @@ impl Env {
             .filter(|v| !v.is_empty())
     }
 
-    /// The fixed user-level config directory, `~/.config/herdr-ade`.
+    /// Config directory: `$XDG_CONFIG_HOME/herdr-ade` when that variable is set
+    /// (SPEC-ADE item 39), else `~/.config/herdr-ade`.
     pub fn config_dir(&self) -> PathBuf {
-        self.home.join(".config").join("herdr-ade")
+        match self.var("XDG_CONFIG_HOME") {
+            Some(xdg) => self.expand_tilde(xdg).join("herdr-ade"),
+            None => self.home.join(".config").join("herdr-ade"),
+        }
     }
 
     /// `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
@@ -231,6 +235,20 @@ mod tests {
     fn herdr_bin_prefers_the_variable() {
         let env = Env::for_test(Path::new("/h"), &[("HERDR_BIN_PATH", "/opt/herdr")]);
         assert_eq!(env.herdr_bin(), "/opt/herdr");
+    }
+
+    #[test]
+    fn config_dir_reads_xdg_config_home() {
+        let home = Path::new("/h");
+        let env = Env::for_test(home, &[]);
+        assert_eq!(env.config_dir(), PathBuf::from("/h/.config/herdr-ade"));
+        let env = Env::for_test(home, &[("XDG_CONFIG_HOME", "/var/tmp/ade-a1/xdg")]);
+        assert_eq!(
+            env.config_dir(),
+            PathBuf::from("/var/tmp/ade-a1/xdg/herdr-ade")
+        );
+        let env = Env::for_test(home, &[("XDG_CONFIG_HOME", "")]);
+        assert_eq!(env.config_dir(), PathBuf::from("/h/.config/herdr-ade"));
     }
 
     #[test]
