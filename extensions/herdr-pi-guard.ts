@@ -40,7 +40,7 @@ export default function (pi) {
     if (
       status === 401 ||
       status === 403 ||
-      /unauthorized|forbidden|credentials|api key|apikey|token|re-login|relogin|log in again|login expired|not_ready|not ready/.test(
+      /unauthorized|forbidden|credentials|api key|apikey|invalid token|invalid_token|expired token|token expired|token has expired|refresh token|access token|re-login|relogin|log in again|login expired|not_ready|not ready/.test(
         text,
       )
     ) {
