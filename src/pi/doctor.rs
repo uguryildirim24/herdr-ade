@@ -591,7 +591,11 @@ fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row 
         .chain(output.stderr.lines())
         // Only `pi is ...` lines: a login shell's rc files may print their
         // own lines, and one with " is " in it is not a resolution of pi.
-        .filter_map(|line| line.trim().strip_prefix("pi is ").map(|p| p.trim().to_string()))
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("pi is ")
+                .map(|p| p.trim().to_string())
+        })
         .filter(|p| !p.is_empty())
         .collect();
     let first = list.first().cloned().unwrap_or_default();
@@ -729,7 +733,10 @@ mod tests {
         runner.on("zsh -lic command -v npm", ok("/opt/homebrew/bin/npm\n"));
         runner.on(
             "zsh -lic npm root -g",
-            ok(&format!("{}\n", env.home.join("global/node_modules").display())),
+            ok(&format!(
+                "{}\n",
+                env.home.join("global/node_modules").display()
+            )),
         );
         runner.on(
             "zsh -lic whence -va pi",
@@ -808,7 +815,10 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on(
             "zsh -lic whence -va pi",
-            ok(&format!("pi is /opt/homebrew/bin/pi\npi is {}\n", link.display())),
+            ok(&format!(
+                "pi is /opt/homebrew/bin/pi\npi is {}\n",
+                link.display()
+            )),
         );
         assert_eq!(wrapper_path_row(&runner, &env, &layout).level, Level::Fail);
     }

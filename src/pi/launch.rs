@@ -531,7 +531,11 @@ mod tests {
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
         let baked = dir.path().join("it's $state/pi/agent");
         let wrapper = dir.path().join("pi");
-        std::fs::write(&wrapper, wrapper_script(&baked, Path::new("/nowhere/cli.js"))).unwrap();
+        std::fs::write(
+            &wrapper,
+            wrapper_script(&baked, Path::new("/nowhere/cli.js")),
+        )
+        .unwrap();
 
         let run = |agent_dir: Option<&str>, cwd: &Path| {
             let mut cmd = std::process::Command::new("sh");
