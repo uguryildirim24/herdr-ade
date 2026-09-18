@@ -293,6 +293,14 @@ fn say_problems(field: &str, value: &str, g: &plain::Glossary) -> Vec<String> {
 pub fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let project = Project::load(&ctx.root, slug)?;
     check_structured(&project, &new)?;
+    // The board line is checked before anything is recorded: a record whose
+    // line can never pass would be retried by the ticker forever.
+    let compact = compact_line(&Ask {
+        question: new.question.trim().to_string(),
+        choices: new.choices.clone(),
+        ..Ask::default()
+    });
+    glossary::gate(&project, &compact).context("the compact board line failed the check")?;
     let binding = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
     let record = {
         let _lock = project.lock()?;
@@ -331,8 +339,6 @@ pub fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
         write_atomic(&path, toml::to_string(&record)?.as_bytes())?;
         record
     };
-    let compact = compact_line(&record);
-    glossary::gate(&project, &compact).context("the compact board line failed the check")?;
     if let Err(e) = publish(
         ctx,
         &project,
@@ -1005,6 +1011,18 @@ mod tests {
             "keep the experiment running another hour? (2 choices)"
         );
         assert!(crate::board::refresh(&ctx, &fx.project).unwrap().is_empty());
+        // Review defect: a gloss-form name passed the check onto the board.
+        crate::thread::update(&fx.project, &a, |t| {
+            t.plain = "The lane that renames the parts.".into()
+        })
+        .unwrap();
+        let glossed = format!("The lane that renames the parts ({a}).");
+        glossary::gate(&fx.project, &glossed).unwrap();
+        let e = format!(
+            "{:#}",
+            crate::board::check_value(&fx.project, &glossed).unwrap_err()
+        );
+        assert!(e.contains("names"), "{e}");
     }
 
     #[test]

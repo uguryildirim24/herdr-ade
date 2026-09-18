@@ -165,6 +165,16 @@ pub fn gate(project: &Project, text: &str) -> Result<()> {
     }
 }
 
+/// The first born name or term `text` carries, even in gloss form. Board
+/// values carry none (item 14).
+pub fn name_in(project: &Project, text: &str) -> Option<String> {
+    names(project)
+        .into_iter()
+        .map(|e| e.name)
+        .chain(terms(project).into_iter().map(|t| t.name))
+        .find(|name| !name.is_empty() && contains_name(text, name))
+}
+
 fn contains_name(sentence: &str, name: &str) -> bool {
     let lower = sentence.to_ascii_lowercase();
     let name = name.to_ascii_lowercase();

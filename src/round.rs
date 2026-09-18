@@ -1020,6 +1020,15 @@ pub fn validate_verdict(git: &Git, record: &RoundRecord, v: &str) -> Result<Stri
 pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<MergeOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = load(&project, round)?;
+    // One merge per round at a time: a second run waits, then reads the
+    // first one's record and resumes from it (item 34).
+    std::fs::create_dir_all(merge_dir(&project, round))?;
+    let single = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(merge_dir(&project, round).join("merge.lock"))?;
+    single.lock()?;
     let git = Git::new(ctx.runner, &record.repo);
     let outcome = match read_merge(&project, round)? {
         Some(intent) => resume(ctx, &project, &record, &git, intent, stop),
@@ -1445,13 +1454,18 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
 /// reports a pending merge once, resumes ask publication, runs the talk
 /// writer and refreshes the board. Never merges on its own.
 pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
-    let events = sealed_events(project).unwrap_or_default();
+    // An unreadable events folder refreshes nothing: an empty list would
+    // unpin every lane and bump every revision (D6, item 33).
+    let events = sealed_events(project).ok();
     for listed in list(project) {
         let round = listed.round.clone();
+        // A merging round keeps the pins it was admitted and merged with.
+        if let Some(events) = &events
+            && matches!(read_merge(project, &round), Ok(None))
         {
             let _lock = project.lock()?;
             if let Ok(mut record) = load(project, &round)
-                && refresh_pins(project, &mut record, &events).unwrap_or(false)
+                && refresh_pins(project, &mut record, events).unwrap_or(false)
             {
                 save(project, &record)?;
             }

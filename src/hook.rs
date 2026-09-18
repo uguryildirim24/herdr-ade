@@ -17,6 +17,9 @@ use crate::remote::quote;
 use crate::runner::Cmd;
 
 const INPUT_LIMIT: usize = 64 * 1024;
+/// The hook input read to find the session; the reply inside it is bounded
+/// by `INPUT_LIMIT`.
+const READ_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_CORRECTIONS: u32 = 3;
 const DEADLINE_SECS: i64 = 10 * 60;
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -136,7 +139,7 @@ fn owned_hook(value: &serde_json::Value) -> bool {
 fn install_entry(value: &mut serde_json::Value, shape: ConfigShape, command: &str) -> Result<()> {
     let object = value
         .as_object_mut()
-        .expect("read_json_object returns an object");
+        .context("hook_install_failed: the settings file is not a JSON object")?;
     if shape == ConfigShape::Cursor {
         object.insert("version".into(), serde_json::json!(1));
     }
@@ -227,10 +230,11 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
     }
     let mut bytes = Vec::new();
     std::io::stdin()
-        .take((INPUT_LIMIT + 1) as u64)
+        .take((READ_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > INPUT_LIMIT {
-        return correction(kind, "plain_input_too_large: reply exceeds 64 KiB");
+    if bytes.len() > READ_LIMIT {
+        // Too large to read the session from: not blocked, and not checked.
+        return Ok(());
     }
     let input: serde_json::Value =
         serde_json::from_slice(&bytes).context("hook input is not JSON")?;
@@ -246,13 +250,31 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
         return cursor_stop(ctx, &project, kind);
     }
     let text = reply_text(kind, &input).unwrap_or_default();
+    // An oversize reply is a failed check like any other: it spends the
+    // turn's budget and ends in the fixed notice, never a block loop.
+    let (text, oversize) = if text.len() > INPUT_LIMIT {
+        ("", true)
+    } else {
+        (text, false)
+    };
     let turn = if kind == "cursor" {
         project::read_json::<CursorPending>(&cursor_pending_path(&project))
             .map(|pending| pending.turn)
-            .unwrap_or_else(|| turn_key(&input, text))
+            .map_or_else(|| turn_key(&project, session, &input, text), Ok)?
     } else {
-        turn_key(&input, text)
+        turn_key(&project, session, &input, text)?
     };
+    if oversize {
+        return failed_check(
+            ctx,
+            &project,
+            kind,
+            session,
+            &turn,
+            text,
+            "plain_input_too_large: reply exceeds 64 KiB",
+        );
+    }
     let messages = match parse_envelopes(text) {
         Ok(messages) => messages,
         Err(error) => {
@@ -361,20 +383,53 @@ fn reply_text<'a>(kind: &str, input: &'a serde_json::Value) -> Option<&'a str> {
     }
 }
 
-fn turn_key(input: &serde_json::Value, text: &str) -> String {
+/// The human turn this stop belongs to. A native id wins. Claude sends none:
+/// its first stop of a turn has `stop_hook_active = false` and starts a new
+/// turn (a fresh budget and fresh publication keys); a continuation has it
+/// `true` and keeps the turn it continues.
+fn turn_key(
+    project: &Project,
+    session: &str,
+    input: &serde_json::Value,
+    text: &str,
+) -> Result<String> {
     for field in ["turn_id", "last_user_message_id", "prompt_id"] {
         if let Some(value) = input[field].as_str().filter(|value| !value.is_empty()) {
-            return value.to_string();
+            return Ok(value.to_string());
         }
     }
-    // Continuations keep the same transcript path. This fallback does not
-    // reset on `stop_hook_active`; a fresh native human turn should supply one
-    // of the identifiers above on qualified adapters.
-    input["transcript_path"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("text-{:x}", Sha256::digest(text.as_bytes())))
+    // Without the flag (Cursor) the transcript is the turn, as before.
+    let Some(continuing) = input["stop_hook_active"].as_bool() else {
+        return Ok(input["transcript_path"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("text-{:x}", Sha256::digest(text.as_bytes()))));
+    };
+    let path = project
+        .state_dir()
+        .join("plain")
+        .join("turn")
+        .join(format!("{:x}", Sha256::digest(session.as_bytes())));
+    if continuing && let Ok(turn) = std::fs::read_to_string(&path) {
+        return Ok(turn);
+    }
+    let turn = format!(
+        "turn-{:x}",
+        Sha256::digest(
+            format!(
+                "{}\n{}\n{text}",
+                input["transcript_path"].as_str().unwrap_or_default(),
+                jiff::Timestamp::now().as_nanosecond()
+            )
+            .as_bytes()
+        )
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    project::write_atomic(&path, turn.as_bytes())?;
+    Ok(turn)
 }
 
 fn failed_check(
@@ -657,6 +712,19 @@ mod tests {
         remove(&project).unwrap();
         let value = read_json_object(&path).unwrap();
         assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    /// Review defect: Claude's key was the transcript path, so the budget of
+    /// the first failing turn never reset for the rest of the session.
+    #[test]
+    fn a_new_human_turn_gets_a_new_key_and_a_continuation_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let stop =
+            |active| serde_json::json!({"transcript_path": "/t.jsonl", "stop_hook_active": active});
+        let first = turn_key(&project, "s", &stop(false), "a").unwrap();
+        assert_eq!(turn_key(&project, "s", &stop(true), "b").unwrap(), first);
+        assert_ne!(turn_key(&project, "s", &stop(false), "a").unwrap(), first);
     }
 
     #[test]
