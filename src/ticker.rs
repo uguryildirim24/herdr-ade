@@ -24,7 +24,7 @@ const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
-fn lock_path(root: &Path) -> PathBuf {
+pub fn lock_path(root: &Path) -> PathBuf {
     root.join(".ticker.lock")
 }
 

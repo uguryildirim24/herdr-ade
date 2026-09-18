@@ -65,6 +65,41 @@ fn report(
     let _ = writeln!(out, "version:    {}", crate::VERSION);
     let _ = writeln!(out, "root:       {}", root.display());
     let _ = writeln!(out, "config dir: {}", config_dir.display());
+    let _ = writeln!(
+        out,
+        "ticker:     {}",
+        crate::ticker::lock_path(root).display()
+    );
+    let manifest: toml::Table =
+        toml::from_str(include_str!("../herdr-plugin.toml")).unwrap_or_default();
+    let commands = |key: &str, field: &str| -> Vec<String> {
+        manifest
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| match entry.get(field)? {
+                toml::Value::String(s) => Some(s.clone()),
+                toml::Value::Array(a) => Some(
+                    a.iter()
+                        .filter_map(toml::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => None,
+            })
+            .collect()
+    };
+    let _ = writeln!(
+        out,
+        "startup:    {}",
+        commands("startup", "command").join("; ")
+    );
+    let mut actions = commands("actions", "id");
+    actions.sort();
+    actions.dedup();
+    let _ = writeln!(out, "actions:    {}", actions.join(", "));
+    let _ = writeln!(out, "log:        herdr plugin log --plugin herdr-ade");
     let _ = writeln!(out);
 
     let bin = env.herdr_bin();
