@@ -15,7 +15,20 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Prints the report and returns whether every required check passed.
 pub fn run(ctx: &Ctx, session: &SessionFlags) -> Result<bool> {
-    let (text, healthy) = report(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
+    let (mut text, mut healthy) = report(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
+    // The pi rows read the process's own layout (SPEC-pi §3.4).
+    match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root) {
+        Ok((rows, pi_healthy)) => {
+            healthy &= pi_healthy;
+            for row in rows {
+                let _ = writeln!(text, "{}", row.line());
+            }
+        }
+        Err(error) => {
+            healthy = false;
+            let _ = writeln!(text, "[FAIL] pi: {error:#}");
+        }
+    }
     print!("{text}");
     Ok(healthy)
 }
@@ -251,28 +264,20 @@ fn report(
         }
     }
 
-    match crate::project::load_roles(config_dir) {
-        Ok(table) => {
-            for name in project::day_one_roles() {
-                let spec = table
-                    .roles
-                    .get(*name)
-                    .cloned()
-                    .unwrap_or_else(|| project::default_role_spec(name));
-                if project::kind_needs_permission_args(&spec.kind) && spec.args.is_empty() {
-                    check(
-                        &mut out,
-                        None,
-                        &format!("role {name}"),
-                        format!(
-                            "kind {} has no args; a permission flag is usually required",
-                            spec.kind
-                        ),
-                    );
-                }
+    let ctx = Ctx {
+        env,
+        root: root.to_path_buf(),
+        config_dir: config_dir.to_path_buf(),
+        runner,
+        detached_ticker: false,
+    };
+    match crate::launch::doctor_rows(&ctx) {
+        Ok(rows) => {
+            for row in rows {
+                check(&mut out, row.ok, &row.label, row.detail.clone());
             }
         }
-        Err(error) => check(&mut out, Some(false), "roles", format!("{error:#}")),
+        Err(error) => check(&mut out, Some(false), "picker", format!("{error:#}")),
     }
 
     // Machines that projects use need an SSH target for report and library copies.

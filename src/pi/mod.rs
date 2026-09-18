@@ -2,7 +2,7 @@
 //!
 //! The library owns pi itself: the pinned npm prefix, the wrapper the login
 //! shell finds, one shared pi folder for every lane, the D2 rows and Jev
-//! recipe ids, the priming row for the adapter table, resume helpers, doctor
+//! recipe ids, resume helpers, doctor
 //! rows, and the guard extension that turns a provider failure into
 //! `blocked` / `WAITING` instead of a silent `done`.
 //!
@@ -19,15 +19,12 @@ pub mod doctor;
 pub mod folder;
 pub mod install;
 pub mod launch;
-pub mod priming;
 pub mod resume;
 pub mod roles;
 pub mod sh;
 
 #[cfg(test)]
 mod scenarios;
-
-pub use doctor::CheckReport;
 
 /// The pinned pi package. Never a caret range, never `npm install -g`
 /// (SPEC-pi v2 §1, §3.2).
@@ -201,7 +198,11 @@ pub fn resolve_root(env: &Env) -> Result<PathBuf> {
 
 /// `root` from ADE's `config.toml`, when the file sets one.
 fn config_root(env: &Env) -> Result<Option<String>> {
-    let path = env.home.join(".config/herdr-ade/config.toml");
+    let config = env
+        .var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env.home.join(".config"));
+    let path = config.join("herdr-ade/config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(None);
     };
@@ -213,20 +214,6 @@ fn config_root(env: &Env) -> Result<Option<String>> {
         .and_then(toml::Value::as_str)
         .filter(|root| !root.is_empty())
         .map(str::to_string))
-}
-
-/// A read-only check before `herdr agent start`, from the process
-/// environment. This is the entry A1 calls: `crate::pi::check(provider)`.
-/// `Err` carries every failing row's text.
-pub fn check(provider: &str) -> Result<CheckReport> {
-    let env = Env::from_process()?;
-    let layout = Layout::from_env(&env)?;
-    let report = doctor::check_report(&env, &layout, &sh::RealRunner, provider);
-    if report.ok {
-        Ok(report)
-    } else {
-        anyhow::bail!("{}", report.error_text())
-    }
 }
 
 /// The one-time login per provider (SPEC-pi v2 §2). The plugin prints these

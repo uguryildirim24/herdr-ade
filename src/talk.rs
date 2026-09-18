@@ -134,10 +134,10 @@ pub fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Opti
     let path = journal_path(project);
     let bytes = std::fs::read(&path).unwrap_or_default();
     let journal = parse(&bytes);
-    if let Some(key) = key {
-        if journal.lines.iter().any(|l| l.key.as_deref() == Some(key)) {
-            return Ok(None);
-        }
+    if let Some(key) = key
+        && journal.lines.iter().any(|l| l.key.as_deref() == Some(key))
+    {
+        return Ok(None);
     }
     let mut file = File::options().create(true).append(true).open(&path)?;
     let mut seq = journal.lines.last().map_or(0, |l| l.seq);
@@ -201,20 +201,6 @@ pub fn coordinator_kind(project: &Project) -> String {
 
 /// Per-kind labels (D17 item 2, D18 item 5). The shipped capability table is
 /// A2's `adapters.rs`; these are the values this spec fixes today.
-pub fn chat_label(kind: &str) -> &'static str {
-    match kind {
-        "claude" => "checked after display; native pane shows the first version",
-        _ => "not checked",
-    }
-}
-
-pub fn surface_label(kind: &str) -> &'static str {
-    match kind {
-        "claude" => "surface mediated, native checked after display",
-        _ => "chat: shown only through say and ask",
-    }
-}
-
 fn recipient(project: &Project) -> Recipient {
     let coord = project.coordinator().unwrap_or_default();
     Recipient {
@@ -457,11 +443,11 @@ pub fn header(project: &Project) -> String {
         } else {
             coord.pane_id.as_str()
         },
-        chat_label(&kind)
+        crate::adapters::chat_label(&kind)
     );
     if kind != "claude" {
         out.push_str("; ");
-        out.push_str(surface_label(&kind));
+        out.push_str(crate::adapters::surface_label(&kind));
     }
     out
 }
@@ -588,29 +574,30 @@ impl<'a> Surface<'a> {
             _ => {}
         }
         let trimmed = line.trim();
-        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
-            if let Some((id, rev)) = self.binding.clone() {
-                let newest = crate::ask::newest_open(project).map(|a| (a.id, a.revision));
-                if newest != Some((id.clone(), rev)) {
-                    notice(ctx, project, "ask_redrawn");
-                    return Ok(Vec::new());
-                }
-                let choice: u32 = trimmed.parse().unwrap_or(u32::MAX);
-                return match crate::ask::answer(ctx, &project.slug, &id, rev, choice, "talk") {
-                    Ok(a) => {
-                        let line = format!("ANSWER {id}@{rev} {choice}: Rolf chose \"{}\"", a.text);
-                        let _ = submit(ctx, project, &line);
-                        Ok(Vec::new())
-                    }
-                    Err(e) if format!("{e}").starts_with("ask_choice_out_of_range") => {
-                        Ok(vec![format!("  {}", e)])
-                    }
-                    Err(_) => {
-                        notice(ctx, project, "ask_not_found");
-                        Ok(Vec::new())
-                    }
-                };
+        if !trimmed.is_empty()
+            && trimmed.chars().all(|c| c.is_ascii_digit())
+            && let Some((id, rev)) = self.binding.clone()
+        {
+            let newest = crate::ask::newest_open(project).map(|a| (a.id, a.revision));
+            if newest != Some((id.clone(), rev)) {
+                notice(ctx, project, "ask_redrawn");
+                return Ok(Vec::new());
             }
+            let choice: u32 = trimmed.parse().unwrap_or(u32::MAX);
+            return match crate::ask::answer(ctx, &project.slug, &id, rev, choice, "talk") {
+                Ok(a) => {
+                    let line = format!("ANSWER {id}@{rev} {choice}: Rolf chose \"{}\"", a.text);
+                    let _ = submit(ctx, project, &line);
+                    Ok(Vec::new())
+                }
+                Err(e) if format!("{e}").starts_with("ask_choice_out_of_range") => {
+                    Ok(vec![format!("  {}", e)])
+                }
+                Err(_) => {
+                    notice(ctx, project, "ask_not_found");
+                    Ok(Vec::new())
+                }
+            };
         }
         // `/...` passes through unchanged for CLI slash commands.
         submit(ctx, project, line)?;
@@ -710,13 +697,11 @@ pub fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceTab>> {
     if let Some(tab) = std::fs::read_to_string(surface_path(project))
         .ok()
         .and_then(|t| toml::from_str::<SurfaceTab>(&t).ok())
-    {
-        if h.pane_list()
+        && h.pane_list()
             .map(|panes| panes.iter().any(|p| p.pane_id == tab.pane_id))
             .unwrap_or(false)
-        {
-            return Ok(Some(tab));
-        }
+    {
+        return Ok(Some(tab));
     }
     let dir = project.dir().to_string_lossy().into_owned();
     let result = h

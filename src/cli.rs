@@ -277,11 +277,6 @@ enum Command {
         #[command(subcommand)]
         command: TickerCommand,
     },
-    // ade-picker begin
-    /// Print the picker's health rows (hidden; `doctor` will print them)
-    #[command(hide = true)]
-    PickerDoctor,
-    // ade-picker end
 }
 
 #[derive(Subcommand)]
@@ -741,6 +736,9 @@ enum ThreadCommand {
         /// Role from the roles table (default: lane)
         #[arg(long, value_name = "ROLE")]
         role: Option<String>,
+        /// Pin this recipe; the picker is skipped
+        #[arg(long, value_name = "ID")]
+        recipe: Option<String>,
     },
     /// Bring back a thread whose pane is gone or whose start failed
     Restart { slug: String, id: String },
@@ -958,6 +956,7 @@ pub fn run() -> Result<()> {
                 task_file,
                 plain,
                 role,
+                recipe,
             } => {
                 let task = read_text(&task_file)?;
                 let thread = threads::start(
@@ -971,6 +970,7 @@ pub fn run() -> Result<()> {
                         task,
                         plain: plain.unwrap_or_default(),
                         role,
+                        recipe,
                     },
                 )?;
                 println!(
@@ -1159,8 +1159,5 @@ pub fn run() -> Result<()> {
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
-        // ade-picker begin
-        Command::PickerDoctor => crate::launch::picker_doctor(&ctx),
-        // ade-picker end
     }
 }

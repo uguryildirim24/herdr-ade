@@ -15,18 +15,16 @@ mod glossary;
 mod herdr;
 mod hook;
 mod inbox;
-#[allow(dead_code)]
 mod jev;
 mod lane;
-#[allow(dead_code)]
 mod launch;
 mod lifecycle;
 mod ops;
 mod overview;
 mod paths;
+// Shared with the `herdr-pi` binary: setup, install and login run only there.
 #[allow(dead_code)]
 mod pi;
-#[allow(dead_code)]
 #[path = "pi/ade.rs"]
 mod pi_ade;
 mod plain;

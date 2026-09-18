@@ -61,6 +61,9 @@ pub const FALLBACK_CONFIG_CHANGED: &str = "config_changed";
 /// (SPEC-jev-picker v2 §3, "Where the reason shows").
 pub const TEMPLATE_DEFAULT: &str = "{job} looks like ordinary work, so it runs on {plain}.";
 pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
+/// The resolver was never asked (off, not opted in, one row, no gate):
+/// SPEC-ADE item 96.
+pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, the usual choice.";
 pub const TEMPLATE_FALLBACK: &str =
     "{job} runs on {plain}, the usual choice, because the picker did not answer.";
 pub const TEMPLATE_SHADOW: &str = "{job} runs on {plain}; the picker would have chosen {pick}.";
@@ -209,9 +212,79 @@ pub fn parse_picker_config(config_dir: &Path, opted_in: bool) -> Result<PickerCo
         }
         roles.insert(name.clone(), parse_role(&name, raw_role, &mut recipes)?);
     }
+    builtin_pi_recipes(&mut recipes, &roles)?;
+    for (id, recipe) in &recipes {
+        // The pair filter and the scrub list read `--model <v>` and
+        // `model=<v>` only (SPEC-ADE item 99).
+        if recipe
+            .args
+            .iter()
+            .any(|arg| arg == "-m" || arg.starts_with("--model="))
+        {
+            bail!(
+                "recipe_model_unreadable: recipe `{id}` spells its model as `-m` or `--model=`; write `--model <value>`"
+            );
+        }
+    }
     let mut config = finish(settings, recipes, roles, opted_in)?;
     config.inline_without_plain = inline_without_plain;
     Ok(config)
+}
+
+/// The ready-made `kind = "pi"` rows (SPEC-pi v2 §3.5) join the table under
+/// their own ids; a config row may not reuse one, a withheld row may not be
+/// named, and a row that is not start-time allowed stays out of `allowed`.
+fn builtin_pi_recipes(
+    recipes: &mut BTreeMap<String, Recipe>,
+    roles: &BTreeMap<String, RolePicker>,
+) -> Result<()> {
+    let named = |id: &str| {
+        roles.iter().find_map(|(name, role)| {
+            (role.default == id
+                || role.allowed.iter().any(|a| a == id)
+                || role.escalate.iter().any(|e| e == id)
+                || role.gates.iter().any(|g| g.recipe == id))
+            .then(|| name.clone())
+        })
+    };
+    for (id, why) in crate::pi::roles::withheld_recipes() {
+        if recipes.contains_key(id) || named(id).is_some() {
+            bail!("recipe_withheld: `{id}` does not ship: {why}");
+        }
+    }
+    for row in crate::pi::roles::pi_recipes() {
+        if recipes.contains_key(row.id) {
+            bail!(
+                "recipe_builtin: `{}` is a ready-made pi row; use another id",
+                row.id
+            );
+        }
+        if !row.start_time_allowed
+            && let Some(name) = roles
+                .iter()
+                .find(|(_, role)| role.allowed.iter().any(|a| a == row.id))
+                .map(|(name, _)| name)
+        {
+            bail!(
+                "recipe_not_start_time: `{}` may be escalated to, not in [roles.{name}].allowed",
+                row.id
+            );
+        }
+        recipes.insert(
+            row.id.to_string(),
+            Recipe {
+                kind: row.kind.to_string(),
+                args: row.args.clone(),
+                env: row.env.clone(),
+                ready_timeout_ms: row.ready_timeout_ms,
+                provider: row.provider.to_string(),
+                cost: CostClass::Default,
+                enabled: row.enabled,
+                plain: row.plain.to_string(),
+            },
+        );
+    }
+    Ok(())
 }
 
 fn finish(
@@ -546,12 +619,10 @@ fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
                 let arg = arg.to_ascii_lowercase();
                 arg.contains("opus") || arg.contains("fable")
             });
-            if names_capped {
-                if effort_value(&args).as_deref() != Some("high") {
-                    bail!(
-                        "recipe_effort_forbidden: `{id}` names Opus or Fable without `--effort high`"
-                    );
-                }
+            if names_capped && effort_value(&args).as_deref() != Some("high") {
+                bail!(
+                    "recipe_effort_forbidden: `{id}` names Opus or Fable without `--effort high`"
+                );
             }
             if !has("--dangerously-skip-permissions") {
                 bail!("recipe_permission_missing: `{id}` has no permission flag");
@@ -581,6 +652,7 @@ fn check_reasons_are_plain(config: &PickerConfig) -> Result<()> {
             for sentence in [
                 default_reason(name, &recipe.plain),
                 pinned_reason(name, &recipe.plain),
+                usual_reason(name, &recipe.plain),
                 fallback_reason(name, &recipe.plain),
             ] {
                 check_plain(name, &sentence)?;
@@ -664,6 +736,10 @@ pub fn default_reason(role: &str, plain: &str) -> String {
 
 pub fn pinned_reason(role: &str, plain: &str) -> String {
     render(TEMPLATE_PINNED, job_noun(role), plain, "")
+}
+
+pub fn usual_reason(role: &str, plain: &str) -> String {
+    render(TEMPLATE_USUAL, job_noun(role), plain, "")
 }
 
 pub fn fallback_reason(role: &str, plain: &str) -> String {
@@ -799,7 +875,7 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
 
     // Step 2: a PROJECT.md front matter pin for this role (decision 3).
     if let Some(pin) = &input.project_pin {
-        if pin.kind != default_recipe.kind && pin.args.is_empty() {
+        if !pin.kind.trim().is_empty() && pin.kind != default_recipe.kind && pin.args.is_empty() {
             bail!(
                 "role_args_missing: [roles.{}] kind changes without args",
                 input.role
@@ -817,6 +893,9 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
         // passes the same flag checks as a table row, so a pin cannot drop a
         // permission flag or name Opus without `--effort high`.
         let mut pin = pin.clone();
+        if pin.kind.trim().is_empty() {
+            pin.kind = default_recipe.kind.clone();
+        }
         if pin.args.is_empty() {
             pin.args = default_recipe.args.clone();
         }
@@ -1167,7 +1246,7 @@ fn default_launch(
 ) -> Launch {
     let mut launch = launch_from(recipe, config, config.resolver, role);
     launch.recipe_id = id.to_string();
-    launch.reason = fallback_reason(role, &recipe.plain);
+    launch.reason = usual_reason(role, &recipe.plain);
     launch.fallback = Some(fallback.to_string());
     launch
 }
@@ -1186,12 +1265,19 @@ fn fallback_launch(
     launch
 }
 
+/// Today's UTC date, `2026-09-18`: the daily cap file's name (item 98).
+fn utc_date() -> String {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .to_string()
+}
+
 /// The per-project, per-UTC-day call counter. Returns false when the cap is
 /// already spent (SPEC-jev-picker v2 §3 step 5).
 fn project_take_daily_call(project: &Project, cap: u64) -> Result<bool> {
     let _lock = project.lock()?;
-    let now = jiff::Timestamp::now().as_second();
-    let day = now / 86_400;
+    let day = utc_date();
     let dir = project.dir().join(".state/jev-calls");
     std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
     let path = dir.join(format!("{day}.count"));
@@ -1414,28 +1500,6 @@ fn table_rows(ctx: &Ctx, config: &PickerConfig, rows: &mut Vec<DoctorRow>) {
     }
 }
 
-/// Print the rows with `doctor`'s three marks and fail when one is a FAIL.
-/// The hidden `picker doctor` verb uses this until A1's `doctor` calls
-/// `doctor_rows`.
-pub fn picker_doctor(ctx: &Ctx) -> Result<()> {
-    let mut healthy = true;
-    for row in doctor_rows(ctx)? {
-        let mark = match row.ok {
-            Some(true) => "ok  ",
-            Some(false) => {
-                healthy = false;
-                "FAIL"
-            }
-            None => "warn",
-        };
-        println!("[{mark}] {}: {}", row.label, row.detail);
-    }
-    if !healthy {
-        bail!("the picker has failing checks");
-    }
-    Ok(())
-}
-
 /// The executable a kind starts, for the doctor's `command -v`.
 pub fn kind_executable(kind: &str) -> &str {
     match kind {
@@ -1562,7 +1626,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         assert_eq!(world.runner.count("/usr/bin/curl"), 0);
         assert_eq!(
             launch.reason,
-            "this task runs on the usual coding helper, the usual choice, because the picker did not answer."
+            "this task runs on the usual coding helper, the usual choice."
         );
         assert_eq!(
             launch.compact_reason,
@@ -1739,7 +1803,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         let launch = run(&world, &project, &task).unwrap();
         assert_eq!(launch.fallback.as_deref(), Some("http_429"));
         assert_eq!(world.runner.count("/usr/bin/curl"), 2);
-        let day = jiff::Timestamp::now().as_second() / 86_400;
+        let day = utc_date();
         let path = project.dir().join(format!(".state/jev-calls/{day}.count"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
         run(&world, &project, &task).unwrap();
@@ -1753,7 +1817,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         single_response(&world, &answers_body(0.91));
         let dir = project.dir().join(".state/jev-calls");
         std::fs::create_dir_all(&dir).unwrap();
-        let day = jiff::Timestamp::now().as_second() / 86_400;
+        let day = utc_date();
         std::fs::write(dir.join(format!("{day}.count")), "200").unwrap();
         let launch = run(&world, &project, &task).unwrap();
         assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_DAILY_CAP));

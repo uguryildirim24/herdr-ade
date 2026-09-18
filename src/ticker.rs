@@ -528,6 +528,21 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             continue;
         }
         *may_start = false;
+        // A pi provider that stopped being ready (an expired login) fails
+        // the thread at once instead of launching into it (SPEC-pi §3.4).
+        if t.launch.kind == "pi"
+            && let Err(error) = crate::threads::pi_ready(pass.ctx, &t.launch)
+        {
+            let message = format!("{error:#}");
+            errors.extend(
+                thread::update(pass.project, &t.id, |t| {
+                    t.status = thread::Status::Failed;
+                    t.error = message;
+                })
+                .err(),
+            );
+            continue;
+        }
         let launched = (|| -> Result<()> {
             thread::update(pass.project, &t.id, |t| t.launch_attempts += 1)?;
             // The coordinator's pane is on the project's server; a remote
@@ -567,6 +582,16 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             thread::update(pass.project, &t.id, |rec| {
                 thread::bind_identity(rec, &socket, &agent, process);
             })?;
+            // The board says which helper took the task (SPEC-jev-picker v2
+            // §3 Publication); the value is plain-checked there.
+            if !t.launch.compact_reason.is_empty() {
+                let _ = crate::board::publish_value(
+                    pass.ctx,
+                    pass.project,
+                    "ade_last",
+                    &t.launch.compact_reason,
+                );
+            }
             Ok(())
         })();
         errors.extend(

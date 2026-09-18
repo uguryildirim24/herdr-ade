@@ -15,17 +15,21 @@ pub struct Adapter {
     pub positive_resend_evidence: &'static str,
     pub required: &'static str,
     pub correction: CorrectionAdapter,
-    pub documented_label: &'static str,
+    /// What happens to the coordinator's native chat (the `talk` header).
+    pub chat: &'static str,
+    /// The `talk` header's surface clause for a non-Claude coordinator.
+    pub surface: &'static str,
 }
 
-pub const ADAPTERS: [Adapter; 7] = [
+pub const ADAPTERS: [Adapter; 8] = [
     Adapter {
         kind: "claude",
         receipt: "ha skill or ha context",
         positive_resend_evidence: "explicit rejected submission only",
         required: "coordinator and lane",
         correction: CorrectionAdapter::ClaudeStop,
-        documented_label: "chat: checked after display; native pane shows the first version",
+        chat: "checked after display; native pane shows the first version",
+        surface: "surface mediated, native checked after display",
     },
     Adapter {
         kind: "cursor",
@@ -33,7 +37,8 @@ pub const ADAPTERS: [Adapter; 7] = [
         positive_resend_evidence: "observed unsubmitted pasted block for the same attempt",
         required: "lane and reviewer",
         correction: CorrectionAdapter::CursorFollowup,
-        documented_label: "chat: follow-up after display",
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
     },
     Adapter {
         kind: "codex",
@@ -41,7 +46,8 @@ pub const ADAPTERS: [Adapter; 7] = [
         positive_resend_evidence: "explicit rejected submission only",
         required: "no",
         correction: CorrectionAdapter::CodexStop,
-        documented_label: "chat: checked after display",
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
     },
     Adapter {
         kind: "opencode",
@@ -49,7 +55,8 @@ pub const ADAPTERS: [Adapter; 7] = [
         positive_resend_evidence: "none",
         required: "no",
         correction: CorrectionAdapter::None,
-        documented_label: "chat: not checked",
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
     },
     Adapter {
         kind: "agy",
@@ -57,7 +64,8 @@ pub const ADAPTERS: [Adapter; 7] = [
         positive_resend_evidence: "none",
         required: "no",
         correction: CorrectionAdapter::None,
-        documented_label: "chat: not checked",
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
     },
     Adapter {
         kind: "chatgpt",
@@ -65,7 +73,8 @@ pub const ADAPTERS: [Adapter; 7] = [
         positive_resend_evidence: "none",
         required: "Pro attack turns",
         correction: CorrectionAdapter::None,
-        documented_label: "chat: not checked",
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
     },
     Adapter {
         kind: "dsh",
@@ -73,12 +82,34 @@ pub const ADAPTERS: [Adapter; 7] = [
         positive_resend_evidence: "none",
         required: "no",
         correction: CorrectionAdapter::None,
-        documented_label: "chat: not checked",
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
+    },
+    Adapter {
+        kind: "pi",
+        receipt: "ha skill or ha context",
+        positive_resend_evidence: "none",
+        required: "yes, if the coding lane moves",
+        correction: CorrectionAdapter::None,
+        chat: "not checked",
+        surface: "chat: shown only through say and ask",
     },
 ];
 
 pub fn get(kind: &str) -> Option<&'static Adapter> {
     ADAPTERS.iter().find(|adapter| adapter.kind == kind)
+}
+
+/// The `talk` header's native-chat clause for a coordinator kind.
+pub fn chat_label(kind: &str) -> &'static str {
+    get(kind).map_or("not checked", |adapter| adapter.chat)
+}
+
+/// The `talk` header's surface clause for a coordinator kind.
+pub fn surface_label(kind: &str) -> &'static str {
+    get(kind).map_or("chat: shown only through say and ask", |adapter| {
+        adapter.surface
+    })
 }
 
 /// Capability labels are evidence-based. Installation alone never promotes a
@@ -106,11 +137,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matrix_has_the_seven_declared_kinds() {
+    fn matrix_has_the_declared_kinds() {
         assert_eq!(
             ADAPTERS.map(|adapter| adapter.kind),
             [
-                "claude", "cursor", "codex", "opencode", "agy", "chatgpt", "dsh"
+                "claude", "cursor", "codex", "opencode", "agy", "chatgpt", "dsh", "pi"
             ]
         );
     }

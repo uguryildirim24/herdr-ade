@@ -573,10 +573,10 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
-        if let Some(merge) = read_merge(&project, round)? {
-            if merge.phase == MergePhase::Checkpointed {
-                bail!("round_closed: `{round}` is merged and checkpointed");
-            }
+        if let Some(merge) = read_merge(&project, round)?
+            && merge.phase == MergePhase::Checkpointed
+        {
+            bail!("round_closed: `{round}` is merged and checkpointed");
         }
         if !record
             .manifest
@@ -1450,10 +1450,10 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
         let round = listed.round.clone();
         {
             let _lock = project.lock()?;
-            if let Ok(mut record) = load(project, &round) {
-                if refresh_pins(project, &mut record, &events).unwrap_or(false) {
-                    save(project, &record)?;
-                }
+            if let Ok(mut record) = load(project, &round)
+                && refresh_pins(project, &mut record, &events).unwrap_or(false)
+            {
+                save(project, &record)?;
             }
         }
         let Ok(record) = load(project, &round) else {

@@ -661,15 +661,14 @@ fn cursor_artifacts(layout: &Layout) -> Vec<String> {
             if name.starts_with("pi-cursor") {
                 found.push(name.clone());
             }
-            if name.starts_with('@') {
-                if let Ok(inner) = std::fs::read_dir(entry.path()) {
-                    for item in inner.flatten() {
-                        let scoped = format!("{name}/{}", item.file_name().to_string_lossy());
-                        if scoped.to_ascii_lowercase().contains("pi-cursor")
-                            || scoped == "@cursor/sdk"
-                        {
-                            found.push(scoped);
-                        }
+            if name.starts_with('@')
+                && let Ok(inner) = std::fs::read_dir(entry.path())
+            {
+                for item in inner.flatten() {
+                    let scoped = format!("{name}/{}", item.file_name().to_string_lossy());
+                    if scoped.to_ascii_lowercase().contains("pi-cursor") || scoped == "@cursor/sdk"
+                    {
+                        found.push(scoped);
                     }
                 }
             }

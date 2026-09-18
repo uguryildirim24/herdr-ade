@@ -6,12 +6,6 @@ rust-version = "1.89"
 license = "MIT"
 description = "Projects for herdr: a coordinator conversation, parallel worker threads, shared memory and an overview"
 
-[lints.clippy]
-# `collapsible_if` still fails on unowned `lifecycle.rs`. `type_complexity`
-# still fails on FakeRunner. A1 fixed `too_many_arguments` in `ticker.rs`.
-collapsible_if = "allow"
-type_complexity = "allow"
-
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

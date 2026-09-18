@@ -2,29 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Day-one roles in `~/.config/herdr-ade/config.toml` (SPEC-ADE D2).
-pub const DAY_ONE_ROLES: [&str; 6] = [
-    "coordinator",
-    "lane",
-    "reviewer",
-    "critic",
-    "drafter",
-    "pro",
-];
-
-/// Launch recipe stored on the thread, never rebuilt from mutable settings
-/// (SPEC-ADE D2).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LaunchRecipe {
-    pub kind: String,
-    pub args: Vec<String>,
-    pub env: Vec<String>,
-    pub ready_timeout_ms: u64,
-    pub policy_hash: String,
-    pub attempt: u32,
-    pub brief_hash: String,
-}
-
 /// The resolver mode from `[roles] resolver`: `off` or `shadow` (SPEC-jev-picker
 /// v2 §2 Config, §3). `pin` never comes from config: `--recipe` or a
 /// PROJECT.md pin sets it on the record (SPEC-jev-picker v2 §3 steps 1 and 2).
@@ -169,9 +146,9 @@ pub struct IdentityBinding {
     pub agent_session: Option<String>,
 }
 
-/// One `[roles.<name>]` row (SPEC-ADE D2). Unknown fields are refused.
+/// A role's resolved row (SPEC-ADE D2): the `default` recipe of
+/// `[roles.<name>]`, then the PROJECT.md override.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
 pub struct RoleSpec {
     pub kind: String,
     #[serde(default)]
@@ -180,13 +157,6 @@ pub struct RoleSpec {
     pub env: Vec<String>,
     #[serde(default)]
     pub ready_timeout_ms: u64,
-}
-
-/// The roles table (SPEC-ADE D2). Arrays replace, never merge.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct RolesTable {
-    #[serde(default)]
-    pub roles: std::collections::BTreeMap<String, RoleSpec>,
 }
 
 /// `done` or `waiting` (SPEC-ADE D5).
@@ -481,34 +451,6 @@ mod tests {
     {
         json_roundtrip(value);
         toml_roundtrip(value);
-    }
-
-    #[test]
-    fn roles_table_roundtrip_and_unknown_field_refused() {
-        let mut table = RolesTable::default();
-        table.roles.insert(
-            "lane".into(),
-            RoleSpec {
-                kind: "claude".into(),
-                args: vec!["--dangerously-skip-permissions".into()],
-                env: vec!["DSH_TUI_LANG=en".into()],
-                ready_timeout_ms: 20_000,
-            },
-        );
-        both(&table);
-        let err = toml::from_str::<RoleSpec>("kind = \"claude\"\nbootstrap = true\n").unwrap_err();
-        assert!(err.to_string().contains("bootstrap"), "{err}");
-        assert_eq!(
-            DAY_ONE_ROLES,
-            [
-                "coordinator",
-                "lane",
-                "reviewer",
-                "critic",
-                "drafter",
-                "pro"
-            ]
-        );
     }
 
     #[test]

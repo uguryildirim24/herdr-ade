@@ -465,6 +465,7 @@ fn thread_start_is_refused_when_paused() {
         task: "t".into(),
         plain: "The lane does the work.".into(),
         role: None,
+        recipe: None,
     };
     let error = threads::start(&world.ctx(), "demo", args)
         .unwrap_err()
@@ -1320,6 +1321,7 @@ fn a_remote_thread_without_a_repo_is_refused() {
         task: "t".into(),
         plain: "The lane does the work.".into(),
         role: None,
+        recipe: None,
     };
     assert!(
         threads::start(&world.ctx(), "demo", args)
