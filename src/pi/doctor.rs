@@ -250,12 +250,12 @@ pub fn doctor_rows_with(
                 ));
             }
             if state.skills_disabled {
-                rows.push(Row::ok("settings skills", "skills.enabled: false"));
+                rows.push(Row::ok("settings skills", "skills: [\"!**\"]"));
             } else {
                 rows.push(Row::fail(
                     "settings skills",
                     format!(
-                        "{} must set skills.enabled: false",
+                        "{} must set \"skills\": [\"!**\"] (pi 0.85.1 has no skills.enabled)",
                         layout.settings().display()
                     ),
                 ));

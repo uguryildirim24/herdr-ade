@@ -10,12 +10,19 @@ use serde_json::Value;
 
 use super::Layout;
 
-/// Exactly SPEC-pi v2 §3.3: no trust dialog, no personal skills, one retry.
+/// SPEC-pi v2 §3.3: no trust dialog, no personal skills, one retry.
+///
+/// Skills: pi 0.85.1 has no `skills.enabled`. The spec's
+/// `"skills": { "enabled": false }` is pi's old object form, which it
+/// migrates away on its next settings write and which never stopped
+/// discovery (a `~/.agents/skills` probe still loaded). `skills` is now a
+/// list of paths and patterns; `!**` excludes every discovered skill, so a
+/// bare `pi --session` restore without `--no-skills` loads none.
 pub const SETTINGS_JSON: &str = r#"{
   "defaultProjectTrust": "never",
   "enableInstallTelemetry": false,
   "quietStartup": true,
-  "skills": { "enabled": false },
+  "skills": ["!**"],
   "retry": {
     "enabled": true,
     "maxRetries": 1,
@@ -100,9 +107,8 @@ pub fn read_settings(layout: &Layout) -> Result<SettingsState> {
         trust_never: value.get("defaultProjectTrust").and_then(Value::as_str) == Some("never"),
         skills_disabled: value
             .get("skills")
-            .and_then(|s| s.get("enabled"))
-            .and_then(Value::as_bool)
-            == Some(false),
+            .and_then(Value::as_array)
+            .is_some_and(|patterns| patterns.iter().any(|p| p.as_str() == Some("!**"))),
         telemetry_off: value.get("enableInstallTelemetry").and_then(Value::as_bool) == Some(false),
         retries_capped: value
             .get("retry")
@@ -154,17 +160,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_follow_the_spec_contract() {
-        let value: Value = serde_json::from_str(SETTINGS_JSON).unwrap();
-        assert_eq!(value["defaultProjectTrust"], "never");
-        assert_eq!(value["skills"]["enabled"], false);
-        assert_eq!(value["enableInstallTelemetry"], false);
-        assert_eq!(value["retry"]["maxRetries"], 1);
-        assert_eq!(value["retry"]["provider"]["maxRetries"], 0);
-        assert_eq!(value["retry"]["provider"]["maxRetryDelayMs"], 60000);
-    }
-
-    #[test]
     fn ensure_writes_the_folder_once_and_never_clobbers_settings() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pi"));
@@ -208,5 +203,12 @@ mod tests {
                 retries_capped: true,
             }
         );
+        // The old object form does not stop discovery in pi 0.85.1.
+        std::fs::write(
+            layout.settings(),
+            r#"{"defaultProjectTrust":"never","skills":{"enabled":false}}"#,
+        )
+        .unwrap();
+        assert!(!read_settings(&layout).unwrap().skills_disabled);
     }
 }
