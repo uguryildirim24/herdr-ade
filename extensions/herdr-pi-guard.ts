@@ -8,7 +8,6 @@
 // `done`) plus one `ha waiting` line per class per ten minutes.
 //
 // It never runs a login, never retries, and never runs `ha done`.
-// The classification patterns mirror `src/pi/limits.rs`; keep them together.
 // @ts-nocheck
 
 const CLASSES = ["limit", "login", "unreachable", "error"];
@@ -99,11 +98,13 @@ export default function (pi) {
     lastStatus = null;
   }
 
-  // An ADE lane (HERDR_ADE_LAUNCH set) runs `ha waiting`. Without it (a
-  // skill-driven lane before ADE lands, or a lane whose tab env was lost on
-  // a server bounce), or when `ha` fails, the parent token is the way.
+  // Only an ADE lane (HERDR_ADE_LAUNCH set) reports; the pane's `blocked`
+  // state is raised either way.
   async function runWaiting(label, cls, provider) {
     const env = process.env || {};
+    if (!env.HERDR_ADE_LAUNCH) {
+      return;
+    }
     const now = Date.now();
     const sentAt = lastSentAt.get(cls) || 0;
     if (now - sentAt < THROTTLE_MS) {
@@ -111,20 +112,10 @@ export default function (pi) {
     }
     lastSentAt.set(cls, now);
     const text = `${provider} ${cls}: ${first120(label)}`;
-    if (env.HERDR_ADE_LAUNCH) {
-      try {
-        const result = await pi.exec("ha", ["waiting", text], { timeout: 5000 });
-        if (result && result.code === 0) {
-          return;
-        }
-      } catch {
-        // `ha` is not on PATH; fall through to herdr.
-      }
-    }
     try {
-      await notifyParent(pi, text);
+      await pi.exec("ha", ["waiting", text], { timeout: 5000 });
     } catch {
-      // Best effort only; a missing parent is not an error in the guard.
+      // A failed report never stops pi; the pane is blocked either way.
     }
   }
 
@@ -216,32 +207,4 @@ export default function (pi) {
   pi.on("ui_prompt_end", () => {
     clear("ui");
   });
-}
-
-// Before ADE lands (no HERDR_ADE_LAUNCH, or no `ha`), read this pane's parent
-// token and tell the coordinator through herdr itself (SPEC-pi v2 §3.7).
-async function notifyParent(pi, text) {
-  const paneId = process.env.HERDR_PANE_ID;
-  if (!paneId) {
-    return;
-  }
-  const herdr = process.env.HERDR_BIN_PATH || "herdr";
-  const list = await pi.exec(herdr, ["agent", "list", "--json"], { timeout: 5000 });
-  if (!list || list.code !== 0) {
-    return;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(list.stdout);
-  } catch {
-    return;
-  }
-  const agents = parsed?.result?.agents || [];
-  const self = agents.find((agent) => agent?.pane_id === paneId);
-  const parent = self?.tokens?.parent;
-  if (!parent) {
-    return;
-  }
-  const name = self?.name || paneId;
-  await pi.exec(herdr, ["agent", "prompt", parent, `WAITING ${name} ${text}`], { timeout: 5000 });
 }

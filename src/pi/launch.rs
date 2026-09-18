@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use super::sh;
-
 /// The provider and model names this round is allowed to start. The role
 /// table and Jev recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
 /// `opencode-go` is the OpenCode Go plan (the Muse row, SPEC-ADE §6 item 65);
@@ -46,29 +44,6 @@ pub const FORBIDDEN_ARGS: [&str; 15] = [
     "--extension",
     "--no-extensions",
 ];
-
-/// The flags ADE appends itself for a thread restart, never from a recipe.
-pub fn is_ade_owned_arg(arg: &str) -> bool {
-    arg == "--session"
-}
-
-/// Which agent dir the wrapper uses (SPEC-pi v2 §3.2 items 1 to 3):
-/// `PI_CODING_AGENT_DIR` when set and not under `~/.pi`, the baked path
-/// otherwise. A dir under `~/.pi` is refused; the harness never writes there.
-pub fn agent_dir_for(env_dir: Option<&str>, home: &Path, baked: &Path) -> Result<PathBuf> {
-    let chosen = match env_dir {
-        Some(dir) if !dir.is_empty() => sh::expand_tilde(dir, home),
-        _ => baked.to_path_buf(),
-    };
-    let pi_home = home.join(".pi");
-    if chosen == pi_home || chosen.starts_with(&pi_home) {
-        bail!(
-            "refusing PI_CODING_AGENT_DIR under {}: the harness pi never uses Rolf's ~/.pi",
-            pi_home.display()
-        );
-    }
-    Ok(chosen)
-}
 
 /// The wrapper script written by setup and linked as `~/.local/bin/pi`
 /// (SPEC-pi v2 §3.2). `exec` keeps the pane's foreground process the node
@@ -469,43 +444,6 @@ mod tests {
         let row = args(&["--provider", "deepseek", "--model", "x", "--no-skills"]);
         assert!(validate_provider_column("deepseek", &row).is_ok());
         assert!(validate_provider_column("opencode", &row).is_err());
-    }
-
-    #[test]
-    fn wrapper_uses_the_shared_folder_and_refuses_pi_home() {
-        let home = Path::new("/h/me");
-        let baked = Path::new("/state/ade/pi/agent");
-        assert_eq!(
-            agent_dir_for(None, home, baked).unwrap(),
-            PathBuf::from("/state/ade/pi/agent")
-        );
-        assert_eq!(
-            agent_dir_for(Some("~/other"), home, baked).unwrap(),
-            PathBuf::from("/h/me/other")
-        );
-        assert!(agent_dir_for(Some("~/.pi"), home, baked).is_err());
-        assert!(agent_dir_for(Some("~/.pi/agent"), home, baked).is_err());
-        assert!(agent_dir_for(Some("/tmp/x"), home, baked).is_ok());
-    }
-
-    #[test]
-    fn wrapper_script_contains_every_refusal_and_env_line() {
-        let script = wrapper_script(
-            Path::new("/state/ade/pi/agent"),
-            Path::new("/state/ade/pi/npm/x/cli.js"),
-        );
-        for needle in [
-            "exec node '/state/ade/pi/npm/x/cli.js'",
-            "/state/ade/pi/agent",
-            "PI_SKIP_VERSION_CHECK=1",
-            "PI_TELEMETRY=0",
-            "install | remove | uninstall | update | config",
-            "node is not on PATH",
-            "older than 22.19.0",
-            ".pi",
-        ] {
-            assert!(script.contains(needle), "missing {needle}");
-        }
     }
 
     /// The wrapper, run for real with `sh` and a fake `node` that prints

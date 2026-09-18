@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{GUARD_FILE, HERDR_EXTENSION_FILE, Layout};
+use super::Layout;
 
 /// Exactly SPEC-pi v2 §3.3: no trust dialog, no personal skills, one retry.
 pub const SETTINGS_JSON: &str = r#"{
@@ -144,27 +144,6 @@ fn any_true(value: &Value) -> bool {
     }
 }
 
-/// The guard and the herdr state hook, both in the shared folder
-/// (SPEC-pi v2 §3.3, §3.7).
-pub fn extension_state(layout: &Layout) -> (bool, bool) {
-    let guard = std::fs::read_to_string(layout.guard())
-        .map(|text| text.contains(super::GUARD_MARKER))
-        .unwrap_or(false);
-    let herdr = layout.herdr_extension().exists();
-    (guard, herdr)
-}
-
-/// True when the file names one of the two plugin-managed extensions.
-pub fn is_managed_extension(name: &str) -> bool {
-    name == GUARD_FILE || name == HERDR_EXTENSION_FILE
-}
-
-/// The per-lane session dir for a shared cwd (SPEC-pi v2 §3.3): a static
-/// `--session-dir` in the recipe, never computed at launch.
-pub fn lane_session_dir(layout: &Layout, thread_id: &str) -> std::path::PathBuf {
-    layout.lanes().join(thread_id)
-}
-
 /// Sanity used by setup and doctor: the folder exists and has a settings file.
 pub fn exists(layout: &Layout) -> bool {
     layout.agent().is_dir() && layout.settings().is_file()
@@ -228,15 +207,6 @@ mod tests {
                 telemetry_off: true,
                 retries_capped: true,
             }
-        );
-    }
-
-    #[test]
-    fn lane_session_dir_is_per_thread() {
-        let layout = Layout::for_test("/p/pi");
-        assert_eq!(
-            lane_session_dir(&layout, "t-0007"),
-            std::path::PathBuf::from("/p/pi/lanes/t-0007")
         );
     }
 }

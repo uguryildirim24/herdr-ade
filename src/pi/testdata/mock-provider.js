@@ -1,7 +1,8 @@
 // Test-only mock provider for the guard check (SPEC-pi v2 §7, T7).
 // Answers OpenAI-compatible chat completions with a fixed failure:
 //   node mock-provider.js limit 19890 /var/tmp/ade-a5/guard-test/log/hits.log
-// `limit` -> 429 with retry-after, `login` -> 401, `ok` -> a tiny stream.
+// `limit` -> 429 with retry-after, `login` -> 401, `context` -> 400 with a
+// context-length message (class `error`, not `login`), `ok` -> a tiny stream.
 // Never used by the plugin; throwaway fixtures only.
 const http = require("node:http");
 const fs = require("node:fs");
@@ -40,6 +41,18 @@ const server = http.createServer((req, res) => {
     res.end(
       JSON.stringify({
         error: { message: "Incorrect API key provided: mock-key", type: "invalid_request_error" },
+      }),
+    );
+    return;
+  }
+  if (mode === "context") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "This model's maximum context length is 128000 tokens",
+          type: "invalid_request_error",
+        },
       }),
     );
     return;

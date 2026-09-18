@@ -13,12 +13,6 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-/// The exact line native restore types (fork-owned; recorded here so doctor
-/// and the skill can assert it).
-pub fn restore_line(session: &Path) -> String {
-    format!("pi --session {}", session.display())
-}
-
 /// The argv ADE appends for a new attempt on the same session.
 pub fn append_resume_session(session: &Path, recipe_args: &[String]) -> Result<Vec<String>> {
     for arg in recipe_args {
@@ -66,46 +60,16 @@ pub const R2_STRIP_RULES: [(&str, bool); 7] = [
     ("--resume", false),
 ];
 
-/// Parse the session path the herdr extension reported from a `pane get`
-/// answer. Accepts the pane shape and the agent shape, tolerantly; `None`
-/// means the pane has not reported one yet.
+/// The session path the herdr extension reported, from a `pane get` answer
+/// (`result.pane.agent_session.value`); `None` means the pane has not
+/// reported one yet.
 pub fn session_from_pane_get(json: &str) -> Result<Option<String>> {
     let value: serde_json::Value = serde_json::from_str(json)?;
-    for root in ["pane", "agent"] {
-        if let Some(session) = value
-            .get("result")
-            .and_then(|r| r.get(root))
-            .and_then(|a| a.get("agent_session"))
-        {
-            if let Some(path) = session.get("value").and_then(|v| v.as_str()) {
-                if !path.is_empty() {
-                    return Ok(Some(path.to_string()));
-                }
-            }
-            if let Some(path) = session.get("agent_session_path").and_then(|v| v.as_str()) {
-                if !path.is_empty() {
-                    return Ok(Some(path.to_string()));
-                }
-            }
-        }
-        if let Some(session) = value
-            .get("result")
-            .and_then(|r| r.get(root))
-            .and_then(|a| a.get("agent_session_path"))
-            .and_then(|v| v.as_str())
-        {
-            if !session.is_empty() {
-                return Ok(Some(session.to_string()));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// A fresh login shell has no plugin env; the wrapper is on the login `PATH`
-/// (`~/.local/bin`), so a bare `pi` finds the shared folder again.
-pub fn login_path_is_the_way_back() -> &'static str {
-    "the wrapper at ~/.local/bin/pi is what the login PATH must resolve; no per-lane env survives"
+    Ok(value
+        .pointer("/result/pane/agent_session/value")
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string))
 }
 
 #[cfg(test)]
@@ -129,24 +93,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_line_is_the_bare_pi_session() {
-        assert_eq!(
-            restore_line(Path::new("/state/pi/agent/sessions/--/x.jsonl")),
-            "pi --session /state/pi/agent/sessions/--/x.jsonl"
-        );
-    }
-
-    #[test]
-    fn pane_get_session_path_is_read_from_both_shapes() {
+    fn pane_get_session_path_is_read_from_the_pane() {
         let pane = r#"{"result":{"pane":{"agent_session":{"source":"herdr:pi","agent":"pi","kind":"path","value":"/s/a.jsonl"}}}}"#;
         assert_eq!(
             session_from_pane_get(pane).unwrap().as_deref(),
             Some("/s/a.jsonl")
-        );
-        let agent = r#"{"result":{"agent":{"agent_session":{"value":"/s/b.jsonl"}}}}"#;
-        assert_eq!(
-            session_from_pane_get(agent).unwrap().as_deref(),
-            Some("/s/b.jsonl")
         );
         let none = r#"{"result":{"pane":{"pane_id":"w1:p1"}}}"#;
         assert_eq!(session_from_pane_get(none).unwrap(), None);

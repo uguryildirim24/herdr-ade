@@ -14,7 +14,6 @@
 //! add the function here; see the report's "Left for the reviewer".
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Result;
 
@@ -83,9 +82,6 @@ pub fn process_prefix() -> Result<PathBuf> {
     Ok(layout.npm())
 }
 
-/// A timeout for the adapter's callers that do not set one.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,7 +98,7 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("zsh -lic node --version", ok("v22.19.0\n"));
         let adapter = Adapter(&runner);
-        let cmd = sh::Cmd::new("zsh", DEFAULT_TIMEOUT)
+        let cmd = sh::Cmd::new("zsh", sh::SHORT)
             .args(["-lic", "node --version"])
             .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string());
         let output = adapter.run(&cmd).unwrap();
