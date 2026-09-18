@@ -685,7 +685,10 @@ mod tests {
         )
         .unwrap_err();
         let e = format!("{e:#}");
-        assert!(e.starts_with("plain_refused") && e.contains("plain_question_form"), "{e}");
+        assert!(
+            e.starts_with("plain_refused") && e.contains("plain_question_form"),
+            "{e}"
+        );
         assert!(open_asks(&fx.project).is_empty());
         assert!(!crate::talk::journal_path(&fx.project).exists());
     }
@@ -696,18 +699,43 @@ mod tests {
         let a = ask(&fx.world.ctx(), "demo", keep_or_stop()).unwrap();
         assert_eq!((a.id.as_str(), a.revision), ("a-1", 1));
         let compact = compact_line(&a);
-        assert_eq!(compact, "keep the experiment running another hour? (2 choices)");
+        assert_eq!(
+            compact,
+            "keep the experiment running another hour? (2 choices)"
+        );
         assert!(compact.chars().count() <= 60);
-        assert!(fx.world.runner.count(&format!("--token ade_needs_you={compact}")) == 1);
-        assert!(fx.world.runner.count(&format!("notification show {compact} --body 1. keep it running another hour")) == 1);
+        assert!(
+            fx.world
+                .runner
+                .count(&format!("--token ade_needs_you={compact}"))
+                == 1
+        );
+        assert!(
+            fx.world.runner.count(&format!(
+                "notification show {compact} --body 1. keep it running another hour"
+            )) == 1
+        );
         assert_eq!(journal_kinds(&fx.project), ["ask a-1@1"]);
         let shown = crate::talk::replay(&fx.world.ctx(), "demo").unwrap();
         assert!(shown.contains("  1. keep it running another hour\n  2. stop it now\n  0. I did not understand the question"), "{shown}");
         assert!(published_marker(&fx.project, "a-1", 1).exists());
         let overview = crate::overview::render(&fx.project, &[]);
-        assert!(overview.contains(&format!("  questions for you: 1 (newest a-1@1: {compact})\n")), "{overview}");
+        assert!(
+            overview.contains(&format!(
+                "  questions for you: 1 (newest a-1@1: {compact})\n"
+            )),
+            "{overview}"
+        );
         // A second publication of the same ask appends nothing.
-        publish(&fx.world.ctx(), &fx.project, &HumanMessage::Ask { id: "a-1".into(), revision: 1 }).unwrap();
+        publish(
+            &fx.world.ctx(),
+            &fx.project,
+            &HumanMessage::Ask {
+                id: "a-1".into(),
+                revision: 1,
+            },
+        )
+        .unwrap();
         assert_eq!(journal_kinds(&fx.project).len(), 1);
     }
 
@@ -720,11 +748,17 @@ mod tests {
         assert!(rev_path(&project, &a.id, 1).exists());
         assert!(!published_marker(&project, &a.id, 1).exists());
         world.runner.on("notification show", ok(r#"{"result":{}}"#));
-        world.runner.on("workspace report-metadata", ok(r#"{"result":{}}"#));
+        world
+            .runner
+            .on("workspace report-metadata", ok(r#"{"result":{}}"#));
         tick(&world.ctx(), &project).unwrap();
         assert!(published_marker(&project, &a.id, 1).exists());
         assert_eq!(world.runner.count("notification show"), 2);
-        assert_eq!(journal_kinds(&project), ["ask a-1@1"], "one journal line across both tries");
+        assert_eq!(
+            journal_kinds(&project),
+            ["ask a-1@1"],
+            "one journal line across both tries"
+        );
     }
 
     #[test]
@@ -732,22 +766,61 @@ mod tests {
         let fx = fixture();
         let ctx = fx.world.ctx();
         ask(&ctx, "demo", keep_or_stop()).unwrap();
-        let again = ask(&ctx, "demo", NewAsk { reask: Some("a-1".into()), ..keep_or_stop() }).unwrap();
+        let again = ask(
+            &ctx,
+            "demo",
+            NewAsk {
+                reask: Some("a-1".into()),
+                ..keep_or_stop()
+            },
+        )
+        .unwrap();
         assert_eq!(again.revision, 2);
-        let e = format!("{:#}", answer(&ctx, "demo", "a-1", 1, 2, "test").unwrap_err());
+        let e = format!(
+            "{:#}",
+            answer(&ctx, "demo", "a-1", 1, 2, "test").unwrap_err()
+        );
         assert!(e.starts_with("ask_revision_stale"), "{e}");
-        let e = format!("{:#}", answer(&ctx, "demo", "a-1", 2, 3, "test").unwrap_err());
+        let e = format!(
+            "{:#}",
+            answer(&ctx, "demo", "a-1", 2, 3, "test").unwrap_err()
+        );
         assert!(e.starts_with("ask_choice_out_of_range"), "{e}");
         let a = answer(&ctx, "demo", "a-1", 2, 0, "test").unwrap();
         assert!(a.not_understood);
         assert_eq!(a.text, NOT_UNDERSTOOD);
         assert_eq!(not_understood_count(&fx.project), 1);
-        let e = format!("{:#}", answer(&ctx, "demo", "a-1", 2, 1, "test").unwrap_err());
+        let e = format!(
+            "{:#}",
+            answer(&ctx, "demo", "a-1", 2, 1, "test").unwrap_err()
+        );
         assert!(e.starts_with("ask_closed"), "{e}");
         assert!(open_asks(&fx.project).is_empty());
-        let e = format!("{:#}", publish(&ctx, &fx.project, &HumanMessage::Ask { id: "a-1".into(), revision: 2 }).unwrap_err());
+        let e = format!(
+            "{:#}",
+            publish(
+                &ctx,
+                &fx.project,
+                &HumanMessage::Ask {
+                    id: "a-1".into(),
+                    revision: 2
+                }
+            )
+            .unwrap_err()
+        );
         assert!(e.starts_with("ask_closed"), "{e}");
-        let e = format!("{:#}", publish(&ctx, &fx.project, &HumanMessage::Ask { id: "a-9".into(), revision: 1 }).unwrap_err());
+        let e = format!(
+            "{:#}",
+            publish(
+                &ctx,
+                &fx.project,
+                &HumanMessage::Ask {
+                    id: "a-9".into(),
+                    revision: 1
+                }
+            )
+            .unwrap_err()
+        );
         assert!(e.starts_with("ask_unknown"), "{e}");
     }
 
@@ -755,25 +828,49 @@ mod tests {
     fn say_refuses_a_sha_and_a_bare_name_and_appends_nothing() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        let e = format!("{:#}", say(&ctx, "demo", "The lane landed at 3f9a2c1d.", None).unwrap_err());
-        assert!(e.contains("plain_identifier") && e.contains("3f9a2c1d"), "{e}");
+        let e = format!(
+            "{:#}",
+            say(&ctx, "demo", "The lane landed at 3f9a2c1d.", None).unwrap_err()
+        );
+        assert!(
+            e.contains("plain_identifier") && e.contains("3f9a2c1d"),
+            "{e}"
+        );
         let (id, _) = fx.lane(1);
-        let e = format!("{:#}", say(&ctx, "demo", &format!("The lane {id} is done."), None).unwrap_err());
+        let e = format!(
+            "{:#}",
+            say(&ctx, "demo", &format!("The lane {id} is done."), None).unwrap_err()
+        );
         assert!(e.starts_with("plain_refused") && e.contains(&id), "{e}");
         let e = format!("{:#}", say(&ctx, "demo", "", None).unwrap_err());
         assert!(e.contains("plain_envelope"), "{e}");
         assert!(crate::talk::read(&fx.project).lines.is_empty());
-        say(&ctx, "demo", "The first lane is done.", Some("You can read its report now.")).unwrap();
+        say(
+            &ctx,
+            "demo",
+            "The first lane is done.",
+            Some("You can read its report now."),
+        )
+        .unwrap();
         assert_eq!(journal_kinds(&fx.project), ["say"]);
-        assert!(fx.world.runner.count("--token ade_last=The first lane is done.") == 1);
+        assert!(
+            fx.world
+                .runner
+                .count("--token ade_last=The first lane is done.")
+                == 1
+        );
     }
 
     #[test]
     fn a_duplicate_keyed_publication_appends_once() {
         let fx = fixture();
-        let msg = HumanMessage::Say { what: "The review is done.".into(), means: None };
+        let msg = HumanMessage::Say {
+            what: "The review is done.".into(),
+            means: None,
+        };
         let first = publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
-        let second = publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
+        let second =
+            publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
         assert!(first.seq.is_some() && second.seq.is_none());
         assert_eq!(journal_kinds(&fx.project), ["say"]);
     }
@@ -781,25 +878,60 @@ mod tests {
     #[test]
     fn notices_are_fixed_ids_only() {
         let fx = fixture();
-        let e = format!("{:#}", publish(&fx.world.ctx(), &fx.project, &HumanMessage::Notice { id: "anything".into() }).unwrap_err());
+        let e = format!(
+            "{:#}",
+            publish(
+                &fx.world.ctx(),
+                &fx.project,
+                &HumanMessage::Notice {
+                    id: "anything".into()
+                }
+            )
+            .unwrap_err()
+        );
         assert!(e.starts_with("notice_unknown"), "{e}");
-        let p = publish(&fx.world.ctx(), &fx.project, &HumanMessage::Notice { id: "plain_exhausted".into() }).unwrap();
-        assert!(p.board, "the exhausted-budget notice also goes to the board");
-        assert!(fx.world.runner.count("--token ade_last=The coordinator could not say this in plain words.") == 1);
+        let p = publish(
+            &fx.world.ctx(),
+            &fx.project,
+            &HumanMessage::Notice {
+                id: "plain_exhausted".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            p.board,
+            "the exhausted-budget notice also goes to the board"
+        );
+        assert!(
+            fx.world
+                .runner
+                .count("--token ade_last=The coordinator could not say this in plain words.")
+                == 1
+        );
     }
 
     #[test]
     fn board_refuses_a_failing_value_and_keeps_the_old_one() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        crate::board::publish_value(&ctx, &fx.project, "ade_last", "The first lane is done.").unwrap();
+        crate::board::publish_value(&ctx, &fx.project, "ade_last", "The first lane is done.")
+            .unwrap();
         let before = fx.world.runner.count("workspace report-metadata");
-        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", "run cargo_test now").unwrap_err();
+        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", "run cargo_test now")
+            .unwrap_err();
         assert!(format!("{e:#}").contains("plain_identifier"));
-        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", &"word ".repeat(20)).unwrap_err();
+        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", &"word ".repeat(20))
+            .unwrap_err();
         assert!(format!("{e:#}").contains("at most 80"));
-        assert_eq!(fx.world.runner.count("workspace report-metadata"), before, "nothing was sent");
-        assert_eq!(crate::board::state(&fx.project).values["ade_last"], "The first lane is done.");
+        assert_eq!(
+            fx.world.runner.count("workspace report-metadata"),
+            before,
+            "nothing was sent"
+        );
+        assert_eq!(
+            crate::board::state(&fx.project).values["ade_last"],
+            "The first lane is done."
+        );
     }
 
     #[test]
@@ -834,9 +966,18 @@ mod tests {
             }
         }
         let get = |k: &str| values.iter().find(|(key, _)| key == k).unwrap().1.clone();
-        assert_eq!(get("ade_stage"), "round 1 has 1 lanes working. The first round lands the shared types.");
-        assert_eq!(get("ade_lanes"), "0 working, 1 done, 1 waiting for you, 0 stuck");
-        assert_eq!(get("ade_needs_you"), "keep the experiment running another hour? (2 choices)");
+        assert_eq!(
+            get("ade_stage"),
+            "round 1 has 1 lanes working. The first round lands the shared types."
+        );
+        assert_eq!(
+            get("ade_lanes"),
+            "0 working, 1 done, 1 waiting for you, 0 stuck"
+        );
+        assert_eq!(
+            get("ade_needs_you"),
+            "keep the experiment running another hour? (2 choices)"
+        );
         assert!(crate::board::refresh(&ctx, &fx.project).unwrap().is_empty());
     }
 
@@ -844,10 +985,30 @@ mod tests {
     fn names_are_born_with_a_sentence_and_listed_in_the_glossary() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        let e = format!("{:#}", glossary::add_term(&ctx, "demo", "quotient", None, None).unwrap_err());
+        let e = format!(
+            "{:#}",
+            glossary::add_term(&ctx, "demo", "quotient", None, None).unwrap_err()
+        );
         assert!(e.starts_with("plain_missing"), "{e}");
-        glossary::add_term(&ctx, "demo", "quotient", Some("The smaller model that keeps the same answers."), Some("tasks/spec.md")).unwrap();
-        let e = format!("{:#}", glossary::add_term(&ctx, "demo", "quotient", Some("Another sentence for it."), None).unwrap_err());
+        glossary::add_term(
+            &ctx,
+            "demo",
+            "quotient",
+            Some("The smaller model that keeps the same answers."),
+            Some("tasks/spec.md"),
+        )
+        .unwrap();
+        let e = format!(
+            "{:#}",
+            glossary::add_term(
+                &ctx,
+                "demo",
+                "quotient",
+                Some("Another sentence for it."),
+                None
+            )
+            .unwrap_err()
+        );
         assert!(e.starts_with("term_exists"), "{e}");
         crate::round::open(
             &ctx,
@@ -861,16 +1022,26 @@ mod tests {
         )
         .unwrap();
         let text = std::fs::read_to_string(glossary::glossary_path(&fx.project)).unwrap();
-        assert!(text.contains("- quotient: The smaller model that keeps the same answers. (tasks/spec.md)\n"));
-        assert!(text.ends_with("- r1: The first round lands the shared types. (tasks/review-r1.md)\n"), "newest last:\n{text}");
+        assert!(text.contains(
+            "- quotient: The smaller model that keeps the same answers. (tasks/spec.md)\n"
+        ));
+        assert!(
+            text.ends_with("- r1: The first round lands the shared types. (tasks/review-r1.md)\n"),
+            "newest last:\n{text}"
+        );
         assert_eq!(
             glossary::explain(&ctx, "demo", "r1").unwrap(),
             "r1: The first round lands the shared types.\n(tasks/review-r1.md)\n"
         );
-        assert!(format!("{:#}", glossary::explain(&ctx, "demo", "nope").unwrap_err()).starts_with("term_unknown"));
+        assert!(
+            format!("{:#}", glossary::explain(&ctx, "demo", "nope").unwrap_err())
+                .starts_with("term_unknown")
+        );
         // A registered name used bare fails R1; in gloss form it passes.
         assert!(glossary::gate(&fx.project, "Work on r1 goes on.").is_err());
-        assert!(glossary::gate(&fx.project, "The first round lands the shared types (r1).").is_ok());
+        assert!(
+            glossary::gate(&fx.project, "The first round lands the shared types (r1).").is_ok()
+        );
         // An invented sentence for a term fails R2.
         assert!(glossary::gate(&fx.project, "The quotient is a thing.").is_err());
     }

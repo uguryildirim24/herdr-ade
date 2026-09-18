@@ -658,7 +658,10 @@ pub fn herdr_quiet(
         .run(&cmd)
         .map_err(|e| fail("unreachable", format!("{e:#}")))?;
     if out.timed_out {
-        return Err(fail("timeout", format!("`herdr {}` timed out", args.join(" "))));
+        return Err(fail(
+            "timeout",
+            format!("`herdr {}` timed out", args.join(" ")),
+        ));
     }
     let reply = [&out.stdout, &out.stderr]
         .into_iter()
@@ -2400,7 +2403,10 @@ mod quiet_tests {
         world.runner.on("pane run w1:p1", ok(""));
         world.runner.on(
             "agent send-keys",
-            fail(1, r#"{"error":{"code":"agent_not_found","message":"agent target w1:p1 not found"}}"#),
+            fail(
+                1,
+                r#"{"error":{"code":"agent_not_found","message":"agent target w1:p1 not found"}}"#,
+            ),
         );
         world.runner.on("pane send-keys", fail(1, ""));
         let ctx = world.ctx();
@@ -2409,9 +2415,11 @@ mod quiet_tests {
         assert!(super::herdr_quiet(&ctx, &h, &["pane", "run", "w1:p1", "echo"], t).is_ok());
         // `Herdr::call` reads the same empty success as a failure.
         assert!(h.call(&["pane", "run", "w1:p1", "echo"], t).is_err());
-        let e = super::herdr_quiet(&ctx, &h, &["agent", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        let e =
+            super::herdr_quiet(&ctx, &h, &["agent", "send-keys", "w1:p1", "esc"], t).unwrap_err();
         assert_eq!(e.code, "agent_not_found");
-        let e = super::herdr_quiet(&ctx, &h, &["pane", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        let e =
+            super::herdr_quiet(&ctx, &h, &["pane", "send-keys", "w1:p1", "esc"], t).unwrap_err();
         assert_eq!(e.code, "failed");
     }
 }

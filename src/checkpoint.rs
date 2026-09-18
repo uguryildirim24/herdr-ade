@@ -1356,8 +1356,15 @@ mod tests {
     fn splice_replaces_the_herdr_section_or_appends_it() {
         let doc = "# H\n\n## Goal\n\ng\n\n## Herdr\n\nold\n\n## Next\n\n- n\n";
         let out = splice_herdr(doc, "## Herdr (new)\n\nfresh\n");
-        assert_eq!(out, "# H\n\n## Goal\n\ng\n\n## Herdr (new)\n\nfresh\n\n## Next\n\n- n\n");
-        assert_eq!(splice_herdr(&out, "## Herdr (new)\n\nfresh\n"), out, "idempotent");
+        assert_eq!(
+            out,
+            "# H\n\n## Goal\n\ng\n\n## Herdr (new)\n\nfresh\n\n## Next\n\n- n\n"
+        );
+        assert_eq!(
+            splice_herdr(&out, "## Herdr (new)\n\nfresh\n"),
+            out,
+            "idempotent"
+        );
         assert_eq!(splice_herdr("# H\n", "## Herdr\n"), "# H\n\n## Herdr\n");
     }
 
@@ -1369,7 +1376,9 @@ mod tests {
             "workers": [{"pane_id": "w1:p11", "tab_id": "w1:t2", "name": "lane-one"}],
             "git": {"branches": ["main", "lane/1"]},
         });
-        let good = format!("{HANDOFF}## Herdr\n\nPane w1:p1 and lane-one in w1:p11, pane w1:p5 is closed. Branch `lane/1`, `README.md`.\n");
+        let good = format!(
+            "{HANDOFF}## Herdr\n\nPane w1:p1 and lane-one in w1:p11, pane w1:p5 is closed. Branch `lane/1`, `README.md`.\n"
+        );
         let problems = check_document(&good, &st, &fx.repo);
         assert!(problems.is_empty(), "{problems:?}");
         let bad = "# H\n\n## Next\n\n- one\n- two\n\nPane w1:p5 and `tasks/nope.md`, `lane/9`, <fill me>.\n";
@@ -1395,29 +1404,75 @@ mod tests {
         let fx = fixture();
         snapshot(&fx);
         let ctx = fx.world.ctx();
-        commit_file(&fx.repo, "HANDOFF.md", "# HANDOFF\n\n## Next\n\n- a\n- b\n", "bad handoff");
+        commit_file(
+            &fx.repo,
+            "HANDOFF.md",
+            "# HANDOFF\n\n## Next\n\n- a\n- b\n",
+            "bad handoff",
+        );
         let before = git(&fx.repo, &["rev-parse", "main"]);
         let e = format!("{:#}", checkpoint(&ctx, "demo", args(&fx)).unwrap_err());
-        assert!(e.starts_with("checkpoint_check_failed") && e.contains("Next must be exactly one action"), "{e}");
-        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), before, "nothing was committed");
+        assert!(
+            e.starts_with("checkpoint_check_failed")
+                && e.contains("Next must be exactly one action"),
+            "{e}"
+        );
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", "main"]),
+            before,
+            "nothing was committed"
+        );
 
         commit_file(&fx.repo, "HANDOFF.md", HANDOFF, "handoff");
         let before = git(&fx.repo, &["rev-parse", "main"]);
-        let printed = checkpoint(&ctx, "demo", CheckpointArgs { print: true, ..args(&fx) }).unwrap();
-        assert!(printed.starts_with("## Herdr (generated ") && printed.contains("lane-one"), "{printed}");
-        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), before, "--print writes nothing");
+        let printed = checkpoint(
+            &ctx,
+            "demo",
+            CheckpointArgs {
+                print: true,
+                ..args(&fx)
+            },
+        )
+        .unwrap();
+        assert!(
+            printed.starts_with("## Herdr (generated ") && printed.contains("lane-one"),
+            "{printed}"
+        );
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", "main"]),
+            before,
+            "--print writes nothing"
+        );
         let out = checkpoint(&ctx, "demo", args(&fx)).unwrap();
         let h = git(&fx.repo, &["rev-parse", "main"]);
-        assert!(out.starts_with(&format!("checkpoint H {h} on `main`")), "{out}");
+        assert!(
+            out.starts_with(&format!("checkpoint H {h} on `main`")),
+            "{out}"
+        );
         assert_eq!(git(&fx.repo, &["rev-parse", "main^"]), before);
-        assert_eq!(git(&fx.repo, &["diff", "--name-only", &before, &h]), "HANDOFF.json\nHANDOFF.md");
+        assert_eq!(
+            git(&fx.repo, &["diff", "--name-only", &before, &h]),
+            "HANDOFF.json\nHANDOFF.md"
+        );
         let md = git(&fx.repo, &["show", "main:HANDOFF.md"]);
         assert!(md.contains("## Herdr (generated ") && md.contains("## Traps"));
-        let sidecar: Value = serde_json::from_str(&git(&fx.repo, &["show", "main:HANDOFF.json"])).unwrap();
+        let sidecar: Value =
+            serde_json::from_str(&git(&fx.repo, &["show", "main:HANDOFF.json"])).unwrap();
         assert_eq!(sidecar["coordinator"]["pane_id"], "w1:p1");
         assert_eq!(sidecar["workers"][0]["name"], "lane-one");
-        let checked = checkpoint(&ctx, "demo", CheckpointArgs { check_only: true, ..args(&fx) }).unwrap();
-        assert!(checked.starts_with("OK HANDOFF.md: 1 nested workers"), "{checked}");
+        let checked = checkpoint(
+            &ctx,
+            "demo",
+            CheckpointArgs {
+                check_only: true,
+                ..args(&fx)
+            },
+        )
+        .unwrap();
+        assert!(
+            checked.starts_with("OK HANDOFF.md: 1 nested workers"),
+            "{checked}"
+        );
     }
 
     #[test]
@@ -1439,13 +1494,29 @@ mod tests {
             .into();
         let ctx = fx.world.ctx();
         let dry = pickup(&ctx, "demo", Some("w1:p1"), true).unwrap();
-        assert!(dry.contains(&format!("re-linked:      {live} (dry-run)")), "{dry}");
+        assert!(
+            dry.contains(&format!("re-linked:      {live} (dry-run)")),
+            "{dry}"
+        );
         assert_eq!(fx.world.runner.count("pane report-metadata"), 0);
         let out = pickup(&ctx, "demo", Some("w1:p1"), false).unwrap();
-        assert!(out.contains(&format!("already linked: {linked}\n")), "{out}");
+        assert!(
+            out.contains(&format!("already linked: {linked}\n")),
+            "{out}"
+        );
         assert!(out.contains(&format!("re-linked:      {live}\n")), "{out}");
-        assert_eq!(fx.world.runner.count("pane report-metadata w1:p11 --source herdr-ade --token parent=w1:p1"), 1);
-        assert!(out.contains(&format!("--label {gone} --no-focus --env HERDR_ADE_LAUNCH=1")), "{out}");
+        assert_eq!(
+            fx.world
+                .runner
+                .count("pane report-metadata w1:p11 --source herdr-ade --token parent=w1:p1"),
+            1
+        );
+        assert!(
+            out.contains(&format!(
+                "--label {gone} --no-focus --env HERDR_ADE_LAUNCH=1"
+            )),
+            "{out}"
+        );
         assert!(out.contains("--kind codex --pane <root_pane.pane_id from that JSON> --parent w1:p1 --timeout 30000 -- --full-auto"), "{out}");
         for verb in ["agent start", "agent prompt", "tab create", "pane run"] {
             assert_eq!(fx.world.runner.count(verb), 0, "pickup ran `{verb}`");

@@ -275,13 +275,25 @@ enum RoundCommand {
         repo: Option<String>,
     },
     /// Admit a lane to the round's manifest
-    Admit { slug: String, round: String, thread: String },
+    Admit {
+        slug: String,
+        round: String,
+        thread: String,
+    },
     /// Remove a lane from the round's manifest
-    Remove { slug: String, round: String, thread: String },
+    Remove {
+        slug: String,
+        round: String,
+        thread: String,
+    },
     /// Commit the review brief B, freeze the manifest, create the review branch
     Review { slug: String, round: String },
     /// Record the reviewer thread whose sealed done sha is the verdict commit V
-    Reviewer { slug: String, round: String, thread: String },
+    Reviewer {
+        slug: String,
+        round: String,
+        thread: String,
+    },
     /// Merge on an exact MERGE verdict, then checkpoint; resumes after a crash
     Merge {
         slug: String,
@@ -383,30 +395,60 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         repo,
                     },
                 )?;
-                println!("opened {} on `{}` (gates: {})", r.round, r.branch, r.gates.len());
+                println!(
+                    "opened {} on `{}` (gates: {})",
+                    r.round,
+                    r.branch,
+                    r.gates.len()
+                );
                 Ok(())
             }
-            RoundCommand::Admit { slug, round: id, thread } => {
+            RoundCommand::Admit {
+                slug,
+                round: id,
+                thread,
+            } => {
                 let r = round::admit(ctx, &slug, &id, &thread)?;
-                println!("{thread} admitted to {id}; manifest revision {}", r.manifest.revision);
+                println!(
+                    "{thread} admitted to {id}; manifest revision {}",
+                    r.manifest.revision
+                );
                 Ok(())
             }
-            RoundCommand::Remove { slug, round: id, thread } => {
+            RoundCommand::Remove {
+                slug,
+                round: id,
+                thread,
+            } => {
                 let r = round::remove(ctx, &slug, &id, &thread)?;
-                println!("{thread} removed from {id}; manifest revision {}", r.manifest.revision);
+                println!(
+                    "{thread} removed from {id}; manifest revision {}",
+                    r.manifest.revision
+                );
                 Ok(())
             }
             RoundCommand::Review { slug, round: id } => {
                 let o = round::review(ctx, &slug, &id)?;
                 println!("brief commit B {} ({})", o.brief_commit, o.brief_path);
-                println!("review branch {} at {}", o.review_branch, o.worktree.display());
-                println!("manifest revision {} frozen, hash {}", o.revision, o.manifest_hash);
+                println!(
+                    "review branch {} at {}",
+                    o.review_branch,
+                    o.worktree.display()
+                );
+                println!(
+                    "manifest revision {} frozen, hash {}",
+                    o.revision, o.manifest_hash
+                );
                 println!(
                     "next: start the reviewer thread in that worktree with role reviewer, then `round reviewer {slug} {id} <thread>`"
                 );
                 Ok(())
             }
-            RoundCommand::Reviewer { slug, round: id, thread } => {
+            RoundCommand::Reviewer {
+                slug,
+                round: id,
+                thread,
+            } => {
                 round::bind_reviewer(ctx, &slug, &id, &thread)?;
                 println!("{thread} reviews {id}");
                 Ok(())
@@ -474,7 +516,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 println!("critic of {topic} is pane {pane}");
                 Ok(())
             }
-            DialogueCommand::Turn { slug, topic, resend } => {
+            DialogueCommand::Turn {
+                slug,
+                topic,
+                resend,
+            } => {
                 let t = dialogue::turn(ctx, &slug, &topic, resend)?;
                 println!("turn {} sent; expected {}", t.n, t.expected_path);
                 Ok(())
@@ -507,8 +553,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             print!("{out}");
             Ok(())
         }
-        Command::Pickup { slug, pane, dry_run } => {
-            print!("{}", checkpoint::pickup(ctx, &slug, pane.as_deref(), dry_run)?);
+        Command::Pickup {
+            slug,
+            pane,
+            dry_run,
+        } => {
+            print!(
+                "{}",
+                checkpoint::pickup(ctx, &slug, pane.as_deref(), dry_run)?
+            );
             Ok(())
         }
         Command::Ask {
@@ -552,7 +605,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
         },
-        Command::Say { what, means, project } => {
+        Command::Say {
+            what,
+            means,
+            project,
+        } => {
             let slug = slug_of(project)?;
             ask::say(ctx, &slug, &what, means.as_deref())?;
             println!("said");
