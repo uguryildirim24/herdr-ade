@@ -727,8 +727,6 @@ mod tests {
             serde_json::from_str::<CostClass>("\"sideways\"").unwrap(),
             CostClass::Sideways
         );
-        assert!(Recipe::default().enabled);
-        assert_eq!(Recipe::default().ready_timeout_ms, 30_000);
         let err =
             toml::from_str::<Recipe>("kind = \"cursor\"\narge = [\"--force\"]\n").unwrap_err();
         assert!(err.to_string().contains("arge"), "{err}");

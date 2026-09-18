@@ -1577,22 +1577,6 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
     }
 
     #[test]
-    fn a_gate_over_its_threshold_in_shadow_records_the_pick_only() {
-        let (world, project, task) = world("shadow", "read the vendor pages and cite them");
-        with_help(&world);
-        single_response(&world, &answers_body(0.91));
-        let launch = run(&world, &project, &task).unwrap();
-        assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
-        assert_eq!(launch.kind, "cursor");
-        assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
-        assert_eq!(launch.gate.as_deref(), Some("agy_gemini_flash"));
-        assert_eq!(launch.gate_p, Some(0.91), "the Noul, not the threshold");
-        assert_eq!(launch.jev_input_tokens, Some(356));
-        assert_eq!(launch.jev_model.as_deref(), Some(jev::JEV_MODEL));
-        assert_eq!(world.runner.count("/usr/bin/curl"), 1);
-    }
-
-    #[test]
     fn a_low_noul_keeps_the_default_with_no_gate() {
         let (world, project, task) = world("shadow", "write the parser");
         with_help(&world);
@@ -1777,8 +1761,14 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         single_response(&world, &answers_body(0.91));
         let launch = run(&world, &project, &task).unwrap();
         assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
+        assert_eq!(launch.kind, "cursor");
         assert_eq!(launch.resolver, ResolverMode::Shadow);
         assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
+        assert_eq!(launch.gate.as_deref(), Some("agy_gemini_flash"));
+        assert_eq!(launch.gate_p, Some(0.91), "the Noul, not the threshold");
+        assert_eq!(launch.jev_input_tokens, Some(356));
+        assert_eq!(launch.jev_model.as_deref(), Some(jev::JEV_MODEL));
+        assert_eq!(world.runner.count("/usr/bin/curl"), 1);
         assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_SHADOW));
         assert_eq!(
             launch.reason,

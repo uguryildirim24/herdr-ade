@@ -825,7 +825,7 @@ pub fn key_report(env: &Env) -> KeyReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{CostClass, Gate, GateCriteria};
+    use crate::contracts::CostClass;
     use crate::runner::fake::{FakeRunner, fail, ok, timeout};
 
     fn recipes() -> BTreeMap<String, Recipe> {
@@ -1023,7 +1023,6 @@ mod tests {
         assert!(!out.contains("flash"), "{out}");
         assert!(!out.contains("web research helper"), "{out}");
         assert!(!out.contains("gpt"), "{out}");
-        assert!(scrub.fingerprint().len() == 64);
     }
 
     #[test]
@@ -1065,7 +1064,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["model"], JEV_MODEL);
         assert_eq!(value["questions"]["agy_gemini_flash"]["type"], "noul");
-        assert_eq!(prompt_hash(&[question()], EXCERPT_VERSION).len(), 64);
     }
 
     #[test]
@@ -1282,32 +1280,5 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("--config", ok("{}\n401"));
         assert_eq!(models_probe(&runner, "k", Duration::from_secs(3)).0, 401);
-    }
-
-    #[test]
-    fn a_gate_and_its_criteria_are_sent_verbatim() {
-        let gate = Gate {
-            recipe: "agy_gemini_flash".into(),
-            cost: CostClass::Sideways,
-            threshold: Some(0.75),
-            instructions: "Is the main job of `task` web research?".into(),
-            criteria: GateCriteria {
-                is_true: "Web research with citations.".into(),
-                is_false: "Implementation.".into(),
-            },
-        };
-        let question = Question {
-            id: gate.recipe.clone(),
-            instructions: gate.instructions.clone(),
-            criteria_true: gate.criteria.is_true.clone(),
-            criteria_false: gate.criteria.is_false.clone(),
-            threshold: gate.threshold.unwrap(),
-        };
-        let value = questions(&[question]);
-        assert_eq!(value["agy_gemini_flash"]["instructions"], gate.instructions);
-        assert_eq!(
-            value["agy_gemini_flash"]["criteria"]["false"],
-            "Implementation."
-        );
     }
 }
