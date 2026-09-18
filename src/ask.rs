@@ -704,6 +704,8 @@ mod tests {
         let shown = crate::talk::replay(&fx.world.ctx(), "demo").unwrap();
         assert!(shown.contains("  1. keep it running another hour\n  2. stop it now\n  0. I did not understand the question"), "{shown}");
         assert!(published_marker(&fx.project, "a-1", 1).exists());
+        let overview = crate::overview::render(&fx.project, &[]);
+        assert!(overview.contains(&format!("  questions for you: 1 (newest a-1@1: {compact})\n")), "{overview}");
         // A second publication of the same ask appends nothing.
         publish(&fx.world.ctx(), &fx.project, &HumanMessage::Ask { id: "a-1".into(), revision: 1 }).unwrap();
         assert_eq!(journal_kinds(&fx.project).len(), 1);

@@ -109,6 +109,19 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
         let _ = write!(out, " — {goal}");
     }
     let _ = writeln!(out);
+    // ade-rounds: the round stage and the questions waiting on Rolf.
+    let _ = writeln!(out, "  stage: {}", crate::board::stage(project));
+    let asks = crate::ask::open_asks(project);
+    if let Some(newest) = crate::ask::newest_open(project) {
+        let _ = writeln!(
+            out,
+            "  questions for you: {} (newest {}@{}: {})",
+            asks.len(),
+            newest.id,
+            newest.revision,
+            crate::ask::compact_line(&newest)
+        );
+    }
     if rows.is_empty() {
         let _ = writeln!(out, "\n  no threads yet");
     }
@@ -247,6 +260,8 @@ mod tests {
         .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
         assert!(text.contains("needs you in pane w2:p1"));
+        assert!(text.contains("\n  stage: no round is open yet\n"), "{text}");
+        assert!(!text.contains("questions for you"));
     }
 
     #[test]
