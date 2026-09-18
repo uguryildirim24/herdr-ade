@@ -44,25 +44,49 @@ fn report(
     let binary = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("unknown ({e})"));
+    let prefix = crate::coordinator::command_prefix(Path::new(&binary), root);
+    let _ = writeln!(out, "plugin:     herdr-ade");
+    let _ = writeln!(out, "crate:      herdr-ade");
     let _ = writeln!(out, "binary:     {binary}");
+    let _ = writeln!(out, "prefix:     {prefix}");
     let _ = writeln!(out, "version:    {}", crate::VERSION);
     let _ = writeln!(out, "root:       {}", root.display());
     let _ = writeln!(out, "config dir: {}", config_dir.display());
     let _ = writeln!(out);
 
     let bin = env.herdr_bin();
+    let parent_cli = herdr::parent_on_start_supported(&bin, runner);
     match herdr::version(&bin, runner) {
         Ok(version) if version >= herdr::MIN_VERSION => {
             check(&mut out, Some(true), "herdr", format!("{version} ({bin})"))
         }
+        Ok(version) if version == herdr::Version(0, 9, 0) && parent_cli => check(
+            &mut out,
+            Some(true),
+            "herdr",
+            format!("{version} ({bin}); fork string 0.9.0 accepted until install day (0.9.1)"),
+        ),
         Ok(version) => check(
             &mut out,
             Some(false),
             "herdr",
-            format!("{version} ({bin}); {} or later is required", herdr::MIN_VERSION),
+            format!(
+                "{version} ({bin}); {} or later is required",
+                herdr::MIN_VERSION
+            ),
         ),
         Err(error) => check(&mut out, Some(false), "herdr", format!("{error:#}")),
     }
+    check(
+        &mut out,
+        if parent_cli { Some(true) } else { None },
+        "parent",
+        if parent_cli {
+            "CLI `agent start --parent` (fork)".into()
+        } else {
+            "CLI has no `--parent`; post-start fallback only".into()
+        },
+    );
 
     match paths::resolve_session(session, env, runner) {
         Ok(found) => {
@@ -91,12 +115,21 @@ fn report(
         let result = runner.run(&Cmd::new(tool, TOOL_TIMEOUT).args(args));
         match result {
             Ok(o) if o.success() => {
-                let text = if o.stdout.trim().is_empty() { &o.stderr } else { &o.stdout };
+                let text = if o.stdout.trim().is_empty() {
+                    &o.stderr
+                } else {
+                    &o.stdout
+                };
                 let line = text.lines().next().unwrap_or("").trim().to_string();
                 check(&mut out, Some(true), tool, line);
             }
             Ok(o) => check(&mut out, required.then_some(false), tool, o.error_text()),
-            Err(error) => check(&mut out, required.then_some(false), tool, format!("{error:#}")),
+            Err(error) => check(
+                &mut out,
+                required.then_some(false),
+                tool,
+                format!("{error:#}"),
+            ),
         }
     }
     match runner.run(&Cmd::new("gh", TOOL_TIMEOUT).args(["auth", "status"])) {
@@ -145,20 +178,57 @@ fn report(
             continue;
         };
         let label = format!("project {slug}");
+        if let Ok(text) = std::fs::read_to_string(project.project_md())
+            && let Ok(front) = project::project_md_front(&text)
+        {
+            let legacy = project::legacy_agent_keys(front);
+            if !legacy.is_empty() {
+                check(
+                    &mut out,
+                    Some(false),
+                    &label,
+                    format!(
+                        "PROJECT.md still has {}; D2 removed these keys",
+                        legacy.join(", ")
+                    ),
+                );
+                continue;
+            }
+        }
         let Some(record) = project.coordinator() else {
-            check(&mut out, Some(true), &label, format!("{}; never opened", project.status()));
+            check(
+                &mut out,
+                Some(true),
+                &label,
+                format!("{}; never opened", project.status()),
+            );
             continue;
         };
         if !Path::new(&record.socket).exists() {
-            check(&mut out, None, &label, format!("recorded socket {} no longer exists; `open --rebind` moves it", record.socket));
+            check(
+                &mut out,
+                None,
+                &label,
+                format!(
+                    "recorded socket {} no longer exists; `open --rebind` moves it",
+                    record.socket
+                ),
+            );
             continue;
         }
         let herdr = Herdr::new(&bin, &record.socket, runner);
         match herdr.pane_list() {
-            Err(error) => check(&mut out, None, &label, format!("session at {} unreachable: {error}", record.socket)),
+            Err(error) => check(
+                &mut out,
+                None,
+                &label,
+                format!("session at {} unreachable: {error}", record.socket),
+            ),
             Ok(panes) => {
                 let workspace = panes.iter().any(|p| p.workspace_id == record.workspace_id);
-                let pane = panes.iter().any(|p| crate::coordinator::pane_matches(&record, p));
+                let pane = panes
+                    .iter()
+                    .any(|p| crate::coordinator::pane_matches(&record, p));
                 check(
                     &mut out,
                     if pane { Some(true) } else { None },
@@ -170,11 +240,39 @@ fn report(
                         record.workspace_id,
                         if workspace { "exists" } else { "is gone" },
                         record.pane_id,
-                        if pane { "exists" } else { "is gone (run `open`)" },
+                        if pane {
+                            "exists"
+                        } else {
+                            "is gone (run `open`)"
+                        },
                     ),
                 );
             }
         }
+    }
+
+    match crate::project::load_roles(config_dir) {
+        Ok(table) => {
+            for name in project::day_one_roles() {
+                let spec = table
+                    .roles
+                    .get(*name)
+                    .cloned()
+                    .unwrap_or_else(|| project::default_role_spec(name));
+                if project::kind_needs_permission_args(&spec.kind) && spec.args.is_empty() {
+                    check(
+                        &mut out,
+                        None,
+                        &format!("role {name}"),
+                        format!(
+                            "kind {} has no args; a permission flag is usually required",
+                            spec.kind
+                        ),
+                    );
+                }
+            }
+        }
+        Err(error) => check(&mut out, Some(false), "roles", format!("{error:#}")),
     }
 
     // Machines that projects use need an SSH target for report and library copies.
@@ -186,12 +284,27 @@ fn report(
         if let Ok((settings, _)) = project.read_project_md() {
             machines.extend(settings.repos.into_iter().filter_map(|r| r.machine));
         }
-        machines.extend(crate::thread::list(&project).into_iter().filter(|t| t.is_remote() && t.status != crate::thread::Status::Resolved).map(|t| t.machine));
+        machines.extend(
+            crate::thread::list(&project)
+                .into_iter()
+                .filter(|t| t.is_remote() && t.status != crate::thread::Status::Resolved)
+                .map(|t| t.machine),
+        );
     }
     for machine in machines {
         match crate::remote::ssh_target(runner, &bin, config_dir, &machine) {
-            Ok(target) => check(&mut out, Some(true), &format!("machine {machine}"), format!("ssh target {target}")),
-            Err(error) => check(&mut out, Some(false), &format!("machine {machine}"), format!("{error:#}")),
+            Ok(target) => check(
+                &mut out,
+                Some(true),
+                &format!("machine {machine}"),
+                format!("ssh target {target}"),
+            ),
+            Err(error) => check(
+                &mut out,
+                Some(false),
+                &format!("machine {machine}"),
+                format!("{error:#}"),
+            ),
         }
     }
 
@@ -250,5 +363,29 @@ mod tests {
         assert!(text.contains("[warn] root"));
         assert!(text.contains(&format!("root:       {}", root.display())));
         assert!(!root.exists(), "doctor must not create the root");
+        assert!(text.contains("plugin:     herdr-ade"), "{text}");
+        assert!(text.contains("crate:      herdr-ade"), "{text}");
+        assert!(text.contains("prefix:"), "{text}");
+    }
+
+    #[test]
+    fn fork_0_9_0_with_parent_is_accepted() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.0\n");
+        runner.on(
+            "agent start --help",
+            ok("usage: herdr agent start <name> --kind KIND --pane ID [--parent PANE_ID]\n"),
+        );
+        let (text, healthy) = report(
+            &env,
+            &home.path().join("root"),
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(healthy, "{text}");
+        assert!(text.contains("install day"), "{text}");
+        assert!(text.contains("[ok  ] parent:"), "{text}");
     }
 }
