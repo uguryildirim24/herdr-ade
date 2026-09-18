@@ -138,6 +138,12 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
         );
     }
 
+    // One writer types into the coordinator's pane; `!native` in talk
+    // suspends it and the event waits for the next tick (D18).
+    let _writer = crate::talk::writer_lock(project)?;
+    if crate::talk::writer_suspended(project) {
+        return Ok(());
+    }
     let agent = herdr.agent_list()?.into_iter().find(|agent| {
         agent.pane_id == event.recipient.pane
             && agent.name == coordinator.agent_name
@@ -449,6 +455,10 @@ pub fn nudge(
         };
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick.
+        let _writer = crate::talk::writer_lock(project)?;
+        if crate::talk::writer_suspended(project) {
+            return Ok(());
+        }
         herdr.agent_prompt(pane, NUDGE_TEXT)?;
     } else {
         let body = format!(

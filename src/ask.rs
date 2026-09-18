@@ -466,6 +466,30 @@ pub struct Published {
     pub notified: bool,
 }
 
+/// The stored ask an `ade-ask` envelope names: known, latest, unanswered
+/// and still passing the check. The hook corrects on the same refusal.
+pub fn open_revision(
+    project: &Project,
+    id: &str,
+    revision: u32,
+    g: &crate::plain::Glossary,
+) -> Result<Ask> {
+    let latest = latest_revision(project, id);
+    let record = load_revision(project, id, revision)?
+        .with_context(|| format!("ask_unknown: `{id}` revision {revision} does not exist"))?;
+    if revision != latest {
+        bail!("ask_revision_stale: `{id}` is at revision {latest}");
+    }
+    if answer_of(project, id, revision).is_some() {
+        bail!("ask_closed: `{id}` revision {revision} is answered");
+    }
+    let checked = plain::check_ask(&record.question, &record.choices, g);
+    if !checked.passed() {
+        bail!("plain_refused: the stored question no longer passes the check");
+    }
+    Ok(record)
+}
+
 pub fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
     publish_keyed(ctx, project, msg, None)
 }
@@ -524,20 +548,7 @@ pub fn publish_keyed(
             })
         }
         HumanMessage::Ask { id, revision } => {
-            let latest = latest_revision(project, id);
-            let record = load_revision(project, id, *revision)?.with_context(|| {
-                format!("ask_unknown: `{id}` revision {revision} does not exist")
-            })?;
-            if *revision != latest {
-                bail!("ask_revision_stale: `{id}` is at revision {latest}");
-            }
-            if answer_of(project, id, *revision).is_some() {
-                bail!("ask_closed: `{id}` revision {revision} is answered");
-            }
-            let checked = plain::check_ask(&record.question, &record.choices, &g);
-            if !checked.passed() {
-                bail!("plain_refused: the stored question no longer passes the check");
-            }
+            let record = open_revision(project, id, *revision, &g)?;
             let compact = compact_line(&record);
             glossary::gate(project, &compact)?;
             let seq = crate::talk::append(
@@ -759,6 +770,24 @@ mod tests {
             ["ask a-1@1"],
             "one journal line across both tries"
         );
+    }
+
+    /// Defect: the hook looked for `asks/<id>.toml`, so every `ade-ask`
+    /// envelope was corrected as an unknown ask.
+    #[test]
+    fn the_hook_accepts_an_envelope_for_a_recorded_ask() {
+        let fx = fixture();
+        ask(&fx.world.ctx(), "demo", keep_or_stop()).unwrap();
+        let envelope = |revision| HumanMessage::Ask {
+            id: "a-1".into(),
+            revision,
+        };
+        crate::hook::validate_message(&fx.project, &envelope(1)).unwrap();
+        let e = format!(
+            "{:#}",
+            crate::hook::validate_message(&fx.project, &envelope(2)).unwrap_err()
+        );
+        assert!(e.starts_with("ask_unknown"), "{e}");
     }
 
     #[test]
