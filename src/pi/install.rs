@@ -1,7 +1,7 @@
 //! The pinned install (SPEC-pi v2 §3.2).
 //!
 //! Exactly `@earendil-works/pi-coding-agent@0.85.1` into
-//! `$HERDR_PLUGIN_STATE_DIR/pi/npm`, never global, never `pi install`.
+//! `<ADE root>/pi/npm`, never global, never `pi install`.
 //! Setup is an action Rolf runs; the library refuses a start without the pin.
 
 use std::time::Duration;

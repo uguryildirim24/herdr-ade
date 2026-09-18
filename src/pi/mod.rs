@@ -95,15 +95,15 @@ impl Env {
 /// (SPEC-pi v2 §3.1, §3.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
-    /// `$HERDR_PLUGIN_STATE_DIR/pi` (or `<HERDR_ADE_ROOT>/pi`, or
-    /// `~/.herdr-ade/pi`).
+    /// `<ADE root>/pi`: `<HERDR_ADE_ROOT>/pi`, or `<root from
+    /// config.toml>/pi`, or `~/.herdr-ade/pi`.
     pub root: PathBuf,
 }
 
 impl Layout {
     pub fn from_env(env: &Env) -> Result<Layout> {
         Ok(Layout {
-            root: resolve_root(env),
+            root: resolve_root(env)?,
         })
     }
 
@@ -178,16 +178,41 @@ impl Layout {
     }
 }
 
-/// `HERDR_PLUGIN_STATE_DIR` (actions and the ticker run with it), else
-/// `HERDR_ADE_ROOT`, else `~/.herdr-ade`; then one `pi/` below it.
-pub fn resolve_root(env: &Env) -> PathBuf {
-    if let Some(dir) = env.var("HERDR_PLUGIN_STATE_DIR") {
-        return env.expand_tilde(dir).join("pi");
-    }
-    if let Some(dir) = env.var("HERDR_ADE_ROOT") {
-        return env.expand_tilde(dir).join("pi");
-    }
-    env.home.join(".herdr-ade").join("pi")
+/// ADE's root, then one `pi/` below it: `HERDR_ADE_ROOT`, else `root` in
+/// `~/.config/herdr-ade/config.toml`, else `~/.herdr-ade` (the order
+/// `crate::paths::resolve_root` uses without a `--root` flag).
+///
+/// Not `HERDR_PLUGIN_STATE_DIR`: herdr sets it only for plugin actions, so
+/// `herdr-pi setup` run as an action would install into one folder while
+/// `ha thread start` in a coordinator shell, the ticker and `herdr-pi` from a
+/// terminal check another, and every pi start would be refused.
+pub fn resolve_root(env: &Env) -> Result<PathBuf> {
+    let root = if let Some(dir) = env.var("HERDR_ADE_ROOT") {
+        env.expand_tilde(dir)
+    } else if let Some(root) = config_root(env)? {
+        env.expand_tilde(&root)
+    } else {
+        env.home.join(".herdr-ade")
+    };
+    let root = std::path::absolute(&root)
+        .with_context(|| format!("bad path {}", root.display()))?;
+    Ok(root.join("pi"))
+}
+
+/// `root` from ADE's `config.toml`, when the file sets one.
+fn config_root(env: &Env) -> Result<Option<String>> {
+    let path = env.home.join(".config/herdr-ade/config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let table: toml::Table = text
+        .parse()
+        .with_context(|| format!("{} does not parse", path.display()))?;
+    Ok(table
+        .get("root")
+        .and_then(toml::Value::as_str)
+        .filter(|root| !root.is_empty())
+        .map(str::to_string))
 }
 
 /// A read-only check before `herdr agent start`, from the process
@@ -246,20 +271,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_prefers_the_plugin_state_dir() {
-        let home = std::path::Path::new("/h/me");
-        let env = Env::for_test(
+    fn root_is_the_ade_root_whoever_runs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // An action has HERDR_PLUGIN_STATE_DIR; a coordinator shell does not.
+        // Both must land on the same folder.
+        let action = Env::for_test(
             home,
             &[
                 ("HERDR_PLUGIN_STATE_DIR", "/state/ade"),
                 ("HERDR_ADE_ROOT", "/root"),
             ],
         );
-        assert_eq!(resolve_root(&env), PathBuf::from("/state/ade/pi"));
+        let shell = Env::for_test(home, &[("HERDR_ADE_ROOT", "/root")]);
+        assert_eq!(resolve_root(&action).unwrap(), PathBuf::from("/root/pi"));
+        assert_eq!(resolve_root(&shell).unwrap(), PathBuf::from("/root/pi"));
         let env = Env::for_test(home, &[("HERDR_ADE_ROOT", "~/r")]);
-        assert_eq!(resolve_root(&env), PathBuf::from("/h/me/r/pi"));
+        assert_eq!(resolve_root(&env).unwrap(), home.join("r/pi"));
+        let env = Env::for_test(home, &[("HERDR_PLUGIN_STATE_DIR", "/state/ade")]);
+        assert_eq!(resolve_root(&env).unwrap(), home.join(".herdr-ade/pi"));
+        std::fs::create_dir_all(home.join(".config/herdr-ade")).unwrap();
+        std::fs::write(
+            home.join(".config/herdr-ade/config.toml"),
+            "root = \"~/from-config\"\n",
+        )
+        .unwrap();
         let env = Env::for_test(home, &[]);
-        assert_eq!(resolve_root(&env), PathBuf::from("/h/me/.herdr-ade/pi"));
+        assert_eq!(resolve_root(&env).unwrap(), home.join("from-config/pi"));
     }
 
     #[test]
