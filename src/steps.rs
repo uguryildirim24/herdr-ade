@@ -71,12 +71,11 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
     if coordinator.pane_id != event.recipient.pane
         || coordinator.launch_attempts.max(1) != event.recipient.coordinator_attempt
     {
-        inbox::write(
+        inbox::write_event(
             project,
+            event,
             "recipient-changed",
-            &event.thread,
             "a sealed lane event belongs to an earlier coordinator binding",
-            "",
         )?;
         return Ok(());
     }

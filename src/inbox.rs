@@ -111,7 +111,11 @@ pub fn write_event(
     summary: &str,
 ) -> Result<String> {
     let _lock = project.lock()?;
-    let id = format!("event-{}", event.id);
+    let id = if kind == "recipient-changed" {
+        format!("recipient-changed-{}", event.id)
+    } else {
+        format!("event-{}", event.id)
+    };
     validate_id(&id)?;
     let path = inbox_dir(project).join(format!("{id}.md"));
     if path.exists()
@@ -210,9 +214,15 @@ pub fn acknowledge_events(
         .filter(|item| ids.contains(&item.id) && !item.event.is_empty())
     {
         let event = crate::events::load(project, &item.event)?;
-        if event.recipient.pane == pane
-            && event.recipient.coordinator_attempt == coordinator_attempt
-        {
+        let binding_matches = if item.kind == "recipient-changed" {
+            project.coordinator().is_some_and(|record| {
+                record.pane_id == pane && record.launch_attempts.max(1) == coordinator_attempt
+            })
+        } else {
+            event.recipient.pane == pane
+                && event.recipient.coordinator_attempt == coordinator_attempt
+        };
+        if binding_matches {
             crate::events::append_delivery(
                 project,
                 &event.id,
@@ -276,7 +286,14 @@ pub fn done_bound(
             let Some((pane, attempt)) = binding else {
                 bail!("coordinator_binding_required: event item `{id}` needs its coordinator");
             };
-            if event.recipient.pane != pane || event.recipient.coordinator_attempt != attempt {
+            let binding_matches = if item.kind == "recipient-changed" {
+                project.coordinator().is_some_and(|record| {
+                    record.pane_id == pane && record.launch_attempts.max(1) == attempt
+                })
+            } else {
+                event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt
+            };
+            if !binding_matches {
                 bail!("coordinator_binding_mismatch: event item `{id}` belongs to another binding");
             }
         }
@@ -434,6 +451,49 @@ mod tests {
                 crate::contracts::DeliveryState::Acknowledged,
                 crate::contracts::DeliveryState::Handled
             ]
+        );
+    }
+
+    #[test]
+    fn replacement_coordinator_acknowledges_recipient_changed_item() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        project
+            .update_coordinator(|record| {
+                record.pane_id = "w2:p1".into();
+                record.launch_attempts = 3;
+            })
+            .unwrap();
+        let event = crate::contracts::Event {
+            id: "t-0001-1-1".into(),
+            op: "t-0001-1-1".into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                done: None,
+                waiting: Some(crate::contracts::WaitingPayload {
+                    text: "wait".into(),
+                }),
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        let item = write_event(
+            &project,
+            &event,
+            "recipient-changed",
+            "an earlier event needs review",
+        )
+        .unwrap();
+        acknowledge_events(&project, &[item], "w2:p1", 3).unwrap();
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![crate::contracts::DeliveryState::Acknowledged]
         );
     }
 }
