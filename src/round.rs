@@ -2361,7 +2361,15 @@ mod tests {
             "a second writer waits for the first"
         );
         drop(held);
-        assert!(other.try_lock().is_ok());
+        // A git child spawned by a parallel test can hold a forked copy of
+        // the descriptor for an instant; a real waiter blocks in `lock()`.
+        let free = (0..200).any(|_| {
+            other.try_lock().is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(free, "the lock is released when the holder drops it");
     }
 
     #[test]
