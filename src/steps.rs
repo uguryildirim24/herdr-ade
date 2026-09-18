@@ -68,7 +68,8 @@ pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         if !states.is_empty() {
             continue;
         }
-        if thread::load(project, &event.thread).is_ok_and(|lane| lane.attempt.max(1) != event.attempt)
+        if thread::load(project, &event.thread)
+            .is_ok_and(|lane| lane.attempt.max(1) != event.attempt)
         {
             continue;
         }
