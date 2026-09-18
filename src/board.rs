@@ -114,7 +114,7 @@ fn send(ctx: &Ctx, project: &Project, pairs: &[(String, String)]) -> Result<()> 
         args.push("--token");
         args.push(t);
     }
-    h.call(&args, Duration::from_secs(10))
+    crate::round::herdr_quiet(ctx, &h, &args, Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("board_unavailable: {}", e.message))?;
     save_state(project, |s| {
         for (k, v) in pairs {

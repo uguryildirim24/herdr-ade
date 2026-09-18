@@ -637,6 +637,47 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
     Ok(record)
 }
 
+/// A herdr call whose success prints nothing: `workspace|pane
+/// report-metadata`, `pane run` and `pane send-keys` on the fork build exit 0
+/// with an empty stdout, which `Herdr::call` reads as a failure. An empty
+/// reply with exit 0 is success here; a JSON `error` is still an error. Stand-in
+/// until `Herdr::call` accepts it (left for the reviewer).
+pub fn herdr_quiet(
+    ctx: &Ctx,
+    herdr: &crate::herdr::Herdr,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::result::Result<(), crate::herdr::HerdrError> {
+    let cmd = herdr.cmd(timeout).args(args.iter().copied());
+    let fail = |code: &str, message: String| crate::herdr::HerdrError {
+        code: code.into(),
+        message,
+    };
+    let out = ctx
+        .runner
+        .run(&cmd)
+        .map_err(|e| fail("unreachable", format!("{e:#}")))?;
+    if out.timed_out {
+        return Err(fail("timeout", format!("`herdr {}` timed out", args.join(" "))));
+    }
+    let reply = [&out.stdout, &out.stderr]
+        .into_iter()
+        .find_map(|t| serde_json::from_str::<serde_json::Value>(t.trim()).ok());
+    if let Some(error) = reply.as_ref().and_then(|r| r.get("error")) {
+        return Err(fail(
+            error["code"].as_str().unwrap_or("failed"),
+            error["message"].as_str().unwrap_or("").to_string(),
+        ));
+    }
+    if out.success() {
+        return Ok(());
+    }
+    Err(fail(
+        "failed",
+        format!("`herdr {}`: {}", args.join(" "), out.error_text()),
+    ))
+}
+
 /// Agent-plane workspace tokens `round` and `branch`, no TTL (restored by the
 /// fork's `[session] restore_tokens`). Best effort: the record is the authority.
 fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
@@ -649,7 +690,9 @@ fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
     let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &coord.socket, ctx.runner);
     let round = format!("round={}", record.round);
     let branch = format!("branch={}", record.branch);
-    if let Err(e) = herdr.call(
+    if let Err(e) = herdr_quiet(
+        ctx,
+        &herdr,
         &[
             "workspace",
             "report-metadata",
@@ -2341,5 +2384,34 @@ mod tests {
     fn fence_is_longer_than_any_inner_run() {
         assert_eq!(fence_for("plain"), "```");
         assert_eq!(fence_for("a ```` b"), "`````");
+    }
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use std::time::Duration;
+
+    use crate::runner::fake::{fail, ok};
+    use crate::scenarios::World;
+
+    #[test]
+    fn an_empty_reply_with_exit_zero_is_success_and_an_error_reply_is_not() {
+        let world = World::new();
+        world.runner.on("pane run w1:p1", ok(""));
+        world.runner.on(
+            "agent send-keys",
+            fail(1, r#"{"error":{"code":"agent_not_found","message":"agent target w1:p1 not found"}}"#),
+        );
+        world.runner.on("pane send-keys", fail(1, ""));
+        let ctx = world.ctx();
+        let h = crate::herdr::Herdr::new("herdr", "/nonexistent.sock", ctx.runner);
+        let t = Duration::from_secs(1);
+        assert!(super::herdr_quiet(&ctx, &h, &["pane", "run", "w1:p1", "echo"], t).is_ok());
+        // `Herdr::call` reads the same empty success as a failure.
+        assert!(h.call(&["pane", "run", "w1:p1", "echo"], t).is_err());
+        let e = super::herdr_quiet(&ctx, &h, &["agent", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        assert_eq!(e.code, "agent_not_found");
+        let e = super::herdr_quiet(&ctx, &h, &["pane", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        assert_eq!(e.code, "failed");
     }
 }
