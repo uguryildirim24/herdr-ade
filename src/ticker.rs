@@ -804,7 +804,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
                 // that may have changed since (SPEC-ADE D2).
                 let launch = if record.launch.kind.is_empty() {
                     let (settings, _) = project.read_project_md()?;
-                    let spec = crate::project::resolve_role(&ctx.config_dir, &settings, "coordinator")?;
+                    let spec =
+                        crate::project::resolve_role(&ctx.config_dir, &settings, "coordinator")?;
                     crate::project::launch_recipe(&spec, 0, String::new(), String::new())
                 } else {
                     record.launch.clone()

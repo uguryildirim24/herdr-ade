@@ -287,9 +287,9 @@ pub fn done_bound(
                 bail!("coordinator_binding_required: event item `{id}` needs its coordinator");
             };
             let binding_matches = if item.kind == "recipient-changed" {
-                project.coordinator().is_some_and(|record| {
-                    record.pane_id == pane && record.attempt() == attempt
-                })
+                project
+                    .coordinator()
+                    .is_some_and(|record| record.pane_id == pane && record.attempt() == attempt)
             } else {
                 event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt
             };

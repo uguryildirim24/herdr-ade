@@ -730,9 +730,13 @@ mod tests {
             h.call(&["pane", "run", "w1:p1", "echo"], t).unwrap(),
             serde_json::Value::Null
         );
-        let e = h.call(&["agent", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        let e = h
+            .call(&["agent", "send-keys", "w1:p1", "esc"], t)
+            .unwrap_err();
         assert_eq!(e.code, "agent_not_found");
-        let e = h.call(&["pane", "send-keys", "w1:p1", "esc"], t).unwrap_err();
+        let e = h
+            .call(&["pane", "send-keys", "w1:p1", "esc"], t)
+            .unwrap_err();
         assert_eq!(e.code, "failed");
     }
 

@@ -238,7 +238,12 @@ pub fn commit_files_locked(
     let head = git(
         runner,
         &repo_s,
-        &["rev-parse", "--verify", "-q", &format!("{git_ref}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{git_ref}^{{commit}}"),
+        ],
         Duration::from_secs(5),
     )
     .with_context(|| format!("branch_missing: `{branch}` does not exist"))?;
@@ -284,7 +289,12 @@ pub fn commit_files_locked(
             let mut commit = vec!["commit", "-q", "--no-verify", "-m", message, "--"];
             commit.extend(own.iter().copied());
             git(runner, &dir_s, &commit, WRITE_TIMEOUT)?;
-            git(runner, &dir_s, &["rev-parse", "HEAD"], Duration::from_secs(5))
+            git(
+                runner,
+                &dir_s,
+                &["rev-parse", "HEAD"],
+                Duration::from_secs(5),
+            )
         }
         None => {
             std::fs::create_dir_all(tmp_dir)

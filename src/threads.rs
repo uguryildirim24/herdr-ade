@@ -461,7 +461,12 @@ fn place_ade_worktree(
     if git(
         runner,
         &record.repo,
-        &["rev-parse", "--verify", "-q", &format!("refs/heads/{integration}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{integration}"),
+        ],
         GIT_TIMEOUT,
     )
     .is_err()
@@ -485,7 +490,8 @@ fn place_ade_worktree(
         if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
             eprintln!("warning: {error:#}");
         }
-        let head = crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
+        let head =
+            crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
         let sha = crate::git::commit_files_locked(
             runner,
             Path::new(&record.repo),
@@ -1636,14 +1642,18 @@ mod tests {
         };
         let rel = format!("tasks/{}.md", started.id);
         let committed = git_out(&["show", &format!("main:{rel}")]);
-        assert!(committed.starts_with("plain: The lane does the work."), "{committed}");
+        assert!(
+            committed.starts_with("plain: The lane does the work."),
+            "{committed}"
+        );
         assert_eq!(git_out(&["rev-parse", "main"]), started.base);
         assert!(wt.join(&rel).is_file(), "the brief is in the lane checkout");
         assert_eq!(
             started.launch.brief_hash,
             crate::thread::sha256_hex(format!("{committed}\n").as_bytes())
         );
-        let exclude = std::fs::read_to_string(Path::new(&repo_s).join(".git/info/exclude")).unwrap();
+        let exclude =
+            std::fs::read_to_string(Path::new(&repo_s).join(".git/info/exclude")).unwrap();
         assert!(exclude.lines().any(|l| l == ".worktrees/"), "{exclude}");
         let calls = world.runner.calls.borrow();
         let env = format!(

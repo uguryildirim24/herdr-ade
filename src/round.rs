@@ -2233,4 +2233,3 @@ mod tests {
         assert_eq!(fence_for("a ```` b"), "`````");
     }
 }
-

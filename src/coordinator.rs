@@ -153,10 +153,12 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     });
     // A reused pane keeps the environment it was created with, so it keeps
     // its attempt and brief hash; a new tab is the next attempt (D14).
-    let previous_launch = previous.as_ref().map(|r| r.launch.clone()).unwrap_or_default();
-    let brief_hash = crate::thread::sha256_hex(
-        &std::fs::read(project.project_md()).unwrap_or_default(),
-    );
+    let previous_launch = previous
+        .as_ref()
+        .map(|r| r.launch.clone())
+        .unwrap_or_default();
+    let brief_hash =
+        crate::thread::sha256_hex(&std::fs::read(project.project_md()).unwrap_or_default());
     let launch = match reusable {
         Some(record) if !record.launch.brief_hash.is_empty() => record.launch.clone(),
         _ => project::launch_recipe(
@@ -166,7 +168,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             project::policy_hash(&ctx.config_dir),
         ),
     };
-    let env = project::tab_env(slug, "coordinator", launch.attempt, &launch.brief_hash, &spec);
+    let env = project::tab_env(
+        slug,
+        "coordinator",
+        launch.attempt,
+        &launch.brief_hash,
+        &spec,
+    );
     let (workspace_id, tab_id, pane_id) = if let Some(record) = reusable {
         sync_label(&herdr, &record.workspace_id, &label);
         (
@@ -303,12 +311,7 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
         if let Some(record) = project.coordinator()
             && std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
         {
-            inbox::acknowledge_events(
-                &project,
-                &shown,
-                &record.pane_id,
-                record.attempt(),
-            )?;
+            inbox::acknowledge_events(&project, &shown, &record.pane_id, record.attempt())?;
         }
     }
     Ok(())

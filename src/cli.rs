@@ -947,10 +947,9 @@ pub fn run() -> Result<()> {
                 let project = Project::load(&ctx.root, &slug)?;
                 let record = project.coordinator();
                 let pane = std::env::var("HERDR_PANE_ID").ok();
-                let binding = record.as_ref().and_then(|record| {
-                    pane.as_deref()
-                        .map(|pane| (pane, record.attempt()))
-                });
+                let binding = record
+                    .as_ref()
+                    .and_then(|record| pane.as_deref().map(|pane| (pane, record.attempt())));
                 let moved = inbox::done_bound(&project, &ids, all, binding)?;
                 println!("{moved} item(s) moved to inbox/done");
                 Ok(())
