@@ -515,7 +515,7 @@ pub fn live_state(thread: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::
 pub fn identity_verifies(
     thread: &Thread,
     agent: &Agent,
-    process: Option<&crate::contracts::ProcessIdentity>,
+    live: &[crate::contracts::ProcessIdentity],
 ) -> bool {
     if !agent_matches(thread, agent) {
         return false;
@@ -526,10 +526,8 @@ pub fn identity_verifies(
     let Some(stored) = thread.identity.process.as_ref() else {
         return false;
     };
-    let Some(live) = process else {
-        return false;
-    };
-    stored.pid == live.pid && stored.argv0 == live.argv0
+    live.iter()
+        .any(|p| stored.pid == p.pid && stored.argv0 == p.argv0)
 }
 
 pub fn bind_identity(
@@ -1154,18 +1152,24 @@ mod tests {
         t.identity.pane_id = t.pane_id.clone();
         t.identity.cwd = t.cwd.clone();
         let live = agent("hp-demo-t-0001", "/wt");
-        assert!(identity_verifies(&t, &live, Some(&process)));
+        assert!(identity_verifies(&t, &live, std::slice::from_ref(&process)));
         let other = crate::contracts::ProcessIdentity {
             pid: 10,
             argv0: "/bin/claude".into(),
         };
-        assert!(!identity_verifies(&t, &live, Some(&other)));
+        assert!(!identity_verifies(&t, &live, std::slice::from_ref(&other)));
+        // A1 review M2: a tool in the foreground beside the agent.
+        assert!(identity_verifies(
+            &t,
+            &live,
+            &[other.clone(), process.clone()]
+        ));
         let renamed = crate::contracts::ProcessIdentity {
             pid: 9,
             argv0: "/bin/other".into(),
         };
-        assert!(!identity_verifies(&t, &live, Some(&renamed)));
-        assert!(!identity_verifies(&t, &live, None));
+        assert!(!identity_verifies(&t, &live, &[renamed]));
+        assert!(!identity_verifies(&t, &live, &[]));
         bind_identity(&mut t, "/sock", &live, Some(process.clone()));
         assert_eq!(t.identity.socket, "/sock");
         assert_eq!(t.identity.agent_name.as_deref(), Some("hp-demo-t-0001"));

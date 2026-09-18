@@ -413,6 +413,32 @@ fn every_resolve_copies_first_and_remove_worktree_needs_a_complete_copy() {
     assert_eq!(world.runner.count("agent start"), 0);
 }
 
+/// A1 review H5: only `working` stopped a removal; an idle lane with no
+/// sealed `done` lost its worktree.
+#[test]
+fn remove_worktree_needs_a_released_lane() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    world.runner.on("worktree remove", ok(""));
+    let e = threads::resolve(
+        &world.ctx(),
+        "demo",
+        "t-0001",
+        &ResolveArgs {
+            remove_worktree: true,
+            ..ResolveArgs::default()
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("worktree_not_released"), "{e:#}");
+    assert_eq!(world.runner.count("worktree remove"), 0);
+    assert_eq!(
+        thread::load(&project, "t-0001").unwrap().status,
+        Status::Open
+    );
+}
+
 #[test]
 fn a_failed_final_copy_blocks_resolve_unless_skipped() {
     let world = World::new();
