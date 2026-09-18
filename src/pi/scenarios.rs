@@ -1,0 +1,156 @@
+//! FakeRunner scenarios for a pi lane: start and restart
+//! (SPEC-pi v2 §7; SPEC-ADE §1.3).
+//!
+//! Every command is scripted through `pi::sh::fake`; no herdr, no pi process,
+//! no network. The guard is TypeScript and runs only inside pi, so its test
+//! is `src/pi/testdata/guard-check.sh` (T7): the shipping extension against
+//! the isolated pi with a mock provider that answers 429, 401 and 400.
+
+use std::path::Path;
+
+use super::sh::fake::{FakeRunner, ok};
+use super::{Env, Layout, doctor, folder, install, launch, roles};
+
+/// A throwaway plugin root with the pinned files in place and the wrapper on
+/// the login PATH (a real symlink under the fixture HOME).
+fn world(dir: &Path) -> (Env, Layout) {
+    let layout = Layout::for_test(dir.join("state/pi"));
+    folder::ensure(&layout).unwrap();
+    install::write_guard(&layout).unwrap();
+    launch::write_wrapper(&layout).unwrap();
+    std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
+    std::fs::write(layout.package_json(), r#"{"version":"0.85.1"}"#).unwrap();
+    std::fs::write(layout.cli_js(), "// cli").unwrap();
+    std::fs::write(
+        layout.npm().join("package.json"),
+        r#"{"dependencies":{"@earendil-works/pi-coding-agent":"0.85.1"}}"#,
+    )
+    .unwrap();
+    let env = Env::for_test(dir, &[("HERDR_BIN_PATH", "/h/herdr")]);
+    std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
+    std::os::unix::fs::symlink(layout.wrapper(), env.home.join(".local/bin/pi")).unwrap();
+    (env, layout)
+}
+
+#[test]
+fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_env, _layout) = world(dir.path());
+    let row = roles::pi_recipes()
+        .into_iter()
+        .find(|r| r.id == "pi_deepseek_flash")
+        .unwrap();
+
+    let start =
+        launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &row.args, None).unwrap();
+    let line = start.join(" ");
+    assert_eq!(
+        line,
+        "agent start a5 --kind pi --pane w1F:p13 --parent w1F:p1 --timeout 30000 -- \
+         --provider deepseek --model deepseek-v4-flash --thinking low --no-skills"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for forbidden in ["--approve", "-na", "--no-approve", "--session"] {
+        assert!(!start.iter().any(|a| a == forbidden), "{forbidden}");
+    }
+    assert!(row.env.is_empty());
+    // A trust dialog never appears because trust is settled by settings.
+    assert!(folder::SETTINGS_JSON.contains("\"defaultProjectTrust\": \"never\""));
+}
+
+#[test]
+fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_env, _layout) = world(dir.path());
+    let row = roles::pi_recipes()
+        .into_iter()
+        .find(|r| r.id == "pi_kimi_k3")
+        .unwrap();
+    let pane_get = r#"{"result":{"pane":{"agent_session":{"source":"herdr:pi","agent":"pi","kind":"path","value":"/state/pi/agent/sessions/--/lane.jsonl"}}}}"#;
+    let session = super::resume::session_from_pane_get(pane_get)
+        .unwrap()
+        .expect("the extension reported a session");
+    let session = Path::new(&session);
+
+    let restart =
+        launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &row.args, Some(session))
+            .unwrap();
+    assert_eq!(
+        restart.iter().filter(|a| *a == "--session").count(),
+        1,
+        "exactly one --session"
+    );
+    assert!(
+        restart
+            .iter()
+            .any(|a| a == "/state/pi/agent/sessions/--/lane.jsonl")
+    );
+    assert!(!restart.iter().any(|a| a == "-c" || a == "--continue"));
+    assert!(!restart.iter().any(|a| a == "--approve"));
+    // The recipe itself is unchanged and still valid.
+    row.validate().unwrap();
+}
+
+#[test]
+fn scenario_setup_then_check_for_deepseek() {
+    let dir = tempfile::tempdir().unwrap();
+    let (env, layout) = world(dir.path());
+    let runner = FakeRunner::new();
+    runner.on("zsh -lic node --version", ok("v22.19.0\n"));
+    runner.on("zsh -lic command -v npm", ok("/opt/homebrew/bin/npm\n"));
+    runner.on(
+        "zsh -lic npm root -g",
+        ok("/opt/homebrew/lib/node_modules\n"),
+    );
+    runner.on(
+        "zsh -lic whence -va pi",
+        ok(&format!(
+            "pi is {}\n",
+            env.home.join(".local/bin/pi").display()
+        )),
+    );
+    runner.on("herdr integration status", ok("pi: current\n"));
+    runner.on("--version", ok("0.85.1\n"));
+    runner.on(
+        "auth check --provider deepseek",
+        ok(r#"{"status":"ready"}"#),
+    );
+
+    let report = doctor::check_report(&env, &layout, &runner, "deepseek");
+    assert!(report.ok, "{}", report.error_text());
+    assert_eq!(
+        runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.display().contains("auth check"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scenario_check_refuses_a_missing_login_before_any_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (env, layout) = world(dir.path());
+    let runner = FakeRunner::new();
+    runner.on(
+        "zsh -lic whence -va pi",
+        ok(&format!(
+            "pi is {}\n",
+            env.home.join(".local/bin/pi").display()
+        )),
+    );
+    runner.on("herdr integration status", ok("pi: current\n"));
+    runner.on(
+        "auth check --provider deepseek",
+        ok(r#"{"status":"not_ready","reason":"credentials_not_configured"}"#),
+    );
+    let report = doctor::check_report(&env, &layout, &runner, "deepseek");
+    assert!(!report.ok);
+    assert!(report.error_text().contains("credentials_not_configured"));
+    // The refusal is the check path A1 calls; a start never happens.
+    assert_eq!(runner.count("agent start"), 0);
+}

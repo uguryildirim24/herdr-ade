@@ -24,6 +24,11 @@ mod lifecycle;
 mod ops;
 mod overview;
 mod paths;
+#[allow(dead_code)]
+mod pi;
+#[allow(dead_code)]
+#[path = "pi/ade.rs"]
+mod pi_ade;
 mod plain;
 mod pr;
 mod project;
