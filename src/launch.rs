@@ -811,6 +811,16 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
                 pin.kind
             );
         }
+        // A pin that keeps the kind and gives no args keeps the default's args
+        // (D2: only a kind change must bring its own args). The pinned row then
+        // passes the same flag checks as a table row, so a pin cannot drop a
+        // permission flag or name Opus without `--effort high`.
+        let mut pin = pin.clone();
+        if pin.args.is_empty() {
+            pin.args = default_recipe.args.clone();
+        }
+        validate_flags(&format!("{}_project", input.role), &pin)?;
+        let pin = &pin;
         let plain = if pin.plain.trim().is_empty() {
             &default_recipe.plain
         } else {
@@ -1935,6 +1945,71 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         .unwrap_err();
         assert!(
             error.to_string().contains("recipe_kind_unknown"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_project_pin_passes_the_flag_checks() {
+        let (world, project, task) = world("shadow", "x");
+        with_help(&world);
+        let ctx = world.ctx();
+        let resolve = |pin: Recipe| {
+            resolve_launch(
+                &ctx,
+                &project,
+                &ResolveInput {
+                    role: "lane",
+                    task: &task,
+                    project_pin: Some(pin),
+                    opted_in: true,
+                    ..ResolveInput::default()
+                },
+            )
+        };
+        // Same kind, no args: the default's args, permission flag included.
+        let launch = resolve(Recipe {
+            kind: "cursor".into(),
+            ..Recipe::default()
+        })
+        .unwrap();
+        assert_eq!(
+            launch.args,
+            ["--model", "cursor-grok-4.6-xhigh", "--force"],
+            "{launch:?}"
+        );
+        // A kind change without args is role_args_missing.
+        let error = resolve(Recipe {
+            kind: "claude".into(),
+            ..Recipe::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("role_args_missing"), "{error:#}");
+        // A pin without its permission flag, or Opus without high effort.
+        let error = resolve(Recipe {
+            kind: "cursor".into(),
+            args: vec!["--model".into(), "cursor-grok-4.6-xhigh".into()],
+            ..Recipe::default()
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("recipe_permission_missing"),
+            "{error:#}"
+        );
+        let error = resolve(Recipe {
+            kind: "claude".into(),
+            args: vec![
+                "--model".into(),
+                "claude-opus-5".into(),
+                "--effort".into(),
+                "max".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+            ..Recipe::default()
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("recipe_effort_forbidden"),
             "{error:#}"
         );
     }
