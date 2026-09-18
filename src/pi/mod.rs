@@ -206,7 +206,7 @@ pub fn check(provider: &str) -> Result<CheckReport> {
 
 /// The one-time login per provider (SPEC-pi v2 §2). The plugin prints these
 /// steps; Rolf types `/login` inside pi, in the shared folder.
-pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 5] {
+pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 6] {
     [
         (
             "openai-codex",
@@ -217,6 +217,11 @@ pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 5] {
             "opencode",
             "OpenCode Zen",
             "`/login`, pick \"Use an API key\", OpenCode, and paste the key. Zen serves grok-4.6, muse-spark-1.3 and more.",
+        ),
+        (
+            "opencode-go",
+            "OpenCode Go (the Muse row)",
+            "`/login`, pick \"Use an API key\", OpenCode Go, and paste the Go plan's key. Go serves muse-spark-1.3-contributor.",
         ),
         (
             "deepseek",

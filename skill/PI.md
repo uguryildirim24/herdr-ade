@@ -22,7 +22,7 @@ Always `--no-skills`. Never `--approve` or `-a`. Never `--session`, `-c`,
 | Role | Provider | Model | Thinking |
 |---|---|---|---|
 | DeepSeek flash | `deepseek` | `deepseek-v4-flash` | `low` |
-| OpenCode Muse | `opencode` | `muse-spark-1.3` | `high` |
+| OpenCode Muse | `opencode-go` | `muse-spark-1.3-contributor` | `high` |
 | Kimi k3 | `kimi-coding` | `k3` | `high` |
 | ChatGPT Sol (escalate only) | `openai-codex` | `gpt-5.6-sol` | `high` |
 | ChatGPT Astra (disabled) | `openai-codex` | `gpt-6-astra` | `xhigh` |
@@ -38,7 +38,7 @@ The plugin never runs a login and never sees a key. Rolf runs
 | Provider | What he does once |
 |---|---|
 | `openai-codex` | `/login`, "ChatGPT Plus/Pro (Codex)", finish in the browser or with the device code |
-| `opencode` | `/login`, "Use an API key", OpenCode |
+| `opencode-go` | `/login`, "Use an API key", OpenCode Go (the Go plan's key; Zen is the separate `opencode` provider) |
 | `deepseek` | `/login`, "Use an API key", DeepSeek |
 | `kimi-coding` | `/login`; use the device flow when the screen shows it, else paste the key |
 

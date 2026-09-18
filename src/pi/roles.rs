@@ -111,8 +111,8 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
         ),
         recipe(
             "pi_opencode_muse",
-            "opencode",
-            "muse-spark-1.3",
+            "opencode-go",
+            "muse-spark-1.3-contributor",
             "high",
             true,
             true,
@@ -207,7 +207,7 @@ mod tests {
         let providers = enabled_providers();
         assert_eq!(
             providers,
-            vec!["deepseek", "openai-codex", "opencode", "kimi-coding"]
+            vec!["deepseek", "openai-codex", "opencode-go", "kimi-coding"]
         );
         assert!(!providers.contains(&"cursor"));
     }
