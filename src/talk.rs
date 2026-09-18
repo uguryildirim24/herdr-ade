@@ -857,15 +857,42 @@ mod tests {
     #[test]
     fn a_cut_tail_is_skipped_terminated_and_reported_once() {
         let fx = fixture();
-        append(&fx.project, None, Entry::Say { what: "One.".into(), means: None }).unwrap();
-        let mut f = File::options().append(true).open(journal_path(&fx.project)).unwrap();
+        append(
+            &fx.project,
+            None,
+            Entry::Say {
+                what: "One.".into(),
+                means: None,
+            },
+        )
+        .unwrap();
+        let mut f = File::options()
+            .append(true)
+            .open(journal_path(&fx.project))
+            .unwrap();
         f.write_all(br#"{"seq":2,"say":{"wh"#).unwrap();
         drop(f);
         let j = read(&fx.project);
         assert!(j.tail_incomplete);
         assert_eq!(j.lines.len(), 1, "the cut line is never read as an entry");
-        append(&fx.project, None, Entry::Say { what: "Two.".into(), means: None }).unwrap();
-        append(&fx.project, None, Entry::Say { what: "Three.".into(), means: None }).unwrap();
+        append(
+            &fx.project,
+            None,
+            Entry::Say {
+                what: "Two.".into(),
+                means: None,
+            },
+        )
+        .unwrap();
+        append(
+            &fx.project,
+            None,
+            Entry::Say {
+                what: "Three.".into(),
+                means: None,
+            },
+        )
+        .unwrap();
         let j = read(&fx.project);
         assert!(!j.tail_incomplete);
         assert_eq!(j.skipped, 1);
@@ -877,11 +904,19 @@ mod tests {
     #[test]
     fn a_keyed_entry_is_appended_once_and_oversize_is_refused() {
         let fx = fixture();
-        let e = || Entry::Notice { id: "native_on".into() };
+        let e = || Entry::Notice {
+            id: "native_on".into(),
+        };
         assert_eq!(append(&fx.project, Some("k"), e()).unwrap(), Some(1));
         assert_eq!(append(&fx.project, Some("k"), e()).unwrap(), None);
-        let big = Entry::Say { what: "x".repeat(MAX_ENTRY_BYTES), means: None };
-        assert!(format!("{:#}", append(&fx.project, None, big).unwrap_err()).starts_with("talk_entry_too_large"));
+        let big = Entry::Say {
+            what: "x".repeat(MAX_ENTRY_BYTES),
+            means: None,
+        };
+        assert!(
+            format!("{:#}", append(&fx.project, None, big).unwrap_err())
+                .starts_with("talk_entry_too_large")
+        );
         assert_eq!(read(&fx.project).lines.len(), 1);
     }
 
@@ -890,7 +925,12 @@ mod tests {
         let (fx, _) = talk_fixture("idle");
         let (_, state) = submit(&fx.world.ctx(), &fx.project, "please look at the tests").unwrap();
         assert_eq!(state, TalkRequestState::Submitted);
-        assert_eq!(fx.world.runner.count("agent prompt w1:p1 please look at the tests"), 1);
+        assert_eq!(
+            fx.world
+                .runner
+                .count("agent prompt w1:p1 please look at the tests"),
+            1
+        );
         assert_eq!(mark_accepted(&fx.project).unwrap(), 1);
         assert_eq!(states(&fx), [TalkRequestState::Accepted]);
         assert_eq!(mark_accepted(&fx.project).unwrap(), 0);
@@ -906,7 +946,11 @@ mod tests {
         *reply.borrow_mut() = ok(r#"{"result":{}}"#);
         deliver_queued(&fx.world.ctx(), &fx.project).unwrap();
         tick(&fx.world.ctx(), &fx.project).unwrap();
-        assert_eq!(fx.world.runner.count("agent prompt"), 1, "uncertain is never re-sent");
+        assert_eq!(
+            fx.world.runner.count("agent prompt"),
+            1,
+            "uncertain is never re-sent"
+        );
         assert_eq!(states(&fx), [TalkRequestState::Uncertain]);
     }
 
@@ -916,13 +960,29 @@ mod tests {
         *reply.borrow_mut() = fail(1, r#"{"error":{"code":"agent_busy","message":"busy"}}"#);
         submit(&fx.world.ctx(), &fx.project, "first").unwrap();
         submit(&fx.world.ctx(), &fx.project, "second").unwrap();
-        assert_eq!(states(&fx), [TalkRequestState::Queued, TalkRequestState::Queued]);
+        assert_eq!(
+            states(&fx),
+            [TalkRequestState::Queued, TalkRequestState::Queued]
+        );
         assert_eq!(notices(&fx), ["request_waiting", "request_waiting"]);
         *reply.borrow_mut() = ok(r#"{"result":{}}"#);
         tick(&fx.world.ctx(), &fx.project).unwrap();
-        assert_eq!(states(&fx), [TalkRequestState::Submitted, TalkRequestState::Submitted]);
-        let calls: Vec<String> = fx.world.runner.calls.borrow().iter().map(|c| c.display()).filter(|d| d.contains("agent prompt")).collect();
-        assert!(calls[calls.len() - 2].ends_with("first") && calls[calls.len() - 1].ends_with("second"));
+        assert_eq!(
+            states(&fx),
+            [TalkRequestState::Submitted, TalkRequestState::Submitted]
+        );
+        let calls: Vec<String> = fx
+            .world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .map(|c| c.display())
+            .filter(|d| d.contains("agent prompt"))
+            .collect();
+        assert!(
+            calls[calls.len() - 2].ends_with("first") && calls[calls.len() - 1].ends_with("second")
+        );
     }
 
     #[test]
@@ -938,7 +998,14 @@ mod tests {
         assert_eq!(states(&fx), [TalkRequestState::Submitted]);
         set_state(&fx, "blocked");
         tick(&fx.world.ctx(), &fx.project).unwrap();
-        assert_eq!(notices(&fx).iter().filter(|n| *n == "needs_you_in_pane").count(), 2, "one per episode");
+        assert_eq!(
+            notices(&fx)
+                .iter()
+                .filter(|n| *n == "needs_you_in_pane")
+                .count(),
+            2,
+            "one per episode"
+        );
     }
 
     #[test]
@@ -946,13 +1013,25 @@ mod tests {
         let (fx, reply) = talk_fixture("idle");
         *reply.borrow_mut() = fail(1, r#"{"error":{"code":"agent_busy","message":"busy"}}"#);
         submit(&fx.world.ctx(), &fx.project, "hello").unwrap();
-        fx.project.update_coordinator(|c| c.pane_id = "w1:p9".into()).unwrap();
+        fx.project
+            .update_coordinator(|c| c.pane_id = "w1:p9".into())
+            .unwrap();
         *reply.borrow_mut() = ok(r#"{"result":{}}"#);
         tick(&fx.world.ctx(), &fx.project).unwrap();
         tick(&fx.world.ctx(), &fx.project).unwrap();
-        assert_eq!(fx.world.runner.count("agent prompt"), 1, "only the first refused try");
+        assert_eq!(
+            fx.world.runner.count("agent prompt"),
+            1,
+            "only the first refused try"
+        );
         assert_eq!(states(&fx), [TalkRequestState::Queued]);
-        assert_eq!(notices(&fx).iter().filter(|n| *n == "recipient_changed").count(), 1);
+        assert_eq!(
+            notices(&fx)
+                .iter()
+                .filter(|n| *n == "recipient_changed")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -970,8 +1049,21 @@ mod tests {
         set_state(&fx, "idle");
         s.handle("!back").unwrap();
         assert!(!writer_suspended(&fx.project));
-        assert_eq!(fx.world.runner.count("agent prompt w1:p1 while you are there"), 1);
-        assert_eq!(notices(&fx), ["native_on", "request_waiting", "native_not_ready", "native_off"]);
+        assert_eq!(
+            fx.world
+                .runner
+                .count("agent prompt w1:p1 while you are there"),
+            1
+        );
+        assert_eq!(
+            notices(&fx),
+            [
+                "native_on",
+                "request_waiting",
+                "native_not_ready",
+                "native_off"
+            ]
+        );
         s.handle("!stop").unwrap();
         assert_eq!(fx.world.runner.count("agent send-keys w1:p1 esc"), 1);
     }
@@ -980,7 +1072,9 @@ mod tests {
     fn slash_commands_pass_through_unchanged() {
         let (fx, _) = talk_fixture("idle");
         let ctx = fx.world.ctx();
-        Surface::new(&ctx, fx.project.clone()).handle("/compact\n").unwrap();
+        Surface::new(&ctx, fx.project.clone())
+            .handle("/compact\n")
+            .unwrap();
         assert_eq!(fx.world.runner.count("agent prompt w1:p1 /compact"), 1);
     }
 
@@ -1019,12 +1113,24 @@ mod tests {
         let out = s.handle("7").unwrap();
         assert!(out[0].contains("ask_choice_out_of_range"), "{out:?}");
         s.handle("2").unwrap();
-        assert_eq!(crate::ask::answer_of(&fx.project, "a-1", 2).unwrap().choice, 2);
-        assert_eq!(fx.world.runner.count("agent prompt w1:p1 ANSWER a-1@2 2: Rolf chose \"stop it now\""), 1);
+        assert_eq!(
+            crate::ask::answer_of(&fx.project, "a-1", 2).unwrap().choice,
+            2
+        );
+        assert_eq!(
+            fx.world
+                .runner
+                .count("agent prompt w1:p1 ANSWER a-1@2 2: Rolf chose \"stop it now\""),
+            1
+        );
         s.draw_prompt();
         assert_eq!(s.binding, None);
         s.handle("3").unwrap();
-        assert_eq!(fx.world.runner.count("agent prompt w1:p1 3"), 1, "no open ask: a digit is a message");
+        assert_eq!(
+            fx.world.runner.count("agent prompt w1:p1 3"),
+            1,
+            "no open ask: a digit is a message"
+        );
     }
 
     #[test]
@@ -1036,14 +1142,25 @@ mod tests {
         let md = std::fs::read_to_string(fx.project.project_md()).unwrap();
         std::fs::write(
             fx.project.project_md(),
-            md.replacen("coordinator_agent = \"claude\"", "coordinator_agent = \"codex\"", 1),
+            md.replacen(
+                "coordinator_agent = \"claude\"",
+                "coordinator_agent = \"codex\"",
+                1,
+            ),
         )
         .unwrap();
         let h = header(&fx.project);
-        assert!(h.contains("chat there is not checked; chat: shown only through say and ask"), "{h}");
+        assert!(
+            h.contains("chat there is not checked; chat: shown only through say and ask"),
+            "{h}"
+        );
         assert!(!enabled(&fx.project));
         let md = std::fs::read_to_string(fx.project.project_md()).unwrap();
-        std::fs::write(fx.project.project_md(), md.replacen("+++\n", "+++\ntalk = true\n", 1)).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            md.replacen("+++\n", "+++\ntalk = true\n", 1),
+        )
+        .unwrap();
         assert!(enabled(&fx.project));
     }
 
@@ -1051,14 +1168,24 @@ mod tests {
     fn replay_is_identical_and_sends_nothing() {
         let (fx, _) = talk_fixture("idle");
         let ctx = fx.world.ctx();
-        crate::ask::say(&ctx, "demo", "The first lane is done.", Some("You can read its report now.")).unwrap();
+        crate::ask::say(
+            &ctx,
+            "demo",
+            "The first lane is done.",
+            Some("You can read its report now."),
+        )
+        .unwrap();
         submit(&ctx, &fx.project, "thanks").unwrap();
         open_ask(&fx, None);
         let calls = fx.world.runner.calls.borrow().len();
         let a = replay(&ctx, "demo").unwrap();
         let b = replay(&ctx, "demo").unwrap();
         assert_eq!(a, b);
-        assert_eq!(fx.world.runner.calls.borrow().len(), calls, "replay makes no herdr call");
+        assert_eq!(
+            fx.world.runner.calls.borrow().len(),
+            calls,
+            "replay makes no herdr call"
+        );
         assert!(a.contains("coordinator: The first lane is done.\n  for you: You can read its report now.\nyou: thanks\n  (sent)\nquestion:\n"), "{a}");
     }
 

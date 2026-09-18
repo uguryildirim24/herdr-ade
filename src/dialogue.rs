@@ -423,7 +423,10 @@ mod tests {
     fn start_needs_a_born_name_and_passes_the_pair_filter() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        let e = format!("{:#}", start(&ctx, "demo", args(&fx, None), &AnyPair).unwrap_err());
+        let e = format!(
+            "{:#}",
+            start(&ctx, "demo", args(&fx, None), &AnyPair).unwrap_err()
+        );
         assert!(e.starts_with("plain_missing"), "{e}");
         let mut same = args(&fx, Some(PLAIN));
         same.critic = "claude".into();
@@ -434,11 +437,24 @@ mod tests {
         assert!(start(&ctx, "demo", codex, &NoCodexPair).is_err());
         assert!(list(&fx.project).is_empty());
         let (d, next) = start(&ctx, "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap();
-        assert_eq!((d.branch.as_str(), d.integration.as_str()), ("lane/spec-shapes", "main"));
-        assert!(next.contains("--branch lane/spec-shapes") && next.contains("--role pro --passive"), "{next}");
-        let e = format!("{:#}", start(&ctx, "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap_err());
+        assert_eq!(
+            (d.branch.as_str(), d.integration.as_str()),
+            ("lane/spec-shapes", "main")
+        );
+        assert!(
+            next.contains("--branch lane/spec-shapes") && next.contains("--role pro --passive"),
+            "{next}"
+        );
+        let e = format!(
+            "{:#}",
+            start(&ctx, "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap_err()
+        );
         assert!(e.starts_with("dialogue_exists"), "{e}");
-        assert!(crate::glossary::explain(&ctx, "demo", "shapes").unwrap().contains(PLAIN));
+        assert!(
+            crate::glossary::explain(&ctx, "demo", "shapes")
+                .unwrap()
+                .contains(PLAIN)
+        );
     }
 
     #[test]
@@ -446,9 +462,15 @@ mod tests {
         let fx = fixture();
         *fx.world.agents.borrow_mut() = r#"[{"pane_id":"w1:p7","tab_id":"w1:t7","workspace_id":"w1","cwd":"/","name":"other","agent":"chatgpt","agent_status":"idle"}]"#.into();
         start(&fx.world.ctx(), "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap();
-        let e = format!("{:#}", bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p7").unwrap_err());
+        let e = format!(
+            "{:#}",
+            bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p7").unwrap_err()
+        );
         assert!(e.starts_with("critic_mismatch"), "{e}");
-        let e = format!("{:#}", bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p9").unwrap_err());
+        let e = format!(
+            "{:#}",
+            bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p9").unwrap_err()
+        );
         assert!(e.starts_with("critic_not_found"), "{e}");
     }
 
@@ -458,7 +480,11 @@ mod tests {
         let ctx = fx.world.ctx();
         *reply.borrow_mut() = fail(1, r#"{"error":{"code":"agent_busy","message":"busy"}}"#);
         assert!(turn(&ctx, "demo", "shapes", false).is_err());
-        assert_eq!(load(&fx.project, "shapes").unwrap().turn.unwrap().n, 1, "pinned although the send failed");
+        assert_eq!(
+            load(&fx.project, "shapes").unwrap().turn.unwrap().n,
+            1,
+            "pinned although the send failed"
+        );
         let e = format!("{:#}", turn(&ctx, "demo", "shapes", false).unwrap_err());
         assert!(e.starts_with("turn_outstanding"), "{e}");
         *reply.borrow_mut() = ok(r#"{"result":{}}"#);
@@ -492,7 +518,10 @@ mod tests {
             git(&fx.repo, &["show", "main:tasks/shapes/turns/01-pro.md"]),
             "The names are fine."
         );
-        assert_eq!(git(&fx.repo, &["log", "-1", "--format=%s", "main"]), "spec(shapes): turn 01 from pro");
+        assert_eq!(
+            git(&fx.repo, &["log", "-1", "--format=%s", "main"]),
+            "spec(shapes): turn 01 from pro"
+        );
         let d = load(&fx.project, "shapes").unwrap();
         assert!(d.turn.is_none());
         assert_eq!(d.turns.len(), 1);
