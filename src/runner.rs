@@ -161,11 +161,15 @@ impl Runner for RealRunner {
 
         // Readers and the writer run on their own threads so a full pipe in
         // either direction cannot deadlock against the deadline loop below.
-        let stdin_thread = child.stdin.take().zip(cmd.stdin.clone()).map(|(mut pipe, text)| {
-            std::thread::spawn(move || {
-                let _ = pipe.write_all(text.as_bytes());
-            })
-        });
+        let stdin_thread = child
+            .stdin
+            .take()
+            .zip(cmd.stdin.clone())
+            .map(|(mut pipe, text)| {
+                std::thread::spawn(move || {
+                    let _ = pipe.write_all(text.as_bytes());
+                })
+            });
         let stdout_thread = child.stdout.take().map(read_all);
         let stderr_thread = child.stderr.take().map(read_all);
 
@@ -263,6 +267,7 @@ pub mod fake {
     /// A scripted runner: the first rule whose matcher accepts the command
     /// answers it. Every command is recorded, matched or not.
     #[derive(Default)]
+    #[allow(clippy::type_complexity)]
     pub struct FakeRunner {
         rules: RefCell<Vec<(Matcher, Box<dyn Fn(&Cmd) -> Result<Output>>)>>,
         pub calls: RefCell<Vec<Cmd>>,
@@ -303,7 +308,64 @@ pub mod fake {
                 .filter(|cmd| cmd.display().contains(needle))
                 .count()
         }
+
+        /// Canned herdr replies for the ADE verbs named in SPEC-ADE §1.3.
+        /// No plugin behaviour is implemented yet; later lanes match on these needles.
+        pub fn on_ade_new_verbs(&self) -> &Self {
+            for (needle, stdout) in ADE_NEW_VERB_REPLIES {
+                self.on(needle, ok(stdout));
+            }
+            self
+        }
     }
+
+    /// Scenario names in SPEC-ADE §1.3 for the new verbs.
+    pub const ADE_NEW_VERB_SCENARIOS: [&str; 9] = [
+        "thread_start_parent",
+        "ha_done",
+        "ha_waiting",
+        "round_open",
+        "round_review",
+        "checkpoint",
+        "ask",
+        "say",
+        "talk",
+    ];
+
+    /// Needle → canned stdout for each new verb's herdr or git call (SPEC-ADE §1.3).
+    /// More specific needles come first so FakeRunner's first-match rule is stable.
+    pub const ADE_NEW_VERB_REPLIES: &[(&str, &str)] = &[
+        (
+            "--parent",
+            r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#,
+        ),
+        (
+            "HERDR_ADE_LAUNCH",
+            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
+        ),
+        (
+            "label talk",
+            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t-talk","pane_id":"w1:p-talk","cwd":"/project"}}}"#,
+        ),
+        ("git status --short", ""),
+        (
+            "rev-parse HEAD",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        ),
+        ("worktree add", ""),
+        ("update-ref", ""),
+        ("workspace report-metadata", r#"{"result":{}}"#),
+        ("notification show", r#"{"result":{}}"#),
+        ("agent prompt", r#"{"result":{}}"#),
+        (
+            "tab create",
+            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
+        ),
+        (
+            "agent start",
+            r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"lane-t-0001"}}}"#,
+        ),
+    ];
 
     pub fn ok(stdout: &str) -> Output {
         Output {
@@ -340,7 +402,9 @@ pub mod fake {
         }
 
         fn socket_request(&self, socket: &Path, line: &str, _timeout: Duration) -> Result<String> {
-            self.socket_requests.borrow_mut().push((socket.to_path_buf(), line.to_string()));
+            self.socket_requests
+                .borrow_mut()
+                .push((socket.to_path_buf(), line.to_string()));
             Ok(r#"{"id":"hp","result":{"type":"agent_view","active":true}}"#.to_string())
         }
     }
@@ -353,7 +417,10 @@ mod tests {
     #[test]
     fn captures_output_and_exit_code() {
         let out = RealRunner
-            .run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c", "echo hi; echo err >&2; exit 3"]))
+            .run(
+                &Cmd::new("sh", Duration::from_secs(5))
+                    .args(["-c", "echo hi; echo err >&2; exit 3"]),
+            )
             .unwrap();
         assert_eq!(out.code, Some(3));
         assert_eq!(out.stdout, "hi\n");
