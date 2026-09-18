@@ -55,12 +55,10 @@ pub const FALLBACK_TIMEOUT: &str = "timeout";
 pub const FALLBACK_MALFORMED: &str = "malformed";
 pub const FALLBACK_MODEL_MISMATCH: &str = "model_mismatch";
 pub const FALLBACK_ERROR: &str = "error";
-pub const FALLBACK_NOT_ALLOWED: &str = "not_allowed";
 pub const FALLBACK_CONFIG_CHANGED: &str = "config_changed";
 
 /// Reason templates, fixed in the binary and checked at load
 /// (SPEC-jev-picker v2 §3, "Where the reason shows").
-pub const TEMPLATE_PICKED: &str = "{job} looks like {clause}, so it runs on {plain}.";
 pub const TEMPLATE_DEFAULT: &str = "{job} looks like ordinary work, so it runs on {plain}.";
 pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
 pub const TEMPLATE_FALLBACK: &str =
@@ -258,13 +256,6 @@ impl Settings {
                 self.resolver = match text {
                     "off" => ResolverMode::Off,
                     "shadow" => ResolverMode::Shadow,
-                    // The first plugin round ships `off` and `shadow` only: no
-                    // launch follows a pick until the second labelled month
-                    // passes (SPEC-jev-picker v2 §4.1, question 1; lane brief).
-                    "jev" => bail!(
-                        "resolver_mode_unavailable: {}: [roles] resolver = \"jev\" is not in this plugin round; use \"shadow\" to record picks",
-                        file.display()
-                    ),
                     other => bail!(
                         "{}: [roles] resolver must be \"off\" or \"shadow\", not {other:?}",
                         file.display()
@@ -600,9 +591,6 @@ fn check_reasons_are_plain(config: &PickerConfig) -> Result<()> {
             let Some(recipe) = config.recipes.get(&gate.recipe) else {
                 continue;
             };
-            if let Some(clause) = reason_clause(&gate.recipe) {
-                check_plain(name, &picked_reason(name, clause, &recipe.plain))?;
-            }
             if let Some(default) = config.recipes.get(&role.default) {
                 check_plain(name, &shadow_reason(name, &default.plain, &recipe.plain))?;
             }
@@ -667,45 +655,27 @@ pub fn job_noun(role: &str) -> &'static str {
     }
 }
 
-/// The reason clause of each shipped non-default recipe, fixed in the binary
-/// (SPEC-jev-picker v2 §3).
-pub fn reason_clause(recipe_id: &str) -> Option<&'static str> {
-    match recipe_id {
-        "claude_opus_high" => Some("design or spec work"),
-        "codex_sol_high" => Some("number or engine work"),
-        "codex_astra_high" => Some("the hardest number work"),
-        "agy_gemini_flash" => Some("web research"),
-        "claude_fable_high" => Some("a second opinion on a draft"),
-        _ => None,
-    }
-}
-
-fn render(template: &str, job: &str, clause: &str, plain: &str, pick: &str) -> String {
+fn render(template: &str, job: &str, plain: &str, pick: &str) -> String {
     template
         .replace("{job}", job)
-        .replace("{clause}", clause)
         .replace("{plain}", plain)
         .replace("{pick}", pick)
 }
 
-pub fn picked_reason(role: &str, clause: &str, plain: &str) -> String {
-    render(TEMPLATE_PICKED, job_noun(role), clause, plain, "")
-}
-
 pub fn default_reason(role: &str, plain: &str) -> String {
-    render(TEMPLATE_DEFAULT, job_noun(role), "", plain, "")
+    render(TEMPLATE_DEFAULT, job_noun(role), plain, "")
 }
 
 pub fn pinned_reason(role: &str, plain: &str) -> String {
-    render(TEMPLATE_PINNED, job_noun(role), "", plain, "")
+    render(TEMPLATE_PINNED, job_noun(role), plain, "")
 }
 
 pub fn fallback_reason(role: &str, plain: &str) -> String {
-    render(TEMPLATE_FALLBACK, job_noun(role), "", plain, "")
+    render(TEMPLATE_FALLBACK, job_noun(role), plain, "")
 }
 
 pub fn shadow_reason(role: &str, plain: &str, pick: &str) -> String {
-    render(TEMPLATE_SHADOW, job_noun(role), "", plain, pick)
+    render(TEMPLATE_SHADOW, job_noun(role), plain, pick)
 }
 
 /// `"<job> runs on <plain>"`, at most 80 characters: the ticker's `ade_last`
@@ -1029,7 +999,7 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
                                 Some(answers),
                             )
                         } else {
-                            let launch = accepted_launch(
+                            let launch = shadow_launch(
                                 &config,
                                 input,
                                 &questions,
@@ -1110,7 +1080,9 @@ fn role_default(
     Ok((id, recipe))
 }
 
-fn accepted_launch(
+/// Shadow acceptance: the default row always launches; a fired gate is
+/// recorded as `jev_pick` beside it (SPEC-jev-picker v2 §3 step 7).
+fn shadow_launch(
     config: &PickerConfig,
     input: &ResolveInput,
     questions: &[Question],
@@ -1118,19 +1090,11 @@ fn accepted_launch(
     default_recipe: &Recipe,
     default_id: &str,
 ) -> Launch {
-    let shadow = config.resolver == ResolverMode::Shadow;
+    let mut launch = launch_from(default_recipe, config, ResolverMode::Shadow, input.role);
+    launch.recipe_id = default_id.to_string();
+    launch.fallback = Some(FALLBACK_SHADOW.to_string());
     let Some(question) = jev::fired_gate(questions, &answers.nouls) else {
-        let mut launch = launch_from(default_recipe, config, config.resolver, input.role);
-        launch.recipe_id = default_id.to_string();
         launch.reason = default_reason(input.role, &default_recipe.plain);
-        launch.fallback = Some(
-            if shadow {
-                FALLBACK_SHADOW
-            } else {
-                FALLBACK_NO_GATE
-            }
-            .to_string(),
-        );
         return launch;
     };
     let picked_plain = config
@@ -1138,39 +1102,10 @@ fn accepted_launch(
         .get(&question.id)
         .map(|recipe| recipe.plain.as_str())
         .unwrap_or_default();
-    if shadow {
-        let mut launch = launch_from(default_recipe, config, ResolverMode::Shadow, input.role);
-        launch.recipe_id = default_id.to_string();
-        launch.gate = Some(question.id.clone());
-        launch.gate_p = answers.nouls.get(&question.id).copied();
-        launch.jev_pick = Some(question.id.clone());
-        launch.reason = shadow_reason(input.role, &default_recipe.plain, picked_plain);
-        launch.fallback = Some(FALLBACK_SHADOW.to_string());
-        return launch;
-    }
-    let allowed = config
-        .roles
-        .get(input.role)
-        .map(|role| role.allowed.contains(&question.id))
-        .unwrap_or(false);
-    if !allowed {
-        return fallback_launch(
-            default_recipe,
-            default_id,
-            config,
-            input.role,
-            FALLBACK_NOT_ALLOWED,
-        );
-    }
-    let recipe = config.recipes.get(&question.id).unwrap_or(default_recipe);
-    let mut launch = launch_from(recipe, config, ResolverMode::Jev, input.role);
-    launch.recipe_id = question.id.clone();
     launch.gate = Some(question.id.clone());
     launch.gate_p = answers.nouls.get(&question.id).copied();
     launch.jev_pick = Some(question.id.clone());
-    launch.reason = reason_clause(&question.id)
-        .map(|clause| picked_reason(input.role, clause, picked_plain))
-        .unwrap_or_else(|| default_reason(input.role, picked_plain));
+    launch.reason = shadow_reason(input.role, &default_recipe.plain, picked_plain);
     launch
 }
 
@@ -1298,7 +1233,6 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
             match config.resolver {
                 ResolverMode::Off => "off",
                 ResolverMode::Shadow => "shadow",
-                ResolverMode::Jev => "jev",
                 ResolverMode::Pin => "pin",
             },
             config.recipes.len(),
@@ -1650,70 +1584,6 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         std::fs::write(home.path().join("config.toml"), text).unwrap();
         let error = parse_picker_config(home.path(), true).unwrap_err();
         assert!(format!("{error:#}").contains("sideway"), "{error:#}");
-    }
-
-    #[test]
-    fn the_jev_mode_is_refused_in_this_round() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("config.toml"), config_text("jev")).unwrap();
-        let error = parse_picker_config(home.path(), true).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("resolver_mode_unavailable"),
-            "{error:#}"
-        );
-        // An absent file is the shipped default: off.
-        let empty = tempfile::tempdir().unwrap();
-        assert_eq!(
-            parse_picker_config(empty.path(), true).unwrap().resolver,
-            ResolverMode::Off
-        );
-    }
-
-    /// The `jev` acceptance path, kept for the round that turns it on: a gate
-    /// over its threshold switches and records the pick.
-    #[test]
-    fn a_gate_over_its_threshold_switches_in_jev_mode() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("config.toml"), config_text("shadow")).unwrap();
-        let mut config = parse_picker_config(home.path(), true).unwrap();
-        config.resolver = ResolverMode::Jev;
-        let role = config.roles["lane"].clone();
-        let questions = gate_questions(&role.gates, &config.floor);
-        let mut nouls = BTreeMap::new();
-        nouls.insert("agy_gemini_flash".to_string(), 0.91);
-        let answers = jev::Answers {
-            model: jev::JEV_MODEL.into(),
-            nouls,
-            input_tokens: Some(356),
-        };
-        let default = config.recipes["cursor_grok_xhigh"].clone();
-        let input = ResolveInput {
-            role: "lane",
-            ..ResolveInput::default()
-        };
-        let launch = accepted_launch(
-            &config,
-            &input,
-            &questions,
-            &answers,
-            &default,
-            "cursor_grok_xhigh",
-        );
-        assert_eq!(launch.recipe_id, "agy_gemini_flash");
-        assert_eq!(launch.kind, "agy");
-        assert_eq!(launch.resolver, ResolverMode::Jev);
-        assert_eq!(launch.gate.as_deref(), Some("agy_gemini_flash"));
-        assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
-        assert_eq!(launch.gate_p, Some(0.91), "the Noul, not the threshold");
-        assert_eq!(launch.fallback, None);
-        assert_eq!(
-            launch.reason,
-            "this task looks like web research, so it runs on the web research helper."
-        );
-        assert_eq!(
-            launch.compact_reason,
-            "this task runs on the web research helper"
-        );
     }
 
     #[test]
@@ -2256,7 +2126,6 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
     fn the_reason_templates_are_plain_and_the_compact_form_fits() {
         let glossary = Glossary::default();
         for sentence in [
-            picked_reason("lane", "web research", "the web research helper"),
             default_reason("lane", "the usual coding helper"),
             pinned_reason("reviewer", "the strongest design helper"),
             fallback_reason("critic", "the second opinion helper"),

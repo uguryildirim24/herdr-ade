@@ -15,8 +15,7 @@ mod plain;
 
 use plain::{Glossary, check};
 
-/// The five templates, exactly as `src/launch.rs` writes them.
-const PICKED: &str = "{job} looks like {clause}, so it runs on {plain}.";
+/// The four templates, exactly as `src/launch.rs` writes them.
 const DEFAULT: &str = "{job} looks like ordinary work, so it runs on {plain}.";
 const PINNED: &str = "You chose {plain} for {job}.";
 const FALLBACK: &str =
@@ -42,19 +41,9 @@ const JOBS: [&str; 5] = [
     "this lookup",
 ];
 
-/// The reason clause of each shipped non-default recipe.
-const CLAUSES: [&str; 5] = [
-    "design or spec work",
-    "number or engine work",
-    "the hardest number work",
-    "web research",
-    "a second opinion on a draft",
-];
-
-fn render(template: &str, job: &str, clause: &str, plain: &str, pick: &str) -> String {
+fn render(template: &str, job: &str, plain: &str, pick: &str) -> String {
     template
         .replace("{job}", job)
-        .replace("{clause}", clause)
         .replace("{plain}", plain)
         .replace("{pick}", pick)
 }
@@ -67,7 +56,7 @@ fn assert_plain(sentence: &str) {
 #[test]
 fn the_templates_in_this_fixture_are_the_ones_launch_writes() {
     let source = include_str!("../src/launch.rs");
-    for template in [PICKED, DEFAULT, PINNED, FALLBACK, SHADOW] {
+    for template in [DEFAULT, PINNED, FALLBACK, SHADOW] {
         assert!(
             source.contains(template),
             "src/launch.rs no longer contains `{template}`"
@@ -77,12 +66,6 @@ fn the_templates_in_this_fixture_are_the_ones_launch_writes() {
         assert!(
             source.contains(&format!("\"{job}\"")),
             "src/launch.rs no longer contains the job noun `{job}`"
-        );
-    }
-    for clause in CLAUSES {
-        assert!(
-            source.contains(&format!("\"{clause}\"")),
-            "src/launch.rs no longer contains the clause `{clause}`"
         );
     }
 }
@@ -98,16 +81,11 @@ fn every_recipe_phrase_passes_as_a_birth_sentence() {
 fn every_rendered_reason_passes_as_a_birth_sentence() {
     for job in JOBS {
         for plain in PHRASES {
-            assert_plain(&render(DEFAULT, job, "", plain, ""));
-            assert_plain(&render(PINNED, job, "", plain, ""));
-            assert_plain(&render(FALLBACK, job, "", plain, ""));
+            assert_plain(&render(DEFAULT, job, plain, ""));
+            assert_plain(&render(PINNED, job, plain, ""));
+            assert_plain(&render(FALLBACK, job, plain, ""));
             for pick in PHRASES {
-                assert_plain(&render(SHADOW, job, "", plain, pick));
-            }
-        }
-        for clause in CLAUSES {
-            for plain in PHRASES {
-                assert_plain(&render(PICKED, job, clause, plain, ""));
+                assert_plain(&render(SHADOW, job, plain, pick));
             }
         }
     }

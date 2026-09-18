@@ -28,7 +28,6 @@ doctor
 done
 draft
 drafter
-engine
 envelope
 event
 events
@@ -82,7 +81,6 @@ say
 sealed
 sentence
 skill
-spec
 staged
 strongest
 submitted

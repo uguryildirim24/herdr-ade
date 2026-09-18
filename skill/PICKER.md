@@ -1,8 +1,8 @@
 # Picker: how a coordinator pins a helper
 
-The picker reads the task text when a lane, reviewer, drafter or critic starts. It may move the launch to another allowed helper only when one of its yes-or-no questions is clearly yes. It never changes a launch after the fact, and it never runs for a coordinator or for Pro.
+The picker reads the task text when a lane, reviewer, drafter or critic starts. It asks one yes-or-no question per switch in the table and records which allowed helper it would have chosen; the usual helper still runs. It never changes a launch after the fact, and it never runs for a coordinator or for Pro.
 
-The picker ships switched off (`[roles] resolver = "off"` in `~/.config/herdr-ade/config.toml`). `shadow` records what it would have chosen and launches the usual helper. `jev` (launch the pick) is not in this plugin round: the config is refused with `resolver_mode_unavailable` until a second recording month shows the picker beats the simple table.
+The picker ships switched off (`[roles] resolver = "off"` in `~/.config/herdr-ade/config.toml`). The only other mode is `shadow`: the picker records what it would have chosen and launches the usual helper. It never launches its own pick.
 
 ## Pinning one helper for a task
 

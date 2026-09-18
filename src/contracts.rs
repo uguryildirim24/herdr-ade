@@ -25,16 +25,15 @@ pub struct LaunchRecipe {
     pub brief_hash: String,
 }
 
-/// The resolver mode from `[roles] resolver` (SPEC-jev-picker v2 §2 Config).
-/// `pin` never comes from config: `--recipe` or a PROJECT.md pin sets it
-/// (SPEC-jev-picker v2 §3 step 1 and step 2).
+/// The resolver mode from `[roles] resolver`: `off` or `shadow` (SPEC-jev-picker
+/// v2 §2 Config, §3). `pin` never comes from config: `--recipe` or a
+/// PROJECT.md pin sets it on the record (SPEC-jev-picker v2 §3 steps 1 and 2).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolverMode {
     #[default]
     Off,
     Shadow,
-    Jev,
     Pin,
 }
 
@@ -692,15 +691,15 @@ mod tests {
             attempt: 1,
             brief_hash: String::new(),
             recipe_id: "agy_gemini_flash".into(),
-            resolver: ResolverMode::Jev,
+            resolver: ResolverMode::Shadow,
             gate: Some("agy_gemini_flash".into()),
             gate_p: Some(0.91),
             jev_pick: Some("agy_gemini_flash".into()),
             jev_confidence: Some(0.91),
             jev_probabilities,
-            reason: "this task looks like web research, so it runs on the web research helper."
+            reason: "this task runs on the usual coding helper; the picker would have chosen the web research helper."
                 .into(),
-            compact_reason: "this task runs on the web research helper".into(),
+            compact_reason: "this task runs on the usual coding helper".into(),
             fallback: None,
             jev_model: Some("jev-1.13.0".into()),
             jev_input_tokens: Some(356),
@@ -723,10 +722,6 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ResolverMode>("\"shadow\"").unwrap(),
             ResolverMode::Shadow
-        );
-        assert_eq!(
-            serde_json::from_str::<ResolverMode>("\"jev\"").unwrap(),
-            ResolverMode::Jev
         );
         assert_eq!(
             serde_json::from_str::<CostClass>("\"sideways\"").unwrap(),
