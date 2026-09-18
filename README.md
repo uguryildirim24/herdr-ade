@@ -14,7 +14,7 @@
 
 ## Keep one conversation going while the work happens in parallel
 
-The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in its own git worktree and branch, or in its own folder when there's no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
+The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in a git worktree tab under the coordinator, or in its own folder when there's no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
 
 ## Choose between briefing each agent by hand, one long agent session, a cloud projects product, or a coordinator in Herdr
 
@@ -93,7 +93,11 @@ No. A project is a folder on your machine, the plugin talks to your local Herdr 
 
 ### Will it touch my branches or worktrees on its own?
 
-No. It never removes a worktree, deletes a branch, merges or pushes on its own. `thread resolve --remove-worktree` removes a worktree only when you ask, never with force, and only after the thread's report and files are copied home. Deleting a project moves its folder to a trash folder and leaves every worktree and branch alone.
+No. It never deletes a branch, merges or pushes on its own. An ADE lane is `git worktree add` into `<repo>/.worktrees/<id>` plus a tab in the coordinator workspace. `thread resolve --remove-worktree` runs `git worktree remove` without force, never `herdr worktree remove`, and only after the thread's report and files are copied home. Deleting a project moves its folder to a trash folder and leaves every worktree and branch alone.
+
+### What is `--plain`?
+
+A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the plugin's plain-language check (one sentence, known words). `--role` selects a row from the roles table (default `lane`). `--passive` on adopt sets the parent token and sends no primer.
 
 ### Where does my project live?
 
