@@ -51,6 +51,21 @@ pub fn r2_strip_list() -> Vec<&'static str> {
     SESSION_PICKING.to_vec()
 }
 
+/// Pi's session flags with their arity, for the fork's
+/// `strip_session_picking_args` on r2 (SPEC-pi v2 §3.8, §4 item 2). That
+/// function treats `-c`, `--continue`, `-r` and `--resume` as taking a value
+/// when the next word has no dash; for pi they are booleans, and eating the
+/// next word would drop a message. `true` = the flag takes a value.
+pub const R2_STRIP_RULES: [(&str, bool); 7] = [
+    ("--session", true),
+    ("--fork", true),
+    ("--no-session", false),
+    ("-c", false),
+    ("--continue", false),
+    ("-r", false),
+    ("--resume", false),
+];
+
 /// Parse the session path the herdr extension reported from a `pane get`
 /// answer. Accepts the pane shape and the agent shape, tolerantly; `None`
 /// means the pane has not reported one yet.
@@ -145,5 +160,14 @@ mod tests {
             assert!(strip.contains(&flag), "missing {flag}");
         }
         assert!(!strip.contains(&"-s"), "pi has no -s");
+        for (flag, _) in R2_STRIP_RULES {
+            assert!(strip.contains(&flag), "{flag} is in the rules but not the list");
+        }
+        let takes_value = |flag: &str| R2_STRIP_RULES.iter().find(|(f, _)| *f == flag).map(|r| r.1);
+        assert_eq!(takes_value("--session"), Some(true));
+        assert_eq!(takes_value("--fork"), Some(true));
+        assert_eq!(takes_value("-c"), Some(false));
+        assert_eq!(takes_value("--no-session"), Some(false));
+        assert_eq!(takes_value("-s"), None);
     }
 }
