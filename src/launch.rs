@@ -242,9 +242,15 @@ impl Settings {
                 self.resolver = match text {
                     "off" => ResolverMode::Off,
                     "shadow" => ResolverMode::Shadow,
-                    "jev" => ResolverMode::Jev,
+                    // The first plugin round ships `off` and `shadow` only: no
+                    // launch follows a pick until the second labelled month
+                    // passes (SPEC-jev-picker v2 §4.1, question 1; lane brief).
+                    "jev" => bail!(
+                        "resolver_mode_unavailable: {}: [roles] resolver = \"jev\" is not in this plugin round; use \"shadow\" to record picks",
+                        file.display()
+                    ),
                     other => bail!(
-                        "{}: [roles] resolver must be \"off\", \"shadow\" or \"jev\", not {other:?}",
+                        "{}: [roles] resolver must be \"off\" or \"shadow\", not {other:?}",
                         file.display()
                     ),
                 };
@@ -1566,40 +1572,91 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
     }
 
     #[test]
-    fn a_gate_over_its_threshold_switches_and_records_the_pick() {
-        let (world, project, task) = world("jev", "read the vendor pages and cite them");
-        with_help(&world);
-        single_response(&world, &answers_body(0.91));
-        let launch = run(&world, &project, &task).unwrap();
+    fn the_jev_mode_is_refused_in_this_round() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), config_text("jev")).unwrap();
+        let error = parse_picker_config(home.path(), true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("resolver_mode_unavailable"),
+            "{error:#}"
+        );
+        // An absent file is the shipped default: off.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            parse_picker_config(empty.path(), true).unwrap().resolver,
+            ResolverMode::Off
+        );
+    }
+
+    /// The `jev` acceptance path, kept for the round that turns it on: a gate
+    /// over its threshold switches and records the pick.
+    #[test]
+    fn a_gate_over_its_threshold_switches_in_jev_mode() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), config_text("shadow")).unwrap();
+        let mut config = parse_picker_config(home.path(), true).unwrap();
+        config.resolver = ResolverMode::Jev;
+        let role = config.roles["lane"].clone();
+        let questions = gate_questions(&role.gates, &config.floor);
+        let mut nouls = BTreeMap::new();
+        nouls.insert("agy_gemini_flash".to_string(), 0.91);
+        let answers = jev::Answers {
+            model: jev::JEV_MODEL.into(),
+            nouls,
+            input_tokens: Some(356),
+        };
+        let default = config.recipes["cursor_grok_xhigh"].clone();
+        let input = ResolveInput {
+            role: "lane",
+            ..ResolveInput::default()
+        };
+        let launch = accepted_launch(
+            &config,
+            &input,
+            &questions,
+            &answers,
+            &default,
+            "cursor_grok_xhigh",
+        );
         assert_eq!(launch.recipe_id, "agy_gemini_flash");
         assert_eq!(launch.kind, "agy");
         assert_eq!(launch.resolver, ResolverMode::Jev);
         assert_eq!(launch.gate.as_deref(), Some("agy_gemini_flash"));
-        assert_eq!(launch.gate_p, Some(0.75));
         assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
         assert_eq!(launch.fallback, None);
         assert_eq!(
             launch.reason,
             "this task looks like web research, so it runs on the web research helper."
         );
-        assert_eq!(launch.jev_input_tokens, Some(356));
-        assert_eq!(launch.jev_model.as_deref(), Some(jev::JEV_MODEL));
         assert_eq!(
             launch.compact_reason,
             "this task runs on the web research helper"
         );
+    }
+
+    #[test]
+    fn a_gate_over_its_threshold_in_shadow_records_the_pick_only() {
+        let (world, project, task) = world("shadow", "read the vendor pages and cite them");
+        with_help(&world);
+        single_response(&world, &answers_body(0.91));
+        let launch = run(&world, &project, &task).unwrap();
+        assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
+        assert_eq!(launch.kind, "cursor");
+        assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
+        assert_eq!(launch.jev_input_tokens, Some(356));
+        assert_eq!(launch.jev_model.as_deref(), Some(jev::JEV_MODEL));
         assert_eq!(world.runner.count("/usr/bin/curl"), 1);
     }
 
     #[test]
     fn a_low_noul_keeps_the_default_with_no_gate() {
-        let (world, project, task) = world("jev", "write the parser");
+        let (world, project, task) = world("shadow", "write the parser");
         with_help(&world);
         single_response(&world, &answers_body(0.40));
         let launch = run(&world, &project, &task).unwrap();
         assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
-        assert_eq!(launch.resolver, ResolverMode::Jev);
-        assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_NO_GATE));
+        assert_eq!(launch.resolver, ResolverMode::Shadow);
+        assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_SHADOW));
         assert_eq!(launch.jev_pick, None);
         assert_eq!(
             launch.reason,
@@ -1609,7 +1666,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
 
     #[test]
     fn another_model_is_a_fallback() {
-        let (world, project, task) = world("jev", "read the vendor pages");
+        let (world, project, task) = world("shadow", "read the vendor pages");
         with_help(&world);
         let body = "{\"model\":\"jev-1.12.0\",\"answers\":{\"agy_gemini_flash\":{\"type\":\"noul\",\"noul\":0.99}}}\n200";
         single_response(&world, body);
@@ -1621,7 +1678,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
 
     #[test]
     fn a_429_is_retried_once_then_picked() {
-        let (world, project, task) = world("jev", "read the vendor pages");
+        let (world, project, task) = world("shadow", "read the vendor pages");
         with_help(&world);
         let responses =
             std::cell::RefCell::new(vec!["{}\n429".to_string(), answers_body(0.91)].into_iter());
@@ -1636,7 +1693,8 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
             },
         );
         let launch = run(&world, &project, &task).unwrap();
-        assert_eq!(launch.recipe_id, "agy_gemini_flash");
+        assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
+        assert_eq!(launch.jev_pick.as_deref(), Some("agy_gemini_flash"));
         assert_eq!(world.runner.count("/usr/bin/curl"), 2);
     }
 
@@ -1670,7 +1728,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
                 FALLBACK_MALFORMED,
             ),
         ] {
-            let (world, project, task) = world("jev", "read the vendor pages");
+            let (world, project, task) = world("shadow", "read the vendor pages");
             with_help(&world);
             world.runner.on_fn(
                 |cmd| cmd.display().contains("/usr/bin/curl"),
@@ -1684,7 +1742,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
 
     #[test]
     fn the_daily_cap_stops_the_call() {
-        let (world, project, task) = world("jev", "read the vendor pages");
+        let (world, project, task) = world("shadow", "read the vendor pages");
         with_help(&world);
         single_response(&world, &answers_body(0.91));
         let dir = project.dir().join(".state/jev-calls");
@@ -1718,7 +1776,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
 
     #[test]
     fn a_recipe_pin_skips_jev_and_the_agent_pin_is_project() {
-        let (world, project, task) = world("jev", "read the vendor pages");
+        let (world, project, task) = world("shadow", "read the vendor pages");
         with_help(&world);
         single_response(&world, &answers_body(0.91));
         let ctx = world.ctx();
@@ -1774,7 +1832,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
 
     #[test]
     fn a_project_pin_keeps_the_default_plain_and_refuses_an_unknown_kind() {
-        let (world, project, task) = world("jev", "x");
+        let (world, project, task) = world("shadow", "x");
         with_help(&world);
         let ctx = world.ctx();
         let pin = Recipe {
@@ -1834,7 +1892,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
 
     #[test]
     fn a_recipe_outside_the_allowed_list_is_refused() {
-        let (world, project, task) = world("jev", "x");
+        let (world, project, task) = world("shadow", "x");
         with_help(&world);
         let ctx = world.ctx();
         let error = resolve_launch(
@@ -1892,7 +1950,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         let kinds = jev::parse_kinds(KINDS_HELP).unwrap();
         let home = tempfile::tempdir().unwrap();
         let config_dir = home.path();
-        std::fs::write(config_dir.join("config.toml"), config_text("jev")).unwrap();
+        std::fs::write(config_dir.join("config.toml"), config_text("shadow")).unwrap();
         let mut config = parse_picker_config(config_dir, true).unwrap();
 
         let mut bad = config.clone();
@@ -2001,9 +2059,9 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
     fn the_policy_hash_covers_recipes_lists_gates_and_thresholds() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path();
-        std::fs::write(dir.join("config.toml"), config_text("jev")).unwrap();
+        std::fs::write(dir.join("config.toml"), config_text("shadow")).unwrap();
         let base = parse_picker_config(dir, true).unwrap();
-        let mut changed = config_text("jev");
+        let mut changed = config_text("shadow");
         changed = changed.replace("threshold = 0.75", "threshold = 0.80");
         std::fs::write(dir.join("config.toml"), changed).unwrap();
         let moved = parse_picker_config(dir, true).unwrap();
