@@ -136,3 +136,34 @@ Also learned:
 - With both default servers on 0.9.1 the plugin loads in them: all nine actions are listed on this Mac and on the second machine, `plugin link` works there without a named session, and no ticker runs on either (no projects yet).
 - **A herdr server not started from a login shell gives plugins a minimal `PATH`.** The `doctor` action in this Mac's default session reported `gh` as not installed although it is at `/opt/homebrew/bin/gh`. A ticker started by `[[startup]]` would have silently skipped pull request follow-up. The binary now appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own `PATH` at startup; the same action then reported `gh` and `gh auth` as ok.
 - `eliasstravik/herdr-projects` was created as a private repository with the `herdr-plugin` topic. The name had been a redirect to `herdr-tracker` (that repository's earlier name); creating the new repository replaced the redirect. No local clone used the old URL.
+
+## ADE stage O5/O6: live handoff (SPEC-ADE §0.3, turn 01, session `ade-smoke`, herdr 0.9.1 fork build)
+
+| Assumption | Result |
+| --- | --- |
+| `server live-handoff --import-exe <same 0.9.1>` keeps panes, agents and tokens | **Partly.** 0.125 s, log `handoff import ready panes=2`. Kept: pane ids, agent names, both `claude` processes. Changed: `terminal_id`. Lost on 0.9.1 before r2: every token, `parent` included; agent status reset. The ticker (a `[[startup]]` child) survived and re-stamped its own tokens within one tick; `parent` stayed lost. |
+| A reverse handoff to the installed 0.9.0 works | **Holds as a path, not as a fleet rollback.** Completed with both panes present, status `unknown`, tokens lost; the forward handoff then completed too. Two Claude panes only; no chatgpt pane was in it. |
+
+What the plugin takes from this:
+
+- Never key anything on `terminal_id`; re-resolve a pane by endpoint plus public pane id.
+- Tokens are a projection. The board rows (`ade_*`, TTL 300 s) and the thread tokens are re-sent every tick, so a handoff that drops them costs at most one tick. The records under the project root are the truth; the board is never read back.
+- The `talk` surface is a plain process in a tab and survives a live handoff like any other.
+
+## ADE: what fork round r2 changes (SPEC-ADE §0.4)
+
+- `lane/lineage-persist` @ `24bd6898`: pane and workspace snapshots carry every non-TTL token; live handoff restores all of them; cold restore restores `[session] restore_tokens` (default `parent`, `lane`, `round`, `branch`); a `parent` that does not resolve to a restored pane is dropped. `agent start --parent` applies the parent through `pane.report_metadata` before typing; a failed typed send can leave the parent token behind.
+- `lane/cycle-gate` @ `17271c62`: `parent_cycle` refused at report time; `parent` with `--ttl-ms` is `invalid_metadata_token`; a workspace `parent` is reserved.
+- `lane/restart-core` (running when the spec was written): `herdr server restart`, `server_handed_off` on open waits.
+- Consequence for the plugin: `ha pickup` re-applies `parent` with `pane report-metadata <pane> --source herdr-ade --token parent=<coordinator pane>` and no TTL, because a TTL on `parent` is refused. The board rows are TTL tokens and are not in the default `restore_tokens`, which is fine: the ticker re-sends them.
+- The first bounce from 0.9.0 still loses every token (the 0.9.0 exporter has none); pickup is the reconciler for that case, not the durability mechanism.
+
+## ADE rounds: CLI shapes the rounds package relies on (fork build 0.9.1, from `--help`, 2026-09-18)
+
+| Call | Shape |
+| --- | --- |
+| board rows | `herdr workspace report-metadata <workspace> --source <id> --token k=v ... --ttl-ms <n>`; values over 80 characters are cut by the server (`src/app/api_helpers.rs:208`), so the plugin keeps every value at 80 or fewer and never relies on the cut |
+| re-parenting | `herdr pane report-metadata <pane> --source <id> --token parent=<pane>` |
+| talk tab | `herdr tab create --workspace <ws> --cwd <dir> --label talk --no-focus`, then `herdr pane run <pane> "<prefix> talk <slug>"` |
+| `!stop` | `herdr agent send-keys <pane> esc` |
+| checkpoint | `herdr api snapshot` (`agents`, `panes`, `tabs`, `workspaces`), `herdr pane process-info --pane <pane>` for start flags |

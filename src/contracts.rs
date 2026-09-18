@@ -277,6 +277,21 @@ pub struct RoundRecord {
     pub expected_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<String>,
+    /// When `ha round open` wrote the record; orders `GLOSSARY.md` (A3).
+    #[serde(default)]
+    pub opened: String,
+    /// Repository the integration branch lives in, fixed at open (A3).
+    #[serde(default)]
+    pub repo: String,
+    /// Manifest revision frozen at the review brief commit `B` (SPEC-ADE D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_revision: Option<u64>,
+    /// `review/r<n>`, created from `B` (SPEC-ADE D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_branch: Option<String>,
+    /// The reviewer thread whose sealed `done` sha is `V` (SPEC-ADE D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
@@ -554,6 +569,11 @@ mod tests {
             },
             expected_head: Some("bbb".into()),
             manifest_hash: Some("mh".into()),
+            opened: "2026-09-18T00:00:00Z".into(),
+            repo: "/repo".into(),
+            frozen_revision: Some(2),
+            review_branch: Some("review/r1".into()),
+            reviewer: Some("t-0003".into()),
         });
         both(&MergeIntent {
             op: "merge-r1".into(),
