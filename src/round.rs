@@ -717,7 +717,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     }
     let mut reports = Vec::new();
     for member in &record.manifest.members {
-        let pin = member.pin.as_ref().expect("checked above");
+        let pin = member.pin.as_ref().context("round_not_complete")?;
         let path = artifacts_dir(&project).join(&pin.artifact);
         let bytes = std::fs::read(&path)
             .map_err(|e| anyhow::anyhow!("artifact_missing: {} ({e})", path.display()))?;
@@ -1198,7 +1198,7 @@ fn checkpoint_phase(
             (md, json)
         }
     };
-    let cp = intent.checkpoint.clone().expect("set above");
+    let cp = intent.checkpoint.clone().context("checkpoint_missing")?;
     let h = {
         let _repo = repo_lock(git)?;
         let head = git.branch_head(&record.branch)?.context("branch_missing")?;
