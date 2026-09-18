@@ -11,9 +11,9 @@ use crate::threads::{self, ResolveArgs, StartArgs};
 use crate::{actions, adopt, doctor, inbox, lifecycle, overview, routine, ticker};
 
 #[derive(Parser)]
-#[command(name = "herdr-projects", version = crate::VERSION, about = "Projects for herdr")]
+#[command(name = "herdr-ade", version = crate::VERSION, about = "Projects for herdr")]
 struct Cli {
-    /// Projects root (default: $HERDR_PROJECTS_ROOT, then config.toml, then ~/.herdr-projects)
+    /// Projects root (default: $HERDR_ADE_ROOT, then config.toml, then ~/.herdr-ade)
     #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
 
@@ -292,10 +292,17 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::New { name, goal, repos } => {
-            let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
+            let repos = repos
+                .iter()
+                .map(|arg| project::parse_repo_arg(arg))
+                .collect();
             let project = project::create(&ctx.root, &name, &goal, repos)?;
             println!("created `{}` at {}", project.slug, project.dir().display());
-            println!("next: {} open {}", coordinator::current_prefix(&ctx.root)?, project.slug);
+            println!(
+                "next: {} open {}",
+                coordinator::current_prefix(&ctx.root)?,
+                project.slug
+            );
             Ok(())
         }
         Command::List { all } => {
@@ -307,14 +314,37 @@ pub fn run() -> Result<()> {
                 }
                 let mut counts = std::collections::BTreeMap::new();
                 for row in threads::rows(&ctx, &project) {
-                    *counts.entry(row.group.rank()).or_insert((row.group.label(), 0)) = (row.group.label(), counts.get(&row.group.rank()).map_or(0, |c: &(&str, usize)| c.1) + 1);
+                    *counts
+                        .entry(row.group.rank())
+                        .or_insert((row.group.label(), 0)) = (
+                        row.group.label(),
+                        counts
+                            .get(&row.group.rank())
+                            .map_or(0, |c: &(&str, usize)| c.1)
+                            + 1,
+                    );
                 }
-                let summary: Vec<String> = counts.values().map(|(label, n)| format!("{label}: {n}")).collect();
-                println!("{slug}\t{status}\t{}", if summary.is_empty() { "no threads".to_string() } else { summary.join(", ") });
+                let summary: Vec<String> = counts
+                    .values()
+                    .map(|(label, n)| format!("{label}: {n}"))
+                    .collect();
+                println!(
+                    "{slug}\t{status}\t{}",
+                    if summary.is_empty() {
+                        "no threads".to_string()
+                    } else {
+                        summary.join(", ")
+                    }
+                );
             }
             Ok(())
         }
-        Command::Open { slug, reprime, rebind, session } => coordinator::open(
+        Command::Open {
+            slug,
+            reprime,
+            rebind,
+            session,
+        } => coordinator::open(
             &ctx,
             &slug,
             &OpenOptions {
@@ -336,35 +366,87 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, machine, agent, base, task_file } => {
+            ThreadCommand::Start {
+                slug,
+                title,
+                repo,
+                machine,
+                agent,
+                base,
+                task_file,
+            } => {
                 let task = read_text(&task_file)?;
-                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, agent, base, task })?;
-                println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id }));
+                let thread = threads::start(
+                    &ctx,
+                    &slug,
+                    StartArgs {
+                        title,
+                        repo,
+                        machine,
+                        agent,
+                        base,
+                        task,
+                    },
+                )?;
+                println!(
+                    "{}",
+                    serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id })
+                );
                 Ok(())
             }
             ThreadCommand::Restart { slug, id } => {
                 let thread = threads::restart(&ctx, &slug, &id)?;
-                println!("{} is back in pane {}; the ticker launches its agent", thread.id, thread.pane_id);
+                println!(
+                    "{} is back in pane {}; the ticker launches its agent",
+                    thread.id, thread.pane_id
+                );
                 Ok(())
             }
-            ThreadCommand::Prompt { slug, id, text_file } => {
+            ThreadCommand::Prompt {
+                slug,
+                id,
+                text_file,
+            } => {
                 let text = read_text(&text_file)?;
                 let state = threads::prompt(&ctx, &slug, &id, &text)?;
                 println!("sent to {id} (agent was {state})");
                 Ok(())
             }
-            ThreadCommand::Adopt { slug, pane, title, task_file } => {
+            ThreadCommand::Adopt {
+                slug,
+                pane,
+                title,
+                task_file,
+            } => {
                 let task = task_file.map(|file| read_text(&file)).transpose()?;
                 let thread = adopt::adopt(&ctx, &slug, &pane, &title, task)?;
-                println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id, "prompt_pending": thread.prompt_pending }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id, "prompt_pending": thread.prompt_pending })
+                );
                 Ok(())
             }
             ThreadCommand::List { slug } => threads::print_list(&ctx, &slug),
             ThreadCommand::Show { slug, id } => threads::print_show(&ctx, &slug, &id),
             ThreadCommand::Ack { slug, id } => threads::ack(&ctx, &slug, &id),
-            ThreadCommand::Resolve { slug, id, reopen, remove_worktree, skip_copy, discard_uncopied } => {
-                threads::resolve(&ctx, &slug, &id, &ResolveArgs { reopen, remove_worktree, skip_copy, discard_uncopied })
-            }
+            ThreadCommand::Resolve {
+                slug,
+                id,
+                reopen,
+                remove_worktree,
+                skip_copy,
+                discard_uncopied,
+            } => threads::resolve(
+                &ctx,
+                &slug,
+                &id,
+                &ResolveArgs {
+                    reopen,
+                    remove_worktree,
+                    skip_copy,
+                    discard_uncopied,
+                },
+            ),
         },
         Command::Routine { command } => match command {
             RoutineCommand::Approve { slug, name } => {
@@ -388,9 +470,22 @@ pub fn run() -> Result<()> {
         Command::Archive { slug } => lifecycle::set_status(&ctx, &slug, Status::Archived),
         Command::Unarchive { slug } => lifecycle::set_status(&ctx, &slug, Status::Active),
         Command::Delete { slug, force } => lifecycle::delete(&ctx, &slug, force),
-        Command::AdoptWorkspace { name, goal, pane, workspace_cwd, session } => {
-            adopt::adopt_workspace(&ctx, &adopt::AdoptWorkspace { name, goal, pane, workspace_cwd, session: session.into() })
-        }
+        Command::AdoptWorkspace {
+            name,
+            goal,
+            pane,
+            workspace_cwd,
+            session,
+        } => adopt::adopt_workspace(
+            &ctx,
+            &adopt::AdoptWorkspace {
+                name,
+                goal,
+                pane,
+                workspace_cwd,
+                session: session.into(),
+            },
+        ),
         Command::Action { id } => actions::run_action(&ctx, &id),
         Command::Pane { id } => actions::run_pane(&ctx, &id),
         Command::Safety { command } => match command {
@@ -399,11 +494,17 @@ pub fn run() -> Result<()> {
                 let safety = project.safety(&ctx.config_dir)?;
                 println!("Effective safety settings for `{slug}`:");
                 println!("  start_threads = {:?}", safety.start_threads);
-                println!("  coordinator_agent_args = {:?}", safety.coordinator_agent_args);
+                println!(
+                    "  coordinator_agent_args = {:?}",
+                    safety.coordinator_agent_args
+                );
                 println!("  thread_agent_args = {:?}", safety.thread_agent_args);
                 println!("  routine_commands = {}", safety.routine_commands);
                 println!();
-                println!("To change one, edit {} by hand and add:", ctx.config_dir.join("config.toml").display());
+                println!(
+                    "To change one, edit {} by hand and add:",
+                    ctx.config_dir.join("config.toml").display()
+                );
                 println!();
                 println!("[safety.{:?}]", project.canonical_dir().to_string_lossy());
                 Ok(())
