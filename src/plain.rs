@@ -75,7 +75,10 @@ impl Glossary {
     }
 
     fn is_known_name(&self, token: &str) -> bool {
-        self.names.contains_key(token) || self.terms.contains_key(token)
+        self.names
+            .keys()
+            .chain(self.terms.keys())
+            .any(|name| !name.is_empty() && name.eq_ignore_ascii_case(token))
     }
 }
 
@@ -246,16 +249,25 @@ fn check_r1_r2(text: &str, glossary: &Glossary) -> Vec<Violation> {
     violations
 }
 
+/// Every place `name` stands as a whole token, in any letter case: a
+/// capital at the start of a sentence is the same name (A0 review M3).
 fn name_spans(text: &str, name: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
+    if name.is_empty() {
+        return spans;
+    }
+    // ASCII lowercasing keeps every byte offset.
+    let lower = text.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let name = name.as_str();
     let mut from = 0;
-    while let Some(rel) = text[from..].find(name) {
+    while let Some(rel) = lower[from..].find(name) {
         let start = from + rel;
         let end = start + name.len();
         if is_token_boundary(text, start, end) {
             spans.push((start, end));
         }
-        from = start + name.len().max(1);
+        from = start + name.len();
     }
     spans
 }
@@ -335,14 +347,28 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
         if is_number(token.raw) || is_time(token.raw) {
             continue;
         }
-        let lower = token.raw.to_ascii_lowercase();
+        let lower = token.raw.replace('\u{2019}', "'").to_ascii_lowercase();
         // A possessive is its word: "the coordinator's pane" (SPEC-ADE item 73).
         let base = lower.strip_suffix("'s").unwrap_or(&lower);
         let raw_base = token.raw.strip_suffix("'s").unwrap_or(token.raw);
         if base == "rolf" || admitted.contains(base) || glossary.is_known_name(raw_base) {
             continue;
         }
-        if lower.chars().all(|c| c.is_ascii_alphabetic() || c == '\'') {
+        // Numbers with units and ordinals (`10s`, `1st`, `r2`) pass; R3 owns
+        // identifier shapes.
+        if lower.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // Each part of a joined word is a word: a hyphen or dash hides
+        // nothing (A0 review H1). A letter outside ASCII is never admitted.
+        let unknown = base
+            .split(['-', '\u{2014}', '\u{2013}'])
+            .filter(|part| part.chars().any(char::is_alphabetic))
+            .any(|part| {
+                let part = part.strip_suffix("'s").unwrap_or(part);
+                part != "rolf" && !admitted.contains(part)
+            });
+        if unknown {
             violations.push(Violation {
                 rule: Rule::UnknownWord,
                 span: Span {
@@ -472,7 +498,7 @@ fn tokens(text: &str) -> Vec<Token<'_>> {
         while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        let (core_start, core_end) = trim_punct(bytes, start, i);
+        let (core_start, core_end) = trim_punct(text, start, i);
         if core_start < core_end {
             out.push(Token {
                 raw: &text[core_start..core_end],
@@ -504,33 +530,16 @@ fn take_path(text: &str, start: usize) -> Option<usize> {
     Some(start + chunk.len())
 }
 
-fn trim_punct(bytes: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
-    while start < end && is_wrap_punct(bytes[start]) {
-        start += 1;
+/// Strips everything that is not a letter or digit from both ends, so a
+/// backtick, star or curly quote cannot hide a word (A0 review H2).
+fn trim_punct(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let s = &text[start..end];
+    let lead = s.len() - s.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
+    let trail = s.trim_end_matches(|c: char| !c.is_alphanumeric()).len();
+    if trail <= lead {
+        return (start, start);
     }
-    while end > start && is_wrap_punct(bytes[end - 1]) {
-        end -= 1;
-    }
-    (start, end)
-}
-
-fn is_wrap_punct(b: u8) -> bool {
-    matches!(
-        b,
-        b'.' | b','
-            | b';'
-            | b':'
-            | b'!'
-            | b'?'
-            | b'"'
-            | b'\''
-            | b'('
-            | b')'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-    )
+    (start + lead, start + trail)
 }
 
 fn is_identifier_shaped(token: &str) -> bool {
@@ -581,6 +590,7 @@ fn is_hex_run(token: &str) -> bool {
     token.len() >= 7
         && token.chars().all(|c| c.is_ascii_hexdigit())
         && token.chars().any(|c| c.is_ascii_digit())
+        && !token.chars().all(|c| c.is_ascii_digit())
 }
 
 fn is_number(token: &str) -> bool {
@@ -658,6 +668,33 @@ mod tests {
         g.names
             .insert("F-cap".into(), "The failing choice form.".into());
         g
+    }
+
+    /// A0 review H1, H2, M3, M4, L11: shapes that slipped past the check.
+    #[test]
+    fn joined_wrapped_and_capitalised_words_do_not_slip_through() {
+        let g = Glossary::default();
+        for text in [
+            "The bisimulation-quotient is done.",
+            "The lane\u{2014}bisimulation is done.",
+            "The caf\u{e9} is done.",
+            "The coordinator\u{2019}s bisimulation.",
+            "The *bisimulation* is done.",
+            "The \u{201c}bisimulation\u{201d} is done.",
+        ] {
+            assert_eq!(codes(&check(text, &g)), ["plain_unknown_word"], "{text}");
+        }
+        assert_eq!(
+            codes(&check("Run `snake_case_token` now.", &g)),
+            ["plain_identifier"]
+        );
+        let g = glossary_acronym();
+        assert_eq!(codes(&check("F-CAP failed.", &g)), ["plain_bare_name"]);
+        let mut empty = Glossary::default();
+        empty.names.insert(String::new(), String::new());
+        check("\u{e9} a b", &empty);
+        assert!(check("The lane is done.", &empty).passed());
+        assert!(check("The file has 1234567 lines.", &Glossary::default()).passed());
     }
 
     /// SPEC-ADE item 73: a possessive is checked as its word.
