@@ -702,7 +702,10 @@ fn classify(output: &Output) -> Transport {
 pub fn systemone_config(key: &str, body: &str) -> String {
     let mut config = String::new();
     config.push_str(&format!("url = \"{SYSTEMONE_URL}\"\n"));
-    config.push_str(&format!("header = \"Authorization: Bearer {key}\"\n"));
+    config.push_str(&format!(
+        "header = \"Authorization: Bearer {}\"\n",
+        escape_curl(key)
+    ));
     config.push_str("header = \"Content-Type: application/json\"\n");
     config.push_str(&format!("data-binary = \"{}\"\n", escape_curl(body)));
     config.push_str("write-out = \"\\n%{http_code}\"\n");
@@ -712,7 +715,10 @@ pub fn systemone_config(key: &str, body: &str) -> String {
 fn models_config(key: &str) -> String {
     let mut config = String::new();
     config.push_str(&format!("url = \"{MODELS_URL}\"\n"));
-    config.push_str(&format!("header = \"Authorization: Bearer {key}\"\n"));
+    config.push_str(&format!(
+        "header = \"Authorization: Bearer {}\"\n",
+        escape_curl(key)
+    ));
     config.push_str("write-out = \"\\n%{http_code}\"\n");
     config
 }
@@ -777,16 +783,27 @@ pub fn key_path(env: &Env) -> PathBuf {
 
 /// `TYPESAFE_API_KEY`, else `~/.config/typesafe/api_key`
 /// (SPEC-jev-picker v2 §5).
+///
+/// A key with a control character inside (a second line, say) is no key: it
+/// would end the curl config line and add settings of its own.
 pub fn load_key(env: &Env) -> Option<String> {
     if let Some(value) = env.var("TYPESAFE_API_KEY") {
         let value = value.trim();
         if !value.is_empty() {
-            return Some(value.to_string());
+            return usable_key(value);
         }
     }
     let text = std::fs::read_to_string(key_path(env)).ok()?;
     let key = text.trim();
     if key.is_empty() {
+        None
+    } else {
+        usable_key(key)
+    }
+}
+
+fn usable_key(key: &str) -> Option<String> {
+    if key.chars().any(char::is_control) {
         None
     } else {
         Some(key.to_string())
@@ -796,7 +813,7 @@ pub fn load_key(env: &Env) -> Option<String> {
 pub fn key_report(env: &Env) -> KeyReport {
     let path = key_path(env);
     let (source, mode, readable_by_others) = if let Some(value) = env.var("TYPESAFE_API_KEY") {
-        if value.trim().is_empty() {
+        if value.trim().is_empty() || usable_key(value.trim()).is_none() {
             (KeySource::Missing, None, false)
         } else {
             (KeySource::Env, None, false)
@@ -1257,6 +1274,22 @@ mod tests {
         let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "env-key")]);
         assert_eq!(load_key(&env).as_deref(), Some("env-key"));
         assert_eq!(key_report(&env).source, KeySource::Env);
+    }
+
+    #[test]
+    fn a_key_cannot_add_curl_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(
+            home.path(),
+            &[("TYPESAFE_API_KEY", "abc\"\noutput = \"/tmp/x")],
+        );
+        assert_eq!(load_key(&env), None);
+        let config = systemone_config("a\"b", "{}");
+        assert!(
+            config.contains("header = \"Authorization: Bearer a\\\"b\"\n"),
+            "{config}"
+        );
+        assert_eq!(config.lines().count(), 5);
     }
 
     #[test]
