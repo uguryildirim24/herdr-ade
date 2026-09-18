@@ -43,6 +43,14 @@ struct Budget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CursorPending {
+    session: String,
+    turn: String,
+    text: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Publication {
     pub id: String,
     pub session: String,
@@ -54,18 +62,32 @@ fn binding_path(project: &Project) -> PathBuf {
     project.state_dir().join("plain").join("hook-binding.json")
 }
 
-fn settings_path(project: &Project, kind: &str) -> Option<PathBuf> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigShape {
+    ClaudeLike,
+    Cursor,
+}
+
+fn settings_path(project: &Project, kind: &str) -> Option<(PathBuf, ConfigShape)> {
     match kind {
-        "claude" => Some(project.dir().join(".claude").join("settings.local.json")),
-        // These are intentionally not installed before their installed-version
-        // probes qualify their exact schema and continuation behavior.
-        "cursor" | "codex" => None,
+        "claude" => Some((
+            project.dir().join(".claude").join("settings.local.json"),
+            ConfigShape::ClaudeLike,
+        )),
+        "codex" => Some((
+            project.dir().join(".codex").join("hooks.json"),
+            ConfigShape::ClaudeLike,
+        )),
+        "cursor" => Some((
+            project.dir().join(".cursor").join("hooks.json"),
+            ConfigShape::Cursor,
+        )),
         _ => None,
     }
 }
 
 pub fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<bool> {
-    let Some(path) = settings_path(project, kind) else {
+    let Some((path, shape)) = settings_path(project, kind) else {
         return Ok(false);
     };
     let binary = std::env::current_exe().context("could not locate herdr-ade")?;
@@ -79,23 +101,7 @@ pub fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<b
     );
     let _lock = project.lock()?;
     let mut value = read_json_object(&path)?;
-    let hooks = value
-        .as_object_mut()
-        .expect("read_json_object returns an object")
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let hooks = hooks
-        .as_object_mut()
-        .context("hook_config_invalid: `hooks` is not an object")?;
-    let stop = hooks.entry("Stop").or_insert_with(|| serde_json::json!([]));
-    let stop = stop
-        .as_array_mut()
-        .context("hook_config_invalid: `hooks.Stop` is not an array")?;
-    stop.retain(|entry| !owned_hook(entry));
-    stop.push(serde_json::json!({
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": command }]
-    }));
+    install_entry(&mut value, shape, &command)?;
     write_json_atomic(&path, &value)?;
     let dir = project.state_dir().join("plain");
     std::fs::create_dir_all(&dir)?;
@@ -108,7 +114,7 @@ pub fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<b
             session_id: String::new(),
         },
     )?;
-    verify_owned_entry(&path, pane)?;
+    verify_owned_entry(&path, pane, shape)?;
     Ok(true)
 }
 
@@ -116,17 +122,11 @@ pub fn remove(project: &Project) -> Result<()> {
     let _lock = project.lock()?;
     let binding: Option<Binding> = project::read_json(&binding_path(project));
     if let Some(binding) = binding
-        && let Some(path) = settings_path(project, &binding.kind)
+        && let Some((path, shape)) = settings_path(project, &binding.kind)
         && path.exists()
     {
         let mut value = read_json_object(&path)?;
-        if let Some(stop) = value
-            .get_mut("hooks")
-            .and_then(|hooks| hooks.get_mut("Stop"))
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            stop.retain(|entry| !owned_hook(entry));
-        }
+        remove_entries(&mut value, shape);
         write_json_atomic(&path, &value)?;
     }
     let _ = std::fs::remove_file(binding_path(project));
@@ -134,22 +134,95 @@ pub fn remove(project: &Project) -> Result<()> {
 }
 
 fn owned_hook(value: &serde_json::Value) -> bool {
-    value["hooks"].as_array().into_iter().flatten().any(|hook| {
-        hook["command"]
-            .as_str()
-            .is_some_and(|command| command.contains(" plain hook --kind "))
-    })
+    value["command"]
+        .as_str()
+        .is_some_and(|command| command.contains(" plain hook --kind "))
+        || value["hooks"].as_array().into_iter().flatten().any(|hook| {
+            hook["command"]
+                .as_str()
+                .is_some_and(|command| command.contains(" plain hook --kind "))
+        })
 }
 
-fn verify_owned_entry(path: &Path, pane: &str) -> Result<()> {
+fn install_entry(value: &mut serde_json::Value, shape: ConfigShape, command: &str) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .expect("read_json_object returns an object");
+    if shape == ConfigShape::Cursor {
+        object.insert("version".into(), serde_json::json!(1));
+    }
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("hook_config_invalid: `hooks` is not an object")?;
+    match shape {
+        ConfigShape::ClaudeLike => {
+            let stop = hooks
+                .entry("Stop")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .context("hook_config_invalid: `hooks.Stop` is not an array")?;
+            stop.retain(|entry| !owned_hook(entry));
+            stop.push(serde_json::json!({
+                "matcher": "",
+                "hooks": [{ "type": "command", "command": command }]
+            }));
+        }
+        ConfigShape::Cursor => {
+            for (event, phase) in [("afterAgentResponse", "observe"), ("stop", "stop")] {
+                let entries = hooks
+                    .entry(event)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .with_context(|| {
+                        format!("hook_config_invalid: `hooks.{event}` is not an array")
+                    })?;
+                entries.retain(|entry| !owned_hook(entry));
+                entries.push(serde_json::json!({
+                    "command": format!("{command} --phase {phase}"),
+                    "loop_limit": 3
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_entries(value: &mut serde_json::Value, shape: ConfigShape) {
+    let names: &[&str] = match shape {
+        ConfigShape::ClaudeLike => &["Stop"],
+        ConfigShape::Cursor => &["afterAgentResponse", "stop"],
+    };
+    for name in names {
+        if let Some(entries) = value
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(*name))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            entries.retain(|entry| !owned_hook(entry));
+        }
+    }
+}
+
+fn verify_owned_entry(path: &Path, pane: &str, shape: ConfigShape) -> Result<()> {
     let value = read_json_object(path)?;
-    let found = value["hooks"]["Stop"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|entry| owned_hook(entry))
-        .count();
-    if found != 1 || !value.to_string().contains(pane) {
+    let names: &[&str] = match shape {
+        ConfigShape::ClaudeLike => &["Stop"],
+        ConfigShape::Cursor => &["afterAgentResponse", "stop"],
+    };
+    let found: usize = names
+        .iter()
+        .map(|event| {
+            value["hooks"][event]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|entry| owned_hook(entry))
+                .count()
+        })
+        .sum();
+    if found != names.len() || !value.to_string().contains(pane) {
         bail!("hook_install_failed: owned Stop entry did not verify");
     }
     Ok(())
@@ -157,7 +230,7 @@ fn verify_owned_entry(path: &Path, pane: &str) -> Result<()> {
 
 /// Runs from a native CLI hook. Non-matching pane/session invocations are out
 /// of scope and exit successfully without checking or publishing.
-pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str) -> Result<()> {
+pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let inherited = std::env::var("HERDR_PANE_ID").unwrap_or_default();
     if inherited != pane {
@@ -176,11 +249,23 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str) -> Result<()> {
     if !scope_binding(&project, kind, pane, session)? {
         return Ok(());
     }
+    if kind == "cursor" && phase == "stop" {
+        return cursor_stop(ctx, &project, kind);
+    }
     let text = reply_text(kind, &input).unwrap_or_default();
-    let turn = turn_key(&input, text);
+    let turn = if kind == "cursor" {
+        project::read_json::<CursorPending>(&cursor_pending_path(&project))
+            .map(|pending| pending.turn)
+            .unwrap_or_else(|| turn_key(&input, text))
+    } else {
+        turn_key(&input, text)
+    };
     let messages = match parse_envelopes(text) {
         Ok(messages) => messages,
         Err(error) => {
+            if kind == "cursor" && phase == "observe" {
+                return save_cursor_pending(&project, session, &turn, text, &error.to_string());
+            }
             return failed_check(
                 ctx,
                 &project,
@@ -197,12 +282,62 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str) -> Result<()> {
             .err()
             .map(|error| error.to_string())
     }) {
+        if kind == "cursor" && phase == "observe" {
+            return save_cursor_pending(&project, session, &turn, text, &reason);
+        }
         return failed_check(ctx, &project, kind, session, &turn, text, &reason);
     }
     for message in messages {
         publish(&project, session, &turn, message)?;
     }
+    if kind == "cursor" {
+        let _ = std::fs::remove_file(cursor_pending_path(&project));
+    }
     Ok(())
+}
+
+fn cursor_pending_path(project: &Project) -> PathBuf {
+    project
+        .state_dir()
+        .join("plain")
+        .join("cursor-pending.json")
+}
+
+fn save_cursor_pending(
+    project: &Project,
+    session: &str,
+    turn: &str,
+    text: &str,
+    reason: &str,
+) -> Result<()> {
+    let path = cursor_pending_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    project::write_json(
+        &path,
+        &CursorPending {
+            session: session.to_string(),
+            turn: turn.to_string(),
+            text: text.to_string(),
+            reason: reason.to_string(),
+        },
+    )
+}
+
+fn cursor_stop(ctx: &Ctx, project: &Project, kind: &str) -> Result<()> {
+    let Some(pending) = project::read_json::<CursorPending>(&cursor_pending_path(project)) else {
+        return Ok(());
+    };
+    failed_check(
+        ctx,
+        project,
+        kind,
+        &pending.session,
+        &pending.turn,
+        &pending.text,
+        &pending.reason,
+    )
 }
 
 fn scope_binding(project: &Project, kind: &str, pane: &str, session: &str) -> Result<bool> {
@@ -652,5 +787,60 @@ mod tests {
                 id: "plain-budget-exhausted".into()
             }
         );
+    }
+
+    #[test]
+    fn cursor_and_codex_use_their_project_hook_shapes() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        install(&ctx, &project, "cursor", "w1:p1").unwrap();
+        install(&ctx, &project, "cursor", "w1:p1").unwrap();
+        let cursor = read_json_object(&project.dir().join(".cursor/hooks.json")).unwrap();
+        assert_eq!(cursor["version"], 1);
+        assert_eq!(
+            cursor["hooks"]["afterAgentResponse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            cursor["hooks"]["afterAgentResponse"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--phase observe")
+        );
+        assert!(
+            cursor["hooks"]["stop"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--phase stop")
+        );
+        remove(&project).unwrap();
+
+        install(&ctx, &project, "codex", "w1:p1").unwrap();
+        let codex = read_json_object(&project.dir().join(".codex/hooks.json")).unwrap();
+        assert_eq!(codex["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(
+            codex["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--kind codex")
+        );
+        remove(&project).unwrap();
+        let codex = read_json_object(&project.dir().join(".codex/hooks.json")).unwrap();
+        assert!(codex["hooks"]["Stop"].as_array().unwrap().is_empty());
     }
 }
