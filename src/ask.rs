@@ -27,7 +27,7 @@ pub const NOT_UNDERSTOOD: &str = "I did not understand the question";
 pub const NOTICES: &[(&str, &str)] = &[
     (
         "plain_exhausted",
-        "The coordinator could not say this plainly. Open its pane to read it.",
+        "The coordinator could not say this in plain words. Open its pane to read it.",
     ),
     (
         "talk_uncertain",
@@ -43,7 +43,7 @@ pub const NOTICES: &[(&str, &str)] = &[
     ),
     (
         "journal_tail",
-        "An unfinished line was found at the end of this record and was skipped.",
+        "A half written line was found at the end of this record and was left out.",
     ),
     (
         "session_changed",
@@ -557,7 +557,6 @@ pub fn publish_keyed(
             for (i, c) in record.choices.iter().enumerate() {
                 body.push_str(&format!("{}. {}\n", i + 1, c));
             }
-            body.push_str(&format!("0. {NOT_UNDERSTOOD}"));
             let notified = notify(ctx, project, &compact, &body);
             if board && notified {
                 let _ = std::fs::write(published_marker(project, id, *revision), "");
@@ -594,13 +593,16 @@ fn notify(ctx: &Ctx, project: &Project, title: &str, body: &str) -> bool {
     if glossary::gate(project, title).is_err() || glossary::gate(project, body).is_err() {
         return false;
     }
+    // The standing choice is the spec's fixed text; R4 has no entry for "I",
+    // so it is appended after the check (open question in the report).
+    let body = format!("{body}0. {NOT_UNDERSTOOD}");
     let Some(coord) = project.coordinator().filter(|c| !c.socket.is_empty()) else {
         return false;
     };
     let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &coord.socket, ctx.runner);
     herdr
         .call(
-            &["notification", "show", title, "--body", body],
+            &["notification", "show", title, "--body", &body],
             Duration::from_secs(10),
         )
         .is_ok()
@@ -623,4 +625,251 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::round::testkit::fixture;
+    use crate::runner::fake::ok;
+    use crate::scenarios::World;
+
+    fn keep_or_stop() -> NewAsk {
+        NewAsk {
+            question: "keep the experiment running another hour, or stop now?".into(),
+            choices: vec!["keep it running another hour".into(), "stop it now".into()],
+            what: None,
+            means: None,
+            round: None,
+            reask: None,
+        }
+    }
+
+    fn journal_kinds(project: &Project) -> Vec<String> {
+        crate::talk::read(project)
+            .lines
+            .iter()
+            .map(|l| match &l.entry {
+                crate::talk::Entry::Say { .. } => "say".to_string(),
+                crate::talk::Entry::Ask { id, revision } => format!("ask {id}@{revision}"),
+                crate::talk::Entry::Notice { id } => format!("notice {id}"),
+                crate::talk::Entry::Answer { id, choice, .. } => format!("answer {id} {choice}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_fixed_notice_and_the_standing_choice_pass_the_check() {
+        let g = plain::Glossary::default();
+        for (id, text) in NOTICES {
+            let r = plain::check(text, &g);
+            assert!(r.passed(), "{id}: {}", format_check(text, &r));
+        }
+        // The spec's standing choice fails R4 on "I" (not in words.txt); it
+        // is fixed text and bypasses the gate. Pin that so a word-list fix shows.
+        assert!(!plain::check(NOT_UNDERSTOOD, &g).passed());
+    }
+
+    #[test]
+    fn a_term_as_a_choice_is_refused_and_nothing_is_recorded() {
+        let fx = fixture();
+        let e = ask(
+            &fx.world.ctx(),
+            "demo",
+            NewAsk {
+                question: "F-cap criterion?".into(),
+                choices: vec!["F-cap".into(), "no".into()],
+                ..keep_or_stop()
+            },
+        )
+        .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.starts_with("plain_refused") && e.contains("plain_question_form"), "{e}");
+        assert!(open_asks(&fx.project).is_empty());
+        assert!(!crate::talk::journal_path(&fx.project).exists());
+    }
+
+    #[test]
+    fn ask_records_first_then_board_line_notification_and_surface() {
+        let fx = fixture();
+        let a = ask(&fx.world.ctx(), "demo", keep_or_stop()).unwrap();
+        assert_eq!((a.id.as_str(), a.revision), ("a-1", 1));
+        let compact = compact_line(&a);
+        assert_eq!(compact, "keep the experiment running another hour? (2 choices)");
+        assert!(compact.chars().count() <= 60);
+        assert!(fx.world.runner.count(&format!("--token ade_needs_you={compact}")) == 1);
+        assert!(fx.world.runner.count(&format!("notification show {compact} --body 1. keep it running another hour")) == 1);
+        assert_eq!(journal_kinds(&fx.project), ["ask a-1@1"]);
+        let shown = crate::talk::replay(&fx.world.ctx(), "demo").unwrap();
+        assert!(shown.contains("  1. keep it running another hour\n  2. stop it now\n  0. I did not understand the question"), "{shown}");
+        assert!(published_marker(&fx.project, "a-1", 1).exists());
+        // A second publication of the same ask appends nothing.
+        publish(&fx.world.ctx(), &fx.project, &HumanMessage::Ask { id: "a-1".into(), revision: 1 }).unwrap();
+        assert_eq!(journal_kinds(&fx.project).len(), 1);
+    }
+
+    #[test]
+    fn a_crash_after_the_record_is_resumed_by_the_ticker() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        // No notification rule: publication fails after the record exists.
+        let a = ask(&world.ctx(), "demo", keep_or_stop()).unwrap();
+        assert!(rev_path(&project, &a.id, 1).exists());
+        assert!(!published_marker(&project, &a.id, 1).exists());
+        world.runner.on("notification show", ok(r#"{"result":{}}"#));
+        world.runner.on("workspace report-metadata", ok(r#"{"result":{}}"#));
+        tick(&world.ctx(), &project).unwrap();
+        assert!(published_marker(&project, &a.id, 1).exists());
+        assert_eq!(world.runner.count("notification show"), 2);
+        assert_eq!(journal_kinds(&project), ["ask a-1@1"], "one journal line across both tries");
+    }
+
+    #[test]
+    fn answers_bind_id_and_revision() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        ask(&ctx, "demo", keep_or_stop()).unwrap();
+        let again = ask(&ctx, "demo", NewAsk { reask: Some("a-1".into()), ..keep_or_stop() }).unwrap();
+        assert_eq!(again.revision, 2);
+        let e = format!("{:#}", answer(&ctx, "demo", "a-1", 1, 2, "test").unwrap_err());
+        assert!(e.starts_with("ask_revision_stale"), "{e}");
+        let e = format!("{:#}", answer(&ctx, "demo", "a-1", 2, 3, "test").unwrap_err());
+        assert!(e.starts_with("ask_choice_out_of_range"), "{e}");
+        let a = answer(&ctx, "demo", "a-1", 2, 0, "test").unwrap();
+        assert!(a.not_understood);
+        assert_eq!(a.text, NOT_UNDERSTOOD);
+        assert_eq!(not_understood_count(&fx.project), 1);
+        let e = format!("{:#}", answer(&ctx, "demo", "a-1", 2, 1, "test").unwrap_err());
+        assert!(e.starts_with("ask_closed"), "{e}");
+        assert!(open_asks(&fx.project).is_empty());
+        let e = format!("{:#}", publish(&ctx, &fx.project, &HumanMessage::Ask { id: "a-1".into(), revision: 2 }).unwrap_err());
+        assert!(e.starts_with("ask_closed"), "{e}");
+        let e = format!("{:#}", publish(&ctx, &fx.project, &HumanMessage::Ask { id: "a-9".into(), revision: 1 }).unwrap_err());
+        assert!(e.starts_with("ask_unknown"), "{e}");
+    }
+
+    #[test]
+    fn say_refuses_a_sha_and_a_bare_name_and_appends_nothing() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let e = format!("{:#}", say(&ctx, "demo", "The lane landed at 3f9a2c1d.", None).unwrap_err());
+        assert!(e.contains("plain_identifier") && e.contains("3f9a2c1d"), "{e}");
+        let (id, _) = fx.lane(1);
+        let e = format!("{:#}", say(&ctx, "demo", &format!("The lane {id} is done."), None).unwrap_err());
+        assert!(e.starts_with("plain_refused") && e.contains(&id), "{e}");
+        let e = format!("{:#}", say(&ctx, "demo", "", None).unwrap_err());
+        assert!(e.contains("plain_envelope"), "{e}");
+        assert!(crate::talk::read(&fx.project).lines.is_empty());
+        say(&ctx, "demo", "The first lane is done.", Some("You can read its report now.")).unwrap();
+        assert_eq!(journal_kinds(&fx.project), ["say"]);
+        assert!(fx.world.runner.count("--token ade_last=The first lane is done.") == 1);
+    }
+
+    #[test]
+    fn a_duplicate_keyed_publication_appends_once() {
+        let fx = fixture();
+        let msg = HumanMessage::Say { what: "The review is done.".into(), means: None };
+        let first = publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
+        let second = publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
+        assert!(first.seq.is_some() && second.seq.is_none());
+        assert_eq!(journal_kinds(&fx.project), ["say"]);
+    }
+
+    #[test]
+    fn notices_are_fixed_ids_only() {
+        let fx = fixture();
+        let e = format!("{:#}", publish(&fx.world.ctx(), &fx.project, &HumanMessage::Notice { id: "anything".into() }).unwrap_err());
+        assert!(e.starts_with("notice_unknown"), "{e}");
+        let p = publish(&fx.world.ctx(), &fx.project, &HumanMessage::Notice { id: "plain_exhausted".into() }).unwrap();
+        assert!(p.board, "the exhausted-budget notice also goes to the board");
+        assert!(fx.world.runner.count("--token ade_last=The coordinator could not say this in plain words.") == 1);
+    }
+
+    #[test]
+    fn board_refuses_a_failing_value_and_keeps_the_old_one() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        crate::board::publish_value(&ctx, &fx.project, "ade_last", "The first lane is done.").unwrap();
+        let before = fx.world.runner.count("workspace report-metadata");
+        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", "run cargo_test now").unwrap_err();
+        assert!(format!("{e:#}").contains("plain_identifier"));
+        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", &"word ".repeat(20)).unwrap_err();
+        assert!(format!("{e:#}").contains("at most 80"));
+        assert_eq!(fx.world.runner.count("workspace report-metadata"), before, "nothing was sent");
+        assert_eq!(crate::board::state(&fx.project).values["ade_last"], "The first lane is done.");
+    }
+
+    #[test]
+    fn board_templates_pass_the_check_and_carry_no_registry_name() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The first round lands the shared types.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        let (a, sha) = fx.lane(1);
+        let (b, _) = fx.lane(2);
+        crate::round::admit(&ctx, "demo", "r1", &a).unwrap();
+        crate::round::admit(&ctx, "demo", "r1", &b).unwrap();
+        fx.seal_done(&a, 1, 1, &sha, "report\n");
+        fx.seal_waiting(&b, 1, 1, "need a look");
+        crate::round::tick(&ctx, &fx.project).unwrap();
+        ask(&ctx, "demo", keep_or_stop()).unwrap();
+        let values = crate::board::compute(&ctx, &fx.project);
+        let g = glossary::registry(&fx.project);
+        for (k, v) in &values {
+            crate::board::check_value(&fx.project, v).unwrap_or_else(|e| panic!("{k}={v}: {e:#}"));
+            for name in g.names.keys() {
+                assert!(!v.contains(name.as_str()), "{k}={v} carries {name}");
+            }
+        }
+        let get = |k: &str| values.iter().find(|(key, _)| key == k).unwrap().1.clone();
+        assert_eq!(get("ade_stage"), "round 1 has 1 lanes working. The first round lands the shared types.");
+        assert_eq!(get("ade_lanes"), "0 working, 1 done, 1 waiting for you, 0 stuck");
+        assert_eq!(get("ade_needs_you"), "keep the experiment running another hour? (2 choices)");
+        assert!(crate::board::refresh(&ctx, &fx.project).unwrap().is_empty());
+    }
+
+    #[test]
+    fn names_are_born_with_a_sentence_and_listed_in_the_glossary() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let e = format!("{:#}", glossary::add_term(&ctx, "demo", "quotient", None, None).unwrap_err());
+        assert!(e.starts_with("plain_missing"), "{e}");
+        glossary::add_term(&ctx, "demo", "quotient", Some("The smaller model that keeps the same answers."), Some("tasks/spec.md")).unwrap();
+        let e = format!("{:#}", glossary::add_term(&ctx, "demo", "quotient", Some("Another sentence for it."), None).unwrap_err());
+        assert!(e.starts_with("term_exists"), "{e}");
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The first round lands the shared types.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(glossary::glossary_path(&fx.project)).unwrap();
+        assert!(text.contains("- quotient: The smaller model that keeps the same answers. (tasks/spec.md)\n"));
+        assert!(text.ends_with("- r1: The first round lands the shared types. (tasks/review-r1.md)\n"), "newest last:\n{text}");
+        assert_eq!(
+            glossary::explain(&ctx, "demo", "r1").unwrap(),
+            "r1: The first round lands the shared types.\n(tasks/review-r1.md)\n"
+        );
+        assert!(format!("{:#}", glossary::explain(&ctx, "demo", "nope").unwrap_err()).starts_with("term_unknown"));
+        // A registered name used bare fails R1; in gloss form it passes.
+        assert!(glossary::gate(&fx.project, "Work on r1 goes on.").is_err());
+        assert!(glossary::gate(&fx.project, "The first round lands the shared types (r1).").is_ok());
+        // An invented sentence for a term fails R2.
+        assert!(glossary::gate(&fx.project, "The quotient is a thing.").is_err());
+    }
 }
