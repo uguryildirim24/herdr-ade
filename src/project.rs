@@ -149,9 +149,11 @@ pub struct Settings {
     pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
-    /// Plugin-owned conversation surface (SPEC-ADE D18). Default off.
-    #[serde(default)]
-    pub talk: bool,
+    /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
+    /// default of item 24: on for a `claude` coordinator, off otherwise
+    /// (`talk::enabled`). Never written by `new`, so the default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talk: Option<bool>,
     /// Per-role `kind`/`args` overrides (SPEC-ADE D2). Arrays replace.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub roles: std::collections::BTreeMap<String, RoleOverride>,
@@ -185,7 +187,7 @@ impl Default for Settings {
             // text the user has half-typed (docs/herdr-notes.md, stage 2). With
             // `false` the ticker shows a herdr notification instead.
             nudge: false,
-            talk: false,
+            talk: None,
             roles: std::collections::BTreeMap::new(),
             repos: Vec::new(),
         }
@@ -282,6 +284,17 @@ pub struct Coordinator {
     pub prime_pending: bool,
     pub launch_attempts: u32,
     pub updated: String,
+    /// The coordinator's launch recipe from the `coordinator` role (SPEC-ADE
+    /// D2), stored at `open` and reused by the ticker's relaunch. `attempt`
+    /// counts coordinator tabs; `brief_hash` is the SHA-256 of `PROJECT.md`
+    /// at `open`. Both reach the pane in `HERDR_ADE_LAUNCH` (D14).
+    pub launch: crate::contracts::LaunchRecipe,
+    /// The priming line was submitted for this binding. Transport is not the
+    /// receipt: `prime_pending` clears only on the `ha context` receipt, and
+    /// the ticker never re-sends a submitted line on its own (D14).
+    pub prime_sent: bool,
+    /// `"acknowledged"` after the matching bootstrap call (D14).
+    pub bootstrap: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -604,6 +617,46 @@ pub fn tab_env(
         }
     }
     env
+}
+
+/// `HERDR_ADE_LAUNCH=<project>/<thread>/<attempt>/<brief hash>` (SPEC-ADE
+/// D4, D14), parsed. The thread is `coordinator` for a coordinator pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEnv {
+    pub project: String,
+    pub thread: String,
+    pub attempt: u32,
+    pub brief_hash: String,
+}
+
+impl LaunchEnv {
+    pub fn parse(value: &str) -> Option<LaunchEnv> {
+        let mut parts = value.trim().split('/');
+        let project = parts.next()?.to_string();
+        let thread = parts.next()?.to_string();
+        let attempt = parts.next()?.parse().ok()?;
+        let brief_hash = parts.next()?.to_string();
+        if parts.next().is_some()
+            || project.is_empty()
+            || thread.is_empty()
+            || brief_hash.is_empty()
+        {
+            return None;
+        }
+        Some(LaunchEnv {
+            project,
+            thread,
+            attempt,
+            brief_hash,
+        })
+    }
+
+    /// The pane's own value, `None` when unset or malformed.
+    pub fn from_process() -> Option<LaunchEnv> {
+        std::env::var("HERDR_ADE_LAUNCH")
+            .ok()
+            .and_then(|value| LaunchEnv::parse(&value))
+    }
 }
 
 /// Day-one role names, for doctor.
@@ -960,10 +1013,10 @@ mod tests {
         let text = std::fs::read_to_string(project.project_md()).unwrap();
         let front = project_md_front(&text).unwrap();
         assert!(legacy_agent_keys(front).is_empty(), "{front}");
-        assert!(front.contains("talk = false"));
+        assert!(!front.contains("talk"), "{front}");
         let (settings, _) = parse_project_md(&text).unwrap();
         assert_eq!(settings.coordinator_agent, "claude");
-        assert!(!settings.talk);
+        assert_eq!(settings.talk, None);
     }
 
     #[test]

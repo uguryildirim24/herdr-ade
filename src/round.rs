@@ -402,35 +402,20 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
 /// closed. A1's record carries `attempt`; a base-plugin record has none and
 /// is attempt 1.
 pub fn thread_attempt(project: &Project, id: &str) -> Result<u32> {
-    let value = thread_value(project, id)?;
-    let attempt = value
-        .get("attempt")
-        .and_then(toml::Value::as_integer)
-        .or_else(|| {
-            value
-                .get("launch")
-                .and_then(|l| l.get("attempt"))
-                .and_then(toml::Value::as_integer)
-        })
-        .unwrap_or(1);
-    Ok(u32::try_from(attempt).unwrap_or(1).max(1))
+    Ok(thread_record(project, id)?.attempt.max(1))
 }
 
 /// The thread's birth sentence (`plain` on A1's record), or empty.
 pub fn thread_plain(project: &Project, id: &str) -> String {
-    thread_value(project, id)
-        .ok()
-        .and_then(|v| v.get("plain").and_then(|p| p.as_str().map(str::to_string)))
+    thread_record(project, id)
+        .map(|t| t.plain)
         .unwrap_or_default()
 }
 
-fn thread_value(project: &Project, id: &str) -> Result<toml::Value> {
-    thread::validate_id(id)?;
-    let path = thread::record_path(project, id);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("thread_unreadable: {} ({e})", path.display()))?;
-    toml::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("thread_unreadable: {} does not parse ({e})", path.display()))
+/// A1's typed record. Unreadable fails closed: a round decision never
+/// treats a record it cannot read as absent (D6).
+fn thread_record(project: &Project, id: &str) -> Result<thread::Thread> {
+    thread::load(project, id).map_err(|e| anyhow::anyhow!("thread_unreadable: {e:#}"))
 }
 
 // ------------------------------------------------------------------- events
@@ -1791,14 +1776,7 @@ pub mod testkit {
         }
 
         pub fn set_attempt(&self, id: &str, attempt: u32) {
-            let path = thread::record_path(&self.project, id);
-            let text = std::fs::read_to_string(&path).unwrap();
-            let kept: String = text
-                .lines()
-                .filter(|l| !l.starts_with("attempt ="))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            std::fs::write(&path, format!("attempt = {attempt}\n{kept}")).unwrap();
+            thread::update(&self.project, id, |t| t.attempt = attempt).unwrap();
         }
 
         /// Writes the artifact and a sealed `done` event, as A2's seal would.

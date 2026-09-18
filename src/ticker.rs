@@ -626,11 +626,20 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         .iter()
         .find(|a| coordinator::agent_matches(&record, a));
     if let Some(agent) = agent {
-        if record.prime_pending && agent.ready() {
+        // One priming line per binding. Transport is not the receipt: an ADE
+        // binding clears `prime_pending` only on its `ha context` receipt, and
+        // a submitted line is never re-sent on a timer (SPEC-ADE D14).
+        if record.prime_pending && !record.prime_sent && agent.ready() {
             let prefix = coordinator::current_prefix(&ctx.root)?;
+            let receipted = !record.launch.brief_hash.is_empty();
             match herdr.agent_prompt(&record.pane_id, &coordinator::priming_prompt(&prefix, slug)) {
                 Ok(()) => {
-                    project.update_coordinator(|c| c.prime_pending = false)?;
+                    project.update_coordinator(|c| {
+                        c.prime_sent = true;
+                        if !receipted {
+                            c.prime_pending = false;
+                        }
+                    })?;
                 }
                 Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
             }
@@ -787,15 +796,27 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {
             may_start = false;
             let started = (|| -> Result<()> {
-                project.update_coordinator(|c| c.launch_attempts += 1)?;
-                let (settings, _) = project.read_project_md()?;
-                let safety = project.safety(&ctx.config_dir)?;
-                herdr.agent_start(
-                    &record.agent_name,
-                    &settings.coordinator_agent,
-                    &record.pane_id,
-                    &safety.coordinator_agent_args,
-                )?;
+                project.update_coordinator(|c| {
+                    c.launch_attempts += 1;
+                    c.prime_sent = false;
+                })?;
+                // The recipe stored at `open`, never rebuilt from settings
+                // that may have changed since (SPEC-ADE D2).
+                let launch = if record.launch.kind.is_empty() {
+                    let (settings, _) = project.read_project_md()?;
+                    let spec = crate::project::resolve_role(&ctx.config_dir, &settings, "coordinator")?;
+                    crate::project::launch_recipe(&spec, 0, String::new(), String::new())
+                } else {
+                    record.launch.clone()
+                };
+                herdr.agent_start_opts(&crate::herdr::AgentStart {
+                    name: &record.agent_name,
+                    kind: &launch.kind,
+                    pane: &record.pane_id,
+                    agent_args: &launch.args,
+                    parent: None,
+                    ready_timeout_ms: launch.ready_timeout_ms,
+                })?;
                 Ok(())
             })();
             errors.extend(started.err());

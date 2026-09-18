@@ -19,7 +19,7 @@ struct Binding {
 pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     let binding = current_lane(ctx)?;
     let recipient = recipient(&binding.project)?;
-    let attempt = binding.thread.launch_attempts.max(1);
+    let attempt = binding.thread.attempt.max(1);
     let op = ops::reserve(
         &binding.project,
         &binding.thread.id,
@@ -53,7 +53,7 @@ pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
     let binding = current_lane(ctx)?;
     let text = bounded_waiting(text)?;
     let recipient = recipient(&binding.project)?;
-    let attempt = binding.thread.launch_attempts.max(1);
+    let attempt = binding.thread.attempt.max(1);
     let op = ops::reserve(
         &binding.project,
         &binding.thread.id,
@@ -99,7 +99,7 @@ fn validate_current(
     op: &crate::contracts::Op,
 ) -> Result<()> {
     let current = thread::load(project, id)?;
-    if current.launch_attempts.max(1) != attempt || current.pane_id != pane_id()? {
+    if current.attempt.max(1) != attempt || current.pane_id != pane_id()? {
         bail!("stale_attempt: lane binding changed before seal");
     }
     let recipient = recipient(project)?;
@@ -190,37 +190,53 @@ struct BootstrapReceipt {
 pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
     match role {
         "coordinator" => print!("{}", include_str!("../skill/COORDINATOR.md")),
-        "lane" => {
+        "lane" | "reviewer" | "critic" | "drafter" => {
             let binding = current_lane(ctx)?;
+            let recorded = match binding.thread.role.as_str() {
+                "" => "lane",
+                other => other,
+            };
+            if recorded != role {
+                bail!(
+                    "bootstrap_mismatch: this pane is a `{recorded}` thread; run `skill {recorded}`"
+                );
+            }
             acknowledge_bootstrap(&binding)?;
-            print!("{}", include_str!("../skill/LANE.md"));
+            print!(
+                "{}",
+                match role {
+                    "reviewer" => include_str!("../skill/REVIEWER.md"),
+                    "critic" => include_str!("../skill/CRITIC.md"),
+                    "drafter" => include_str!("../skill/DRAFTER.md"),
+                    _ => include_str!("../skill/LANE.md"),
+                }
+            );
         }
-        "reviewer" | "critic" | "drafter" | "pickup" => {
-            bail!("skill_unavailable: `{role}` is supplied by ade-rounds")
-        }
+        "pickup" => print!("{}", include_str!("../skill/PICKUP.md")),
         _ => bail!("unknown role `{role}`"),
     }
     print_rules(&ctx.config_dir)
 }
 
 fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
-    let raw = std::env::var("HERDR_ADE_LAUNCH")
-        .context("bootstrap_mismatch: launch receipt is missing")?;
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).context("bootstrap_mismatch: HERDR_ADE_LAUNCH is not JSON")?;
-    let project = value["project"].as_str().unwrap_or_default();
-    let thread = value["thread"].as_str().unwrap_or_default();
-    let attempt = value["attempt"].as_u64().unwrap_or_default() as u32;
-    let brief_hash = value["brief_hash"].as_str().unwrap_or_default();
+    let launch = project::LaunchEnv::from_process()
+        .context("bootstrap_mismatch: HERDR_ADE_LAUNCH is missing or malformed")?;
     let pane = pane_id()?;
-    if project != binding.project.slug
-        || thread != binding.thread.id
-        || attempt != binding.thread.launch_attempts.max(1)
-        || brief_hash.is_empty()
-        || pane != binding.thread.pane_id
+    let lane = &binding.thread;
+    if launch.project != binding.project.slug
+        || launch.thread != lane.id
+        || launch.attempt != lane.attempt.max(1)
+        || launch.brief_hash != lane.launch.brief_hash
+        || pane != lane.pane_id
     {
         bail!("bootstrap_mismatch: launch receipt does not match this lane");
     }
+    let (project, thread, attempt, brief_hash) = (
+        launch.project.as_str(),
+        launch.thread.as_str(),
+        launch.attempt,
+        launch.brief_hash.as_str(),
+    );
     let dir = binding.project.state_dir().join("bootstrap");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", binding.thread.id));
@@ -234,7 +250,11 @@ fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
             eprintln!("bootstrap already accepted");
             return Ok(());
         }
-        bail!("bootstrap_mismatch: a different receipt is already recorded");
+        // A restart is a new attempt with a new receipt; an older one is kept
+        // on the record only as history, never as authority.
+        if receipt.attempt >= attempt {
+            bail!("bootstrap_mismatch: a different receipt is already recorded");
+        }
     }
     project::write_json(
         &path,
@@ -246,7 +266,11 @@ fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
             pane,
             acknowledged: project::now(),
         },
-    )
+    )?;
+    thread::update(&binding.project, &binding.thread.id, |t| {
+        t.bootstrap = "acknowledged".into();
+    })?;
+    Ok(())
 }
 
 pub fn print_rules(config_dir: &Path) -> Result<()> {

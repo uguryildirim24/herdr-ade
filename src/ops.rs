@@ -295,7 +295,7 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
                 let current = crate::thread::load(project, &op.thread);
                 let coordinator = project.coordinator();
                 let valid = current.as_ref().is_ok_and(|thread| {
-                    thread.launch_attempts.max(1) == op.attempt
+                    thread.attempt.max(1) == op.attempt
                         && thread.pane_id != op.recipient.pane
                 }) && coordinator.as_ref().is_some_and(|record| {
                     record.pane_id == op.recipient.pane
