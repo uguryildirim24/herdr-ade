@@ -5,7 +5,7 @@ with recovery after a crash at any point), the spec dialogue between two lanes, 
 the Spaces tab, questions to Rolf as picturable choices, the glossary and "explain", and the
 talk tab: the plugin's own conversation window where only checked replies appear.
 
-Start line (for a restart after GONE): `herdr agent start a3 --kind <kind> --pane <pane> --parent w1F:p1 -- <flags per HANDOFF>`
+Start line (for a restart after GONE): `herdr agent start a3 --kind claude --pane w1F:p11 --parent w1F:p1 -- --model claude-opus-5 --effort high --dangerously-skip-permissions`
 
 ## Owned files (SPEC-ADE §4.2, lane A3)
 

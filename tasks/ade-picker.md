@@ -6,7 +6,7 @@ switch the lane away from the usual helper only when it is sure. It ships switch
 first only recording what it would have picked, so Rolf can compare it with his own choices
 for a month.
 
-Start line (for a restart after GONE): `herdr agent start a4 --kind <kind> --pane <pane> --parent w1F:p1 -- <flags per HANDOFF>`
+Start line (for a restart after GONE): `herdr agent start a4 --kind opencode --pane w1F:p12 --parent w1F:p1 -- --model opencode-go/deepseek-v4.1-flash`
 
 ## Spec
 
