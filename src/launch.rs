@@ -768,6 +768,15 @@ pub struct ResolveInput<'a> {
 /// Resolve one launch before any tab or worktree exists
 /// (SPEC-jev-picker v2 §2 and §3).
 pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
+    // Pro is started by pro-mcp and adopted; the coordinator is opened by
+    // `open`. Neither is ever launched from the table (SPEC-jev-picker v2 §2,
+    // SPEC-ADE D7).
+    if NEVER_RESOLVED.contains(&input.role) {
+        bail!(
+            "role_not_resolved: role `{}` is never launched by the picker",
+            input.role
+        );
+    }
     let config = parse_picker_config(&ctx.config_dir, input.opted_in)?;
     let kinds = agent_kinds(ctx.env, ctx.runner)?;
     validate_config(&config, &kinds)?;
@@ -2252,6 +2261,28 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
                 .any(|row| row.label == "picker recipes" && row.ok == Some(true)),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn pro_and_the_coordinator_never_resolve() {
+        let (world, project, task) = world("shadow", "x");
+        with_help(&world);
+        let ctx = world.ctx();
+        for role in ["pro", "coordinator"] {
+            let error = resolve_launch(
+                &ctx,
+                &project,
+                &ResolveInput {
+                    role,
+                    task: &task,
+                    opted_in: true,
+                    ..ResolveInput::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("role_not_resolved"), "{error:#}");
+        }
+        assert_eq!(world.runner.count("/usr/bin/curl"), 0);
     }
 
     #[test]
