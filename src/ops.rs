@@ -262,7 +262,6 @@ fn event_from_op(op: &Op) -> Result<Event> {
     })
 }
 
-#[allow(dead_code)] // called by A1's ticker integration through `tick`
 pub fn abandon(project: &Project, id: &str) -> Result<Op> {
     let _lock = project.lock()?;
     let mut op = load(project, id)?;
@@ -277,43 +276,58 @@ pub fn abandon(project: &Project, id: &str) -> Result<Op> {
 /// A2 ticker pass. A1 wires this from its ticker with the existing `Ctx` and
 /// project. Staged operations are sealable from their own durable payload;
 /// reserved operations are abandoned only when their exact helper is dead.
-#[allow(dead_code)] // reviewer seam; A1 owns the ticker call site
 pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    let mut first: Option<anyhow::Error> = None;
     for op in list(project) {
-        match op.state {
-            OpState::Reserved if !pid_alive(ctx.runner, op.helper_pid) => {
-                abandon(project, &op.op)?;
-                crate::inbox::write(
-                    project,
-                    "preparation-abandoned",
-                    &op.thread,
-                    "completion preparation was abandoned",
-                    "",
-                )?;
-            }
-            OpState::Staged => {
-                let current = crate::thread::load(project, &op.thread);
-                let coordinator = project.coordinator();
-                let valid = current.as_ref().is_ok_and(|thread| {
-                    thread.attempt.max(1) == op.attempt
-                        && thread.pane_id != op.recipient.pane
-                }) && coordinator.as_ref().is_some_and(|record| {
-                    record.pane_id == op.recipient.pane
-                        && record.launch_attempts.max(1) == op.recipient.coordinator_attempt
-                });
-                if valid {
-                    let _ = seal(project, &op.op, |_| Ok(()))?;
-                } else {
-                    abandon(project, &op.op)?;
-                }
-            }
-            _ => {}
+        if let Err(error) = tick_op(ctx, project, &op) {
+            first.get_or_insert(error.context(format!("op {}", op.op)));
         }
     }
-    crate::steps::deliver_events(ctx, project)
+    let delivered = crate::steps::deliver_events(ctx, project);
+    match first {
+        Some(error) => Err(error),
+        None => delivered,
+    }
 }
 
-#[allow(dead_code)] // reachable once A1 wires `tick`
+/// X1 and X2 for one operation (D5).
+fn tick_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
+    let current = crate::thread::load(project, &op.thread);
+    let superseded = current
+        .as_ref()
+        .is_ok_and(|thread| thread.attempt.max(1) != op.attempt);
+    match op.state {
+        // X1: the helper is dead, or the lane's attempt was superseded.
+        OpState::Reserved if superseded || !pid_alive(ctx.runner, op.helper_pid) => {
+            abandon(project, &op.op)?;
+            crate::inbox::write(
+                project,
+                "preparation-abandoned",
+                &op.thread,
+                "completion preparation was abandoned",
+                "",
+            )?;
+        }
+        // X2: seal from the op's own payload when the bindings still match.
+        OpState::Staged => {
+            let coordinator = project.coordinator();
+            let valid = current.as_ref().is_ok_and(|thread| {
+                thread.attempt.max(1) == op.attempt && thread.pane_id != op.recipient.pane
+            }) && coordinator.as_ref().is_some_and(|record| {
+                record.pane_id == op.recipient.pane
+                    && record.attempt() == op.recipient.coordinator_attempt
+            });
+            if valid {
+                let _ = seal(project, &op.op, |_| Ok(()))?;
+            } else {
+                abandon(project, &op.op)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn pid_alive(runner: &dyn Runner, pid: u32) -> bool {
     runner
         .run(

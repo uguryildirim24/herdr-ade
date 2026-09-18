@@ -216,7 +216,7 @@ pub fn acknowledge_events(
         let event = crate::events::load(project, &item.event)?;
         let binding_matches = if item.kind == "recipient-changed" {
             project.coordinator().is_some_and(|record| {
-                record.pane_id == pane && record.launch_attempts.max(1) == coordinator_attempt
+                record.pane_id == pane && record.attempt() == coordinator_attempt
             })
         } else {
             event.recipient.pane == pane
@@ -288,7 +288,7 @@ pub fn done_bound(
             };
             let binding_matches = if item.kind == "recipient-changed" {
                 project.coordinator().is_some_and(|record| {
-                    record.pane_id == pane && record.launch_attempts.max(1) == attempt
+                    record.pane_id == pane && record.attempt() == attempt
                 })
             } else {
                 event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt
@@ -461,7 +461,7 @@ mod tests {
         project
             .update_coordinator(|record| {
                 record.pane_id = "w2:p1".into();
-                record.launch_attempts = 3;
+                record.generation = 3;
             })
             .unwrap();
         let event = crate::contracts::Event {

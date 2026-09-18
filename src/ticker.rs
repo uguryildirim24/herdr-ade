@@ -666,10 +666,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     if let Err(error) = crate::threads::tick(&mut ticker) {
         first_error = first_error.or(Some(error));
     }
-    // Reviewer wires A2/A3/A4 here:
-    // crate::ops::tick(&mut ticker)?;
-    // crate::round::tick(&mut ticker)?;
-    // crate::picker::tick(&mut ticker)?;
+    // The ops pass (A2) and the rounds pass (A3) run in the slow pass,
+    // outside the project lock (SPEC-ADE item 57). The picker (A4) has no
+    // tick: it runs at launch time.
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(
         coordinator_recorded == 1
@@ -798,6 +797,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             let started = (|| -> Result<()> {
                 project.update_coordinator(|c| {
                     c.launch_attempts += 1;
+                    c.generation += 1;
                     c.prime_sent = false;
                 })?;
                 // The recipe stored at `open`, never rebuilt from settings
@@ -930,6 +930,19 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             ));
         }
     }
+    // D5 recovery and delivery (X1 to X5), then rounds, asks, talk and the
+    // board (D6, D17, D18). Each takes the project lock only for its own
+    // file writes; git and herdr run outside it.
+    errors.extend(
+        crate::ops::tick(ctx, project)
+            .err()
+            .map(|e| e.context("ops")),
+    );
+    errors.extend(
+        crate::round::tick(ctx, project)
+            .err()
+            .map(|e| e.context("rounds")),
+    );
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
@@ -1161,7 +1174,8 @@ mod tests {
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 0);
         assert_eq!(runner.count("agent start"), 0);
-        assert_eq!(runner.count("report-metadata"), 0);
+        // The board (workspace tokens) still publishes; the pane is untouched.
+        assert_eq!(runner.count("pane report-metadata"), 0);
     }
 
     #[test]
