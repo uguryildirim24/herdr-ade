@@ -5,10 +5,13 @@ plugin for his herdr fork (SPEC-ADE v3.1). Six lanes built it as packages
 A0 `ade-contracts` (`lane/ade-contracts` 20fd9e9c), A1 `ade-core` (`lane/ade-core`
 1a947922), A2 `ade-outbox` (`lane/ade-outbox` 2d8ff3a1), A3 `ade-rounds`
 (`lane/ade-rounds` 99e1c0e9), A4 `ade-picker` (`lane/ade-picker` 0d3e706e) and A5 `ade-pi`
-(`lane/ade-pi` d6f71088). A1 to A5 all branch from A0's pin 20fd9e9c. You merge them
-into one candidate, own every seam, wire what the lanes left for you, inspect and **fix**
-every package yourself, run every gate and the §4.3 acceptance, and write one verdict.
-Nothing reaches `main` before your verdict.
+(`lane/ade-pi` d6f71088). A1 to A5 all branch from A0's pin 20fd9e9c. The surface is about
+26,000 added lines, so this round has two reviewers: **you own the candidate, every seam, the
+wiring, the gates, the acceptance and the verdict**; a second reviewer (`reviewer-b`, brief
+`tasks/review-plugin-r1-b.md`) inspects and fixes A4 and A5 on their own lane branches in
+parallel and hands them to you through the coordinator. You merge A0 to A3 now and A4, A5
+when the coordinator prompts you `MERGE A4 <sha> A5 <sha>`. Nothing reaches `main` before
+your verdict.
 
 ## Setup
 
@@ -35,8 +38,11 @@ Nothing reaches `main` before your verdict.
   `~/.herdr-ade`, `~/.herdr-projects`, `~/.pi`, `~/.local/bin`, `~/.claude`, `~/.codex`,
   `~/.cursor`. Never type a `/login` anywhere. Rolf's live server (four builds in it):
   never `herdr server stop`, `herdr server restart`, `herdr update`. Real `claude` panes in
-  your throwaway session are fine (they run as Rolf, nothing is copied); hooks go only into
-  the throwaway project's own `.claude/settings.json`, never Rolf's home. No Cursor pane
+  your throwaway session are fine (they run as Rolf, nothing is copied), and **every one of
+  them runs Haiku**: `-- --model claude-haiku-4-5-20251001 --dangerously-skip-permissions`,
+  and the throwaway project's roles table pins that model for every Claude role; never Opus
+  or Sonnet in a throwaway pane (Rolf, 19:15). Hooks go only into the throwaway project's own
+  `.claude/settings.json`, never Rolf's home. No Cursor pane
   (quota gone, Cursor is retired after the port) and no Codex pane for acceptance rows:
   those rows are NOT-RUN with that reason.
 - Start line (for a restart after GONE; Rolf names the helper, the coordinator keeps this
@@ -52,8 +58,14 @@ Nothing reaches `main` before your verdict.
    reports pasted below. Base line references with the `hp:` prefix mean this repository at
    a4cdb0a.
 2. Merge in this order, resolving each seam yourself, one merge commit each:
-   `git merge lane/ade-contracts`, then `lane/ade-core`, `lane/ade-outbox`, `lane/ade-rounds`,
-   `lane/ade-picker`, `lane/ade-pi`. Known seams: the marked `ade-<pkg> begin/end` blocks in
+   `git merge lane/ade-contracts`, then `lane/ade-core`, `lane/ade-outbox`, `lane/ade-rounds`
+   now; `lane/ade-picker` and `lane/ade-pi` only after the coordinator's prompt
+   `MERGE A4 <sha> A5 <sha>` (reviewer-b's fixes land on those branches first, so their heads
+   move past 0d3e706e and d6f71088; merge the shas the prompt names). Do everything for A0 to
+   A3 first (steps 3 to 6 as far as they reach without A4 and A5); if you get there before the
+   prompt, push `WAITING review-plugin-r1 A4 and A5 from reviewer-b` with the closing lines
+   below and stop; after the prompt, merge, wire A4 and A5, and rerun every gate and the
+   acceptance on the full candidate. Known seams: the marked `ade-<pkg> begin/end` blocks in
    `src/main.rs` and `src/cli.rs` (keep every block; A5's is five lines with a
    `#[path = "pi/ade.rs"]` module); the additive `contracts(<pkg>)` commits on
    `src/contracts.rs` (adjacent-line conflicts, keep every field, one `RoundRecord`, one
