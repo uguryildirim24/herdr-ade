@@ -37,7 +37,7 @@ The plugin never runs a login and never sees a key. Rolf runs
 | Provider | What he does once |
 |---|---|
 | `openai-codex` | `/login`, "ChatGPT Plus/Pro (Codex)", finish in the browser or with the device code |
-| `opencode-go` | `/login`, "Use an API key", OpenCode Go (the Go plan's key; Zen is the separate `opencode` provider) |
+| `opencode-go` | `/login`, "Use an API key", OpenCode Go (the Go plan's key) |
 | `kimi-coding` | `/login`; use the device flow when the screen shows it, else paste the key |
 
 One login serves every pi lane. A lane that starts without a login is

@@ -853,10 +853,10 @@ mod tests {
             ok(r#"{"status":"not_ready","reason":"credentials_not_configured"}"#),
         );
         runner.on(
-            "auth check --provider opencode",
+            "auth check --provider opencode-go",
             ok(r#"{"status":"ready"}"#),
         );
-        let rows = doctor_rows_with(&env, &layout, &runner, &["kimi-coding", "opencode"]);
+        let rows = doctor_rows_with(&env, &layout, &runner, &["kimi-coding", "opencode-go"]);
         let text: Vec<String> = rows.iter().map(Row::line).collect();
         assert!(
             text.iter()
@@ -865,7 +865,8 @@ mod tests {
             "{text:?}"
         );
         assert!(
-            text.iter().any(|l| l.contains("[ok  ] provider opencode")),
+            text.iter()
+                .any(|l| l.contains("[ok  ] provider opencode-go")),
             "{text:?}"
         );
     }

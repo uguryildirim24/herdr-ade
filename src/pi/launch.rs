@@ -13,9 +13,8 @@ use anyhow::{Result, bail};
 
 /// The provider and model names this round is allowed to start. The role
 /// table and Jev recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
-/// `opencode-go` is the OpenCode Go plan (the Muse row, SPEC-ADE §6 item 65);
-/// `opencode` is Zen.
-pub const PROVIDERS: [&str; 4] = ["openai-codex", "opencode", "opencode-go", "kimi-coding"];
+/// `opencode-go` is the OpenCode Go plan (the Muse row, SPEC-ADE §6 item 65).
+pub const PROVIDERS: [&str; 3] = ["openai-codex", "opencode-go", "kimi-coding"];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
 /// `pi_args_forbidden`. `-na` is `--no-approve`'s short form (§1) and
@@ -433,7 +432,7 @@ mod tests {
     fn the_provider_column_must_match() {
         let row = args(&["--provider", "kimi-coding", "--model", "x", "--no-skills"]);
         assert!(validate_provider_column("kimi-coding", &row).is_ok());
-        assert!(validate_provider_column("opencode", &row).is_err());
+        assert!(validate_provider_column("opencode-go", &row).is_err());
     }
 
     /// The wrapper, run for real with `sh` and a fake `node` that prints
