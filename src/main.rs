@@ -1,6 +1,8 @@
 mod actions;
 mod adopt;
 mod cli;
+#[allow(dead_code)]
+mod contracts;
 mod coordinator;
 mod doctor;
 mod herdr;
