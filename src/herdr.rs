@@ -163,12 +163,70 @@ pub struct Agent {
     pub agent_status: String,
     #[serde(default)]
     pub cwd: String,
+    /// Pane tokens from `agent list` (SPEC-ADE D3).
+    #[serde(default)]
+    pub tokens: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct AgentSession {
+    #[serde(default)]
+    pub id: String,
 }
 
 impl Agent {
     /// The one "ready for a prompt" predicate: state `idle` or `done`.
     pub fn ready(&self) -> bool {
         ready_state(&self.agent_status)
+    }
+
+    pub fn parent(&self) -> Option<&str> {
+        self.tokens.get("parent").map(String::as_str)
+    }
+}
+
+/// Arguments for `agent start` including `--parent` and `ready_timeout_ms`.
+#[derive(Debug, Clone)]
+pub struct AgentStart<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub pane: &'a str,
+    pub agent_args: &'a [String],
+    pub parent: Option<&'a str>,
+    pub ready_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct ProcessInfo {
+    #[serde(default)]
+    pub pane_id: String,
+    #[serde(default)]
+    pub foreground_processes: Vec<ForegroundProcess>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct ForegroundProcess {
+    pub pid: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub argv0: Option<String>,
+}
+
+impl ProcessInfo {
+    /// First foreground process, used as identity evidence (SPEC-ADE D3).
+    pub fn identity(&self) -> Option<crate::contracts::ProcessIdentity> {
+        let proc = self.foreground_processes.first()?;
+        Some(crate::contracts::ProcessIdentity {
+            pid: proc.pid,
+            argv0: proc
+                .argv0
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| proc.name.clone()),
+        })
     }
 }
 
@@ -291,23 +349,42 @@ impl<'a> Herdr<'a> {
         label: &str,
         focus: bool,
     ) -> Result<Created, HerdrError> {
+        self.tab_create_env(workspace, cwd, label, focus, &[])
+    }
+
+    /// `tab create` with `--env KEY=VALUE` (SPEC-ADE D4).
+    pub fn tab_create_env(
+        &self,
+        workspace: &str,
+        cwd: &Path,
+        label: &str,
+        focus: bool,
+        env: &[String],
+    ) -> Result<Created, HerdrError> {
         let cwd = cwd.to_string_lossy();
         let focus = if focus { "--focus" } else { "--no-focus" };
-        let result = self.call(
-            &[
-                "tab",
-                "create",
-                "--workspace",
-                workspace,
-                "--cwd",
-                &cwd,
-                "--label",
-                label,
-                focus,
-            ],
-            CALL_TIMEOUT,
-        )?;
+        let mut args = vec![
+            "tab".to_string(),
+            "create".to_string(),
+            "--workspace".to_string(),
+            workspace.to_string(),
+            "--cwd".to_string(),
+            cwd.into_owned(),
+            "--label".to_string(),
+            label.to_string(),
+            focus.to_string(),
+        ];
+        for pair in env {
+            args.push("--env".into());
+            args.push(pair.clone());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = self.call(&borrowed, CALL_TIMEOUT)?;
         Self::created(&result)
+    }
+
+    pub fn tab_close(&self, tab: &str) -> Result<(), HerdrError> {
+        self.call(&["tab", "close", tab], CALL_TIMEOUT).map(|_| ())
     }
 
     /// Creates a worktree-backed workspace. Returns the ids and the checkout
@@ -410,11 +487,23 @@ impl<'a> Herdr<'a> {
 
     /// The working directory herdr reports for a new tab's pane.
     pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
+        Ok(self.pane_get(pane)?.cwd)
+    }
+
+    pub fn pane_get(&self, pane: &str) -> Result<Pane, HerdrError> {
         let result = self.call(&["pane", "get", pane], CALL_TIMEOUT)?;
-        Ok(result["pane"]["cwd"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        serde_json::from_value(result["pane"].clone()).map_err(|e| HerdrError {
+            code: "failed".into(),
+            message: format!("`herdr pane get` reply changed: {e}"),
+        })
+    }
+
+    pub fn pane_process_info(&self, pane: &str) -> Result<ProcessInfo, HerdrError> {
+        let result = self.call(&["pane", "process-info", "--pane", pane], CALL_TIMEOUT)?;
+        serde_json::from_value(result["process_info"].clone()).map_err(|e| HerdrError {
+            code: "failed".into(),
+            message: format!("`herdr pane process-info` reply changed: {e}"),
+        })
     }
 
     /// Starts an agent in a pane that is at a shell prompt. Success means herdr
@@ -426,24 +515,41 @@ impl<'a> Herdr<'a> {
         pane: &str,
         agent_args: &[String],
     ) -> Result<Agent, HerdrError> {
-        let timeout_ms = AGENT_START_TIMEOUT.as_millis().to_string();
-        let mut args = vec![
-            "agent",
-            "start",
+        self.agent_start_opts(&AgentStart {
             name,
-            "--kind",
             kind,
-            "--pane",
             pane,
-            "--timeout",
-            &timeout_ms,
+            agent_args,
+            parent: None,
+            ready_timeout_ms: AGENT_START_TIMEOUT.as_millis() as u64,
+        })
+    }
+
+    /// `agent start` with `--parent` and `ready_timeout_ms` (SPEC-ADE D2, D3).
+    pub fn agent_start_opts(&self, opts: &AgentStart<'_>) -> Result<Agent, HerdrError> {
+        let timeout_ms = opts.ready_timeout_ms.to_string();
+        let mut args = vec![
+            "agent".to_string(),
+            "start".to_string(),
+            opts.name.to_string(),
+            "--kind".to_string(),
+            opts.kind.to_string(),
+            "--pane".to_string(),
+            opts.pane.to_string(),
+            "--timeout".to_string(),
+            timeout_ms,
         ];
-        if !agent_args.is_empty() {
-            args.push("--");
-            args.extend(agent_args.iter().map(String::as_str));
+        if let Some(parent) = opts.parent.filter(|p| !p.is_empty()) {
+            args.push("--parent".into());
+            args.push(parent.to_string());
         }
-        // herdr enforces the timeout itself; the outer deadline only guards a hang.
-        let result = self.call(&args, AGENT_START_TIMEOUT + Duration::from_secs(5))?;
+        if !opts.agent_args.is_empty() {
+            args.push("--".into());
+            args.extend(opts.agent_args.iter().cloned());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let wait = Duration::from_millis(opts.ready_timeout_ms) + Duration::from_secs(5);
+        let result = self.call(&borrowed, wait)?;
         serde_json::from_value(result["agent"].clone()).map_err(|e| HerdrError {
             code: "failed".into(),
             message: format!("`herdr agent start` reply changed: {e}"),
@@ -505,6 +611,36 @@ impl<'a> Herdr<'a> {
         }
         self.call(&args, CALL_TIMEOUT).map(|_| ())
     }
+
+    /// Adopt / reconcile parent token: pane path, no TTL (SPEC-ADE D3).
+    pub fn pane_set_parent(&self, pane: &str, parent: &str) -> Result<(), HerdrError> {
+        let token = format!("parent={parent}");
+        self.call(
+            &[
+                "pane",
+                "report-metadata",
+                pane,
+                "--source",
+                SOURCE,
+                "--token",
+                &token,
+            ],
+            CALL_TIMEOUT,
+        )
+        .map(|_| ())
+    }
+}
+
+/// True when `herdr agent start --help` names `--parent` (the r2 fork).
+pub fn parent_on_start_supported(bin: &str, runner: &dyn Runner) -> bool {
+    runner
+        .run(&bare(bin).args(["agent", "start", "--help"]))
+        .ok()
+        .map(|out| {
+            let text = format!("{}{}", out.stdout, out.stderr);
+            text.contains("--parent")
+        })
+        .unwrap_or(false)
 }
 
 pub const SOURCE: &str = "herdr-ade";
@@ -575,5 +711,75 @@ mod tests {
         assert_eq!(parse_version("herdr"), None);
         assert!(Version(0, 9, 0) < MIN_VERSION);
         assert!(Version(0, 10, 0) > MIN_VERSION);
+    }
+
+    #[test]
+    fn agent_start_opts_passes_parent_and_timeout() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "--parent",
+            ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"lane","tokens":{"parent":"w1:p1"}}}}"#),
+        );
+        let herdr = Herdr::new("herdr", "/tmp/x.sock", &runner);
+        let args = vec!["--force".to_string()];
+        let agent = herdr
+            .agent_start_opts(&AgentStart {
+                name: "lane",
+                kind: "cursor",
+                pane: "w2:p1",
+                agent_args: &args,
+                parent: Some("w1:p1"),
+                ready_timeout_ms: 30_000,
+            })
+            .unwrap();
+        assert_eq!(agent.parent(), Some("w1:p1"));
+        let call = runner.calls.borrow();
+        let line = call[0].display();
+        assert!(line.contains("--parent w1:p1"), "{line}");
+        assert!(line.contains("--timeout 30000"), "{line}");
+        assert!(line.contains("--force"), "{line}");
+    }
+
+    #[test]
+    fn tab_create_env_passes_launch_variable() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "HERDR_ADE_LAUNCH",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#),
+        );
+        let herdr = Herdr::new("herdr", "/tmp/x.sock", &runner);
+        let created = herdr
+            .tab_create_env(
+                "w1",
+                Path::new("/wt"),
+                "t-0001",
+                false,
+                &["HERDR_ADE_LAUNCH=demo/t-0001/1/abcd".into()],
+            )
+            .unwrap();
+        assert_eq!(created.pane_id, "w1:p2");
+        let line = runner.calls.borrow()[0].display();
+        assert!(
+            line.contains("--env HERDR_ADE_LAUNCH=demo/t-0001/1/abcd"),
+            "{line}"
+        );
+        assert!(line.contains("--no-focus"), "{line}");
+    }
+
+    #[test]
+    fn process_info_identity_uses_argv0() {
+        let info = ProcessInfo {
+            pane_id: "w2:p1".into(),
+            foreground_processes: vec![ForegroundProcess {
+                pid: 9,
+                name: "cursor-agent".into(),
+                argv0: Some("/bin/cursor-agent".into()),
+            }],
+        };
+        let id = info.identity().unwrap();
+        assert_eq!(id.pid, 9);
+        assert_eq!(id.argv0, "/bin/cursor-agent");
     }
 }

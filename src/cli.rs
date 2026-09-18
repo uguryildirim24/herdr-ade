@@ -192,6 +192,14 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
+        // ade-core begin
+        /// Birth sentence (SPEC-ADE D17 item 6)
+        #[arg(long)]
+        plain: Option<String>,
+        /// Role from the roles table (default: lane)
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        // ade-core end
     },
     /// Bring back a thread whose pane is gone or whose start failed
     Restart { slug: String, id: String },
@@ -217,6 +225,16 @@ enum ThreadCommand {
         /// Optional task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: Option<String>,
+        // ade-core begin
+        /// Birth sentence (SPEC-ADE D17 item 6)
+        #[arg(long)]
+        plain: Option<String>,
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        /// Do not send a primer (SPEC-ADE D7)
+        #[arg(long)]
+        passive: bool,
+        // ade-core end
     },
     /// Record that the user has seen the current report
     Ack { slug: String, id: String },
@@ -374,9 +392,14 @@ pub fn run() -> Result<()> {
                 agent,
                 base,
                 task_file,
+                // ade-core begin
+                plain,
+                role,
+                // ade-core end
             } => {
                 let task = read_text(&task_file)?;
-                let thread = threads::start(
+                // ade-core begin
+                let thread = threads::start_with_ade(
                     &ctx,
                     &slug,
                     StartArgs {
@@ -387,7 +410,12 @@ pub fn run() -> Result<()> {
                         base,
                         task,
                     },
+                    threads::AdeStart {
+                        plain: plain.unwrap_or_default(),
+                        role,
+                    },
                 )?;
+                // ade-core end
                 println!(
                     "{}",
                     serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id })
@@ -417,9 +445,27 @@ pub fn run() -> Result<()> {
                 pane,
                 title,
                 task_file,
+                // ade-core begin
+                plain,
+                role,
+                passive,
+                // ade-core end
             } => {
                 let task = task_file.map(|file| read_text(&file)).transpose()?;
-                let thread = adopt::adopt(&ctx, &slug, &pane, &title, task)?;
+                // ade-core begin
+                let thread = adopt::adopt_with_ade(
+                    &ctx,
+                    &slug,
+                    &pane,
+                    &title,
+                    task,
+                    adopt::AdeAdopt {
+                        plain: plain.unwrap_or_default(),
+                        role,
+                        passive,
+                    },
+                )?;
+                // ade-core end
                 println!(
                     "{}",
                     serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id, "prompt_pending": thread.prompt_pending })

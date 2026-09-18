@@ -5,6 +5,9 @@ mod cli;
 mod contracts;
 mod coordinator;
 mod doctor;
+// ade-core begin
+mod git;
+// ade-core end
 mod herdr;
 mod inbox;
 mod lifecycle;
