@@ -10,6 +10,10 @@ mod inbox;
 mod lifecycle;
 mod overview;
 mod paths;
+// ade-pi begin
+#[allow(dead_code)]
+mod pi;
+// ade-pi end
 #[allow(dead_code)]
 mod plain;
 mod pr;
