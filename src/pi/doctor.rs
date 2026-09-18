@@ -849,18 +849,19 @@ mod tests {
         let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
         let runner = scripted(&env);
         runner.on(
-            "auth check --provider deepseek",
+            "auth check --provider kimi-coding",
             ok(r#"{"status":"not_ready","reason":"credentials_not_configured"}"#),
         );
         runner.on(
             "auth check --provider opencode",
             ok(r#"{"status":"ready"}"#),
         );
-        let rows = doctor_rows_with(&env, &layout, &runner, &["deepseek", "opencode"]);
+        let rows = doctor_rows_with(&env, &layout, &runner, &["kimi-coding", "opencode"]);
         let text: Vec<String> = rows.iter().map(Row::line).collect();
         assert!(
-            text.iter().any(|l| l.contains("[FAIL] provider deepseek")
-                && l.contains("credentials_not_configured")),
+            text.iter()
+                .any(|l| l.contains("[FAIL] provider kimi-coding")
+                    && l.contains("credentials_not_configured")),
             "{text:?}"
         );
         assert!(
@@ -930,7 +931,7 @@ mod tests {
     fn check_refuses_cursor_and_unknown_providers() {
         assert!(check_provider_allowed("cursor").is_err());
         assert!(check_provider_allowed("moonshot").is_err());
-        assert!(check_provider_allowed("deepseek").is_ok());
+        assert!(check_provider_allowed("kimi-coding").is_ok());
     }
 
     #[test]
@@ -940,18 +941,18 @@ mod tests {
         let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
         let runner = scripted(&env);
         runner.on(
-            "auth check --provider deepseek",
+            "auth check --provider kimi-coding",
             fail(
                 1,
                 r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
             ),
         );
-        let report = check_report(&env, &layout, &runner, "deepseek");
+        let report = check_report(&env, &layout, &runner, "kimi-coding");
         assert!(!report.ok);
         assert!(report.error_text().contains("not ready"));
         let json = report.json();
         assert_eq!(json["ok"], Value::Bool(false));
-        assert_eq!(json["provider"], "deepseek");
+        assert_eq!(json["provider"], "kimi-coding");
         assert!(report.failures().iter().any(|r| r.label == "login"));
     }
 

@@ -3,8 +3,8 @@
 //!
 //! One pi row replaces its native twin in exactly the list the twin was in.
 //! Cursor is not replaced: `cursor_grok_xhigh` stays native while the port
-//! runs, then it is retired; no `pi_cursor_*` row exists. Grok under pi is
-//! withheld until Rolf says (decision 2026-09-18 19:25, item 6).
+//! runs, then it is retired; no `pi_cursor_*` row exists. No Grok model runs
+//! under pi (Rolf, 2026-09-18).
 
 use anyhow::Result;
 
@@ -83,15 +83,6 @@ fn recipe(
 pub fn pi_recipes() -> Vec<PiRecipe> {
     vec![
         recipe(
-            "pi_deepseek_flash",
-            "deepseek",
-            "deepseek-v4-flash",
-            "low",
-            true,
-            true,
-            "the cheap coding helper",
-        ),
-        recipe(
             "pi_codex_sol_high",
             "openai-codex",
             "gpt-5.6-sol",
@@ -126,20 +117,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             true,
             true,
             "the long task helper",
-        ),
-    ]
-}
-
-/// Rows that deliberately do not ship yet, with the reason.
-pub fn withheld_recipes() -> Vec<(&'static str, &'static str)> {
-    vec![
-        (
-            "pi_xai_grok_xhigh",
-            "Grok under pi waits for Rolf's word (decision 19:25, item 6)",
-        ),
-        (
-            "pi_opencode_grok_xhigh",
-            "the OpenCode Grok door is a Grok route; withheld with the xAI row",
         ),
     ]
 }
@@ -192,14 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn there_is_no_cursor_recipe_and_no_grok_recipe_yet() {
+    fn there_is_no_cursor_recipe() {
         for row in pi_recipes() {
             assert!(!row.id.contains("cursor"));
             assert!(!row.provider.contains("cursor"));
         }
-        let witheld = withheld_recipes();
-        assert!(witheld.iter().any(|(id, _)| *id == "pi_xai_grok_xhigh"));
-        assert!(!pi_recipes().iter().any(|r| r.id.contains("grok")));
     }
 
     #[test]
@@ -207,7 +181,7 @@ mod tests {
         let providers = enabled_providers();
         assert_eq!(
             providers,
-            vec!["deepseek", "openai-codex", "opencode-go", "kimi-coding"]
+            vec!["openai-codex", "opencode-go", "kimi-coding"]
         );
         assert!(!providers.contains(&"cursor"));
     }

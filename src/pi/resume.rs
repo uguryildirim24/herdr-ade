@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn resume_appends_exactly_one_session() {
-        let recipe = vec!["--provider".to_string(), "deepseek".to_string()];
+        let recipe = vec!["--provider".to_string(), "kimi-coding".to_string()];
         let extra = append_resume_session(Path::new("/s/lane.jsonl"), &recipe).unwrap();
         assert_eq!(extra, vec!["--session", "/s/lane.jsonl"]);
         let bad = vec!["--session".to_string(), "/old".to_string()];

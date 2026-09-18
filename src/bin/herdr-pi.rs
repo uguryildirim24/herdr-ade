@@ -33,14 +33,14 @@ enum Command {
     Setup,
     /// Print the one-time login steps; open pi on the shared folder
     Login {
-        /// One provider: openai-codex, opencode, opencode-go, deepseek, kimi-coding, xai
+        /// One provider: openai-codex, opencode, opencode-go, kimi-coding
         provider: Option<String>,
     },
     /// Check the setup; exit 1 when any check fails
     Doctor,
     /// Read-only readiness for one provider (JSON); exit 1 when not ready
     Check {
-        /// The pi provider id, for example deepseek
+        /// The pi provider id, for example kimi-coding
         provider: String,
     },
 }

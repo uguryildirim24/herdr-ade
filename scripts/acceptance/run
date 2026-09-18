@@ -303,8 +303,8 @@ live_new_open() {
   ha new acc --repo "$REPO_LIVE" >/dev/null || { echo "ha new failed"; return; }
   ha open acc --session "$ACC_SESSION" >"$ACC_DIR/open.txt" 2>&1 || { echo "ha open failed: $(tail -1 "$ACC_DIR/open.txt")"; return; }
   coord="$HERDR_ADE_ROOT/acc/.state/coordinator.json"
-  grep -q 'plain hook --kind claude' "$HERDR_ADE_ROOT/acc/.claude/settings.json" 2>/dev/null ||
-    { echo "no hook in the project's own .claude/settings.json"; return; }
+  grep -q 'plain hook --kind claude' "$HERDR_ADE_ROOT/acc/.claude/settings.local.json" 2>/dev/null ||
+    { echo "no hook in the project's own .claude/settings.local.json"; return; }
   wait_for 120 grep -q '"bootstrap": *"acknowledged"' "$coord" || { echo "bootstrap not acknowledged within 120 s"; return; }
   echo PASS
 }
@@ -316,7 +316,7 @@ live_round_lanes() {
   # Two Claude lanes; no Cursor pane in a throwaway (row 9 says why).
   for n in one two; do
     printf 'Write the file notes/%s.txt with one line and commit it, then finish as your brief says.\n' "$n" |
-      ha thread start acc --title "note $n" --role lane --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$n.txt" 2>&1 ||
+      ha thread start acc --title "note $n" --repo "$REPO_LIVE" --role lane --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$n.txt" 2>&1 ||
       { echo "thread start --role lane failed: $(tail -1 "$ACC_DIR/start-$n.txt")"; return; }
     id=$(grep -o 't-[0-9]*' "$ACC_DIR/start-$n.txt" | head -1)
     ha round admit acc r1 "$id" >/dev/null || { echo "round admit $id failed"; return; }
@@ -334,7 +334,7 @@ live_done_events() {
   need_verb "waiting" "" A2 || return
   [ -s "$ACC_DIR/lanes.txt" ] || { echo "NOT-RUN: row 2 did not start lanes"; return; }
   for id in $(cat "$ACC_DIR/lanes.txt"); do
-    wait_for 900 sh -c "grep -l 'thread = \"$id\"' '$HERDR_ADE_ROOT/acc/events/'*.toml 2>/dev/null | xargs grep -q 'payload.done'" ||
+    wait_for 900 sh -c "for f in '$HERDR_ADE_ROOT/acc/events/'*.toml; do [ -f \"\$f\" ] && grep -q 'thread = \"$id\"' \"\$f\" && grep -q 'payload.done' \"\$f\" && exit 0; done; exit 1" ||
       { echo "no sealed done event for $id within 15 minutes"; return; }
   done
   ha context acc --peek >"$ACC_DIR/peek.txt" 2>&1
@@ -583,7 +583,7 @@ mod "a wrong pi earlier on PATH fails doctor and refuses the start" A5 "pi::doct
 row_end pi-T10 "wrong pi earlier on PATH: doctor fails and start refuses"
 
 row_begin
-cli "check refuses and names the missing login" fail "credentials_not_configured" -- "$HP" check deepseek
+cli "check refuses and names the missing login" fail "credentials_not_configured" -- "$HP" check kimi-coding
 mod "a missing login refuses the start" A5 "pi::scenarios::scenario_check_refuses_a_missing_login|pi::doctor::tests::a_missing_login"
 row_end pi-T11 "missing login: the start is refused, never a lane waiting for its first prompt"
 
@@ -601,7 +601,8 @@ for r in "pi-T4 one live lane per enabled provider" "pi-T5 ha done from a pi lan
     "$TAB" "$TAB" "${r#* }" "$PI_LOGIN_REASON"
 done
 
-# A server this script started is never left running.
+# A server or ticker this script started is never left running.
+"$HA" ticker stop >/dev/null 2>&1 || true
 if [ -f "$ACC_DIR/server.pid" ]; then
   H session stop "$ACC_SESSION" >/dev/null 2>&1 || true
 fi
