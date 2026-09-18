@@ -10,6 +10,8 @@ mod inbox;
 mod lifecycle;
 mod overview;
 mod paths;
+#[allow(dead_code)]
+mod plain;
 mod pr;
 mod project;
 mod remote;
