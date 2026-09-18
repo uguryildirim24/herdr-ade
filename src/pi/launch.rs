@@ -15,7 +15,16 @@ use super::sh;
 
 /// The provider and model names this round is allowed to start. The role
 /// table and Jev recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
-pub const PROVIDERS: [&str; 5] = ["openai-codex", "opencode", "deepseek", "kimi-coding", "xai"];
+/// `opencode-go` is the OpenCode Go plan (the Muse row, SPEC-ADE §6 item 65);
+/// `opencode` is Zen.
+pub const PROVIDERS: [&str; 6] = [
+    "openai-codex",
+    "opencode",
+    "opencode-go",
+    "deepseek",
+    "kimi-coding",
+    "xai",
+];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
 /// `pi_args_forbidden`.
