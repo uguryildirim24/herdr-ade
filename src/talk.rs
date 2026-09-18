@@ -1,0 +1,782 @@
+//! The plugin-owned conversation surface (SPEC-ADE D18): `ha talk <slug>`.
+//!
+//! A line-oriented program in its own tab, no alternate screen. It renders
+//! only `talk/journal.jsonl`: checked coordinator messages, Rolf's own lines,
+//! asks with their numbered choices, `say` lines and fixed notices. Rolf's
+//! input is a recoverable request (`queued`, `submitted`, `uncertain`,
+//! `accepted`, item 35); replaying the journal renders and never re-sends.
+//!
+//! One append owner: every writer appends under `talk/journal.lock`,
+//! fsyncs and releases. A trailing incomplete line is terminated, skipped by
+//! readers, and reported once as a `journal_tail` notice.
+//!
+//! Decision on item 24: ships this round, on by default for a `claude`
+//! coordinator and off for other kinds until their hooks are verified;
+//! `talk = true | false` in `PROJECT.md` front matter overrides.
+
+use std::fs::File;
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::contracts::{HumanMessage, Recipient, TalkInbound, TalkRequestState};
+use crate::herdr::Herdr;
+use crate::paths::Ctx;
+use crate::project::{self, Project};
+
+/// Entries are bounded (D18 item 6).
+pub const MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+/// One journal entry. Serialized flattened next to `seq`, so an inbound line
+/// is `{"seq":n,...,"inbound":{...}}` and also parses as A0's
+/// `TalkJournalRecord`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Entry {
+    Inbound(TalkInbound),
+    /// Rolf's own line, shown as typed.
+    Rolf {
+        request: String,
+        text: String,
+    },
+    Say {
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        means: Option<String>,
+    },
+    Ask {
+        id: String,
+        revision: u32,
+    },
+    Answer {
+        id: String,
+        revision: u32,
+        choice: u32,
+    },
+    Notice {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Line {
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub at: String,
+    #[serde(flatten)]
+    pub entry: Entry,
+}
+
+pub fn talk_dir(project: &Project) -> PathBuf {
+    project.dir().join("talk")
+}
+
+pub fn journal_path(project: &Project) -> PathBuf {
+    talk_dir(project).join("journal.jsonl")
+}
+
+#[derive(Debug, Default)]
+pub struct Journal {
+    pub lines: Vec<Line>,
+    /// Complete lines that did not parse (a terminated partial tail).
+    pub skipped: usize,
+    /// The file ends without a newline: a write was cut.
+    pub tail_incomplete: bool,
+}
+
+pub fn parse(bytes: &[u8]) -> Journal {
+    let mut journal = Journal::default();
+    let text = String::from_utf8_lossy(bytes);
+    journal.tail_incomplete = !text.is_empty() && !text.ends_with('\n');
+    let mut parts: Vec<&str> = text.split('\n').collect();
+    // The last piece is "" after a final newline, or the incomplete tail.
+    parts.pop();
+    for part in parts {
+        if part.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Line>(part) {
+            Ok(line) => journal.lines.push(line),
+            Err(_) => journal.skipped += 1,
+        }
+    }
+    journal
+}
+
+pub fn read(project: &Project) -> Journal {
+    parse(&std::fs::read(journal_path(project)).unwrap_or_default())
+}
+
+struct Locked {
+    _file: File,
+}
+
+fn lock_file(project: &Project, name: &str) -> Result<Locked> {
+    std::fs::create_dir_all(talk_dir(project))?;
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(talk_dir(project).join(name))?;
+    file.lock()?;
+    Ok(Locked { _file: file })
+}
+
+/// Appends one entry under the journal lock and fsyncs. With `key`, an entry
+/// already carrying that key is not appended again (`Ok(None)`).
+pub fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Option<u64>> {
+    let _lock = lock_file(project, "journal.lock")?;
+    let path = journal_path(project);
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    let journal = parse(&bytes);
+    if let Some(key) = key {
+        if journal.lines.iter().any(|l| l.key.as_deref() == Some(key)) {
+            return Ok(None);
+        }
+    }
+    let mut file = File::options().create(true).append(true).open(&path)?;
+    let mut seq = journal.lines.last().map_or(0, |l| l.seq);
+    let mut out = String::new();
+    if journal.tail_incomplete {
+        // Terminate the cut line so it stays a skipped line of its own, then
+        // report it once. It is never an acknowledgement or a result.
+        out.push('\n');
+        seq += 1;
+        out.push_str(&serde_json::to_string(&Line {
+            seq,
+            key: None,
+            at: project::now(),
+            entry: Entry::Notice {
+                id: "journal_tail".into(),
+            },
+        })?);
+        out.push('\n');
+    }
+    seq += 1;
+    let text = serde_json::to_string(&Line {
+        seq,
+        key: key.map(str::to_string),
+        at: project::now(),
+        entry,
+    })?;
+    if text.len() > MAX_ENTRY_BYTES {
+        bail!(
+            "talk_entry_too_large: {} bytes, at most {MAX_ENTRY_BYTES}",
+            text.len()
+        );
+    }
+    out.push_str(&text);
+    out.push('\n');
+    file.write_all(out.as_bytes())?;
+    file.sync_all()?;
+    Ok(Some(seq))
+}
+
+// ------------------------------------------------------------- settings
+
+/// `talk` in `PROJECT.md` front matter, else on for a `claude` coordinator.
+pub fn enabled(project: &Project) -> bool {
+    let front = std::fs::read_to_string(project.project_md())
+        .ok()
+        .and_then(|t| {
+            t.strip_prefix("+++\n")?
+                .split_once("\n+++")
+                .map(|(f, _)| f.to_string())
+        })
+        .unwrap_or_default();
+    let value: toml::Value =
+        toml::from_str(&front).unwrap_or(toml::Value::Table(Default::default()));
+    if let Some(on) = value.get("talk").and_then(toml::Value::as_bool) {
+        return on;
+    }
+    coordinator_kind(project) == "claude"
+}
+
+pub fn coordinator_kind(project: &Project) -> String {
+    project
+        .read_project_md()
+        .map(|(s, _)| s.coordinator_agent)
+        .unwrap_or_else(|_| "claude".into())
+}
+
+/// Per-kind labels (D17 item 2, D18 item 5). The shipped capability table is
+/// A2's `adapters.rs`; these are the values this spec fixes today.
+pub fn chat_label(kind: &str) -> &'static str {
+    match kind {
+        "claude" => "checked after display; native pane shows the first version",
+        _ => "not checked",
+    }
+}
+
+pub fn surface_label(kind: &str) -> &'static str {
+    match kind {
+        "claude" => "surface mediated, native checked after display",
+        _ => "chat: shown only through say and ask",
+    }
+}
+
+fn recipient(project: &Project) -> Recipient {
+    let coord = project.coordinator().unwrap_or_default();
+    Recipient {
+        pane: coord.pane_id,
+        coordinator_attempt: coord.launch_attempts,
+    }
+}
+
+// ---------------------------------------------------------------- writer
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Native {
+    suspended: bool,
+    since: String,
+}
+
+fn native_path(project: &Project) -> PathBuf {
+    talk_dir(project).join("native.toml")
+}
+
+/// True while Rolf works in the native pane (`!native` until `!back`). The
+/// outbox's writer (A2) must not type into the coordinator while this holds.
+pub fn writer_suspended(project: &Project) -> bool {
+    std::fs::read_to_string(native_path(project))
+        .ok()
+        .and_then(|t| toml::from_str::<Native>(&t).ok())
+        .is_some_and(|n| n.suspended)
+}
+
+fn set_suspended(project: &Project, on: bool) -> Result<()> {
+    std::fs::create_dir_all(talk_dir(project))?;
+    project::write_atomic(
+        &native_path(project),
+        toml::to_string(&Native {
+            suspended: on,
+            since: project::now(),
+        })?
+        .as_bytes(),
+    )
+}
+
+/// The serialized writer's lock for this coordinator (D8). A2's outbox takes
+/// the same lock around its read-and-prompt.
+pub struct WriterLock {
+    _lock: Locked,
+}
+
+pub fn writer_lock(project: &Project) -> Result<WriterLock> {
+    Ok(WriterLock {
+        _lock: lock_file(project, "writer.lock")?,
+    })
+}
+
+/// The latest state of every request, in the order they were queued.
+pub fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut state: std::collections::BTreeMap<String, TalkInbound> = Default::default();
+    let mut text: std::collections::BTreeMap<String, String> = Default::default();
+    for line in &journal.lines {
+        match &line.entry {
+            Entry::Rolf { request, text: t } => {
+                text.insert(request.clone(), t.clone());
+            }
+            Entry::Inbound(inbound) => {
+                if !state.contains_key(&inbound.request) {
+                    order.push(inbound.request.clone());
+                }
+                state.insert(inbound.request.clone(), inbound.clone());
+            }
+            _ => {}
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|r| {
+            let inbound = state.remove(&r)?;
+            let t = text.remove(&r).unwrap_or_default();
+            Some((inbound, t))
+        })
+        .collect()
+}
+
+fn notice(ctx: &Ctx, project: &Project, id: &str) {
+    let _ = crate::ask::publish(ctx, project, &HumanMessage::Notice { id: id.to_string() });
+}
+
+fn coordinator_herdr<'a>(ctx: &'a Ctx, project: &Project) -> Option<(Herdr<'a>, String)> {
+    let coord = project.coordinator()?;
+    if coord.socket.is_empty() || coord.pane_id.is_empty() {
+        return None;
+    }
+    Some((
+        Herdr::new(ctx.env.herdr_bin(), &coord.socket, ctx.runner),
+        coord.pane_id,
+    ))
+}
+
+/// The coordinator's detector state, or `None` when herdr cannot be read.
+fn coordinator_state(ctx: &Ctx, project: &Project) -> Option<String> {
+    let (h, pane) = coordinator_herdr(ctx, project)?;
+    let agents = h.agent_list().ok()?;
+    Some(
+        agents
+            .into_iter()
+            .find(|a| a.pane_id == pane)
+            .map(|a| a.agent_status)
+            .unwrap_or_else(|| "gone".into()),
+    )
+}
+
+/// Sends queued requests in order through the serialized writer. Only
+/// `queued` requests are ever sent; `uncertain` ones are never re-sent.
+pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkRequestState)>> {
+    let _writer = writer_lock(project)?;
+    let mut out = Vec::new();
+    if writer_suspended(project) {
+        return Ok(out);
+    }
+    let pending: Vec<(TalkInbound, String)> = requests(&read(project))
+        .into_iter()
+        .filter(|(i, _)| i.state == TalkRequestState::Queued)
+        .collect();
+    for (inbound, text) in pending {
+        let current = recipient(project);
+        if inbound.recipient != current {
+            // Never retargeted: the request stays queued for the old
+            // incarnation and Rolf is told once.
+            let _ = crate::ask::publish_keyed(
+                ctx,
+                project,
+                &HumanMessage::Notice {
+                    id: "recipient_changed".into(),
+                },
+                Some(&format!("recipient_changed:{}", inbound.request)),
+            );
+            continue;
+        }
+        match coordinator_state(ctx, project).as_deref() {
+            Some("idle") | Some("done") => {}
+            _ => break,
+        }
+        let Some((h, pane)) = coordinator_herdr(ctx, project) else {
+            break;
+        };
+        let state = match h.agent_prompt(&pane, &text) {
+            Ok(()) => TalkRequestState::Submitted,
+            Err(e) if matches!(e.code.as_str(), "timeout" | "unreachable" | "failed") => {
+                TalkRequestState::Uncertain
+            }
+            // herdr refused before typing (blocked, not found): still queued.
+            Err(_) => break,
+        };
+        append(
+            project,
+            None,
+            Entry::Inbound(TalkInbound {
+                request: inbound.request.clone(),
+                state,
+                recipient: inbound.recipient.clone(),
+            }),
+        )?;
+        if state == TalkRequestState::Uncertain {
+            notice(ctx, project, "talk_uncertain");
+        }
+        out.push((inbound.request, state));
+        if state != TalkRequestState::Submitted {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Rolf typed a line: journal the intent first, then hand it to the writer.
+pub fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
+    let request = format!(
+        "q-{}-{}",
+        jiff::Timestamp::now().as_millisecond(),
+        std::process::id()
+    );
+    append(
+        project,
+        None,
+        Entry::Rolf {
+            request: request.clone(),
+            text: text.to_string(),
+        },
+    )?;
+    append(
+        project,
+        None,
+        Entry::Inbound(TalkInbound {
+            request: request.clone(),
+            state: TalkRequestState::Queued,
+            recipient: recipient(project),
+        }),
+    )?;
+    let sent = deliver_queued(ctx, project)?;
+    let state = sent
+        .iter()
+        .find(|(r, _)| *r == request)
+        .map(|(_, s)| *s)
+        .unwrap_or(TalkRequestState::Queued);
+    if state == TalkRequestState::Queued {
+        notice(ctx, project, "request_waiting");
+    }
+    Ok((request, state))
+}
+
+/// Called when the coordinator's turn ends after a submission (the
+/// correction hook, A2): every `submitted` request becomes `accepted`.
+pub fn mark_accepted(project: &Project) -> Result<usize> {
+    let submitted: Vec<TalkInbound> = requests(&read(project))
+        .into_iter()
+        .map(|(i, _)| i)
+        .filter(|i| i.state == TalkRequestState::Submitted)
+        .collect();
+    for mut inbound in submitted.iter().cloned() {
+        inbound.state = TalkRequestState::Accepted;
+        append(project, None, Entry::Inbound(inbound))?;
+    }
+    Ok(submitted.len())
+}
+
+// --------------------------------------------------------------- surface
+
+pub fn header(project: &Project) -> String {
+    let kind = coordinator_kind(project);
+    let coord = project.coordinator().unwrap_or_default();
+    let who = project
+        .read_project_md()
+        .ok()
+        .map(|(s, _)| s.name)
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("the coordinator of {n}"))
+        .unwrap_or_else(|| "the coordinator".into());
+    let mut out = format!(
+        "talking to {who}; its own pane is {}; chat there is {}",
+        if coord.pane_id.is_empty() {
+            "not open yet"
+        } else {
+            coord.pane_id.as_str()
+        },
+        chat_label(&kind)
+    );
+    if kind != "claude" {
+        out.push_str("; ");
+        out.push_str(surface_label(&kind));
+    }
+    out
+}
+
+/// One journal line as the surface shows it; `None` for bookkeeping lines.
+pub fn render(project: &Project, line: &Line) -> Option<String> {
+    match &line.entry {
+        Entry::Rolf { text, .. } => Some(format!("you: {text}")),
+        Entry::Inbound(i) => match i.state {
+            TalkRequestState::Submitted => Some("  (sent)".into()),
+            _ => None,
+        },
+        Entry::Say { what, means } => Some(match means {
+            Some(m) => format!("coordinator: {what}\n  for you: {m}"),
+            None => format!("coordinator: {what}"),
+        }),
+        Entry::Ask { id, revision } => Some(
+            match crate::ask::load_revision(project, id, *revision)
+                .ok()
+                .flatten()
+            {
+                Some(ask) => {
+                    let mut s = String::from("question:\n");
+                    if let Some(w) = &ask.what {
+                        s.push_str(&format!("  {w}\n"));
+                    }
+                    if let Some(m) = &ask.means {
+                        s.push_str(&format!("  {m}\n"));
+                    }
+                    s.push_str(crate::ask::numbered(&ask).trim_end());
+                    s
+                }
+                None => "question: (this question could not be shown)".into(),
+            },
+        ),
+        Entry::Answer { choice, .. } => Some(format!("you answered {choice}")),
+        Entry::Notice { id } => crate::ask::notice_text(id).map(|t| format!("notice: {t}")),
+    }
+}
+
+/// The surface's state: the ask binding captured when the prompt was drawn
+/// is frozen until the line is submitted (item 35).
+pub struct Surface<'a> {
+    ctx: &'a Ctx<'a>,
+    project: Project,
+    pub binding: Option<(String, u32)>,
+    pub shown: u64,
+}
+
+impl<'a> Surface<'a> {
+    pub fn new(ctx: &'a Ctx<'a>, project: Project) -> Self {
+        Surface {
+            ctx,
+            project,
+            binding: None,
+            shown: 0,
+        }
+    }
+
+    /// Journal lines not yet shown, rendered. Display only; never re-sends.
+    pub fn new_output(&mut self) -> Vec<String> {
+        let journal = read(&self.project);
+        let mut out = Vec::new();
+        let shown = self.shown;
+        for line in journal.lines.iter().filter(|l| l.seq > shown) {
+            if let Some(text) = render(&self.project, line) {
+                out.push(text);
+            }
+            self.shown = line.seq;
+        }
+        out
+    }
+
+    /// Draws the prompt and freezes the binding to the newest open ask.
+    pub fn draw_prompt(&mut self) -> String {
+        self.binding = crate::ask::newest_open(&self.project).map(|a| (a.id, a.revision));
+        match &self.binding {
+            Some((id, rev)) => {
+                let n = crate::ask::load_revision(&self.project, id, *rev)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |a| a.choices.len());
+                format!("answer 0 to {n} for the question above, or type a message > ")
+            }
+            None => "> ".into(),
+        }
+    }
+
+    /// Handles one typed line and returns what to print.
+    pub fn handle(&mut self, input: &str) -> Result<Vec<String>> {
+        let line = input.trim_end_matches(['\n', '\r']);
+        let ctx = self.ctx;
+        let project = &self.project;
+        if line.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        match line.trim() {
+            "!stop" => {
+                if let Some((h, pane)) = coordinator_herdr(ctx, project) {
+                    h.call(
+                        &["agent", "send-keys", &pane, "esc"],
+                        Duration::from_secs(10),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+                }
+                return Ok(vec!["  (escape sent)".into()]);
+            }
+            "!native" => {
+                set_suspended(project, true)?;
+                notice(ctx, project, "native_on");
+                return Ok(Vec::new());
+            }
+            "!back" => {
+                match coordinator_state(ctx, project).as_deref() {
+                    Some("idle") | Some("done") | Some("working") => {
+                        set_suspended(project, false)?;
+                        notice(ctx, project, "native_off");
+                        deliver_queued(ctx, project)?;
+                    }
+                    _ => notice(ctx, project, "native_not_ready"),
+                }
+                return Ok(Vec::new());
+            }
+            _ => {}
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+            if let Some((id, rev)) = self.binding.clone() {
+                let newest = crate::ask::newest_open(project).map(|a| (a.id, a.revision));
+                if newest != Some((id.clone(), rev)) {
+                    notice(ctx, project, "ask_redrawn");
+                    return Ok(Vec::new());
+                }
+                let choice: u32 = trimmed.parse().unwrap_or(u32::MAX);
+                return match crate::ask::answer(ctx, &project.slug, &id, rev, choice, "talk") {
+                    Ok(a) => {
+                        let line = format!("ANSWER {id}@{rev} {choice}: Rolf chose \"{}\"", a.text);
+                        let _ = submit(ctx, project, &line);
+                        Ok(Vec::new())
+                    }
+                    Err(e) if format!("{e}").starts_with("ask_choice_out_of_range") => {
+                        Ok(vec![format!("  {}", e)])
+                    }
+                    Err(_) => {
+                        notice(ctx, project, "ask_not_found");
+                        Ok(Vec::new())
+                    }
+                };
+            }
+        }
+        // `/...` passes through unchanged for CLI slash commands.
+        submit(ctx, project, line)?;
+        Ok(Vec::new())
+    }
+}
+
+/// `ha talk <slug> --replay`: the journal rendered once. Never sends.
+pub fn replay(ctx: &Ctx, slug: &str) -> Result<String> {
+    let project = Project::load(&ctx.root, slug)?;
+    let mut out = header(&project);
+    out.push('\n');
+    for line in read(&project).lines {
+        if let Some(text) = render(&project, &line) {
+            out.push_str(&text);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// `ha talk <slug>`: the surface loop. Stdin is read on its own thread so new
+/// journal lines show while Rolf has not typed.
+pub fn run(ctx: &Ctx, slug: &str) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let mut surface = Surface::new(ctx, project.clone());
+    println!("{}", header(&project));
+    for line in surface.new_output() {
+        println!("{line}");
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            if tx.send(line.ok()).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(None);
+    });
+    let mut prompt = surface.draw_prompt();
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(line)) => {
+                for out in surface.handle(&line)? {
+                    println!("{out}");
+                }
+                for out in surface.new_output() {
+                    println!("{out}");
+                }
+                prompt = surface.draw_prompt();
+                print!("{prompt}");
+                std::io::stdout().flush()?;
+            }
+            Ok(None) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let fresh = surface.new_output();
+                if !fresh.is_empty() {
+                    println!();
+                    for out in fresh {
+                        println!("{out}");
+                    }
+                    // The binding stays frozen until this input is submitted.
+                    print!("{prompt}");
+                    std::io::stdout().flush()?;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+// ------------------------------------------------------------ tab and tick
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SurfaceTab {
+    pub tab_id: String,
+    pub pane_id: String,
+    pub created: String,
+}
+
+fn surface_path(project: &Project) -> PathBuf {
+    talk_dir(project).join("surface.toml")
+}
+
+/// Creates the `talk` tab in the coordinator workspace when talk is on and
+/// the recorded tab is gone, and runs `ha talk <slug>` in it. Called by
+/// `ha open` (A2's `coordinator::open`) after the coordinator is bound.
+pub fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceTab>> {
+    if !enabled(project) {
+        return Ok(None);
+    }
+    let coord = project.coordinator().context("the project is not open")?;
+    let h = Herdr::new(ctx.env.herdr_bin(), &coord.socket, ctx.runner);
+    if let Some(tab) = std::fs::read_to_string(surface_path(project))
+        .ok()
+        .and_then(|t| toml::from_str::<SurfaceTab>(&t).ok())
+    {
+        if h.pane_list()
+            .map(|panes| panes.iter().any(|p| p.pane_id == tab.pane_id))
+            .unwrap_or(false)
+        {
+            return Ok(Some(tab));
+        }
+    }
+    let dir = project.dir().to_string_lossy().into_owned();
+    let result = h
+        .call(
+            &[
+                "tab",
+                "create",
+                "--workspace",
+                &coord.workspace_id,
+                "--cwd",
+                &dir,
+                "--label",
+                "talk",
+                "--no-focus",
+            ],
+            Duration::from_secs(10),
+        )
+        .map_err(|e| anyhow::anyhow!("could not create the talk tab: {}", e.message))?;
+    let pane = &result["root_pane"];
+    let tab = SurfaceTab {
+        tab_id: pane["tab_id"].as_str().unwrap_or_default().to_string(),
+        pane_id: pane["pane_id"].as_str().unwrap_or_default().to_string(),
+        created: project::now(),
+    };
+    let prefix = crate::coordinator::current_prefix(&ctx.root)?;
+    let command = format!("{prefix} talk {}", project.slug);
+    h.call(
+        &["pane", "run", &tab.pane_id, &command],
+        Duration::from_secs(10),
+    )
+    .map_err(|e| anyhow::anyhow!("could not start the talk surface: {}", e.message))?;
+    std::fs::create_dir_all(talk_dir(project))?;
+    project::write_atomic(&surface_path(project), toml::to_string(&tab)?.as_bytes())?;
+    Ok(Some(tab))
+}
+
+/// Ticker pass: a fixed notice when the coordinator reads `blocked` (once per
+/// episode), and queued requests sent when it is ready.
+pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    if !enabled(project) || !journal_path(project).exists() {
+        return Ok(());
+    }
+    let flag = talk_dir(project).join("blocked.flag");
+    match coordinator_state(ctx, project).as_deref() {
+        Some("blocked") => {
+            if !flag.exists() {
+                notice(ctx, project, "needs_you_in_pane");
+                let _ = std::fs::write(&flag, project::now());
+            }
+        }
+        Some(_) => {
+            let _ = std::fs::remove_file(&flag);
+            deliver_queued(ctx, project)?;
+        }
+        None => {}
+    }
+    Ok(())
+}
