@@ -232,26 +232,12 @@ pub fn parse_picker_config(config_dir: &Path, opted_in: bool) -> Result<PickerCo
 }
 
 /// The ready-made `kind = "pi"` rows (SPEC-pi v2 §3.5) join the table under
-/// their own ids; a config row may not reuse one, a withheld row may not be
-/// named, and a row that is not start-time allowed stays out of `allowed`.
+/// their own ids; a config row may not reuse one, and a row that is not
+/// start-time allowed stays out of `allowed`.
 fn builtin_pi_recipes(
     recipes: &mut BTreeMap<String, Recipe>,
     roles: &BTreeMap<String, RolePicker>,
 ) -> Result<()> {
-    let named = |id: &str| {
-        roles.iter().find_map(|(name, role)| {
-            (role.default == id
-                || role.allowed.iter().any(|a| a == id)
-                || role.escalate.iter().any(|e| e == id)
-                || role.gates.iter().any(|g| g.recipe == id))
-            .then(|| name.clone())
-        })
-    };
-    for (id, why) in crate::pi::roles::withheld_recipes() {
-        if recipes.contains_key(id) || named(id).is_some() {
-            bail!("recipe_withheld: `{id}` does not ship: {why}");
-        }
-    }
     for row in crate::pi::roles::pi_recipes() {
         if recipes.contains_key(row.id) {
             bail!(

@@ -218,7 +218,7 @@ fn config_root(env: &Env) -> Result<Option<String>> {
 
 /// The one-time login per provider (SPEC-pi v2 §2). The plugin prints these
 /// steps; Rolf types `/login` inside pi, in the shared folder.
-pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 6] {
+pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 4] {
     [
         (
             "openai-codex",
@@ -228,7 +228,7 @@ pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 6] {
         (
             "opencode",
             "OpenCode Zen",
-            "`/login`, pick \"Use an API key\", OpenCode, and paste the key. Zen serves grok-4.6, muse-spark-1.3 and more.",
+            "`/login`, pick \"Use an API key\", OpenCode, and paste the key. Zen serves muse-spark-1.3 and more.",
         ),
         (
             "opencode-go",
@@ -236,19 +236,9 @@ pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 6] {
             "`/login`, pick \"Use an API key\", OpenCode Go, and paste the Go plan's key. Go serves muse-spark-1.3-contributor.",
         ),
         (
-            "deepseek",
-            "DeepSeek",
-            "`/login`, pick \"Use an API key\", DeepSeek, and paste the key. The direct key, not through Zen.",
-        ),
-        (
             "kimi-coding",
             "Kimi coding",
             "`/login`. Use the \"Kimi Code (subscription)\" device flow when the screen shows it; otherwise paste the key. Not moonshot.",
-        ),
-        (
-            "xai",
-            "Grok by SuperGrok or X Premium (optional)",
-            "`/login xai`, pick \"Use a subscription\", and sign in. Workers skip Grok until Rolf enables this row.",
         ),
     ]
 }

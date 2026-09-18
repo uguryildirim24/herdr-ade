@@ -38,7 +38,7 @@ fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
     let (_env, _layout) = world(dir.path());
     let row = roles::pi_recipes()
         .into_iter()
-        .find(|r| r.id == "pi_deepseek_flash")
+        .find(|r| r.id == "pi_kimi_k3")
         .unwrap();
 
     let start =
@@ -47,7 +47,7 @@ fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
     assert_eq!(
         line,
         "agent start a5 --kind pi --pane w1F:p13 --parent w1F:p1 --timeout 30000 -- \
-         --provider deepseek --model deepseek-v4-flash --thinking low --no-skills"
+         --provider kimi-coding --model k3 --thinking high --no-skills"
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -94,7 +94,7 @@ fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
 }
 
 #[test]
-fn scenario_setup_then_check_for_deepseek() {
+fn scenario_setup_then_check_for_kimi() {
     let dir = tempfile::tempdir().unwrap();
     let (env, layout) = world(dir.path());
     let runner = FakeRunner::new();
@@ -114,11 +114,11 @@ fn scenario_setup_then_check_for_deepseek() {
     runner.on("herdr integration status", ok("pi: current\n"));
     runner.on("--version", ok("0.85.1\n"));
     runner.on(
-        "auth check --provider deepseek",
+        "auth check --provider kimi-coding",
         ok(r#"{"status":"ready"}"#),
     );
 
-    let report = doctor::check_report(&env, &layout, &runner, "deepseek");
+    let report = doctor::check_report(&env, &layout, &runner, "kimi-coding");
     assert!(report.ok, "{}", report.error_text());
     assert_eq!(
         runner
@@ -145,10 +145,10 @@ fn scenario_check_refuses_a_missing_login_before_any_start() {
     );
     runner.on("herdr integration status", ok("pi: current\n"));
     runner.on(
-        "auth check --provider deepseek",
+        "auth check --provider kimi-coding",
         ok(r#"{"status":"not_ready","reason":"credentials_not_configured"}"#),
     );
-    let report = doctor::check_report(&env, &layout, &runner, "deepseek");
+    let report = doctor::check_report(&env, &layout, &runner, "kimi-coding");
     assert!(!report.ok);
     assert!(report.error_text().contains("credentials_not_configured"));
     // The refusal is the check path A1 calls; a start never happens.

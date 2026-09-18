@@ -15,14 +15,7 @@ use anyhow::{Result, bail};
 /// table and Jev recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
 /// `opencode-go` is the OpenCode Go plan (the Muse row, SPEC-ADE §6 item 65);
 /// `opencode` is Zen.
-pub const PROVIDERS: [&str; 6] = [
-    "openai-codex",
-    "opencode",
-    "opencode-go",
-    "deepseek",
-    "kimi-coding",
-    "xai",
-];
+pub const PROVIDERS: [&str; 4] = ["openai-codex", "opencode", "opencode-go", "kimi-coding"];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
 /// `pi_args_forbidden`. `-na` is `--no-approve`'s short form (§1) and
@@ -308,10 +301,7 @@ pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high
 pub fn thinking_supported(provider: &str, model: &str, level: &str) -> Option<bool> {
     let _ = provider;
     match (model, level) {
-        ("deepseek-v4-flash", "xhigh") => Some(false),
         ("k3", "xhigh") => Some(false),
-        ("grok-4.6", "max") => Some(false),
-        ("deepseek-v4-flash", "max") => Some(false),
         _ => Some(true),
     }
 }
@@ -340,9 +330,9 @@ mod tests {
     fn start_args_are_exactly_the_spec_line() {
         let recipe = args(&[
             "--provider",
-            "deepseek",
+            "kimi-coding",
             "--model",
-            "deepseek-v4-flash",
+            "k3",
             "--thinking",
             "low",
             "--no-skills",
@@ -364,9 +354,9 @@ mod tests {
                 "30000",
                 "--",
                 "--provider",
-                "deepseek",
+                "kimi-coding",
                 "--model",
-                "deepseek-v4-flash",
+                "k3",
                 "--thinking",
                 "low",
                 "--no-skills",
@@ -379,12 +369,12 @@ mod tests {
     #[test]
     fn forbidden_flags_and_cursor_are_refused() {
         for flag in FORBIDDEN_ARGS {
-            let bad = args(&["--provider", "deepseek", "--model", "x", flag]);
+            let bad = args(&["--provider", "kimi-coding", "--model", "x", flag]);
             let error = validate_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{flag}: {error}");
         }
         for provider in ["cursor", "Cursor", "CURSOR"] {
-            let cursor = args(&["--provider", provider, "--model", "grok-4.6", "--no-skills"]);
+            let cursor = args(&["--provider", provider, "--model", "x", "--no-skills"]);
             assert!(
                 validate_args(&cursor)
                     .unwrap_err()
@@ -395,7 +385,7 @@ mod tests {
         }
         let sdk = args(&[
             "--provider",
-            "deepseek",
+            "kimi-coding",
             "--model",
             "x",
             "--extension",
@@ -420,7 +410,7 @@ mod tests {
         for bad in [
             args(&["--provider", "mock-provider", "--no-skills"]),
             args(&["--provider", "mock-provider", "--model", "m"]),
-            args(&["--provider", "deepseek", "--model", "", "--no-skills"]),
+            args(&["--provider", "kimi-coding", "--model", "", "--no-skills"]),
         ] {
             let error = validate_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{bad:?}: {error}");
@@ -441,8 +431,8 @@ mod tests {
 
     #[test]
     fn the_provider_column_must_match() {
-        let row = args(&["--provider", "deepseek", "--model", "x", "--no-skills"]);
-        assert!(validate_provider_column("deepseek", &row).is_ok());
+        let row = args(&["--provider", "kimi-coding", "--model", "x", "--no-skills"]);
+        assert!(validate_provider_column("kimi-coding", &row).is_ok());
         assert!(validate_provider_column("opencode", &row).is_err());
     }
 
@@ -528,12 +518,8 @@ mod tests {
 
     #[test]
     fn thinking_levels_are_checked_against_the_clamps() {
-        assert!(validate_thinking("deepseek", "deepseek-v4-flash", "low").is_ok());
-        assert!(validate_thinking("deepseek", "deepseek-v4-flash", "xhigh").is_err());
         assert!(validate_thinking("kimi-coding", "k3", "high").is_ok());
         assert!(validate_thinking("kimi-coding", "k3", "xhigh").is_err());
-        assert!(validate_thinking("opencode", "grok-4.6", "xhigh").is_ok());
-        assert!(validate_thinking("opencode", "grok-4.6", "max").is_err());
-        assert!(validate_thinking("deepseek", "x", "sometimes").is_err());
+        assert!(validate_thinking("kimi-coding", "x", "sometimes").is_err());
     }
 }
