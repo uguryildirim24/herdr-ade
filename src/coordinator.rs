@@ -134,6 +134,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         if options.reprime {
             deliver_or_defer(&project, &herdr, agent, &prompt)?;
         }
+        talk_tab(ctx, &project);
         ticker::start(ctx)?;
         println!("coordinator is running in pane {}", record.pane_id);
         println!("Commands: {prefix}");
@@ -250,6 +251,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         ),
     }
     report_tokens(&herdr, slug, &record.pane_id);
+    talk_tab(ctx, &project);
     ticker::start(ctx)?;
     println!(
         "opened `{slug}` in workspace {} (pane {})",
@@ -257,6 +259,14 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     );
     println!("Commands: {prefix}");
     Ok(())
+}
+
+/// The talk tab beside a bound coordinator (D18). A tab that cannot be made
+/// is said once and never blocks `open`.
+fn talk_tab(ctx: &Ctx, project: &Project) {
+    if let Err(error) = crate::talk::ensure_tab(ctx, project) {
+        println!("the talk tab was not created ({error:#})");
+    }
 }
 
 /// Renames a recorded workspace whose label is not the project's display name,
@@ -457,6 +467,18 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
             "- preparation-abandoned: {} {} attempt {}",
             op.thread, op.op, op.attempt
         );
+    }
+
+    // Open questions to Rolf, as he sees them (D17 item 4).
+    let asks = crate::ask::open_asks(project);
+    let _ = writeln!(
+        out,
+        "\n## Open questions ({}, {} not understood so far)",
+        asks.len(),
+        crate::ask::not_understood_count(project)
+    );
+    for a in &asks {
+        let _ = write!(out, "- {}@{} {}", a.id, a.revision, crate::ask::numbered(a));
     }
 
     let items = inbox::unhandled(project);

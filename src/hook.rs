@@ -1,8 +1,7 @@
 //! Coordinator correction-hook lifecycle, budget, and typed envelope parsing.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,15 +9,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::contracts::{Ask, HumanMessage};
+use crate::contracts::HumanMessage;
 use crate::paths::Ctx;
-use crate::plain::{self, Glossary};
+use crate::plain;
 use crate::project::{self, Project};
 use crate::remote::quote;
 use crate::runner::Cmd;
 
-pub const FIXED_FAILURE_NOTICE: &str =
-    "The coordinator could not say this plainly. Open its pane to read it.";
 const INPUT_LIMIT: usize = 64 * 1024;
 const MAX_CORRECTIONS: u32 = 3;
 const DEADLINE_SECS: i64 = 10 * 60;
@@ -48,14 +45,6 @@ struct CursorPending {
     turn: String,
     text: String,
     reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Publication {
-    pub id: String,
-    pub session: String,
-    pub turn: String,
-    pub message: HumanMessage,
 }
 
 fn binding_path(project: &Project) -> PathBuf {
@@ -249,6 +238,10 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
     if !scope_binding(&project, kind, pane, session)? {
         return Ok(());
     }
+    // The coordinator's turn ended: talk requests it was handed are taken.
+    if phase != "observe" {
+        crate::talk::mark_accepted(&project)?;
+    }
     if kind == "cursor" && phase == "stop" {
         return cursor_stop(ctx, &project, kind);
     }
@@ -287,9 +280,7 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
         }
         return failed_check(ctx, &project, kind, session, &turn, text, &reason);
     }
-    for message in messages {
-        publish(&project, session, &turn, message)?;
-    }
+    publish(ctx, &project, session, &turn, &messages)?;
     if kind == "cursor" {
         let _ = std::fs::remove_file(cursor_pending_path(&project));
     }
@@ -415,21 +406,18 @@ fn failed_check(
                 .iter()
                 .all(|message| validate_message(project, message).is_ok())
         {
-            for message in messages {
-                publish(project, session, turn, message)?;
-            }
-            return Ok(());
+            return publish(ctx, project, session, turn, &messages);
         }
     }
     publish(
+        ctx,
         project,
         session,
         turn,
-        HumanMessage::Notice {
-            id: "plain-budget-exhausted".into(),
-        },
-    )?;
-    Ok(())
+        &[HumanMessage::Notice {
+            id: "plain_exhausted".into(),
+        }],
+    )
 }
 
 fn correction(kind: &str, reason: &str) -> Result<()> {
@@ -489,87 +477,31 @@ fn parse_envelopes(text: &str) -> Result<Vec<HumanMessage>> {
     Ok(messages)
 }
 
-fn validate_message(project: &Project, message: &HumanMessage) -> Result<()> {
-    let glossary = glossary(project);
+pub(crate) fn validate_message(project: &Project, message: &HumanMessage) -> Result<()> {
+    let glossary = crate::glossary::registry(project);
     let result = plain::check_message(message, &glossary);
     if let Some(violation) = result.violations.first() {
         bail!("{}: {}", violation.rule.code(), violation.fix);
     }
     if let HumanMessage::Ask { id, revision } = message {
-        let path = project.dir().join("asks").join(format!("{id}.toml"));
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("plain_envelope: unknown ask {id}@{revision}"))?;
-        let ask: Ask = toml::from_str(&text)?;
-        if ask.revision != *revision {
-            bail!(
-                "ask_revision_stale: expected {}, got {revision}",
-                ask.revision
-            );
-        }
-        let result = plain::check_ask(&ask.question, &ask.choices, &glossary);
-        if let Some(violation) = result.violations.first() {
-            bail!("{}: {}", violation.rule.code(), violation.fix);
-        }
-    }
-    if let HumanMessage::Notice { id } = message
-        && id == "plain-budget-exhausted"
-    {
-        let result = plain::check(FIXED_FAILURE_NOTICE, &glossary);
-        if let Some(violation) = result.violations.first() {
-            bail!("{}: {}", violation.rule.code(), violation.fix);
-        }
+        crate::ask::open_revision(project, id, *revision, &glossary)?;
     }
     Ok(())
 }
 
-fn glossary(project: &Project) -> Glossary {
-    let mut glossary = Glossary::default();
-    for lane in crate::thread::list(project) {
-        glossary.names.insert(
-            lane.id,
-            if lane.title.is_empty() {
-                "This lane".into()
-            } else {
-                lane.title
-            },
-        );
+/// Hands each checked message to the one publisher, keyed by session, turn
+/// and position so a repeated hook run of the same reply appends once.
+fn publish(
+    ctx: &Ctx,
+    project: &Project,
+    session: &str,
+    turn: &str,
+    messages: &[HumanMessage],
+) -> Result<()> {
+    for (n, message) in messages.iter().enumerate() {
+        let key = format!("hook:{session}:{turn}:{n}");
+        crate::ask::publish_keyed(ctx, project, message, Some(&key))?;
     }
-    glossary
-}
-
-/// The only hook publication entry point. It accepts a typed value, dedupes a
-/// repeated native reply, and leaves A3 a durable checked queue to render.
-pub fn publish(project: &Project, session: &str, turn: &str, message: HumanMessage) -> Result<()> {
-    let serialized = serde_json::to_vec(&message)?;
-    let id = format!(
-        "{:x}",
-        Sha256::digest([session.as_bytes(), turn.as_bytes(), &serialized].concat())
-    );
-    let path = project.state_dir().join("plain").join("publications.jsonl");
-    let _lock = project.lock()?;
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Publication>(line).ok())
-            .any(|p| p.id == id)
-    {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(
-        &mut file,
-        &Publication {
-            id,
-            session: session.to_string(),
-            turn: turn.to_string(),
-            message,
-        },
-    )?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
     Ok(())
 }
 
@@ -697,22 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_publication_appends_once() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let message = HumanMessage::Say {
-            what: "The work is ready.".into(),
-            means: None,
-        };
-        publish(&project, "s", "t", message.clone()).unwrap();
-        publish(&project, "s", "t", message).unwrap();
-        let text =
-            std::fs::read_to_string(project.state_dir().join("plain").join("publications.jsonl"))
-                .unwrap();
-        assert_eq!(text.lines().count(), 1);
-    }
-
-    #[test]
     fn claude_install_is_idempotent_and_preserves_unrelated_hooks() {
         let temp = tempfile::tempdir().unwrap();
         let env = Env::for_test(temp.path(), &[]);
@@ -773,18 +689,12 @@ mod tests {
         let budget = load_budget(&project, "session-one", "same-turn").unwrap();
         assert_eq!(budget.corrections, 3);
         assert_eq!(budget.translator_runs, 0);
-        let text =
-            std::fs::read_to_string(project.state_dir().join("plain").join("publications.jsonl"))
-                .unwrap();
-        let publications: Vec<Publication> = text
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(publications.len(), 1);
+        let lines = crate::talk::read(&project).lines;
+        assert_eq!(lines.len(), 1);
         assert_eq!(
-            publications[0].message,
-            HumanMessage::Notice {
-                id: "plain-budget-exhausted".into()
+            lines[0].entry,
+            crate::talk::Entry::Notice {
+                id: "plain_exhausted".into()
             }
         );
     }
