@@ -1834,6 +1834,31 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
     }
 
     #[test]
+    fn a_task_that_names_a_model_is_not_a_pin() {
+        let (world, project, task) = world(
+            "shadow",
+            "Use the Opus helper, claude-opus-5 with high effort, for this parser.",
+        );
+        with_help(&world);
+        single_response(&world, &answers_body(0.10));
+        let launch = run(&world, &project, &task).unwrap();
+        assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
+        assert_eq!(launch.kind, "cursor");
+        assert_eq!(launch.fallback.as_deref(), Some(FALLBACK_SHADOW));
+        // The name never reached the service.
+        let sent: String = world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|cmd| cmd.program == jev::CURL)
+            .filter_map(|cmd| cmd.stdin.clone())
+            .collect();
+        assert!(sent.contains("data-binary"), "{sent}");
+        assert!(!sent.to_ascii_lowercase().contains("opus"), "{sent}");
+    }
+
+    #[test]
     fn the_daily_cap_stops_the_call() {
         let (world, project, task) = world("shadow", "read the vendor pages");
         with_help(&world);
