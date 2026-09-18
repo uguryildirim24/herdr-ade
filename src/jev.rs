@@ -129,7 +129,7 @@ impl ScrubList {
                 kinds.insert(recipe.kind.trim().to_ascii_lowercase());
             }
             for (index, arg) in recipe.args.iter().enumerate() {
-                let value = if arg == "--model" || arg == "-m" {
+                let value = if arg == "--model" {
                     recipe.args.get(index + 1).cloned()
                 } else {
                     arg.strip_prefix("model=").map(|value| value.to_string())
@@ -181,16 +181,6 @@ impl ScrubList {
         let mut named: Vec<String> = named.into_iter().collect();
         named.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         ScrubList { patterns, named }
-    }
-
-    /// The fixed list alone, for callers that build the state before the table
-    /// is validated.
-    pub fn fixed() -> Self {
-        Self::new(&BTreeMap::new())
-    }
-
-    pub fn patterns(&self) -> &[String] {
-        &self.patterns
     }
 
     /// The longest recipe kind or model word the raw task names, if any
@@ -674,21 +664,13 @@ fn classify(output: &Output) -> Transport {
         };
     }
     let stdout = output.stdout.trim_end_matches(['\n', '\r']);
-    if let Some((body, status)) = stdout.rsplit_once('\n') {
-        if let Ok(status) = status.trim().parse::<u16>()
-            && status != 0
-        {
-            return Transport::Response {
-                status,
-                body: body.to_string(),
-            };
-        }
-    } else if let Ok(status) = stdout.trim().parse::<u16>()
+    if let Some((body, status)) = stdout.rsplit_once('\n')
+        && let Ok(status) = status.trim().parse::<u16>()
         && status != 0
     {
         return Transport::Response {
             status,
-            body: String::new(),
+            body: body.to_string(),
         };
     }
     Transport::Failed {
@@ -994,7 +976,7 @@ mod tests {
 
     #[test]
     fn the_excerpt_cuts_at_a_word_boundary_at_2200() {
-        let scrub = ScrubList::fixed();
+        let scrub = ScrubList::new(&BTreeMap::new());
         let word = "word ";
         let task = word.repeat(1000);
         let excerpt = transform_task(&task, &scrub);

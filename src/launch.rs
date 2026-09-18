@@ -411,12 +411,7 @@ pub fn agent_kinds(env: &Env, runner: &dyn Runner) -> Result<BTreeSet<String>> {
     let output = runner
         .run(&Cmd::new(&bin, HELP_TIMEOUT).args(["agent", "start", "--help"]))
         .with_context(|| format!("could not run `{bin} agent start --help`"))?;
-    let text = if output.stdout.trim().is_empty() {
-        output.stderr.as_str()
-    } else {
-        output.stdout.as_str()
-    };
-    jev::parse_kinds(text).context("`herdr agent start --help` did not list kinds")
+    jev::parse_kinds(&output.stdout).context("`herdr agent start --help` did not list kinds")
 }
 
 /// Validate the table before any tab or worktree exists
@@ -552,14 +547,12 @@ fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
                     );
                 }
             }
-            if !has("--dangerously-skip-permissions")
-                && !has("--dangerously-bypass-approvals-and-sandbox")
-            {
+            if !has("--dangerously-skip-permissions") {
                 bail!("recipe_permission_missing: `{id}` has no permission flag");
             }
         }
         "cursor" => {
-            if !has("--force") && !has("--yolo") {
+            if !has("--force") {
                 bail!("recipe_permission_missing: `{id}` has no permission flag");
             }
         }
@@ -619,7 +612,7 @@ fn check_plain(context: &str, sentence: &str) -> Result<()> {
 pub fn model_value(args: &[&str]) -> Option<String> {
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--model" || args[index] == "-m" {
+        if args[index] == "--model" {
             return args.get(index + 1).map(|value| (*value).to_string());
         }
         if let Some(value) = args[index].strip_prefix("model=") {
@@ -635,9 +628,6 @@ fn effort_value(args: &[&str]) -> Option<String> {
     while index < args.len() {
         if args[index] == "--effort" {
             return args.get(index + 1).map(|value| (*value).to_string());
-        }
-        if let Some(value) = args[index].strip_prefix("--effort=") {
-            return Some(value.to_string());
         }
         index += 1;
     }
