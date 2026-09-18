@@ -218,17 +218,12 @@ fn config_root(env: &Env) -> Result<Option<String>> {
 
 /// The one-time login per provider (SPEC-pi v2 §2). The plugin prints these
 /// steps; Rolf types `/login` inside pi, in the shared folder.
-pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 4] {
+pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 3] {
     [
         (
             "openai-codex",
             "ChatGPT Plus/Pro coding models (Astra, Sol)",
             "`/login`, pick \"ChatGPT Plus/Pro (Codex)\", finish in the browser or with the device code. This is the subscription, not an OpenAI API key.",
-        ),
-        (
-            "opencode",
-            "OpenCode Zen",
-            "`/login`, pick \"Use an API key\", OpenCode, and paste the key. Zen serves muse-spark-1.3 and more.",
         ),
         (
             "opencode-go",
