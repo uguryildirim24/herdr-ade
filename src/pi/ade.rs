@@ -112,4 +112,34 @@ mod tests {
         drop(calls);
         let _ = (&env, &layout);
     }
+
+    /// A4's table slots each `plain` phrase into its reason templates and
+    /// refuses the config when one fails the plain check
+    /// (`recipe_reason_not_plain`). The templates are A4's, copied here
+    /// because A4's module is not on this branch; the words it adds
+    /// (`picker`) are left out.
+    #[test]
+    fn every_pi_plain_phrase_passes_the_plain_check_in_the_reason_templates() {
+        use crate::plain::{Glossary, check};
+        let glossary = Glossary::default();
+        for row in crate::pi::roles::pi_recipes() {
+            let plain = row.plain;
+            assert!(plain.starts_with("the "), "{}: `{plain}`", row.id);
+            for text in [
+                plain.to_string(),
+                format!("You chose {plain} for this task."),
+                format!("this task looks like ordinary work, so it runs on {plain}."),
+                format!("this task runs on {plain}"),
+            ] {
+                let result = check(&text, &glossary);
+                assert!(
+                    result.passed(),
+                    "{}: `{text}` fails: {:?}",
+                    row.id,
+                    result.violations
+                );
+            }
+            assert!(format!("this second opinion runs on {plain}").chars().count() <= 80);
+        }
+    }
 }
