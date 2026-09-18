@@ -25,6 +25,121 @@ pub struct LaunchRecipe {
     pub brief_hash: String,
 }
 
+/// The resolver mode from `[roles] resolver` (SPEC-jev-picker v2 §2 Config).
+/// `pin` never comes from config: `--recipe` or a PROJECT.md pin sets it
+/// (SPEC-jev-picker v2 §3 step 1 and step 2).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolverMode {
+    #[default]
+    Off,
+    Shadow,
+    Jev,
+    Pin,
+}
+
+/// Cost class a gate's threshold belongs to (SPEC-jev-picker v2 §2 Design C).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CostClass {
+    #[default]
+    Default,
+    Sideways,
+    Upgrade,
+}
+
+/// One `[recipes.<id>]` row: the full D2 row plus `provider` (reserved for the
+/// pi move, question 25), `cost`, `enabled` and `plain`
+/// (SPEC-jev-picker v2 §2 Config).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Recipe {
+    pub kind: String,
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub ready_timeout_ms: u64,
+    pub provider: String,
+    pub cost: CostClass,
+    pub enabled: bool,
+    pub plain: String,
+}
+
+impl Default for Recipe {
+    fn default() -> Self {
+        Recipe {
+            kind: String::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+            ready_timeout_ms: 30_000,
+            provider: String::new(),
+            cost: CostClass::Default,
+            enabled: true,
+            plain: String::new(),
+        }
+    }
+}
+
+/// The `criteria` table of one gate: `true` and `false` descriptions
+/// (SPEC-jev-picker v2 §2 Config).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct GateCriteria {
+    #[serde(rename = "true")]
+    pub is_true: String,
+    #[serde(rename = "false")]
+    pub is_false: String,
+}
+
+/// One `[[roles.<name>.gates]]` row: a Noul question tied to one recipe in the
+/// role's `allowed` list (SPEC-jev-picker v2 §2 Design C).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Gate {
+    pub recipe: String,
+    pub cost: CostClass,
+    /// `None` uses the cost class floor (SPEC-jev-picker v2 §2 Design C).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+    pub instructions: String,
+    pub criteria: GateCriteria,
+}
+
+/// The thread record's `launch` object: the chosen recipe's full D2 row plus
+/// the picker fields (SPEC-jev-picker v2 §2 Output). `brief_hash` is filled
+/// after the brief commit; `attempt` is 1 at resolve time (D2, D9).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Launch {
+    pub kind: String,
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub ready_timeout_ms: u64,
+    pub policy_hash: String,
+    pub attempt: u32,
+    pub brief_hash: String,
+    pub recipe_id: String,
+    pub resolver: ResolverMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jev_pick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jev_confidence: Option<f64>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub jev_probabilities: std::collections::BTreeMap<String, f64>,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jev_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jev_input_tokens: Option<u64>,
+    pub jev_prompt_hash: String,
+    pub excerpt_version: u32,
+}
+
 /// Process identity from `pane process-info` once the agent is ready
 /// (SPEC-ADE D3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -530,6 +645,90 @@ mod tests {
         json_roundtrip(&HumanMessage::Notice {
             id: "plain_exhausted".into(),
         });
+    }
+
+    #[test]
+    fn recipe_gate_and_launch_roundtrip() {
+        let recipe = Recipe {
+            kind: "cursor".into(),
+            args: vec!["--model".into(), "cursor-grok-4.6-xhigh".into()],
+            env: vec![],
+            ready_timeout_ms: 30_000,
+            provider: "cursor".into(),
+            cost: CostClass::Default,
+            enabled: true,
+            plain: "the usual coding helper".into(),
+        };
+        both(&recipe);
+        both(&Gate {
+            recipe: "agy_gemini_flash".into(),
+            cost: CostClass::Sideways,
+            threshold: Some(0.75),
+            instructions: "Is the main job of `task` to read public web pages?".into(),
+            criteria: GateCriteria {
+                is_true: "Web research with citations.".into(),
+                is_false: "Implementation, review, or spec writing.".into(),
+            },
+        });
+        both(&Gate {
+            recipe: "claude_opus_high".into(),
+            cost: CostClass::Upgrade,
+            threshold: None,
+            instructions: "Does this need the strongest judge?".into(),
+            criteria: GateCriteria::default(),
+        });
+        let mut jev_probabilities = std::collections::BTreeMap::new();
+        jev_probabilities.insert("web_research".to_string(), 0.91);
+        both(&Launch {
+            kind: "agy".into(),
+            args: vec!["--model".into(), "gemini-3.8-flash-high".into()],
+            env: vec![],
+            ready_timeout_ms: 60_000,
+            policy_hash: "cc".into(),
+            attempt: 1,
+            brief_hash: String::new(),
+            recipe_id: "agy_gemini_flash".into(),
+            resolver: ResolverMode::Jev,
+            gate: Some("agy_gemini_flash".into()),
+            gate_p: Some(0.91),
+            jev_pick: Some("agy_gemini_flash".into()),
+            jev_confidence: Some(0.91),
+            jev_probabilities,
+            reason: "this task looks like web research, so it runs on the web research helper."
+                .into(),
+            fallback: None,
+            jev_model: Some("jev-1.13.0".into()),
+            jev_input_tokens: Some(356),
+            jev_prompt_hash: "dd".into(),
+            excerpt_version: 1,
+        });
+        both(&Launch {
+            resolver: ResolverMode::Off,
+            ..Launch::default()
+        });
+    }
+
+    #[test]
+    fn resolver_mode_and_cost_class_parse_from_lowercase() {
+        assert!(serde_json::from_str::<ResolverMode>("\"nope\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<ResolverMode>("\"off\"").unwrap(),
+            ResolverMode::Off
+        );
+        assert_eq!(
+            serde_json::from_str::<ResolverMode>("\"shadow\"").unwrap(),
+            ResolverMode::Shadow
+        );
+        assert_eq!(
+            serde_json::from_str::<ResolverMode>("\"jev\"").unwrap(),
+            ResolverMode::Jev
+        );
+        assert_eq!(
+            serde_json::from_str::<CostClass>("\"sideways\"").unwrap(),
+            CostClass::Sideways
+        );
+        assert_eq!(Recipe::default().enabled, true);
+        assert_eq!(Recipe::default().ready_timeout_ms, 30_000);
     }
 
     #[test]
