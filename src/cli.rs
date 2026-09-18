@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
@@ -169,23 +169,540 @@ enum Command {
         #[command(subcommand)]
         command: PlainCommand,
     },
-    /// Spec dialogue registration; ade-rounds supplies the implementation
-    Dialogue {
-        #[command(subcommand)]
-        command: DialogueCommand,
-    },
     // ade-outbox end
     /// Check the setup: versions, tools, root, ticker and each project's session
     Doctor {
         #[command(flatten)]
         session: SessionArgs,
     },
+    // ade-rounds begin
+    /// Rounds: open, admit lanes, review, merge with its checkpoint (SPEC-ADE D6)
+    Round {
+        #[command(subcommand)]
+        command: RoundCommand,
+    },
+    /// The spec dialogue between a drafter and a critic (SPEC-ADE D7)
+    Dialogue {
+        #[command(subcommand)]
+        command: DialogueCommand,
+    },
+    /// Write HANDOFF.md and HANDOFF.json as one commit (the save-state port)
+    Checkpoint {
+        slug: String,
+        /// The coordinator pane (default: $HERDR_PANE_ID, then the record)
+        #[arg(long)]
+        pane: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        repo: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Print the generated Herdr section; write nothing
+        #[arg(long, conflicts_with = "check")]
+        print: bool,
+        /// Check the current HANDOFF.md; write nothing
+        #[arg(long)]
+        check: bool,
+    },
+    /// Re-apply parents and print start lines for gone threads; never starts anything
+    Pickup {
+        slug: String,
+        #[arg(long)]
+        pane: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Ask Rolf a question with two to four choices he can picture
+    #[command(args_conflicts_with_subcommands = true)]
+    Ask {
+        #[command(subcommand)]
+        command: Option<AskCommand>,
+        question: Option<String>,
+        #[arg(long = "choice", value_name = "SENTENCE")]
+        choices: Vec<String>,
+        /// One sentence: what happened
+        #[arg(long)]
+        what: Option<String>,
+        /// One sentence: what it means for Rolf
+        #[arg(long)]
+        means: Option<String>,
+        #[arg(long)]
+        round: Option<String>,
+        /// Ask an existing question again as its next revision
+        #[arg(long, value_name = "ASK_ID")]
+        reask: Option<String>,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Tell Rolf one checked line on the board and the talk tab
+    Say {
+        #[arg(long)]
+        what: String,
+        #[arg(long)]
+        means: Option<String>,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Print a name's recorded sentence and where it was born
+    Explain {
+        name: String,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Glossary terms
+    Term {
+        #[command(subcommand)]
+        command: TermCommand,
+    },
+    /// The talk tab: Rolf's checked conversation with the coordinator (SPEC-ADE D18)
+    Talk {
+        slug: String,
+        /// Print the journal once and exit; sends nothing
+        #[arg(long, conflicts_with_all = ["accepted", "open_tab"])]
+        replay: bool,
+        /// Record that the coordinator's turn ended after a submission (the correction hook)
+        #[arg(long, hide = true, conflicts_with = "open_tab")]
+        accepted: bool,
+        /// Create the talk tab in the coordinator workspace when talk is on
+        #[arg(long)]
+        open_tab: bool,
+    },
+    /// Publish the board rows now, or print them
+    Board {
+        slug: String,
+        #[arg(long)]
+        print: bool,
+    },
+    // ade-rounds end
     /// The background ticker
     Ticker {
         #[command(subcommand)]
         command: TickerCommand,
     },
 }
+
+// ade-rounds begin
+#[derive(Subcommand)]
+enum RoundCommand {
+    /// Open a round: its record, gate list and policy hash
+    Open {
+        slug: String,
+        round: String,
+        #[arg(long)]
+        branch: String,
+        /// One sentence that says what the round does (required)
+        #[arg(long)]
+        plain: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        repo: Option<String>,
+    },
+    /// Admit a lane to the round's manifest
+    Admit {
+        slug: String,
+        round: String,
+        thread: String,
+    },
+    /// Remove a lane from the round's manifest
+    Remove {
+        slug: String,
+        round: String,
+        thread: String,
+    },
+    /// Commit the review brief B, freeze the manifest, create the review branch
+    Review { slug: String, round: String },
+    /// Record the reviewer thread whose sealed done sha is the verdict commit V
+    Reviewer {
+        slug: String,
+        round: String,
+        thread: String,
+    },
+    /// Merge on an exact MERGE verdict, then checkpoint; resumes after a crash
+    Merge {
+        slug: String,
+        round: String,
+        /// Test-only fault injection: stop after ref, merged, intent or commit
+        #[arg(long, hide = true, value_name = "PHASE")]
+        stop_after: Option<String>,
+    },
+    /// Show the round's record and merge phase
+    Show { slug: String, round: String },
+    /// Run the ticker's pass for rounds, asks, talk and the board once
+    Tick { slug: String },
+}
+
+#[derive(Subcommand)]
+enum DialogueCommand {
+    /// Record a dialogue and print the lines that start its two sides
+    Start {
+        slug: String,
+        topic: String,
+        #[arg(long)]
+        drafter: String,
+        /// A role, or `pro`
+        #[arg(long)]
+        critic: String,
+        #[arg(long)]
+        plain: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        repo: Option<String>,
+        /// The integration branch turn files are committed on
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Record the critic's pane after checking who is in it
+    Critic {
+        slug: String,
+        topic: String,
+        #[arg(long)]
+        pane: String,
+    },
+    /// Pin the next turn and send the TURN line
+    Turn {
+        slug: String,
+        topic: String,
+        #[arg(long)]
+        resend: bool,
+    },
+    /// Commit the expected turn file, then advance
+    Commit { slug: String, topic: String, n: u32 },
+}
+
+#[derive(Subcommand)]
+enum AskCommand {
+    /// Answer an ask by id and revision
+    Answer {
+        id: String,
+        #[arg(long)]
+        revision: u32,
+        choice: u32,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TermCommand {
+    /// Add a term with its one sentence
+    Add {
+        name: String,
+        #[arg(long)]
+        plain: Option<String>,
+        /// Where the term is explained (brief or spec path)
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+}
+
+fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
+    use crate::{ask, board, checkpoint, dialogue, glossary, round, talk};
+    let slug_of = |slug: Option<String>| overview::require_slug(ctx, slug.as_deref());
+    match command {
+        Command::Round { command } => match command {
+            RoundCommand::Open {
+                slug,
+                round: id,
+                branch,
+                plain,
+                repo,
+            } => {
+                let r = round::open(
+                    ctx,
+                    &slug,
+                    round::OpenArgs {
+                        round: id,
+                        branch,
+                        plain,
+                        repo,
+                    },
+                )?;
+                println!(
+                    "opened {} on `{}` (gates: {})",
+                    r.round,
+                    r.branch,
+                    r.gates.len()
+                );
+                Ok(())
+            }
+            RoundCommand::Admit {
+                slug,
+                round: id,
+                thread,
+            } => {
+                let r = round::admit(ctx, &slug, &id, &thread)?;
+                println!(
+                    "{thread} admitted to {id}; manifest revision {}",
+                    r.manifest.revision
+                );
+                Ok(())
+            }
+            RoundCommand::Remove {
+                slug,
+                round: id,
+                thread,
+            } => {
+                let r = round::remove(ctx, &slug, &id, &thread)?;
+                println!(
+                    "{thread} removed from {id}; manifest revision {}",
+                    r.manifest.revision
+                );
+                Ok(())
+            }
+            RoundCommand::Review { slug, round: id } => {
+                let o = round::review(ctx, &slug, &id)?;
+                println!("brief commit B {} ({})", o.brief_commit, o.brief_path);
+                println!(
+                    "review branch {} at {}",
+                    o.review_branch,
+                    o.worktree.display()
+                );
+                println!(
+                    "manifest revision {} frozen, hash {}",
+                    o.revision, o.manifest_hash
+                );
+                println!(
+                    "next: start the reviewer thread in that worktree with role reviewer, then `round reviewer {slug} {id} <thread>`"
+                );
+                Ok(())
+            }
+            RoundCommand::Reviewer {
+                slug,
+                round: id,
+                thread,
+            } => {
+                round::bind_reviewer(ctx, &slug, &id, &thread)?;
+                println!("{thread} reviews {id}");
+                Ok(())
+            }
+            RoundCommand::Merge {
+                slug,
+                round: id,
+                stop_after,
+            } => {
+                let stop = stop_after.map(|s| s.parse()).transpose()?;
+                match round::merge(ctx, &slug, &id, stop)? {
+                    round::MergeOutcome::Checkpointed { head, lanes } => {
+                        println!("merged and checkpointed: H {head}");
+                        for l in lanes {
+                            println!("  {l}");
+                        }
+                    }
+                    round::MergeOutcome::NoOp { head } => {
+                        println!("already checkpointed at H {head}; nothing to do")
+                    }
+                    round::MergeOutcome::Stopped { phase } => {
+                        println!("stopped (test fault injection) at phase {phase:?}")
+                    }
+                }
+                Ok(())
+            }
+            RoundCommand::Show { slug, round: id } => {
+                print!("{}", round::show(ctx, &slug, &id)?);
+                Ok(())
+            }
+            RoundCommand::Tick { slug } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                round::tick(ctx, &project)
+            }
+        },
+        Command::Dialogue { command } => match command {
+            DialogueCommand::Start {
+                slug,
+                topic,
+                drafter,
+                critic,
+                plain,
+                repo,
+                branch,
+            } => {
+                let (d, next) = dialogue::start(
+                    ctx,
+                    &slug,
+                    dialogue::StartArgs {
+                        topic,
+                        drafter,
+                        critic,
+                        plain,
+                        repo,
+                        integration: branch,
+                    },
+                    &dialogue::AnyPair,
+                )?;
+                println!("dialogue {} recorded on {}", d.topic, d.branch);
+                print!("{next}");
+                Ok(())
+            }
+            DialogueCommand::Critic { slug, topic, pane } => {
+                dialogue::bind_critic(ctx, &slug, &topic, &pane)?;
+                println!("critic of {topic} is pane {pane}");
+                Ok(())
+            }
+            DialogueCommand::Turn {
+                slug,
+                topic,
+                resend,
+            } => {
+                let t = dialogue::turn(ctx, &slug, &topic, resend)?;
+                println!("turn {} sent; expected {}", t.n, t.expected_path);
+                Ok(())
+            }
+            DialogueCommand::Commit { slug, topic, n } => {
+                let r = dialogue::commit(ctx, &slug, &topic, n)?;
+                println!("turn {} committed as {} (sha256 {})", r.n, r.commit, r.hash);
+                Ok(())
+            }
+        },
+        Command::Checkpoint {
+            slug,
+            pane,
+            repo,
+            branch,
+            print,
+            check,
+        } => {
+            let out = checkpoint::checkpoint(
+                ctx,
+                &slug,
+                checkpoint::CheckpointArgs {
+                    pane,
+                    repo,
+                    branch,
+                    print,
+                    check_only: check,
+                },
+            )?;
+            print!("{out}");
+            Ok(())
+        }
+        Command::Pickup {
+            slug,
+            pane,
+            dry_run,
+        } => {
+            print!(
+                "{}",
+                checkpoint::pickup(ctx, &slug, pane.as_deref(), dry_run)?
+            );
+            Ok(())
+        }
+        Command::Ask {
+            command,
+            question,
+            choices,
+            what,
+            means,
+            round: r,
+            reask,
+            project,
+        } => match command {
+            Some(AskCommand::Answer {
+                id,
+                revision,
+                choice,
+                project,
+            }) => {
+                let slug = slug_of(project)?;
+                let a = ask::answer(ctx, &slug, &id, revision, choice, "command")?;
+                println!("{id} revision {revision}: {} ({})", a.choice, a.text);
+                Ok(())
+            }
+            None => {
+                let slug = slug_of(project)?;
+                let question = question.context("a question is required")?;
+                let a = ask::ask(
+                    ctx,
+                    &slug,
+                    ask::NewAsk {
+                        question,
+                        choices,
+                        what,
+                        means,
+                        round: r,
+                        reask,
+                    },
+                )?;
+                println!("ask {} revision {}", a.id, a.revision);
+                print!("{}", ask::numbered(&a));
+                Ok(())
+            }
+        },
+        Command::Say {
+            what,
+            means,
+            project,
+        } => {
+            let slug = slug_of(project)?;
+            ask::say(ctx, &slug, &what, means.as_deref())?;
+            println!("said");
+            Ok(())
+        }
+        Command::Explain { name, project } => {
+            let slug = slug_of(project)?;
+            print!("{}", glossary::explain(ctx, &slug, &name)?);
+            Ok(())
+        }
+        Command::Term { command } => match command {
+            TermCommand::Add {
+                name,
+                plain,
+                path,
+                project,
+            } => {
+                let slug = slug_of(project)?;
+                let t = glossary::add_term(ctx, &slug, &name, plain.as_deref(), path.as_deref())?;
+                println!("- {}: {}", t.name, t.sentence);
+                Ok(())
+            }
+        },
+        Command::Talk {
+            slug,
+            replay,
+            accepted,
+            open_tab,
+        } => {
+            if replay {
+                print!("{}", talk::replay(ctx, &slug)?);
+                Ok(())
+            } else if accepted {
+                let project = Project::load(&ctx.root, &slug)?;
+                println!("{} request(s) accepted", talk::mark_accepted(&project)?);
+                Ok(())
+            } else if open_tab {
+                let project = Project::load(&ctx.root, &slug)?;
+                match talk::ensure_tab(ctx, &project)? {
+                    Some(tab) => println!("talk tab {} (pane {})", tab.tab_id, tab.pane_id),
+                    None => println!("talk is off for this project"),
+                }
+                Ok(())
+            } else {
+                talk::run(ctx, &slug)
+            }
+        }
+        Command::Board { slug, print } => {
+            let project = Project::load(&ctx.root, &slug)?;
+            if print {
+                for (k, v) in board::compute(ctx, &project) {
+                    let verdict = match board::check_value(&project, &v) {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => format!("refused: {e:#}"),
+                    };
+                    println!("{k}\t{v}\t{verdict}");
+                }
+                println!(
+                    "not understood so far\t{}",
+                    ask::not_understood_count(&project)
+                );
+            } else {
+                for (k, why) in board::refresh(ctx, &project)? {
+                    println!("{k} kept its previous value: {why}");
+                }
+            }
+            Ok(())
+        }
+        _ => unreachable!("run_rounds only receives this lane's commands"),
+    }
+}
+// ade-rounds end
 
 #[derive(Subcommand)]
 enum InboxCommand {
@@ -342,19 +859,6 @@ enum PlainCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum DialogueCommand {
-    /// Start a specification dialogue
-    Start {
-        topic: String,
-        #[arg(long)]
-        drafter: String,
-        #[arg(long)]
-        critic: String,
-        #[arg(long)]
-        plain: Option<String>,
-    },
-}
 // ade-outbox end
 
 pub fn run() -> Result<()> {
@@ -657,21 +1161,6 @@ pub fn run() -> Result<()> {
                 phase,
             } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         },
-        Command::Dialogue { command } => match command {
-            DialogueCommand::Start {
-                topic,
-                drafter,
-                critic,
-                plain,
-            } => {
-                if plain.as_deref().is_none_or(str::is_empty) {
-                    bail!("plain_missing: dialogue start requires --plain");
-                }
-                bail!(
-                    "dialogue_unavailable: ade-rounds must handle `{topic}` with drafter `{drafter}` and critic `{critic}`"
-                )
-            }
-        },
         // ade-outbox end
         Command::Doctor { session } => {
             if !doctor::run(&ctx, &session.into())? {
@@ -679,6 +1168,18 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+        // ade-rounds begin
+        command @ (Command::Round { .. }
+        | Command::Dialogue { .. }
+        | Command::Checkpoint { .. }
+        | Command::Pickup { .. }
+        | Command::Ask { .. }
+        | Command::Say { .. }
+        | Command::Explain { .. }
+        | Command::Term { .. }
+        | Command::Talk { .. }
+        | Command::Board { .. }) => run_rounds(&ctx, command),
+        // ade-rounds end
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),

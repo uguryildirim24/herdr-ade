@@ -1,4 +1,13 @@
 mod actions;
+// ade-rounds begin
+mod ask;
+mod board;
+mod checkpoint;
+mod dialogue;
+mod glossary;
+mod round;
+mod talk;
+// ade-rounds end
 mod adopt;
 mod cli;
 // ade-outbox begin
