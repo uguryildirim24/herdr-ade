@@ -52,7 +52,7 @@ pub enum CostClass {
 /// pi move, question 25), `cost`, `enabled` and `plain`
 /// (SPEC-jev-picker v2 §2 Config).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Recipe {
     pub kind: String,
     pub args: Vec<String>,
@@ -82,7 +82,7 @@ impl Default for Recipe {
 /// The `criteria` table of one gate: `true` and `false` descriptions
 /// (SPEC-jev-picker v2 §2 Config).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GateCriteria {
     #[serde(rename = "true")]
     pub is_true: String,
@@ -93,7 +93,7 @@ pub struct GateCriteria {
 /// One `[[roles.<name>.gates]]` row: a Noul question tied to one recipe in the
 /// role's `allowed` list (SPEC-jev-picker v2 §2 Design C).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Gate {
     pub recipe: String,
     pub cost: CostClass,
@@ -729,6 +729,9 @@ mod tests {
         );
         assert!(Recipe::default().enabled);
         assert_eq!(Recipe::default().ready_timeout_ms, 30_000);
+        let err =
+            toml::from_str::<Recipe>("kind = \"cursor\"\narge = [\"--force\"]\n").unwrap_err();
+        assert!(err.to_string().contains("arge"), "{err}");
     }
 
     #[test]
