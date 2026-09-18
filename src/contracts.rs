@@ -283,6 +283,9 @@ pub struct RoundRecord {
     /// Repository the integration branch lives in, fixed at open (A3).
     #[serde(default)]
     pub repo: String,
+    /// Manifest revision frozen at the review brief commit `B` (SPEC-ADE D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_revision: Option<u64>,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
