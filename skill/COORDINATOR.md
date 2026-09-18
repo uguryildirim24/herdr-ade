@@ -90,6 +90,44 @@ Keep the file short: it is printed every turn and costs tokens.
 
 When the user asks for scheduled or watched work, create or edit a file in `routines/<name>.md`: TOML front matter between `+++` lines with `schedule` (`every <N>m|h|d` or `daily HH:MM`), an optional `command`, and `enabled`; the body is the prompt you will receive as an inbox item when it is due. A routine with a `command` runs only after the user has enabled routine commands and approved it; tell the user when one needs approval.
 
+## Talking to Rolf: say, ask and the talk tab
+
+Rolf reads you in the `talk` tab when the project has it on (`hp context` prints the label). The talk tab shows only checked messages, never your prose. Every text that reaches Rolf's board, notifications or talk tab goes through one check: known words, short sentences, names only in the form `<recorded sentence> (<name>)`. The check proves the words are known, not that Rolf understands them.
+
+- `hp say --what "<one sentence: what happened>" [--means "<one sentence: what it means for you>"]` puts one line on the board and in talk.
+- `hp ask "<question>?" --choice "<a sentence Rolf can picture>" --choice "<another>"` (two to four choices, never a single word or a name). It prints `<id>@<revision>`. Every ask also carries `0 = I did not understand the question`; when Rolf answers 0, ask again with `hp ask --reask <id> ...` in other words. A number Rolf types in your pane answers nothing; only `hp ask answer <id> --revision <r> <n>` or the talk tab does.
+- `hp explain <name>` prints the recorded sentence for a name. `hp term add <name> --plain "<sentence>"` records a term before you use it.
+- End every reply with an envelope block; the hook publishes only the blocks and never your prose:
+
+  ````
+  ```ade-say
+  what: <one sentence: what happened>
+  means: <optional: what it means for Rolf>
+  ```
+  ````
+
+  or, for a question you asked with `hp ask`:
+
+  ````
+  ```ade-ask
+  ask: <id>@<revision>
+  ```
+  ````
+
+  A reply without a block, or with a block that fails the check, is sent back to you to rewrite. A question typed in prose never reaches Rolf's talk tab.
+- Lines Rolf types in talk reach you as ordinary messages. The plugin serializes its own writers; text Rolf types straight into your pane is outside that guarantee.
+
+## Rounds
+
+A round is a set of lanes that are reviewed and merged together (`hp round show <slug> <round>`).
+
+- `hp round open <slug> <round> --branch <integration branch> --plain "<sentence>"`, then `hp round admit <slug> <round> <thread>` per lane. A lane is complete when it runs `hp done`; its sealed sha is pinned automatically.
+- `hp round review <slug> <round>` commits the review brief and creates `review/<round>`. Start the reviewer thread with the printed line, then `hp round reviewer <slug> <round> <thread>`.
+- `hp round merge <slug> <round>` merges only on an exact MERGE verdict at the verdict commit for the pinned candidate, then writes the checkpoint. Run it again after any failure: it resumes and never merges twice.
+- `hp dialogue start|critic|turn|commit` runs a spec dialogue; `hp checkpoint <slug>` writes `HANDOFF.md` and `HANDOFF.json` as one commit; `hp pickup <slug>` re-links live workers and prints start lines for gone ones.
+
 ## Never without the user asking in chat
 
-Merge, force-push, delete branches, remove worktrees, resolve threads, delete or archive the project.
+Force-push, delete branches, remove worktrees, resolve threads, delete or archive the project.
+
+Never merge except through `hp round merge`, which merges only on an exact MERGE verdict at the verdict commit for the pinned candidate. A MERGE-AFTER-DECISION verdict waits for Rolf: ask him with `hp ask`.
