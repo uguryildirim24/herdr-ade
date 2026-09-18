@@ -246,12 +246,6 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Moves items to `inbox/done/`. Returns how many moved.
-#[allow(dead_code)] // compatibility wrapper used by existing callers and tests
-pub fn done(project: &Project, ids: &[String], all: bool) -> Result<usize> {
-    done_bound(project, ids, all, None)
-}
-
 /// Handles event-linked items only when the caller is their bound coordinator.
 pub fn done_bound(
     project: &Project,
@@ -337,7 +331,10 @@ mod tests {
         mark_seen(&project, &[items[0].id.clone()]).unwrap();
         assert_eq!(seen(&project).len(), 1);
 
-        assert_eq!(done(&project, &[items[0].id.clone()], false).unwrap(), 1);
+        assert_eq!(
+            done_bound(&project, &[items[0].id.clone()], false, None).unwrap(),
+            1
+        );
         assert_eq!(unhandled(&project).len(), 1);
         assert!(
             inbox_dir(&project)
@@ -345,7 +342,7 @@ mod tests {
                 .join(format!("{}.md", items[0].id))
                 .is_file()
         );
-        assert_eq!(done(&project, &[], true).unwrap(), 1);
+        assert_eq!(done_bound(&project, &[], true, None).unwrap(), 1);
         assert!(unhandled(&project).is_empty());
     }
 
@@ -363,7 +360,7 @@ mod tests {
         assert_eq!(items[1].summary, "second line");
         assert!(items.iter().all(|i| i.body.is_empty()));
         // A written item can be marked done by its id.
-        assert_eq!(done(&project, &[a], false).unwrap(), 1);
+        assert_eq!(done_bound(&project, &[a], false, None).unwrap(), 1);
     }
 
     #[test]
@@ -393,7 +390,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         for bad in ["../PROJECT", "a/b", "", ".hidden", "x..y"] {
-            assert!(done(&project, &[bad.to_string()], false).is_err(), "{bad}");
+            assert!(
+                done_bound(&project, &[bad.to_string()], false, None).is_err(),
+                "{bad}"
+            );
         }
     }
 

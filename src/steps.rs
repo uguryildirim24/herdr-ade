@@ -154,25 +154,25 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
     )
 }
 
-/// Named item writers used by A1's ticker integration.
-#[allow(dead_code)] // named seam for A1's ticker
-pub fn config_changed(project: &Project, subject: &str, summary: &str) -> Result<()> {
-    inbox::write(project, "config-changed", subject, summary, "").map(|_| ())
-}
-
-#[allow(dead_code)] // named seam for A1's ticker
-pub fn report_available(project: &Project, lane: &Thread, path: &str) -> Result<()> {
-    inbox::write(
-        project,
-        "report-available",
-        &lane.id,
-        &format!(
-            "{} has report bytes at {path}; this is not a completion",
-            lane.id
-        ),
-        "",
-    )
-    .map(|_| ())
+/// D11: records the digest of `config.toml` and `RULES.md`; when it moved
+/// since the last tick, one `config-changed` item. Best-effort, not tamper
+/// evidence.
+pub fn config_changed(project: &Project, digest: &str) -> Result<()> {
+    let path = project.state_dir().join("policy_hash");
+    let recorded = std::fs::read_to_string(&path).ok();
+    if recorded.as_deref().map(str::trim) == Some(digest) {
+        return Ok(());
+    }
+    if recorded.is_some() {
+        inbox::write(
+            project,
+            "config-changed",
+            "policy",
+            &format!("config.toml or RULES.md changed; the policy hash is now {digest}"),
+            "",
+        )?;
+    }
+    project::write_atomic(&path, digest.as_bytes())
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
@@ -392,16 +392,18 @@ pub fn write_thread_items(
         if t.last_group != Group::ReadyForReview.token() && t.last_group != Group::Landing.token() {
             continue;
         }
-        let mut summary = format!("{} has a new report: threads/{}.md", thread_label(&t), t.id);
+        let mut summary = format!(
+            "{} has a new report: threads/{}.md; report bytes are not a completion",
+            thread_label(&t),
+            t.id
+        );
         if let Some(notes) = copy_notes.get(&t.id) {
             summary.push_str(&format!(
                 "; not everything was copied: {}",
                 notes.join("; ")
             ));
         }
-        // A0's legacy ticker reaches this function directly. A1 replaces this
-        // call with `report_available`, whose item is explicitly non-completion.
-        inbox::write(project, "thread-state", &t.id, &summary, "")?;
+        inbox::write(project, "report-available", &t.id, &summary, "")?;
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
     }

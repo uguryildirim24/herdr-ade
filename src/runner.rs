@@ -74,7 +74,7 @@ impl Cmd {
     }
 
     /// The command as one line; the scripted fake matches on it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn display(&self) -> String {
         let mut line = self.program.clone();
         for arg in &self.args {
@@ -263,13 +263,13 @@ pub mod fake {
     use std::cell::RefCell;
 
     type Matcher = Box<dyn Fn(&Cmd) -> bool>;
+    type Answer = Box<dyn Fn(&Cmd) -> Result<Output>>;
 
     /// A scripted runner: the first rule whose matcher accepts the command
     /// answers it. Every command is recorded, matched or not.
     #[derive(Default)]
-    #[allow(clippy::type_complexity)]
     pub struct FakeRunner {
-        rules: RefCell<Vec<(Matcher, Box<dyn Fn(&Cmd) -> Result<Output>>)>>,
+        rules: RefCell<Vec<(Matcher, Answer)>>,
         pub calls: RefCell<Vec<Cmd>>,
         /// (socket, request line) of every socket request.
         pub socket_requests: RefCell<Vec<(PathBuf, String)>>,

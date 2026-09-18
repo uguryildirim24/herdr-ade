@@ -139,13 +139,6 @@ pub struct Repo {
 pub struct Settings {
     pub name: String,
     pub goal: String,
-    /// Kept for unowned callers (`coordinator.rs`). New files do not write it
-    /// (SPEC-ADE D2). `doctor` refuses a project whose front matter still has
-    /// the key.
-    #[serde(default = "default_claude", skip_serializing)]
-    pub coordinator_agent: String,
-    #[serde(default = "default_claude", skip_serializing)]
-    pub thread_agent: String,
     pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
@@ -158,10 +151,6 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub roles: std::collections::BTreeMap<String, RoleOverride>,
     pub repos: Vec<Repo>,
-}
-
-fn default_claude() -> String {
-    "claude".into()
 }
 
 /// Project override of one role. Only `kind` and `args` (SPEC-ADE D2).
@@ -179,8 +168,6 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             goal: String::new(),
-            coordinator_agent: default_claude(),
-            thread_agent: default_claude(),
             max_parallel_threads: 3,
             auto_resolve_days: 7,
             // Off by default: on herdr 0.9.1 a prompt merges with, and submits,
@@ -312,8 +299,6 @@ impl Coordinator {
 #[serde(default)]
 pub struct Safety {
     pub start_threads: String,
-    pub coordinator_agent_args: Vec<String>,
-    pub thread_agent_args: Vec<String>,
     pub routine_commands: bool,
 }
 
@@ -321,8 +306,6 @@ impl Default for Safety {
     fn default() -> Self {
         Safety {
             start_threads: "propose".into(),
-            coordinator_agent_args: Vec::new(),
-            thread_agent_args: Vec::new(),
             routine_commands: false,
         }
     }
@@ -902,7 +885,6 @@ mod tests {
         let (settings, body) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
-        assert_eq!(settings.coordinator_agent, "claude");
         assert_eq!(settings.max_parallel_threads, 3);
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(!settings.nudge);
@@ -930,7 +912,6 @@ mod tests {
             parse_project_md("+++\nname = \"X\"\nnudge = true\n+++\n\nBody\n+++\nmore\n").unwrap();
         assert_eq!(settings.name, "X");
         assert!(settings.nudge);
-        assert_eq!(settings.thread_agent, "claude");
         assert_eq!(body, "Body\n+++\nmore\n");
         assert!(parse_project_md("no front matter").is_err());
         assert!(parse_project_md("+++\nname = \n+++\n").is_err());
@@ -957,14 +938,12 @@ mod tests {
 
         std::fs::write(
             config.path().join("config.toml"),
-            "root = \"/projects\"\n\n[safety.\"/projects/demo\"]\nstart_threads = \"auto\"\nthread_agent_args = [\"--x\"]\n",
+            "root = \"/projects\"\n\n[safety.\"/projects/demo\"]\nstart_threads = \"auto\"\n",
         )
         .unwrap();
         let safety = load_safety(config.path(), here).unwrap();
         assert_eq!(safety.start_threads, "auto");
-        assert_eq!(safety.thread_agent_args, ["--x"]);
         assert!(!safety.routine_commands);
-        assert!(safety.coordinator_agent_args.is_empty());
         assert_eq!(
             load_safety(config.path(), Path::new("/projects/other")).unwrap(),
             Safety::default()
@@ -1026,7 +1005,6 @@ mod tests {
         assert!(legacy_agent_keys(front).is_empty(), "{front}");
         assert!(!front.contains("talk"), "{front}");
         let (settings, _) = parse_project_md(&text).unwrap();
-        assert_eq!(settings.coordinator_agent, "claude");
         assert_eq!(settings.talk, None);
     }
 

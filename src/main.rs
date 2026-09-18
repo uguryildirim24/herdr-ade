@@ -1,44 +1,36 @@
 mod actions;
-// ade-rounds begin
+mod adapters;
+mod adopt;
 mod ask;
 mod board;
 mod checkpoint;
-mod dialogue;
-mod glossary;
-mod round;
-mod talk;
-// ade-rounds end
-mod adopt;
 mod cli;
-// ade-outbox begin
-mod adapters;
-mod events;
-mod hook;
-mod lane;
-mod ops;
-// ade-outbox end
-#[allow(dead_code)]
 mod contracts;
 mod coordinator;
+mod dialogue;
 mod doctor;
-// ade-core begin
+mod events;
 mod git;
-// ade-core end
+mod glossary;
 mod herdr;
+mod hook;
 mod inbox;
+mod lane;
 mod lifecycle;
+mod ops;
 mod overview;
 mod paths;
-#[allow(dead_code)]
 mod plain;
 mod pr;
 mod project;
 mod remote;
+mod round;
 mod routine;
 mod runner;
 #[cfg(test)]
 mod scenarios;
 mod steps;
+mod talk;
 mod thread;
 mod threads;
 mod ticker;

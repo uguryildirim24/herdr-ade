@@ -153,123 +153,6 @@ fn socket_of(cmd: &Cmd) -> String {
 }
 
 #[test]
-fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() {
-    let world = World::new();
-    let project = world.project("demo", "a.sock");
-    let worktree = world.home.path().join("wt");
-    std::fs::create_dir(&worktree).unwrap();
-    let repo = world.home.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    let wt = worktree.to_string_lossy().into_owned();
-
-    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
-    world.runner.on("rev-parse --show-toplevel", ok("/repo\n"));
-    world.runner.on(
-        "remote get-url origin",
-        ok("git@github.com:Owner/App.git\n"),
-    );
-    world.runner.on("fetch origin", fail(1, "offline"));
-    world.runner.on("symbolic-ref", ok("origin/main\n"));
-    world
-        .runner
-        .on("rev-parse --git-path", fail(1, "not a repo"));
-    world.runner.on(
-        "worktree create",
-        ok(&format!(
-            r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":"{wt}"}},"worktree":{{"path":"{wt}"}}}}}}"#
-        )),
-    );
-    world.runner.on(
-        "agent start",
-        ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#),
-    );
-    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-
-    let ctx = world.ctx();
-    let started = threads::start(
-        &ctx,
-        "demo",
-        StartArgs {
-            title: "Fix $(it)".into(),
-            repo: Some(repo.to_string_lossy().into_owned()),
-            machine: None,
-            agent: None,
-            base: None,
-            task: "Do the thing.".into(),
-        },
-    )
-    .unwrap();
-
-    // A failed fetch is a warning; nothing was launched.
-    assert_eq!(world.runner.count("agent start"), 0);
-    assert_eq!(started.status, Status::Open);
-    assert!(started.prompt_pending);
-    assert_eq!(started.branch, "hp/demo/t-0001-fix-it");
-    assert_eq!(started.base, "origin/main");
-    assert_eq!(started.origin, "git@github.com:Owner/App.git");
-    assert_eq!(started.agent_name, "hp-demo-t-0001");
-    let brief =
-        std::fs::read_to_string(worktree.join(".herdr-project/demo-t-0001/brief.md")).unwrap();
-    assert!(brief.contains("Do the thing."));
-    assert!(brief.contains("# Project instructions"));
-    // The hostile title reaches herdr as one argument, unchanged.
-    let calls = world.runner.calls.borrow();
-    let create = calls
-        .iter()
-        .find(|c| c.display().contains("worktree create"))
-        .unwrap();
-    assert!(create.args.contains(&"Fix $(it)".to_string()));
-    drop(calls);
-
-    // Tick 1: the pane is at a shell prompt: start, do not prompt.
-    *world.panes.borrow_mut() = format!(
-        "[{},{}]",
-        world.coordinator_pane(&project),
-        pane_json("w2", "w2:t1", "w2:p1", &wt)
-    );
-    assert!(ticker::tick_project(&ctx, &project).unwrap());
-    assert_eq!(world.runner.count("agent start"), 1);
-    assert_eq!(world.runner.count("agent prompt"), 0);
-    assert_eq!(thread::load(&project, "t-0001").unwrap().launch_attempts, 1);
-
-    // Tick 2: the agent is ready: prompt once, no second start.
-    *world.agents.borrow_mut() = format!(
-        "[{}]",
-        agent_json("w2", "w2:t1", "w2:p1", &wt, "hp-demo-t-0001", "idle")
-    );
-    assert!(ticker::tick_project(&ctx, &project).unwrap());
-    assert_eq!(world.runner.count("agent start"), 1);
-    assert_eq!(world.runner.count("agent prompt"), 1);
-    let calls = world.runner.calls.borrow();
-    let prompt = calls
-        .iter()
-        .find(|c| c.display().contains("agent prompt"))
-        .unwrap();
-    assert_eq!(
-        prompt.args.last().unwrap(),
-        "Read .herdr-project/demo-t-0001/brief.md and do what it says."
-    );
-    drop(calls);
-    assert!(!thread::load(&project, "t-0001").unwrap().prompt_pending);
-
-    // Delivering the brief to an idle agent is not "the thread went Idle".
-    assert_eq!(
-        thread::load(&project, "t-0001").unwrap().last_group,
-        "working"
-    );
-    assert!(inbox::unhandled(&project).is_empty());
-
-    // Tick 3: nothing more to deliver.
-    *world.agents.borrow_mut() = format!(
-        "[{}]",
-        agent_json("w2", "w2:t1", "w2:p1", &wt, "hp-demo-t-0001", "working")
-    );
-    assert!(ticker::tick_project(&ctx, &project).unwrap());
-    assert_eq!(world.runner.count("agent prompt"), 1);
-    assert!(inbox::unhandled(&project).is_empty());
-}
-
-#[test]
 fn one_agent_start_per_project_per_tick_and_three_failures_give_failed() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -364,7 +247,7 @@ fn two_projects_in_two_sockets_sharing_a_pane_id_do_not_mix() {
         .collect();
     assert_eq!(prompts.len(), 1);
     assert_eq!(socket_of(prompts[0]), b_socket);
-    assert!(prompts[0].display().contains("beta-t-0001"));
+    assert!(prompts[0].display().contains("tasks/t-0001.md"));
     drop(calls);
     assert!(thread::load(&a, "t-0001").unwrap().prompt_pending);
     assert!(!thread::load(&b, "t-0001").unwrap().prompt_pending);
@@ -423,12 +306,26 @@ fn restart_defers_to_the_ticker_and_resets_launch_attempts() {
         t.status = Status::Failed;
         t.error = "no agent".into();
         t.launch_attempts = 3;
+        t.attempt = 1;
+        t.launch.kind = "claude".into();
+        t.launch.brief_hash = "h1".into();
     });
     std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();
-    *world.panes.borrow_mut() = format!("[{}]", pane_json("w2", "w2:t1", "w2:p1", &cwd));
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd)
+    );
     world
         .runner
         .on("rev-parse --git-path", fail(1, "not a repo"));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world.runner.on(
+        "tab create",
+        ok(&format!(
+            r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","cwd":"{cwd}"}}}}}}"#
+        )),
+    );
 
     let t = threads::restart(&world.ctx(), "demo", "t-0001").unwrap();
     assert_eq!(
@@ -438,9 +335,16 @@ fn restart_defers_to_the_ticker_and_resets_launch_attempts() {
     assert!(t.error.is_empty());
     assert_eq!(world.runner.count("agent start"), 0);
     assert_eq!(world.runner.count("agent prompt"), 0);
-    let brief = std::fs::read_to_string(Path::new(&t.thread_dir).join("brief.md")).unwrap();
-    assert!(brief.contains("previous attempt"));
-    assert!(brief.contains("The task."));
+    // A1 M5: the bare shell's HERDR_ADE_LAUNCH names attempt 1, so attempt 2
+    // gets a new tab carrying its own launch line.
+    assert_eq!(t.attempt, 2);
+    assert_eq!(t.pane_id, "w1:p3");
+    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+    let calls = world.runner.calls.borrow();
+    assert!(calls.iter().any(|c| {
+        let line = c.display();
+        line.contains("tab create") && line.contains("HERDR_ADE_LAUNCH=demo/t-0001/2/h1")
+    }));
 }
 
 #[test]
@@ -557,9 +461,10 @@ fn thread_start_is_refused_when_paused() {
         title: "x".into(),
         repo: None,
         machine: None,
-        agent: None,
         base: None,
         task: "t".into(),
+        plain: "The lane does the work.".into(),
+        role: None,
     };
     let error = threads::start(&world.ctx(), "demo", args)
         .unwrap_err()
@@ -678,7 +583,7 @@ fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     for _ in 0..4 {
         ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
     }
-    let items = items_of(&project, "thread-state");
+    let items = items_of(&project, "report-available");
     assert_eq!(items.len(), 1, "{items:?}");
     assert!(items[0].summary.contains("threads/t-0001.md"));
     assert!(items[0].body.is_empty());
@@ -706,7 +611,7 @@ fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     set_agents(&world, &project, "done");
     ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
     ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
-    assert_eq!(items_of(&project, "thread-state").len(), 1);
+    assert_eq!(items_of(&project, "report-available").len(), 1);
     assert_eq!(nudges(&world), 1);
 
     // A new report: one more item, one more nudge.
@@ -718,7 +623,7 @@ fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     for _ in 0..3 {
         ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
     }
-    assert_eq!(items_of(&project, "thread-state").len(), 2);
+    assert_eq!(items_of(&project, "report-available").len(), 2);
     assert_eq!(nudges(&world), 2);
 }
 
@@ -1411,9 +1316,10 @@ fn a_remote_thread_without_a_repo_is_refused() {
         title: "x".into(),
         repo: None,
         machine: Some("box".into()),
-        agent: None,
         base: None,
         task: "t".into(),
+        plain: "The lane does the work.".into(),
+        role: None,
     };
     assert!(
         threads::start(&world.ctx(), "demo", args)

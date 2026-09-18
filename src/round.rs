@@ -924,9 +924,6 @@ struct Verdict {
     candidate: String,
     manifest_hash: String,
     policy_hash: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    gates: Vec<String>,
 }
 
 fn parse_verdict(text: &str) -> Result<Verdict> {

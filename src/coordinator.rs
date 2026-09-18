@@ -127,7 +127,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if let Some(record) = &previous
         && let Some(agent) = agents.iter().find(|a| agent_matches(record, a))
     {
-        crate::hook::install(ctx, &project, &record_kind(record, &spec), &record.pane_id)?;
+        crate::hook::install(ctx, &project, &record.launch.kind, &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
         report_tokens(&herdr, slug, &record.pane_id);
@@ -160,8 +160,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let brief_hash =
         crate::thread::sha256_hex(&std::fs::read(project.project_md()).unwrap_or_default());
     let launch = match reusable {
-        Some(record) if !record.launch.brief_hash.is_empty() => record.launch.clone(),
-        _ => project::launch_recipe(
+        Some(record) => record.launch.clone(),
+        None => project::launch_recipe(
             &spec,
             previous_launch.attempt + 1,
             brief_hash,
@@ -356,11 +356,8 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
             );
             let _ = writeln!(
                 out,
-                "Settings: thread_agent={} max_parallel_threads={} auto_resolve_days={} nudge={}",
-                settings.thread_agent,
-                settings.max_parallel_threads,
-                settings.auto_resolve_days,
-                settings.nudge
+                "Settings: max_parallel_threads={} auto_resolve_days={} nudge={}",
+                settings.max_parallel_threads, settings.auto_resolve_days, settings.nudge
             );
             if settings.repos.is_empty() {
                 let _ = writeln!(out, "Repos: (none)");
@@ -384,11 +381,8 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
         Ok(safety) => {
             let _ = writeln!(
                 out,
-                "Safety: start_threads={} routine_commands={} thread_agent_args={:?} coordinator_agent_args={:?}",
-                safety.start_threads,
-                safety.routine_commands,
-                safety.thread_agent_args,
-                safety.coordinator_agent_args
+                "Safety: start_threads={} routine_commands={}",
+                safety.start_threads, safety.routine_commands
             );
         }
         Err(error) => {
@@ -529,10 +523,6 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
     if pane.is_empty() || pane != record.pane_id {
         return Ok(());
     }
-    if record.launch.brief_hash.is_empty() {
-        // A binding opened before launch receipts existed has none to match.
-        return Ok(());
-    }
     let launch = project::LaunchEnv::from_process()
         .context("bootstrap_mismatch: HERDR_ADE_LAUNCH is missing or malformed")?;
     if launch.project != project.slug
@@ -568,15 +558,6 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
         coordinator.bootstrap = "acknowledged".into();
     })?;
     Ok(())
-}
-
-/// The recorded coordinator kind, else the role's (a pre-ADE binding).
-fn record_kind(record: &Coordinator, spec: &crate::contracts::RoleSpec) -> String {
-    if record.launch.kind.is_empty() {
-        spec.kind.clone()
-    } else {
-        record.launch.kind.clone()
-    }
 }
 
 #[cfg(test)]

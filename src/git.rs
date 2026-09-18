@@ -4,8 +4,6 @@
 //! Git runs outside the project lock. Public helpers stay for A2/A3 merge
 //! and for tests that do not call every path from this crate's binary.
 
-#![allow(dead_code)]
-
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -96,24 +94,6 @@ pub fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()
     Ok(())
 }
 
-/// True when `ancestor` is an ancestor of `descendant`.
-pub fn is_ancestor(
-    runner: &dyn Runner,
-    repo: &str,
-    ancestor: &str,
-    descendant: &str,
-) -> Result<bool> {
-    let out = runner.run(&Cmd::new("git", Duration::from_secs(5)).args([
-        "-C",
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        ancestor,
-        descendant,
-    ]))?;
-    Ok(out.success())
-}
-
 /// SHA of `refs/heads/<branch>`, or of any ref name passed in.
 pub fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
     git(runner, repo, &["rev-parse", rev], Duration::from_secs(5))
@@ -186,32 +166,6 @@ pub fn branch_checkout(runner: &dyn Runner, repo: &str, branch: &str) -> Result<
         }
     }
     Ok(None)
-}
-
-/// Commit one file on `branch` under the repository lock (SPEC-ADE D9). See
-/// [`commit_files_locked`] for the three checkout cases.
-pub fn commit_file_on_branch(
-    runner: &dyn Runner,
-    repo: &str,
-    branch: &str,
-    relative_path: &str,
-    contents: &[u8],
-    message: &str,
-) -> Result<String> {
-    let text = std::str::from_utf8(contents)
-        .with_context(|| format!("{relative_path} is not text; only text files are committed"))?;
-    let lock = lock(runner, repo)?;
-    let head = rev_parse(runner, repo, &branch_ref(branch))
-        .with_context(|| format!("branch_missing: `{branch}` does not exist"))?;
-    commit_files_locked(
-        runner,
-        Path::new(repo),
-        branch,
-        &[(relative_path, text)],
-        message,
-        &head,
-        &lock.common_dir.join("herdr-ade-tmp"),
-    )
 }
 
 /// The one D9 commit: `files` (path, text) on `branch`, whose head must be
@@ -342,14 +296,8 @@ pub fn commit_files_locked(
     }
 }
 
-/// Adds `.herdr-project/` and `.worktrees/` to `info/exclude` when missing,
-/// under the repository lock (D4).
-pub fn exclude_plugin_paths(runner: &dyn Runner, repo: &str) -> Result<()> {
-    let _lock = lock(runner, repo)?;
-    exclude_plugin_paths_locked(runner, repo)
-}
-
-/// [`exclude_plugin_paths`] for a caller that holds the repository lock.
+/// Adds `.herdr-project/` and `.worktrees/` to `info/exclude` when missing;
+/// the caller holds the repository lock (D4).
 pub fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Result<()> {
     let exclude = git(
         runner,
@@ -451,28 +399,29 @@ mod tests {
         assert!(err.contains("not a clean worktree"), "{err}");
     }
 
-    #[test]
-    fn ancestor_and_update_ref_go_through_the_runner() {
-        let runner = FakeRunner::new();
-        runner.on("merge-base --is-ancestor", ok(""));
-        runner.on("update-ref", ok(""));
-        assert!(is_ancestor(&runner, "/repo", "B", "C").unwrap());
-        update_ref(&runner, "/repo", "refs/heads/main", "H", "V").unwrap();
-        let calls = runner.calls.borrow();
-        let uref = calls
-            .iter()
-            .find(|c| c.display().contains("update-ref"))
-            .unwrap();
-        assert_eq!(
-            uref.args
-                .iter()
-                .rev()
-                .take(3)
-                .rev()
-                .cloned()
-                .collect::<Vec<_>>(),
-            ["refs/heads/main", "H", "V"]
-        );
+    fn commit_file_on_branch(
+        runner: &dyn Runner,
+        repo: &str,
+        branch: &str,
+        relative_path: &str,
+        contents: &[u8],
+        message: &str,
+    ) -> Result<String> {
+        let text = std::str::from_utf8(contents).with_context(|| {
+            format!("{relative_path} is not text; only text files are committed")
+        })?;
+        let lock = lock(runner, repo)?;
+        let head = rev_parse(runner, repo, &branch_ref(branch))
+            .with_context(|| format!("branch_missing: `{branch}` does not exist"))?;
+        commit_files_locked(
+            runner,
+            Path::new(repo),
+            branch,
+            &[(relative_path, text)],
+            message,
+            &head,
+            &lock.common_dir.join("herdr-ade-tmp"),
+        )
     }
 
     #[test]

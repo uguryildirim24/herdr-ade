@@ -14,7 +14,6 @@ use crate::thread::{self, CopyOutcome, Group, Kind, Live, Status, Thread};
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The project's session as the binary sees it right now.
 pub struct SessionView<'a> {
@@ -94,16 +93,11 @@ pub struct StartArgs {
     pub title: String,
     pub repo: Option<String>,
     pub machine: Option<String>,
-    pub agent: Option<String>,
     pub base: Option<String>,
     pub task: String,
-}
-
-/// ADE fields for `thread start` (SPEC-ADE D2, D17 item 6). Not added to
-/// `StartArgs` so unowned scenario constructors keep compiling.
-#[derive(Debug, Clone, Default)]
-pub struct AdeStart {
+    /// The birth sentence (SPEC-ADE D17 item 6).
     pub plain: String,
+    /// A roles-table row; `lane` when empty (SPEC-ADE D2).
     pub role: Option<String>,
 }
 
@@ -134,19 +128,9 @@ pub fn check_birth_plain(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Creates the workspace or tab, the thread directory and the brief, then
+/// Creates the worktree or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
-/// Unowned scenario tests still call this legacy path.
-#[allow(dead_code)]
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_inner(ctx, slug, args, None)
-}
-
-pub fn start_with_ade(ctx: &Ctx, slug: &str, args: StartArgs, ade: AdeStart) -> Result<Thread> {
-    start_inner(ctx, slug, args, Some(ade))
-}
-
-fn start_inner(ctx: &Ctx, slug: &str, args: StartArgs, ade: Option<AdeStart>) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let status = project.status();
     if status != project::Status::Active {
@@ -209,33 +193,17 @@ fn start_inner(ctx: &Ctx, slug: &str, args: StartArgs, ade: Option<AdeStart>) ->
         );
     }
 
-    let mut ade_spec = None;
-    let mut ade_plain = String::new();
-    let mut ade_role = String::new();
-    if let Some(ade) = &ade {
-        check_birth_plain(&ade.plain)?;
-        if !machine.is_empty() {
-            bail!("remote_not_admissible");
-        }
-        let role = ade
-            .role
-            .as_deref()
-            .filter(|r| !r.is_empty())
-            .unwrap_or("lane");
-        // Validation happens before any tab or worktree (SPEC-ADE D2).
-        let spec = project::resolve_role(&ctx.config_dir, &settings, role)?;
-        ade_spec = Some(spec);
-        ade_plain = ade.plain.trim().to_string();
-        ade_role = role.to_string();
+    check_birth_plain(&args.plain)?;
+    if !machine.is_empty() {
+        bail!("remote_not_admissible");
     }
-
-    let agent_kind = if let Some(spec) = &ade_spec {
-        spec.kind.clone()
-    } else {
-        args.agent
-            .clone()
-            .unwrap_or_else(|| settings.thread_agent.clone())
-    };
+    let role = args
+        .role
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .unwrap_or("lane");
+    // Validation happens before any tab or worktree (SPEC-ADE D2).
+    let spec = project::resolve_role(&ctx.config_dir, &settings, role)?;
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = if repo.is_empty() {
@@ -245,19 +213,17 @@ fn start_inner(ctx: &Ctx, slug: &str, args: StartArgs, ade: Option<AdeStart>) ->
         };
         t.repo = repo.clone();
         t.machine = machine.clone();
-        t.agent = agent_kind.clone();
+        t.agent = spec.kind.clone();
         t.base = args.base.clone().unwrap_or_default();
-        if let Some(spec) = &ade_spec {
-            t.role = ade_role.clone();
-            t.plain = ade_plain.clone();
-            t.attempt = 1;
-            t.launch = project::launch_recipe(
-                spec,
-                1,
-                String::new(),
-                project::policy_hash(&ctx.config_dir),
-            );
-        }
+        t.role = role.to_string();
+        t.plain = args.plain.trim().to_string();
+        t.attempt = 1;
+        t.launch = project::launch_recipe(
+            &spec,
+            1,
+            String::new(),
+            project::policy_hash(&ctx.config_dir),
+        );
     })?;
     let id = record.id.clone();
     {
@@ -294,9 +260,6 @@ fn place_and_brief(
     let runner = ctx.runner;
 
     let placed = match record.kind {
-        Kind::Worktree if record.is_ade() && !record.is_remote() => {
-            place_ade_worktree(ctx, project, view, &record)?
-        }
         Kind::Worktree if record.is_remote() => {
             // The same steps on the thread's own machine: git over ssh, herdr
             // through `--machine`.
@@ -325,80 +288,20 @@ fn place_and_brief(
                 t.pane_id = created.pane_id;
             })?
         }
-        Kind::Worktree => {
-            git(
-                runner,
-                &record.repo,
-                &["rev-parse", "--show-toplevel"],
-                GIT_TIMEOUT,
-            )
-            .with_context(|| format!("{} is not a git repository", record.repo))?;
-            let origin = git(
-                runner,
-                &record.repo,
-                &["remote", "get-url", "origin"],
-                GIT_TIMEOUT,
-            )
-            .unwrap_or_default();
-            if !origin.is_empty()
-                && let Err(error) = git(runner, &record.repo, &["fetch", "origin"], FETCH_TIMEOUT)
-            {
-                eprintln!("warning: {error:#}");
-            }
-            let base = if record.base.is_empty() {
-                git(
-                    runner,
-                    &record.repo,
-                    &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                    GIT_TIMEOUT,
-                )
-                .or_else(|_| {
-                    git(
-                        runner,
-                        &record.repo,
-                        &["rev-parse", "--abbrev-ref", "HEAD"],
-                        GIT_TIMEOUT,
-                    )
-                })
-                .and_then(|base| match base.as_str() {
-                    "HEAD" => git(runner, &record.repo, &["rev-parse", "HEAD"], GIT_TIMEOUT),
-                    _ => Ok(base),
-                })?
-            } else {
-                record.base.clone()
-            };
-            let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) =
-                view.herdr
-                    .worktree_create(&record.repo, &branch, &base, &record.title)?;
-            // Recorded immediately, so a command killed midway still leaves a
-            // record `thread restart` can act on.
-            thread::update(project, id, |t| {
-                t.origin = origin;
-                t.base = base;
-                t.branch = branch;
-                t.worktree_path = path;
-                t.cwd = cwd;
-                t.workspace_id = created.workspace_id;
-                t.tab_id = created.tab_id;
-                t.pane_id = created.pane_id;
-            })?
-        }
-        Kind::Tab if record.is_ade() => place_ade_tab(ctx, project, view, &record)?,
-        Kind::Tab => place_tab(project, view, &record)?,
+        Kind::Worktree => place_ade_worktree(ctx, project, view, &record)?,
+        Kind::Tab => place_ade_tab(ctx, project, view, &record)?,
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
     };
     write_brief(ctx, project, &placed, restart)?;
-    // An ADE lane's hash was fixed before its tab existed and is in the tab's
-    // HERDR_ADE_LAUNCH; the local brief copy never replaces it (D9, D14).
     finish_placement(project, view, id)
 }
 
-/// The thread directory, the git exclude and `brief.md`, on the thread's own
-/// machine. The brief never refers to a path on another machine.
+/// The thread directory and the git exclude; on a remote machine also
+/// `brief.md`. A local brief was written and hashed before its tab existed
+/// (D9, D14) and is never rewritten here.
 fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> Result<()> {
     if !placed.is_remote() {
-        return write_brief_local(ctx, project, placed, restart);
+        return prepare_local_dir(ctx, project, placed);
     }
     let dir = thread::thread_dir(&placed.cwd, &project.slug, &placed.id);
     let with_dir = Thread {
@@ -406,7 +309,7 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
         ..placed.clone()
     };
     let task = std::fs::read_to_string(thread::task_path(project, &placed.id)).unwrap_or_default();
-    let brief = thread::brief_for(project, &with_dir, &task, restart)?;
+    let brief = thread::with_lane_skill(&thread::brief_for(project, &with_dir, &task, restart)?);
     let target = remote::ssh_target(
         ctx.runner,
         &ctx.env.herdr_bin(),
@@ -504,6 +407,7 @@ fn place_ade_worktree(
         // The hash is on the record before the lane branch exists (D9).
         thread::update(project, &record.id, |t| {
             t.launch.brief_hash = brief_hash.clone();
+            t.thread_dir = stub.thread_dir.clone();
             t.base = sha.clone();
             t.branch = branch.clone();
             t.partial = Some("worktree_add".into());
@@ -601,17 +505,28 @@ fn place_ade_tab(
         env: record.launch.env.clone(),
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
-    // No repository, so no committed brief: the hash is of the brief this
-    // tab will read, fixed before the tab exists and stored on the record.
+    // No repository, so no committed brief: the brief is written once into
+    // the thread directory and its hash fixed before the tab exists.
     let brief_hash = if record.launch.brief_hash.is_empty() {
         let task =
             std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
+        let dir = thread::thread_dir(&folder.to_string_lossy(), &project.slug, &record.id);
         let stub = Thread {
-            thread_dir: thread::thread_dir(&folder.to_string_lossy(), &project.slug, &record.id),
+            thread_dir: dir.clone(),
             ..record.clone()
         };
-        let hash = thread::sha256_hex(thread::brief_for(project, &stub, &task, false)?.as_bytes());
-        thread::update(project, &record.id, |t| t.launch.brief_hash = hash.clone())?;
+        let brief = format!(
+            "plain: {}\n\n{}",
+            record.plain,
+            thread::brief_for(project, &stub, &task, false)?
+        );
+        std::fs::create_dir_all(&dir).with_context(|| format!("could not create {dir}"))?;
+        project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
+        let hash = thread::sha256_hex(brief.as_bytes());
+        thread::update(project, &record.id, |t| {
+            t.launch.brief_hash = hash.clone();
+            t.thread_dir = dir;
+        })?;
         hash
     } else {
         record.launch.brief_hash.clone()
@@ -644,60 +559,19 @@ fn place_ade_tab(
     })
 }
 
-fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
-    let coordinator = project
-        .coordinator()
-        .context("the project has never been opened")?;
-    if !view.panes.iter().any(|p| {
-        p.workspace_id == coordinator.workspace_id && coordinator::pane_matches(&coordinator, p)
-    }) {
-        bail!(
-            "the project's workspace is not open; run `open {}` first",
-            project.slug
-        );
-    }
-    let folder = project.dir().join("threads").join(&record.id);
-    {
-        let _lock = project.lock()?;
-        if !folder.is_dir() {
-            std::fs::create_dir(&folder)
-                .with_context(|| format!("could not create {}", folder.display()))?;
-        }
-    }
-    let folder = std::fs::canonicalize(&folder)?;
-    let created =
-        view.herdr
-            .tab_create(&coordinator.workspace_id, &folder, &record.title, false)?;
-    let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
-    let cwd = if cwd.is_empty() {
-        folder.to_string_lossy().into_owned()
+/// Creates the recorded thread directory with its library and keeps it out
+/// of git.
+fn prepare_local_dir(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
+    let dir = if placed.thread_dir.is_empty() {
+        thread::thread_dir(&placed.cwd, &project.slug, &placed.id)
     } else {
-        cwd
+        placed.thread_dir.clone()
     };
-    thread::update(project, &record.id, |t| {
-        t.cwd = cwd;
-        t.workspace_id = created.workspace_id;
-        t.tab_id = created.tab_id;
-        t.pane_id = created.pane_id;
-    })
-}
-
-/// Creates the thread directory, keeps it out of git, writes `brief.md`.
-fn write_brief_local(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> Result<()> {
-    let dir = thread::thread_dir(&placed.cwd, &project.slug, &placed.id);
-    let with_dir = Thread {
-        thread_dir: dir.clone(),
-        ..placed.clone()
-    };
-    let task = std::fs::read_to_string(thread::task_path(project, &placed.id)).unwrap_or_default();
-    let brief = thread::brief_for(project, &with_dir, &task, restart)?;
-
     std::fs::create_dir_all(Path::new(&dir).join("library"))
         .with_context(|| format!("could not create {dir}"))?;
     if placed.kind != Kind::Tab {
         exclude_from_git(ctx.runner, &placed.cwd)?;
     }
-    project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
     thread::update(project, &placed.id, |t| t.thread_dir = dir)?;
     Ok(())
 }
@@ -859,39 +733,36 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     };
 
     let plan = restart_plan(&record, &live, branch_exists, now)?;
-    if record.is_ade() {
-        thread::update(&project, id, |t| {
-            t.attempt = t.attempt.max(1).saturating_add(1);
-            t.launch.attempt = t.attempt;
-        })?;
-    }
+    thread::update(&project, id, |t| {
+        t.attempt = t.attempt.max(1).saturating_add(1);
+        t.launch.attempt = t.attempt;
+    })?;
     match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
-        RestartPlan::ReusePane => {}
-        RestartPlan::Reopen => {
-            let record = thread::load(&project, id)?;
-            if record.is_ade() {
-                place_ade_tab(ctx, &project, &view, &record)?;
-            } else {
-                match record.kind {
-                    Kind::Worktree => {
-                        let (created, path, cwd) = view
-                            .herdr
-                            .on_machine(&record.machine)
-                            .worktree_open(&record.repo, &record.worktree_path, &record.title)?;
-                        thread::update(&project, id, |t| {
-                            t.worktree_path = path;
-                            t.cwd = cwd;
-                            t.workspace_id = created.workspace_id;
-                            t.tab_id = created.tab_id;
-                            t.pane_id = created.pane_id;
-                        })?;
-                    }
-                    _ => {
-                        place_tab(&project, &view, &record)?;
-                    }
-                }
+        RestartPlan::ReusePane if record.is_remote() => {}
+        RestartPlan::Reopen if record.is_remote() => {
+            let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_open(
+                &record.repo,
+                &record.worktree_path,
+                &record.title,
+            )?;
+            thread::update(&project, id, |t| {
+                t.worktree_path = path;
+                t.cwd = cwd;
+                t.workspace_id = created.workspace_id;
+                t.tab_id = created.tab_id;
+                t.pane_id = created.pane_id;
+            })?;
+        }
+        RestartPlan::ReusePane | RestartPlan::Reopen => {
+            // The live pane is a bare shell whose HERDR_ADE_LAUNCH names the
+            // previous attempt; the new attempt gets its own tab (D14).
+            if plan == RestartPlan::ReusePane {
+                view.herdr
+                    .tab_close(&record.tab_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            place_ade_tab(ctx, &project, &view, &thread::load(&project, id)?)?;
         }
     }
     let placed = thread::load(&project, id)?;
@@ -1077,7 +948,7 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
 /// Never forces. herdr's or git's refusal (for example uncommitted changes) is
 /// reported unchanged.
 fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
-    if record.is_ade() && !record.is_remote() {
+    if !record.is_remote() {
         return remove_ade_worktree(ctx, project, record);
     }
     if record.worktree_path.is_empty() {
@@ -1096,31 +967,22 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
             .worktree_remove(&record.workspace_id)
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
-    if record.is_remote() {
-        let target = remote::ssh_target(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            &record.machine,
-        )?;
-        let script = format!(
-            "cd {} && git worktree remove {}",
-            remote::quote(&record.repo),
-            remote::quote(&record.worktree_path)
-        );
-        let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
-        if !out.success() {
-            bail!("{}", out.error_text());
-        }
-        return Ok(());
-    }
-    git(
+    let target = remote::ssh_target(
         ctx.runner,
-        &record.repo,
-        &["worktree", "remove", &record.worktree_path],
-        Duration::from_secs(20),
-    )
-    .map(|_| ())
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        &record.machine,
+    )?;
+    let script = format!(
+        "cd {} && git worktree remove {}",
+        remote::quote(&record.repo),
+        remote::quote(&record.worktree_path)
+    );
+    let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
+    if !out.success() {
+        bail!("{}", out.error_text());
+    }
+    Ok(())
 }
 
 fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
@@ -1151,20 +1013,17 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
     Ok(())
 }
 
-/// Lineage repair for ADE threads (SPEC-ADE D3). Wired from A1's ticker.
-pub fn tick(t: &mut crate::ticker::Ticker<'_>) -> anyhow::Result<()> {
-    let Some(herdr) = t.herdr else {
-        return Ok(());
-    };
-    let coordinator = match t.project.coordinator() {
+/// Lineage repair (SPEC-ADE D3); lineage is local.
+pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
+    let coordinator = match project.coordinator() {
         Some(c) => c,
         None => return Ok(()),
     };
-    for record in thread::list(t.project) {
-        if !record.is_ade() || record.status == Status::Resolved {
+    for record in thread::list(project) {
+        if record.is_remote() || record.status == Status::Resolved {
             continue;
         }
-        let Some(agent) = t.agents.iter().find(|a| thread::agent_matches(&record, a)) else {
+        let Some(agent) = agents.iter().find(|a| thread::agent_matches(&record, a)) else {
             continue;
         };
         let process = herdr
@@ -1174,7 +1033,7 @@ pub fn tick(t: &mut crate::ticker::Ticker<'_>) -> anyhow::Result<()> {
         if record.identity.process.is_some() {
             if !thread::identity_verifies(&record, agent, process.as_ref()) {
                 let _ = crate::inbox::write(
-                    t.project,
+                    project,
                     "lineage-mismatch",
                     &record.id,
                     "the live process does not match the stored identity; parent was not repaired",
@@ -1603,18 +1462,15 @@ mod tests {
             runner: &split,
             detached_ticker: false,
         };
-        let started = start_with_ade(
+        let started = start(
             &ctx,
             "demo",
             StartArgs {
                 title: "Fix login".into(),
                 repo: Some(repo_s.clone()),
                 machine: None,
-                agent: None,
                 base: None,
                 task: "Do the thing.".into(),
-            },
-            AdeStart {
                 plain: "The lane does the work.".into(),
                 role: None,
             },
@@ -1692,6 +1548,32 @@ mod tests {
         assert!(launch.contains("--parent w1:p1"), "{launch}");
         drop(calls);
 
+        // A1 H2: the ready lane is primed once with its role skill and the
+        // committed brief, never with the pre-ADE `brief.md` line.
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json("w1", "w1:t2", "w1:p2", &wt_s, "hp-demo-t-0001", "idle")
+        );
+        crate::ticker::tick_project(&ctx, &project).unwrap();
+        crate::ticker::tick_project(&ctx, &project).unwrap();
+        let calls = world.runner.calls.borrow();
+        let prompts: Vec<String> = calls
+            .iter()
+            .filter(|c| c.display().contains("agent prompt") && c.display().contains("w1:p2"))
+            .map(|c| c.args.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(
+            prompts[0].ends_with(&format!(
+                " skill lane, then read tasks/{}.md and do what it says.",
+                started.id
+            )),
+            "{}",
+            prompts[0]
+        );
+        drop(calls);
+        *world.agents.borrow_mut() = "[]".into();
+
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
         let restarted = restart(&ctx, "demo", &started.id).unwrap();
         assert_eq!(restarted.attempt, 2);
@@ -1712,18 +1594,15 @@ mod tests {
         let _project = world.project("demo", "a.sock");
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&_project));
         let ctx = world.ctx();
-        let missing = start_with_ade(
+        let missing = start(
             &ctx,
             "demo",
             StartArgs {
                 title: "X".into(),
                 repo: None,
                 machine: None,
-                agent: None,
                 base: None,
                 task: "Do the thing.".into(),
-            },
-            AdeStart {
                 plain: String::new(),
                 role: None,
             },
@@ -1732,18 +1611,15 @@ mod tests {
         .to_string();
         assert!(missing.contains("plain_missing"), "{missing}");
 
-        let remote = start_with_ade(
+        let remote = start(
             &ctx,
             "demo",
             StartArgs {
                 title: "X".into(),
                 repo: Some("/repo".into()),
                 machine: Some("box".into()),
-                agent: None,
                 base: None,
                 task: "Do the thing.".into(),
-            },
-            AdeStart {
                 plain: "The lane does the work.".into(),
                 role: None,
             },

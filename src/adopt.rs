@@ -51,16 +51,6 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
     Ok(agent)
 }
 
-pub fn adopt(
-    ctx: &Ctx,
-    slug: &str,
-    pane: &str,
-    title: &str,
-    task: Option<String>,
-) -> Result<Thread> {
-    adopt_inner(ctx, slug, pane, title, task, None)
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct AdeAdopt {
     pub plain: String,
@@ -68,24 +58,13 @@ pub struct AdeAdopt {
     pub passive: bool,
 }
 
-pub fn adopt_with_ade(
+pub fn adopt(
     ctx: &Ctx,
     slug: &str,
     pane: &str,
     title: &str,
     task: Option<String>,
     ade: AdeAdopt,
-) -> Result<Thread> {
-    adopt_inner(ctx, slug, pane, title, task, Some(ade))
-}
-
-fn adopt_inner(
-    ctx: &Ctx,
-    slug: &str,
-    pane: &str,
-    title: &str,
-    task: Option<String>,
-    ade: Option<AdeAdopt>,
 ) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() != project::Status::Active {
@@ -98,22 +77,14 @@ fn adopt_inner(
         bail!("--title may not be empty");
     }
     let (settings, _) = project.read_project_md()?;
-    let mut ade_role = String::new();
-    let mut ade_plain = String::new();
-    let mut ade_spec = None;
-    let mut passive = false;
-    if let Some(ade) = &ade {
-        crate::threads::check_birth_plain(&ade.plain)?;
-        let role = ade
-            .role
-            .as_deref()
-            .filter(|r| !r.is_empty())
-            .unwrap_or("lane");
-        ade_spec = Some(project::resolve_role(&ctx.config_dir, &settings, role)?);
-        ade_role = role.to_string();
-        ade_plain = ade.plain.trim().to_string();
-        passive = ade.passive;
-    }
+    crate::threads::check_birth_plain(&ade.plain)?;
+    let role = ade
+        .role
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .unwrap_or("lane");
+    let spec = project::resolve_role(&ctx.config_dir, &settings, role)?;
+    let passive = ade.passive;
     let record = project
         .coordinator()
         .with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
@@ -154,19 +125,17 @@ fn adopt_inner(
         t.workspace_id = agent.workspace_id.clone();
         t.tab_id = agent.tab_id.clone();
         t.pane_id = agent.pane_id.clone();
-        if let Some(spec) = &ade_spec {
-            t.role = ade_role.clone();
-            t.plain = ade_plain.clone();
-            t.passive = passive;
-            t.attempt = 1;
-            t.launch = project::launch_recipe(
-                spec,
-                1,
-                String::new(),
-                project::policy_hash(&ctx.config_dir),
-            );
-            t.agent = spec.kind.clone();
-        }
+        t.role = role.to_string();
+        t.plain = ade.plain.trim().to_string();
+        t.passive = passive;
+        t.attempt = 1;
+        t.launch = project::launch_recipe(
+            &spec,
+            1,
+            String::new(),
+            project::policy_hash(&ctx.config_dir),
+        );
+        t.agent = spec.kind.clone();
     })?;
     let id = created.id.clone();
     let task = task
@@ -184,7 +153,7 @@ fn adopt_inner(
             thread_dir: dir.clone(),
             ..created.clone()
         };
-        let brief = thread::brief_for(&project, &with_dir, &task, false)?;
+        let brief = thread::with_lane_skill(&thread::brief_for(&project, &with_dir, &task, false)?);
         std::fs::create_dir_all(Path::new(&dir).join("library"))
             .with_context(|| format!("could not create {dir}"))?;
         threads::exclude_from_git(ctx.runner, &agent.cwd)?;
@@ -208,25 +177,22 @@ fn adopt_inner(
     let sent = !passive
         && agent.ready()
         && herdr
-            .agent_prompt(pane, &thread::launch_prompt(slug, &id))
+            .agent_prompt(pane, &thread::launch_prompt("", slug, &created))
             .is_ok();
     let adopted = thread::update(&project, &id, |t| {
         t.status = Status::Open;
         t.prompt_pending = !passive && !sent;
         t.last_state = agent.agent_status.clone();
         t.last_state_change = project::now();
-        if let Some(spec) = &ade_spec {
-            thread::bind_identity(
-                t,
-                &record.socket,
-                &agent,
-                herdr
-                    .pane_process_info(pane)
-                    .ok()
-                    .and_then(|p| p.identity()),
-            );
-            t.agent = spec.kind.clone();
-        }
+        thread::bind_identity(
+            t,
+            &record.socket,
+            &agent,
+            herdr
+                .pane_process_info(pane)
+                .ok()
+                .and_then(|p| p.identity()),
+        );
     })?;
     threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
     Ok(adopted)
@@ -235,6 +201,8 @@ fn adopt_inner(
 pub struct AdoptWorkspace {
     pub name: String,
     pub goal: String,
+    /// The adopted thread's birth sentence (SPEC-ADE D17 item 6).
+    pub plain: String,
     pub pane: String,
     pub workspace_cwd: String,
     pub session: SessionFlags,
@@ -243,6 +211,7 @@ pub struct AdoptWorkspace {
 /// "Continue as a project": `new`, then `open`, then `thread adopt`. It
 /// refuses, before creating anything, under the same conditions as `thread adopt`.
 pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
+    crate::threads::check_birth_plain(&args.plain)?;
     let session = paths::resolve_session(&args.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
@@ -293,7 +262,17 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
             rebind: false,
         },
     )?;
-    let adopted = adopt(ctx, &project.slug, &args.pane, &args.name, None)?;
+    let adopted = adopt(
+        ctx,
+        &project.slug,
+        &args.pane,
+        &args.name,
+        None,
+        AdeAdopt {
+            plain: args.plain.clone(),
+            ..AdeAdopt::default()
+        },
+    )?;
     println!(
         "adopted pane {} as thread {} of `{}`",
         args.pane, adopted.id, project.slug
@@ -306,6 +285,13 @@ mod tests {
     use super::*;
     use crate::runner::fake::{fail, ok};
     use crate::scenarios::{World, agent_json};
+
+    fn lane() -> AdeAdopt {
+        AdeAdopt {
+            plain: "The lane does the work.".into(),
+            ..AdeAdopt::default()
+        }
+    }
 
     fn world_with_agent(state: &str, name: &str) -> (World, Project, String) {
         let world = World::new();
@@ -332,6 +318,7 @@ mod tests {
             "w5:p1",
             "Adopted work",
             Some("Finish the refactor.".into()),
+            lane(),
         )
         .unwrap();
         assert_eq!(
@@ -346,7 +333,7 @@ mod tests {
         assert_eq!(world.runner.count("agent start"), 0);
 
         // A second pane in the same directory gets its own thread directory.
-        let second = adopt(&world.ctx(), "demo", "w5:p2", "Second", None).unwrap();
+        let second = adopt(&world.ctx(), "demo", "w5:p2", "Second", None, lane()).unwrap();
         assert_eq!(
             second.thread_dir,
             format!("{cwd}/.herdr-project/demo-t-0002")
@@ -359,7 +346,7 @@ mod tests {
     #[test]
     fn a_busy_agent_gets_its_prompt_later_even_when_it_ends_in_done() {
         let (world, project, cwd) = world_with_agent("working", "my-agent");
-        let t = adopt(&world.ctx(), "demo", "w5:p1", "Busy", None).unwrap();
+        let t = adopt(&world.ctx(), "demo", "w5:p1", "Busy", None, lane()).unwrap();
         assert!(t.prompt_pending);
         assert_eq!(world.runner.count("agent prompt"), 0);
 
@@ -380,15 +367,15 @@ mod tests {
         let ctx = world.ctx();
         // No detected agent in that pane.
         assert!(
-            adopt(&ctx, "demo", "w9:p9", "x", None)
+            adopt(&ctx, "demo", "w9:p9", "x", None, lane())
                 .unwrap_err()
                 .to_string()
                 .contains("no agent is detected")
         );
         // Already a thread.
-        adopt(&ctx, "demo", "w5:p1", "first", None).unwrap();
+        adopt(&ctx, "demo", "w5:p1", "first", None, lane()).unwrap();
         assert!(
-            adopt(&ctx, "demo", "w5:p1", "again", None)
+            adopt(&ctx, "demo", "w5:p1", "again", None, lane())
                 .unwrap_err()
                 .to_string()
                 .contains("already thread t-0001")
@@ -397,7 +384,7 @@ mod tests {
 
         // Same pane id recorded by a project in ANOTHER socket is a different pane.
         let other = world.project("other", "b.sock");
-        let t = adopt(&ctx, "other", "w5:p1", "other session", None);
+        let t = adopt(&ctx, "other", "w5:p1", "other session", None, lane());
         // `other` lives in b.sock; the fake serves the same agent list for it, so
         // the pane is adoptable there: ids are only compared within one socket.
         assert!(t.is_ok(), "{t:?}");
@@ -413,6 +400,7 @@ mod tests {
             goal: String::new(),
             pane: "w9:p9".into(),
             workspace_cwd: String::new(),
+            plain: "The lane does the work.".into(),
             session: SessionFlags {
                 session: None,
                 socket: Some(socket),
@@ -425,7 +413,7 @@ mod tests {
     #[test]
     fn passive_adopt_sends_no_prompt_and_sets_parent() {
         let (world, _, _) = world_with_agent("idle", "pro");
-        let t = adopt_with_ade(
+        let t = adopt(
             &world.ctx(),
             "demo",
             "w5:p1",
