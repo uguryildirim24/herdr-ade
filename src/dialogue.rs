@@ -363,3 +363,144 @@ pub fn commit(ctx: &Ctx, slug: &str, topic: &str, n: u32) -> Result<TurnRecord> 
     }
     Ok(record)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::round::testkit::{Fx, fixture, git};
+    use crate::runner::Output;
+    use crate::runner::fake::{fail, ok};
+
+    struct NoCodexPair;
+    impl PairFilter for NoCodexPair {
+        fn check(&self, drafter: &str, _: &str) -> std::result::Result<(), String> {
+            if drafter == "codex" {
+                Err("dialogue_pair: not this pair".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn args(fx: &Fx, plain: Option<&str>) -> StartArgs {
+        StartArgs {
+            topic: "shapes".into(),
+            drafter: "claude".into(),
+            critic: "pro".into(),
+            plain: plain.map(str::to_string),
+            repo: Some(fx.repo.to_string_lossy().into_owned()),
+            integration: None,
+        }
+    }
+
+    const PLAIN: &str = "The plan for how the parts are named.";
+
+    /// A started dialogue bound to a Pro pane; `agent prompt` answers `reply`.
+    fn started() -> (Fx, Rc<RefCell<Output>>) {
+        let fx = fixture();
+        *fx.world.agents.borrow_mut() = r#"[{"pane_id":"w1:p7","tab_id":"w1:t7","workspace_id":"w1","cwd":"/","name":"pro","agent":"chatgpt","agent_status":"idle"}]"#.into();
+        let reply = Rc::new(RefCell::new(ok(r#"{"result":{}}"#)));
+        let r = reply.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("agent prompt"),
+            move |_| Ok(r.borrow().clone()),
+        );
+        start(&fx.world.ctx(), "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap();
+        bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p7").unwrap();
+        (fx, reply)
+    }
+
+    fn write_turn(fx: &Fx, n: u32, text: &str) {
+        let p = fx.repo.join(format!("tasks/shapes/turns/{n:02}-pro.md"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn start_needs_a_born_name_and_passes_the_pair_filter() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let e = format!("{:#}", start(&ctx, "demo", args(&fx, None), &AnyPair).unwrap_err());
+        assert!(e.starts_with("plain_missing"), "{e}");
+        let mut same = args(&fx, Some(PLAIN));
+        same.critic = "claude".into();
+        let e = format!("{:#}", start(&ctx, "demo", same, &AnyPair).unwrap_err());
+        assert!(e.starts_with("dialogue_pair"), "{e}");
+        let mut codex = args(&fx, Some(PLAIN));
+        codex.drafter = "codex".into();
+        assert!(start(&ctx, "demo", codex, &NoCodexPair).is_err());
+        assert!(list(&fx.project).is_empty());
+        let (d, next) = start(&ctx, "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap();
+        assert_eq!((d.branch.as_str(), d.integration.as_str()), ("lane/spec-shapes", "main"));
+        assert!(next.contains("--branch lane/spec-shapes") && next.contains("--role pro --passive"), "{next}");
+        let e = format!("{:#}", start(&ctx, "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap_err());
+        assert!(e.starts_with("dialogue_exists"), "{e}");
+        assert!(crate::glossary::explain(&ctx, "demo", "shapes").unwrap().contains(PLAIN));
+    }
+
+    #[test]
+    fn a_pro_critic_must_be_the_chatgpt_agent_named_pro() {
+        let fx = fixture();
+        *fx.world.agents.borrow_mut() = r#"[{"pane_id":"w1:p7","tab_id":"w1:t7","workspace_id":"w1","cwd":"/","name":"other","agent":"chatgpt","agent_status":"idle"}]"#.into();
+        start(&fx.world.ctx(), "demo", args(&fx, Some(PLAIN)), &AnyPair).unwrap();
+        let e = format!("{:#}", bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p7").unwrap_err());
+        assert!(e.starts_with("critic_mismatch"), "{e}");
+        let e = format!("{:#}", bind_critic(&fx.world.ctx(), "demo", "shapes", "w1:p9").unwrap_err());
+        assert!(e.starts_with("critic_not_found"), "{e}");
+    }
+
+    #[test]
+    fn a_turn_is_pinned_before_the_line_is_sent() {
+        let (fx, reply) = started();
+        let ctx = fx.world.ctx();
+        *reply.borrow_mut() = fail(1, r#"{"error":{"code":"agent_busy","message":"busy"}}"#);
+        assert!(turn(&ctx, "demo", "shapes", false).is_err());
+        assert_eq!(load(&fx.project, "shapes").unwrap().turn.unwrap().n, 1, "pinned although the send failed");
+        let e = format!("{:#}", turn(&ctx, "demo", "shapes", false).unwrap_err());
+        assert!(e.starts_with("turn_outstanding"), "{e}");
+        *reply.borrow_mut() = ok(r#"{"result":{}}"#);
+        let t = turn(&ctx, "demo", "shapes", true).unwrap();
+        assert_eq!(t.expected_path, "tasks/shapes/turns/01-pro.md");
+        let line = format!(
+            "agent prompt w1:p7 TURN shapes-01: write your turn to {}/tasks/shapes/turns/01-pro.md, then reply DONE shapes-01 tasks/shapes/turns/01-pro.md -",
+            fx.repo.display()
+        );
+        assert_eq!(fx.world.runner.count(&line), 2);
+    }
+
+    #[test]
+    fn commit_refuses_a_wrong_missing_or_empty_turn_then_commits_and_advances() {
+        let (fx, _) = started();
+        let ctx = fx.world.ctx();
+        let e = format!("{:#}", commit(&ctx, "demo", "shapes", 1).unwrap_err());
+        assert!(e.starts_with("turn_none"), "{e}");
+        turn(&ctx, "demo", "shapes", false).unwrap();
+        let e = format!("{:#}", commit(&ctx, "demo", "shapes", 2).unwrap_err());
+        assert!(e.starts_with("turn_mismatch"), "{e}");
+        let e = format!("{:#}", commit(&ctx, "demo", "shapes", 1).unwrap_err());
+        assert!(e.starts_with("turn_file_missing"), "{e}");
+        write_turn(&fx, 1, "  \n");
+        let e = format!("{:#}", commit(&ctx, "demo", "shapes", 1).unwrap_err());
+        assert!(e.starts_with("turn_file_empty"), "{e}");
+        write_turn(&fx, 1, "The names are fine.\n");
+        let r = commit(&ctx, "demo", "shapes", 1).unwrap();
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), r.commit);
+        assert_eq!(
+            git(&fx.repo, &["show", "main:tasks/shapes/turns/01-pro.md"]),
+            "The names are fine."
+        );
+        assert_eq!(git(&fx.repo, &["log", "-1", "--format=%s", "main"]), "spec(shapes): turn 01 from pro");
+        let d = load(&fx.project, "shapes").unwrap();
+        assert!(d.turn.is_none());
+        assert_eq!(d.turns.len(), 1);
+        assert_eq!(d.turns[0].hash, sha256_hex(b"The names are fine.\n"));
+        let t = turn(&ctx, "demo", "shapes", false).unwrap();
+        assert_eq!(t.n, 2);
+        // A delayed reply for turn 1 never completes turn 2.
+        let e = format!("{:#}", commit(&ctx, "demo", "shapes", 1).unwrap_err());
+        assert!(e.starts_with("turn_mismatch"), "{e}");
+    }
+}
