@@ -39,7 +39,8 @@ pub const PI_VERSION: &str = "0.85.1";
 pub const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
 /// The guard extension's file name and marker (SPEC-pi v2 §3.9).
 pub const GUARD_FILE: &str = "herdr-pi-guard.ts";
-pub const GUARD_MARKER: &str = "herdr-pi-guard:version=1";
+/// Version 2: the parent fallback runs whenever `ha waiting` did not.
+pub const GUARD_MARKER: &str = "herdr-pi-guard:version=2";
 /// The herdr state hook the running herdr writes (SPEC-pi v2 §3.3).
 pub const HERDR_EXTENSION_FILE: &str = "herdr-agent-state.ts";
 
