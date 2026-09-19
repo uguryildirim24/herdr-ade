@@ -149,10 +149,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
 
-    let listed = args
-        .repo
-        .as_ref()
-        .and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     check_birth_plain(&args.plain)?;
     // A box lane needs a repository: no repository means a tab in this Mac's
     // project workspace, which is local (SPEC-remote §4.2).
@@ -209,12 +205,12 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
         );
     }
-    let repo = match (&args.repo, remote_choice) {
-        (None, true) => unreachable!(),
-        (None, false) => String::new(),
-        // A remote path is stored as it is on its own machine.
-        (Some(repo), true) => repo.clone(),
-        (Some(repo), false) => {
+    let repo = match &args.repo {
+        None if remote_choice => unreachable!(),
+        None => String::new(),
+        // A box lane still commits and pushes from the Mac clone, so every
+        // explicit repository is a local path and follows the same allowlist.
+        Some(repo) => {
             let path = std::fs::canonicalize(repo)
                 .with_context(|| format!("repository {repo} does not exist"))?
                 .to_string_lossy()
@@ -239,13 +235,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             "machine_held: `{machine}` is held; run `ha machine release {machine}` when the fork refresh or resize is done"
         );
     }
-    if !machine.is_empty()
-        && listed.is_none()
-        && !crate::harness::is_harness_repo(&ctx.config_dir, &repo)
-    {
-        eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
-    }
-
     let open_count = thread::list(&project)
         .iter()
         .filter(|t| t.status == Status::Open || t.status == Status::Starting)
@@ -2154,7 +2143,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let error = start(&ctx, "demo", args(other_s)).unwrap_err().to_string();
+        let error = start(&ctx, "demo", args(other_s.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repo_not_listed"), "{error}");
+        let mut remote_args = args(other_s);
+        remote_args.machine = Some("box".into());
+        let error = start(&ctx, "demo", remote_args).unwrap_err().to_string();
         assert!(error.contains("repo_not_listed"), "{error}");
         assert!(thread::list(&project).is_empty());
 
