@@ -22,6 +22,7 @@ pub mod image;
 pub mod lane;
 pub mod packet;
 pub mod provider;
+pub mod serve;
 pub mod state;
 pub mod turn;
 
@@ -227,6 +228,20 @@ impl Layout {
 
     pub fn bridge_state(&self) -> PathBuf {
         self.root.join("bridge-state.json")
+    }
+
+    /// `serve.json`: the relay's port, pid, start time and bearer token.
+    pub fn serve_state(&self) -> PathBuf {
+        self.root.join("serve.json")
+    }
+
+    /// The shared pi folder's `models.json`: `<ADE root>/pi/agent/models.json`,
+    /// one level up from `<state dir>/pro-bridge`.
+    pub fn pi_models(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or(&self.root)
+            .join("pi/agent/models.json")
     }
 
     pub fn lane(&self, name: &str) -> PathBuf {
