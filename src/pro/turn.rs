@@ -70,6 +70,12 @@ pub fn prepare(
     if lane.stopped {
         bail!("lane `{}` is stopped", opts.lane);
     }
+    if let Some(profile) = &lane.profile {
+        bail!(
+            "lane `{}` uses Codex profile `{profile}`; profile lanes do not accept Pro bridge turns",
+            opts.lane
+        );
+    }
     if !lane.ready() {
         bail!(
             "lane `{}` is {}; only a ready lane accepts a turn",
@@ -795,6 +801,7 @@ mod tests {
             workspace_id: "w1".into(),
             parent: None,
             cwd: "/w".into(),
+            profile: None,
             session_id: None,
             rollout: Some(rollout.display().to_string()),
             started_at: crate::pro::now_rfc3339(),
@@ -991,6 +998,7 @@ mod tests {
             workspace_id: "w1".into(),
             parent: None,
             cwd: "/w".into(),
+            profile: None,
             session_id: None,
             rollout: None,
             started_at: crate::pro::now_rfc3339(),
@@ -1036,6 +1044,7 @@ mod tests {
             workspace_id: "w1".into(),
             parent: None,
             cwd: "/w".into(),
+            profile: None,
             session_id: None,
             rollout: None,
             started_at: crate::pro::now_rfc3339(),
