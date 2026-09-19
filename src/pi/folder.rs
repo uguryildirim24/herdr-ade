@@ -31,8 +31,9 @@ pub const SETTINGS_JSON: &str = r#"{
 }
 "#;
 
-/// No custom providers this round: Pro stays the pro-bridge Codex worker and
-/// Cursor stays outside pi (decisions 18:05, 18:30).
+/// The empty provider table setup starts from. `herdr-pro serve` and
+/// `herdr-pi setup` merge the `pro` relay provider into it; nothing else adds
+/// a provider this round (Cursor stays outside pi, decisions 18:05, 18:30).
 pub const MODELS_JSON: &str = "{\n  \"providers\": {}\n}\n";
 
 /// What setup created; printed by `herdr-pi setup`.

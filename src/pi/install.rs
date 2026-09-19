@@ -10,6 +10,11 @@ use anyhow::{Context, Result, bail};
 
 use super::{GUARD_MARKER, Layout, PI_PACKAGE, PI_VERSION, sh};
 
+/// The `pro` provider writer, shared with `herdr-pro` by path (the file is
+/// self-contained, so both binaries can compile it).
+#[path = "../pro/provider.rs"]
+mod provider;
+
 /// The guard extension, plugin-owned, beside the herdr state hook
 /// (SPEC-pi v2 §3.3, §3.7). Doctor checks the marker.
 pub const GUARD_TS: &str = include_str!("../../extensions/herdr-pi-guard.ts");
@@ -116,6 +121,19 @@ pub struct SetupReport {
     pub link_line: String,
 }
 
+/// Write the `pro` provider into `models.json` when the relay has written its
+/// `serve.json`. Returns the relay base URL that was written.
+fn write_provider(layout: &Layout) -> Option<String> {
+    let ade_root = layout.root.parent()?;
+    let text = std::fs::read_to_string(ade_root.join("pro-bridge/serve.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let port = value.get("port")?.as_u64()? as u16;
+    let token = value.get("token")?.as_str()?.to_string();
+    let base = provider::base_url(port);
+    provider::write_merged(&layout.models(), &base, &token).ok()?;
+    Some(base)
+}
+
 /// Setup: pinned install, shared folder, guard, the running herdr's state
 /// hook, then print the one line Rolf types. Never a login.
 pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Result<SetupReport> {
@@ -123,6 +141,7 @@ pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Resu
     let folder = super::folder::ensure(layout)?;
     let wrapper = super::launch::write_wrapper(layout)?;
     let guard = write_guard(layout)?;
+    let provider = write_provider(layout);
 
     let integration = runner.run(
         &sh::Cmd::new(env.herdr_bin(), Duration::from_secs(120))
@@ -137,7 +156,7 @@ pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Resu
         );
     }
 
-    let steps = vec![
+    let mut steps = vec![
         format!(
             "installed {PI_PACKAGE}@{PI_VERSION} into {} (`{}`)",
             layout.npm().display(),
@@ -154,6 +173,22 @@ pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Resu
             layout.extensions().display()
         ),
     ];
+    if let Some(base) = &provider {
+        steps.push(format!(
+            "wrote the `pro` provider ({base}) into {}",
+            layout.models().display()
+        ));
+    } else {
+        steps.push(format!(
+            "no `pro` provider yet: {} is missing; run `herdr-pro serve`, then `herdr-pi setup` again",
+            layout
+                .root
+                .parent()
+                .unwrap_or(&layout.root)
+                .join("pro-bridge/serve.json")
+                .display()
+        ));
+    }
     let _ = folder;
     Ok(SetupReport {
         steps,
@@ -215,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn setup_writes_the_provider_when_the_relay_has_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pi"));
+        std::fs::create_dir_all(layout.agent()).unwrap();
+        let pro = dir.path().join("pro-bridge");
+        std::fs::create_dir_all(&pro).unwrap();
+        std::fs::write(
+            pro.join("serve.json"),
+            r#"{"port":1234,"pid":1,"started":"now","token":"tok"}"#,
+        )
+        .unwrap();
+        let base = write_provider(&layout).unwrap();
+        assert_eq!(base, "http://127.0.0.1:1234/v1");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
+        assert_eq!(value["providers"]["pro"]["apiKey"], "tok");
+        assert_eq!(
+            value["providers"]["pro"]["baseUrl"],
+            "http://127.0.0.1:1234/v1"
+        );
+    }
+
+    #[test]
     fn setup_runs_the_five_steps_and_hands_back_the_link_line() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pi"));
@@ -234,7 +292,16 @@ mod tests {
         );
         runner.on("/h/herdr integration install pi", ok("installed pi\n"));
         let report = setup(&runner, &env, &layout).unwrap();
-        assert_eq!(report.steps.len(), 5);
+        assert_eq!(report.steps.len(), 6);
+        assert!(
+            report
+                .steps
+                .last()
+                .unwrap()
+                .contains("no `pro` provider yet"),
+            "{:?}",
+            report.steps
+        );
         assert!(report.link_line.starts_with("ln -s "));
         assert!(layout.settings().exists());
         assert!(layout.guard().exists());
