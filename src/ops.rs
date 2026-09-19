@@ -263,6 +263,9 @@ pub fn seal(
     validate(&op)?;
     let event = event_from_op(&op)?;
     events::seal_create_if_absent(project, &event)?;
+    // The receipt records the bytes this sealer hashed (D5); the courier
+    // carries it to the Mac ledger.
+    events::write_receipt(project, &event)?;
     op.state = OpState::Sealed;
     op.revision = 3;
     write_op(project, &op)?;
@@ -364,6 +367,70 @@ fn tick_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Box-side D5 recovery (SPEC-remote §4.3, gate R15). The courier helper runs
+/// this once per pass on the box, before it reads the sealed events. The lane
+/// card, not a Mac-side thread record, is the box authority.
+pub fn recover_box(ctx: &Ctx) -> Result<()> {
+    let mut first: Option<anyhow::Error> = None;
+    for slug in project::list_slugs(&ctx.root) {
+        let Ok(project) = Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        for op in list(&project) {
+            if let Err(error) = recover_box_op(ctx, &project, &op) {
+                first.get_or_insert(error.context(format!("op {}", op.op)));
+            }
+        }
+    }
+    match first {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// X1 and X2 for one box operation (D5). A reserved op whose helper is dead or
+/// whose card moved on is abandoned; a staged op whose card still matches is
+/// sealed from its own durable payload (X2b repairs the marker).
+fn recover_box_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
+    match op.state {
+        OpState::Reserved => {
+            let card = load_box_card(project, &op.thread);
+            let superseded = card.as_ref().is_some_and(|card| card.attempt != op.attempt);
+            if superseded || !pid_alive(ctx.runner, op.helper_pid) {
+                abandon(project, &op.op)?;
+                crate::inbox::write(
+                    project,
+                    "preparation-abandoned",
+                    &op.thread,
+                    "completion preparation was abandoned",
+                    "",
+                )?;
+            }
+        }
+        OpState::Staged => {
+            let valid = load_box_card(project, &op.thread)
+                .is_some_and(|card| card.attempt == op.attempt && card.recipient == op.recipient);
+            if valid {
+                seal(project, &op.op, |_| Ok(()))?;
+            } else {
+                abandon(project, &op.op)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The lane card the box wrote at start (SPEC-remote §4.2 step 5).
+fn load_box_card(project: &Project, thread: &str) -> Option<crate::contracts::LaneCard> {
+    if crate::thread::validate_id(thread).is_err() {
+        return None;
+    }
+    let path = project.dir().join("lanes").join(format!("{thread}.toml"));
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&text).ok()
 }
 
 fn pid_alive(runner: &dyn Runner, pid: u32) -> bool {
@@ -724,6 +791,93 @@ mod tests {
         let b = std::thread::spawn(move || seal(&b_project, &b_id, |_| Ok(())).unwrap());
         assert_eq!(a.join().unwrap(), b.join().unwrap());
         assert_eq!(events::list(&project).len(), 1);
+    }
+
+    #[test]
+    fn box_recovery_seals_a_staged_op_from_its_card_and_abandons_a_dead_reserved_one() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let recipient = Recipient {
+            pane: "w1:p1".into(),
+            coordinator_attempt: 1,
+        };
+        std::fs::create_dir_all(project.dir().join("lanes")).unwrap();
+        for (thread, attempt) in [("t-0001", 1), ("t-0002", 1)] {
+            let card = crate::contracts::LaneCard {
+                project: "demo".into(),
+                thread: thread.into(),
+                attempt,
+                brief_hash: "abcd".into(),
+                role: "lane".into(),
+                kind: "pi".into(),
+                pane_id: "w2:p1".into(),
+                machine_label: "oci".into(),
+                machine_id: "1".into(),
+                box_repo: "/box/repo".into(),
+                box_worktree: "/box/wt".into(),
+                brief_commit: "b0".into(),
+                branch: format!("hp/demo/{thread}"),
+                publish_url: "https://github.com/uguryildirim24/herdr-ade.git".into(),
+                recipient: recipient.clone(),
+                start_line: "Run the box skill".into(),
+                created: "2026-09-19T00:00:00Z".into(),
+            };
+            std::fs::write(
+                project.dir().join("lanes").join(format!("{thread}.toml")),
+                toml::to_string(&card).unwrap(),
+            )
+            .unwrap();
+        }
+        let staged = reserve(
+            &project,
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient: recipient.clone(),
+                round: None,
+                requested: Requested::Waiting {
+                    text: "wait".into(),
+                },
+                helper_pid: 1,
+            },
+        )
+        .unwrap();
+        stage_waiting(&project, &staged.op).unwrap();
+        let reserved = reserve(
+            &project,
+            Reservation {
+                thread: "t-0002",
+                attempt: 1,
+                kind: OpKind::Waiting,
+                recipient,
+                round: None,
+                requested: Requested::Waiting {
+                    text: "still here".into(),
+                },
+                helper_pid: 999_999,
+            },
+        )
+        .unwrap();
+
+        let runner = FakeRunner::new();
+        runner.on("/bin/kill -0", fail(1, "gone"));
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        recover_box(&ctx).unwrap();
+        assert_eq!(load(&project, &staged.op).unwrap().state, OpState::Sealed);
+        assert_eq!(events::list(&project).len(), 1);
+        assert!(events::receipt_path(&project, &staged.op).unwrap().exists());
+        assert_eq!(
+            load(&project, &reserved.op).unwrap().state,
+            OpState::Abandoned
+        );
     }
 
     #[test]
