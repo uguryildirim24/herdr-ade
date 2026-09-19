@@ -304,9 +304,17 @@ impl App {
             }
         }
         if event.kind == MouseEventKind::Down(MouseButton::Left)
-            && let Some((_, reference)) = self.hits.iter().find(|(r, _)| contains(r))
+            && let Some(reference) = self
+                .hits
+                .iter()
+                .find(|(r, _)| contains(r))
+                .map(|(_, reference)| reference.clone())
         {
-            self.selection.selected = Some(reference.clone());
+            self.selection.selected = Some(reference);
+            // A click can select a timeline copy while the pinned panel is
+            // scrolled elsewhere. Reveal the same card before a digit can
+            // become an answer target.
+            self.reveal = true;
         }
     }
     fn key(&mut self, key: KeyEvent, c: &Conversation) -> Input {
@@ -1550,6 +1558,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.selection.selected, Some(reference));
+        assert!(app.reveal);
         assert!(app.selection.drawn.is_none());
     }
     #[test]
