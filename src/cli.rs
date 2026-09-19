@@ -147,6 +147,10 @@ enum Command {
     /// Run by herdr's action menu
     #[command(hide = true)]
     Action { id: String },
+    /// Recover an interrupted box completion before the courier reads the box
+    /// (run by the courier helper on the box)
+    #[command(hide = true)]
+    Recover,
     /// Run inside a plugin popup pane
     #[command(hide = true)]
     Pane { id: String },
@@ -274,6 +278,9 @@ enum Command {
     /// Publish the board rows now, or print them
     Board {
         slug: String,
+        /// Print one lane's board line (names its machine, SPEC-remote §5)
+        #[arg(long, value_name = "THREAD")]
+        thread: Option<String>,
         #[arg(long)]
         print: bool,
     },
@@ -692,8 +699,30 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 talk::run(ctx, &slug)
             }
         }
-        Command::Board { slug, print } => {
+        Command::Board {
+            slug,
+            thread,
+            print,
+        } => {
             let project = Project::load(&ctx.root, &slug)?;
+            if let Some(id) = thread {
+                let lane = crate::thread::load(&project, &id)?;
+                let machine = if lane.is_remote() && !lane.machine.is_empty() {
+                    format!("on machine `{}`", lane.machine)
+                } else {
+                    "on this Mac".to_string()
+                };
+                let since = if lane.is_remote() {
+                    crate::events::remote_state(&project, lane.machine_route()).last_pass
+                } else {
+                    lane.updated.clone()
+                };
+                let age = crate::board::age(&since)
+                    .map(|age| format!("{age} ago"))
+                    .unwrap_or_else(|| "not heard yet".into());
+                println!("{}\t{}\t{}\t{age}", lane.id, lane.last_group, machine);
+                return Ok(());
+            }
             if print {
                 for (k, v) in board::compute(ctx, &project) {
                     let verdict = match board::check_value(&project, &v) {
@@ -1155,6 +1184,7 @@ pub fn run() -> Result<()> {
             },
         ),
         Command::Action { id } => actions::run_action(&ctx, &id),
+        Command::Recover => crate::ops::recover_box(&ctx),
         Command::Pane { id } => actions::run_pane(&ctx, &id),
         Command::Safety { command } => match command {
             SafetyCommand::Show { slug } => {

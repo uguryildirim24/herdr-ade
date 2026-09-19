@@ -51,26 +51,6 @@ struct SavedMachine {
     enabled: bool,
 }
 
-/// The SSH target of a saved machine: from `herdr machine list --json`, else
-/// `[machines.<label>] ssh` in `config.toml`.
-pub fn ssh_target(
-    runner: &dyn Runner,
-    herdr_bin: &str,
-    config_dir: &Path,
-    machine: &str,
-) -> Result<String> {
-    let listed = saved_machines(runner, herdr_bin).unwrap_or_default();
-    if let Some(found) = listed
-        .iter()
-        .find(|m| m.label == machine || m.id == machine)
-        && !found.target.is_empty()
-    {
-        return Ok(found.target.clone());
-    }
-    configured_target(config_dir, machine)
-        .with_context(|| format!("machine `{machine}` has no SSH target: it is not in `herdr machine list`, and config.toml has no [machines.{machine}] ssh"))
-}
-
 /// The stable profile of one saved machine (SPEC-remote §4.1). `local` is a
 /// real profile with no SSH target.
 pub fn machine_profile(
@@ -112,26 +92,6 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
     }
     serde_json::from_str::<Vec<SavedMachine>>(&out.stdout)
         .context("machine_list_invalid: herdr returned invalid JSON")
-}
-
-fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
-    #[derive(Deserialize, Default)]
-    struct Entry {
-        #[serde(default)]
-        ssh: String,
-    }
-    #[derive(Deserialize, Default)]
-    struct Config {
-        #[serde(default)]
-        machines: std::collections::BTreeMap<String, Entry>,
-    }
-    let text = std::fs::read_to_string(config_dir.join("config.toml")).ok()?;
-    let mut config: Config = toml::from_str(&text).ok()?;
-    config
-        .machines
-        .remove(machine)
-        .map(|e| e.ssh)
-        .filter(|s| !s.is_empty())
 }
 
 /// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box
@@ -294,9 +254,28 @@ pub fn provision_card(
     Ok(())
 }
 
+/// The courier's helper call over its multiplexed connection (SPEC-remote
+/// §4.3): the box-local helper runs `sh -c <script>` and the following
+/// `scp` reuses the same control socket.
+pub fn ssh_courier(
+    runner: &dyn Runner,
+    target: &str,
+    control_dir: &Path,
+    script: &str,
+    cursor: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    check_target(target)?;
+    let mut args = multiplex_options(control_dir);
+    args.extend(SSH_OPTIONS.iter().map(|s| (*s).to_string()));
+    args.push("--".into());
+    args.push(target.to_string());
+    args.push(format!("sh -c {}", quote(script)));
+    runner.run(&Cmd::new("ssh", timeout).args(args).stdin(cursor))
+}
+
 /// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per
-/// pass. The second lane's courier passes these on the helper and `scp` calls.
-#[allow(dead_code)]
+/// pass. The courier passes these on its helper and `scp` calls.
 pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
     let dir = control_dir.join("ssh");
     let _ = std::fs::create_dir_all(&dir);
@@ -486,32 +465,13 @@ mod tests {
     }
 
     #[test]
-    fn target_comes_from_herdr_then_from_config() {
+    fn machine_profiles_come_only_from_enabled_saved_machines() {
         let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[machines.box]\nssh = \"me@box.local\"\n",
-        )
-        .unwrap();
         let runner = FakeRunner::new();
         runner.on(
             "machine list --json",
             ok(r#"[{"id":"abc","label":"m1","target":"m1.local","session":"default","enabled":true}]"#),
         );
-        assert_eq!(
-            ssh_target(&runner, "herdr", config.path(), "m1").unwrap(),
-            "m1.local"
-        );
-        assert_eq!(
-            ssh_target(&runner, "herdr", config.path(), "abc").unwrap(),
-            "m1.local"
-        );
-        assert_eq!(
-            ssh_target(&runner, "herdr", config.path(), "box").unwrap(),
-            "me@box.local"
-        );
-        assert!(ssh_target(&runner, "herdr", config.path(), "nope").is_err());
-
         let profile = machine_profile(&runner, "herdr", config.path(), "m1").unwrap();
         assert_eq!(profile.id, "abc");
         assert_eq!(profile.label, "m1");
@@ -526,10 +486,7 @@ mod tests {
 
         let broken = FakeRunner::new();
         broken.on("machine list --json", fail(1, "no"));
-        assert_eq!(
-            ssh_target(&broken, "herdr", config.path(), "box").unwrap(),
-            "me@box.local"
-        );
+        assert!(machine_profile(&broken, "herdr", config.path(), "box").is_err());
     }
 
     #[test]

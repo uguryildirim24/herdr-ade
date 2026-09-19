@@ -40,7 +40,9 @@ impl World {
         };
         let agents = world.agents.clone();
         world.runner.on_fn(
-            |cmd| cmd.display().contains("agent list"),
+            |cmd| {
+                cmd.program != "ssh" && cmd.program != "scp" && cmd.display().contains("agent list")
+            },
             move |_| {
                 Ok(ok(&format!(
                     r#"{{"result":{{"agents":{}}}}}"#,
@@ -50,7 +52,9 @@ impl World {
         );
         let panes = world.panes.clone();
         world.runner.on_fn(
-            |cmd| cmd.display().contains("pane list"),
+            |cmd| {
+                cmd.program != "ssh" && cmd.program != "scp" && cmd.display().contains("pane list")
+            },
             move |_| {
                 Ok(ok(&format!(
                     r#"{{"result":{{"panes":{}}}}}"#,
@@ -1202,7 +1206,7 @@ fn remote_world() -> (World, Project) {
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
     );
     (world, project)
 }
@@ -1218,27 +1222,32 @@ fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ti
         runner: FakeRunner::new(),
         ..world
     };
-    failing
-        .runner
-        .on_fn(is_machine_call, |_| Ok(crate::runner::fake::timeout()));
-    failing
-        .runner
-        .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+    failing.runner.on(
+        "ssh",
+        fail(255, "ssh: connect to host box: Operation timed out"),
+    );
+    failing.runner.on(
+        "machine list --json",
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
+    );
     let panes = format!(
         r#"{{"result":{{"panes":[{}]}}}}"#,
         failing.coordinator_pane(&project)
     );
     failing.runner.on("pane list", ok(&panes));
+    failing
+        .runner
+        .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
     failing.runner.on("report-metadata", ok("{}"));
     let ctx = failing.ctx();
     let mut memory = Memory::new(&ctx);
 
-    let machine_calls = |w: &World| {
+    let courier_calls = |w: &World| {
         w.runner
             .calls
             .borrow()
             .iter()
-            .filter(|c| is_machine_call(c))
+            .filter(|c| c.program == "ssh")
             .count()
     };
     for tick in 1..=9 {
@@ -1246,10 +1255,10 @@ fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ti
         let _ = ticker::tick_project_with(&ctx, &project, &mut memory);
     }
     // Polled once at tick 1, then skipped for the next eight ticks.
-    assert_eq!(machine_calls(&failing), 1);
+    assert_eq!(courier_calls(&failing), 1);
     memory.tick = 10;
     let _ = ticker::tick_project_with(&ctx, &project, &mut memory);
-    assert_eq!(machine_calls(&failing), 2);
+    assert_eq!(courier_calls(&failing), 2);
 
     // No state was read: no group change, no item, no copy.
     let t = thread::load(&project, "t-0001").unwrap();
@@ -1269,41 +1278,38 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
     let (world, project) = remote_world();
     let down = Rc::new(RefCell::new(true));
     let flag = down.clone();
-    let agents = r#"{"result":{"agents":[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/home/me/wt","name":"hp-demo-t-0001","agent_status":"working"}]}}"#;
+    let agents = r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/home/me/wt","name":"hp-demo-t-0001","agent_status":"working"}]"#;
     let scripted = World {
         runner: FakeRunner::new(),
         ..world
     };
     scripted.runner.on_fn(
-        |cmd| is_machine_call(cmd) && cmd.display().contains("agent list"),
+        |cmd| cmd.program == "ssh",
         move |_| {
             Ok(if *flag.borrow() {
                 fail(255, "ssh: connect to host box: Operation timed out")
             } else {
-                ok(agents)
+                ok(&format!(
+                    "boot\tboot-1\nfree\t1\nagents\t{{\"result\":{{\"agents\":{agents}}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n"
+                ))
             })
         },
     );
-    scripted.runner.on_fn(
-        |cmd| is_machine_call(cmd) && cmd.display().contains("pane list"),
-        |_| Ok(ok(r#"{"result":{"panes":[]}}"#)),
+    scripted.runner.on(
+        "machine list --json",
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
     );
     scripted
         .runner
         .on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{}}"#)));
-    scripted.runner.on(
-        "machine list --json",
-        ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
-    );
-    scripted.runner.on("ssh", ok("t-0001 -\n"));
-    scripted
-        .runner
-        .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
     let panes = format!(
         r#"{{"result":{{"panes":[{}]}}}}"#,
         scripted.coordinator_pane(&project)
     );
     scripted.runner.on("pane list", ok(&panes));
+    scripted
+        .runner
+        .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
     scripted.runner.on("report-metadata", ok("{}"));
     let ctx = scripted.ctx();
     let mut memory = Memory::new(&ctx);
@@ -1345,26 +1351,25 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
         runner: FakeRunner::new(),
         ..world
     };
-    scripted.runner.on_fn(
-        |cmd| is_machine_call(cmd) && cmd.display().contains("agent list"),
-        |_| Ok(ok(r#"{"result":{"agents":[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/home/me/wt","name":"hp-demo-t-0001","agent_status":"blocked"}]}}"#)),
+    scripted.runner.on(
+        "ssh",
+        ok("boot\tboot-1\nfree\t1\nagents\t{\"result\":{\"agents\":[{\"pane_id\":\"w2:p1\",\"tab_id\":\"w2:t1\",\"workspace_id\":\"w2\",\"cwd\":\"/home/me/wt\",\"name\":\"hp-demo-t-0001\",\"agent_status\":\"blocked\"}]}}\npanes\t{\"result\":{\"panes\":[]}}\n"),
     );
     scripted
         .runner
-        .on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{"panes":[]}}"#)));
+        .on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{}}"#)));
     scripted.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
     );
-    scripted.runner.on("ssh", ok("t-0001 -\n"));
-    scripted
-        .runner
-        .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
     let panes = format!(
         r#"{{"result":{{"panes":[{}]}}}}"#,
         scripted.coordinator_pane(&project)
     );
     scripted.runner.on("pane list", ok(&panes));
+    scripted
+        .runner
+        .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
     scripted.runner.on("report-metadata", ok("{}"));
     let ctx = scripted.ctx();
     let mut memory = Memory::new(&ctx);

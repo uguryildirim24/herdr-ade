@@ -332,13 +332,24 @@ fn report(
         );
     }
     for machine in machines {
-        match crate::remote::ssh_target(runner, &bin, config_dir, &machine) {
-            Ok(target) => check(
+        match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
+            Ok(profile) if profile.is_local() => check(
                 &mut out,
                 Some(true),
                 &format!("machine {machine}"),
-                format!("ssh target {target}"),
+                "on this Mac".into(),
             ),
+            Ok(profile) => {
+                check(
+                    &mut out,
+                    Some(true),
+                    &format!("machine {machine}"),
+                    format!("ssh target {}", profile.target),
+                );
+                for (ok, label, detail) in box_rows(runner, &bin, &profile) {
+                    check(&mut out, ok, &label, detail);
+                }
+            }
             Err(error) => check(
                 &mut out,
                 Some(false),
@@ -349,6 +360,312 @@ fn report(
     }
 
     (out, healthy)
+}
+
+/// One saved machine's box rows (SPEC-remote §§2–3, R11): boot service,
+/// server, host, listeners, repository mapping, Git identity and GitHub
+/// reach, per-kind logins, and live CPU/RAM/disk capacity with the 12 GB
+/// gate. One read-only SSH call.
+fn box_rows(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    profile: &crate::contracts::MachineProfile,
+) -> Vec<(Option<bool>, String, String)> {
+    let label = &profile.label;
+    if profile.target.is_empty() {
+        return vec![(
+            Some(false),
+            format!("box {label}"),
+            "has no SSH target".into(),
+        )];
+    }
+    let repos: Vec<&crate::contracts::BoxRepoMap> = crate::contracts::BOX_REPOS.iter().collect();
+    let mut script = String::from(
+        "set -u\n\
+         printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
+         printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
+         printf 'server\\t%s\\n' \"$(\"$HOME/.local/bin/herdr\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
+         printf 'tailscale\\t%s\\n' \"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"\n\
+         printf 'nproc\\t%s\\n' \"$(nproc 2>/dev/null || echo 0)\"\n\
+         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
+         printf 'df_free\\t%s\\n' \"$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\"\n\
+         printf 'listeners\\t%s\\n' \"$(ss -tln 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')\"\n\
+         printf 'git_name\\t%s\\n' \"$(git config --global user.name 2>/dev/null || true)\"\n\
+         printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
+         printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
+         printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
+         \"$HOME/.local/bin/claude\" auth status >/dev/null 2>&1 && printf 'login_claude\\tok\\n' || printf 'login_claude\\tmissing\\n'\n\
+         \"$HOME/.local/bin/codex\" login status >/dev/null 2>&1 && printf 'login_codex\\tok\\n' || printf 'login_codex\\tmissing\\n'\n\
+         \"$HOME/.local/bin/agy\" models >/dev/null 2>&1 && printf 'login_agy\\tok\\n' || printf 'login_agy\\tmissing\\n'\n",
+    );
+    // Pi readiness is read on the box through its own wrapper and login store
+    // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
+    for provider in crate::pi::roles::enabled_providers() {
+        let provider = crate::remote::quote(provider);
+        script.push_str(&format!(
+            "HERDR_ADE_ROOT=\"$HOME/.herdr-ade\" \"$HOME/.local/bin/herdr-pi\" check {provider} >/dev/null 2>&1 && printf 'pi_%s\\tok\\n' {provider} || printf 'pi_%s\\tfail\\n' {provider}\n"
+        ));
+    }
+    for repo in repos {
+        let path = crate::remote::quote(repo.box_path);
+        script.push_str(&format!(
+            "if [ -d {path}/.git ]; then printf 'repo %s\\tok\\n' {path}; else printf 'repo %s\\tmissing\\n' {path}; fi\n"
+        ));
+    }
+    let facts = match crate::remote::ssh(
+        runner,
+        &profile.target,
+        &script,
+        None,
+        crate::remote::SSH_START_TIMEOUT,
+    ) {
+        Ok(out) if out.success() => parse_facts(&out.stdout),
+        Ok(out) => {
+            return vec![(
+                None,
+                format!("box {label}"),
+                format!("unreachable: {}", out.error_text()),
+            )];
+        }
+        Err(error) => {
+            return vec![(
+                None,
+                format!("box {label}"),
+                format!("unreachable: {error:#}"),
+            )];
+        }
+    };
+    let fact = |key: &str| facts.get(key).cloned().unwrap_or_default();
+    let mut rows = Vec::new();
+    rows.push((
+        env_bool(&fact("boot"), &["enabled"]),
+        format!("box {label} boot"),
+        format!("systemd user unit herdr.service: {}", fact("boot")),
+    ));
+    rows.push((
+        if fact("server").starts_with("herdr") {
+            Some(true)
+        } else {
+            None
+        },
+        format!("box {label} server"),
+        format!("{} ({})", fact("server"), "$HOME/.local/bin/herdr"),
+    ));
+    let tailscale = fact("tailscale");
+    rows.push((
+        if tailscale.is_empty() {
+            None
+        } else {
+            Some(true)
+        },
+        format!("box {label} host"),
+        format!("{} (Tailscale {tailscale})", fact("host")),
+    ));
+    rows.push((
+        Some(true),
+        format!("box {label} listeners"),
+        format!(
+            "{} non-loopback TCP listeners (check `ss -tln`)",
+            fact("listeners")
+        ),
+    ));
+    for repo in crate::contracts::BOX_REPOS.iter() {
+        let key = format!("repo {}", repo.box_path);
+        let value = fact(&key);
+        rows.push((
+            env_bool(&value, &["ok"]),
+            format!("box {label} repo {}", repo.box_path),
+            format!("clone {value}"),
+        ));
+    }
+    let git = format!("{} <{}>", fact("git_name"), fact("git_email"));
+    rows.push((
+        if fact("git_name").is_empty() || fact("git_email").is_empty() {
+            Some(false)
+        } else {
+            Some(true)
+        },
+        format!("box {label} git"),
+        git,
+    ));
+    rows.push((
+        env_bool(&fact("gh"), &["ok"]),
+        format!("box {label} gh"),
+        format!("gh auth status: {}", fact("gh")),
+    ));
+    for kind in ["claude", "codex", "agy"] {
+        let value = fact(&format!("login_{kind}"));
+        rows.push((
+            env_bool(&value, &["ok"]),
+            format!("box {label} login {kind}"),
+            format!("{kind} authentication: {value}"),
+        ));
+    }
+    // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
+    // answers `type -a -P pi` and `command -v` in its own shell.
+    match box_pane_probe(runner, herdr_bin, profile) {
+        Ok(answer) => {
+            let (pi, tools) = parse_box_probe(&answer);
+            let wrapper = "/home/ubuntu/.local/bin/pi";
+            rows.push((
+                if pi == wrapper {
+                    Some(true)
+                } else {
+                    Some(false)
+                },
+                format!("box {label} wrapper"),
+                if pi.is_empty() {
+                    "the box pane did not answer `type -a -P pi`".into()
+                } else {
+                    format!("`type -a -P pi` first hit: {pi}")
+                },
+            ));
+            let missing: Vec<&str> = ["cargo", "just", "claude", "codex", "agy", "node"]
+                .into_iter()
+                .filter(|tool| {
+                    !tools
+                        .iter()
+                        .any(|found| found.ends_with(&format!("/{tool}")))
+                })
+                .collect();
+            rows.push((
+                if missing.is_empty() {
+                    Some(true)
+                } else {
+                    Some(false)
+                },
+                format!("box {label} tools"),
+                if missing.is_empty() {
+                    tools.join(" ")
+                } else {
+                    format!("the pane cannot find: {}", missing.join(" "))
+                },
+            ));
+        }
+        Err(error) => rows.push((
+            Some(false),
+            format!("box {label} wrapper"),
+            format!("the box pane probe failed: {error:#}"),
+        )),
+    }
+    for provider in crate::pi::roles::enabled_providers() {
+        let value = fact(&format!("pi_{provider}"));
+        rows.push((
+            env_bool(&value, &["ok"]),
+            format!("box {label} pi {provider}"),
+            format!("herdr-pi check {provider}: {value}"),
+        ));
+    }
+    let nproc: u64 = fact("nproc").parse().unwrap_or(0);
+    let mem_gb = fact("mem_avail_kb")
+        .parse::<u64>()
+        .map(|kb| kb as f64 / 1_000_000.0)
+        .unwrap_or(0.0);
+    let disk_gb = fact("df_free")
+        .parse::<u64>()
+        .map(|bytes| bytes as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
+    let cpu_fit = nproc.saturating_sub(1);
+    let mem_fit = (mem_gb / 4.0) as u64;
+    let disk_fit = (disk_gb / 5.0) as u64;
+    let fits = cpu_fit.min(mem_fit).min(disk_fit);
+    let capacity_ok = disk_gb >= 12.0;
+    rows.push((
+        if capacity_ok { Some(true) } else { Some(false) },
+        format!("box {label} capacity"),
+        format!(
+            "{nproc} OCPU, {mem_gb:.1} GB RAM free, {disk_gb:.1} GB disk free; about {fits} more lane(s) fit; refuses below 12 GB free"
+        ),
+    ));
+    let rules = fact("rules");
+    rows.push((
+        if rules.is_empty() { None } else { Some(true) },
+        format!("box {label} rules"),
+        if rules.is_empty() {
+            "no generated RULES.md recorded".into()
+        } else {
+            format!("RULES.md sha256 {rules}")
+        },
+    ));
+    rows
+}
+
+fn parse_facts(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+        .collect()
+}
+
+/// The probe a fresh box pane runs in its own Bash shell (SPEC-remote §3.3).
+const BOX_PROBE: &str = "printf '@@pi '; type -a -P pi 2>/dev/null | head -n1; \
+                         printf '@@cmd\\n'; command -v cargo just claude codex agy node 2>/dev/null; \
+                         printf '@@done\\n'";
+
+/// Creates a fresh box pane with the lane PATH, runs [`BOX_PROBE`] in that
+/// pane's own shell, reads the answer and closes the workspace. This is the
+/// §3.3 probe: never a bare `ssh` command string, never `bash -lic`.
+fn box_pane_probe(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    profile: &crate::contracts::MachineProfile,
+) -> Result<String> {
+    let herdr = Herdr::new(herdr_bin, "", runner).on_machine(&profile.id);
+    let env = vec![format!("PATH={}", crate::contracts::BOX_PATH)];
+    let created = herdr
+        .workspace_create_env(
+            Path::new(crate::contracts::BOX_HOME),
+            "ha-doctor-probe",
+            false,
+            &env,
+        )
+        .map_err(|error| anyhow::anyhow!("box probe pane: {error}"))?;
+    let pane = created.pane_id.clone();
+    let answer = (|| -> Result<String> {
+        herdr
+            .pane_run(&pane, BOX_PROBE)
+            .map_err(|error| anyhow::anyhow!("box probe run: {error}"))?;
+        for _ in 0..50 {
+            let text = herdr
+                .pane_read_text(&pane, "recent")
+                .map_err(|error| anyhow::anyhow!("box probe read: {error}"))?;
+            if text.contains("@@done") {
+                return Ok(text);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::bail!("the box pane did not answer the probe in time")
+    })();
+    let _ = herdr.workspace_close(&created.workspace_id);
+    answer
+}
+
+/// The `@@pi` first hit and the `command -v` paths from a probe answer.
+fn parse_box_probe(text: &str) -> (String, Vec<String>) {
+    let mut pi = String::new();
+    let mut tools = Vec::new();
+    let mut in_tools = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("@@pi ") {
+            pi = rest.trim().to_string();
+        } else if line == "@@cmd" {
+            in_tools = true;
+        } else if line == "@@done" {
+            in_tools = false;
+        } else if in_tools && !line.is_empty() {
+            tools.push(line.to_string());
+        }
+    }
+    (pi, tools)
+}
+
+fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
+    if ok.contains(&value) {
+        Some(true)
+    } else {
+        Some(false)
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +723,139 @@ mod tests {
         assert!(text.contains("plugin:     herdr-ade"), "{text}");
         assert!(text.contains("crate:      herdr-ade"), "{text}");
         assert!(text.contains("prefix:"), "{text}");
+    }
+
+    fn box_facts() -> String {
+        let mut lines: Vec<String> = [
+            "host\toci-pi",
+            "boot\tenabled",
+            "server\therdr 0.9.1",
+            "tailscale\t100.91.36.88",
+            "nproc\t16",
+            "mem_avail_kb\t40000000",
+            "df_free\t100000000000",
+            "listeners\t2",
+            "git_name\tuguryildirim24",
+            "git_email\trolf@example.com",
+            "gh\tok",
+            "rules\tabc",
+            "login_claude\tok",
+            "login_codex\tok",
+            "login_agy\tok",
+            "repo /home/ubuntu/projects/herdr\tok",
+            "repo /home/ubuntu/projects/herdr-ade\tok",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for provider in crate::pi::roles::enabled_providers() {
+            lines.push(format!("pi_{provider}\tok"));
+        }
+        lines.join("\n") + "\n"
+    }
+
+    fn probe_fakes(runner: &FakeRunner) {
+        runner.on(
+            "workspace create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+        );
+        runner.on("pane run", ok(r#"{"result":{}}"#));
+        runner.on(
+            "pane read",
+            ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/home/ubuntu/.local/bin/claude\n/home/ubuntu/.local/bin/codex\n/home/ubuntu/.local/bin/agy\n/usr/local/bin/node\n@@done\n"),
+        );
+        runner.on("workspace close", ok(r#"{"result":{}}"#));
+    }
+
+    fn box_profile() -> crate::contracts::MachineProfile {
+        crate::contracts::MachineProfile {
+            id: "abc".into(),
+            label: "oci".into(),
+            target: "me@box".into(),
+            session: "default".into(),
+        }
+    }
+
+    #[test]
+    fn box_rows_read_the_box_and_gate_on_free_disk() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&box_facts()));
+        probe_fakes(&runner);
+        let rows = box_rows(&runner, "herdr", &box_profile());
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(_, name, _)| name == label)
+                .map(|(ok, _, detail)| (*ok, detail.clone()))
+                .unwrap_or_else(|| panic!("no row {label}"))
+        };
+        assert_eq!(find("box oci boot").0, Some(true));
+        assert_eq!(find("box oci wrapper").0, Some(true));
+        assert!(
+            find("box oci wrapper")
+                .1
+                .contains("/home/ubuntu/.local/bin/pi")
+        );
+        assert_eq!(find("box oci tools").0, Some(true));
+        assert_eq!(
+            find("box oci repo /home/ubuntu/projects/herdr").0,
+            Some(true)
+        );
+        assert_eq!(find("box oci capacity").0, Some(true));
+        assert!(find("box oci capacity").1.contains("refuses below 12 GB"));
+        let calls = runner.calls.borrow();
+        let ssh = calls
+            .iter()
+            .find(|call| call.program == "ssh")
+            .unwrap()
+            .display();
+        assert!(
+            ssh.contains("\"$HOME/.local/bin/claude\" auth status"),
+            "{ssh}"
+        );
+        assert!(
+            ssh.contains("\"$HOME/.local/bin/codex\" login status"),
+            "{ssh}"
+        );
+        assert!(ssh.contains("\"$HOME/.local/bin/agy\" models"), "{ssh}");
+        drop(calls);
+
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok(&box_facts().replace("df_free\t100000000000", "df_free\t5000000000")),
+        );
+        probe_fakes(&runner);
+        assert_eq!(find_row(&runner, "box oci capacity").0, Some(false));
+
+        let runner = FakeRunner::new();
+        runner.on("ssh", fail(255, "ssh: connect timed out"));
+        let rows = box_rows(&runner, "herdr", &box_profile());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, None);
+        assert!(rows[0].2.contains("unreachable"));
+    }
+
+    #[test]
+    fn box_wrapper_probe_fails_closed_when_the_pane_answers_another_path() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&box_facts()));
+        runner.on(
+            "workspace create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+        );
+        runner.on("pane run", ok(r#"{"result":{}}"#));
+        runner.on("pane read", ok("@@pi /usr/local/bin/pi\n@@cmd\n@@done\n"));
+        runner.on("workspace close", ok(r#"{"result":{}}"#));
+        let row = find_row(&runner, "box oci wrapper");
+        assert_eq!(row.0, Some(false));
+        assert!(row.2.contains("/usr/local/bin/pi"), "{}", row.2);
+    }
+
+    fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
+        box_rows(runner, "herdr", &box_profile())
+            .into_iter()
+            .find(|(_, name, _)| name == label)
+            .unwrap_or_else(|| panic!("no row {label}"))
     }
 
     #[test]
