@@ -16,7 +16,7 @@ SPEC: `herdr/tasks/pro-bridge/SPEC-pro-bridge.md` v2 (on the fork branch
 | `herdr-pro init` | Rolf | link `~/.local/bin/herdr-pro`, create the state dirs |
 | `herdr-pro login` | Rolf | print the two login steps; never drives one |
 | `herdr-pro doctor [--json]` | Rolf / coordinator | bridge, route, login, breaker, herdr |
-| `herdr-pro start --name N --parent PANE [--cwd DIR]` | coordinator | start a Pro Codex lane |
+| `herdr-pro start --name N [--cwd DIR]` | coordinator | start a Pro Codex lane nested under the caller, or under the project coordinator outside a herdr pane |
 | `herdr-pro turn N --brief F --out F --notify AGENT [--attach F]... [--id TAG]` | coordinator | run one turn; forks a detached collector |
 | `herdr-pro resume N` | coordinator | start a gone lane again and resume its Codex thread |
 | `herdr-pro reconcile` | plugin startup | mark lanes whose pane stopped running Codex as `gone`; print resume lines |

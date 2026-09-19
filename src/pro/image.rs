@@ -61,7 +61,10 @@ pub fn run(
     let cwd = std::path::absolute(&cwd).with_context(|| format!("bad cwd {}", cwd.display()))?;
     let pictures = reference_pictures(&opts.with)?;
 
-    let name = lane_name(layout, &cwd)?;
+    // Codex accepts pictures only on its process start line. A call with
+    // references therefore needs a fresh lane even when `--keep` left an
+    // earlier picture lane ready.
+    let name = lane_name(layout, &cwd, !pictures.is_empty())?;
     let lane = ensure_lane(env, layout, runner, &name, &cwd, &pictures)?;
 
     let result: Result<PathBuf> = (|| {
@@ -144,16 +147,18 @@ fn parse_size(size: &str) -> Result<(u32, u32)> {
 
 /// The picture lane for `cwd`: an existing one, else the first free name near
 /// `gpt-image-gen`.
-fn lane_name(layout: &Layout, cwd: &Path) -> Result<String> {
+fn lane_name(layout: &Layout, cwd: &Path, fresh: bool) -> Result<String> {
     let base = home::IMAGE_PROFILE;
     let cwd_text = cwd.display().to_string();
-    for lane in Lane::list(layout)? {
-        if !lane.stopped
-            && lane.cwd == cwd_text
-            && lane.profile.as_deref() == Some(home::IMAGE_PROFILE)
-            && (lane.name == base || lane.name.starts_with(&format!("{base}-")))
-        {
-            return Ok(lane.name);
+    if !fresh {
+        for lane in Lane::list(layout)? {
+            if !lane.stopped
+                && lane.cwd == cwd_text
+                && lane.profile.as_deref() == Some(home::IMAGE_PROFILE)
+                && (lane.name == base || lane.name.starts_with(&format!("{base}-")))
+            {
+                return Ok(lane.name);
+            }
         }
     }
     if name_available(layout, base) {
