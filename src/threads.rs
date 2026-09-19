@@ -219,12 +219,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
                 .with_context(|| format!("repository {repo} does not exist"))?
                 .to_string_lossy()
                 .into_owned();
-            if !settings
-                .repos
-                .iter()
-                .any(|r| r.path == path || &r.path == repo)
-            {
-                eprintln!("warning: {path} is not listed in `repos` in PROJECT.md");
+            if !crate::harness::allowed_repo(&settings, &ctx.config_dir, &path) {
+                bail!(
+                    "repo_not_listed: {path} is not listed in `repos` in PROJECT.md and is not a harness repository"
+                );
             }
             path
         }
@@ -241,7 +239,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             "machine_held: `{machine}` is held; run `ha machine release {machine}` when the fork refresh or resize is done"
         );
     }
-    if !machine.is_empty() && listed.is_none() {
+    if !machine.is_empty()
+        && listed.is_none()
+        && !crate::harness::is_harness_repo(&ctx.config_dir, &repo)
+    {
         eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
     }
 
@@ -1918,6 +1919,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        world.add_repo(&project, &repo_s);
 
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
         // Registered first: the first matching rule answers.
@@ -2080,6 +2082,85 @@ mod tests {
             .filter(|c| c.display().contains("tab create"))
             .count();
         assert!(tabs >= 2, "restart should open a tab, not a workspace");
+    }
+
+    #[test]
+    fn a_harness_repo_starts_from_a_project_that_does_not_list_it() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::World;
+
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let harness = world.home.path().join("harness");
+        std::fs::create_dir(&harness).unwrap();
+        init_repo(&harness);
+        let harness_s = std::fs::canonicalize(&harness)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
+        std::fs::write(
+            world.home.path().join("cfg/config.toml"),
+            format!(
+                "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
+            ),
+        )
+        .unwrap();
+
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        world.runner.on(
+            "agent start --help",
+            ok("      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n"),
+        );
+        world.runner.on(
+            "HERDR_ADE_LAUNCH",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#),
+        );
+        world.runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"hp-demo-t-0001","tokens":{"parent":"w1:p1"}}}}"#),
+        );
+        world.runner.on(
+            "process-info",
+            ok(r#"{"result":{"process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":42,"name":"claude","argv0":"/bin/claude"}]}}}"#),
+        );
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+
+        let split = GitReal {
+            fake: &world.runner,
+        };
+        let ctx = crate::paths::Ctx {
+            env: &world.env,
+            root: world.root.clone(),
+            config_dir: world.home.path().join("cfg"),
+            runner: &split,
+            detached_ticker: false,
+        };
+        let args = |repo: String| StartArgs {
+            title: "Fix login".into(),
+            repo: Some(repo),
+            machine: None,
+            base: None,
+            task: "Do the thing.".into(),
+            plain: "The lane does the work.".into(),
+            role: None,
+            recipe: None,
+        };
+
+        let other = world.home.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        init_repo(&other);
+        let other_s = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let error = start(&ctx, "demo", args(other_s)).unwrap_err().to_string();
+        assert!(error.contains("repo_not_listed"), "{error}");
+        assert!(thread::list(&project).is_empty());
+
+        let started = start(&ctx, "demo", args(harness_s.clone())).unwrap();
+        assert_eq!(started.repo, harness_s);
+        assert!(thread::list(&project).iter().any(|t| t.id == started.id));
     }
 
     #[test]
