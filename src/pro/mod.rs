@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod doctor;
 pub mod herdr_cli;
 pub mod home;
+pub mod image;
 pub mod lane;
 pub mod packet;
 pub mod state;
@@ -207,6 +208,12 @@ impl Layout {
 
     pub fn turn_lock(&self) -> PathBuf {
         self.root.join("turn.lock")
+    }
+
+    /// Serializes `herdr-pro image` calls, so one picture lane serves one
+    /// caller at a time.
+    pub fn image_lock(&self) -> PathBuf {
+        self.root.join("image.lock")
     }
 
     pub fn cooldown(&self) -> PathBuf {

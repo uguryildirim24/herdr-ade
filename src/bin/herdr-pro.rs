@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use pro::sh::RealRunner;
-use pro::{Env, Layout, bridge, doctor, home, lane, state, turn};
+use pro::{Env, Layout, bridge, doctor, home, image, lane, state, turn};
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD_ID"));
 
@@ -85,6 +85,21 @@ enum Command {
     Resume { name: String },
     /// Mark lanes whose pane no longer runs Codex as gone; print resume lines
     Reconcile,
+    /// Make one picture with Codex's image tool on the `gpt-image-gen` profile
+    Image {
+        /// A file holding the prompt
+        #[arg(long, value_name = "FILE")]
+        prompt_file: PathBuf,
+        /// The picture size, `WxH`
+        #[arg(long, value_name = "WxH")]
+        size: String,
+        /// Where the PNG is saved (must not exist yet)
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Keep the picture lane running for the next call
+        #[arg(long)]
+        keep: bool,
+    },
     /// The stop switch: stop one lane so a restart never brings it back
     Stop { name: String },
     /// Clear the breaker and resume the bridge
@@ -137,6 +152,7 @@ fn run(cli: &Cli) -> Result<bool> {
                     name: name.clone(),
                     parent: Some(parent.clone()),
                     cwd: cwd.clone(),
+                    profile: None,
                 },
             )?;
             println!(
@@ -191,6 +207,26 @@ fn run(cli: &Cli) -> Result<bool> {
             }
             Ok(true)
         }
+        Command::Image {
+            prompt_file,
+            size,
+            out,
+            keep,
+        } => {
+            let path = image::run(
+                &env,
+                &layout,
+                &runner,
+                &image::ImageOptions {
+                    prompt_file: prompt_file.clone(),
+                    size: size.clone(),
+                    out: out.clone(),
+                    keep: *keep,
+                },
+            )?;
+            println!("{}", path.display());
+            Ok(true)
+        }
         Command::Stop { name } => {
             let lane = lane::stop(&env, &layout, &runner, name)?;
             println!("{} stopped; reconcile will not bring it back", lane.name);
@@ -210,25 +246,33 @@ fn run(cli: &Cli) -> Result<bool> {
 fn init(env: &Env, layout: &Layout) -> Result<bool> {
     layout.ensure()?;
     home::init(layout)?;
+    // `current_exe` can be the invoking symlink (`~/.local/bin/herdr-pro`),
+    // so canonicalize before linking or the link points at itself.
     let exe = std::env::current_exe().context("could not find this binary's own path")?;
+    let exe = std::fs::canonicalize(&exe)
+        .with_context(|| format!("could not resolve {}", exe.display()))?;
     let bin_dir = env.home.join(".local/bin");
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("could not create {}", bin_dir.display()))?;
     let link = bin_dir.join("herdr-pro");
-    if let Ok(meta) = link.symlink_metadata() {
-        if meta.file_type().is_symlink() {
-            std::fs::remove_file(&link)
-                .with_context(|| format!("could not replace {}", link.display()))?;
-        } else {
-            bail!(
-                "{} exists and is not a symlink; move it aside by hand",
-                link.display()
-            );
+    if link == exe {
+        println!("{} is already this binary", link.display());
+    } else {
+        if let Ok(meta) = link.symlink_metadata() {
+            if meta.file_type().is_symlink() {
+                std::fs::remove_file(&link)
+                    .with_context(|| format!("could not replace {}", link.display()))?;
+            } else {
+                bail!(
+                    "{} exists and is not a symlink; move it aside by hand",
+                    link.display()
+                );
+            }
         }
+        std::os::unix::fs::symlink(&exe, &link)
+            .with_context(|| format!("could not link {}", link.display()))?;
+        println!("linked {} -> {}", link.display(), exe.display());
     }
-    std::os::unix::fs::symlink(&exe, &link)
-        .with_context(|| format!("could not link {}", link.display()))?;
-    println!("linked {} -> {}", link.display(), exe.display());
     println!("state lives in {}", layout.root.display());
     println!("Pro home: {}", layout.codex_home().display());
     println!("next: `herdr-pro login`, then `herdr-pro doctor`");

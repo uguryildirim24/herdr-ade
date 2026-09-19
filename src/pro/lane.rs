@@ -35,6 +35,9 @@ pub struct StartOptions {
     pub name: String,
     pub parent: Option<String>,
     pub cwd: Option<String>,
+    /// A Codex config profile to launch instead of the Pro bridge route. A
+    /// picture lane is `Some("gpt-image-gen")` and never sees the bridge.
+    pub profile: Option<String>,
 }
 
 /// The four `-c` overrides every Pro Codex process carries (spec Design,
@@ -49,6 +52,22 @@ pub fn codex_args(port: u16) -> Vec<String> {
         format!("openai_base_url=http://127.0.0.1:{port}/v1"),
         "-c".into(),
         format!("tool_output_token_limit={}", super::TOOL_OUTPUT_TOKEN_LIMIT),
+    ]
+}
+
+/// The `--profile` overrides for a lane that runs on Codex's own backend
+/// (Codex 0.155 reads `<name>.config.toml` from the home).
+pub fn profile_args(profile: &str) -> Vec<String> {
+    vec!["--profile".into(), profile.into()]
+}
+
+/// The resume line for a profile lane: `codex resume --profile <name>`.
+pub fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
+    vec![
+        "resume".into(),
+        "--profile".into(),
+        profile.into(),
+        session_id.into(),
     ]
 }
 
@@ -249,20 +268,27 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     {
         bail!("lane `{}` was stopped; use a new lane name", opts.name);
     }
-    if let Err(error) = doctor::gate(env, layout, runner) {
-        return Err(anyhow::anyhow!("WAITING pro-bridge {error:#}"));
-    }
-    let (port, health) = bridge::health_any(runner)?;
-    if !health.accepting {
-        bail!("WAITING pro-bridge the bridge is draining");
-    }
-    if state::cooldown_active(layout, jiff::Timestamp::now()) {
-        bail!("WAITING pro-bridge cooldown is active");
-    }
+    // A bridge lane gates on the bridge; a profile lane (the picture maker)
+    // runs on Codex's own backend and gates on nothing here.
+    let extra = match opts.profile.as_deref() {
+        Some(profile) => profile_args(profile),
+        None => {
+            if let Err(error) = doctor::gate(env, layout, runner) {
+                return Err(anyhow::anyhow!("WAITING pro-bridge {error:#}"));
+            }
+            let (port, health) = bridge::health_any(runner)?;
+            if !health.accepting {
+                bail!("WAITING pro-bridge the bridge is draining");
+            }
+            if state::cooldown_active(layout, jiff::Timestamp::now()) {
+                bail!("WAITING pro-bridge cooldown is active");
+            }
+            codex_args(port)
+        }
+    };
     if state::name_taken(layout, &opts.name) {
         bail!("lane `{}` already exists and is not gone", opts.name);
     }
-
     let cwd = match opts.cwd.as_deref().filter(|c| !c.is_empty()) {
         Some(cwd) => env.expand_tilde(cwd),
         None => std::env::current_dir().context("could not read the current directory")?,
@@ -294,7 +320,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
             kind: "codex",
             pane: &pane.pane_id,
             parent: opts.parent.as_deref(),
-            extra: &codex_args(port),
+            extra: &extra,
             ready_timeout_ms: READY_TIMEOUT_MS,
         },
     ) {
@@ -334,6 +360,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         workspace_id: pane.workspace_id.clone(),
         parent: opts.parent.clone(),
         cwd: cwd_text,
+        profile: opts.profile.clone(),
         session_id: session_id.clone(),
         rollout: None,
         started_at: started.to_string(),
@@ -341,7 +368,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         stopped: false,
         last_turn: None,
     };
-    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+    if opts.profile.is_none() && wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
         let reason = screen_reason(runner, &bin, &pane.pane_id);
         let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
         bail!(
@@ -388,9 +415,6 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     if lane.state != "gone" {
         bail!("lane `{name}` is {}, not gone", lane.state);
     }
-    if state::cooldown_active(layout, jiff::Timestamp::now()) {
-        bail!("WAITING pro-bridge cooldown is active");
-    }
     let session = lane
         .session_id
         .clone()
@@ -399,13 +423,22 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     if let Some(other) = state::session_in_use(layout, &session, name) {
         bail!("Codex session {session} is already held by lane `{other}`");
     }
-    if let Err(error) = doctor::gate(env, layout, runner) {
-        bail!("WAITING pro-bridge {error:#}");
-    }
-    let (port, health) = bridge::health_any(runner)?;
-    if !health.accepting {
-        bail!("WAITING pro-bridge the bridge is draining");
-    }
+    let extra = match lane.profile.as_deref() {
+        Some(profile) => profile_resume_args(profile, &session),
+        None => {
+            if state::cooldown_active(layout, jiff::Timestamp::now()) {
+                bail!("WAITING pro-bridge cooldown is active");
+            }
+            if let Err(error) = doctor::gate(env, layout, runner) {
+                bail!("WAITING pro-bridge {error:#}");
+            }
+            let (port, health) = bridge::health_any(runner)?;
+            if !health.accepting {
+                bail!("WAITING pro-bridge the bridge is draining");
+            }
+            codex_resume_args(port, &session)
+        }
+    };
     let cwd = PathBuf::from(&lane.cwd);
     home::trust(layout, &cwd)
         .with_context(|| format!("could not trust `{}` in the Pro home", lane.cwd))?;
@@ -427,7 +460,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
             kind: "codex",
             pane: &pane.pane_id,
             parent: lane.parent.as_deref(),
-            extra: &codex_resume_args(port, &session),
+            extra: &extra,
             ready_timeout_ms: READY_TIMEOUT_MS,
         },
     ) {
@@ -459,7 +492,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     lane.workspace_id = pane.workspace_id;
     lane.state = "ready".into();
     lane.stopped = false;
-    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+    if lane.profile.is_none() && wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
         let reason = screen_reason(runner, &bin, &lane.pane_id);
         let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
         bail!(
@@ -613,6 +646,7 @@ mod tests {
                 name: "pro".into(),
                 parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
+                profile: None,
             },
         )
         .unwrap_err();
@@ -662,6 +696,7 @@ mod tests {
                 name: "pro".into(),
                 parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
+                profile: None,
             },
         )
         .unwrap();
@@ -685,6 +720,7 @@ mod tests {
             workspace_id: "w1".into(),
             parent: None,
             cwd: "/w".into(),
+            profile: None,
             session_id: Some("abc".into()),
             rollout: None,
             started_at: jiff::Timestamp::now().to_string(),
@@ -715,6 +751,7 @@ mod tests {
             workspace_id: "w1".into(),
             parent: None,
             cwd: "/w".into(),
+            profile: None,
             session_id: Some("abc".into()),
             rollout: None,
             started_at: jiff::Timestamp::now().to_string(),
@@ -757,6 +794,7 @@ mod tests {
                 name: "pro".into(),
                 parent: None,
                 cwd: Some(cwd.display().to_string()),
+                profile: None,
             },
         )
         .unwrap_err();
@@ -792,6 +830,7 @@ mod tests {
                 name: "pro".into(),
                 parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
+                profile: None,
             },
         )
         .unwrap_err();
