@@ -574,13 +574,26 @@ pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> V
         state.gone.clear();
         state.missing.clear();
     }
-    let mut lines: Vec<String> = Vec::new();
+    enum Signal {
+        Blocked(String),
+        Gone(String),
+    }
+    impl Signal {
+        fn line(&self) -> String {
+            match self {
+                Signal::Blocked(lane) => format!("BLOCKED {lane}"),
+                Signal::Gone(lane) => format!("GONE {lane}"),
+            }
+        }
+    }
+
+    let mut signals = Vec::new();
     for lane in threads {
         let live = thread::live_state(lane, agents, panes, now);
         let blocked = live.agent_state.as_deref() == Some("blocked");
         if blocked {
-            if state.blocked.insert(lane.id.clone()) {
-                lines.push(format!("BLOCKED {}", lane.id));
+            if !state.blocked.contains(&lane.id) {
+                signals.push(Signal::Blocked(lane.id.clone()));
             }
         } else {
             state.blocked.remove(&lane.id);
@@ -592,18 +605,24 @@ pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> V
             *count += 1;
         }
         let missing = *state.missing.get(&lane.id).unwrap_or(&0);
-        if (boot_changed || missing >= 2) && state.gone.insert(lane.id.clone()) {
-            lines.push(format!("GONE {}", lane.id));
+        if (boot_changed || missing >= 2) && !state.gone.contains(&lane.id) {
+            signals.push(Signal::Gone(lane.id.clone()));
         }
     }
-    for line in lines {
+    for signal in signals {
+        let line = signal.line();
         match type_remote_line(ctx, project, &line) {
-            Ok(true) => {}
-            Ok(false) => {
-                // The writer is suspended or the coordinator is not ready;
-                // the state stays marked so the line is not typed twice, and
-                // `deliver_events` retries the sealed events on a later tick.
-            }
+            Ok(true) => match signal {
+                Signal::Blocked(lane) => {
+                    state.blocked.insert(lane);
+                }
+                Signal::Gone(lane) => {
+                    state.gone.insert(lane);
+                }
+            },
+            // A suspended or busy writer has not consumed the transition. Do
+            // not mark it: the next successful pass must try again.
+            Ok(false) => {}
             Err(error) => errors.push(error.context(format!("remote line `{line}`"))),
         }
     }
@@ -1139,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn a_box_lane_absent_twice_is_pushed_gone_once() {
+    fn a_box_lane_signal_waits_until_the_coordinator_can_receive_it() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let lane = thread::allocate(&project, |t| {
@@ -1193,25 +1212,13 @@ mod tests {
             },
         );
         let state = events::remote_state(&project, "abc");
-        assert!(state.gone.contains(&lane.id), "{state:?}");
-        // A later pass does not repeat the line.
-        let before = state.gone.len();
-        remote_attention(
-            &ctx,
-            &project,
-            RemoteView {
-                machine_id: "abc",
-                threads: &threads,
-                agents: &[],
-                panes: &[],
-                boot_id: "boot-1",
-                now,
-            },
+        assert!(
+            !state.gone.contains(&lane.id),
+            "a missing coordinator must not consume GONE: {state:?}"
         );
-        assert_eq!(events::remote_state(&project, "abc").gone.len(), before);
 
-        // A reboot clears the per-boot GONE set so every open lane is pushed
-        // again, and the new boot id is recorded.
+        // A reboot records the new boot but still leaves GONE pending while
+        // there is no coordinator to receive it.
         remote_attention(
             &ctx,
             &project,
@@ -1226,7 +1233,7 @@ mod tests {
         );
         let state = events::remote_state(&project, "abc");
         assert_eq!(state.boot_id, "boot-2");
-        assert!(state.gone.contains(&lane.id));
+        assert!(!state.gone.contains(&lane.id));
     }
 
     #[test]
