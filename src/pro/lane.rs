@@ -33,11 +33,13 @@ pub const TRUST_PROMPT: &str = "Do you trust the contents of this directory?";
 #[derive(Debug, Clone)]
 pub struct StartOptions {
     pub name: String,
-    pub parent: Option<String>,
     pub cwd: Option<String>,
     /// A Codex config profile to launch instead of the Pro bridge route. A
     /// picture lane is `Some("gpt-image-gen")` and never sees the bridge.
     pub profile: Option<String>,
+    /// Reference pictures Codex attaches at start (`--image`), used by the
+    /// picture lane.
+    pub images: Vec<PathBuf>,
 }
 
 /// The four `-c` overrides every Pro Codex process carries (spec Design,
@@ -59,6 +61,50 @@ pub fn codex_args(port: u16) -> Vec<String> {
 /// (Codex 0.155 reads `<name>.config.toml` from the home).
 pub fn profile_args(profile: &str) -> Vec<String> {
     vec!["--profile".into(), profile.into()]
+}
+
+/// The pictures a picture lane attaches at start: Codex's `--image <file>`
+/// (repeatable; `codex --help`, 0.155.1).
+pub fn image_args(files: &[PathBuf]) -> Vec<String> {
+    let mut args = Vec::new();
+    for file in files {
+        args.push("--image".into());
+        args.push(file.display().to_string());
+    }
+    args
+}
+
+/// The project slug from `HERDR_ADE_LAUNCH` (`<project>/<thread>/<n>/<hash>`).
+fn launch_project(env: &Env) -> Option<String> {
+    let launch = env.var("HERDR_ADE_LAUNCH")?;
+    let slug = launch.split('/').next()?;
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// The project coordinator's pane from `coordinator.json`, for a caller that
+/// is not itself a herdr pane. `ha` records it per project.
+fn coordinator_pane(env: &Env) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Record {
+        #[serde(default)]
+        pane_id: String,
+    }
+    let slug = launch_project(env)?;
+    let path = super::ade_root(env)
+        .ok()?
+        .join(slug)
+        .join(".state/coordinator.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let record: Record = serde_json::from_str(&text).ok()?;
+    (!record.pane_id.is_empty()).then_some(record.pane_id)
+}
+
+/// The pane a lane started by this call sits under: the caller's own herdr
+/// pane, else the project's coordinator pane, else none.
+pub fn parent_pane(env: &Env) -> Option<String> {
+    env.var("HERDR_PANE_ID")
+        .map(str::to_string)
+        .or_else(|| coordinator_pane(env))
 }
 
 /// The resume line for a profile lane: `codex resume --profile <name>`.
@@ -271,7 +317,11 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     // A bridge lane gates on the bridge; a profile lane (the picture maker)
     // runs on Codex's own backend and gates on nothing here.
     let extra = match opts.profile.as_deref() {
-        Some(profile) => profile_args(profile),
+        Some(profile) => {
+            let mut args = profile_args(profile);
+            args.extend(image_args(&opts.images));
+            args
+        }
         None => {
             if let Err(error) = doctor::gate(env, layout, runner) {
                 return Err(anyhow::anyhow!("WAITING pro-bridge {error:#}"));
@@ -307,7 +357,8 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     }
 
     let bin = env.herdr_bin();
-    let workspace = workspace_for(env, runner, &bin, opts.parent.as_deref()).unwrap_or_default();
+    let parent = parent_pane(env);
+    let workspace = workspace_for(env, runner, &bin, parent.as_deref()).unwrap_or_default();
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &cwd_text, &opts.name, &env_pairs)
         .context("could not create the lane tab")?;
@@ -319,7 +370,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
             name: &opts.name,
             kind: "codex",
             pane: &pane.pane_id,
-            parent: opts.parent.as_deref(),
+            parent: parent.as_deref(),
             extra: &extra,
             ready_timeout_ms: READY_TIMEOUT_MS,
         },
@@ -358,7 +409,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         pane_id: pane.pane_id.clone(),
         tab_id: pane.tab_id.clone(),
         workspace_id: pane.workspace_id.clone(),
-        parent: opts.parent.clone(),
+        parent: parent.clone(),
         cwd: cwd_text,
         profile: opts.profile.clone(),
         session_id: session_id.clone(),
@@ -447,7 +498,8 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     }
 
     let bin = env.herdr_bin();
-    let workspace = workspace_for(env, runner, &bin, lane.parent.as_deref())
+    let parent = parent_pane(env);
+    let workspace = workspace_for(env, runner, &bin, parent.as_deref())
         .unwrap_or_else(|| lane.workspace_id.clone());
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &lane.cwd, name, &env_pairs)
@@ -459,7 +511,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
             name,
             kind: "codex",
             pane: &pane.pane_id,
-            parent: lane.parent.as_deref(),
+            parent: parent.as_deref(),
             extra: &extra,
             ready_timeout_ms: READY_TIMEOUT_MS,
         },
@@ -490,6 +542,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     lane.pane_id = pane.pane_id;
     lane.tab_id = pane.tab_id;
     lane.workspace_id = pane.workspace_id;
+    lane.parent = parent;
     lane.state = "ready".into();
     lane.stopped = false;
     if lane.profile.is_none() && wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
@@ -644,9 +697,9 @@ mod tests {
             &runner,
             &StartOptions {
                 name: "pro".into(),
-                parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap_err();
@@ -694,9 +747,9 @@ mod tests {
             &runner,
             &StartOptions {
                 name: "pro".into(),
-                parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap();
@@ -792,9 +845,9 @@ mod tests {
             &runner,
             &StartOptions {
                 name: "pro".into(),
-                parent: None,
                 cwd: Some(cwd.display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap_err();
@@ -828,14 +881,147 @@ mod tests {
             &runner,
             &StartOptions {
                 name: "pro".into(),
-                parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap_err();
         assert!(error.to_string().contains("WAITING pro-bridge"), "{error}");
         assert!(error.to_string().contains("Sign in"), "{error}");
+    }
+
+    /// An `Env` and `Layout` with the given variables on top of `test_env`'s.
+    fn nest_env(dir: &Path, extra: &[(&str, &str)]) -> (Env, Layout) {
+        let state = dir.join("pro");
+        let mut vars = vec![
+            ("HERDR_BIN_PATH", "/h/herdr"),
+            ("HERDR_PRO_STATE_DIR", state.to_str().unwrap()),
+        ];
+        vars.extend_from_slice(extra);
+        let env = Env::for_test(dir, &vars);
+        let layout = Layout::for_test(state);
+        layout.ensure().unwrap();
+        (env, layout)
+    }
+
+    fn profile_start(dir: &Path, images: Vec<PathBuf>) -> StartOptions {
+        StartOptions {
+            name: home::IMAGE_PROFILE.into(),
+            cwd: Some(dir.display().to_string()),
+            profile: Some(home::IMAGE_PROFILE.into()),
+            images,
+        }
+    }
+
+    #[test]
+    fn start_nests_the_lane_under_the_callers_own_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, layout) = nest_env(
+            dir.path(),
+            &[("HERDR_PANE_ID", "wC:p1"), ("HERDR_WORKSPACE_ID", "wC")],
+        );
+        let runner = FakeRunner::new();
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"wC:p2","tab_id":"wC:t2","workspace_id":"wC","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"wC:p2","name":"gpt-image-gen","agent":"codex","agent_status":"idle"}}}"#),
+        );
+        runner.on("pane read", ok("codex> \n"));
+        let lane = start(
+            &env,
+            &layout,
+            &runner,
+            &profile_start(dir.path(), Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(lane.parent.as_deref(), Some("wC:p1"));
+        let calls = runner.calls.borrow();
+        let line = calls
+            .iter()
+            .map(|cmd| cmd.display())
+            .find(|line| line.contains("agent start"))
+            .unwrap();
+        assert!(line.contains("--parent wC:p1"), "{line}");
+    }
+
+    #[test]
+    fn start_reads_the_coordinator_pane_when_the_caller_is_not_a_herdr_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let ade = dir.path().join("ade");
+        let (env, layout) = nest_env(
+            dir.path(),
+            &[
+                ("HERDR_ADE_ROOT", ade.to_str().unwrap()),
+                ("HERDR_ADE_LAUNCH", "demo/coordinator/1/abcd"),
+            ],
+        );
+        let state = ade.join("demo/.state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("coordinator.json"), r#"{"pane_id":"wD:p9"}"#).unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"wD:p2","tab_id":"wD:t2","workspace_id":"wD","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"wD:p2","name":"gpt-image-gen","agent":"codex","agent_status":"idle"}}}"#),
+        );
+        runner.on("pane read", ok("codex> \n"));
+        let lane = start(
+            &env,
+            &layout,
+            &runner,
+            &profile_start(dir.path(), Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(lane.parent.as_deref(), Some("wD:p9"));
+        let calls = runner.calls.borrow();
+        let line = calls
+            .iter()
+            .map(|cmd| cmd.display())
+            .find(|line| line.contains("agent start"))
+            .unwrap();
+        assert!(line.contains("--parent wD:p9"), "{line}");
+    }
+
+    #[test]
+    fn start_attaches_the_with_pictures_to_the_profile_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, layout) = test_env(dir.path());
+        let image = dir.path().join("ref.png");
+        std::fs::write(&image, b"png").unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"wC:p2","tab_id":"wC:t2","workspace_id":"wC","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"wC:p2","name":"gpt-image-gen","agent":"codex","agent_status":"idle"}}}"#),
+        );
+        runner.on("pane read", ok("codex> \n"));
+        start(
+            &env,
+            &layout,
+            &runner,
+            &profile_start(dir.path(), vec![image.clone()]),
+        )
+        .unwrap();
+        let calls = runner.calls.borrow();
+        let line = calls
+            .iter()
+            .map(|cmd| cmd.display())
+            .find(|line| line.contains("agent start"))
+            .unwrap();
+        assert!(
+            line.contains(&format!("--image {}", image.display())),
+            "{line}"
+        );
     }
 
     #[test]

@@ -48,9 +48,6 @@ enum Command {
         /// Lane name (the herdr agent name)
         #[arg(long)]
         name: String,
-        /// The coordinator pane that owns the lane
-        #[arg(long)]
-        parent: String,
         /// A trusted directory; default: the current directory
         #[arg(long)]
         cwd: Option<String>,
@@ -96,6 +93,9 @@ enum Command {
         /// Where the PNG is saved (must not exist yet)
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
+        /// A reference picture the model sees before it draws; repeatable, up to four
+        #[arg(long = "with", value_name = "FILE")]
+        with: Vec<PathBuf>,
         /// Keep the picture lane running for the next call
         #[arg(long)]
         keep: bool,
@@ -143,16 +143,16 @@ fn run(cli: &Cli) -> Result<bool> {
             login(&layout);
             Ok(true)
         }
-        Command::Start { name, parent, cwd } => {
+        Command::Start { name, cwd } => {
             let lane = lane::start(
                 &env,
                 &layout,
                 &runner,
                 &lane::StartOptions {
                     name: name.clone(),
-                    parent: Some(parent.clone()),
                     cwd: cwd.clone(),
                     profile: None,
+                    images: Vec::new(),
                 },
             )?;
             println!(
@@ -211,6 +211,7 @@ fn run(cli: &Cli) -> Result<bool> {
             prompt_file,
             size,
             out,
+            with,
             keep,
         } => {
             let path = image::run(
@@ -221,6 +222,7 @@ fn run(cli: &Cli) -> Result<bool> {
                     prompt_file: prompt_file.clone(),
                     size: size.clone(),
                     out: out.clone(),
+                    with: with.clone(),
                     keep: *keep,
                 },
             )?;
