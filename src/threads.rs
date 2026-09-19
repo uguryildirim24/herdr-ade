@@ -81,6 +81,20 @@ pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: G
     );
 }
 
+/// The `parent` value a lane's pane carries. On this Mac it is the bare
+/// coordinator pane; a box lane names the machine its coordinator lives on,
+/// `<label>:<pane>`, the form the fork lane t-0053 introduces (SPEC-remote §6).
+pub fn parent_token(record: &Thread, coordinator_pane: &str) -> String {
+    if record.is_remote() {
+        format!(
+            "{}:{coordinator_pane}",
+            crate::contracts::MACHINE_LOCAL_LABEL
+        )
+    } else {
+        coordinator_pane.to_string()
+    }
+}
+
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
     if !thread.pane_id.is_empty() {
         let _ = herdr
@@ -631,6 +645,20 @@ fn place_box_worktree(
     } else {
         cwd
     };
+
+    // The box lane nests under its coordinator from its first second: the
+    // machine-qualified parent token is written before the ticker starts the
+    // agent, which passes no `--parent` for a box lane.
+    if let Some(coord) = project.coordinator() {
+        herdr
+            .pane_set_parent(&created.pane_id, &parent_token(record, &coord.pane_id))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not link box pane {} to its coordinator: {error}",
+                    created.pane_id
+                )
+            })?;
+    }
 
     // Step 5: the lane card, now that the pane id exists.
     let recipient = project
@@ -2478,9 +2506,15 @@ mod tests {
     fn an_unreachable_box_falls_back_to_this_mac() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, LANE_CONFIG);
-        fx.world.runner.on(
-            "sh -c true",
-            crate::runner::fake::fail(255, "connection refused"),
+        fx.world.runner.on_fn(
+            |cmd| {
+                cmd.program == "ssh"
+                    && cmd
+                        .args
+                        .last()
+                        .is_some_and(|script| script.ends_with("\ntrue'"))
+            },
+            |_| Ok(crate::runner::fake::fail(255, "connection refused")),
         );
         stub_box(&fx);
         let started = start(
