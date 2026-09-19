@@ -712,7 +712,8 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } else {
                     "on this Mac".to_string()
                 };
-                println!("{}\t{}\t{}", lane.id, lane.last_group, machine);
+                let age = crate::board::age(&lane.updated).unwrap_or_default();
+                println!("{}\t{}\t{}\t{age} ago", lane.id, lane.last_group, machine);
                 return Ok(());
             }
             if print {
