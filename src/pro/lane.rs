@@ -38,6 +38,9 @@ pub struct StartOptions {
     /// A Codex config profile to launch instead of the Pro bridge route. A
     /// picture lane is `Some("gpt-image-gen")` and never sees the bridge.
     pub profile: Option<String>,
+    /// Reference pictures Codex attaches at start (`--image`), used by the
+    /// picture lane.
+    pub images: Vec<PathBuf>,
 }
 
 /// The four `-c` overrides every Pro Codex process carries (spec Design,
@@ -59,6 +62,17 @@ pub fn codex_args(port: u16) -> Vec<String> {
 /// (Codex 0.155 reads `<name>.config.toml` from the home).
 pub fn profile_args(profile: &str) -> Vec<String> {
     vec!["--profile".into(), profile.into()]
+}
+
+/// The pictures a picture lane attaches at start: Codex's `--image <file>`
+/// (repeatable; `codex --help`, 0.155.1).
+pub fn image_args(files: &[PathBuf]) -> Vec<String> {
+    let mut args = Vec::new();
+    for file in files {
+        args.push("--image".into());
+        args.push(file.display().to_string());
+    }
+    args
 }
 
 /// The resume line for a profile lane: `codex resume --profile <name>`.
@@ -271,7 +285,11 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     // A bridge lane gates on the bridge; a profile lane (the picture maker)
     // runs on Codex's own backend and gates on nothing here.
     let extra = match opts.profile.as_deref() {
-        Some(profile) => profile_args(profile),
+        Some(profile) => {
+            let mut args = profile_args(profile);
+            args.extend(image_args(&opts.images));
+            args
+        }
         None => {
             if let Err(error) = doctor::gate(env, layout, runner) {
                 return Err(anyhow::anyhow!("WAITING pro-bridge {error:#}"));
@@ -647,6 +665,7 @@ mod tests {
                 parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap_err();
@@ -697,6 +716,7 @@ mod tests {
                 parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap();
@@ -795,6 +815,7 @@ mod tests {
                 parent: None,
                 cwd: Some(cwd.display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap_err();
@@ -831,11 +852,57 @@ mod tests {
                 parent: Some("w1:p1".into()),
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
+                images: Vec::new(),
             },
         )
         .unwrap_err();
         assert!(error.to_string().contains("WAITING pro-bridge"), "{error}");
         assert!(error.to_string().contains("Sign in"), "{error}");
+    }
+
+    fn profile_start(dir: &Path, images: Vec<PathBuf>) -> StartOptions {
+        StartOptions {
+            name: home::IMAGE_PROFILE.into(),
+            parent: None,
+            cwd: Some(dir.display().to_string()),
+            profile: Some(home::IMAGE_PROFILE.into()),
+            images,
+        }
+    }
+
+    #[test]
+    fn start_attaches_the_with_pictures_to_the_profile_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, layout) = test_env(dir.path());
+        let image = dir.path().join("ref.png");
+        std::fs::write(&image, b"png").unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"wC:p2","tab_id":"wC:t2","workspace_id":"wC","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"wC:p2","name":"gpt-image-gen","agent":"codex","agent_status":"idle"}}}"#),
+        );
+        runner.on("pane read", ok("codex> \n"));
+        start(
+            &env,
+            &layout,
+            &runner,
+            &profile_start(dir.path(), vec![image.clone()]),
+        )
+        .unwrap();
+        let calls = runner.calls.borrow();
+        let line = calls
+            .iter()
+            .map(|cmd| cmd.display())
+            .find(|line| line.contains("agent start"))
+            .unwrap();
+        assert!(
+            line.contains(&format!("--image {}", image.display())),
+            "{line}"
+        );
     }
 
     #[test]
