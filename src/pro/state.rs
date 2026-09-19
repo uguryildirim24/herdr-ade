@@ -84,10 +84,6 @@ pub struct Lane {
     pub stopped: bool,
     #[serde(default)]
     pub last_turn: Option<String>,
-    /// The lane recipe's `ready_timeout_ms`, when the caller had one. Kept so
-    /// `resume` waits with the same bound as `start`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ready_timeout_ms: Option<u64>,
 }
 
 impl Lane {
@@ -416,7 +412,6 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
-            ready_timeout_ms: None,
         };
         lane.write(&layout).unwrap();
         let back = Lane::read(&layout, "pro").unwrap();
@@ -532,7 +527,6 @@ mod tests {
                 state: "ready".into(),
                 stopped: false,
                 last_turn: None,
-                ready_timeout_ms: None,
             }
             .write(&layout)
             .unwrap();
