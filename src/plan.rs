@@ -168,11 +168,19 @@ fn with_plan<T>(
             plan.revision
         );
     }
+    let before = plan.clone();
     if plan.schema == 0 {
         plan.schema = 1;
     }
     let extra = change(&mut plan)?;
+    // Every plan mutation also refreshes the persisted projection. In
+    // particular, adding or removing a binding must not leave a stale state
+    // until a later `plan sync`.
+    project_states(project, &mut plan);
     validate(project, &plan)?;
+    if plan == before {
+        return Ok((plan, extra));
+    }
     plan.revision += 1;
     write(project, &plan)?;
     Ok((plan, extra))
@@ -650,6 +658,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_mutation_does_not_advance_the_revision() {
+        let fx = fixture();
+        goal(&fx, "I want to build a trading bot with Jeff.");
+        let first = set(
+            &fx.world.ctx(),
+            "demo",
+            "screen",
+            "It shows pretend trades.",
+            0,
+        )
+        .unwrap();
+        let same = set(
+            &fx.world.ctx(),
+            "demo",
+            "screen",
+            "It shows pretend trades.",
+            first.revision,
+        )
+        .unwrap();
+        assert_eq!(same.revision, first.revision);
+    }
+
+    #[test]
     fn a_normal_set_keeps_zero_steps_valid_but_refuses_bad_values() {
         let fx = fixture();
         let e = format!(
@@ -756,11 +787,13 @@ mod tests {
         set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
         let (lane, sha) = fx.lane(1);
         add(&fx, "Landed by the lane.", 1);
-        step_link(&ctx, "demo", "s-1", vec![lane.clone()], vec![], 2).unwrap();
-        // Bound to an existing thread with no carrying round: running.
+        let linked = step_link(&ctx, "demo", "s-1", vec![lane.clone()], vec![], 2).unwrap();
+        // Binding changes refresh the projection in the same committed plan.
+        assert_eq!(linked.revision, 3);
+        assert_eq!(linked.steps[0].state, StepState::Running);
         assert_eq!(
             sync(&ctx, "demo").unwrap(),
-            SyncOutcome::Changed { revision: 4 }
+            SyncOutcome::Unchanged { revision: 3 }
         );
         assert_eq!(state(&fx), StepState::Running);
 
