@@ -1,13 +1,17 @@
-//! Immutable completion events and their append-only delivery journals.
+//! Immutable completion events, their append-only delivery journals, and the
+//! Mac-side import of box envelopes (SPEC-remote §4.3).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::contracts::{DeliveryLine, DeliveryState, Event, EventPayload};
-use crate::project::Project;
+use crate::project::{self, Project};
 
 fn events_dir(project: &Project) -> PathBuf {
     project.dir().join("events")
@@ -38,6 +42,279 @@ fn validate_id(id: &str) -> Result<()> {
         bail!("`{id}` is not an event id");
     }
     Ok(())
+}
+
+fn validate_machine(machine: &str) -> Result<()> {
+    let valid = !machine.is_empty()
+        && !machine.starts_with('.')
+        && !machine.contains("..")
+        && machine
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !valid {
+        bail!("`{machine}` is not a machine profile id");
+    }
+    Ok(())
+}
+
+/// The Mac's content-addressed artifact folder (SPEC-remote §4.3).
+pub fn artifact_dir(project: &Project) -> PathBuf {
+    project.dir().join("artifacts")
+}
+
+/// The Mac path of one artifact, named by its own hash.
+pub fn artifact_path(project: &Project, hash: &str) -> PathBuf {
+    artifact_dir(project).join(hash)
+}
+
+/// The source tuple recorded for every box event imported on the Mac
+/// (SPEC-remote §4.3, D5/D10). It is the taken cursor's entry: the box event
+/// id and the hash of the box's own bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ImportSource {
+    /// Stable saved-profile id the envelope came from.
+    pub machine: String,
+    /// Box project slug (the Mac's slug).
+    pub project: String,
+    pub event: String,
+    pub event_hash: String,
+    /// Empty for a `waiting` envelope.
+    pub artifact_hash: String,
+    pub imported: String,
+}
+
+fn imports_dir(project: &Project) -> PathBuf {
+    project.dir().join("imports")
+}
+
+fn import_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf> {
+    validate_machine(machine)?;
+    validate_id(event)?;
+    Ok(imports_dir(project)
+        .join(machine)
+        .join(format!("{event}.toml")))
+}
+
+pub fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSource> {
+    let path = import_path(project, machine, event).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&text).ok()
+}
+
+#[allow(dead_code)]
+pub fn list_imports(project: &Project, machine: &str) -> Vec<ImportSource> {
+    if validate_machine(machine).is_err() {
+        return Vec::new();
+    }
+    let dir = imports_dir(project).join(machine);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut imports: Vec<ImportSource> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".toml").map(str::to_owned))
+        .filter_map(|id| load_import(project, machine, &id))
+        .collect();
+    imports.sort_by(|a, b| a.event.cmp(&b.event));
+    imports
+}
+
+/// What an [`import_box_event`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// The event and its artifact were written to the Mac ledger.
+    New,
+    /// The exact `(machine, event id, hash)` was already imported; nothing
+    /// was rewritten.
+    Replay,
+}
+
+/// Imports one box envelope into the Mac's canonical ledger, create-only
+/// (SPEC-remote §4.3). The box's own bytes must hash to `event_hash`; the
+/// artifact must hash to the event's `artifact`. The local event keeps the
+/// same id and payload but its `report_path` is rewritten to the Mac artifact
+/// path, so the typed DONE line names a path the Mac owns. The same event id
+/// with different bytes is corruption and refuses.
+pub fn import_box_event(
+    project: &Project,
+    machine: &str,
+    box_bytes: &[u8],
+    artifact: Option<&[u8]>,
+) -> Result<ImportOutcome> {
+    validate_machine(machine)?;
+    let text = std::str::from_utf8(box_bytes).context("box event is not UTF-8")?;
+    let event: Event = toml::from_str(text).context("box event does not parse")?;
+    validate_id(&event.id)?;
+    let event_hash = hash_bytes(box_bytes);
+    if let Some(existing) = load_import(project, machine, &event.id) {
+        if existing.event_hash == event_hash {
+            return Ok(ImportOutcome::Replay);
+        }
+        bail!(
+            "event_conflict: box event {} already imported with hash {}, now {event_hash}",
+            event.id,
+            existing.event_hash
+        );
+    }
+
+    let mut artifact_hash = String::new();
+    if let Some(done) = &event.payload.done {
+        let bytes = artifact.with_context(|| {
+            format!(
+                "artifact_missing: event {} names artifact {}",
+                event.id, done.artifact
+            )
+        })?;
+        let got = hash_bytes(bytes);
+        if got != done.artifact {
+            bail!(
+                "artifact_mismatch: event {} artifact is {}, fetched {got}",
+                event.id,
+                done.artifact
+            );
+        }
+        write_artifact_create_only(project, &done.artifact, bytes)?;
+        artifact_hash = done.artifact.clone();
+    }
+
+    let mut local = event.clone();
+    if let Some(done) = local.payload.done.as_mut() {
+        done.report_path = artifact_path(project, &done.artifact)
+            .to_string_lossy()
+            .into_owned();
+    }
+    seal_create_if_absent(project, &local)
+        .with_context(|| format!("could not import event {}", event.id))?;
+
+    let source = ImportSource {
+        machine: machine.to_string(),
+        project: project.slug.clone(),
+        event: event.id.clone(),
+        event_hash,
+        artifact_hash,
+        imported: project::now(),
+    };
+    write_import_create_only(project, &source)?;
+    Ok(ImportOutcome::New)
+}
+
+fn write_import_create_only(project: &Project, source: &ImportSource) -> Result<()> {
+    let path = import_path(project, &source.machine, &source.event)?;
+    let mut text = toml::to_string(source)?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let actual = std::fs::read_to_string(&path).unwrap_or_default();
+            let expected = String::from_utf8_lossy(text.as_bytes()).into_owned();
+            if actual == expected {
+                return Ok(());
+            }
+            bail!(
+                "import_conflict: {} already exists with different bytes",
+                source.event
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not write {}", path.display()));
+        }
+    };
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Content-addressed artifact write; a retry with the same bytes is a no-op.
+fn write_artifact_create_only(project: &Project, hash: &str, bytes: &[u8]) -> Result<()> {
+    let dir = artifact_dir(project);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(hash);
+    if path.exists() {
+        if std::fs::read(&path)? == bytes {
+            return Ok(());
+        }
+        bail!("artifact_conflict: {} has different bytes", path.display());
+    }
+    let tmp = dir.join(format!(".{hash}.{}.tmp", std::process::id()));
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => {}
+        Err(error) if path.exists() && std::fs::read(&path)? == bytes => {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = error;
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+    }
+    File::open(&dir)?.sync_all()?;
+    Ok(())
+}
+
+/// A box lane's Mac-side courier state, one file per (profile id, project)
+/// (SPEC-remote §4.3). `taken` is the cursor: box event id -> the hash of the
+/// box's bytes. `missing` counts consecutive successful passes with no pane
+/// and no agent; `gone` and `blocked` stop a line being typed twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RemoteState {
+    pub boot_id: String,
+    pub last_pass: String,
+    pub taken: BTreeMap<String, String>,
+    pub missing: BTreeMap<String, u32>,
+    pub gone: BTreeSet<String>,
+    pub blocked: BTreeSet<String>,
+}
+
+fn remote_state_path(project: &Project, machine: &str) -> Result<PathBuf> {
+    validate_machine(machine)?;
+    Ok(project
+        .state_dir()
+        .join("remote")
+        .join(format!("{machine}.json")))
+}
+
+pub fn remote_state(project: &Project, machine: &str) -> RemoteState {
+    remote_state_path(project, machine)
+        .ok()
+        .and_then(|path| project::read_json(&path))
+        .unwrap_or_default()
+}
+
+pub fn save_remote_state(project: &Project, machine: &str, state: &RemoteState) -> Result<()> {
+    let path = remote_state_path(project, machine)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = project.lock()?;
+    project::write_json(&path, state)
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The import record's path, exposed for tests.
+#[allow(dead_code)]
+pub fn source_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf> {
+    import_path(project, machine, event)
+}
+
+#[allow(dead_code)]
+pub fn artifact_dir_path(project: &Project) -> PathBuf {
+    artifact_dir(project)
 }
 
 /// Canonical bytes used both for the create-if-absent write and the X2b
@@ -226,6 +503,92 @@ mod tests {
                 .to_string()
                 .contains("event_conflict")
         );
+    }
+
+    fn box_event(artifact: &str) -> Event {
+        Event {
+            id: "t-0001-1-1".into(),
+            op: "t-0001-1-1".into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            created: "2026-09-19T00:00:00Z".into(),
+            payload: EventPayload {
+                done: Some(DonePayload {
+                    sha: "abc".into(),
+                    report_path: ".reports/t-0001.md".into(),
+                    artifact: artifact.into(),
+                }),
+                waiting: None,
+            },
+        }
+    }
+
+    #[test]
+    fn box_import_is_create_only_hash_checked_and_rewrites_the_report_path() {
+        let (_root, project, _event) = fixture();
+        let report = b"report body";
+        let hash = format!("{:x}", Sha256::digest(report));
+        let event = box_event(&hash);
+        let box_bytes = bytes(&event).unwrap();
+
+        assert_eq!(
+            import_box_event(&project, "oci", &box_bytes, Some(report)).unwrap(),
+            ImportOutcome::New
+        );
+        let imported = load(&project, &event.id).unwrap();
+        let written = imported.payload.done.clone().unwrap().report_path;
+        assert!(written.ends_with(&hash), "{written}");
+        assert!(!written.contains(".reports"), "{written}");
+        assert_eq!(
+            std::fs::read(artifact_path(&project, &hash)).unwrap(),
+            report
+        );
+
+        // The exact replay is a no-op; changed bytes under the same id refuse.
+        assert_eq!(
+            import_box_event(&project, "oci", &box_bytes, Some(report)).unwrap(),
+            ImportOutcome::Replay
+        );
+        let mut changed = event.clone();
+        changed.created.push('x');
+        assert!(
+            import_box_event(&project, "oci", &bytes(&changed).unwrap(), Some(report))
+                .unwrap_err()
+                .to_string()
+                .contains("event_conflict")
+        );
+    }
+
+    #[test]
+    fn box_import_refuses_an_artifact_that_does_not_hash_to_its_name() {
+        let (_root, project, _event) = fixture();
+        let event = box_event("deadbeef");
+        let box_bytes = bytes(&event).unwrap();
+        assert!(
+            import_box_event(&project, "oci", &box_bytes, Some(b"other"))
+                .unwrap_err()
+                .to_string()
+                .contains("artifact_mismatch")
+        );
+    }
+
+    #[test]
+    fn remote_state_roundtrips_per_profile_and_project() {
+        let (_root, project, _event) = fixture();
+        let mut state = remote_state(&project, "abc");
+        state.boot_id = "boot-1".into();
+        state.taken.insert("t-0001-1-1".into(), "hash".into());
+        state.missing.insert("t-0001".into(), 2);
+        state.gone.insert("t-0001".into());
+        save_remote_state(&project, "abc", &state).unwrap();
+        assert_eq!(remote_state(&project, "abc"), state);
+        assert!(remote_state(&project, "other").taken.is_empty());
+        assert!(save_remote_state(&project, "../escape", &state).is_err());
     }
 
     #[test]
