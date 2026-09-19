@@ -81,6 +81,19 @@ points at the wrapper. The shared folder, the model and the thinking level
 come back by themselves. Do not replay `--provider`, `--model` or
 `--approve`.
 
+## On the cloud box
+
+A pi lane on the box runs the box's own pi at `/home/ubuntu/.local/bin/pi`
+(the guarded wrapper) against the box's own `~/.herdr-ade/pi` login store.
+The Mac login does not count. Rolf signs each provider in once on the box
+(the coordinator opens a terminal for it): `herdr-pi login openai-codex`,
+`login opencode-go`, `login kimi-coding`. `herdr-pi check <provider>` on the
+box gates the start, and `herdr-pi doctor` shows the per-machine rows. Never
+copy `auth.json` or any Mac credential to the box.
+
+A box pi lane publishes its branch, seals with `ha done` on the box, and is
+restarted from the brief after a reboot or resize like any other box lane.
+
 ## What a pi lane must not do
 
 - Never `pi install`, `pi update`, `pi remove` or `pi config`; the wrapper

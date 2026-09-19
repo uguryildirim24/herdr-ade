@@ -531,6 +531,7 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
         // A pi provider that stopped being ready (an expired login) fails
         // the thread at once instead of launching into it (SPEC-pi §3.4).
         if t.launch.kind == "pi"
+            && !t.is_remote()
             && let Err(error) = crate::threads::pi_ready(pass.ctx, &t.launch)
         {
             let message = format!("{error:#}");
@@ -557,20 +558,19 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             } else {
                 t.launch.ready_timeout_ms
             };
-            let agent =
-                pass.herdr
-                    .on_machine(&t.machine)
-                    .agent_start_opts(&crate::herdr::AgentStart {
-                        name: &t.agent_name,
-                        kind: &t.launch.kind,
-                        pane: &t.pane_id,
-                        agent_args: &t.launch.args,
-                        parent: parent.as_deref(),
-                        ready_timeout_ms: timeout,
-                    })?;
+            let agent = pass.herdr.on_machine(t.machine_route()).agent_start_opts(
+                &crate::herdr::AgentStart {
+                    name: &t.agent_name,
+                    kind: &t.launch.kind,
+                    pane: &t.pane_id,
+                    agent_args: &t.launch.args,
+                    parent: parent.as_deref(),
+                    ready_timeout_ms: timeout,
+                },
+            )?;
             let process = pass
                 .herdr
-                .on_machine(&t.machine)
+                .on_machine(t.machine_route())
                 .pane_process_info(&t.pane_id)
                 .ok()
                 .and_then(|info| info.identity(&t.launch.kind));
@@ -701,14 +701,16 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
 }
 
 /// One remote machine: one `agent list` (and `pane list`) through
-/// `herdr --machine`, one ssh call for every report hash, then the same thread
-/// pass, copies and launches as for local threads. If the machine cannot be
-/// reached nothing is read: no state, no group change, no copy, no inbox item.
+/// `herdr --machine`, then the same thread pass and launches as for local
+/// threads. The report bytes, sealed events and boot id arrive through the
+/// courier (the second lane); this pass never reads a report hash or copies a
+/// file. If the machine cannot be reached nothing is read: no state, no group
+/// change, no inbox item.
 fn remote_pass(
     pass: &LaunchPass<'_>,
     machine: &str,
     may_start: &mut bool,
-    copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>,
+    _copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>,
     errors: &mut Vec<anyhow::Error>,
 ) -> Result<Vec<Transition>, String> {
     let ctx = pass.ctx;
@@ -718,55 +720,11 @@ fn remote_pass(
     let remote = herdr.on_machine(machine);
     let agents = remote.agent_list().map_err(|e| e.to_string())?;
     let panes = remote.pane_list().map_err(|e| e.to_string())?;
-    let target =
-        crate::remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)
-            .map_err(|e| format!("{e:#}"))?;
-    let dirs: Vec<(String, String)> = threads
-        .iter()
-        .filter(|t| !t.thread_dir.is_empty())
-        .map(|t| (t.id.clone(), t.thread_dir.clone()))
-        .collect();
-    let hashes =
-        crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
     let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
-    let pass = thread_pass(
-        project,
-        &prefix,
-        &remote,
-        threads,
-        &agents,
-        &panes,
-        Some(&hashes),
-    )
-    .map_err(|e| format!("{e:#}"))?;
+    let pass = thread_pass(project, &prefix, &remote, threads, &agents, &panes, None)
+        .map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
-
-    for t in threads {
-        let Some(hash) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
-            continue;
-        };
-        let copied = thread::copy_home_remote(project, t, true, ctx.runner, &target);
-        match copied.outcome {
-            thread::CopyOutcome::Failed(error) => errors.push(anyhow::anyhow!(
-                "{}: copy from {machine} failed: {error}",
-                t.id
-            )),
-            outcome => {
-                if let thread::CopyOutcome::Partial(notes) = outcome {
-                    copy_notes.insert(t.id.clone(), notes);
-                }
-                let hash = copied.report_hash.unwrap_or_else(|| hash.clone());
-                errors.extend(
-                    thread::update(project, &t.id, |t| {
-                        t.report_hash = hash;
-                        t.last_report_change = project::now();
-                    })
-                    .err(),
-                );
-            }
-        }
-    }
     launch_pass(
         &LaunchPass {
             ctx,
@@ -870,7 +828,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let mut state = steps::load_state(project);
     let before = state.clone();
     let remote_threads = open_threads(project, true);
-    let mut machines: Vec<String> = remote_threads.iter().map(|t| t.machine.clone()).collect();
+    let mut machines: Vec<String> = remote_threads
+        .iter()
+        .map(|t| t.machine_route().to_string())
+        .collect();
     machines.sort();
     machines.dedup();
     for machine in machines {
@@ -879,7 +840,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         }
         let threads: Vec<thread::Thread> = remote_threads
             .iter()
-            .filter(|t| t.machine == machine)
+            .filter(|t| t.machine_route() == machine)
             .cloned()
             .collect();
         let outcome = remote_pass(

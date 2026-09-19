@@ -604,13 +604,7 @@ fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
 
 pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
-    let t = thread::load(&project, thread_id)?;
-    if t.is_remote() {
-        bail!(
-            "remote_not_admissible: `{thread_id}` runs on machine `{}`; rounds are local",
-            t.machine
-        );
-    }
+    let _ = thread::load(&project, thread_id)?;
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
@@ -2288,14 +2282,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_thread_is_not_admissible() {
+    fn a_mixed_round_admits_a_box_lane() {
         let fx = fixture();
         open_r1(&fx);
         let id = fx.thread("Remote");
-        thread::update(&fx.project, &id, |t| t.machine = "dell".into()).unwrap();
-        assert!(
-            err(admit(&fx.world.ctx(), "demo", "r1", &id)).starts_with("remote_not_admissible")
-        );
+        thread::update(&fx.project, &id, |t| {
+            t.machine = "oci".into();
+            t.machine_id = "abc".into();
+        })
+        .unwrap();
+        let record = admit(&fx.world.ctx(), "demo", "r1", &id).unwrap();
+        assert!(record.manifest.members.iter().any(|m| m.thread == id));
     }
 
     #[test]
