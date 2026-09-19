@@ -414,6 +414,14 @@ struct RelayTurn {
     files: usize,
 }
 
+/// A failed Codex turn plus the reads already served for this pi request.
+#[derive(Debug)]
+struct RelayFailure {
+    error: anyhow::Error,
+    rounds: usize,
+    files: usize,
+}
+
 /// One Codex turn. The real one spawns `codex exec`; the tests script answers.
 trait Codex: Send + Sync {
     fn turn(
@@ -540,18 +548,30 @@ impl Relay {
 
     /// Run the Codex turns for one pi request, serving the model's file
     /// requests until it produces a final answer.
-    fn converse(&self, key: &str, resume: Option<&str>, prompt: &str) -> Result<RelayTurn> {
+    fn converse(
+        &self,
+        key: &str,
+        resume: Option<&str>,
+        prompt: &str,
+    ) -> std::result::Result<RelayTurn, RelayFailure> {
         let mut resume_id = resume.map(str::to_string);
         let mut prompt = prompt.to_string();
         let mut rounds = 0usize;
         let mut files = 0usize;
         loop {
             let mut noop = |_: &str, _: &Value| Ok(());
-            let mut outcome = self.codex.turn(resume_id.as_deref(), &prompt, &mut noop)?;
+            let mut outcome = self
+                .codex
+                .turn(resume_id.as_deref(), &prompt, &mut noop)
+                .map_err(|error| RelayFailure {
+                    error,
+                    rounds,
+                    files,
+                })?;
             if let Some(id) = &outcome.codex_id {
                 resume_id = Some(id.clone());
             }
-            outcome.answer = strip_bridge_note(&outcome.answer);
+            outcome.answer = strip_bridge_note(&unescape_bridge_markdown(&outcome.answer));
             let (body, requests) = split_requests(&outcome.answer);
             if requests.is_empty() {
                 outcome.answer = body;
@@ -613,7 +633,7 @@ impl Relay {
         };
         let (text, ok) = match request {
             FileRequest::Read(_) => self.render_read(&path, *budget),
-            FileRequest::List(_) => self.render_list(&path),
+            FileRequest::List(_) => self.render_list(&path, *budget),
         };
         *budget = budget.saturating_sub(text.len());
         (text, ok)
@@ -622,7 +642,7 @@ impl Relay {
     /// Resolve a requested path, or return the one refusal line.
     fn resolve_allowed(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let path = Path::new(raw);
-        if !path.is_absolute() {
+        if !path.is_absolute() || forbidden_path(path) {
             return Err(REFUSED.to_string());
         }
         let Ok(canonical) = std::fs::canonicalize(path) else {
@@ -658,29 +678,35 @@ impl Relay {
         if buf.len() > limit {
             buf.truncate(limit);
         }
-        match String::from_utf8(buf) {
-            Ok(mut text) => {
-                if over_file {
-                    text.push_str(&format!(
-                        "\n[truncated: the file is larger than {} KB]",
-                        FILE_MAX_BYTES / 1024
-                    ));
-                } else if limit < FILE_MAX_BYTES {
-                    text.push_str("\n[truncated: this round's read budget is spent]");
-                }
-                (text, true)
+        let text = match String::from_utf8(buf) {
+            Ok(text) => text,
+            Err(error) if error.utf8_error().error_len().is_none() => {
+                let valid = error.utf8_error().valid_up_to();
+                // The byte cap may split the last UTF-8 character. Keep the
+                // complete prefix instead of calling an ordinary text file binary.
+                String::from_utf8_lossy(&error.into_bytes()[..valid]).into_owned()
             }
-            Err(_) => ("refused: binary file".into(), false),
+            Err(_) => return ("refused: binary file".into(), false),
+        };
+        let mut text = text;
+        if over_file {
+            text.push_str(&format!(
+                "\n[truncated: the file is larger than {} KB]",
+                FILE_MAX_BYTES / 1024
+            ));
+        } else if limit < FILE_MAX_BYTES {
+            text.push_str("\n[truncated: this round's read budget is spent]");
         }
+        (text, true)
     }
 
-    fn render_list(&self, path: &Path) -> (String, bool) {
+    fn render_list(&self, path: &Path, budget: usize) -> (String, bool) {
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) => return (format!("error: {error}"), false),
         };
         let mut rows: Vec<(String, String, String)> = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(LIST_MAX_ENTRIES + 1) {
             let name = entry.file_name().to_string_lossy().into_owned();
             let (kind, size) = match entry.metadata() {
                 Ok(meta) if meta.is_dir() => ("dir".to_string(), String::new()),
@@ -708,7 +734,12 @@ impl Relay {
                 "[more than {LIST_MAX_ENTRIES} entries; the list was cut]"
             ));
         }
-        (lines.join("\n"), true)
+        let text = fit_with_note(
+            &lines.join("\n"),
+            budget,
+            "[truncated: this round's read budget is spent]",
+        );
+        (text, true)
     }
 
     /// Append the one log line and the `usage.jsonl` line for one request.
@@ -818,9 +849,16 @@ impl Relay {
                 )?;
                 sse.end()
             }
-            Err(error) => {
-                let message = self.failure_message(&error);
-                let _ = self.record_request(key, bytes_in, "failed", 0, 0, None);
+            Err(failure) => {
+                let message = self.failure_message(&failure.error);
+                let _ = self.record_request(
+                    key,
+                    bytes_in,
+                    "failed",
+                    failure.rounds,
+                    failure.files,
+                    None,
+                );
                 let _ = sse.send(
                     "response.failed",
                     &json!({
@@ -870,9 +908,16 @@ impl Relay {
                     }),
                 )
             }
-            Err(error) => {
-                let message = self.failure_message(&error);
-                let _ = self.record_request(key, bytes_in, "failed", 0, 0, None);
+            Err(failure) => {
+                let message = self.failure_message(&failure.error);
+                let _ = self.record_request(
+                    key,
+                    bytes_in,
+                    "failed",
+                    failure.rounds,
+                    failure.files,
+                    None,
+                );
                 write_json(
                     stream,
                     200,
@@ -1513,6 +1558,43 @@ pub fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
     (lines.join("\n").trim_end().to_string(), requests)
 }
 
+/// Remove the markdown escapes the web bridge adds to model text.
+///
+/// Only punctuation observed from the bridge is unescaped; ordinary
+/// backslashes (including those in paths) stay untouched.
+pub fn unescape_bridge_markdown(answer: &str) -> String {
+    let mut chars = answer.chars().peekable();
+    let mut plain = String::with_capacity(answer.len());
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && chars.peek().is_some_and(|next| {
+                matches!(
+                    next,
+                    '=' | '.'
+                        | '-'
+                        | '_'
+                        | '*'
+                        | '['
+                        | ']'
+                        | '#'
+                        | '>'
+                        | '|'
+                        | '('
+                        | ')'
+                        | '+'
+                        | '!'
+                        | '`'
+                )
+            })
+        {
+            plain.push(chars.next().expect("peeked character exists"));
+        } else {
+            plain.push(ch);
+        }
+    }
+    plain
+}
+
 /// Drop the bridge's "Local tools unavailable" blockquote: the leading `>`
 /// lines and the blank line that closes them.
 pub fn strip_bridge_note(answer: &str) -> String {
@@ -1541,6 +1623,26 @@ fn forbidden_path(path: &Path) -> bool {
     parts
         .windows(2)
         .any(|pair| pair[0] == ".git" && pair[1] == "objects")
+}
+
+/// Cut UTF-8 text to a byte budget and keep the truncation note inside it.
+fn fit_with_note(text: &str, limit: usize, note: &str) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    if limit <= note.len() {
+        let mut end = limit;
+        while end > 0 && !note.is_char_boundary(end) {
+            end -= 1;
+        }
+        return note[..end].to_string();
+    }
+    let content_limit = limit - note.len() - 1;
+    let mut end = content_limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n{note}", &text[..end])
 }
 
 fn new_response_id() -> String {
@@ -1982,6 +2084,31 @@ mod tests {
     }
 
     #[test]
+    fn bridge_markdown_escapes_are_removed_before_requests_and_final_text() {
+        assert_eq!(
+            unescape_bridge_markdown("\\=\\.\\-\\_\\*\\[\\]\\#\\>\\|\\(\\)\\+\\!\\` and \\q"),
+            "=.-_*[]#>|()+!` and \\q"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("a.md");
+        std::fs::write(&file, "alpha").unwrap();
+        let escaped_path = file.display().to_string().replace('.', "\\.");
+        let first = format!("\\> Local tools unavailable\n\\>\n\nlooking\nREAD {escaped_path}");
+        let (relay, codex) = relay_with(
+            root,
+            vec![first, "\\#\\# 1\\. Goal\n\\=== FILE: a\\.md ===".into()],
+        );
+
+        let turn = relay.converse("session:test", None, "hello").unwrap();
+
+        assert_eq!(turn.rounds, 1);
+        assert_eq!(turn.files, 1);
+        assert!(codex.prompt(1).contains("alpha"), "{}", codex.prompt(1));
+        assert_eq!(turn.outcome.answer, "## 1. Goal\n=== FILE: a.md ===");
+    }
+
+    #[test]
     fn a_file_over_the_cap_is_truncated_with_a_note() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2004,6 +2131,36 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_character_at_the_file_cap_is_text_not_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("utf8.txt");
+        std::fs::write(&file, "€".repeat(FILE_MAX_BYTES / 3 + 2)).unwrap();
+        let (relay, _) = relay_with(root, Vec::new());
+
+        let (text, served) = relay.render_read(&file, FILE_MAX_BYTES);
+
+        assert!(served);
+        assert!(text.ends_with("[truncated: the file is larger than 200 KB]"));
+    }
+
+    #[test]
+    fn a_list_uses_only_the_round_budget_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for index in 0..20 {
+            std::fs::write(root.join(format!("long-entry-{index:02}.txt")), "x").unwrap();
+        }
+        let (relay, _) = relay_with(root, Vec::new());
+
+        let (text, served) = relay.render_list(root, 80);
+
+        assert!(served);
+        assert!(text.len() <= 80, "{} bytes: {text}", text.len());
+        assert!(text.ends_with("[truncated: this round's read budget is spent]"));
+    }
+
+    #[test]
     fn credential_names_and_git_objects_are_forbidden() {
         let root = Path::new("/home/agent/projects");
         for name in ["auth.json", ".env", "id_rsa", "key.pem", "token.txt"] {
@@ -2011,5 +2168,16 @@ mod tests {
         }
         assert!(forbidden_path(&root.join("x/.git/objects/ab/cd")));
         assert!(!forbidden_path(&root.join("readme.md")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("readme.md");
+        let alias = dir.path().join("token-link");
+        std::fs::write(&target, "public").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let (relay, _) = relay_with(dir.path(), Vec::new());
+        assert_eq!(
+            relay.resolve_allowed(&alias.display().to_string()),
+            Err(REFUSED.to_string())
+        );
     }
 }
