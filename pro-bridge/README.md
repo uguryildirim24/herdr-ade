@@ -41,6 +41,7 @@ cooldown-until         RFC 3339; the 2 h breaker
 start.lock             flock; one Codex start at a time
 turn.lock              flock; turn admission and the two-turn cap are atomic
 bridge-state.json      last /healthz pid and version
+codex-home/            the shared Pro Codex home (config.toml, instructions.md, AGENTS.md)
 ```
 
 Lane states: `starting → ready → in_turn → ready`, plus
@@ -76,17 +77,25 @@ Default host: the installed Codex Web GPT launcher in browser-only mode, port
 `/healthz` version and refuses an unseen major.
 
 Two logins: the bridge's own ChatGPT login (in the launcher), and Codex's own
-login in the lane `CODEX_HOME` (`~/.codex` in v1). Run
-`codex-chatgpt-web route disconnect` after any bridge setup so daily Codex does
-not go through the bridge; `doctor` fails when `~/.codex/config.toml` carries
-the bridge `openai_base_url`.
+login in the plugin's Pro home. Run `codex-chatgpt-web route disconnect` after
+any bridge setup so daily Codex does not go through the bridge; `doctor` fails
+when `~/.codex/config.toml` carries the bridge `openai_base_url`.
 
-## Pro home (v2)
+## Pro home
 
-Set `HERDR_PRO_CODEX_HOME` to a shared Pro home and `start` / `resume` pass
-`--env CODEX_HOME=<home>` on the lane tab and use that home for login, trust and
-rollout lookup. Empty by default: v1 uses `~/.codex`. Persisting that env
-across a cold restart is the fork change in thread t-0002.
+`herdr-pro init` creates `<state dir>/codex-home`. Every lane runs with
+`CODEX_HOME` set to it on its tab, and login, trust and rollout lookup all use
+it. It is the plugin's own home: Rolf's `~/.codex` is never written.
+
+`config.toml` pins `memories`, `multi_agent`, plugins, apps, skills
+instructions and sub-agents off, replaces Codex's long base instructions with a
+short `instructions.md`, and tells Codex to trust the exact lane cwd before it
+launches. A short `AGENTS.md` holds the packet and TURN contract. Nothing in the
+home adds prompt text; Rolf's `~/.codex/AGENTS.md` and memories do not apply.
+
+The home needs its own Codex ChatGPT sign-in once. `herdr-pro login` prints the
+exact line (`CODEX_HOME=<home> codex login`); `doctor` reports
+`sign_in_required` until it is done. The plugin never copies `~/.codex/auth.json`.
 
 ## Link
 

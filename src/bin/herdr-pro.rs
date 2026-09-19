@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use pro::sh::RealRunner;
-use pro::{Env, Layout, bridge, doctor, lane, state, turn};
+use pro::{Env, Layout, bridge, doctor, home, lane, state, turn};
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD_ID"));
 
@@ -125,7 +125,7 @@ fn run(cli: &Cli) -> Result<bool> {
             Ok(doctor::healthy(&rows))
         }
         Command::Login => {
-            login();
+            login(&layout);
             Ok(true)
         }
         Command::Start { name, parent, cwd } => {
@@ -206,9 +206,10 @@ fn run(cli: &Cli) -> Result<bool> {
     }
 }
 
-/// `init`: the `~/.local/bin/herdr-pro` link, like `~/.local/bin/pi`.
+/// `init`: the `~/.local/bin/herdr-pro` link and the v2 shared Pro home.
 fn init(env: &Env, layout: &Layout) -> Result<bool> {
     layout.ensure()?;
+    home::init(layout)?;
     let exe = std::env::current_exe().context("could not find this binary's own path")?;
     let bin_dir = env.home.join(".local/bin");
     std::fs::create_dir_all(&bin_dir)
@@ -229,12 +230,13 @@ fn init(env: &Env, layout: &Layout) -> Result<bool> {
         .with_context(|| format!("could not link {}", link.display()))?;
     println!("linked {} -> {}", link.display(), exe.display());
     println!("state lives in {}", layout.root.display());
+    println!("Pro home: {}", layout.codex_home().display());
     println!("next: `herdr-pro login`, then `herdr-pro doctor`");
     Ok(true)
 }
 
 /// The two logins, printed, never driven (spec §4, "Never automated").
-fn login() {
+fn login(layout: &Layout) {
     println!("Two logins are needed for a Pro lane. The plugin only prints them.");
     println!();
     println!("1. The bridge's own ChatGPT login (the desktop app):");
@@ -242,9 +244,12 @@ fn login() {
     println!("   and choose browser-only. Then run `codex-chatgpt-web route disconnect` so");
     println!("   your daily Codex does not go through the bridge.");
     println!();
-    println!("2. Codex's own ChatGPT login in ~/.codex:");
-    println!("   Run `codex login` and finish in the browser or with the device code.");
-    println!("   The lane reuses this login; the plugin never copies auth.json.");
+    println!("2. Codex's own ChatGPT login in the Pro home:");
+    println!(
+        "   Run `CODEX_HOME={} codex login` and finish in the browser or with the device code.",
+        layout.codex_home().display()
+    );
+    println!("   The plugin never copies auth.json from ~/.codex.");
     println!();
     println!("Then `herdr-pro doctor` must be green before `herdr-pro start`.");
 }

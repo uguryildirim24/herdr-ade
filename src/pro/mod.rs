@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 pub mod bridge;
 pub mod doctor;
 pub mod herdr_cli;
+pub mod home;
 pub mod lane;
 pub mod packet;
 pub mod state;
@@ -57,6 +58,10 @@ pub const SEEN_BRIDGE_MAJORS: &[u64] = &[5];
 pub struct Env {
     vars: BTreeMap<String, String>,
     pub home: PathBuf,
+    /// The resolved plugin state root, so the Pro home is available without a
+    /// separate `Layout` (the `trusted` check keeps the pi module's `Env`
+    /// shape).
+    root: PathBuf,
 }
 
 impl Env {
@@ -67,18 +72,28 @@ impl Env {
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
             .context("HOME is not set")?;
-        Ok(Env { vars, home })
+        let mut env = Env {
+            vars,
+            home,
+            root: PathBuf::new(),
+        };
+        env.root = resolve_root(&env)?;
+        Ok(env)
     }
 
     #[cfg(test)]
     pub fn for_test(home: &Path, vars: &[(&str, &str)]) -> Self {
-        Env {
+        let mut env = Env {
             vars: vars
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             home: home.to_path_buf(),
-        }
+            root: PathBuf::new(),
+        };
+        env.root =
+            resolve_root(&env).unwrap_or_else(|_| home.to_path_buf().join(".herdr-ade/pro-bridge"));
+        env
     }
 
     /// A variable's value; an empty value counts as unset.
@@ -98,31 +113,23 @@ impl Env {
         self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
     }
 
-    /// The Codex home every Pro lane uses: Rolf's `~/.codex` in v1 (spec
-    /// Design, "Codex home (v1)"). `-c` overrides only; nothing is written
-    /// there. `CODEX_HOME` is never set by the plugin unless a Pro home is
-    /// named.
+    /// Rolf's everyday Codex home, `~/.codex`. Read only, for the doctor check
+    /// that the bridge route never lands there.
     pub fn codex_home(&self) -> PathBuf {
         self.home.join(".codex")
     }
 
-    /// The v2 shared Pro home, when Rolf names one. Empty for v1.
-    pub fn pro_codex_home(&self) -> Option<PathBuf> {
-        self.var("HERDR_PRO_CODEX_HOME")
-            .map(|dir| self.expand_tilde(dir))
-    }
-
-    /// The home a lane's Codex actually uses.
+    /// The v2 shared Pro home: `<state dir>/codex-home`. It is the only home a
+    /// lane uses. There is no `~/.codex` fallback and no override switch.
     pub fn lane_codex_home(&self) -> PathBuf {
-        self.pro_codex_home().unwrap_or_else(|| self.codex_home())
+        self.root.join("codex-home")
     }
 
-    /// `CODEX_HOME=...` for a lane tab, only when a Pro home is named. The
-    /// fork's launch-env persistence makes this survive a cold restart; until
-    /// then `herdr-pro resume` passes it again.
+    /// `CODEX_HOME=<pro home>` for a lane tab. Always set: the lane runs in the
+    /// plugin's own home. The fork's launch-env persistence makes this survive
+    /// a cold restart; until then `herdr-pro resume` passes it again.
     pub fn codex_home_env(&self) -> Option<String> {
-        self.pro_codex_home()
-            .map(|home| format!("CODEX_HOME={}", home.display()))
+        Some(format!("CODEX_HOME={}", self.lane_codex_home().display()))
     }
 
     /// Concurrent Pro turns: two by default, configurable up to the hard cap
@@ -164,8 +171,13 @@ pub struct Layout {
 impl Layout {
     pub fn from_env(env: &Env) -> Result<Layout> {
         Ok(Layout {
-            root: resolve_root(env)?,
+            root: env.root.clone(),
         })
+    }
+
+    /// The v2 shared Pro Codex home: `<state dir>/codex-home`.
+    pub fn codex_home(&self) -> PathBuf {
+        self.root.join("codex-home")
     }
 
     #[cfg(test)]
@@ -334,16 +346,20 @@ mod tests {
     }
 
     #[test]
-    fn a_named_pro_home_changes_the_lane_home_and_the_tab_env() {
-        let env = Env::for_test(Path::new("/h"), &[("HERDR_PRO_CODEX_HOME", "~/pro-codex")]);
-        assert_eq!(env.lane_codex_home(), PathBuf::from("/h/pro-codex"));
+    fn the_lane_home_is_the_plugin_own_codex_home() {
+        let env = Env::for_test(
+            Path::new("/h"),
+            &[("HERDR_PRO_STATE_DIR", "/state/pro-bridge")],
+        );
+        assert_eq!(
+            env.lane_codex_home(),
+            PathBuf::from("/state/pro-bridge/codex-home")
+        );
         assert_eq!(
             env.codex_home_env().as_deref(),
-            Some("CODEX_HOME=/h/pro-codex")
+            Some("CODEX_HOME=/state/pro-bridge/codex-home")
         );
-        let env = Env::for_test(Path::new("/h"), &[]);
-        assert_eq!(env.lane_codex_home(), PathBuf::from("/h/.codex"));
-        assert_eq!(env.codex_home_env(), None);
+        assert_eq!(env.codex_home(), PathBuf::from("/h/.codex"));
     }
 
     #[test]
