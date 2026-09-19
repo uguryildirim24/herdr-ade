@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use pro::sh::RealRunner;
-use pro::{Env, Layout, bridge, doctor, home, lane, state, turn};
+use pro::{Env, Layout, bridge, doctor, home, image, lane, state, turn};
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD_ID"));
 
@@ -85,6 +85,21 @@ enum Command {
     Resume { name: String },
     /// Mark lanes whose pane no longer runs Codex as gone; print resume lines
     Reconcile,
+    /// Make one picture with Codex's image tool on the `gpt-image-gen` profile
+    Image {
+        /// A file holding the prompt
+        #[arg(long, value_name = "FILE")]
+        prompt_file: PathBuf,
+        /// The picture size, `WxH`
+        #[arg(long, value_name = "WxH")]
+        size: String,
+        /// Where the PNG is saved (must not exist yet)
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Keep the picture lane running for the next call
+        #[arg(long)]
+        keep: bool,
+    },
     /// The stop switch: stop one lane so a restart never brings it back
     Stop { name: String },
     /// Clear the breaker and resume the bridge
@@ -190,6 +205,26 @@ fn run(cli: &Cli) -> Result<bool> {
             for line in lane::reconcile(&env, &layout, &runner)? {
                 println!("{line}");
             }
+            Ok(true)
+        }
+        Command::Image {
+            prompt_file,
+            size,
+            out,
+            keep,
+        } => {
+            let path = image::run(
+                &env,
+                &layout,
+                &runner,
+                &image::ImageOptions {
+                    prompt_file: prompt_file.clone(),
+                    size: size.clone(),
+                    out: out.clone(),
+                    keep: *keep,
+                },
+            )?;
+            println!("{}", path.display());
             Ok(true)
         }
         Command::Stop { name } => {
