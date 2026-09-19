@@ -59,16 +59,26 @@ pub fn run(
     let name = lane_name(layout, &cwd)?;
     let lane = ensure_lane(env, layout, runner, &name, &cwd)?;
 
-    let request = request(&prompt, width, height);
-    let started = SystemTime::now();
-    herdr_cli::agent_prompt(runner, &env.herdr_bin(), &lane.name, &request)
-        .context("could not send the picture request")?;
-    let saved = wait_for_image(env, runner, &lane, started)?;
-    save_into(&saved, &out)?;
-    if !opts.keep {
-        lane::stop(env, layout, runner, &lane.name)?;
+    let result: Result<PathBuf> = (|| {
+        let request = request(&prompt, width, height);
+        let started = SystemTime::now();
+        herdr_cli::agent_prompt(runner, &env.herdr_bin(), &lane.name, &request)
+            .context("could not send the picture request")?;
+        let saved = wait_for_image(env, runner, &lane, started)?;
+        save_into(&saved, &out)?;
+        Ok(out)
+    })();
+    if !opts.keep
+        && let Err(stop_error) = lane::stop(env, layout, runner, &lane.name)
+    {
+        return match result {
+            Ok(_) => Err(stop_error.context("the picture was saved, but its lane did not stop")),
+            Err(error) => Err(error.context(format!(
+                "the picture lane also did not stop: {stop_error:#}"
+            ))),
+        };
     }
-    Ok(out)
+    result
 }
 
 /// The one-line request typed into the lane.
@@ -105,24 +115,32 @@ fn lane_name(layout: &Layout, cwd: &Path) -> Result<String> {
     let base = home::IMAGE_PROFILE;
     let cwd_text = cwd.display().to_string();
     for lane in Lane::list(layout)? {
-        if lane.stopped || lane.state == "gone" {
-            continue;
-        }
-        if lane.cwd == cwd_text && (lane.name == base || lane.name.starts_with(&format!("{base}-")))
+        if !lane.stopped
+            && lane.cwd == cwd_text
+            && lane.profile.as_deref() == Some(home::IMAGE_PROFILE)
+            && (lane.name == base || lane.name.starts_with(&format!("{base}-")))
         {
             return Ok(lane.name);
         }
     }
-    if !state::name_taken(layout, base) {
+    if name_available(layout, base) {
         return Ok(base.to_string());
     }
     for n in 2..1000u32 {
         let candidate = format!("{base}-{n}");
-        if !state::name_taken(layout, &candidate) {
+        if name_available(layout, &candidate) {
             return Ok(candidate);
         }
     }
     bail!("no free picture lane name near `{base}`")
+}
+
+/// A gone lane record can be replaced, but a stopped record is permanent: the
+/// stop switch deliberately makes `lane::start` refuse that name.
+fn name_available(layout: &Layout, name: &str) -> bool {
+    Lane::read(layout, name)
+        .map(|lane| !lane.stopped && lane.state == "gone")
+        .unwrap_or(true)
 }
 
 /// Reuse the ready lane for this cwd, resume a gone one, else start a picture
@@ -138,6 +156,7 @@ fn ensure_lane(
     if let Ok(lane) = Lane::read(layout, name)
         && !lane.stopped
         && lane.cwd == cwd_text
+        && lane.profile.as_deref() == Some(home::IMAGE_PROFILE)
     {
         if lane.state == "ready" {
             return Ok(lane);
@@ -145,6 +164,7 @@ fn ensure_lane(
         if lane.state == "gone" {
             return lane::resume(env, layout, runner, name);
         }
+        bail!("picture lane `{name}` is {}, not ready", lane.state);
     }
     lane::start(
         env,
@@ -242,7 +262,18 @@ fn newest_png(dir: &Path, after: SystemTime) -> Option<PathBuf> {
 fn save_into(source: &Path, out: &Path) -> Result<()> {
     let dir = out.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    std::fs::copy(source, out)
-        .with_context(|| format!("could not save {} to {}", source.display(), out.display()))?;
+    let mut input = std::fs::File::open(source)
+        .with_context(|| format!("could not open {}", source.display()))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .with_context(|| format!("refused to replace {}", out.display()))?;
+    if let Err(error) = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+        drop(output);
+        let _ = std::fs::remove_file(out);
+        return Err(error)
+            .with_context(|| format!("could not save {} to {}", source.display(), out.display()));
+    }
     Ok(())
 }
