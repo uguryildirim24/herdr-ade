@@ -214,6 +214,11 @@ enum Command {
     },
     /// Re-link live threads and print start lines for gone ones; --start restarts them
     Pickup {
+        #[arg(
+            value_name = "PROJECT",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
         slug: Option<String>,
         /// Cover every active project under the root
         #[arg(long)]

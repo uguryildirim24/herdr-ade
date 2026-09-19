@@ -547,7 +547,14 @@ fn place_box_worktree(
     // machine-qualified parent token is written before the ticker starts the
     // agent, which passes no `--parent` for a box lane.
     if let Some(coord) = project.coordinator() {
-        let _ = herdr.pane_set_parent(&created.pane_id, &parent_token(record, &coord.pane_id));
+        herdr
+            .pane_set_parent(&created.pane_id, &parent_token(record, &coord.pane_id))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not link box pane {} to its coordinator: {error}",
+                    created.pane_id
+                )
+            })?;
     }
 
     // Step 5: the lane card, now that the pane id exists.

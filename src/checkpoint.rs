@@ -1202,13 +1202,14 @@ pub fn pickup(ctx: &Ctx, args: PickupArgs<'_>) -> Result<String> {
     Ok(out)
 }
 
-/// Every project under the root that is not archived.
+/// Every active project under the root. Paused projects stay stopped even
+/// when `pickup --all --start` is used.
 fn active_slugs(ctx: &Ctx) -> Vec<String> {
     crate::project::list_slugs(&ctx.root)
         .into_iter()
         .filter(|slug| {
             Project::load(&ctx.root, slug)
-                .is_ok_and(|p| p.status() != crate::project::Status::Archived)
+                .is_ok_and(|p| p.status() == crate::project::Status::Active)
         })
         .collect()
 }
@@ -1248,7 +1249,14 @@ fn pickup_project(
     views: &BTreeMap<String, Result<crate::steps::CourierOutcome, String>>,
     args: &PickupArgs<'_>,
 ) -> Result<String> {
-    let (h, coord_pane, _) = coordinator_where(ctx, project, args.pane)?;
+    // `--all` runs from one coordinator's shell but every project's workers
+    // belong under that project's own recorded coordinator, not the caller.
+    let recorded_pane = args
+        .all
+        .then(|| project.coordinator().map(|coord| coord.pane_id))
+        .flatten();
+    let pane = recorded_pane.as_deref().or(args.pane);
+    let (h, coord_pane, _) = coordinator_where(ctx, project, pane)?;
     let coord = project.coordinator().unwrap_or_default();
     let listed = h
         .call(&["agent", "list"], CALL)
@@ -1282,7 +1290,8 @@ fn pickup_project(
                 ));
                 continue;
             };
-            if !thread::live_state(&t, box_agents, box_panes, now).pane_exists {
+            let live = thread::live_state(&t, box_agents, box_panes, now);
+            if live.agent_state.is_none() {
                 gone.push(t);
                 continue;
             }
@@ -1359,7 +1368,11 @@ fn pickup_project(
     }
     if !gone.is_empty() {
         let safety = project.safety(&ctx.config_dir)?;
-        if args.start && !args.dry_run && safety.start_threads == "auto" {
+        if args.start
+            && !args.dry_run
+            && project.status() == crate::project::Status::Active
+            && safety.start_threads == "auto"
+        {
             out.push_str("started (restarted through the launch record):\n");
             for t in &gone {
                 match crate::threads::restart(ctx, &project.slug, &t.id) {
@@ -1793,6 +1806,12 @@ mod tests {
         let fx = fixture();
         let _ = fx.lane(1);
         let beta = fx.world.project("beta", "b.sock");
+        beta.update_coordinator(|coord| {
+            coord.workspace_id = "w3".into();
+            coord.tab_id = "w3:t1".into();
+            coord.pane_id = "w3:p1".into();
+        })
+        .unwrap();
         thread::allocate(&beta, |t| {
             t.title = "Beta".into();
             t.kind = thread::Kind::Tab;
@@ -1817,8 +1836,43 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.contains("project demo\n"), "{out}");
-        assert!(out.contains("project beta\n"), "{out}");
+        assert!(
+            out.contains("project demo\ncoordinator pane w1:p1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("project beta\ncoordinator pane w3:p1\n"),
+            "--all must not parent beta's lanes to the calling project's pane: {out}"
+        );
+
+        beta.set_status(crate::project::Status::Paused).unwrap();
+        let active = active_slugs(&ctx);
+        assert!(active.contains(&"demo".to_string()), "{active:?}");
+        assert!(!active.contains(&"beta".to_string()), "{active:?}");
+    }
+
+    #[test]
+    fn pickup_treats_a_box_shell_without_its_agent_as_gone() {
+        let fx = fixture();
+        let id = box_lane(&fx, "w2:p1", "/box/wt");
+        box_courier(
+            &fx.world,
+            "[]",
+            r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/box/wt"}]"#,
+        );
+        let out = pickup(
+            &fx.world.ctx(),
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
+        assert!(out.contains(&format!("--label {id} --no-focus")), "{out}");
+        assert!(!out.contains(&format!("re-linked:      {id}")), "{out}");
     }
 
     #[test]
@@ -1869,6 +1923,26 @@ mod tests {
             ),
         )
         .unwrap();
+        fx.project
+            .set_status(crate::project::Status::Paused)
+            .unwrap();
+        let paused = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: true,
+            },
+        )
+        .unwrap();
+        assert!(paused.contains("gone (not live;"), "{paused}");
+        assert_eq!(fx.world.runner.count("tab create"), 0);
+
+        fx.project
+            .set_status(crate::project::Status::Active)
+            .unwrap();
         let out = pickup(
             &ctx,
             PickupArgs {
