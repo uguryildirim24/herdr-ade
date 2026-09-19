@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::herdr_cli;
 use super::sh::{Cmd, Runner, SETUP};
 use super::state;
-use super::{Env, Layout, bridge};
+use super::{Env, Layout, bridge, serve};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -155,6 +155,13 @@ pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> 
         )),
         Some(_) => rows.push(Row::ok("cooldown", "expired")),
         None => rows.push(Row::ok("cooldown", "none")),
+    }
+
+    // 7: the pi relay answers `/v1/models` with its own token when it runs.
+    // A stopped relay is a warning: the Codex-pane Pro lane still works.
+    match serve::models_health(runner, layout) {
+        Ok(detail) => rows.push(Row::ok("relay", detail)),
+        Err(error) => rows.push(Row::warn("relay", format!("{error:#}"))),
     }
 
     // herdr itself: the same floor the plugin needs for `--parent` on start.
