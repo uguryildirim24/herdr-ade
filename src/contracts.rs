@@ -323,6 +323,11 @@ pub struct MergeIntent {
     pub candidate: String,
     pub verdict: String,
     pub phase: MergePhase,
+    /// The commit the integration branch held after merging V in: `V` on a
+    /// fast-forward, otherwise a merge commit whose first parent is the moved
+    /// head (SPEC-ADE D6, item 34). The checkpoint commits on top of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,6 +553,7 @@ mod tests {
             expected_old: "B".into(),
             candidate: "C".into(),
             verdict: "V".into(),
+            merged: None,
             phase: MergePhase::Merged,
             checkpoint: Some(CheckpointIntent {
                 parent: "V".into(),

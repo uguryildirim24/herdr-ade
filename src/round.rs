@@ -30,7 +30,7 @@ pub mod repo {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use anyhow::{Result, bail};
+    use anyhow::{Context, Result, bail};
 
     use crate::runner::{Cmd, Output, Runner};
 
@@ -167,6 +167,47 @@ pub mod repo {
 
         pub fn head_in(&self, dir: &Path) -> Result<String> {
             self.run_in(dir, &["rev-parse", "HEAD"])
+        }
+
+        /// The tree of merging `other` into `into`, written nowhere. Uses
+        /// `git merge-tree --write-tree` (git 2.38+): a non-zero exit is a
+        /// conflict and no tree is returned. The first output line is the
+        /// tree object id.
+        pub fn merge_tree(&self, into: &str, other: &str) -> Result<String> {
+            let out = self.output_in(&self.repo, &["merge-tree", "--write-tree", into, other])?;
+            if !out.success() {
+                bail!("merge_conflict: {other} does not merge cleanly into {into}");
+            }
+            out.stdout
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .with_context(|| {
+                    format!("`git merge-tree --write-tree {into} {other}` printed no tree")
+                })
+        }
+
+        /// A two-parent merge commit for `tree`, made without touching any
+        /// checkout. The caller updates the branch ref under the lock.
+        pub fn commit_tree(
+            &self,
+            tree: &str,
+            first: &str,
+            second: &str,
+            message: &str,
+        ) -> Result<String> {
+            self.run(&[
+                "commit-tree",
+                tree,
+                "-p",
+                first,
+                "-p",
+                second,
+                "-m",
+                message,
+            ])
         }
     }
 
@@ -880,6 +921,29 @@ and commit that file alone as the verdict commit V (its only parent is C):\n\n\
 
 // -------------------------------------------------------------------- merge
 
+impl MergeIntent {
+    /// True when the integration branch holds what this intent merged to, or
+    /// still holds the recorded merge start. Both the intent and checkpoint
+    /// phases may resume from here.
+    fn at_or_past_merge(&self, head: &str) -> bool {
+        head == self.expected_old || head == self.verdict || self.merged.as_deref() == Some(head)
+    }
+}
+
+/// Recognize the ref move if the process died after creating a moved-head
+/// merge commit but before recording it. An arbitrary descendant of V is not
+/// the merge result: its parents and tree must be exactly the clean merge.
+fn is_unrecorded_merge_result(git: &Git, intent: &MergeIntent, head: &str) -> Result<bool> {
+    if head == intent.verdict {
+        return Ok(true);
+    }
+    if git.parents(head)? != [intent.expected_old.clone(), intent.verdict.clone()] {
+        return Ok(false);
+    }
+    let actual_tree = git.run(&["rev-parse", &format!("{head}^{{tree}}")])?;
+    Ok(actual_tree == git.merge_tree(&intent.expected_old, &intent.verdict)?)
+}
+
 /// Test-only fault injection: stop right after the named phase boundary
 /// (§4.3 row 6, item 34 fixtures).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1070,19 +1134,33 @@ fn fresh_merge(
     }
     let v = verdict_commit(project, &record)?;
     let c = validate_verdict(git, &record, &v)?;
+    // B is the brief commit, but the integration branch may have moved on: a
+    // later round's brief or a `thread start` task commit lands there. The
+    // effect merges V into whatever the branch holds now, as a fast-forward
+    // when possible and a real merge commit otherwise, so a moved head is no
+    // longer a reason to re-review. A head that no longer contains B (a
+    // rewind) fails closed, and a conflict is refused here, before the intent
+    // is written, so it leaves no merge record behind.
     let head = git.branch_head(&record.branch)?.context("branch_missing")?;
-    if head != b {
+    if head != b && !git.is_ancestor(&b, &head)? {
         bail!(
-            "head_moved: `{}` is at {head}, the brief commit B is {b}",
+            "head_moved: `{}` is at {head}, which does not contain the brief commit B {b}",
             record.branch
         );
     }
+    if !git.is_ancestor(&head, &v)? {
+        git.merge_tree(&head, &v)?;
+    }
     let intent = MergeIntent {
         op: format!("merge-{round}"),
-        expected_old: b,
+        // The compare-and-swap base is the integration head observed for this
+        // merge, which may be newer than B. Recording B here made a crash
+        // before the effect impossible to resume when the branch had moved.
+        expected_old: head,
         candidate: c,
         verdict: v,
         phase: MergePhase::Intent,
+        merged: None,
         checkpoint: None,
         head: None,
     };
@@ -1101,42 +1179,35 @@ fn effect_merge(
     {
         let _repo = repo_lock(git)?;
         let head = git.branch_head(&record.branch)?.context("branch_missing")?;
-        if head == intent.verdict {
-            // A crash after the ref update: record it, never merge again.
-        } else if head != intent.expected_old {
-            drop(_repo);
-            return diverged(project, record, intent, &head);
-        } else {
-            if !git.is_ancestor(&intent.expected_old, &intent.candidate)?
-                || git.parents(&intent.verdict)? != [intent.candidate.clone()]
-            {
-                bail!("merge_revalidation: ancestry changed under the lock");
-            }
-            match git.checkout_of(&record.branch)? {
-                Some(dir) => {
-                    let dirty = git.dirty_paths(&dir)?;
-                    if !dirty.is_empty() {
-                        bail!(
-                            "integration_checkout_dirty: {} has uncommitted changes ({}); the merge intent stays",
-                            dir.display(),
-                            dirty.join(", ")
-                        );
-                    }
-                    if git.head_in(&dir)? != intent.expected_old {
-                        bail!("head_moved: the checkout moved under the lock");
-                    }
-                    git.run_in(&dir, &["merge", "-q", "--ff-only", &intent.verdict])?;
+        // A crash after the ref update already recorded `merged`, or left the
+        // branch past V; record it and never merge again.
+        let already = intent.merged.clone().filter(|merged| head == *merged);
+        let merged = match already {
+            Some(merged) => merged,
+            // The branch already holds exactly the ref result (a crash after
+            // the update, or an old-format record from before `merged`
+            // existed): record it and merge nothing again.
+            None if is_unrecorded_merge_result(git, &intent, &head)? => head.clone(),
+            None => {
+                let b = record
+                    .expected_head
+                    .as_deref()
+                    .context("merge_revalidation: brief commit B is missing")?;
+                if head != intent.expected_old
+                    || !git.is_ancestor(b, &intent.candidate)?
+                    || git.parents(&intent.verdict)? != [intent.candidate.clone()]
+                {
+                    bail!(
+                        "merge_revalidation: ancestry or the integration head changed under the lock"
+                    );
                 }
-                None => {
-                    git.run(&[
-                        "update-ref",
-                        &format!("refs/heads/{}", record.branch),
-                        &intent.verdict,
-                        &intent.expected_old,
-                    ])?;
-                }
+                integrate(git, record, &head, &intent.verdict)?
             }
-        }
+        };
+        intent.merged = Some(merged);
+        // Record the ref move before the phase flips, so a crash between the
+        // two (the `ref` stop point) resumes without merging twice.
+        write_merge(project, &record.round, &intent)?;
     }
     if stop == Some(Stop::Ref) {
         return Ok(MergeOutcome::Stopped {
@@ -1151,6 +1222,60 @@ fn effect_merge(
         });
     }
     checkpoint_phase(ctx, project, record, git, intent, stop)
+}
+
+/// Put `verdict` onto the integration branch whatever it now holds: a
+/// fast-forward when `head` is an ancestor of V, otherwise a real merge commit
+/// whose first parent is `head`. Uses the checkout when there is one, else a
+/// compare-and-swap `update-ref` with a tree built by `git merge-tree`. Never
+/// merges twice: the caller checks the recorded `merged` first.
+fn integrate(git: &Git, record: &RoundRecord, head: &str, verdict: &str) -> Result<String> {
+    let fast_forward = git.is_ancestor(head, verdict)?;
+    match git.checkout_of(&record.branch)? {
+        Some(dir) => {
+            let dirty = git.dirty_paths(&dir)?;
+            if !dirty.is_empty() {
+                bail!(
+                    "integration_checkout_dirty: {} has uncommitted changes ({}); the merge intent stays",
+                    dir.display(),
+                    dirty.join(", ")
+                );
+            }
+            if git.head_in(&dir)? != head {
+                bail!("head_moved: the checkout moved under the lock");
+            }
+            if fast_forward {
+                git.run_in(&dir, &["merge", "-q", "--ff-only", verdict])?;
+            } else {
+                // Refuse a conflict before the checkout is touched.
+                git.merge_tree(head, verdict)?;
+                git.run_in(&dir, &["merge", "-q", "--no-edit", verdict])?;
+            }
+            git.head_in(&dir)
+        }
+        None => {
+            if fast_forward {
+                git.run(&[
+                    "update-ref",
+                    &format!("refs/heads/{}", record.branch),
+                    verdict,
+                    head,
+                ])?;
+                Ok(verdict.to_string())
+            } else {
+                let tree = git.merge_tree(head, verdict)?;
+                let merged =
+                    git.commit_tree(&tree, head, verdict, &format!("Merge verdict {verdict}"))?;
+                git.run(&[
+                    "update-ref",
+                    &format!("refs/heads/{}", record.branch),
+                    &merged,
+                    head,
+                ])?;
+                Ok(merged)
+            }
+        }
+    }
 }
 
 fn staged_payload_paths(project: &Project, round: &str) -> (PathBuf, PathBuf) {
@@ -1173,8 +1298,13 @@ fn checkpoint_phase(
                 crate::checkpoint::compose_for_round(ctx, project, record, &intent.verdict)?;
             write_atomic(&md_path, md.as_bytes())?;
             write_atomic(&json_path, json.as_bytes())?;
+            // The checkpoint commits on top of whatever the merge produced:
+            // V on a fast-forward, else the merge commit.
             intent.checkpoint = Some(CheckpointIntent {
-                parent: intent.verdict.clone(),
+                parent: intent
+                    .merged
+                    .clone()
+                    .unwrap_or_else(|| intent.verdict.clone()),
                 op: intent.op.clone(),
                 payload_hash: crate::checkpoint::payload_hash(&md, &json),
             });
@@ -1265,10 +1395,10 @@ fn resume(
             "merge_diverged: `{}` diverged from the recorded merge; see the inbox",
             record.round
         ),
-        MergePhase::Intent if head == intent.expected_old || head == intent.verdict => {
+        MergePhase::Intent if intent.at_or_past_merge(&head) => {
             effect_merge(ctx, project, record, git, intent, stop)
         }
-        MergePhase::Merged if head == intent.verdict => {
+        MergePhase::Merged if intent.at_or_past_merge(&head) => {
             checkpoint_phase(ctx, project, record, git, intent, stop)
         }
         MergePhase::Merged => match intent.checkpoint.clone() {
@@ -1298,16 +1428,16 @@ fn diverged(
         "merge-diverged",
         &record.round,
         &format!(
-            "{}: `{}` is at {head}, which is neither B, V nor the recorded checkpoint; nothing was merged again",
+            "{}: `{}` is at {head}, which is neither the recorded merge start, merge result nor checkpoint; nothing was merged again",
             record.round, record.branch
         ),
         "",
     );
     bail!(
-        "merge_diverged: `{}` is at {head}; expected B {}, V {} or the recorded checkpoint",
+        "merge_diverged: `{}` is at {head}; expected merge start {}, merge result {} or the recorded checkpoint",
         record.branch,
         intent.expected_old,
-        intent.verdict
+        intent.merged.as_deref().unwrap_or(intent.verdict.as_str())
     )
 }
 
@@ -1436,11 +1566,15 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
     }
     if let Some(m) = merge {
         out.push_str(&format!(
-            "merge: phase {:?}, B {}, C {}, V {}{}\n",
+            "merge: phase {:?}, from {}, C {}, V {}{}{}\n",
             m.phase,
             m.expected_old,
             m.candidate,
             m.verdict,
+            m.merged
+                .as_deref()
+                .map(|m| format!(", merged {m}"))
+                .unwrap_or_default(),
             m.head.map(|h| format!(", H {h}")).unwrap_or_default()
         ));
     }
@@ -2138,11 +2272,58 @@ mod tests {
             err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("lane_not_in_candidate")
         );
 
-        // The head moved after review.
+        // The head moved after review: a later commit merges cleanly, so the
+        // round lands instead of needing `round review` again.
         let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, b) = reviewed(&fx);
+        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let late = commit_file(&fx.repo, "late.txt", "x\n", "late commit");
+        let MergeOutcome::Checkpointed { head, .. } = merge(&ctx, "demo", "r1", None).unwrap()
+        else {
+            panic!()
+        };
+        // A real merge commit: its first parent is the moved head, the second
+        // is V; the checkpoint sits on top of it.
+        let merged = read_merge(&fx.project, "r1")
+            .unwrap()
+            .unwrap()
+            .merged
+            .unwrap();
+        assert_eq!(
+            git(&fx.repo, &["rev-list", "--parents", "-n", "1", &merged]),
+            format!("{merged} {late} {v}")
+        );
+        assert_eq!(
+            git(&fx.repo, &["rev-list", "--parents", "-n", "1", &head]),
+            format!("{head} {merged}")
+        );
+        assert_eq!(phase(&fx), MergePhase::Checkpointed);
+        assert_ne!(late, b);
+
+        // A conflict in a moved head refuses and leaves the branch alone: the
+        // late commit touches a file the verdict also changes.
+        let fx = fixture();
+        let ctx = fx.world.ctx();
         let (lanes, _) = reviewed(&fx);
         verdict(&fx, &lanes, front("MERGE", "r1"));
-        commit_file(&fx.repo, "late.txt", "x\n", "late commit");
+        let late = commit_file(
+            &fx.repo,
+            "src/lane1.rs",
+            "conflicting\n",
+            "conflicting commit",
+        );
+        let e = err(merge(&ctx, "demo", "r1", None));
+        assert!(e.starts_with("merge_conflict"), "{e}");
+        assert_eq!(main_head(&fx), late, "nothing moved on a conflict");
+        assert!(read_merge(&fx.project, "r1").unwrap().is_none());
+
+        // A head rewound past B no longer contains the reviewed base: refuse.
+        let fx = fixture();
+        let (lanes, b) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        git(&fx.repo, &["reset", "-q", "--hard", &format!("{b}~1")]);
+        commit_file(&fx.repo, "rewound.txt", "x\n", "rewound head");
         assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("head_moved"));
 
         // A dirty integration checkout: the intent stays, nothing moves.
@@ -2155,6 +2336,44 @@ mod tests {
                 .starts_with("integration_checkout_dirty")
         );
         assert_eq!((main_head(&fx), phase(&fx)), (b, MergePhase::Intent));
+    }
+
+    #[test]
+    fn a_task_commit_after_b_merges_without_a_new_review() {
+        // The real case: r1 and r2 were both open on `main`; a `thread start`
+        // committed `docs(tasks): t-0009` after r1's brief commit B. r1 must
+        // land with a real merge commit, not `head_moved` and a re-review.
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, b) = reviewed(&fx);
+        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let task = commit_file(
+            &fx.repo,
+            "tasks/t-0009.md",
+            "# t-0009\n",
+            "docs(tasks): t-0009",
+        );
+        let MergeOutcome::Checkpointed { head, .. } = merge(&ctx, "demo", "r1", None).unwrap()
+        else {
+            panic!()
+        };
+        let merged = read_merge(&fx.project, "r1")
+            .unwrap()
+            .unwrap()
+            .merged
+            .unwrap();
+        assert_eq!(
+            git(&fx.repo, &["rev-list", "--parents", "-n", "1", &merged]),
+            format!("{merged} {task} {v}")
+        );
+        assert_eq!(main_head(&fx), head);
+        assert_ne!(task, b);
+        // The round's record still names B as the brief commit, so `round
+        // show` reads the same B it reviewed.
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().expected_head.as_deref(),
+            Some(b.as_str())
+        );
     }
 
     #[test]

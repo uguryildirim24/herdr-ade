@@ -861,6 +861,8 @@ pub struct ResolveArgs {
     pub remove_worktree: bool,
     pub skip_copy: bool,
     pub discard_uncopied: bool,
+    /// Leave the lane's pane and tab open (the idle agent still runs).
+    pub keep_pane: bool,
 }
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()> {
@@ -926,17 +928,31 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &resolved);
     }
+    let pane_closed = if args.keep_pane {
+        false
+    } else {
+        close_pane(ctx, &project, &resolved)?
+    };
     println!("{id} resolved.");
+    if args.keep_pane {
+        println!(
+            "Its pane and tab were left open (--keep-pane); close them in herdr when you are done."
+        );
+    } else if pane_closed {
+        println!("Its pane and tab were closed.");
+    } else {
+        println!("Its pane and tab were already gone.");
+    }
     if !args.remove_worktree {
         match resolved.kind {
             Kind::Worktree if resolved.worktree_path.is_empty() => {
                 println!("No worktree was recorded for it, so there is nothing to close or remove.")
             }
             Kind::Worktree => println!(
-                "Its pane, workspace, worktree ({}) and branch ({}) were left alone. Close the workspace in herdr, or run `thread resolve {slug} {id} --remove-worktree`.",
+                "Its workspace, worktree ({}) and branch ({}) were left alone. Close the workspace in herdr, or run `thread resolve {slug} {id} --remove-worktree`.",
                 resolved.worktree_path, resolved.branch
             ),
-            _ => println!("Its pane and tab were left alone; close them in herdr."),
+            _ => {}
         }
     } else {
         println!(
@@ -945,6 +961,27 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         );
     }
     Ok(())
+}
+
+/// Close the thread's pane and its tab through herdr, the same closing
+/// `herdr tab close <tab>` does. A tab herdr no longer knows, or a session it
+/// cannot reach, has nothing to close and is not an error.
+pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
+    if record.tab_id.is_empty() {
+        return Ok(false);
+    }
+    let Some(view) = session_view(ctx, project) else {
+        return Ok(false);
+    };
+    match view
+        .herdr
+        .on_machine(&record.machine)
+        .tab_close(&record.tab_id)
+    {
+        Ok(()) => Ok(true),
+        Err(error) if error.code == "tab_not_found" => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    }
 }
 
 /// The final report and library copy, storing the new report hash.

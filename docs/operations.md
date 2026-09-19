@@ -46,7 +46,8 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
 | `thread start <project> --title T --plain S [--role R] [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | New thread: the brief `tasks/<id>.md` is committed on the integration branch (`--base`, else the checked-out branch), then a git worktree from that commit and a tab under the coordinator, with `--parent` on launch. The kind and args come from the role. `--plain` is required. Returns before the agent is up. Remote starts are refused. |
-| `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack`, `thread resolve` | See `--help` on each. |
+| `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
+| `thread resolve <project> <id> [--remove-worktree] [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy: close the pane and tab through Herdr (`--keep-pane` leaves them), and optionally remove the worktree (the branch is kept). |
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. `delete` moves the folder to `.trash/`. |
