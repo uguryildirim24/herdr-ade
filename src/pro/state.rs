@@ -5,7 +5,9 @@
 //! records are TOML; `usage.jsonl` is one JSON line per Pro send; the cooldown
 //! file holds one RFC 3339 stamp.
 
+use std::fs::File;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +15,33 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{Layout, now_rfc3339, parse_rfc3339, seconds_since};
+
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+const LOCK_EX: i32 = 2;
+
+/// A process lock used to serialize starts and turn admission.
+pub struct FileLock {
+    _file: File,
+}
+
+impl FileLock {
+    pub fn acquire(path: &Path) -> Result<FileLock> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        let file =
+            File::create(path).with_context(|| format!("could not open {}", path.display()))?;
+        // SAFETY: flock takes an open fd and a flag; it blocks until granted.
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
+            bail!("could not lock {}", path.display());
+        }
+        Ok(FileLock { _file: file })
+    }
+}
 
 /// Lane states. Only `ready` accepts a turn.
 pub const LANE_STATES: &[&str] = &[
@@ -55,6 +84,7 @@ pub struct Lane {
 
 impl Lane {
     pub fn read(layout: &Layout, name: &str) -> Result<Lane> {
+        check_name(name)?;
         let path = layout.lane(name);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("no lane `{name}` ({})", path.display()))?;
@@ -62,6 +92,7 @@ impl Lane {
     }
 
     pub fn write(&self, layout: &Layout) -> Result<()> {
+        check_name(&self.name)?;
         write_atomic(&layout.lane(&self.name), &self.to_toml()?)
     }
 
@@ -323,6 +354,18 @@ pub fn session_in_use(layout: &Layout, session: &str, except: &str) -> Option<St
         (lane.name != except && lane.state != "gone" && lane.session_id.as_deref() == Some(session))
             .then_some(lane.name)
     })
+}
+
+/// Validate a lane name: it becomes a file name and a herdr agent name.
+pub fn check_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("`{name}` is not a usable lane name (letters, digits, `-` and `_`)");
+    }
+    Ok(())
 }
 
 /// Validate a turn id: it becomes a file name and part of the DONE line.
