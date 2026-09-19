@@ -83,6 +83,15 @@ fn recipe(
 pub fn pi_recipes() -> Vec<PiRecipe> {
     vec![
         recipe(
+            "pi_opencode_deepseek",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+            "high",
+            true,
+            true,
+            "the cheap coding helper",
+        ),
+        recipe(
             "pi_codex_sol_high",
             "openai-codex",
             "gpt-5.6-sol",
@@ -181,7 +190,7 @@ mod tests {
         let providers = enabled_providers();
         assert_eq!(
             providers,
-            vec!["openai-codex", "opencode-go", "kimi-coding"]
+            vec!["opencode-go", "openai-codex", "kimi-coding"]
         );
         assert!(!providers.contains(&"cursor"));
     }
