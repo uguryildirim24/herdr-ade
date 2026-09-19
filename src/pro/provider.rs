@@ -9,6 +9,7 @@
 //! also included by `src/pi/install.rs` through a `#[path]` attribute, so it
 //! carries no `crate::` or `super::` paths.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -69,6 +70,8 @@ pub fn write_merged(path: &Path, base_url: &str, token: &str) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, format!("{text}\n"))
         .with_context(|| format!("could not write {}", tmp.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("could not protect {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
 }

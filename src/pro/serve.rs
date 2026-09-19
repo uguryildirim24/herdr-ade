@@ -14,11 +14,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,8 +56,11 @@ impl ServeState {
     }
 
     pub fn write(&self, layout: &Layout) -> Result<()> {
+        let path = layout.serve_state();
         let text = serde_json::to_string_pretty(self).context("could not serialize serve.json")?;
-        state::write_atomic(&layout.serve_state(), &format!("{text}\n"))
+        state::write_atomic(&path, &format!("{text}\n"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("could not protect {}", path.display()))
     }
 
     pub fn remove(layout: &Layout) {
@@ -77,11 +81,50 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// The open liveness endpoint must answer for the exact process in
+/// `serve.json`; a reused pid is not an already-running relay.
+fn relay_healthy(state: &ServeState) -> bool {
+    let address: std::net::SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, state.port).into();
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) else {
+        return false;
+    };
+    let timeout = Some(Duration::from_millis(500));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    if stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return false;
+    }
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    if !head.starts_with("HTTP/1.1 200 ") {
+        return false;
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("pid").and_then(Value::as_u64))
+        == Some(state.pid as u64)
+}
+
 /// `herdr-pro serve`: start the daemon unless one is already running.
 pub fn start(layout: &Layout) -> Result<bool> {
     if let Some(state) = ServeState::read(layout)
         && pid_alive(state.pid)
     {
+        if !relay_healthy(&state) {
+            bail!(
+                "serve.json names live pid {}, but its relay does not answer on port {}; run `herdr-pro stop-serve` first",
+                state.pid,
+                state.port
+            );
+        }
         println!(
             "relay already running on port {} (pid {})",
             state.port, state.pid
@@ -109,6 +152,7 @@ pub fn start(layout: &Layout) -> Result<bool> {
     for _ in 0..100 {
         if let Some(state) = ServeState::read(layout)
             && state.pid == pid
+            && relay_healthy(&state)
         {
             println!(
                 "relay started on port {} (pid {pid}); token in {}",
@@ -116,6 +160,9 @@ pub fn start(layout: &Layout) -> Result<bool> {
                 layout.serve_state().display()
             );
             return Ok(true);
+        }
+        if !pid_alive(pid) {
+            bail!("the relay process exited before it became ready");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -160,7 +207,6 @@ pub fn run(layout: &Layout, env: &Env) -> Result<()> {
         bridge_port,
         sessions: Mutex::new(HashMap::new()),
         inflight: Mutex::new(HashMap::new()),
-        total: AtomicUsize::new(0),
         seq: AtomicU64::new(0),
         failures: Mutex::new(Vec::new()),
     });
@@ -273,7 +319,6 @@ struct Relay {
     bridge_port: u16,
     sessions: Mutex<HashMap<String, Session>>,
     inflight: Mutex<HashMap<String, ()>>,
-    total: AtomicUsize,
     seq: AtomicU64,
     failures: Mutex<Vec<Instant>>,
 }
@@ -286,16 +331,18 @@ impl Relay {
             Err(_) => return Ok(()),
         };
         let _ = stream.set_read_timeout(None);
+        if request.method == "GET" && request.path == "/healthz" {
+            return write_json(
+                &mut stream,
+                200,
+                &json!({"status":"ok","port":self.port,"pid":std::process::id()}),
+            );
+        }
         if !self.authorized(&request) {
             return write_json_error(&mut stream, 401, "missing or wrong bearer token");
         }
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/models") => write_models(&mut stream),
-            ("GET", "/healthz") => write_json(
-                &mut stream,
-                200,
-                &json!({"status":"ok","port":self.port,"pid":std::process::id()}),
-            ),
             ("POST", "/v1/responses") => self.responses(&mut stream, &request),
             ("GET", path) => write_json_error(&mut stream, 404, &format!("no route {path}")),
             _ => write_json_error(&mut stream, 405, "method not allowed"),
@@ -342,7 +389,7 @@ impl Relay {
                     "a turn is already running for this conversation",
                 );
             }
-            if self.total.load(Ordering::SeqCst) >= limit {
+            if inflight.len() >= limit {
                 return write_json_error(
                     stream,
                     429,
@@ -351,7 +398,6 @@ impl Relay {
             }
             inflight.insert(key.clone(), ());
         }
-        self.total.fetch_add(1, Ordering::SeqCst);
         let guard = InflightGuard {
             relay: self,
             key: key.clone(),
@@ -502,9 +548,13 @@ impl Relay {
             self.seq.fetch_add(1, Ordering::SeqCst)
         ));
         let mut child = self.spawn_codex(resume, prompt, &out_file)?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes());
-            drop(stdin);
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(error) = stdin.write_all(prompt.as_bytes())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&out_file);
+            return Err(error).context("could not write the prompt to codex");
         }
         let stdout = child.stdout.take().context("codex has no stdout")?;
         let stderr = child.stderr.take();
@@ -519,21 +569,29 @@ impl Relay {
         let watchdog = watchdog(&child);
         let mut state = StreamState::new(response_id.clone());
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let line = line.context("could not read codex stdout")?;
-            if line.trim().is_empty() {
-                continue;
+        let stream_result = (|| -> Result<()> {
+            for line in reader.lines() {
+                let line = line.context("could not read codex stdout")?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                state.on_event(&event, sink)?;
             }
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            state.on_event(&event, sink)?;
+            Ok(())
+        })();
+        if stream_result.is_err() {
+            let _ = child.kill();
         }
-        let status = child.wait().context("could not wait for codex")?;
+        let status_result = child.wait();
         watchdog.store(true, Ordering::SeqCst);
         let stderr_text = stderr_reader
             .and_then(|handle| handle.join().ok())
             .unwrap_or_default();
+        stream_result?;
+        let status = status_result.context("could not wait for codex")?;
 
         if state.failure.is_none() && !status.success() {
             state.failure = Some(if stderr_text.trim().is_empty() {
@@ -542,23 +600,26 @@ impl Relay {
                 stderr_text.trim().to_string()
             });
         }
-        if state.failure.is_none() && !state.completed && state.answer.trim().is_empty() {
-            state.failure = Some("codex produced no agent message and no completed turn".into());
-        }
-        if let Some(message) = state.failure.clone() {
-            let _ = std::fs::remove_file(&out_file);
-            return Err(anyhow::anyhow!("{message}"));
-        }
         // The `-o` file is the authoritative last message when the stream did
-        // not carry one (or carried only a snapshot we already emitted).
-        if state.answer.trim().is_empty()
+        // not carry one.
+        if state.failure.is_none()
+            && state.answer.trim().is_empty()
             && let Ok(text) = std::fs::read_to_string(&out_file)
             && !text.trim().is_empty()
         {
             state.push_text("msg_codex_final", text.trim(), sink)?;
             state.close_open(sink)?;
         }
+        if state.failure.is_none() && !state.completed {
+            state.failure = Some("codex ended without a completed turn".into());
+        }
+        if state.failure.is_none() && state.answer.trim().is_empty() {
+            state.failure = Some("codex completed without an agent message".into());
+        }
         let _ = std::fs::remove_file(&out_file);
+        if let Some(message) = state.failure.clone() {
+            return Err(anyhow::anyhow!("{message}"));
+        }
         state.finish(sink)?;
         Ok(state.into_outcome())
     }
@@ -602,7 +663,6 @@ impl Drop for InflightGuard<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.key);
-        self.relay.total.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
