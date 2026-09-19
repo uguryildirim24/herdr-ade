@@ -532,6 +532,16 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
     };
     let repo_path = std::fs::canonicalize(&repo)
         .with_context(|| format!("repository {repo} does not exist"))?;
+    if !crate::harness::allowed_repo(
+        &project.read_project_md()?.0,
+        &ctx.config_dir,
+        &repo_path.to_string_lossy(),
+    ) {
+        bail!(
+            "repo_not_listed: {} is not listed in `repos` in PROJECT.md and is not a harness repository",
+            repo_path.display()
+        );
+    }
     let git = Git::new(ctx.runner, &repo_path);
     git.common_dir()
         .with_context(|| format!("{} is not a git repository", repo_path.display()))?;
@@ -1387,6 +1397,11 @@ pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<M
         }
     }
     let _ = crate::board::refresh(ctx, &project);
+    if matches!(&outcome, Ok(MergeOutcome::Checkpointed { .. }))
+        && crate::harness::is_harness_repo(&ctx.config_dir, &record.repo)
+    {
+        println!("run ha harness install");
+    }
     outcome
 }
 
@@ -2015,6 +2030,7 @@ pub mod testkit {
         std::fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
         commit_file(&repo, "README.md", "hello\n", "initial");
         let project = world.project("demo", "a.sock");
+        world.add_repo(&project, &repo.to_string_lossy());
         Fx {
             world,
             project,
@@ -2142,6 +2158,41 @@ mod tests {
     const PLAIN: &str = "The first round lands the shared types.";
 
     fn open_r1(fx: &Fx) {
+        open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn round_open_accepts_an_unlisted_harness_repo() {
+        let fx = fixture();
+        // The project stops listing the repo; the harness list keeps it usable.
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos.clear();
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+        let cfg = fx.world.home.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("config.toml"),
+            format!(
+                "[harness]\nrepos = [{{ path = \"{}\" }}]\n",
+                fx.repo.display()
+            ),
+        )
+        .unwrap();
         open(
             &fx.world.ctx(),
             "demo",
