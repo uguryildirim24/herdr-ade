@@ -44,10 +44,18 @@ enum Command {
     /// Print the bridge and Codex login steps; never drives a login
     Login,
     /// Start the local relay that makes Pro a plain pi lane
-    Serve,
+    Serve {
+        /// An extra folder the relay may read; repeatable
+        #[arg(long = "read-root", value_name = "DIR")]
+        read_root: Vec<PathBuf>,
+    },
     /// The foreground relay (started detached by `serve`)
     #[command(hide = true)]
-    ServeRun,
+    ServeRun {
+        /// An extra folder the relay may read; repeatable
+        #[arg(long = "read-root", value_name = "DIR")]
+        read_root: Vec<PathBuf>,
+    },
     /// Stop the relay and remove its `serve.json`
     StopServe,
     /// Write the `pro` provider into the shared pi folder's `models.json`
@@ -137,12 +145,12 @@ fn run(cli: &Cli) -> Result<bool> {
     let runner = RealRunner;
     match &cli.command {
         Command::Init => init(&env, &layout),
-        Command::Serve => {
-            serve::start(&layout)?;
+        Command::Serve { read_root } => {
+            serve::start(&layout, read_root)?;
             Ok(true)
         }
-        Command::ServeRun => {
-            serve::run(&layout, &env)?;
+        Command::ServeRun { read_root } => {
+            serve::run(&layout, &env, read_root)?;
             Ok(true)
         }
         Command::StopServe => {
