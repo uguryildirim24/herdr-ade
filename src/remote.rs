@@ -468,7 +468,10 @@ mod tests {
 
     #[test]
     fn every_ssh_script_carries_the_box_path() {
-        let expected = format!("sh -c 'PATH={} true'", crate::contracts::BOX_PATH);
+        let expected = format!(
+            "sh -c 'PATH={}; export PATH\ntrue'",
+            crate::contracts::BOX_PATH
+        );
         let runner = FakeRunner::new();
         runner.on("ssh", ok(""));
         ssh(&runner, "box", "true", None, SSH_TIMEOUT).unwrap();
