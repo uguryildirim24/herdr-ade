@@ -212,9 +212,15 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Re-apply parents and print start lines for gone threads; never starts anything
+    /// Re-link live threads and print start lines for gone ones; --start restarts them
     Pickup {
-        slug: String,
+        slug: Option<String>,
+        /// Cover every active project under the root
+        #[arg(long)]
+        all: bool,
+        /// Restart gone threads under a project whose start_threads is `auto`
+        #[arg(long)]
+        start: bool,
         #[arg(long)]
         pane: Option<String>,
         #[arg(long)]
@@ -746,12 +752,23 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
         }
         Command::Pickup {
             slug,
+            all,
+            start,
             pane,
             dry_run,
         } => {
             print!(
                 "{}",
-                checkpoint::pickup(ctx, &slug, pane.as_deref(), dry_run)?
+                checkpoint::pickup(
+                    ctx,
+                    checkpoint::PickupArgs {
+                        slug: slug.as_deref(),
+                        pane: pane.as_deref(),
+                        dry_run,
+                        all,
+                        start,
+                    },
+                )?
             );
             Ok(())
         }
