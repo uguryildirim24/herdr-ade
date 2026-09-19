@@ -198,7 +198,7 @@ struct BootstrapReceipt {
 pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
     match role {
         "coordinator" => print!("{}", include_str!("../skill/COORDINATOR.md")),
-        "lane" | "reviewer" | "critic" | "drafter" => {
+        "lane" | "reviewer" | "critic" | "drafter" | "research" | "planner" => {
             let binding = current_lane(ctx)?;
             let recorded = match binding.thread.role.as_str() {
                 "" => "lane",
