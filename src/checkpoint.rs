@@ -1167,59 +1167,186 @@ fn report(problems: &BTreeMap<String, BTreeSet<String>>, doc: &str, st: &Value) 
     bail!("{}", lines.join("\n"))
 }
 
-/// `ha pickup <slug>`: re-apply parents to live threads whose identity still
-/// matches, print start lines for gone ones from their launch recipe. It
-/// never starts or prompts anything.
-pub fn pickup(ctx: &Ctx, slug: &str, pane: Option<&str>, dry_run: bool) -> Result<String> {
-    let project = Project::load(&ctx.root, slug)?;
-    let (h, coord_pane, _) = coordinator_where(ctx, &project, pane)?;
+/// `ha pickup [slug] [--all] [--start]`: re-apply parents to live threads
+/// whose identity still matches. Local lanes are read from the project's own
+/// session; box lanes are read from the courier's box-local lists (one SSH per
+/// machine, never a second bridge). Gone lanes are printed as start lines, or
+/// restarted through the existing restart path when `--start` runs under a
+/// project whose `start_threads` is `auto`.
+pub struct PickupArgs<'a> {
+    pub slug: Option<&'a str>,
+    pub pane: Option<&'a str>,
+    pub dry_run: bool,
+    pub all: bool,
+    pub start: bool,
+}
+
+pub fn pickup(ctx: &Ctx, args: PickupArgs<'_>) -> Result<String> {
+    if !args.all && args.slug.is_none() {
+        bail!("pickup_needs_project: pass a project slug or --all");
+    }
+    let slugs: Vec<String> = if args.all {
+        active_slugs(ctx)
+    } else {
+        vec![args.slug.unwrap_or_default().to_string()]
+    };
+    let projects: Vec<Project> = slugs
+        .iter()
+        .map(|slug| Project::load(&ctx.root, slug))
+        .collect::<Result<_>>()?;
+    let views = machine_views(ctx, &projects);
+    let mut out = String::new();
+    for project in &projects {
+        out.push_str(&pickup_project(ctx, project, &views, &args)?);
+    }
+    Ok(out)
+}
+
+/// Every active project under the root. Paused projects stay stopped even
+/// when `pickup --all --start` is used.
+fn active_slugs(ctx: &Ctx) -> Vec<String> {
+    crate::project::list_slugs(&ctx.root)
+        .into_iter()
+        .filter(|slug| {
+            Project::load(&ctx.root, slug)
+                .is_ok_and(|p| p.status() == crate::project::Status::Active)
+        })
+        .collect()
+}
+
+/// One courier pass per machine that has an open box lane in any project, so
+/// `--all` costs one SSH per machine, not one per project. A failed pass is
+/// kept as its reason: its lanes are never invented as gone.
+fn machine_views(
+    ctx: &Ctx,
+    projects: &[Project],
+) -> BTreeMap<String, Result<crate::steps::CourierOutcome, String>> {
+    let mut by_machine: BTreeMap<String, Vec<&Project>> = BTreeMap::new();
+    for project in projects {
+        for t in thread::list(project) {
+            if t.status == thread::Status::Resolved || !t.is_remote() || t.pane_id.is_empty() {
+                continue;
+            }
+            let entry = by_machine.entry(t.machine_route().to_string()).or_default();
+            if !entry.iter().any(|p| p.slug == project.slug) {
+                entry.push(project);
+            }
+        }
+    }
+    let mut views = BTreeMap::new();
+    for (machine, projects) in &by_machine {
+        views.insert(
+            machine.clone(),
+            crate::steps::courier(ctx, projects, machine).map_err(|e| format!("{e:#}")),
+        );
+    }
+    views
+}
+
+fn pickup_project(
+    ctx: &Ctx,
+    project: &Project,
+    views: &BTreeMap<String, Result<crate::steps::CourierOutcome, String>>,
+    args: &PickupArgs<'_>,
+) -> Result<String> {
+    // `--all` runs from one coordinator's shell but every project's workers
+    // belong under that project's own recorded coordinator, not the caller.
+    let recorded_pane = args
+        .all
+        .then(|| project.coordinator().map(|coord| coord.pane_id))
+        .flatten();
+    let pane = recorded_pane.as_deref().or(args.pane);
+    let (h, coord_pane, _) = coordinator_where(ctx, project, pane)?;
     let coord = project.coordinator().unwrap_or_default();
     let listed = h
         .call(&["agent", "list"], CALL)
         .map_err(|e| anyhow::anyhow!("herdr agent list: {}", e.message))?;
     let agents = listed["agents"].as_array().cloned().unwrap_or_default();
     let by_pane = by_key(&agents, "pane_id");
-    let (mut relinked, mut already, mut gone) = (Vec::new(), Vec::new(), Vec::new());
-    for t in thread::list(&project) {
-        if t.status == thread::Status::Resolved || t.is_remote() || t.pane_id.is_empty() {
+    let now = jiff::Timestamp::now();
+    let (mut relinked, mut already) = (Vec::new(), Vec::new());
+    let mut gone: Vec<thread::Thread> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for t in thread::list(project) {
+        if t.status == thread::Status::Resolved || t.pane_id.is_empty() {
+            continue;
+        }
+        if t.is_remote() {
+            let view = match views.get(t.machine_route()) {
+                Some(Ok(view)) => view,
+                Some(Err(error)) => {
+                    notes.push(format!("machine `{}` unreachable: {error}", t.machine));
+                    continue;
+                }
+                None => {
+                    notes.push(format!("machine `{}` was not read this pass", t.machine));
+                    continue;
+                }
+            };
+            let (Some(box_agents), Some(box_panes)) = (&view.agents, &view.panes) else {
+                notes.push(format!(
+                    "machine `{}` did not answer; {} is undecided",
+                    t.machine, t.id
+                ));
+                continue;
+            };
+            let live = thread::live_state(&t, box_agents, box_panes, now);
+            if live.agent_state.is_none() {
+                gone.push(t);
+                continue;
+            }
+            let parent = crate::threads::parent_token(&t, &coord_pane);
+            let current = box_agents
+                .iter()
+                .find(|a| thread::agent_matches(&t, a))
+                .and_then(crate::herdr::Agent::parent);
+            if current == Some(parent.as_str()) {
+                already.push(t.id.clone());
+            } else if args.dry_run {
+                relinked.push(format!("{} (dry-run)", t.id));
+            } else {
+                h.on_machine(t.machine_route())
+                    .pane_set_parent(&t.pane_id, &parent)
+                    .map_err(|e| anyhow::anyhow!("re-parenting {}: {}", t.id, e.message))?;
+                relinked.push(t.id.clone());
+            }
             continue;
         }
         let live = by_pane.get(&t.pane_id).filter(|a| {
             let name = s(a, "name");
             t.agent_name.is_empty() || name.is_empty() || name == t.agent_name
         });
-        match live {
-            Some(a) => {
-                let parent = a
-                    .get("tokens")
-                    .and_then(|t| t.get("parent"))
-                    .and_then(Value::as_str);
-                if parent == Some(coord_pane.as_str()) {
-                    already.push(t.id.clone());
-                } else if dry_run {
-                    relinked.push(format!("{} (dry-run)", t.id));
-                } else {
-                    let token = format!("parent={coord_pane}");
-                    h.call(
-                        &[
-                            "pane",
-                            "report-metadata",
-                            &t.pane_id,
-                            "--source",
-                            crate::herdr::SOURCE,
-                            "--token",
-                            &token,
-                        ],
-                        CALL,
-                    )
-                    .map_err(|e| anyhow::anyhow!("re-parenting {}: {}", t.id, e.message))?;
-                    relinked.push(t.id.clone());
-                }
-            }
-            None => gone.push(t),
+        let Some(a) = live else {
+            gone.push(t);
+            continue;
+        };
+        let parent = a
+            .get("tokens")
+            .and_then(|t| t.get("parent"))
+            .and_then(Value::as_str);
+        if parent == Some(coord_pane.as_str()) {
+            already.push(t.id.clone());
+        } else if args.dry_run {
+            relinked.push(format!("{} (dry-run)", t.id));
+        } else {
+            let token = format!("parent={coord_pane}");
+            h.call(
+                &[
+                    "pane",
+                    "report-metadata",
+                    &t.pane_id,
+                    "--source",
+                    crate::herdr::SOURCE,
+                    "--token",
+                    &token,
+                ],
+                CALL,
+            )
+            .map_err(|e| anyhow::anyhow!("re-parenting {}: {}", t.id, e.message))?;
+            relinked.push(t.id.clone());
         }
     }
-    let mut out = format!("coordinator pane {coord_pane}\n");
+    let mut out = format!("project {}\ncoordinator pane {coord_pane}\n", project.slug);
     out.push_str(&format!(
         "already linked: {}\n",
         if already.is_empty() {
@@ -1236,39 +1363,86 @@ pub fn pickup(ctx: &Ctx, slug: &str, pane: Option<&str>, dry_run: bool) -> Resul
             relinked.join(", ")
         }
     ));
+    for note in &notes {
+        out.push_str(&format!("note: {note}\n"));
+    }
     if !gone.is_empty() {
-        out.push_str("gone (not live; the ticker or you start them again; nothing was started):\n");
-        for t in &gone {
-            let launch = launch_of(&project, &t.id);
-            let kind = launch.kind.clone().unwrap_or_else(|| t.agent.clone());
-            let mut tab = format!(
-                "  herdr tab create --workspace {} --cwd {} --label {} --no-focus",
-                coord.workspace_id, t.cwd, t.id
-            );
-            for e in &launch.env {
-                tab.push_str(&format!(" --env {e}"));
-            }
-            out.push_str(&tab);
-            out.push('\n');
-            let mut start = format!(
-                "  herdr agent start {} --kind {kind} --pane <root_pane.pane_id from that JSON> --parent {coord_pane}",
-                if t.agent_name.is_empty() {
-                    t.id.clone()
-                } else {
-                    t.agent_name.clone()
+        let safety = project.safety(&ctx.config_dir)?;
+        if args.start
+            && !args.dry_run
+            && project.status() == crate::project::Status::Active
+            && safety.start_threads == "auto"
+        {
+            out.push_str("started (restarted through the launch record):\n");
+            for t in &gone {
+                match crate::threads::restart(ctx, &project.slug, &t.id) {
+                    Ok(thread) => {
+                        out.push_str(&format!("  {} now in pane {}\n", t.id, thread.pane_id))
+                    }
+                    Err(error) => out.push_str(&format!("  {} could not start: {error:#}\n", t.id)),
                 }
+            }
+        } else {
+            out.push_str(
+                "gone (not live; the ticker or you start them again; nothing was started):\n",
             );
-            if let Some(ms) = launch.ready_timeout_ms.filter(|ms| *ms > 0) {
-                start.push_str(&format!(" --timeout {ms}"));
+            for t in &gone {
+                out.push_str(&start_lines(project, t, &coord_pane, &coord.workspace_id));
             }
-            if !launch.args.is_empty() {
-                start.push_str(&format!(" -- {}", launch.args.join(" ")));
-            }
-            out.push_str(&start);
-            out.push('\n');
         }
     }
     Ok(out)
+}
+
+/// The copy-ready `herdr` commands for one gone lane, from its launch recipe.
+/// A box lane's commands run through `herdr --machine <label>` and name the
+/// coordinator with the machine-qualified parent token.
+fn start_lines(
+    project: &Project,
+    t: &thread::Thread,
+    coord_pane: &str,
+    coord_workspace: &str,
+) -> String {
+    let launch = launch_of(project, &t.id);
+    let kind = launch.kind.clone().unwrap_or_else(|| t.agent.clone());
+    let parent = crate::threads::parent_token(t, coord_pane);
+    let (herdr, workspace, cwd) = if t.is_remote() {
+        (
+            format!("herdr --machine {}", t.machine),
+            t.workspace_id.clone(),
+            t.cwd.clone(),
+        )
+    } else {
+        (
+            "herdr".to_string(),
+            coord_workspace.to_string(),
+            t.cwd.clone(),
+        )
+    };
+    let mut out = format!(
+        "  {herdr} tab create --workspace {workspace} --cwd {cwd} --label {} --no-focus",
+        t.id
+    );
+    for e in &launch.env {
+        out.push_str(&format!(" --env {e}"));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "  {herdr} agent start {} --kind {kind} --pane <root_pane.pane_id from that JSON> --parent {parent}",
+        if t.agent_name.is_empty() {
+            t.id.clone()
+        } else {
+            t.agent_name.clone()
+        }
+    ));
+    if let Some(ms) = launch.ready_timeout_ms.filter(|ms| *ms > 0) {
+        out.push_str(&format!(" --timeout {ms}"));
+    }
+    if !launch.args.is_empty() {
+        out.push_str(&format!(" -- {}", launch.args.join(" ")));
+    }
+    out.push('\n');
+    out
 }
 
 #[derive(Default)]
@@ -1475,13 +1649,33 @@ mod tests {
             {"pane_id":"w1:p12","tab_id":"w1:t3","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
             .into();
         let ctx = fx.world.ctx();
-        let dry = pickup(&ctx, "demo", Some("w1:p1"), true).unwrap();
+        let dry = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: true,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
         assert!(
             dry.contains(&format!("re-linked:      {live} (dry-run)")),
             "{dry}"
         );
         assert_eq!(fx.world.runner.count("pane report-metadata"), 0);
-        let out = pickup(&ctx, "demo", Some("w1:p1"), false).unwrap();
+        let out = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
         assert!(
             out.contains(&format!("already linked: {linked}\n")),
             "{out}"
@@ -1503,5 +1697,265 @@ mod tests {
         for verb in ["agent start", "agent prompt", "tab create", "pane run"] {
             assert_eq!(fx.world.runner.count(verb), 0, "pickup ran `{verb}`");
         }
+    }
+
+    /// One box lane on saved machine `box` (id `1`), live at `pane`.
+    fn box_lane(fx: &Fx, pane: &str, cwd: &str) -> String {
+        thread::allocate(&fx.project, |t| {
+            t.title = "Box lane".into();
+            t.kind = thread::Kind::Worktree;
+            t.status = thread::Status::Open;
+            t.agent = "claude".into();
+            t.agent_name = thread::agent_name("demo", &t.id);
+            t.machine = "box".into();
+            t.workspace_id = "w2".into();
+            t.tab_id = "w2:t1".into();
+            t.pane_id = pane.into();
+            t.cwd = cwd.into();
+        })
+        .unwrap()
+        .id
+    }
+
+    /// The saved-machine profile and one courier manifest with these box-local
+    /// `agent list`/`pane list` arrays.
+    fn box_courier(world: &crate::scenarios::World, agents: &str, panes: &str) {
+        world.runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
+        );
+        let manifest = format!(
+            "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":{agents}}}}}\npanes\t{{\"result\":{{\"panes\":{panes}}}}}\n"
+        );
+        world.runner.on("ssh", ok(&manifest));
+    }
+
+    #[test]
+    fn pickup_relinks_a_live_box_lane_with_the_machine_qualified_parent() {
+        let fx = fixture();
+        let id = box_lane(&fx, "w2:p1", "/box/wt");
+        box_courier(
+            &fx.world,
+            r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"hp-demo-t-0001","agent":"claude","agent_status":"idle","cwd":"/box/wt"}]"#,
+            r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/box/wt"}]"#,
+        );
+        let ctx = fx.world.ctx();
+        let out = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
+        assert!(out.contains(&format!("re-linked:      {id}\n")), "{out}");
+        assert_eq!(
+            fx.world
+                .runner
+                .count("pane report-metadata w2:p1 --source herdr-ade --token parent=Local:w1:p1"),
+            1
+        );
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c.display().contains("--machine box pane report-metadata")),
+            "the re-parent must go through the box bridge"
+        );
+    }
+
+    #[test]
+    fn pickup_prints_a_machine_start_line_for_a_gone_box_lane() {
+        let fx = fixture();
+        let id = box_lane(&fx, "w2:p1", "/box/wt");
+        box_courier(&fx.world, "[]", "[]");
+        let ctx = fx.world.ctx();
+        let out = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains(&format!(
+                "herdr --machine box tab create --workspace w2 --cwd /box/wt --label {id}"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "herdr --machine box agent start hp-demo-t-0001 --kind claude --pane <root_pane.pane_id from that JSON> --parent Local:w1:p1"
+            ),
+            "{out}"
+        );
+        assert_eq!(fx.world.runner.count("pane report-metadata"), 0);
+    }
+
+    #[test]
+    fn pickup_all_covers_two_projects() {
+        let fx = fixture();
+        let _ = fx.lane(1);
+        let beta = fx.world.project("beta", "b.sock");
+        beta.update_coordinator(|coord| {
+            coord.workspace_id = "w3".into();
+            coord.tab_id = "w3:t1".into();
+            coord.pane_id = "w3:p1".into();
+        })
+        .unwrap();
+        thread::allocate(&beta, |t| {
+            t.title = "Beta".into();
+            t.kind = thread::Kind::Tab;
+            t.status = thread::Status::Open;
+            t.agent = "claude".into();
+            t.agent_name = "hp-beta-t-0001".into();
+            t.workspace_id = "w3".into();
+            t.tab_id = "w3:t1".into();
+            t.pane_id = "w3:p1".into();
+            t.cwd = fx.world.home.path().to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let ctx = fx.world.ctx();
+        let out = pickup(
+            &ctx,
+            PickupArgs {
+                slug: None,
+                pane: Some("w1:p1"),
+                dry_run: true,
+                all: true,
+                start: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains("project demo\ncoordinator pane w1:p1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("project beta\ncoordinator pane w3:p1\n"),
+            "--all must not parent beta's lanes to the calling project's pane: {out}"
+        );
+
+        beta.set_status(crate::project::Status::Paused).unwrap();
+        let active = active_slugs(&ctx);
+        assert!(active.contains(&"demo".to_string()), "{active:?}");
+        assert!(!active.contains(&"beta".to_string()), "{active:?}");
+    }
+
+    #[test]
+    fn pickup_treats_a_box_shell_without_its_agent_as_gone() {
+        let fx = fixture();
+        let id = box_lane(&fx, "w2:p1", "/box/wt");
+        box_courier(
+            &fx.world,
+            "[]",
+            r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/box/wt"}]"#,
+        );
+        let out = pickup(
+            &fx.world.ctx(),
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
+        assert!(out.contains(&format!("--label {id} --no-focus")), "{out}");
+        assert!(!out.contains(&format!("re-linked:      {id}")), "{out}");
+    }
+
+    #[test]
+    fn pickup_start_starts_only_under_auto_and_skips_a_relinked_lane() {
+        let fx = fixture();
+        let (linked, _) = fx.lane(1);
+        *fx.world.agents.borrow_mut() = r#"[
+            {"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
+            .into();
+        let gone = thread::allocate(&fx.project, |t| {
+            t.title = "Gone".into();
+            t.kind = thread::Kind::Tab;
+            t.status = thread::Status::Open;
+            t.agent = "claude".into();
+            t.agent_name = thread::agent_name("demo", &t.id);
+            t.workspace_id = "w1".into();
+            t.tab_id = "w1:t3".into();
+            t.pane_id = "w1:p12".into();
+            t.cwd = fx.world.home.path().to_string_lossy().into_owned();
+        })
+        .unwrap()
+        .id;
+        *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+        fx.world.runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t9","pane_id":"w1:p99","cwd":"/tmp"}}}"#),
+        );
+        let ctx = fx.world.ctx();
+        let propose = PickupArgs {
+            slug: Some("demo"),
+            pane: Some("w1:p1"),
+            dry_run: false,
+            all: false,
+            start: true,
+        };
+        // The default `propose` row prints, as today: nothing is started.
+        let out = pickup(&ctx, propose).unwrap();
+        assert!(out.contains("gone (not live;"), "{out}");
+        assert_eq!(fx.world.runner.count("tab create"), 0);
+
+        let config = fx.world.home.path().join("cfg/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[safety.\"{}\"]\nstart_threads = \"auto\"\n",
+                fx.project.canonical_dir().display()
+            ),
+        )
+        .unwrap();
+        fx.project
+            .set_status(crate::project::Status::Paused)
+            .unwrap();
+        let paused = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: true,
+            },
+        )
+        .unwrap();
+        assert!(paused.contains("gone (not live;"), "{paused}");
+        assert_eq!(fx.world.runner.count("tab create"), 0);
+
+        fx.project
+            .set_status(crate::project::Status::Active)
+            .unwrap();
+        let out = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: true,
+            },
+        )
+        .unwrap();
+        assert!(out.contains(&format!("{gone} now in pane")), "{out}");
+        assert!(!out.contains(&format!("re-linked:      {linked}")), "{out}");
+        assert_eq!(fx.world.runner.count("tab create"), 1);
     }
 }
