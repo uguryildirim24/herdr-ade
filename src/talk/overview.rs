@@ -457,8 +457,11 @@ mod tests {
         let fx = fixture();
         let path = fx.project.project_md();
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, text.replacen("name = \"Demo\"", "name = \"Adeherdr\"", 1))
-            .unwrap();
+        std::fs::write(
+            &path,
+            text.replacen("name = \"Demo\"", "name = \"Adeherdr\"", 1),
+        )
+        .unwrap();
         let overview = Overview::load(
             &fx.project,
             &Journal::default(),
