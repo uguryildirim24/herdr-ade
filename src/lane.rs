@@ -252,30 +252,34 @@ fn validate_card(ctx: &Ctx, card: &LaneCard) -> Result<()> {
     {
         bail!("bootstrap_mismatch: launch receipt does not match the lane card");
     }
-    if let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize)
-        && cwd.to_string_lossy() != card.box_worktree
-    {
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .context("bootstrap_mismatch: cwd cannot be resolved")?;
+    if cwd.to_string_lossy() != card.box_worktree {
         bail!("bootstrap_mismatch: cwd is not the card's box worktree");
     }
-    let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
-    if !socket.is_empty() {
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
-        if let Ok(info) = herdr.pane_process_info(&card.pane_id) {
-            let kind = card.kind.as_str();
-            // The agent, a shell that started it, or the plugin running `done`
-            // all count; anything else is a replacement, never this attempt.
-            let known = info.foreground_processes.iter().any(|p| {
-                let name = p.name.as_str();
-                let argv0 = p.argv0.as_deref().unwrap_or("");
-                name == kind
-                    || name.contains(kind)
-                    || argv0.contains(kind)
-                    || matches!(name, "sh" | "bash" | "zsh" | "-zsh" | "herdr-ade" | "ha")
-            });
-            if !known {
-                bail!("bootstrap_mismatch: pane process does not match kind `{kind}`");
-            }
-        }
+    let socket = std::env::var("HERDR_SOCKET_PATH")
+        .context("bootstrap_mismatch: HERDR_SOCKET_PATH is missing")?;
+    if socket.is_empty() {
+        bail!("bootstrap_mismatch: HERDR_SOCKET_PATH is empty");
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let info = herdr.pane_process_info(&card.pane_id).map_err(|error| {
+        anyhow::anyhow!("bootstrap_mismatch: pane process is unavailable: {error}")
+    })?;
+    let kind = card.kind.as_str();
+    // The agent, a shell that started it, or the plugin running `done` all
+    // count; anything else is a replacement, never this attempt.
+    let known = info.foreground_processes.iter().any(|p| {
+        let name = p.name.as_str();
+        let argv0 = p.argv0.as_deref().unwrap_or("");
+        name == kind
+            || name.contains(kind)
+            || argv0.contains(kind)
+            || matches!(name, "sh" | "bash" | "zsh" | "-zsh" | "herdr-ade" | "ha")
+    });
+    if !known {
+        bail!("bootstrap_mismatch: pane process does not match kind `{kind}`");
     }
     Ok(())
 }

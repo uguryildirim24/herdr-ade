@@ -47,6 +47,8 @@ struct SavedMachine {
     target: String,
     #[serde(default)]
     session: String,
+    #[serde(default)]
+    enabled: bool,
 }
 
 /// The SSH target of a saved machine: from `herdr machine list --json`, else
@@ -57,7 +59,7 @@ pub fn ssh_target(
     config_dir: &Path,
     machine: &str,
 ) -> Result<String> {
-    let listed = saved_machines(runner, herdr_bin);
+    let listed = saved_machines(runner, herdr_bin).unwrap_or_default();
     if let Some(found) = listed
         .iter()
         .find(|m| m.label == machine || m.id == machine)
@@ -74,7 +76,7 @@ pub fn ssh_target(
 pub fn machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
-    config_dir: &Path,
+    _config_dir: &Path,
     machine: &str,
 ) -> Result<MachineProfile> {
     if machine.is_empty() || machine == MACHINE_LOCAL {
@@ -85,40 +87,31 @@ pub fn machine_profile(
             session: String::new(),
         });
     }
-    if let Some(found) = saved_machines(runner, herdr_bin)
+    let found = saved_machines(runner, herdr_bin)?
         .into_iter()
         .find(|m| m.label == machine || m.id == machine)
-    {
-        return Ok(MachineProfile {
-            id: if found.id.is_empty() {
-                found.label.clone()
-            } else {
-                found.id
-            },
-            label: found.label,
-            target: found.target,
-            session: found.session,
-        });
+        .with_context(|| format!("unknown_machine: `{machine}` is not a saved profile"))?;
+    if !found.enabled {
+        bail!("machine_disabled: `{}` is disabled", found.label);
     }
-    // A `[machines.<label>] ssh` row without a saved profile: the label is
-    // both identity and name.
-    let target = configured_target(config_dir, machine)
-        .with_context(|| format!("machine `{machine}` is not a saved profile"))?;
+    if found.id.is_empty() || found.target.is_empty() || found.session.is_empty() {
+        bail!("machine_profile_invalid: `{machine}` is incomplete");
+    }
     Ok(MachineProfile {
-        id: machine.to_string(),
-        label: machine.to_string(),
-        target,
-        session: "default".into(),
+        id: found.id,
+        label: found.label,
+        target: found.target,
+        session: found.session,
     })
 }
 
-fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Vec<SavedMachine> {
-    runner
-        .run(&Cmd::new(herdr_bin, SSH_TIMEOUT).args(["machine", "list", "--json"]))
-        .ok()
-        .filter(Output::success)
-        .and_then(|out| serde_json::from_str::<Vec<SavedMachine>>(&out.stdout).ok())
-        .unwrap_or_default()
+fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachine>> {
+    let out = runner.run(&Cmd::new(herdr_bin, SSH_TIMEOUT).args(["machine", "list", "--json"]))?;
+    if !out.success() {
+        bail!("machine_list_failed: {}", out.error_text());
+    }
+    serde_json::from_str::<Vec<SavedMachine>>(&out.stdout)
+        .context("machine_list_invalid: herdr returned invalid JSON")
 }
 
 fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
@@ -147,8 +140,7 @@ pub fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
     BOX_REPOS.iter().find(|row| row.mac == mac_path)
 }
 
-/// The URL-matched remote name in `repo`, never by remote name alone. An
-/// `origin` pointing upstream is only a fallback when nothing matches. The
+/// The URL-matched remote name in `repo`, never by remote name alone. The
 /// second lane's courier calls this to fetch the lane commit (SPEC-remote
 /// §4.3); the start side pushes by URL directly.
 #[allow(dead_code)]
@@ -157,7 +149,6 @@ pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<Stri
     if !out.success() {
         bail!("git remote in {repo}: {}", out.error_text());
     }
-    let mut fallback = String::new();
     for name in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let got = runner
             .run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote", "get-url", name]))?;
@@ -165,14 +156,8 @@ pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<Stri
         if same_url(&got, url) {
             return Ok(name.to_string());
         }
-        if name == "origin" {
-            fallback = name.to_string();
-        }
     }
-    if fallback.is_empty() {
-        bail!("no_url_remote: {repo} has no remote whose URL is {url}");
-    }
-    Ok(fallback)
+    bail!("no_url_remote: {repo} has no remote whose URL is {url}")
 }
 
 #[allow(dead_code)]
@@ -236,15 +221,15 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
          git rev-parse --show-toplevel >/dev/null || exit 3\n\
          git fetch --quiet {url} {branch} || exit 4\n\
          test \"$(git rev-parse FETCH_HEAD)\" = {base} || {{ echo fetch_head_mismatch >&2; exit 5; }}\n\
-         if [ ! -d {wt} ]; then\n\
-           if git show-ref --verify --quiet {ref}; then\n\
-             git worktree add --quiet {wt} {branch}\n\
-           else\n\
-             git worktree add --quiet -b {branch} {wt} FETCH_HEAD\n\
-             git branch --set-upstream-to=origin/{branch} {branch} >/dev/null 2>&1 || true\n\
-           fi\n\
+         if [ -e {wt} ]; then\n\
+           test -d {wt} || {{ echo worktree_not_directory >&2; exit 6; }}\n\
+         elif git show-ref --verify --quiet {ref}; then\n\
+           test \"$(git rev-parse {ref})\" = {base} || {{ echo local_branch_mismatch >&2; exit 6; }}\n\
+           git worktree add --quiet {wt} {branch}\n\
+         else\n\
+           git worktree add --quiet -b {branch} {wt} FETCH_HEAD\n\
          fi\n\
-         test -d {wt} || {{ echo worktree_missing >&2; exit 6; }}\n\
+         test \"$(git -C {wt} rev-parse HEAD)\" = {base} || {{ echo worktree_head_mismatch >&2; exit 7; }}\n\
          git -C {wt} rev-parse HEAD\n",
         repo = quote(req.box_repo),
         wt = quote(req.worktree),
@@ -256,6 +241,13 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
     let out = ssh(runner, target, &script, None, SSH_START_TIMEOUT)?;
     if !out.success() {
         bail!("box provision on {target} failed: {}", out.error_text());
+    }
+    if out.stdout.trim() != req.base {
+        bail!(
+            "box provision on {target} returned {}, expected {}",
+            out.stdout.trim(),
+            req.base
+        );
     }
     Ok(())
 }
@@ -500,7 +492,7 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on(
             "machine list --json",
-            ok(r#"[{"id":"abc","label":"m1","target":"m1.local","session":"default"}]"#),
+            ok(r#"[{"id":"abc","label":"m1","target":"m1.local","session":"default","enabled":true}]"#),
         );
         assert_eq!(
             ssh_target(&runner, "herdr", config.path(), "m1").unwrap(),
@@ -526,6 +518,7 @@ mod tests {
                 .unwrap()
                 .is_local()
         );
+        assert!(machine_profile(&runner, "herdr", config.path(), "box").is_err());
 
         let broken = FakeRunner::new();
         broken.on("machine list --json", fail(1, "no"));
@@ -566,7 +559,7 @@ mod tests {
     #[test]
     fn provision_verifies_fetch_head_and_creates_the_worktree() {
         let runner = FakeRunner::new();
-        runner.on("ssh", ok("abc123\n"));
+        runner.on("ssh", ok("b0b0\n"));
         let req = Provision {
             box_repo: "/home/ubuntu/projects/herdr",
             worktree: "/home/ubuntu/projects/herdr/.worktrees/t-0001",
