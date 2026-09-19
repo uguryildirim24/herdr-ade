@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0012.md",
+      "tasks/review-r5.md",
       "tasks/t-0011.md",
       "tasks/review-r4.md",
       "tasks/t-0010.md",
@@ -20,15 +22,14 @@
       "tasks/t-0003.md",
       "tasks/review-r2.md",
       "tasks/t-0004.md",
-      "tasks/review-r1.md",
-      "tasks/t-0001.md",
-      "tasks/review-plugin-r2.md"
+      "tasks/review-r1.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r5.md",
       "tasks/reviews/code-r4.md",
       "tasks/reviews/code-r2.md",
       "tasks/reviews/code-r1.md",
@@ -37,15 +38,17 @@
       "tasks/reviews/code-plugin-r1-b.md"
     ]
   },
-  "generated": "2026-09-19T13:50:54-04:00",
+  "generated": "2026-09-19T13:59:41-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
+      "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
+      "hp/adeherdr/t-0012-review-r5-the-worker-s-own-small-home",
       "main",
+      "review/r5",
+      "hp/adeherdr/t-0010-drop-the-jev-lane-picker-fix-the-model-p",
+      "hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
       "review/r4",
       "hp/adeherdr/t-0009-herdr-pro-v2-a-dedicated-pro-codex-home",
-      "hp/adeherdr/t-0010-drop-the-jev-lane-picker-fix-the-model-p",
-      "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
       "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro",
       "hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
       "review/r2-2",
@@ -57,22 +60,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "712ff7b docs(review): round r4 verdict",
-      "6bfc123 review(roles): reject the removed project key",
-      "3bf7b6b Merge commit '4159a26ef37fa03f804c18993dfb9c10c18a8150' into hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
-      "689e079 docs(tasks): t-0011",
-      "ddff535 review(r4): brief for revision 1",
-      "4159a26 skill: the coordinator picks the role, never a model"
+      "6a77dd2 docs(review): round r5 verdict",
+      "827304e review(pro): keep the shared home clean and serialized",
+      "8b45927 Merge commit 'beb80276567f84385f1b1140aa996476eda0febb' into hp/adeherdr/t-0012-review-r5-the-worker-s-own-small-home",
+      "008f9ac docs(tasks): t-0012",
+      "1420cc1 review(r5): brief for revision 1",
+      "5f94b7a checkpoint(r4): HANDOFF after merging the round"
     ],
-    "remote": "13 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "712ff7b",
+        "head": "6a77dd2",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r4 verdict"
+        "subject": "docs(review): round r5 verdict"
       },
       {
         "branch": "review/r1",
@@ -101,6 +104,13 @@
         "head": "689e079",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r4",
         "subject": "docs(tasks): t-0011"
+      },
+      {
+        "branch": "review/r5",
+        "dirty": 0,
+        "head": "008f9ac",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r5",
+        "subject": "docs(tasks): t-0012"
       },
       {
         "branch": "hp/adeherdr/t-0001-plain-language-check-everyday-words-pass",
@@ -139,10 +149,10 @@
       },
       {
         "branch": "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
-        "dirty": 2,
-        "head": "a65c07e",
+        "dirty": 0,
+        "head": "cbeb4d8",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0008",
-        "subject": "fix(thread): resolve closes the lane's pane and tab"
+        "subject": "fix(round): merge lands when the integration branch moved"
       },
       {
         "branch": "hp/adeherdr/t-0009-herdr-pro-v2-a-dedicated-pro-codex-home",
@@ -154,9 +164,9 @@
       {
         "branch": "hp/adeherdr/t-0010-drop-the-jev-lane-picker-fix-the-model-p",
         "dirty": 0,
-        "head": "4159a26",
+        "head": "5f94b7a",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0010",
-        "subject": "skill: the coordinator picks the role, never a model"
+        "subject": "checkpoint(r4): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
@@ -164,6 +174,13 @@
         "head": "712ff7b",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0011",
         "subject": "docs(review): round r4 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0012-review-r5-the-worker-s-own-small-home",
+        "dirty": 0,
+        "head": "6a77dd2",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0012",
+        "subject": "docs(review): round r5 verdict"
       }
     ]
   },
@@ -188,8 +205,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r4",
-    "verdict": "712ff7bfc9625afe5ac73c9b407ea7f324ba9950"
+    "round": "r5",
+    "verdict": "6a77dd2267dd32f336aa5bd4add2bd4006d032b1"
   },
   "session": "default",
   "unlinked_agents": [],
@@ -215,25 +232,25 @@
       }
     },
     {
-      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0011",
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0012",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0011",
-      "pane_id": "w1G:pJ",
+      "name": "hp-adeherdr-t-0012",
+      "pane_id": "w1G:pK",
       "pane_label": null,
-      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0011--/2026-09-19T17-42-31-415Z_01a0bac3-38f7-73c1-b893-720ebd7514ca.jsonl",
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0012--/2026-09-19T17-52-04-093Z_01a0bacb-f5fd-7400-b679-c9e03a97fc32.jsonl",
       "start_args": [],
       "status": "done",
-      "tab_id": "w1G:tE",
-      "tab_label": "t-0011",
-      "title": "π - t-0011",
+      "tab_id": "w1G:tF",
+      "tab_label": "t-0012",
+      "title": "π - t-0012",
       "tokens": {
         "done": "1",
-        "lane": "t-0011",
+        "lane": "t-0012",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "1",
         "review": "ready-for-review",
-        "thread": "t-0011"
+        "thread": "t-0012"
       }
     }
   ],
