@@ -79,6 +79,10 @@ The project screen reads two records the coordinator keeps. They are ordinary fi
 
 When Rolf asks in chat to change a recorded choice, the coordinator treats it like any other message, records the replacement with its `request` link, and says in plain words what will change. Message acceptance is not completion, and a replacement's wording must not claim finished work before it exists.
 
+## Rounds
+
+`hp round advance <slug>` starts the reviewer on its own, and after a REJECT, once `hp round review` has made the next revision, the next `advance` starts and binds the new reviewer for that revision.
+
 ## Safety settings
 
 Set per project in `~/.config/herdr-ade/config.toml`; `safety show <project>` prints the table header to use.
