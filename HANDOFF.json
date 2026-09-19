@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0011.md",
+      "tasks/review-r4.md",
+      "tasks/t-0010.md",
+      "tasks/t-0009.md",
+      "tasks/t-0008.md",
       "tasks/t-0007.md",
       "tasks/t-0003.md",
       "tasks/review-r2.md",
       "tasks/t-0004.md",
       "tasks/review-r1.md",
       "tasks/t-0001.md",
-      "tasks/review-plugin-r2.md",
-      "tasks/ade-deepseek-go.md",
-      "tasks/review-plugin-r1-b.md",
-      "tasks/review-plugin-r1.md",
-      "tasks/ade-pi.md",
-      "tasks/ade-picker.md"
+      "tasks/review-plugin-r2.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r4.md",
       "tasks/reviews/code-r2.md",
       "tasks/reviews/code-r1.md",
       "tasks/reviews/code-plugin-r2.md",
@@ -36,37 +37,42 @@
       "tasks/reviews/code-plugin-r1-b.md"
     ]
   },
-  "generated": "2026-09-19T13:11:01-04:00",
+  "generated": "2026-09-19T13:50:54-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
+      "hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
       "main",
+      "review/r4",
+      "hp/adeherdr/t-0009-herdr-pro-v2-a-dedicated-pro-codex-home",
+      "hp/adeherdr/t-0010-drop-the-jev-lane-picker-fix-the-model-p",
+      "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
+      "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro",
+      "hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
       "review/r2-2",
       "hp/adeherdr/t-0005-review-r2-herdr-pro",
       "hp/adeherdr/t-0001-plain-language-check-everyday-words-pass",
       "hp/adeherdr/t-0004-review-r1-word-check-fix",
       "review/r2",
-      "review/r1",
-      "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro"
+      "review/r1"
     ],
     "integration_branch": "main",
     "integration_log": [
-      "65ba6ca docs(review): round r2 verdict",
-      "fe2fa9f review(pro): make turns and breaker fail closed",
-      "8073ca2 Merge commit 'bb878913c254b1edae0895b91747438b584cc7ed' into hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
-      "c191a33 docs(tasks): t-0007",
-      "7efa98f review(r2): brief for revision 1",
-      "c482aa9 checkpoint(r1): HANDOFF after merging the round"
+      "712ff7b docs(review): round r4 verdict",
+      "6bfc123 review(roles): reject the removed project key",
+      "3bf7b6b Merge commit '4159a26ef37fa03f804c18993dfb9c10c18a8150' into hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
+      "689e079 docs(tasks): t-0011",
+      "ddff535 review(r4): brief for revision 1",
+      "4159a26 skill: the coordinator picks the role, never a model"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "13 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "65ba6ca",
+        "head": "712ff7b",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r2 verdict"
+        "subject": "docs(review): round r4 verdict"
       },
       {
         "branch": "review/r1",
@@ -90,6 +96,13 @@
         "subject": "docs(tasks): t-0007"
       },
       {
+        "branch": "review/r4",
+        "dirty": 0,
+        "head": "689e079",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r4",
+        "subject": "docs(tasks): t-0011"
+      },
+      {
         "branch": "hp/adeherdr/t-0001-plain-language-check-everyday-words-pass",
         "dirty": 0,
         "head": "c482aa9",
@@ -99,9 +112,9 @@
       {
         "branch": "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro",
         "dirty": 0,
-        "head": "bb87891",
+        "head": "2f603cf",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0003",
-        "subject": "docs(pro): pro-bridge commands, state and first-turn needs"
+        "subject": "checkpoint(r2): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0004-review-r1-word-check-fix",
@@ -123,6 +136,34 @@
         "head": "65ba6ca",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0007",
         "subject": "docs(review): round r2 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
+        "dirty": 2,
+        "head": "a65c07e",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0008",
+        "subject": "fix(thread): resolve closes the lane's pane and tab"
+      },
+      {
+        "branch": "hp/adeherdr/t-0009-herdr-pro-v2-a-dedicated-pro-codex-home",
+        "dirty": 0,
+        "head": "beb8027",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0009",
+        "subject": "feat(pro): give every Pro lane the plugin's own Codex home"
+      },
+      {
+        "branch": "hp/adeherdr/t-0010-drop-the-jev-lane-picker-fix-the-model-p",
+        "dirty": 0,
+        "head": "4159a26",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0010",
+        "subject": "skill: the coordinator picks the role, never a model"
+      },
+      {
+        "branch": "hp/adeherdr/t-0011-review-r4-the-picker-is-gone-models-fixe",
+        "dirty": 0,
+        "head": "712ff7b",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0011",
+        "subject": "docs(review): round r4 verdict"
       }
     ]
   },
@@ -130,7 +171,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "idle",
+      "status": "working",
       "workspace_id": "w1H"
     },
     {
@@ -147,38 +188,58 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r2",
-    "verdict": "65ba6ca40b78ee9d1ed5876719f1f41d88139761"
+    "round": "r4",
+    "verdict": "712ff7bfc9625afe5ac73c9b407ea7f324ba9950"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
     {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0007",
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0008",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0007",
-      "pane_id": "w1G:pD",
+      "name": "hp-adeherdr-t-0008",
+      "pane_id": "w1G:pF",
       "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0007--/2026-09-19T17-08-39-275Z_01a0baa4-36eb-7126-a729-09f2ce0b7d19.jsonl",
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0008--/2026-09-19T17-24-17-536Z_01a0bab2-8800-716e-bc4b-be310e1f6cc5.jsonl",
       "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:t9",
-      "tab_label": "t-0007",
-      "title": "π - t-0007",
+      "status": "working",
+      "tab_id": "w1G:tB",
+      "tab_label": "t-0008",
+      "title": "π - t-0008",
       "tokens": {
-        "done": "1",
-        "lane": "t-0007",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
         "review": "working",
-        "thread": "t-0007"
+        "thread": "t-0008"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0011",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0011",
+      "pane_id": "w1G:pJ",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0011--/2026-09-19T17-42-31-415Z_01a0bac3-38f7-73c1-b893-720ebd7514ca.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:tE",
+      "tab_label": "t-0011",
+      "title": "π - t-0011",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0011",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0011"
       }
     }
   ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 3
+    "tabs": 4
   }
 }
