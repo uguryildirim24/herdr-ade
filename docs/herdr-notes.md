@@ -148,7 +148,9 @@ What the plugin takes from this:
 
 - Never key anything on `terminal_id`; re-resolve a pane by endpoint plus public pane id.
 - Tokens are a projection. The board rows (`ade_*`, TTL 300 s) and the thread tokens are re-sent every tick, so a handoff that drops them costs at most one tick. The records under the project root are the truth; the board is never read back.
-- The `talk` surface is a plain process in a tab and survives a live handoff like any other.
+- The `talk` surface is a process in a tab and survives a live handoff like any other. It now owns an alternate screen, raw input, bracketed paste and mouse tracking; its cleanup guard restores all of them on exit, setup or draw failure, and unwinding.
+- The project screen adds no fork API: it reads local records and shares one three-second agent/pane poll for coordinator and lane state. `F2` opens the full overview; `F6` chooses the scroll area. It does not claim herdr's `Ctrl+B` or `Ctrl+V`.
+- Copy conversation text with `ha talk <project> --replay`, without network calls or redelivery. After a plugin install, use `Ctrl+C` then `ha talk <project>` in the existing talk shell; `ha open` is not a stopped-screen restart. Neither restart nor scrolling submits anything.
 
 ## ADE: what fork round r2 changes (SPEC-ADE §0.4)
 
