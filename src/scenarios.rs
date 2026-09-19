@@ -97,6 +97,17 @@ impl World {
         project
     }
 
+    /// Add a local repository to the project's `PROJECT.md`.
+    pub fn add_repo(&self, project: &Project, path: &str) {
+        let (mut settings, body) = project.read_project_md().unwrap();
+        settings.repos.push(project::Repo {
+            path: path.to_string(),
+            ..project::Repo::default()
+        });
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(project.project_md(), format!("+++\n{front}+++\n\n{body}")).unwrap();
+    }
+
     pub fn coordinator_pane(&self, project: &Project) -> String {
         pane_json(
             "w1",
@@ -1649,4 +1660,187 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
         parse_json_stdout(&talk)["result"]["root_pane"]["pane_id"],
         "w1:p-talk"
     );
+}
+
+// ---------------------------------------------------------- harness (t-0054)
+
+fn harness_repo(home: &Path, name: &str, package: &str) -> String {
+    let repo = home.join(name);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+    std::fs::canonicalize(&repo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
+    let dir = world.home.path().join("cfg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rows: Vec<String> = repos
+        .iter()
+        .map(|(path, box_path)| format!("  {{ path = \"{path}\", box_path = \"{box_path}\" }},"))
+        .collect();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("[harness]\nrepos = [\n{}\n]\n", rows.join("\n")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn harness_install_builds_and_installs_each_repo_kind() {
+    let world = World::new();
+    let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
+    let fork = harness_repo(world.home.path(), "fork", "herdr");
+    write_harness_config(
+        &world,
+        &[
+            (&plugin, "/home/ubuntu/projects/herdr-ade"),
+            (&fork, "/home/ubuntu/projects/herdr"),
+        ],
+    );
+    world.runner.on("cargo build", ok(""));
+    world.runner.on("cp ", ok(""));
+    world.runner.on("--version", ok("installed version\n"));
+    // No `machine list` rule: `oci` is not saved, so no box step.
+
+    crate::harness::install(&world.ctx()).unwrap();
+
+    let calls = world.runner.calls.borrow();
+    let builds: Vec<_> = calls.iter().filter(|c| c.program == "cargo").collect();
+    assert_eq!(builds.len(), 2, "one build per repo");
+    let plugin_build = builds
+        .iter()
+        .find(|c| c.cwd.as_deref() == Some(Path::new(&plugin)))
+        .expect("plugin build");
+    assert!(
+        !plugin_build.env.iter().any(|(k, _)| k == "ZIG"),
+        "the plugin build has no ZIG"
+    );
+    assert!(plugin_build.env.iter().any(|(k, _)| k == "DEVELOPER_DIR"));
+    assert!(
+        plugin_build
+            .env
+            .iter()
+            .any(|(k, v)| k == "PATH" && v.starts_with("/bin:"))
+    );
+    let fork_build = builds
+        .iter()
+        .find(|c| c.cwd.as_deref() == Some(Path::new(&fork)))
+        .expect("fork build");
+    assert!(
+        fork_build
+            .env
+            .iter()
+            .any(|(k, v)| { k == "ZIG" && v == &format!("{fork}/.target/rebase/zig-0.16.0/zig") })
+    );
+
+    let installs: Vec<String> = calls
+        .iter()
+        .filter(|c| c.program == "cp")
+        .map(|c| c.args.last().cloned().unwrap_or_default())
+        .collect();
+    assert!(
+        installs.iter().any(|p| p.ends_with("herdr-ade")),
+        "{installs:?}"
+    );
+    assert!(
+        installs.iter().any(|p| p.ends_with("herdr-pi")),
+        "{installs:?}"
+    );
+    assert!(
+        installs.iter().any(|p| p.ends_with("herdr")),
+        "{installs:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.display().contains("--version"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        calls.iter().filter(|c| c.program == "ssh").count(),
+        0,
+        "no box step without a saved `oci`"
+    );
+}
+
+#[test]
+fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
+    let plugin = |world: &World| {
+        (
+            harness_repo(world.home.path(), "plugin", "herdr-ade"),
+            harness_repo(world.home.path(), "fork", "herdr"),
+        )
+    };
+
+    let with_box = World::new();
+    let (p, f) = plugin(&with_box);
+    write_harness_config(
+        &with_box,
+        &[
+            (&p, "/home/ubuntu/projects/herdr-ade"),
+            (&f, "/home/ubuntu/projects/herdr"),
+        ],
+    );
+    with_box.runner.on("cargo build", ok(""));
+    with_box.runner.on("cp ", ok(""));
+    with_box.runner.on("--version", ok("installed version\n"));
+    with_box.runner.on("ssh", ok(""));
+    with_box.runner.on(
+        "machine list --json",
+        ok(r#"[{"id":"oci","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
+    );
+    crate::harness::install(&with_box.ctx()).unwrap();
+    assert_eq!(with_box.runner.count("ssh"), 2, "one box build per repo");
+    let calls = with_box.runner.calls.borrow();
+    let scripts: Vec<String> = calls
+        .iter()
+        .filter(|c| c.program == "ssh")
+        .map(|c| c.args.last().cloned().unwrap_or_default())
+        .collect();
+    assert!(
+        scripts.iter().all(|s| s.contains("git fetch --quiet")
+            && s.contains("git merge --ff-only")
+            && s.contains("cargo build --release --locked")
+            && s.contains("cp target/release/")),
+        "{scripts:?}"
+    );
+    drop(calls);
+
+    let without_box = World::new();
+    let (p, f) = plugin(&without_box);
+    write_harness_config(
+        &without_box,
+        &[
+            (&p, "/home/ubuntu/projects/herdr-ade"),
+            (&f, "/home/ubuntu/projects/herdr"),
+        ],
+    );
+    without_box.runner.on("cargo build", ok(""));
+    without_box.runner.on("cp ", ok(""));
+    without_box
+        .runner
+        .on("--version", ok("installed version\n"));
+    without_box.runner.on("ssh", ok(""));
+    crate::harness::install(&without_box.ctx()).unwrap();
+    assert_eq!(without_box.runner.count("ssh"), 0);
+}
+
+#[test]
+fn harness_install_lock_refuses_a_second_install() {
+    let world = World::new();
+    let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
+    write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
+    let _held = crate::harness::lock(&world.home.path().join("cfg")).unwrap();
+    let error = crate::harness::install(&world.ctx())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("harness_install_busy"), "{error}");
 }

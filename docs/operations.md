@@ -26,7 +26,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator pane, ticker state, lock
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
-~/.config/herdr-ade/config.toml             yours, edited by hand; holds the roles table
+~/.config/herdr-ade/config.toml             the harness settings: roles, recipes, machines and the harness repositories; any coordinator may edit it
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
@@ -35,6 +35,8 @@ Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>
 `PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`), `talk` (default: on for a `claude` coordinator), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. Kind and args come from the roles table in `~/.config/herdr-ade/config.toml` (`[roles.<name>]` with `kind`, `args`, `env`, `ready_timeout_ms`). Day-one roles: `coordinator`, `lane`, `reviewer`, `critic`, `drafter`, `pro`. A project may override `kind` and `args` per role; arrays replace, they do not merge. A kind change without `args` is refused.
 
 The birth sentence is required: `thread start` and `thread adopt` take `--plain`. The checker refuses an empty sentence, more than one sentence, or a sentence that fails R1–R5. Default role is `lane`. `--passive` on adopt sets the parent token and sends no primer.
+
+`config.toml` also carries the harness repositories under `[harness] repos` (rows with `path` and `box_path`, the same shape a project's `repos` rows have). Every project may start a lane or open a round on a harness repository, listed in `PROJECT.md` or not; a repository that is neither listed nor a harness repository is refused. `harness install` builds each harness repository after a merge and installs it into `~/.local/bin`, then the same on a saved box.
 
 ## Commands
 
@@ -53,6 +55,7 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list [--json]`, `decide show <id>` | The log of choices the coordinator made without asking. |
 | `say --what S [--means S] [--landed-round R]` | One checked line on the board and in talk. `--landed-round` marks it as landing evidence for a merged round. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
+| `harness install` | Build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. `delete` moves the folder to `.trash/`. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 
@@ -122,7 +125,7 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 ## What the safety settings do and don't stop
 
-- **They are soft.** Agents have a shell. The guards are the skill text, your agent's permission prompts, keeping `config.toml` and approvals outside every agent's working directory, and `routine approve` refusing without a terminal and a typed confirmation. None of this stops an agent that runs with skip-permission arguments from editing those files directly.
+- **They are soft.** Agents have a shell. The guards are the skill text, your agent's permission prompts, keeping the approval list outside every agent's working directory, and `routine approve` refusing without a terminal and a typed confirmation. None of this stops an agent that runs with skip-permission arguments from editing those files directly.
 - **A thread can impersonate you.** Any thread agent can prompt the coordinator's pane through Herdr, and that message carries no ticker marker. The skill's rule that a go-ahead must name the threads lowers the risk; it does not remove it.
 - **An approved routine command covers the command text only.** `./check.sh` keeps its hash while the script changes.
 - **Prompt injection is reduced, not removed.** The coordinator reads reports and may choose to fetch pull request comments itself. Memory is a carrier: whatever it writes there is inlined into every later brief.
