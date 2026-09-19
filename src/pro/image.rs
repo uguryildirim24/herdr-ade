@@ -214,6 +214,7 @@ fn ensure_lane(
             cwd: Some(cwd_text),
             profile: Some(home::IMAGE_PROFILE.to_string()),
             images: pictures.to_vec(),
+            ready_timeout_ms: None,
         },
     )
 }
