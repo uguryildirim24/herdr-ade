@@ -1189,7 +1189,9 @@ mod tests {
     #[test]
     fn an_unchecked_say_is_not_appended() {
         let fx = fixture();
-        assert!(crate::ask::say(&fx.world.ctx(), "demo", "Run the F-cap gate now.", None).is_err());
+        assert!(
+            crate::ask::say(&fx.world.ctx(), "demo", "Run the zorbulate gate now.", None).is_err()
+        );
         assert!(!journal_path(&fx.project).exists());
     }
 }

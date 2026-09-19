@@ -338,7 +338,13 @@ fn check_r3(text: &str, glossary: &Glossary) -> Vec<Violation> {
 }
 
 fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
-    let admitted = admitted_words(glossary);
+    let extra = glossary_words(glossary);
+    let is_admitted = |word: &str| {
+        word == "rolf"
+            || shipped_words().contains(word)
+            || plugin_vocabulary().contains(word)
+            || extra.contains(word)
+    };
     let mut violations = Vec::new();
     for token in tokens(text) {
         if glossary.is_known_name(token.raw) || is_identifier_shaped(token.raw) {
@@ -351,7 +357,7 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
         // A possessive is its word: "the coordinator's pane" (SPEC-ADE item 73).
         let base = lower.strip_suffix("'s").unwrap_or(&lower);
         let raw_base = token.raw.strip_suffix("'s").unwrap_or(token.raw);
-        if base == "rolf" || admitted.contains(base) || glossary.is_known_name(raw_base) {
+        if is_admitted(base) || glossary.is_known_name(raw_base) {
             continue;
         }
         // Numbers with units and ordinals (`10s`, `1st`, `r2`) pass; R3 owns
@@ -366,7 +372,7 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
             .filter(|part| part.chars().any(char::is_alphabetic))
             .any(|part| {
                 let part = part.strip_suffix("'s").unwrap_or(part);
-                part != "rolf" && !admitted.contains(part)
+                !is_admitted(part)
             });
         if unknown {
             violations.push(Violation {
@@ -375,7 +381,9 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
                     start: token.start,
                     end: token.end,
                 },
-                fix: format!("replace {lower} or add it to the glossary with a sentence"),
+                fix: format!(
+                    "replace {base} with words, or run: ha term add {base} --plain \"one sentence that says what {base} is\""
+                ),
             });
         }
     }
@@ -454,9 +462,11 @@ fn check_question_form(question: &str, choices: &[String], glossary: &Glossary) 
     violations
 }
 
-fn admitted_words(glossary: &Glossary) -> BTreeSet<String> {
-    let mut set = shipped_words().clone();
-    set.extend(plugin_vocabulary().iter().cloned());
+/// Words from the glossary's recorded sentences and names, lowercased. The
+/// shipped and vocabulary lists are consulted directly, so the big list is
+/// never cloned (SPEC-ADE D17 R4).
+fn glossary_words(glossary: &Glossary) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
     for sentence in glossary.names.values().chain(glossary.terms.values()) {
         for token in tokens(sentence) {
             set.insert(token.raw.to_ascii_lowercase());
@@ -715,11 +725,15 @@ mod tests {
 
     fn list_is_clean(text: &str) {
         let mut lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-        assert!(
-            lines
-                .iter()
-                .all(|l| l.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
-        );
+        assert!(lines.iter().all(|l| {
+            let mut chars = l.chars();
+            let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+            let last_ok = l.chars().last().is_some_and(|c| c.is_ascii_lowercase());
+            first_ok
+                && last_ok
+                && l.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '-' || c == '\'')
+        }));
         let unique = lines.len();
         lines.sort();
         lines.dedup();
@@ -733,7 +747,10 @@ mod tests {
     fn word_lists_load_sorted_unique_lowercase_and_contain_vocabulary() {
         list_is_clean(WORDS_TXT);
         list_is_clean(VOCAB_TXT);
-        assert_eq!(shipped_words().len(), 5000);
+        // 2026-09-19: ordinary coordinator replies were rejected for these.
+        for word in ["paused", "earpiece", "everyday", "inflections", "don't"] {
+            assert!(shipped_words().contains(word), "{word}");
+        }
         for word in plugin_vocabulary() {
             assert!(
                 shipped_words().contains(word) || plugin_vocabulary().contains(word),
@@ -838,8 +855,8 @@ mod tests {
             pass.violations
         );
         let fail = check_ask(
-            "choose the quotient or the normal form",
-            &["choose the quotient or the normal form".into()],
+            "choose the zorbulate or the normal form",
+            &["choose the zorbulate or the normal form".into()],
             &g,
         );
         assert!(codes(&fail).contains(&"plain_unknown_word"));
@@ -903,11 +920,11 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_choose_quotient_fails_r4_and_r6() {
+    fn adversarial_choose_unknown_word_fails_r4_and_r6() {
         let result = check_ask(
-            "choose the quotient or the normal form",
+            "choose the zorbulate or the normal form",
             &[
-                "choose the quotient or the normal form".into(),
+                "choose the zorbulate or the normal form".into(),
                 "you decide".into(),
             ],
             &Glossary::default(),
