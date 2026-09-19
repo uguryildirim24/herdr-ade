@@ -226,13 +226,24 @@ fn join_text(thread: std::thread::JoinHandle<Vec<u8>>) -> String {
     String::from_utf8_lossy(&thread.join().unwrap_or_default()).into_owned()
 }
 
-/// Run one command through the login shell, the way the user's terminal would
-/// see it (`zsh -lic`). Doctor and check use this, never a bare `sh -c`.
-pub fn login_shell(runner: &dyn Runner, script: &str) -> Result<Output> {
-    runner.run(&Cmd::new("zsh", SHORT).args(["-lic", script]))
+/// The interactive login shell a pane starts in `auto` mode: `$SHELL`, with
+/// zsh as the fallback. SPEC-remote §3.3 replaces the hard-coded `zsh -lic`
+/// probe with the machine's own shell (zsh is absent on the box).
+pub fn shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "zsh".into())
 }
 
-/// A `zsh -lic` command's first output line, trimmed.
+/// Run one command through the login shell, the way the user's terminal would
+/// see it (`$SHELL -lic`). Doctor and check use this, never a bare `sh -c`.
+pub fn login_shell(runner: &dyn Runner, script: &str) -> Result<Output> {
+    runner.run(&Cmd::new(shell(), SHORT).args(["-lic", script]))
+}
+
+/// A `$SHELL -lic` command's first output line, trimmed.
 pub fn first_line(output: &Output) -> String {
     let text = if output.stdout.trim().is_empty() {
         &output.stderr

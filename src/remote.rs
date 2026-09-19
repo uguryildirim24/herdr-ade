@@ -294,9 +294,27 @@ pub fn provision_card(
     Ok(())
 }
 
+/// The courier's helper call over its multiplexed connection (SPEC-remote
+/// §4.3): the box-local helper runs `sh -c <script>` and the following
+/// `scp` reuses the same control socket.
+pub fn ssh_courier(
+    runner: &dyn Runner,
+    target: &str,
+    control_dir: &Path,
+    script: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    check_target(target)?;
+    let mut args = multiplex_options(control_dir);
+    args.extend(SSH_OPTIONS.iter().map(|s| (*s).to_string()));
+    args.push("--".into());
+    args.push(target.to_string());
+    args.push(format!("sh -c {}", quote(script)));
+    runner.run(&Cmd::new("ssh", timeout).args(args))
+}
+
 /// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per
-/// pass. The second lane's courier passes these on the helper and `scp` calls.
-#[allow(dead_code)]
+/// pass. The courier passes these on its helper and `scp` calls.
 pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
     let dir = control_dir.join("ssh");
     let _ = std::fs::create_dir_all(&dir);
