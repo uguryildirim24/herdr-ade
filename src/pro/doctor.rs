@@ -158,10 +158,23 @@ pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> 
     }
 
     // 7: the pi relay answers `/v1/models` with its own token when it runs.
-    // A stopped relay is a warning: the Codex-pane Pro lane still works.
+    // A stopped relay is a warning: the Codex-pane Pro lane still works. The
+    // row always names the readable roots and, when there is one, the last
+    // `serve.log` line.
+    let roots = serve::readable_roots(layout)
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let last = serve::last_log_line(layout)
+        .map(|line| format!("; last: {line}"))
+        .unwrap_or_default();
     match serve::models_health(runner, layout) {
-        Ok(detail) => rows.push(Row::ok("relay", detail)),
-        Err(error) => rows.push(Row::warn("relay", format!("{error:#}"))),
+        Ok(detail) => rows.push(Row::ok("relay", format!("{detail}; roots {roots}{last}"))),
+        Err(error) => rows.push(Row::warn(
+            "relay",
+            format!("{error:#}; roots {roots}{last}"),
+        )),
     }
 
     // herdr itself: the same floor the plugin needs for `--parent` on start.
