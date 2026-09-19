@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -18,6 +19,11 @@ use super::{Env, Layout, MODEL, bridge, doctor};
 /// `agent start` waits this long for a ready agent; a trust or sign-in prompt
 /// shows as a blocked screen and the start times out.
 const READY_TIMEOUT_MS: u64 = 120_000;
+
+/// After the agent is ready, wait this long for Codex to write its session
+/// rollout. A trust prompt never creates one, so a missing rollout means the
+/// lane is not usable.
+const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The exact trust prompt Codex shows for an untrusted directory (2026-09-19
 /// live run, Codex 0.155.1). It does not always read as `blocked`, so the
@@ -178,24 +184,57 @@ fn session_meta(path: &Path) -> Option<Meta> {
     })
 }
 
-fn write_lane_with_rollout(
-    env: &Env,
-    layout: &Layout,
-    lane: &mut Lane,
-    session_id: Option<&str>,
-    started: jiff::Timestamp,
-) {
-    let rollout = find_rollout(&env.lane_codex_home(), &lane.cwd, started, session_id);
-    if let Some(rollout) = rollout {
+/// Point `lane.rollout` at the lane's newest rollout, or return `None` when
+/// Codex has not written one yet. Also fills in `session_id` when it is empty.
+pub fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
+    let existing = lane
+        .rollout
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let path = existing.or_else(|| {
+        let started =
+            super::parse_rfc3339(&lane.started_at).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+        find_rollout(
+            &env.lane_codex_home(),
+            &lane.cwd,
+            started,
+            lane.session_id.as_deref(),
+        )
+    });
+    if let Some(path) = &path {
         if lane.session_id.is_none()
-            && let Some(meta) = session_meta(&rollout)
+            && let Some(meta) = session_meta(path)
             && !meta.id.is_empty()
         {
             lane.session_id = Some(meta.id);
         }
-        lane.rollout = Some(rollout.display().to_string());
+        lane.rollout = Some(path.display().to_string());
     }
-    let _ = layout;
+    path
+}
+
+/// Poll for the rollout after the agent is ready. A trust prompt never writes
+/// one, so this is the second half of "never report ready before the session
+/// exists".
+fn wait_for_rollout(env: &Env, lane: &mut Lane, timeout: Duration) -> Option<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(path) = refresh_rollout(env, lane) {
+            return Some(path);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The trust prompt currently on the pane's screen.
+fn trust_prompt_showing(runner: &dyn Runner, bin: &str, pane: &str) -> bool {
+    herdr_cli::pane_read(runner, bin, pane)
+        .map(|text| text.contains(TRUST_PROMPT))
+        .unwrap_or(false)
 }
 
 /// `herdr-pro start`: doctor, one serialized Codex start, then record.
@@ -293,7 +332,15 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         stopped: false,
         last_turn: None,
     };
-    write_lane_with_rollout(env, layout, &mut lane, session_id.as_deref(), started);
+    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+        let reason = screen_reason(runner, &bin, &pane.pane_id);
+        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        bail!(
+            "WAITING pro-bridge the lane has no Codex rollout after {}s in pane {}: {reason}",
+            ROLLOUT_TIMEOUT.as_secs(),
+            pane.pane_id
+        );
+    }
     if let Err(error) = lane.write(layout) {
         let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
         return Err(error);
@@ -318,13 +365,6 @@ fn screen_reason(runner: &dyn Runner, bin: &str, pane: &str) -> String {
         .and_then(|text| text.lines().last().map(str::trim).map(str::to_string))
         .filter(|line| !line.is_empty())
         .unwrap_or_else(|| "no readable screen".into())
-}
-
-/// The trust prompt currently on the pane's screen.
-fn trust_prompt_showing(runner: &dyn Runner, bin: &str, pane: &str) -> bool {
-    herdr_cli::pane_read(runner, bin, pane)
-        .map(|text| text.contains(TRUST_PROMPT))
-        .unwrap_or(false)
 }
 
 /// `herdr-pro resume`: start the lane again and resume its Codex thread.
@@ -366,7 +406,6 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &lane.cwd, name, &env_pairs)
         .context("could not create the resume tab")?;
-    let started = jiff::Timestamp::now();
     let agent = match herdr_cli::agent_start(
         runner,
         &bin,
@@ -404,7 +443,15 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     lane.workspace_id = pane.workspace_id;
     lane.state = "ready".into();
     lane.stopped = false;
-    write_lane_with_rollout(env, layout, &mut lane, Some(&session), started);
+    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+        let reason = screen_reason(runner, &bin, &lane.pane_id);
+        let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+        bail!(
+            "WAITING pro-bridge the resumed lane has no Codex rollout after {}s in pane {}: {reason}",
+            ROLLOUT_TIMEOUT.as_secs(),
+            lane.pane_id
+        );
+    }
     if let Err(error) = lane.write(layout) {
         let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
         return Err(error);
@@ -551,6 +598,62 @@ mod tests {
         assert!(error.to_string().contains("w1:p2"), "{error}");
         assert_eq!(runner.count("tab close"), 1);
         assert_eq!(runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn start_waits_for_the_rollout_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pro"));
+        layout.ensure().unwrap();
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        std::fs::create_dir_all(dir.path().join(".codex/sessions/2026/09/19")).unwrap();
+        std::fs::write(
+            dir.path().join(".codex/config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        // The rollout exists before the lane starts, so the poll returns at
+        // once; matching is by session id.
+        std::fs::write(
+            dir.path().join(".codex/sessions/2026/09/19/rollout-abc.jsonl"),
+            format!(
+                "{{\"timestamp\":\"2026-09-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"abc\",\"cwd\":\"{}\",\"timestamp\":\"2026-09-19T10:00:00Z\"}}}}\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            ":17841/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","accepting_turns":true}"#),
+        );
+        runner.on("codex login status", ok("Logged in\n"));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p2","name":"pro","agent":"codex","agent_status":"idle","agent_session":{"id":"abc"}}}}"#),
+        );
+        runner.on("pane read", ok("codex> \n"));
+        let lane = start(
+            &env,
+            &layout,
+            &runner,
+            &StartOptions {
+                name: "pro".into(),
+                parent: Some("w1:p1".into()),
+                cwd: Some(dir.path().display().to_string()),
+            },
+        )
+        .unwrap();
+        assert!(lane.rollout.as_deref().unwrap().ends_with("rollout-abc.jsonl"));
+        assert_eq!(lane.session_id.as_deref(), Some("abc"));
     }
 
     #[test]
