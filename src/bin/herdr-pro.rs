@@ -50,7 +50,7 @@ enum Command {
         name: String,
         /// The coordinator pane that owns the lane
         #[arg(long)]
-        parent: Option<String>,
+        parent: String,
         /// A trusted directory; default: the current directory
         #[arg(long)]
         cwd: Option<String>,
@@ -135,7 +135,7 @@ fn run(cli: &Cli) -> Result<bool> {
                 &runner,
                 &lane::StartOptions {
                     name: name.clone(),
-                    parent: parent.clone(),
+                    parent: Some(parent.clone()),
                     cwd: cwd.clone(),
                 },
             )?;

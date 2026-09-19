@@ -40,6 +40,7 @@ fn url(port: u16, path: &str) -> String {
 pub fn health(runner: &dyn Runner, port: u16) -> Result<Health> {
     let output = runner.run(&Cmd::new("curl", HTTP_TIMEOUT).args([
         "-sS",
+        "--fail-with-body",
         "--max-time",
         "5",
         &url(port, "/healthz"),
@@ -133,6 +134,7 @@ fn admin(runner: &dyn Runner, env: &Env, port: u16, path: &str) -> Result<String
     let auth = format!("Authorization: Bearer {token}");
     let output = runner.run(&Cmd::new("curl", HTTP_TIMEOUT).args([
         "-sS",
+        "--fail-with-body",
         "--max-time",
         "5",
         "-X",
@@ -143,6 +145,14 @@ fn admin(runner: &dyn Runner, env: &Env, port: u16, path: &str) -> Result<String
     ]))?;
     if !output.success() {
         bail!("bridge {path} failed: {}", output.error_text());
+    }
+    let body: Value = serde_json::from_str(output.stdout.trim())
+        .with_context(|| format!("bridge {path} did not answer JSON"))?;
+    let expected = path == "/admin/resume";
+    if body.get("status").and_then(Value::as_str) != Some("ok")
+        || body.get("accepting_turns").and_then(Value::as_bool) != Some(expected)
+    {
+        bail!("bridge {path} did not reach the requested state");
     }
     Ok(output.stdout.trim().to_string())
 }

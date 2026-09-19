@@ -19,7 +19,7 @@ use super::lane;
 use super::packet;
 use super::sh::Runner;
 use super::state::{self, BridgeState, Inflight, Lane, Turn};
-use super::{Env, Layout, bridge};
+use super::{Env, Layout, bridge, doctor};
 
 /// The poll interval while waiting on the rollout.
 const POLL: Duration = Duration::from_millis(500);
@@ -43,6 +43,13 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &TurnOptions
         Ok(()) => Ok(turn),
         Err(error) => {
             let _ = std::fs::remove_file(layout.inflight_lock(&turn.tag));
+            let _ = release_lane(layout, &turn.lane);
+            if let Ok(mut failed) = Turn::read(layout, &turn.tag) {
+                failed.state = "failed".into();
+                failed.finished_at = Some(super::now_rfc3339());
+                failed.detail = Some(format!("collector: {error:#}"));
+                let _ = failed.write(layout);
+            }
             Err(error)
         }
     }
@@ -57,25 +64,19 @@ pub fn prepare(
     opts: &TurnOptions,
 ) -> Result<Turn> {
     layout.ensure()?;
+    state::check_name(&opts.lane)?;
+    let _admission = state::FileLock::acquire(&layout.turn_lock())?;
     let mut lane = Lane::read(layout, &opts.lane)?;
     if lane.stopped {
         bail!("lane `{}` is stopped", opts.lane);
     }
-    if lane.state == "in_turn" {
+    if !lane.ready() {
         bail!(
-            "lane `{}` is in a turn; wait for its DONE or WAITING",
-            opts.lane
-        );
-    }
-    let agent = lane::agent_ready(env, runner, &lane)?;
-    if !agent.ready() {
-        bail!(
-            "lane `{}` reads {}; wait for idle or resolve the blocked screen",
+            "lane `{}` is {}; only a ready lane accepts a turn",
             opts.lane,
-            agent.agent_status
+            lane.state
         );
     }
-
     let now = jiff::Timestamp::now();
     if state::cooldown_active(layout, now) {
         let until = state::cooldown_until(layout)
@@ -86,15 +87,23 @@ pub fn prepare(
         );
     }
     let inflight = state::inflight_count(layout);
-    if inflight >= super::INFLIGHT_DEFAULT {
+    let inflight_limit = env.inflight_limit()?;
+    if inflight >= inflight_limit {
         bail!(
-            "refused: {inflight} turns already in flight (default {}, hard max {})",
-            super::INFLIGHT_DEFAULT,
+            "refused: {inflight} turns already in flight (limit {inflight_limit}, hard max {})",
             super::INFLIGHT_MAX
         );
     }
-    if opts.out.exists() {
-        bail!("refused: {} already exists", opts.out.display());
+    let out = std::path::absolute(&opts.out)
+        .with_context(|| format!("bad output path {}", opts.out.display()))?;
+    if out.to_string_lossy().chars().any(char::is_whitespace) {
+        bail!(
+            "refused: output path {} contains whitespace and cannot form a DONE line",
+            out.display()
+        );
+    }
+    if out.exists() {
+        bail!("refused: {} already exists", out.display());
     }
 
     let tag = match &opts.id {
@@ -106,7 +115,18 @@ pub fn prepare(
         bail!("refused: turn `{tag}` already exists");
     }
 
-    let packet = packet::build(&opts.brief, &opts.attachments, &opts.out)?;
+    doctor::gate(env, layout, runner)
+        .map_err(|error| anyhow::anyhow!("refused: doctor failed before the turn: {error:#}"))?;
+    let agent = lane::agent_ready(env, runner, &lane)?;
+    if !agent.ready() {
+        bail!(
+            "lane `{}` reads {}; wait for idle or resolve the blocked screen",
+            opts.lane,
+            agent.agent_status
+        );
+    }
+
+    let packet = packet::build(&opts.brief, &opts.attachments, &out)?;
 
     // The breaker sees a daemon restart on a changed pid (spec §4).
     let (port, health) = bridge::health_any(runner)?;
@@ -130,7 +150,7 @@ pub fn prepare(
         tag: tag.clone(),
         lane: lane.name.clone(),
         brief: opts.brief.display().to_string(),
-        out: opts.out.display().to_string(),
+        out: out.display().to_string(),
         notify: opts.notify.clone(),
         attachments: opts
             .attachments
@@ -148,11 +168,14 @@ pub fn prepare(
         written: None,
     };
     turn.write(layout)?;
-    Inflight::create(layout, &tag)?;
+    let inflight = Inflight::create(layout, &tag)?;
 
     lane.last_turn = Some(tag);
-    lane.state = "ready".into();
-    lane.write(layout)?;
+    lane.state = "in_turn".into();
+    if let Err(error) = lane.write(layout) {
+        inflight.release();
+        return Err(error);
+    }
     Ok(turn)
 }
 
@@ -205,6 +228,20 @@ impl Drop for InflightGuard {
 
 /// The detached worker (`herdr-pro collector`).
 pub fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Result<()> {
+    let result = collect_inner(env, layout, runner, tag);
+    if let Err(error) = result {
+        if let Ok(mut turn) = Turn::read(layout, tag) {
+            let detail = format!("{error:#}");
+            if finish_failed(env, layout, runner, &mut turn, "collector", &detail, true).is_ok() {
+                return Ok(());
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn collect_inner(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Result<()> {
     layout.ensure()?;
     let _guard = InflightGuard::new(layout, tag);
     let mut turn = Turn::read(layout, tag)?;
@@ -226,7 +263,7 @@ pub fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Re
             true,
         );
     };
-    let load = format!("!cat -- '{packet}'");
+    let load = format!("!cat -- {}", shell_quote(&packet));
     if let Err(error) = herdr_cli::agent_prompt(runner, &bin, &turn.lane, &load) {
         return finish_failed(
             env,
@@ -255,9 +292,6 @@ pub fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Re
     reader.drain()?;
     turn.state = "in_flight".into();
     turn.write(layout)?;
-    let mut lane = Lane::read(layout, &turn.lane)?;
-    lane.state = "in_turn".into();
-    lane.write(layout)?;
     state::record_usage(layout, &turn.lane, &turn.tag)?;
 
     let prompt = format!(
@@ -299,8 +333,7 @@ pub fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Re
                 turn.finished_at = Some(super::now_rfc3339());
                 turn.detail = Some(format!("delivered {} bytes", answer.len()));
                 turn.write(layout)?;
-                lane.state = "ready".into();
-                lane.write(layout)?;
+                release_lane(layout, &turn.lane)?;
                 let done = format!("DONE {} {} -", turn.tag, written.display());
                 let note = notify(runner, &bin, &turn.notify, &done);
                 record_note(layout, &mut turn, note);
@@ -343,15 +376,13 @@ fn finish_failed(
     detail: &str,
     trip: bool,
 ) -> Result<()> {
-    let mut tripped = false;
     if trip {
         let prior = state::recent_failures(
             layout,
             jiff::Timestamp::now(),
             super::FAILURE_WINDOW.as_secs() as i64,
         );
-        tripped = prior >= 1;
-        if tripped {
+        if prior >= 1 {
             let _ = trip_breaker(
                 env,
                 layout,
@@ -366,14 +397,25 @@ fn finish_failed(
     turn.finished_at = Some(super::now_rfc3339());
     turn.detail = Some(format!("{code}: {detail}"));
     turn.write(layout)?;
-    if let Ok(mut lane) = Lane::read(layout, &turn.lane) {
-        lane.state = if tripped { "cooldown" } else { "failed" }.into();
-        let _ = lane.write(layout);
-    }
+    // The turn record keeps the failure. The lane returns to ready; the
+    // global cooldown file is the breaker gate when this failure tripped.
+    let _ = release_lane(layout, &turn.lane);
     let waiting = format!("WAITING {} pro {code}: {detail}", turn.tag);
     let note = notify(runner, &env.herdr_bin(), &turn.notify, &waiting);
     record_note(layout, turn, note);
     Ok(())
+}
+
+fn release_lane(layout: &Layout, name: &str) -> Result<()> {
+    let _admission = state::FileLock::acquire(&layout.turn_lock())?;
+    let mut lane = Lane::read(layout, name)?;
+    lane.state = if lane.stopped || lane.state == "gone" {
+        "gone"
+    } else {
+        "ready"
+    }
+    .into();
+    lane.write(layout)
 }
 
 fn record_note(layout: &Layout, turn: &mut Turn, note: Result<(), String>) {
@@ -403,6 +445,10 @@ pub fn trip_breaker(
     format!("cooldown until {until}: {reason}; {drain}")
 }
 
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// Type one line to the coordinator, retried once after five seconds.
 fn notify(runner: &dyn Runner, bin: &str, target: &str, text: &str) -> Result<(), String> {
     let mut last = String::new();
@@ -420,19 +466,40 @@ fn notify(runner: &dyn Runner, bin: &str, target: &str, text: &str) -> Result<()
 
 /// A non-empty answer with an atomic, never-overwriting write.
 fn write_answer(requested: &Path, answer: &str) -> Result<PathBuf> {
+    use std::io::Write;
+
+    let dir = requested.parent().unwrap_or(Path::new("."));
+    let file_name = requested
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "answer".into());
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = dir.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("could not create {}", temp.display()))?;
+    if let Err(error) = file
+        .write_all(answer.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).with_context(|| format!("could not write {}", temp.display()));
+    }
+    drop(file);
+
     let mut candidate = requested.to_path_buf();
     for n in 1..1000u32 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(answer.as_bytes())
-                    .with_context(|| format!("could not write {}", candidate.display()))?;
-                file.sync_all()
-                    .with_context(|| format!("could not fsync {}", candidate.display()))?;
+        match std::fs::hard_link(&temp, &candidate) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&temp);
+                if let Ok(directory) = std::fs::File::open(dir) {
+                    let _ = directory.sync_all();
+                }
                 return Ok(candidate);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -444,15 +511,16 @@ fn write_answer(requested: &Path, answer: &str) -> Result<PathBuf> {
                     .extension()
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
-                let dir = requested.parent().unwrap_or(Path::new("."));
                 candidate = dir.join(format!("{stem}.{n}{ext}"));
             }
             Err(error) => {
+                let _ = std::fs::remove_file(&temp);
                 return Err(error)
                     .with_context(|| format!("could not create {}", candidate.display()));
             }
         }
     }
+    let _ = std::fs::remove_file(&temp);
     bail!(
         "could not find an unused answer path next to {}",
         requested.display()
@@ -468,29 +536,51 @@ pub enum Outcome {
 }
 
 fn classify(completion: &Completion) -> Outcome {
-    let all: String = completion
+    let non_result_events = completion
         .events
         .iter()
-        .map(|event| event.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if all.contains("rate_limit_exceeded") || all.contains("Stopped thinking") {
+        .filter(|event| task_complete(event).is_none());
+    let route_stopped = completion.answer.trim() == "Stopped thinking"
+        || non_result_events.clone().any(|event| {
+            value_contains(event, "rate_limit_exceeded")
+                || value_contains(event, "Stopped thinking")
+        });
+    if route_stopped {
         return Outcome::Cooldown("the route reported a rate limit or stopped thinking".into());
     }
-    if all.contains("chatgpt_session_expired") {
+    if non_result_events
+        .clone()
+        .any(|event| value_contains(event, "chatgpt_session_expired"))
+    {
         return Outcome::Failed("login: the ChatGPT session expired".into());
+    }
+    let has_error = completion.events.iter().any(error_event);
+    if has_error {
+        return Outcome::Failed("the turn contained an error or stream_error event".into());
     }
     if !completion.answer.trim().is_empty() {
         return Outcome::Delivered(completion.answer.clone());
     }
-    Outcome::Failed(format!(
-        "the turn completed with no answer{}",
-        if all.contains("stream_error") {
-            " (stream_error)"
-        } else {
-            ""
-        }
-    ))
+    Outcome::Failed("the turn completed with no answer".into())
+}
+
+fn value_contains(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(needle),
+        Value::Array(values) => values.iter().any(|value| value_contains(value, needle)),
+        Value::Object(values) => values.values().any(|value| value_contains(value, needle)),
+        _ => false,
+    }
+}
+
+fn error_event(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("error" | "stream_error" | "response.failed")
+    ) || matches!(
+        event.pointer("/payload/type").and_then(Value::as_str),
+        Some("error" | "stream_error" | "response.failed")
+    )
 }
 
 /// The turn's result from the rollout.
@@ -539,22 +629,27 @@ fn is_shell_command(event: &Value, packet: &str) -> bool {
     })
 }
 
-/// Wait for the `!cat` item to appear in the rollout.
+/// Wait for the `!cat` item and its own completion. Waiting for completion
+/// keeps that empty turn from being mistaken for the TURN sent next.
 fn wait_for_shell_command(
     reader: &mut RolloutReader,
     packet: &str,
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut seen = false;
     loop {
         for event in reader.new_events()? {
             if is_shell_command(&event, packet) {
+                seen = true;
+            }
+            if seen && task_complete(&event).is_some() {
                 return Ok(());
             }
         }
         if Instant::now() >= deadline {
             bail!(
-                "the packet did not appear in the rollout within {}s",
+                "the packet did not finish loading within {}s",
                 timeout.as_secs()
             );
         }
@@ -844,6 +939,7 @@ mod tests {
             ":17841/healthz",
             ok(r#"{"version":"5.0.8","mode":"browser-only","pid":9,"accepting_turns":true}"#),
         );
+        runner.on("codex login status", ok("Logged in\n"));
         let options = |n| TurnOptions {
             lane: "pro".into(),
             brief: brief.clone(),
@@ -943,6 +1039,7 @@ mod tests {
             ":17841/healthz",
             ok(r#"{"version":"5.0.8","mode":"browser-only","pid":7,"accepting_turns":true}"#),
         );
+        runner.on("codex login status", ok("Logged in\n"));
         let turn = prepare(
             &env,
             &layout,

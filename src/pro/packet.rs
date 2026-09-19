@@ -70,14 +70,12 @@ fn fence_for(content: &str) -> String {
 }
 
 fn section(path: &Path, text: &str) -> Result<String> {
-    if let Some(reason) = secret_reason(path) {
-        bail!(
-            "refusing `{}`: it looks like a {reason} and never enters a packet",
-            path.display()
-        );
-    }
+    refuse_secret(path)?;
     let absolute =
         std::path::absolute(path).with_context(|| format!("bad path {}", path.display()))?;
+    let canonical = std::fs::canonicalize(&absolute)
+        .with_context(|| format!("could not resolve {}", absolute.display()))?;
+    refuse_secret(&canonical)?;
     let fence = fence_for(text);
     Ok(format!(
         "=== {} ===\n{fence}\n{}\n{fence}\n\n",
@@ -89,6 +87,12 @@ fn section(path: &Path, text: &str) -> Result<String> {
 /// Build the packet for one turn. The brief and every attachment must exist
 /// and pass the secret filter.
 pub fn build(brief: &Path, attachments: &[PathBuf], out: &Path) -> Result<Packet> {
+    refuse_secret(out)?;
+    if let (Some(parent), Some(name)) = (out.parent(), out.file_name()) {
+        let parent = std::fs::canonicalize(parent)
+            .with_context(|| format!("could not resolve output folder {}", parent.display()))?;
+        refuse_secret(&parent.join(name))?;
+    }
     let brief_text = std::fs::read_to_string(brief)
         .with_context(|| format!("could not read the brief {}", brief.display()))?;
     let mut text = section(brief, &brief_text)?;
@@ -123,6 +127,16 @@ pub fn build(brief: &Path, attachments: &[PathBuf], out: &Path) -> Result<Packet
         tokens,
         files,
     })
+}
+
+fn refuse_secret(path: &Path) -> Result<()> {
+    if let Some(reason) = secret_reason(path) {
+        bail!(
+            "refusing `{}`: it looks like a {reason} and never enters a packet",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn absolute_string(path: &Path) -> Result<String> {

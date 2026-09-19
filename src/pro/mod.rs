@@ -125,6 +125,23 @@ impl Env {
             .map(|home| format!("CODEX_HOME={}", home.display()))
     }
 
+    /// Concurrent Pro turns: two by default, configurable up to the hard cap
+    /// of four.
+    pub fn inflight_limit(&self) -> Result<usize> {
+        let Some(raw) = self.var("HERDR_PRO_MAX_INFLIGHT") else {
+            return Ok(INFLIGHT_DEFAULT);
+        };
+        let limit = raw
+            .parse::<usize>()
+            .with_context(|| format!("HERDR_PRO_MAX_INFLIGHT is not a number: {raw}"))?;
+        if !(1..=INFLIGHT_MAX).contains(&limit) {
+            anyhow::bail!(
+                "HERDR_PRO_MAX_INFLIGHT must be between 1 and {INFLIGHT_MAX}, got {limit}"
+            );
+        }
+        Ok(limit)
+    }
+
     /// The bridge's own home: `CODEX_CHATGPT_WEB_HOME` else `~/.codex-chatgpt-web`.
     pub fn bridge_home(&self) -> PathBuf {
         match self.var("CODEX_CHATGPT_WEB_HOME") {
@@ -174,6 +191,10 @@ impl Layout {
 
     pub fn start_lock(&self) -> PathBuf {
         self.root.join("start.lock")
+    }
+
+    pub fn turn_lock(&self) -> PathBuf {
+        self.root.join("turn.lock")
     }
 
     pub fn cooldown(&self) -> PathBuf {
