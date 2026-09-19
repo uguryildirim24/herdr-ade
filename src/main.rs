@@ -13,6 +13,7 @@ mod doctor;
 mod events;
 mod git;
 mod glossary;
+mod harness;
 mod herdr;
 mod hook;
 mod inbox;
