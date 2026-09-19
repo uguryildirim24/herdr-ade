@@ -204,7 +204,14 @@ impl Overview {
         let mut out = Self::default();
         match project.read_project_md() {
             Ok((s, _)) => {
-                out.name = safe(project, &s.name, "Your project");
+                // The project name is Rolf's label, not generated overview
+                // prose. Keep it exactly as stored; only an absent name gets
+                // the fixed fallback.
+                out.name = if s.name.is_empty() {
+                    "Your project".into()
+                } else {
+                    s.name
+                };
                 out.sections[0].push(Row::text(if s.goal.is_empty() {
                     EMPTY[0].into()
                 } else {
@@ -443,6 +450,22 @@ mod tests {
                 .contains("needs you Build the screen. last seen")
         }));
         assert_eq!(fx.world.runner.calls.borrow().len(), before);
+    }
+
+    #[test]
+    fn the_header_keeps_the_project_name_even_when_it_is_not_plain_prose() {
+        let fx = fixture();
+        let path = fx.project.project_md();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replacen("name = \"Demo\"", "name = \"Adeherdr\"", 1))
+            .unwrap();
+        let overview = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        assert_eq!(overview.name, "Adeherdr");
     }
 
     #[test]
