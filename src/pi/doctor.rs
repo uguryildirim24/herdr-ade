@@ -774,20 +774,27 @@ mod tests {
 
     fn scripted(env: &Env) -> FakeRunner {
         let link = env.home.join(".local/bin/pi");
+        let shell = sh::shell();
+        let probe = path_probe(&shell);
         let runner = FakeRunner::new();
-        runner.on("zsh -lic node --version", ok("v22.19.0\n"));
-        runner.on("zsh -lic command -v npm", ok("/opt/homebrew/bin/npm\n"));
+        runner.on(&format!("{shell} -lic node --version"), ok("v22.19.0\n"));
         runner.on(
-            "zsh -lic npm root -g",
+            &format!("{shell} -lic command -v npm"),
+            ok("/opt/homebrew/bin/npm\n"),
+        );
+        runner.on(
+            &format!("{shell} -lic npm root -g"),
             ok(&format!(
                 "{}\n",
                 env.home.join("global/node_modules").display()
             )),
         );
-        runner.on(
-            "zsh -lic whence -va pi",
-            ok(&format!("pi is {}\n", link.display())),
-        );
+        let resolution = if probe == "command -v pi" {
+            format!("{}\n", link.display())
+        } else {
+            format!("pi is {}\n", link.display())
+        };
+        runner.on(&format!("{shell} -lic {probe}"), ok(&resolution));
         runner.on("herdr integration status", ok("pi: current\n"));
         runner.on("--version", ok("0.85.1\n"));
         runner
@@ -866,7 +873,10 @@ mod tests {
                 link.display()
             )),
         );
-        assert_eq!(wrapper_path_row(&runner, &env, &layout).level, Level::Ok);
+        assert_eq!(
+            wrapper_path_row_with(&runner, &env, &layout, "/bin/zsh").level,
+            Level::Ok
+        );
         let runner = FakeRunner::new();
         runner.on(
             "zsh -lic whence -va pi",
@@ -875,7 +885,10 @@ mod tests {
                 link.display()
             )),
         );
-        assert_eq!(wrapper_path_row(&runner, &env, &layout).level, Level::Fail);
+        assert_eq!(
+            wrapper_path_row_with(&runner, &env, &layout, "/bin/zsh").level,
+            Level::Fail
+        );
     }
 
     #[test]
