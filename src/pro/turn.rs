@@ -105,6 +105,16 @@ pub fn prepare(
     if out.exists() {
         bail!("refused: {} already exists", out.display());
     }
+    // A lane with no Codex rollout cannot be collected, and the collector
+    // would type the packet before it found that out: refuse before anything
+    // is sent. `start` guarantees a rollout, so a missing one means a stale or
+    // hand-made record.
+    if lane::refresh_rollout(env, &mut lane).is_none() {
+        bail!(
+            "refused: lane `{}` has no Codex rollout yet; start or resume it and wait for the session file",
+            opts.lane
+        );
+    }
 
     let tag = match &opts.id {
         Some(id) => id.clone(),
@@ -773,6 +783,29 @@ mod tests {
     use crate::pro::sh::fake::{FakeRunner, ok};
     use serde_json::json;
 
+    /// A ready lane record with a rollout file on disk, so `prepare`'s rollout
+    /// gate passes. Returns the lane file path the record was written to.
+    fn write_ready_lane(dir: &Path, layout: &Layout) {
+        let rollout = dir.join("rollout-pro.jsonl");
+        std::fs::write(&rollout, "{}\n").unwrap();
+        Lane {
+            name: "pro".into(),
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t2".into(),
+            workspace_id: "w1".into(),
+            parent: None,
+            cwd: "/w".into(),
+            session_id: None,
+            rollout: Some(rollout.display().to_string()),
+            started_at: crate::pro::now_rfc3339(),
+            state: "ready".into(),
+            stopped: false,
+            last_turn: None,
+        }
+        .write(layout)
+        .unwrap();
+    }
+
     fn turn(state: &str) -> Turn {
         Turn {
             tag: "pro-01".into(),
@@ -904,22 +937,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pro"));
         layout.ensure().unwrap();
-        Lane {
-            name: "pro".into(),
-            pane_id: "w1:p2".into(),
-            tab_id: "w1:t2".into(),
-            workspace_id: "w1".into(),
-            parent: None,
-            cwd: "/w".into(),
-            session_id: None,
-            rollout: None,
-            started_at: crate::pro::now_rfc3339(),
-            state: "ready".into(),
-            stopped: false,
-            last_turn: None,
-        }
-        .write(&layout)
-        .unwrap();
+        write_ready_lane(dir.path(), &layout);
         BridgeState {
             pid: Some(7),
             version: Some("5.0.8".into()),
@@ -1007,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_writes_the_record_and_lock() {
+    fn prepare_refuses_a_lane_without_a_rollout_before_typing() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pro"));
         layout.ensure().unwrap();
@@ -1027,6 +1045,33 @@ mod tests {
         }
         .write(&layout)
         .unwrap();
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = FakeRunner::new();
+        let error = prepare(
+            &env,
+            &layout,
+            &runner,
+            &TurnOptions {
+                lane: "pro".into(),
+                brief: dir.path().join("b.md"),
+                out: dir.path().join("answer.md"),
+                notify: "hcoord".into(),
+                attachments: vec![],
+                id: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no Codex rollout"), "{error}");
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(!layout.turn("pro-01").exists());
+    }
+
+    #[test]
+    fn prepare_writes_the_record_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pro"));
+        layout.ensure().unwrap();
+        write_ready_lane(dir.path(), &layout);
         let brief = dir.path().join("brief.md");
         std::fs::write(&brief, "Do the thing").unwrap();
         let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);

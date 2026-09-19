@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -13,11 +14,21 @@ use serde::Deserialize;
 use super::herdr_cli::{self, Agent};
 use super::sh::Runner;
 use super::state::{self, Lane};
-use super::{Env, Layout, MODEL, bridge, doctor};
+use super::{Env, Layout, MODEL, bridge, doctor, home};
 
 /// `agent start` waits this long for a ready agent; a trust or sign-in prompt
 /// shows as a blocked screen and the start times out.
 const READY_TIMEOUT_MS: u64 = 120_000;
+
+/// After the agent is ready, wait this long for Codex to write its session
+/// rollout. A trust prompt never creates one, so a missing rollout means the
+/// lane is not usable.
+const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The exact trust prompt Codex shows for an untrusted directory (2026-09-19
+/// live run, Codex 0.155.1). It does not always read as `blocked`, so the
+/// screen is checked too.
+pub const TRUST_PROMPT: &str = "Do you trust the contents of this directory?";
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -68,8 +79,10 @@ fn workspace_for(
         .filter(|w| !w.is_empty())
 }
 
-/// Is the directory (or an ancestor, up to the home directory) trusted in the
-/// lane Codex home? `[projects."<path>"] trust_level = "trusted"`.
+/// Is exactly `cwd` trusted in the lane Codex home?
+/// `[projects."<path>"] trust_level = "trusted"`. Codex trusts exact project
+/// paths only: a trusted ancestor such as `/home/agent` does not cover a
+/// subdirectory, so the check never walks up.
 pub fn trusted(env: &Env, cwd: &Path) -> bool {
     let config = env.lane_codex_home().join("config.toml");
     let Ok(text) = std::fs::read_to_string(&config) else {
@@ -81,23 +94,11 @@ pub fn trusted(env: &Env, cwd: &Path) -> bool {
     let Some(projects) = table.get("projects").and_then(toml::Value::as_table) else {
         return false;
     };
-    let mut candidate = Some(cwd);
-    while let Some(path) = candidate {
-        let key = path.display().to_string();
-        if projects
-            .get(&key)
-            .and_then(|value| value.get("trust_level"))
-            .and_then(toml::Value::as_str)
-            == Some("trusted")
-        {
-            return true;
-        }
-        if path == env.home {
-            break;
-        }
-        candidate = path.parent();
-    }
-    false
+    projects
+        .get(&cwd.display().to_string())
+        .and_then(|value| value.get("trust_level"))
+        .and_then(toml::Value::as_str)
+        == Some("trusted")
 }
 
 /// The newest rollout for this lane. Prefers a session-id match; otherwise the
@@ -183,24 +184,56 @@ fn session_meta(path: &Path) -> Option<Meta> {
     })
 }
 
-fn write_lane_with_rollout(
-    env: &Env,
-    layout: &Layout,
-    lane: &mut Lane,
-    session_id: Option<&str>,
-    started: jiff::Timestamp,
-) {
-    let rollout = find_rollout(&env.lane_codex_home(), &lane.cwd, started, session_id);
-    if let Some(rollout) = rollout {
+/// Point `lane.rollout` at the lane's newest rollout, or return `None` when
+/// Codex has not written one yet. Also fills in `session_id` when it is empty.
+pub fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
+    let existing = lane
+        .rollout
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let path = existing.or_else(|| {
+        let started = super::parse_rfc3339(&lane.started_at).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+        find_rollout(
+            &env.lane_codex_home(),
+            &lane.cwd,
+            started,
+            lane.session_id.as_deref(),
+        )
+    });
+    if let Some(path) = &path {
         if lane.session_id.is_none()
-            && let Some(meta) = session_meta(&rollout)
+            && let Some(meta) = session_meta(path)
             && !meta.id.is_empty()
         {
             lane.session_id = Some(meta.id);
         }
-        lane.rollout = Some(rollout.display().to_string());
+        lane.rollout = Some(path.display().to_string());
     }
-    let _ = layout;
+    path
+}
+
+/// Poll for the rollout after the agent is ready. A trust prompt never writes
+/// one, so this is the second half of "never report ready before the session
+/// exists".
+fn wait_for_rollout(env: &Env, lane: &mut Lane, timeout: Duration) -> Option<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(path) = refresh_rollout(env, lane) {
+            return Some(path);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The trust prompt currently on the pane's screen.
+fn trust_prompt_showing(runner: &dyn Runner, bin: &str, pane: &str) -> bool {
+    herdr_cli::pane_read(runner, bin, pane)
+        .map(|text| text.contains(TRUST_PROMPT))
+        .unwrap_or(false)
 }
 
 /// `herdr-pro start`: doctor, one serialized Codex start, then record.
@@ -232,6 +265,10 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     };
     let cwd = std::path::absolute(&cwd).with_context(|| format!("bad cwd {}", cwd.display()))?;
     let cwd_text = cwd.display().to_string();
+    // The plugin owns the Pro home and trusts the exact lane cwd there, so
+    // Codex never shows its trust prompt for a lane.
+    home::trust(layout, &cwd)
+        .with_context(|| format!("could not trust `{cwd_text}` in the Pro home"))?;
     if !trusted(env, &cwd) {
         bail!(
             "WAITING pro-bridge `{cwd_text}` is not trusted in {}; trust it once (or pass a trusted --cwd), never press through the prompt",
@@ -268,7 +305,18 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     if agent.blocked() {
         let reason = screen_reason(runner, &bin, &pane.pane_id);
         let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
-        bail!("WAITING pro-bridge the lane is blocked: {reason}");
+        bail!(
+            "WAITING pro-bridge the lane is blocked in pane {}: {reason}",
+            pane.pane_id
+        );
+    }
+    if trust_prompt_showing(runner, &bin, &pane.pane_id) {
+        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        bail!(
+            "WAITING pro-bridge `{cwd_text}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory in {} once, then start again (never press through the prompt)",
+            pane.pane_id,
+            env.lane_codex_home().join("config.toml").display()
+        );
     }
 
     let session_id = agent
@@ -290,7 +338,15 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         stopped: false,
         last_turn: None,
     };
-    write_lane_with_rollout(env, layout, &mut lane, session_id.as_deref(), started);
+    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+        let reason = screen_reason(runner, &bin, &pane.pane_id);
+        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        bail!(
+            "WAITING pro-bridge the lane has no Codex rollout after {}s in pane {}: {reason}",
+            ROLLOUT_TIMEOUT.as_secs(),
+            pane.pane_id
+        );
+    }
     if let Err(error) = lane.write(layout) {
         let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
         return Err(error);
@@ -345,6 +401,8 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
         bail!("WAITING pro-bridge the bridge is draining");
     }
     let cwd = PathBuf::from(&lane.cwd);
+    home::trust(layout, &cwd)
+        .with_context(|| format!("could not trust `{}` in the Pro home", lane.cwd))?;
     if !trusted(env, &cwd) {
         bail!("WAITING pro-bridge `{}` is not trusted", lane.cwd);
     }
@@ -356,7 +414,6 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &lane.cwd, name, &env_pairs)
         .context("could not create the resume tab")?;
-    let started = jiff::Timestamp::now();
     let agent = match herdr_cli::agent_start(
         runner,
         &bin,
@@ -379,14 +436,33 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     if agent.blocked() {
         let reason = screen_reason(runner, &bin, &pane.pane_id);
         let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
-        bail!("WAITING pro-bridge the resumed lane is blocked: {reason}");
+        bail!(
+            "WAITING pro-bridge the resumed lane is blocked in pane {}: {reason}",
+            pane.pane_id
+        );
+    }
+    if trust_prompt_showing(runner, &bin, &pane.pane_id) {
+        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        bail!(
+            "WAITING pro-bridge `{}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory once, then resume",
+            lane.cwd,
+            pane.pane_id
+        );
     }
     lane.pane_id = pane.pane_id;
     lane.tab_id = pane.tab_id;
     lane.workspace_id = pane.workspace_id;
     lane.state = "ready".into();
     lane.stopped = false;
-    write_lane_with_rollout(env, layout, &mut lane, Some(&session), started);
+    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+        let reason = screen_reason(runner, &bin, &lane.pane_id);
+        let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+        bail!(
+            "WAITING pro-bridge the resumed lane has no Codex rollout after {}s in pane {}: {reason}",
+            ROLLOUT_TIMEOUT.as_secs(),
+            lane.pane_id
+        );
+    }
     if let Err(error) = lane.write(layout) {
         let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
         return Err(error);
@@ -443,6 +519,22 @@ mod tests {
     use super::*;
     use crate::pro::sh::fake::{FakeRunner, fail, ok};
 
+    /// An `Env` and `Layout` over one temp dir with the same state root, the
+    /// way `herdr-pro` builds them in production.
+    fn test_env(dir: &Path) -> (Env, Layout) {
+        let state = dir.join("pro");
+        let env = Env::for_test(
+            dir,
+            &[
+                ("HERDR_BIN_PATH", "/h/herdr"),
+                ("HERDR_PRO_STATE_DIR", state.to_str().unwrap()),
+            ],
+        );
+        let layout = Layout::for_test(state);
+        layout.ensure().unwrap();
+        (env, layout)
+    }
+
     #[test]
     fn codex_args_carry_the_route_and_the_tool_limit() {
         let args = codex_args(17841);
@@ -461,12 +553,13 @@ mod tests {
     }
 
     #[test]
-    fn trust_walks_up_to_a_trusted_ancestor() {
+    fn trust_requires_the_exact_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::for_test(dir.path(), &[]);
-        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        let home = env.lane_codex_home();
+        std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
-            dir.path().join(".codex/config.toml"),
+            home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 dir.path().display()
@@ -475,16 +568,111 @@ mod tests {
         .unwrap();
         let deep = dir.path().join("a/b/c");
         std::fs::create_dir_all(&deep).unwrap();
-        assert!(trusted(&env, &deep));
-        std::fs::write(dir.path().join(".codex/config.toml"), "").unwrap();
+        // A trusted ancestor does not cover the subdirectory: Codex trusts
+        // exact project paths only.
+        assert!(trusted(&env, dir.path()));
         assert!(!trusted(&env, &deep));
+        std::fs::write(home.join("config.toml"), "").unwrap();
+        assert!(!trusted(&env, dir.path()));
+    }
+
+    #[test]
+    fn a_trust_prompt_on_screen_is_blocked_and_closes_the_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, layout) = test_env(dir.path());
+        let runner = FakeRunner::new();
+        runner.on(
+            ":17841/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","accepting_turns":true}"#),
+        );
+        runner.on("codex login status", ok("Logged in\n"));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p2","name":"pro","agent":"codex","agent_status":"idle"}}}"#),
+        );
+        runner.on(
+            "pane read",
+            ok("Do you trust the contents of this directory?\n1. Yes, continue\n2. No, quit\n"),
+        );
+        runner.on("tab close", ok(r#"{"result":{}}"#));
+        let error = start(
+            &env,
+            &layout,
+            &runner,
+            &StartOptions {
+                name: "pro".into(),
+                parent: Some("w1:p1".into()),
+                cwd: Some(dir.path().display().to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("trust"), "{error}");
+        assert!(error.to_string().contains("w1:p2"), "{error}");
+        assert_eq!(runner.count("tab close"), 1);
+        assert_eq!(runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn start_waits_for_the_rollout_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, layout) = test_env(dir.path());
+        // The rollout exists before the lane starts, so the poll returns at
+        // once; matching is by session id.
+        let sessions = layout.codex_home().join("sessions/2026/09/19");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-abc.jsonl"),
+            format!(
+                "{{\"timestamp\":\"2026-09-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"abc\",\"cwd\":\"{}\",\"timestamp\":\"2026-09-19T10:00:00Z\"}}}}\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            ":17841/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","accepting_turns":true}"#),
+        );
+        runner.on("codex login status", ok("Logged in\n"));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p2","name":"pro","agent":"codex","agent_status":"idle","agent_session":{"id":"abc"}}}}"#),
+        );
+        runner.on("pane read", ok("codex> \n"));
+        let lane = start(
+            &env,
+            &layout,
+            &runner,
+            &StartOptions {
+                name: "pro".into(),
+                parent: Some("w1:p1".into()),
+                cwd: Some(dir.path().display().to_string()),
+            },
+        )
+        .unwrap();
+        assert!(
+            lane.rollout
+                .as_deref()
+                .unwrap()
+                .ends_with("rollout-abc.jsonl")
+        );
+        assert_eq!(lane.session_id.as_deref(), Some("abc"));
     }
 
     #[test]
     fn reconcile_marks_a_dead_pane_gone_and_prints_one_line() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pro"));
-        layout.ensure().unwrap();
+        let (env, layout) = test_env(dir.path());
         Lane {
             name: "pro".into(),
             pane_id: "w1:p2".into(),
@@ -501,7 +689,6 @@ mod tests {
         }
         .write(&layout)
         .unwrap();
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
         let runner = FakeRunner::new();
         runner.on(
             "pane process-info",
@@ -515,8 +702,7 @@ mod tests {
     #[test]
     fn reconciling_a_live_lane_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pro"));
-        layout.ensure().unwrap();
+        let (env, layout) = test_env(dir.path());
         Lane {
             name: "pro".into(),
             pane_id: "w1:p2".into(),
@@ -533,7 +719,6 @@ mod tests {
         }
         .write(&layout)
         .unwrap();
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
         let runner = FakeRunner::new();
         runner.on(
             "pane process-info",
@@ -544,11 +729,9 @@ mod tests {
     }
 
     #[test]
-    fn start_refuses_an_untrusted_cwd_before_touching_herdr() {
+    fn start_trusts_the_exact_cwd_in_the_pro_home() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pro"));
-        layout.ensure().unwrap();
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let (env, layout) = test_env(dir.path());
         let runner = FakeRunner::new();
         runner.on(
             ":17841/healthz",
@@ -558,6 +741,9 @@ mod tests {
         runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
+        // No `tab create` rule, so start fails there; the exact trust write is
+        // what this checks. The plugin owns the Pro home, so the lane never
+        // hits Codex's trust prompt.
         let error = start(
             &env,
             &layout,
@@ -569,25 +755,14 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not trusted"), "{error}");
-        assert!(runner.count("tab create") == 0);
+        assert!(error.to_string().contains("tab"), "{error}");
+        assert!(trusted(&env, &cwd));
     }
 
     #[test]
     fn a_blocked_start_reports_waiting() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pro"));
-        layout.ensure().unwrap();
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
-        std::fs::write(
-            dir.path().join(".codex/config.toml"),
-            format!(
-                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-                dir.path().display()
-            ),
-        )
-        .unwrap();
+        let (env, layout) = test_env(dir.path());
         let runner = FakeRunner::new();
         runner.on(
             ":17841/healthz",

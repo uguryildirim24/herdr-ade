@@ -180,7 +180,7 @@ pub fn pane_read(runner: &dyn Runner, bin: &str, pane: &str) -> Result<String> {
 }
 
 /// `herdr tab create`; returns the root pane the lane will live in. `env` is
-/// the v2 Pro-home pair (`CODEX_HOME=...`); empty in v1.
+/// the Pro home pair (`CODEX_HOME=<state dir>/codex-home`).
 pub fn tab_create(
     runner: &dyn Runner,
     bin: &str,

@@ -143,8 +143,8 @@ pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> 
     // 3: Rolf's daily Codex must not be routed through the bridge.
     rows.push(codex_route_row(env));
 
-    // 4: the lane Codex home is signed in.
-    rows.push(codex_login_row(env, runner));
+    // 4: the Pro home is signed in.
+    rows.push(codex_login_row(layout, runner));
 
     // 5: the breaker.
     let now = jiff::Timestamp::now();
@@ -213,8 +213,8 @@ fn local_bridge_url(url: &str, port: u16) -> bool {
         .any(|host| url.contains(&format!("{host}:{port}")))
 }
 
-fn codex_login_row(env: &Env, runner: &dyn Runner) -> Row {
-    let home = env.lane_codex_home();
+fn codex_login_row(layout: &Layout, runner: &dyn Runner) -> Row {
+    let home = layout.codex_home();
     match runner.run(
         &Cmd::new("codex", SETUP)
             .args(["login", "status"])
@@ -237,9 +237,10 @@ fn codex_login_row(env: &Env, runner: &dyn Runner) -> Row {
         Ok(output) => Row::fail(
             "codex login",
             format!(
-                "not signed in for {}: {} (run `codex login`)",
+                "sign_in_required: the Pro home {} is not signed in ({}); run `CODEX_HOME={} codex login`",
                 home.display(),
-                output.error_text()
+                output.error_text(),
+                home.display()
             ),
         ),
         Err(error) => Row::fail("codex login", format!("{error:#}")),
