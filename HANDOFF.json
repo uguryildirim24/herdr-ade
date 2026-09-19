@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0025.md",
+      "tasks/review-r12.md",
       "tasks/t-0022.md",
       "tasks/review-r11.md",
       "tasks/t-0024.md",
@@ -20,15 +22,14 @@
       "tasks/t-0019.md",
       "tasks/t-0018.md",
       "tasks/t-0017.md",
-      "tasks/t-0015.md",
-      "tasks/t-0014.md",
-      "tasks/review-r7.md"
+      "tasks/t-0015.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r11.md",
       "tasks/reviews/code-r9.md",
       "tasks/reviews/code-r10.md",
       "tasks/reviews/code-r7.md",
@@ -42,12 +43,14 @@
       "tasks/reviews/code-plugin-r1-b.md"
     ]
   },
-  "generated": "2026-09-19T15:24:34-04:00",
+  "generated": "2026-09-19T15:28:10-04:00",
   "git": {
     "branches": [
       "main",
-      "hp/adeherdr/t-0022-review-r9-box-lanes-start-side",
       "hp/adeherdr/t-0025-review-r11-this-check-reads-the-relay-th",
+      "hp/adeherdr/t-0026-review-r12-this-check-reads-the-piece-th",
+      "review/r12",
+      "hp/adeherdr/t-0022-review-r9-box-lanes-start-side",
       "hp/adeherdr/t-0023-box-lanes-completion-side-the-courier-br",
       "review/r11",
       "hp/adeherdr/t-0018-harness-the-context-tells-a-coordinator",
@@ -80,22 +83,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "3cd3a9a Merge commit 'd360c1f0c66059aa048ec48f4aee01bafce9a216'",
-      "d360c1f docs(review): round r9 verdict",
-      "cf76f5c review(remote): verify both repository URLs",
-      "f37c4ec review(remote): fail closed box starts",
-      "01747e1 review(r11): brief for revision 1",
-      "ca94e81 checkpoint(r10): HANDOFF after merging the round"
+      "b7f4fe3 Merge commit 'fed2f04b7fb95f491d0f3cb58c5a90208212f4eb'",
+      "fed2f04 docs(review): round r11 verdict",
+      "61adf51 review(pro): refuse relay startup drift",
+      "c082b97 review(r12): brief for revision 1",
+      "464aae0 checkpoint(r9): HANDOFF after merging the round",
+      "3cd3a9a Merge commit 'd360c1f0c66059aa048ec48f4aee01bafce9a216'"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "12 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "3cd3a9a",
+        "head": "b7f4fe3",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit 'd360c1f0c66059aa048ec48f4aee01bafce9a216'"
+        "subject": "Merge commit 'fed2f04b7fb95f491d0f3cb58c5a90208212f4eb'"
       },
       {
         "branch": "review/r1",
@@ -117,6 +120,13 @@
         "head": "2c59e5d",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r11",
         "subject": "docs(tasks): t-0025"
+      },
+      {
+        "branch": "review/r12",
+        "dirty": 0,
+        "head": "a6de86a",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r12",
+        "subject": "docs(tasks): t-0026"
       },
       {
         "branch": "review/r2",
@@ -309,10 +319,17 @@
       },
       {
         "branch": "hp/adeherdr/t-0025-review-r11-this-check-reads-the-relay-th",
-        "dirty": 1,
-        "head": "19aee7f",
+        "dirty": 0,
+        "head": "fed2f04",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0025",
-        "subject": "review(pro): fail setup on a broken relay provider"
+        "subject": "docs(review): round r11 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0026-review-r12-this-check-reads-the-piece-th",
+        "dirty": 0,
+        "head": "c849cf3",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0026",
+        "subject": "Merge commit '789bf54e5e056442a62f842841804ecdf82007b4' into hp/adeherdr/t-0026-review-r12-this-check-reads-the-piece-th"
       }
     ]
   },
@@ -337,34 +354,12 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r9",
-    "verdict": "d360c1f0c66059aa048ec48f4aee01bafce9a216"
+    "round": "r11",
+    "verdict": "fed2f04b7fb95f491d0f3cb58c5a90208212f4eb"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0022",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0022",
-      "pane_id": "w1G:p11",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0022--/2026-09-19T19-03-29-756Z_01a0bb0d-5adc-72b8-9554-3e52b1d1da7f.jsonl",
-      "start_args": [],
-      "status": "working",
-      "tab_id": "w1G:tX",
-      "tab_label": "t-0022",
-      "title": "π - t-0022",
-      "tokens": {
-        "done": "1",
-        "lane": "t-0022",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "3",
-        "review": "working",
-        "thread": "t-0022"
-      }
-    },
     {
       "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0025",
       "kind": "pi",
@@ -373,16 +368,38 @@
       "pane_label": null,
       "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0025--/2026-09-19T19-14-20-604Z_01a0bb17-493c-717e-b855-f64aa98885a1.jsonl",
       "start_args": [],
-      "status": "working",
+      "status": "done",
       "tab_id": "w1G:t0",
       "tab_label": "t-0025",
       "title": "π - t-0025",
       "tokens": {
+        "done": "1",
+        "lane": "t-0025",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
         "review": "working",
         "thread": "t-0025"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0026",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0026",
+      "pane_id": "w1G:p15",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0026--/2026-09-19T19-24-43-761Z_01a0bb20-cb70-76a9-a9ee-e538ca7865b4.jsonl",
+      "start_args": [],
+      "status": "working",
+      "tab_id": "w1G:t11",
+      "tab_label": "t-0026",
+      "title": "π - t-0026",
+      "tokens": {
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "3",
+        "review": "working",
+        "thread": "t-0026"
       }
     }
   ],
