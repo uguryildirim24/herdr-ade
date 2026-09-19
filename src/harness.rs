@@ -128,6 +128,7 @@ fn local_build(ctx: &Ctx, repo: &str, kind: Kind) -> Result<()> {
     let mut cmd = Cmd::new("cargo", BUILD_TIMEOUT)
         .args(["build", "--release", "--locked"])
         .cwd(repo)
+        .own_group()
         .env("PATH", mac_path_env(ctx))
         .env("DEVELOPER_DIR", DEVELOPER_DIR);
     if kind == Kind::Fork {
@@ -148,16 +149,40 @@ fn local_install(ctx: &Ctx, repo: &str, bin: &str) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let from = Path::new(repo).join("target/release").join(bin);
     let to = dir.join(bin);
-    let out = ctx.runner.run(
+    let staged = dir.join(format!(".{bin}.install-{}", std::process::id()));
+    let copy = ctx.runner.run(
         &Cmd::new("cp", INSTALL_TIMEOUT)
             .arg(from.to_string_lossy().into_owned())
-            .arg(to.to_string_lossy().into_owned()),
+            .arg(staged.to_string_lossy().into_owned()),
     )?;
-    if !out.success() {
+    if !copy.success() {
+        bail!(
+            "harness_install_failed: stage {bin} for {}: {}",
+            to.display(),
+            copy.error_text()
+        );
+    }
+    let moved = match ctx.runner.run(
+        &Cmd::new("mv", INSTALL_TIMEOUT)
+            .args(["-f"])
+            .arg(staged.to_string_lossy().into_owned())
+            .arg(to.to_string_lossy().into_owned()),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error).context(format!(
+                "harness_install_failed: could not replace {}",
+                to.display()
+            ));
+        }
+    };
+    if !moved.success() {
+        let _ = std::fs::remove_file(&staged);
         bail!(
             "harness_install_failed: install {bin} into {}: {}",
             to.display(),
-            out.error_text()
+            moved.error_text()
         );
     }
     Ok(())
@@ -168,9 +193,14 @@ fn print_version(ctx: &Ctx, bin: &str) -> Result<()> {
     let out = ctx
         .runner
         .run(&Cmd::new(path.to_string_lossy().into_owned(), VERSION_TIMEOUT).arg("--version"))?;
-    if out.success() {
-        println!("{}", out.stdout.trim());
+    if !out.success() {
+        bail!(
+            "harness_version_failed: {} --version: {}",
+            path.display(),
+            out.error_text()
+        );
     }
+    println!("{}", out.stdout.trim());
     Ok(())
 }
 
@@ -183,7 +213,11 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
     }
     let mut installs = String::new();
     for bin in kind.binaries() {
-        installs.push_str(&format!("\ncp target/release/{bin} $HOME/.local/bin/{bin}"));
+        installs.push_str(&format!(
+            "\ncp target/release/{bin} $HOME/.local/bin/.{bin}.install.$$\n\
+             chmod 755 $HOME/.local/bin/.{bin}.install.$$\n\
+             mv -f $HOME/.local/bin/.{bin}.install.$$ $HOME/.local/bin/{bin}"
+        ));
     }
     let script = format!(
         "set -e\n\
@@ -240,13 +274,12 @@ pub fn install(ctx: &Ctx) -> Result<()> {
         );
     }
     let _lock = lock(&ctx.config_dir)?;
-    let box_target = remote::machine_profile(
+    let box_target = remote::optional_machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
         &ctx.config_dir,
         BOX_MACHINE,
-    )
-    .ok()
+    )?
     .map(|profile| profile.target);
     let mut fork = false;
     for repo in &repos {
