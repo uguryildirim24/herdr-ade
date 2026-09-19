@@ -13,7 +13,8 @@ use anyhow::{Result, bail};
 
 /// The provider and model names this round is allowed to start. The role
 /// table and Jev recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
-/// `opencode-go` is the OpenCode Go plan (the Muse row, SPEC-ADE §6 item 65).
+/// `opencode-go` is the OpenCode Go plan (the DeepSeek and Muse rows, SPEC-ADE
+/// §6 items 65, 80).
 pub const PROVIDERS: [&str; 3] = ["openai-codex", "opencode-go", "kimi-coding"];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
