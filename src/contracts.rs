@@ -59,6 +59,16 @@ pub fn box_prefix() -> String {
     format!("{BOX_BIN} --root {BOX_ROOT}")
 }
 
+/// One box `sh -c` script with `PATH` set and exported before the script
+/// (SPEC-remote §3.3, t-0049). A non-login SSH shell starts with a bare
+/// `PATH`, so `node`, the `pi` wrapper and the rest of the box tools would be
+/// invisible without this. Exporting keeps the path for every command, even
+/// when the script starts with a regular builtin. Every SSH script the plugin
+/// runs on the box goes through here.
+pub fn with_box_path(script: &str) -> String {
+    format!("PATH={BOX_PATH}; export PATH\n{script}")
+}
+
 /// The box path of one lane's card (SPEC-remote §4.3).
 pub fn box_lane_card(slug: &str, thread: &str) -> String {
     format!("{BOX_ROOT}/{slug}/lanes/{thread}.toml")

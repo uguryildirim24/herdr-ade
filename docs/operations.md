@@ -147,6 +147,7 @@ Save the machine with `herdr machine add --label <label> <ssh target>` (both mac
 
 - The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
 - The box holds two plugin binaries: `/home/ubuntu/.local/bin/herdr-ade` (lane start and `ha`) and `/home/ubuntu/.local/bin/herdr-pi` (pi `setup`, `login`, `doctor` and `check`); no pi verb runs through `herdr-ade`.
+- Every command the home machine runs on a box goes over SSH with the fixed box `PATH` `/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin` in front, so a fresh box needs no login-shell `PATH` edits for the plugin.
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and it is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back.
 - A blocked remote thread needs you in its pane on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
 - `focus` does not cover remote threads: their sidebar tokens are set on the remote Herdr server. They appear in `overview`, `thread list` and inbox items.
