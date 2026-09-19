@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use pro::sh::RealRunner;
-use pro::{Env, Layout, bridge, doctor, home, image, lane, state, turn};
+use pro::{Env, Layout, bridge, doctor, home, image, lane, serve, state, turn};
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD_ID"));
 
@@ -43,6 +43,15 @@ enum Command {
     },
     /// Print the bridge and Codex login steps; never drives a login
     Login,
+    /// Start the local relay that makes Pro a plain pi lane
+    Serve,
+    /// The foreground relay (started detached by `serve`)
+    #[command(hide = true)]
+    ServeRun,
+    /// Stop the relay and remove its `serve.json`
+    StopServe,
+    /// Write the `pro` provider into the shared pi folder's `models.json`
+    PiProvider,
     /// Start a Pro lane: a Codex agent pointed at the bridge
     Start {
         /// Lane name (the herdr agent name)
@@ -128,6 +137,29 @@ fn run(cli: &Cli) -> Result<bool> {
     let runner = RealRunner;
     match &cli.command {
         Command::Init => init(&env, &layout),
+        Command::Serve => {
+            serve::start(&layout)?;
+            Ok(true)
+        }
+        Command::ServeRun => {
+            serve::run(&layout, &env)?;
+            Ok(true)
+        }
+        Command::StopServe => {
+            serve::stop(&layout)?;
+            Ok(true)
+        }
+        Command::PiProvider => {
+            let state = serve::ServeState::read(&layout)
+                .context("no serve.json; run `herdr-pro serve` first")?;
+            serve::write_provider(&layout, state.port, &state.token)?;
+            println!(
+                "wrote the `pro` provider (http://127.0.0.1:{}/v1) into {}",
+                state.port,
+                layout.pi_models().display()
+            );
+            Ok(true)
+        }
         Command::Doctor { json } => {
             let rows = doctor::doctor_rows(&env, &layout, &runner);
             if *json {
