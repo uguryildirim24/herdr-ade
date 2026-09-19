@@ -53,6 +53,10 @@ pub struct RoleConfig {
     pub default: String,
     pub allowed: Vec<String>,
     pub escalate: Vec<String>,
+    /// The role's machine choice (SPEC-remote D2, §4.1). Empty means the
+    /// recipe's own row, then the project default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine: String,
 }
 
 /// The safety file's view of `~/.config/herdr-ade/config.toml`.
@@ -89,6 +93,7 @@ struct RawRole {
     default: Option<String>,
     allowed: Option<Vec<String>>,
     escalate: Option<Vec<String>>,
+    machine: Option<String>,
 }
 
 /// The ready-made rows the plugin ships: research on agy and the Fable
@@ -141,6 +146,7 @@ fn builtin_roles() -> BTreeMap<String, RoleConfig> {
             default: "agy_gemini_flash".into(),
             allowed: vec!["agy_gemini_flash".into()],
             escalate: Vec::new(),
+            machine: String::new(),
         },
     );
     roles.insert(
@@ -149,6 +155,7 @@ fn builtin_roles() -> BTreeMap<String, RoleConfig> {
             default: "claude_fable_xhigh".into(),
             allowed: vec!["claude_fable_xhigh".into()],
             escalate: Vec::new(),
+            machine: String::new(),
         },
     );
     roles
@@ -280,6 +287,7 @@ fn builtin_pi_recipes(
                 provider: row.provider.to_string(),
                 enabled: row.enabled,
                 plain: row.plain.to_string(),
+                machine: String::new(),
             },
         );
     }
@@ -326,12 +334,14 @@ fn parse_role(
                 .clone()
                 .filter(|plain| !plain.trim().is_empty())
                 .unwrap_or_else(|| "the usual helper".to_string()),
+            machine: raw.machine.clone().unwrap_or_default(),
         };
         recipes.insert(id.clone(), recipe);
         return Ok(RoleConfig {
             default: id.clone(),
             allowed: vec![id],
             escalate: Vec::new(),
+            machine: raw.machine.clone().unwrap_or_default(),
         });
     }
     let default = raw.default.clone().unwrap_or_default();
@@ -342,6 +352,7 @@ fn parse_role(
         default,
         allowed: raw.allowed.clone().unwrap_or_default(),
         escalate: raw.escalate.clone().unwrap_or_default(),
+        machine: raw.machine.clone().unwrap_or_default(),
     })
 }
 
@@ -666,6 +677,19 @@ pub fn resolve_launch(ctx: &Ctx, input: &ResolveInput) -> Result<Launch> {
     let config = parse_launch_config(&ctx.config_dir)?;
     let kinds = agent_kinds(ctx.env, ctx.runner)?;
     validate_config(&config, &kinds)?;
+    // The role's machine choice overrides its recipe's own row (SPEC-remote
+    // §4.1). An empty role row keeps the recipe's `machine`.
+    let role_machine = config
+        .roles
+        .get(input.role)
+        .map(|row| row.machine.clone())
+        .unwrap_or_default();
+    let finish = |mut launch: Launch| -> Launch {
+        if !role_machine.is_empty() {
+            launch.machine = role_machine.clone();
+        }
+        launch
+    };
 
     // A `--recipe <id>` pin.
     if let Some(id) = input.recipe {
@@ -686,7 +710,7 @@ pub fn resolve_launch(ctx: &Ctx, input: &ResolveInput) -> Result<Launch> {
         let mut launch = launch_from(recipe, &config.policy_hash, input.role);
         launch.recipe_id = id.to_string();
         launch.reason = pinned_reason(input.role, &recipe.plain);
-        return Ok(launch);
+        return Ok(finish(launch));
     }
 
     let role = config
@@ -740,17 +764,17 @@ pub fn resolve_launch(ctx: &Ctx, input: &ResolveInput) -> Result<Launch> {
         launch.recipe_id = format!("{}_project", input.role);
         launch.reason = pinned_reason(input.role, plain);
         launch.compact_reason = compact_reason(input.role, plain);
-        return Ok(launch);
+        return Ok(finish(launch));
     }
 
     // The role's default after the pair filter.
     let (id, recipe) = role_default(&config, &role, input.role, input.sibling)?;
-    Ok(default_launch(
+    Ok(finish(default_launch(
         &recipe,
         &id,
         &config.policy_hash,
         input.role,
-    ))
+    )))
 }
 
 /// The role's default after the pair filter: the first remaining allowed row
@@ -789,6 +813,7 @@ fn launch_from(recipe: &Recipe, policy_hash: &str, role: &str) -> Launch {
         recipe_id: String::new(),
         reason: String::new(),
         compact_reason: compact_reason(role, &recipe.plain),
+        machine: recipe.machine.clone(),
     }
 }
 
