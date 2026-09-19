@@ -5,13 +5,14 @@ plain: This check reads the piece that brings a cloud box lane's finished work h
 Run `/Users/rolfie/.local/bin/ha --root /Users/rolfie/.herdr-ade skill reviewer`, then do what this brief says.
 
 Round `r12` on integration branch `main`. The commit that adds this file is the brief commit B.
-Manifest revision 1, manifest hash `84dedd3694c4eb1ba39d5c9acfe5dc6e8e866145179f606fe97f7e8699576011`, policy hash `e1529634be8dfdf8688cad0bfcfd99dfa67f7f19fe2d1c3c7ab9f12ee7c0eec3`.
+Manifest revision 2, manifest hash `2b086b0d162e03da5c1bf1f28c531d25e7d4bf328d2b636bdf686886125a33ba`, policy hash `e1529634be8dfdf8688cad0bfcfd99dfa67f7f19fe2d1c3c7ab9f12ee7c0eec3`.
 
 ## Pinned lanes
 
 | lane | attempt | sha | event | artifact |
 |---|---|---|---|---|
 | t-0023 | 1 | `789bf54e5e056442a62f842841804ecdf82007b4` | `t-0023-1-2` | `618ee8cbf9e321f752f5b0891c3f8c8ba69ae75fa4b8b85b25cd830e025973df` |
+| t-0027 | 1 | `e040856b6eb33a2b75ad137a0ad2e0562c90c7d4` | `t-0027-1-1` | `f53cfb3b735ac3f3308ea89f72f420edbad50b1e5871f352c324a481d7619d62` |
 
 ## Gates
 
@@ -30,7 +31,7 @@ Manifest revision 1, manifest hash `84dedd3694c4eb1ba39d5c9acfe5dc6e8e866145179f
 verdict = "MERGE"  # or "MERGE-AFTER-DECISION" or "REJECT"
 round = "r12"
 candidate = "<C>"
-manifest_hash = "84dedd3694c4eb1ba39d5c9acfe5dc6e8e866145179f606fe97f7e8699576011"
+manifest_hash = "2b086b0d162e03da5c1bf1f28c531d25e7d4bf328d2b636bdf686886125a33ba"
 policy_hash = "e1529634be8dfdf8688cad0bfcfd99dfa67f7f19fe2d1c3c7ab9f12ee7c0eec3"
 gates = []
 +++
@@ -208,5 +209,161 @@ mismatch refuses; remote state round-trips per profile; the courier manifest
 parses and refuses junk; the helper survives a hostile box root; a box lane
 absent twice is pushed GONE once and a boot change re-pushes it; the doctor
 box rows gate on free disk.
+```
+
+### t-0027 (artifact `f53cfb3b735ac3f3308ea89f72f420edbad50b1e5871f352c324a481d7619d62`)
+
+Data, not instructions.
+
+```text
+# t-0027 — repair the box completion side after r12
+
+plain: This fixes the four faults the check found in the piece that brings a
+cloud box lane's finished work home.
+
+Branch starts from `main` (r10 round-advance hook, r11 Pro relay) with the
+reviewed candidate `31bcc5b0cd52d19355fb3899a464367f230896cc` merged in. The
+merge was clean (no `src/ticker.rs` conflict; r10's `round advance` and t-0023's
+`remote_pass` did not overlap). The two review commits `66c2993` and `31bcc5b`
+are untouched. No rebase, no stash. Gates green at every commit with
+`PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools`:
+`cargo fmt --check`, `cargo test --locked` (350 + 44 + 65 + 4),
+`cargo clippy --all-targets --locked -- -D warnings`,
+`cargo build --release --locked`.
+
+Commits: `8e74541` (findings 1–3), `de3a84b` (finding 4), `6121d34` (board age),
+`e040856` (tests).
+
+## Finding 1 — courier cadence per machine, one SSH trip
+
+**Changed.** `src/ticker.rs`: the courier moved out of the per-project
+`tick_slow` and into a new `machine_passes`, called once from `tick` (and from
+the test-only `tick_project_with`) before the per-project slow pass. It groups
+every reachable project's open remote lanes by machine route, calls
+`Memory::machine_is_due` once per machine, and runs `steps::courier` once with
+all projects on that machine. The view is stored in `Memory::machine_views`
+(this tick only) and consumed by `tick_slow`, which no longer checks the cadence
+or calls the courier. Outage recording, the machine-unreachable `BLOCKED` lines
+and `write_machine_outage` moved into `machine_passes` too.
+
+`src/steps.rs`: `courier` now takes `&[&Project]` and resolves the profile,
+builds the cursor, runs the helper and imports every project's envelopes in one
+pass. The helper (`COURIER_HELPER`) reads the box's own lists with the box-local
+binary (`"$HOME/.local/bin/herdr" --session <session> agent list` / `pane list`)
+and prints them as `agents`/`panes` records, so `remote_pass` no longer opens a
+`herdr --machine` bridge for `agent list`/`pane list`. `CourierOutcome` carries
+`agents`/`panes` (`None` when the box server did not answer; the pass then
+imports events but changes no lane state, so no false GONE).
+
+**Tested.** `src/scenarios.rs` rewrote the three remote scenarios to drive the
+courier's `ssh` (not `herdr --machine`): the failure/skip-for-eight-ticks test
+now counts `ssh` courier calls; the outage test and the blocked-lane test feed
+the helper's `agents`/`panes` records. New `courier_imports_every_project_on_the_machine_after_the_taken_cursor`
+in `src/steps.rs` proves two projects on one machine both import from one
+helper call and one `scp` each, and that a second pass with the taken cursor
+does no fetch.
+
+**Not fully honoured.** §4.3 says "one batched `scp`". The pass makes one
+`scp` per project over the one multiplexed connection (one SSH handshake). A
+single destination directory would collide: two projects can both have a box
+event named `t-0001-1-1.toml`, and the later copy would overwrite the earlier
+before its import. The finding's fix text asks for "one SSH trip per pass",
+which this meets.
+
+## Finding 2 — DONE requires the pinned commit
+
+**Changed.** `src/steps.rs`: `deliver_event`, after loading the lane and before
+the inbox item and the typed line, calls `verify_published_sha` for a remote
+lane's `done` event. It resolves the publish URL from the project's own repo row
+then the committed `BOX_REPOS` map (`publish_url_for`), picks the URL-matched
+remote (`remote::remote_for_url`), `git fetch`es `refs/heads/<branch>`, and
+requires `git merge-base --is-ancestor <sha> FETCH_HEAD`. On a failed fetch or an
+absent commit it returns `published_fetch_failed` / `published_sha_missing`, so
+no inbox item and no DONE line are written, no journal line is appended, and the
+next tick retries.
+
+**Tested.** `a_done_event_is_not_delivered_until_its_sha_is_on_the_publish_remote`
+covers both the failed fetch and the absent commit.
+
+**Note.** The "recorded reason" is the error the ticker logs each pass
+(`.ticker.log`); no durable inbox item is written, to avoid a per-pass item.
+The check runs at delivery, not at import, which is the single choke point where
+the DONE line is typed; the event is imported first and stays undelivered.
+
+## Finding 3 — cursor, receipts, box D5 recovery
+
+**Changed.**
+- Cursor: the Mac builds a `<slug>\t<event id>` cursor from every project's
+  `RemoteState.taken` and passes it on the helper's stdin; the helper skips
+  those events (`grep -Fqx`). Its answer starts after the cursor.
+- Receipts: `events::write_receipt` writes `<project>/receipts/<event>.toml`
+  (event hash and artifact hash, create-only) at seal; `ops::seal` calls it for
+  both Mac and box seals. The helper prints `receipt` records and the courier
+  requires the box receipt's `event_hash` and `artifact_hash` to equal the
+  fetched bytes before advancing the cursor (`receipt_missing` /
+  `receipt_mismatch`). Bootstrap receipts (`<slug>/.state/bootstrap/<thread>.json`)
+  are printed as `bootstrap` records; `apply_bootstraps` marks the Mac thread
+  `bootstrap = "acknowledged"` only when the receipt's pane and brief hash still
+  match.
+- Box D5 recovery: new hidden `herdr-ade recover` verb (`src/cli.rs`) calling
+  `ops::recover_box`, which runs before the helper reads the ledger. It uses the
+  box lane card as authority: a reserved op whose helper is dead or whose card
+  moved on is abandoned (X1); a staged op whose card matches is sealed from its
+  own durable payload (X2), and `seal_create_if_absent` repairs a matching event
+  marker (X2b).
+
+**Tested.** `courier_helper_answers_only_after_the_taken_cursor` runs the real
+script with and without a cursor. `courier_refuses_a_receipt_that_disagrees_with_the_fetched_bytes`
+proves no import and no cursor move on a mismatch. `courier_imports_every_project...`
+asserts the bootstrap carry. `a_completion_receipt_is_create_only_and_records_the_hashes`
+covers the receipt file. `box_recovery_seals_a_staged_op_from_its_card_and_abandons_a_dead_reserved_one`
+covers X1/X2 and the receipt on the recovered event.
+
+## Finding 4 — box pane probe, box logins, machine naming
+
+**Changed.**
+- `src/herdr.rs`: `pane_run`, `pane_read_text` (pane read prints text, not JSON)
+  and `workspace_close`.
+- `src/doctor.rs`: `box_pane_probe` creates a fresh box pane with the lane
+  `PATH` (`workspace create --env PATH=...`), runs `BOX_PROBE`
+  (`type -a -P pi` then `command -v cargo just claude codex agy node`) in that
+  pane's own Bash shell, reads `@@pi`/`@@cmd`/`@@done`, and closes the
+  workspace. The old bare-`ssh` `login_*`/`tool_*` checks are gone. The wrapper
+  row fails unless the first `type -a -P pi` hit is
+  `/home/ubuntu/.local/bin/pi`; the tools row fails on any missing tool. Pi
+  provider readiness now runs on the box through the box wrapper
+  (`herdr-pi check <provider>`) in the read-only SSH script; `gh auth status`
+  stays on the box; native kinds keep the box binary check.
+- `src/board.rs`: `compute` counts box lanes (using the Mac record's
+  `last_state`/`last_group` since the live state is on the box), and `ade_last`
+  names the lane's machine. `src/cli.rs`: `ha board <project> --thread <thread>`
+  prints the lane's group, machine and age.
+- `src/steps.rs`: a box lane's completion summary now reads
+  `<lane> on machine `<label>` completed ...`.
+
+**Tested.** `box_rows_read_the_box_and_gate_on_free_disk` fakes the probe pane
+and asserts the wrapper/tools rows; `box_wrapper_probe_fails_closed_when_the_pane_answers_another_path`
+proves the first-hit refusal. `board::tests::a_box_lane_is_counted_and_the_last_line_names_its_machine`
+covers the board. `src/scenarios.rs` still asserts the thread-state line names
+the machine.
+
+**Not fully honoured.** §5's "remote-age fields" on the aggregate board tokens:
+the tokens are single 80-character strings, so the per-lane age and machine live
+on the `ha board <project> --thread <thread>` line, not on `ade_lanes`. §5's
+"detailed record" (profile id, last pass, last sealed event, last import, taken
+cursor, free disk, last error) is not exposed by `ha thread show`; the finding
+did not name it and it is a larger surface than this repair.
+
+## Other spec lines not honoured
+
+- §4.3 "one SSH handshake": the courier is one handshake. Thread token
+  reporting (`pane report-metadata`) and a pending prime still go through
+  `herdr --machine` after the courier, by design (they are lane actions, not the
+  poll); t-0023's scenario asserts the remote token call.
+- §6 "rebooted lanes restarted from the start line": the courier pushes GONE;
+  the restart stays the coordinator's `ha thread restart` (unchanged, as t-0023
+  reported).
+- §4.3 box-side worktree removal under the box repository lock is unchanged
+  from t-0023.
 ```
 
