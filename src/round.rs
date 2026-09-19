@@ -1139,7 +1139,10 @@ fn fresh_merge(
     }
     let intent = MergeIntent {
         op: format!("merge-{round}"),
-        expected_old: b,
+        // The compare-and-swap base is the integration head observed for this
+        // merge, which may be newer than B. Recording B here made a crash
+        // before the effect impossible to resume when the branch had moved.
+        expected_old: head,
         candidate: c,
         verdict: v,
         phase: MergePhase::Intent,
@@ -1172,10 +1175,17 @@ fn effect_merge(
             // and merge nothing again.
             None if git.is_ancestor(&intent.verdict, &head)? => head.clone(),
             None => {
-                if !git.is_ancestor(&intent.expected_old, &intent.candidate)?
+                let b = record
+                    .expected_head
+                    .as_deref()
+                    .context("merge_revalidation: brief commit B is missing")?;
+                if head != intent.expected_old
+                    || !git.is_ancestor(b, &intent.candidate)?
                     || git.parents(&intent.verdict)? != [intent.candidate.clone()]
                 {
-                    bail!("merge_revalidation: ancestry changed under the lock");
+                    bail!(
+                        "merge_revalidation: ancestry or the integration head changed under the lock"
+                    );
                 }
                 integrate(git, record, &head, &intent.verdict)?
             }
@@ -1404,16 +1414,16 @@ fn diverged(
         "merge-diverged",
         &record.round,
         &format!(
-            "{}: `{}` is at {head}, which is neither B, V nor the recorded checkpoint; nothing was merged again",
+            "{}: `{}` is at {head}, which is neither the recorded merge start, merge result nor checkpoint; nothing was merged again",
             record.round, record.branch
         ),
         "",
     );
     bail!(
-        "merge_diverged: `{}` is at {head}; expected B {}, V {} or the recorded checkpoint",
+        "merge_diverged: `{}` is at {head}; expected merge start {}, merge result {} or the recorded checkpoint",
         record.branch,
         intent.expected_old,
-        intent.verdict
+        intent.merged.as_deref().unwrap_or(intent.verdict.as_str())
     )
 }
 
@@ -1542,7 +1552,7 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
     }
     if let Some(m) = merge {
         out.push_str(&format!(
-            "merge: phase {:?}, B {}, C {}, V {}{}{}\n",
+            "merge: phase {:?}, from {}, C {}, V {}{}{}\n",
             m.phase,
             m.expected_old,
             m.candidate,
