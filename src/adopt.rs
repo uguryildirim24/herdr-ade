@@ -248,6 +248,7 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
             vec![project::Repo {
                 path,
                 machine: None,
+                ..project::Repo::default()
             }]
         })
         .unwrap_or_default();
