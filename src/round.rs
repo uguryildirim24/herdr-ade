@@ -1372,7 +1372,12 @@ pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<M
     // The durable completion boundary: the landing evidence and the shared
     // plan refresh. Both are retry-safe and never roll back the merge
     // (SPEC-talk §6.1, §6.5).
-    if matches!(&outcome, Ok(MergeOutcome::Checkpointed { .. })) {
+    if matches!(
+        &outcome,
+        Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
+    ) {
+        // Reconcile on a no-op too: a process can die after the checkpointed
+        // merge record is durable but before either follow-up finishes.
         let what = record.plain.trim().to_string();
         if let Err(e) = crate::ask::say_landed(ctx, slug, &what, None, round) {
             eprintln!("note: the landing line could not be published: {e:#}");
@@ -2410,9 +2415,28 @@ mod tests {
         assert_eq!(landed.len(), 1, "{landed:?}");
         assert_eq!(landed[0].0.as_deref(), Some("landed:r1"));
         assert_eq!(landed[0].1, "r1");
-        // The second merge is a no-op and adds no second landing line.
+        // A no-op merge is idempotent while the evidence is present.
         merge(&ctx, "demo", "r1", None).unwrap();
         let count = crate::talk::read(&fx.project)
+            .lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    &line.entry,
+                    crate::talk::Entry::Say {
+                        landed_round: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(count, 1);
+
+        // It also reconciles a crash or loss between the durable merge phase
+        // and the retry-safe follow-up publication.
+        std::fs::remove_file(crate::talk::journal_path(&fx.project)).unwrap();
+        merge(&ctx, "demo", "r1", None).unwrap();
+        let restored = crate::talk::read(&fx.project)
             .lines
             .into_iter()
             .filter(|line| {
@@ -2425,7 +2449,7 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(count, 1);
+        assert_eq!(restored, 1);
     }
 
     #[test]

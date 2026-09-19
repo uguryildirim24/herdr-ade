@@ -126,12 +126,20 @@ fn ask_set_lock(project: &Project) -> Result<AskSetLock> {
 /// Refuses a fourth co-existing open ask. Re-asking an existing id replaces
 /// its revision and does not count as a new ask.
 fn enforce_ask_cap(project: &Project, reask: Option<&str>) -> Result<()> {
-    if reask.is_some() {
+    let open = open_asks(project);
+    if let Some(id) = reask {
+        // Only the newest open ask can absorb the next consequential need.
+        // Unknown and closed ids keep their more specific errors below.
+        if open.iter().any(|ask| ask.id == id) && open.last().is_some_and(|ask| ask.id != id) {
+            bail!("ask_reask_not_newest: `{id}` is not the newest open ask");
+        }
         return Ok(());
     }
-    let open = open_asks(project).len();
-    if open >= MAX_OPEN_ASKS {
-        bail!("ask_cap: {open} asks are already open; reask the newest one as one merged question");
+    if open.len() >= MAX_OPEN_ASKS {
+        bail!(
+            "ask_cap: {} asks are already open; reask the newest one as one merged question",
+            open.len()
+        );
     }
     Ok(())
 }
@@ -1225,6 +1233,21 @@ mod tests {
         for _ in 0..3 {
             ask_again(&fx).unwrap();
         }
+        let e = format!(
+            "{:#}",
+            ask(
+                &ctx,
+                "demo",
+                NewAsk {
+                    reask: Some("a-1".into()),
+                    ..keep_or_stop()
+                },
+            )
+            .unwrap_err()
+        );
+        assert!(e.starts_with("ask_reask_not_newest"), "{e}");
+        assert_eq!(latest_revision(&fx.project, "a-1"), 1);
+
         let merged = ask(
             &ctx,
             "demo",
