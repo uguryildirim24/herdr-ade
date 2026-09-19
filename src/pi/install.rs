@@ -15,6 +15,10 @@ use super::{GUARD_MARKER, Layout, PI_PACKAGE, PI_VERSION, sh};
 #[path = "../pro/provider.rs"]
 mod provider;
 
+/// The DeepSeek `contextWindow` merge (a second writer of the same
+/// `models.json`; it derives its models from the recipe rows).
+use super::provider as deepseek;
+
 /// The guard extension, plugin-owned, beside the herdr state hook
 /// (SPEC-pi v2 §3.3, §3.7). Doctor checks the marker.
 pub const GUARD_TS: &str = include_str!("../../extensions/herdr-pi-guard.ts");
@@ -152,6 +156,13 @@ fn write_provider(layout: &Layout) -> Result<Option<String>> {
     Ok(Some(base))
 }
 
+/// Write the DeepSeek `contextWindow` overrides into `models.json`. Runs on
+/// every setup, with or without the relay's `serve.json`; the merge keeps the
+/// `pro` provider and every other key.
+fn write_deepseek(layout: &Layout) -> Result<()> {
+    deepseek::write_overrides(&layout.models())
+}
+
 /// Setup: pinned install, shared folder, guard, the running herdr's state
 /// hook, then print the one line Rolf types. Never a login.
 pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Result<SetupReport> {
@@ -160,6 +171,7 @@ pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Resu
     let wrapper = super::launch::write_wrapper(layout)?;
     let guard = write_guard(layout)?;
     let provider = write_provider(layout)?;
+    write_deepseek(layout)?;
 
     let integration = runner.run(
         &sh::Cmd::new(env.herdr_bin(), Duration::from_secs(120))
@@ -189,6 +201,11 @@ pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Resu
         format!(
             "installed the herdr state hook into {}",
             layout.extensions().display()
+        ),
+        format!(
+            "wrote the DeepSeek compaction override (contextWindow {}) into {}",
+            deepseek::DEEPSEEK_CONTEXT_WINDOW,
+            layout.models().display()
         ),
     ];
     if let Some(base) = &provider {
@@ -291,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_runs_the_five_steps_and_hands_back_the_link_line() {
+    fn setup_writes_every_step_and_a_second_run_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pi"));
         let env = crate::pi::Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
@@ -310,7 +327,7 @@ mod tests {
         );
         runner.on("/h/herdr integration install pi", ok("installed pi\n"));
         let report = setup(&runner, &env, &layout).unwrap();
-        assert_eq!(report.steps.len(), 6);
+        assert_eq!(report.steps.len(), 7);
         assert!(
             report
                 .steps
@@ -324,6 +341,18 @@ mod tests {
         assert!(layout.settings().exists());
         assert!(layout.guard().exists());
         assert!(layout.wrapper().exists());
+        // The relay never ran, so the DeepSeek override is the only provider
+        // row, and setup wrote it itself.
+        let models: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
+        assert_eq!(
+            models["providers"]["opencode-go"]["modelOverrides"]["deepseek-v4.1-flash"]["contextWindow"],
+            deepseek::DEEPSEEK_CONTEXT_WINDOW
+        );
+        let first = std::fs::read_to_string(layout.models()).unwrap();
+        let second = setup(&runner, &env, &layout).unwrap();
+        assert_eq!(second.steps.len(), 7);
+        assert_eq!(std::fs::read_to_string(layout.models()).unwrap(), first);
         let integration = runner
             .calls
             .borrow()

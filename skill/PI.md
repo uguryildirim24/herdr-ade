@@ -27,6 +27,9 @@ Always `--no-skills`. Never `--approve` or `-a`. Never `--session`, `-c`,
 | ChatGPT Sol (escalate only) | `openai-codex` | `gpt-5.6-sol` | `high` |
 | ChatGPT Astra (disabled) | `openai-codex` | `gpt-6-astra` | `xhigh` |
 
+Your context is compacted near 372k tokens on DeepSeek; nothing is lost, the
+full record stays in the session file.
+
 Cursor stays outside pi. There is no
 `pi_cursor_*` row.
 
