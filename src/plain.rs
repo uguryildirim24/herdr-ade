@@ -156,7 +156,7 @@ pub fn check_ask(question: &str, choices: &[String], glossary: &Glossary) -> Che
 pub fn check_message(message: &HumanMessage, glossary: &Glossary) -> CheckResult {
     let mut violations = Vec::new();
     match message {
-        HumanMessage::Say { what, means } => {
+        HumanMessage::Say { what, means, .. } => {
             if what.trim().is_empty() {
                 violations.push(envelope_violation("what"));
             } else {
@@ -870,6 +870,7 @@ mod tests {
             &HumanMessage::Say {
                 what: "The head follows the branch.".into(),
                 means: None,
+                landed_round: None,
             },
             &g,
         );
@@ -878,6 +879,7 @@ mod tests {
             &HumanMessage::Say {
                 what: "".into(),
                 means: None,
+                landed_round: None,
             },
             &g,
         );

@@ -631,6 +631,9 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         record
     };
     let _ = crate::glossary::rewrite(&project);
+    if let Err(e) = crate::plan::refresh(ctx, &project) {
+        eprintln!("note: the plan refresh failed: {e:#}");
+    }
     let _ = crate::board::refresh(ctx, &project);
     Ok(record)
 }
@@ -653,6 +656,9 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
         save(&project, &record)?;
         record
     };
+    if let Err(e) = crate::plan::refresh(ctx, &project) {
+        eprintln!("note: the plan refresh failed: {e:#}");
+    }
     let _ = crate::board::refresh(ctx, &project);
     Ok(record)
 }
@@ -1363,6 +1369,18 @@ pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<M
         Some(intent) => resume(ctx, &project, &record, &git, intent, stop),
         None => fresh_merge(ctx, &project, record.clone(), &git, stop),
     };
+    // The durable completion boundary: the landing evidence and the shared
+    // plan refresh. Both are retry-safe and never roll back the merge
+    // (SPEC-talk §6.1, §6.5).
+    if matches!(&outcome, Ok(MergeOutcome::Checkpointed { .. })) {
+        let what = record.plain.trim().to_string();
+        if let Err(e) = crate::ask::say_landed(ctx, slug, &what, None, round) {
+            eprintln!("note: the landing line could not be published: {e:#}");
+        }
+        if let Err(e) = crate::plan::refresh(ctx, &project) {
+            eprintln!("note: the plan refresh failed: {e:#}");
+        }
+    }
     let _ = crate::board::refresh(ctx, &project);
     outcome
 }
@@ -2369,6 +2387,58 @@ mod tests {
             MergeOutcome::NoOp { head: head.clone() }
         );
         assert_eq!(main_head(&fx), head);
+    }
+
+    #[test]
+    fn a_landed_round_publishes_one_keyed_landing_line() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&ctx, "demo", "r1", None).unwrap();
+        let landed: Vec<(Option<String>, String)> = crate::talk::read(&fx.project)
+            .lines
+            .into_iter()
+            .filter_map(|line| match line.entry {
+                crate::talk::Entry::Say {
+                    landed_round: Some(round),
+                    ..
+                } => Some((line.key, round)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(landed.len(), 1, "{landed:?}");
+        assert_eq!(landed[0].0.as_deref(), Some("landed:r1"));
+        assert_eq!(landed[0].1, "r1");
+        // The second merge is a no-op and adds no second landing line.
+        merge(&ctx, "demo", "r1", None).unwrap();
+        let count = crate::talk::read(&fx.project)
+            .lines
+            .into_iter()
+            .filter(|line| {
+                matches!(
+                    &line.entry,
+                    crate::talk::Entry::Say {
+                        landed_round: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_landing_line_for_an_unmerged_round_is_refused() {
+        let fx = fixture();
+        open_r1(&fx);
+        let e = format!(
+            "{:#}",
+            crate::ask::say_landed(&fx.world.ctx(), "demo", "A thing landed.", None, "r1")
+                .unwrap_err()
+        );
+        assert!(e.starts_with("landed_round_unmerged"), "{e}");
+        assert!(crate::talk::read(&fx.project).lines.is_empty());
     }
 
     #[test]

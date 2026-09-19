@@ -334,6 +334,9 @@ pub enum HumanMessage {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         means: Option<String>,
+        /// The merged round this line is landing evidence for (SPEC-talk §6.1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        landed_round: Option<String>,
     },
     Ask {
         id: String,
@@ -460,6 +463,127 @@ pub struct TalkInbound {
     pub request: String,
     pub state: TalkRequestState,
     pub recipient: Recipient,
+}
+
+// --------------------------------------------------------------- plan card
+
+/// The seven end-result kinds and their fixed display sentence
+/// (SPEC-talk §2.7, §6.5). The coordinator picks one; the file stores it.
+pub const PLAN_KINDS: &[(&str, &str)] = &[
+    ("screen", "A screen you open."),
+    ("command", "A command you run."),
+    ("background", "A program that runs underneath."),
+    ("document", "A document."),
+    ("picture", "A picture."),
+    ("number", "A number."),
+    ("finding", "A finding."),
+];
+
+/// The fixed sentence for a stored kind, or `None` for an unknown one.
+pub fn plan_kind_sentence(kind: &str) -> Option<&'static str> {
+    PLAN_KINDS.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v)
+}
+
+/// `state` on one plan step (SPEC-talk §6.5). It is a persisted projection of
+/// the bound work, never a coordinator-supplied status.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StepState {
+    #[default]
+    Left,
+    Running,
+    Done,
+}
+
+impl StepState {
+    pub fn word(self) -> &'static str {
+        match self {
+            StepState::Left => "left",
+            StepState::Running => "running",
+            StepState::Done => "done",
+        }
+    }
+}
+
+/// One ordered plan step (SPEC-talk §6.5). `threads` and `rounds` are required
+/// work, not related discussions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PlanStep {
+    pub id: String,
+    pub text: String,
+    pub state: StepState,
+    pub threads: Vec<String>,
+    pub rounds: Vec<String>,
+}
+
+/// `<project>/plan.toml` (SPEC-talk §6.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct Plan {
+    pub schema: u32,
+    pub revision: u64,
+    pub next_step: u64,
+    pub goal: String,
+    pub kind: String,
+    pub what_you_get: String,
+    pub does: String,
+    pub steps: Vec<PlanStep>,
+}
+
+// ---------------------------------------------------------- decision log
+
+/// The four decision classes (SPEC-talk §6.6). `what-you-get`, `money` and
+/// `undo` need human authority; `routine` does not.
+pub const DECISION_CLASSES: &[&str] = &["what-you-get", "money", "undo", "routine"];
+
+/// One complete line of `<project>/decisions.jsonl` (SPEC-talk §6.6). Nullable
+/// fields stay present as `null` so an old reader sees the shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct Decision {
+    pub schema: u32,
+    pub seq: u64,
+    pub id: String,
+    pub at: String,
+    pub line: String,
+    pub class: String,
+    pub key: Option<String>,
+    pub basis: Option<String>,
+    pub replaces: Option<String>,
+    pub request: Option<String>,
+}
+
+/// A `--basis` reference: an existing human message (`request:<id>`) or a
+/// current, nonzero answered ask (`ask:<id>@<revision>`) (SPEC-talk §6.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorityRef {
+    Request(String),
+    Ask { id: String, revision: u32 },
+}
+
+impl AuthorityRef {
+    pub fn parse(text: &str) -> Option<AuthorityRef> {
+        if let Some(id) = text.strip_prefix("request:") {
+            if id.is_empty() {
+                return None;
+            }
+            return Some(AuthorityRef::Request(id.to_string()));
+        }
+        let rest = text.strip_prefix("ask:")?;
+        let (id, revision) = rest.rsplit_once('@')?;
+        Some(AuthorityRef::Ask {
+            id: id.to_string(),
+            revision: revision.parse().ok()?,
+        })
+    }
+
+    pub fn as_str(&self) -> String {
+        match self {
+            AuthorityRef::Request(id) => format!("request:{id}"),
+            AuthorityRef::Ask { id, revision } => format!("ask:{id}@{revision}"),
+        }
+    }
 }
 
 /// One JSON object on `talk/journal.jsonl` (SPEC-ADE D18 items 2 and 6).
@@ -594,6 +718,7 @@ mod tests {
         json_roundtrip(&HumanMessage::Say {
             what: "A lane is done.".into(),
             means: None,
+            landed_round: None,
         });
         json_roundtrip(&HumanMessage::Ask {
             id: "a-1".into(),
@@ -602,6 +727,78 @@ mod tests {
         json_roundtrip(&HumanMessage::Notice {
             id: "plain_exhausted".into(),
         });
+    }
+
+    #[test]
+    fn plan_step_decision_and_reference_roundtrip() {
+        let plan = Plan {
+            schema: 1,
+            revision: 8,
+            next_step: 6,
+            goal: "I want to build a trading bot with Jeff.".into(),
+            kind: "screen".into(),
+            what_you_get: "A screen you open.".into(),
+            does: "It shows pretend trades and lets you stop them.".into(),
+            steps: vec![
+                PlanStep {
+                    id: "s-1".into(),
+                    text: "Choose what the screen will show.".into(),
+                    state: StepState::Done,
+                    threads: vec!["t-0041".into()],
+                    rounds: vec![],
+                },
+                PlanStep {
+                    id: "s-2".into(),
+                    text: "Show pretend trades.".into(),
+                    state: StepState::Running,
+                    threads: vec!["t-0043".into(), "t-0044".into()],
+                    rounds: vec!["r1".into()],
+                },
+            ],
+        };
+        both(&plan);
+        // An old record without the newer fields still deserializes.
+        let old: Plan = toml::from_str(
+            "schema = 1\nrevision = 1\nnext_step = 2\ngoal = \"A goal.\"\n[[steps]]\nid = \"s-1\"\ntext = \"One step.\"\n",
+        )
+        .unwrap();
+        assert_eq!(old.steps[0].state, StepState::Left);
+        assert!(old.steps[0].threads.is_empty());
+
+        let decision = Decision {
+            schema: 1,
+            seq: 2,
+            id: "d-0002".into(),
+            at: "2026-09-19T12:18:00Z".into(),
+            line: "I will show more detail beside each choice.".into(),
+            class: "routine".into(),
+            key: Some("change-q-example".into()),
+            basis: None,
+            replaces: Some("d-0001".into()),
+            request: Some("q-example".into()),
+        };
+        json_roundtrip(&decision);
+        let text = serde_json::to_string(&decision).unwrap();
+        assert!(text.contains("\"basis\":null"), "{text}");
+        let old: Decision = serde_json::from_str(
+            "{\"schema\":1,\"seq\":1,\"id\":\"d-0001\",\"at\":\"x\",\"line\":\"A line.\",\"class\":\"routine\"}",
+        )
+        .unwrap();
+        assert!(old.key.is_none() && old.replaces.is_none());
+
+        assert_eq!(
+            AuthorityRef::parse("request:q-example"),
+            Some(AuthorityRef::Request("q-example".into()))
+        );
+        assert_eq!(
+            AuthorityRef::parse("ask:a-3@2"),
+            Some(AuthorityRef::Ask {
+                id: "a-3".into(),
+                revision: 2
+            })
+        );
+        assert_eq!(AuthorityRef::parse("ask:a-3"), None);
+        assert_eq!(AuthorityRef::parse("nonsense"), None);
     }
 
     #[test]

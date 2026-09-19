@@ -7,6 +7,7 @@ mod checkpoint;
 mod cli;
 mod contracts;
 mod coordinator;
+mod decide;
 mod dialogue;
 mod doctor;
 mod events;
@@ -27,6 +28,7 @@ mod pi;
 #[path = "pi/ade.rs"]
 mod pi_ade;
 mod plain;
+mod plan;
 mod pr;
 mod project;
 mod remote;
