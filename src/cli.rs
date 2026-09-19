@@ -627,6 +627,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 println!(
                     "next: start the reviewer thread in that worktree with role reviewer, then `round reviewer {slug} {id} <thread>`"
                 );
+                if let (Some(c), Some(v)) = (&o.earlier_candidate, &o.earlier_verdict) {
+                    println!(
+                        "repair: merge the earlier candidate {c} (verdict {v}) over the new base instead of the pinned shas; `round advance {slug}` starts a reviewer with that task"
+                    );
+                }
                 Ok(())
             }
             RoundCommand::Reviewer {
@@ -1121,7 +1126,7 @@ enum ThreadCommand {
     Resolve {
         slug: String,
         id: String,
-        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied", "keep_pane"])]
+        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied", "keep_pane", "force"])]
         reopen: bool,
         /// Also remove the worktree (never forced; the branch is kept)
         #[arg(long)]
@@ -1135,6 +1140,9 @@ enum ThreadCommand {
         /// Leave the lane's pane and tab open instead of closing them
         #[arg(long)]
         keep_pane: bool,
+        /// Close a lane or reviewer an open, unmerged round still holds
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1427,6 +1435,7 @@ pub fn run() -> Result<()> {
                 skip_copy,
                 discard_uncopied,
                 keep_pane,
+                force,
             } => threads::resolve(
                 &ctx,
                 &slug,
@@ -1437,6 +1446,7 @@ pub fn run() -> Result<()> {
                     skip_copy,
                     discard_uncopied,
                     keep_pane,
+                    force,
                 },
             ),
         },

@@ -75,6 +75,10 @@ The project screen reads two records the coordinator keeps. They are ordinary fi
 
 When Rolf asks in chat to change a recorded choice, the coordinator treats it like any other message, records the replacement with its `request` link, and says in plain words what will change. Message acceptance is not completion, and a replacement's wording must not claim finished work before it exists.
 
+## Rounds
+
+A round is a set of lanes that are reviewed and merged together; `hp round advance <slug>` starts the reviewer on its own. When `hp round merge` refuses with `merge_conflict` because another round landed first, run `hp round review <round>`: it keeps the brief commit B, opens the next `review/<round>-<n>` branch from the current integration head and clears the reviewer. The next `hp round advance` starts a reviewer whose task names the earlier candidate C and verdict commit V, so the reviewer merges C (with the earlier reviewer's fixes) over the new base instead of the raw lane shas. A round never gets a second reviewer while one is bound, and a resolved or gone reviewer can be replaced with `hp round reviewer`.
+
 ## Safety settings
 
 Set per project in `~/.config/herdr-ade/config.toml`; `safety show <project>` prints the table header to use.
