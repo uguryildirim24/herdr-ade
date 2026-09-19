@@ -240,6 +240,10 @@ fn trust_prompt_showing(runner: &dyn Runner, bin: &str, pane: &str) -> bool {
 pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOptions) -> Result<Lane> {
     layout.ensure()?;
     state::check_name(&opts.name)?;
+    // Serialize the whole decision, including the shared-home trust write and
+    // the lane-name check. Two starts must not overwrite each other's project
+    // entry or both claim one name.
+    let _lock = state::FileLock::acquire(&layout.start_lock())?;
     if let Ok(existing) = Lane::read(layout, &opts.name)
         && existing.stopped
     {
@@ -277,7 +281,6 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     }
 
     let bin = env.herdr_bin();
-    let _lock = state::FileLock::acquire(&layout.start_lock())?;
     let workspace = workspace_for(env, runner, &bin, opts.parent.as_deref()).unwrap_or_default();
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &cwd_text, &opts.name, &env_pairs)
@@ -375,6 +378,9 @@ fn screen_reason(runner: &dyn Runner, bin: &str, pane: &str) -> String {
 
 /// `herdr-pro resume`: start the lane again and resume its Codex thread.
 pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
+    // Re-read the lane only after owning the start lock. Otherwise two resume
+    // processes can both observe `gone` before either writes `ready`.
+    let _lock = state::FileLock::acquire(&layout.start_lock())?;
     let mut lane = Lane::read(layout, name)?;
     if lane.stopped {
         bail!("lane `{name}` was stopped and cannot be resumed");
@@ -408,7 +414,6 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     }
 
     let bin = env.herdr_bin();
-    let _lock = state::FileLock::acquire(&layout.start_lock())?;
     let workspace = workspace_for(env, runner, &bin, lane.parent.as_deref())
         .unwrap_or_else(|| lane.workspace_id.clone());
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
