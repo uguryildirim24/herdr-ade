@@ -7,6 +7,16 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 - Keep agent-plane names and technical detail in reports. Messages meant for Rolf use the plugin's plain-language commands.
 - Do not edit project memory. Put durable lessons in your report for the coordinator to decide.
 
+## Pictures
+
+A lane can ask Codex for one mock-up picture. Write the prompt to a file and run:
+
+```text
+herdr-pro image --prompt-file <file> --size <WxH> --out <png>
+```
+
+The command starts (or reuses) a picture lane on Codex's own backend, spends one Codex turn, and saves the PNG to `--out`; it takes a few minutes. Ask for a picture only when the brief says pictures are wanted. Name the exact pixel size in `--size`; if the tool only offers fixed sizes it picks the nearest and says which one it used.
+
 ## Finish
 
 Commit the finished work, write the report named by your brief, then run:

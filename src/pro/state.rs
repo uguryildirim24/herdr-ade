@@ -69,6 +69,10 @@ pub struct Lane {
     pub parent: Option<String>,
     #[serde(default)]
     pub cwd: String,
+    /// The Codex config profile this lane runs; `None` is the Pro bridge lane.
+    /// A picture lane is `Some("gpt-image-gen")` and never sees the bridge.
+    #[serde(default)]
+    pub profile: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -401,6 +405,7 @@ mod tests {
             workspace_id: "w1".into(),
             parent: Some("w1:p1".into()),
             cwd: "/w".into(),
+            profile: None,
             session_id: Some("abc".into()),
             rollout: Some("/r.jsonl".into()),
             started_at: now_rfc3339(),
@@ -515,6 +520,7 @@ mod tests {
                 workspace_id: "w".into(),
                 parent: None,
                 cwd: "/w".into(),
+                profile: None,
                 session_id: Some(session.into()),
                 rollout: None,
                 started_at: now_rfc3339(),
