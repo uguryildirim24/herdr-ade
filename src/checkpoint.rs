@@ -1136,6 +1136,12 @@ pub fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<String>
             &project.state_dir().join("tmp"),
         )?
     };
+    // The shared plan refresh at the checkpoint's durable completion
+    // boundary; a failure is separate and never affects the commit
+    // (SPEC-talk §6.5).
+    if let Err(e) = crate::plan::refresh(ctx, &project) {
+        eprintln!("note: the plan refresh failed: {e:#}");
+    }
     Ok(format!(
         "checkpoint H {commit} on `{branch}` (payload {})\n",
         payload_hash(&md, &json)

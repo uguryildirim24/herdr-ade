@@ -242,12 +242,39 @@ enum Command {
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
     },
+    /// The plan card: goal, end result and steps (SPEC-talk §6.5)
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+    /// The choices the coordinator made for Rolf (SPEC-talk §6.6)
+    #[command(args_conflicts_with_subcommands = true)]
+    Decide {
+        #[command(subcommand)]
+        command: Option<DecideCommand>,
+        line: Option<String>,
+        #[arg(long, value_name = "CLASS")]
+        class: Option<String>,
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+        #[arg(long, value_name = "REFERENCE")]
+        basis: Option<String>,
+        #[arg(long, value_name = "DECISION_ID")]
+        replaces: Option<String>,
+        #[arg(long, value_name = "REQUEST_ID")]
+        request: Option<String>,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
     /// Tell Rolf one checked line on the board and the talk tab
     Say {
         #[arg(long)]
         what: String,
         #[arg(long)]
         means: Option<String>,
+        /// Attach this line as landing evidence for a merged round
+        #[arg(long, value_name = "ROUND")]
+        landed_round: Option<String>,
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
     },
@@ -382,6 +409,128 @@ enum DialogueCommand {
 }
 
 #[derive(Subcommand)]
+enum PlanCommand {
+    /// Print the plan card; a missing card prints revision zero
+    Show {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Set the end-result kind and its one sentence
+    Set {
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        #[arg(long)]
+        does: String,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Add, edit, link, unlink, remove or move one step
+    Step {
+        #[command(subcommand)]
+        command: PlanStepCommand,
+    },
+    /// Derive step states from the bound work and write only on change
+    Sync {
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanStepCommand {
+    /// Add a step, optionally bound to threads or rounds
+    Add {
+        text: String,
+        #[arg(long = "thread", value_name = "ID")]
+        threads: Vec<String>,
+        #[arg(long = "round", value_name = "ID")]
+        rounds: Vec<String>,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Replace one step's sentence
+    Edit {
+        id: String,
+        text: String,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Add required work to a step
+    Link {
+        id: String,
+        #[arg(long = "thread", value_name = "ID")]
+        threads: Vec<String>,
+        #[arg(long = "round", value_name = "ID")]
+        rounds: Vec<String>,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Remove required work from a step
+    Unlink {
+        id: String,
+        #[arg(long = "thread", value_name = "ID")]
+        threads: Vec<String>,
+        #[arg(long = "round", value_name = "ID")]
+        rounds: Vec<String>,
+        #[arg(long)]
+        why: String,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Remove one step (identifiers are never reused)
+    Remove {
+        id: String,
+        #[arg(long)]
+        why: String,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Change display order only
+    Move {
+        id: String,
+        #[arg(long, value_name = "ID")]
+        before: String,
+        #[arg(long)]
+        expect: u64,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DecideCommand {
+    /// List the current choices, newest first
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Show one decision and whether it is still current
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AskCommand {
     /// Answer an ask by id and revision
     Answer {
@@ -410,7 +559,7 @@ enum TermCommand {
 }
 
 fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
-    use crate::{ask, board, checkpoint, dialogue, glossary, round, talk};
+    use crate::{ask, board, checkpoint, decide, dialogue, glossary, plan, round, talk};
     let slug_of = |slug: Option<String>| overview::require_slug(ctx, slug.as_deref());
     match command {
         Command::Round { command } => match command {
@@ -647,13 +796,161 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
         },
+        Command::Plan { command } => match command {
+            PlanCommand::Show { json, project } => {
+                let slug = slug_of(project)?;
+                print!("{}", plan::show(ctx, &slug, json)?);
+                Ok(())
+            }
+            PlanCommand::Set {
+                kind,
+                does,
+                expect,
+                project,
+            } => {
+                let slug = slug_of(project)?;
+                let p = plan::set(ctx, &slug, &kind, &does, expect)?;
+                println!("plan revision {} set to `{}`", p.revision, p.kind);
+                Ok(())
+            }
+            PlanCommand::Step { command } => match command {
+                PlanStepCommand::Add {
+                    text,
+                    threads,
+                    rounds,
+                    expect,
+                    project,
+                } => {
+                    let slug = slug_of(project)?;
+                    let p = plan::step_add(ctx, &slug, &text, threads, rounds, expect)?;
+                    let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
+                    println!("plan revision {}: added {id}", p.revision);
+                    Ok(())
+                }
+                PlanStepCommand::Edit {
+                    id,
+                    text,
+                    expect,
+                    project,
+                } => {
+                    let slug = slug_of(project)?;
+                    let p = plan::step_edit(ctx, &slug, &id, &text, expect)?;
+                    println!("plan revision {}: edited {id}", p.revision);
+                    Ok(())
+                }
+                PlanStepCommand::Link {
+                    id,
+                    threads,
+                    rounds,
+                    expect,
+                    project,
+                } => {
+                    let slug = slug_of(project)?;
+                    let p = plan::step_link(ctx, &slug, &id, threads, rounds, expect)?;
+                    println!("plan revision {}: linked {id}", p.revision);
+                    Ok(())
+                }
+                PlanStepCommand::Unlink {
+                    id,
+                    threads,
+                    rounds,
+                    why,
+                    expect,
+                    project,
+                } => {
+                    let slug = slug_of(project)?;
+                    let p = plan::step_unlink(ctx, &slug, &id, threads, rounds, &why, expect)?;
+                    println!("plan revision {}: unlinked {id}", p.revision);
+                    Ok(())
+                }
+                PlanStepCommand::Remove {
+                    id,
+                    why,
+                    expect,
+                    project,
+                } => {
+                    let slug = slug_of(project)?;
+                    let p = plan::step_remove(ctx, &slug, &id, &why, expect)?;
+                    println!("plan revision {}: removed {id}", p.revision);
+                    Ok(())
+                }
+                PlanStepCommand::Move {
+                    id,
+                    before,
+                    expect,
+                    project,
+                } => {
+                    let slug = slug_of(project)?;
+                    let p = plan::step_move(ctx, &slug, &id, &before, expect)?;
+                    println!("plan revision {}: moved {id}", p.revision);
+                    Ok(())
+                }
+            },
+            PlanCommand::Sync { project } => {
+                let slug = slug_of(project)?;
+                match plan::sync(ctx, &slug)? {
+                    plan::SyncOutcome::Missing => println!("no plan is written down yet"),
+                    plan::SyncOutcome::Unchanged { revision } => {
+                        println!("plan revision {revision}: no step state changed")
+                    }
+                    plan::SyncOutcome::Changed { revision } => {
+                        println!("plan revision {revision}: step states refreshed")
+                    }
+                }
+                Ok(())
+            }
+        },
+        Command::Decide {
+            command,
+            line,
+            class,
+            key,
+            basis,
+            replaces,
+            request,
+            project,
+        } => match command {
+            Some(DecideCommand::List { json, project }) => {
+                let slug = slug_of(project)?;
+                print!("{}", decide::list(ctx, &slug, json)?);
+                Ok(())
+            }
+            Some(DecideCommand::Show { id, json, project }) => {
+                let slug = slug_of(project)?;
+                print!("{}", decide::show(ctx, &slug, &id, json)?);
+                Ok(())
+            }
+            None => {
+                let slug = slug_of(project)?;
+                let line = line.context("a decision line is required")?;
+                let class = class.context("a decision needs --class")?;
+                let d = decide::decide(
+                    ctx,
+                    &slug,
+                    decide::NewDecision {
+                        line: &line,
+                        class: &class,
+                        key: key.as_deref(),
+                        basis: basis.as_deref(),
+                        replaces: replaces.as_deref(),
+                        request: request.as_deref(),
+                    },
+                )?;
+                println!("{} {}", d.id, d.class);
+                Ok(())
+            }
+        },
         Command::Say {
             what,
             means,
+            landed_round,
             project,
         } => {
             let slug = slug_of(project)?;
-            ask::say(ctx, &slug, &what, means.as_deref())?;
+            match landed_round {
+                Some(round) => ask::say_landed(ctx, &slug, &what, means.as_deref(), &round)?,
+                None => ask::say(ctx, &slug, &what, means.as_deref())?,
+            }
             println!("said");
             Ok(())
         }
@@ -1245,6 +1542,8 @@ pub fn run() -> Result<()> {
         | Command::Checkpoint { .. }
         | Command::Pickup { .. }
         | Command::Ask { .. }
+        | Command::Plan { .. }
+        | Command::Decide { .. }
         | Command::Say { .. }
         | Command::Explain { .. }
         | Command::Term { .. }

@@ -481,6 +481,7 @@ fn parse_envelopes(text: &str) -> Result<Vec<HumanMessage>> {
                     .get("means")
                     .cloned()
                     .filter(|value| !value.is_empty()),
+                landed_round: None,
             }),
             "ade-ask" => {
                 let ask = fields.get("ask").map(String::as_str).unwrap_or_default();
@@ -611,7 +612,8 @@ mod tests {
             messages,
             vec![HumanMessage::Say {
                 what: "The work is ready.".into(),
-                means: None
+                means: None,
+                landed_round: None
             }]
         );
     }
