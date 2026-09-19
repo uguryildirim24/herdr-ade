@@ -149,6 +149,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
 
+    let listed = args
+        .repo
+        .as_ref()
+        .and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     check_birth_plain(&args.plain)?;
     // A box lane needs a repository: no repository means a tab in this Mac's
     // project workspace, which is local (SPEC-remote §4.2).
@@ -186,30 +190,11 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         },
     )?;
 
-    // The machine is resolved independently of the kind (SPEC-remote §4.1):
-    // `--machine`, else the roles-table row, else the project default, else
-    // this Mac. An unknown or disabled machine refuses; there is no fallback.
-    let chosen = args
-        .machine
-        .clone()
-        .filter(|m| !m.is_empty())
-        .or_else(|| (!launch.machine.is_empty()).then(|| launch.machine.clone()))
-        .or_else(|| {
-            let default = project.machine();
-            (!default.is_empty()).then_some(default)
-        })
-        .unwrap_or_else(|| crate::contracts::MACHINE_LOCAL.to_string());
-    let remote_choice = chosen != crate::contracts::MACHINE_LOCAL;
-    if remote_choice && args.repo.is_none() {
-        bail!(
-            "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
-        );
-    }
+    // A box lane still commits and pushes from the Mac clone, so every
+    // explicit repository is a local path and follows the same allowlist,
+    // local and box lanes alike (SPEC-remote §4.2).
     let repo = match &args.repo {
-        None if remote_choice => unreachable!(),
         None => String::new(),
-        // A box lane still commits and pushes from the Mac clone, so every
-        // explicit repository is a local path and follows the same allowlist.
         Some(repo) => {
             let path = std::fs::canonicalize(repo)
                 .with_context(|| format!("repository {repo} does not exist"))?
@@ -223,18 +208,19 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             path
         }
     };
-    let profile =
-        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &chosen)?;
-    let machine = if profile.is_local() {
-        String::new()
-    } else {
-        profile.label.clone()
-    };
-    if !machine.is_empty() && project::machine_held(&ctx.root, &profile.id) {
-        bail!(
-            "machine_held: `{machine}` is held; run `ha machine release {machine}` when the fork refresh or resize is done"
-        );
-    }
+    // The machine is resolved before any tab or worktree exists (SPEC-remote
+    // §4.1, d-0005). `--machine` wins and never falls back; a default box
+    // start whose box cannot be used falls back to this Mac.
+    let placement = resolve_placement(
+        ctx,
+        slug,
+        args.machine.as_deref().filter(|m| !m.is_empty()),
+        role,
+        &launch,
+        args.repo.as_deref(),
+        listed,
+    )?;
+    let machine = placement.machine.clone();
     let open_count = thread::list(&project)
         .iter()
         .filter(|t| t.status == Status::Open || t.status == Status::Starting)
@@ -246,21 +232,12 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         );
     }
 
-    // A box lane's provider readiness runs on the box (SPEC-remote §4.1); the
-    // Mac's login is irrelevant to it. The local pi check stays for local
-    // lanes.
-    if launch.kind == "pi" {
-        if machine.is_empty() {
-            pi_ready(ctx, &launch)?;
-        } else {
-            box_pi_ready(ctx, &machine, &launch)?;
-        }
+    // A box lane's readiness ran during placement (SPEC-remote §4.1): the
+    // Mac's login is irrelevant to it. A local pi lane is checked here.
+    if machine.is_empty() && launch.kind == "pi" {
+        pi_ready(ctx, &launch)?;
     }
-    let machine_id = if machine.is_empty() {
-        String::new()
-    } else {
-        profile.id.clone()
-    };
+    let machine_id = placement.machine_id.clone();
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = if repo.is_empty() {
@@ -303,6 +280,102 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 }
 
+/// The resolved machine of a new thread: empty for a local thread.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Placement {
+    machine: String,
+    machine_id: String,
+}
+
+/// The default machine of a start without `--machine` (SPEC-remote §4.1,
+/// d-0005): a lane or reviewer whose role row names a machine, on a
+/// repository that has a box clone, runs on that box. Every other start
+/// stays on this Mac.
+fn default_machine(
+    role: &str,
+    role_machine: &str,
+    repo: Option<&str>,
+    listed: Option<&crate::project::Repo>,
+) -> Option<String> {
+    if !matches!(role, "lane" | "reviewer") || role_machine.is_empty() {
+        return None;
+    }
+    let repo = repo?;
+    let has_box = listed.is_some_and(|row| row.box_path.is_some())
+        || crate::remote::box_repo_for(repo).is_some();
+    has_box.then(|| role_machine.to_string())
+}
+
+/// Resolves a start's machine before any tab or worktree exists (SPEC-remote
+/// §4.1, d-0005). `--machine` wins and never falls back. A default box start
+/// whose box cannot be used (an unknown or disabled profile, a held box, or a
+/// box readiness refusal) falls back to this Mac with one plain line.
+fn resolve_placement(
+    ctx: &Ctx,
+    slug: &str,
+    explicit: Option<&str>,
+    role: &str,
+    launch: &crate::contracts::Launch,
+    repo: Option<&str>,
+    listed: Option<&crate::project::Repo>,
+) -> Result<Placement> {
+    let (chosen, fallback) = match explicit {
+        Some(machine) => (machine.to_string(), false),
+        None => match default_machine(role, &launch.machine, repo, listed) {
+            Some(machine) => (machine, true),
+            None => return Ok(Placement::default()),
+        },
+    };
+    if chosen == crate::contracts::MACHINE_LOCAL {
+        return Ok(Placement::default());
+    }
+    let profile =
+        match remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &chosen) {
+            Ok(profile) => profile,
+            Err(_) if fallback => {
+                fallback_say(ctx, slug)?;
+                return Ok(Placement::default());
+            }
+            Err(error) => return Err(error),
+        };
+    if profile.is_local() {
+        return Ok(Placement::default());
+    }
+    if project::machine_held(&ctx.root, &profile.id) {
+        if fallback {
+            fallback_say(ctx, slug)?;
+            return Ok(Placement::default());
+        }
+        bail!(
+            "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
+            profile.label,
+            profile.label
+        );
+    }
+    if let Err(error) = box_launch_ready(ctx, &profile, launch) {
+        if !fallback {
+            return Err(error);
+        }
+        fallback_say(ctx, slug)?;
+        return Ok(Placement::default());
+    }
+    Ok(Placement {
+        machine: profile.label,
+        machine_id: profile.id,
+    })
+}
+
+/// The one plain line when a default box start falls back to this Mac
+/// (SPEC-remote §4.1, d-0005).
+fn fallback_say(ctx: &Ctx, slug: &str) -> Result<()> {
+    crate::ask::say(
+        ctx,
+        slug,
+        "the box was not ready, so this lane runs here",
+        None,
+    )
+}
+
 /// A `kind = "pi"` launch is refused unless its provider is ready (SPEC-pi
 /// §3.4, T11): never a lane that waits for a first prompt it cannot answer.
 pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
@@ -313,15 +386,42 @@ pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
         .with_context(|| format!("pi_not_ready: provider {provider}"))
 }
 
+/// Box readiness: pi launches run their provider check on the box; every
+/// other kind still proves SSH reachability before placement can choose it.
+fn box_launch_ready(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
+    if launch.kind == "pi" {
+        let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+            .context("pi_args_forbidden: a pi launch names no --provider")?;
+        return crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
+            .with_context(|| format!("pi_not_ready: provider {provider} on `{}`", profile.label));
+    }
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        "true",
+        None,
+        remote::SSH_TIMEOUT,
+    )?;
+    if !out.success() {
+        bail!(
+            "machine_unreachable: `{}` did not answer: {}",
+            profile.label,
+            out.error_text()
+        );
+    }
+    Ok(())
+}
+
 /// Box pi readiness: the check runs on the box, never against the Mac login
 /// (SPEC-remote §4.1, SPEC-pi §3.4).
 pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch) -> Result<()> {
-    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-        .context("pi_args_forbidden: a pi launch names no --provider")?;
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
-    crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
-        .with_context(|| format!("pi_not_ready: provider {provider} on `{machine}`"))
+    box_launch_ready(ctx, &profile, launch)
 }
 
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
@@ -2242,5 +2342,283 @@ mod tests {
                 && line.contains("w2:p1")
         });
         assert!(!repaired, "mismatch must not repair parent");
+    }
+
+    // ---- default placement on the box (SPEC-remote §4.1, d-0005) ----
+
+    /// A fixture whose project lists its repository with a box clone and a
+    /// local bare remote the lane branch can publish to, so a box start needs
+    /// no network.
+    fn box_fixture() -> (crate::round::testkit::Fx, String) {
+        let fx = crate::round::testkit::fixture();
+        let remote = fx.world.home.path().join("remote.git");
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", "-q", &remote.to_string_lossy()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let remote = remote.to_string_lossy().into_owned();
+        crate::round::testkit::git(&fx.repo, &["remote", "add", "box", &remote]);
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos = vec![crate::project::Repo {
+            path: fx.repo.to_string_lossy().into_owned(),
+            box_path: Some("/home/ubuntu/projects/repo".into()),
+            publish_url: Some(remote.clone()),
+            ..Default::default()
+        }];
+        let text = format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap());
+        std::fs::write(fx.project.project_md(), text).unwrap();
+        (fx, remote)
+    }
+
+    fn write_config(fx: &crate::round::testkit::Fx, text: &str) {
+        let cfg = fx.world.home.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("config.toml"), text).unwrap();
+    }
+
+    /// The profile, provisioning and create fakes a box start needs.
+    fn stub_box(fx: &crate::round::testkit::Fx) {
+        use crate::runner::fake::ok;
+        fx.world.runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"oci-id","label":"oci","target":"remote-host","session":"default","enabled":true}]"#),
+        );
+        fx.world.runner.on(
+            "agent start --help",
+            ok("      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n"),
+        );
+        fx.world.runner.on(
+            "workspace create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#),
+        );
+        fx.world.runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#),
+        );
+        // `provision` verifies the fetched commit is the one the Mac pushed:
+        // answer with the base the script names. The card write needs nothing.
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |cmd| {
+                let script = cmd.args.last().cloned().unwrap_or_default();
+                let base = script
+                    .split("FETCH_HEAD)\" = ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or("");
+                Ok(ok(&format!("{base}\n")))
+            },
+        );
+    }
+
+    const LANE_CONFIG: &str = "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\nmachine = \"oci\"\n";
+
+    fn start_args(repo: Option<String>, machine: Option<String>) -> StartArgs {
+        StartArgs {
+            title: "Fix login".into(),
+            repo,
+            machine,
+            base: None,
+            task: "Do the thing.".into(),
+            plain: "The lane does the work.".into(),
+            role: None,
+            recipe: None,
+        }
+    }
+
+    fn say_lines(project: &Project) -> Vec<String> {
+        crate::talk::read(project)
+            .lines
+            .iter()
+            .filter_map(|line| match &line.entry {
+                crate::talk::Entry::Say { what, .. } => Some(what.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_lane_and_reviewer_default_to_the_box() {
+        let row = crate::project::Repo {
+            path: "/r".into(),
+            box_path: Some("/box/r".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            default_machine("lane", "oci", Some("/r"), Some(&row)),
+            Some("oci".into())
+        );
+        assert_eq!(
+            default_machine("reviewer", "oci", Some("/r"), Some(&row)),
+            Some("oci".into())
+        );
+        assert_eq!(
+            default_machine("research", "oci", Some("/r"), Some(&row)),
+            None
+        );
+        assert_eq!(default_machine("lane", "", Some("/r"), Some(&row)), None);
+        let plain = crate::project::Repo {
+            path: "/r".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            default_machine("lane", "oci", Some("/r"), Some(&plain)),
+            None
+        );
+        assert_eq!(default_machine("lane", "oci", None, Some(&row)), None);
+    }
+
+    #[test]
+    fn a_lane_on_a_box_repo_lands_on_the_role_row_machine() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        stub_box(&fx);
+        let started = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert_eq!(started.machine, "oci");
+        assert_eq!(started.machine_id, "oci-id");
+        assert!(
+            started
+                .worktree_path
+                .starts_with("/home/ubuntu/projects/repo/.worktrees/")
+        );
+        assert!(
+            say_lines(&fx.project).is_empty(),
+            "a box start says nothing"
+        );
+    }
+
+    #[test]
+    fn machine_local_keeps_a_box_repo_lane_on_this_mac() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        stub_box(&fx);
+        let started = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                Some("local".into()),
+            ),
+        )
+        .unwrap();
+        assert!(started.machine.is_empty());
+        assert!(started.machine_id.is_empty());
+        assert!(
+            started
+                .worktree_path
+                .starts_with(&fx.repo.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn a_task_with_no_repo_stays_a_local_tab() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        stub_box(&fx);
+        *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+        let started = start(&fx.world.ctx(), "demo", start_args(None, None)).unwrap();
+        assert_eq!(started.kind, Kind::Tab);
+        assert!(started.machine.is_empty());
+    }
+
+    #[test]
+    fn a_held_box_falls_back_to_this_mac_with_one_line() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        stub_box(&fx);
+        let ctx = fx.world.ctx();
+        project::machine_hold(&ctx.root, "oci-id").unwrap();
+        let started = start(
+            &ctx,
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert!(started.machine.is_empty());
+        assert_eq!(
+            say_lines(&fx.project),
+            vec!["the box was not ready, so this lane runs here".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unreachable_box_falls_back_to_this_mac() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        fx.world.runner.on(
+            "export PATH",
+            crate::runner::fake::fail(255, "connection refused"),
+        );
+        stub_box(&fx);
+        let started = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert!(started.machine.is_empty());
+        assert_eq!(
+            say_lines(&fx.project),
+            vec!["the box was not ready, so this lane runs here".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_explicit_held_box_refuses() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        stub_box(&fx);
+        let ctx = fx.world.ctx();
+        project::machine_hold(&ctx.root, "oci-id").unwrap();
+        let error = start(
+            &ctx,
+            "demo",
+            start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                Some("oci".into()),
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("machine_held"), "{error}");
+    }
+
+    #[test]
+    fn a_reviewer_advance_lands_on_the_box() {
+        let (fx, _remote) = box_fixture();
+        write_config(
+            &fx,
+            "[roles.reviewer]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\nmachine = \"oci\"\n",
+        );
+        stub_box(&fx);
+        let ctx = fx.world.ctx();
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The first round lands the shared types.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        for (id, sha) in [fx.lane(1), fx.lane(2)] {
+            crate::round::admit(&ctx, "demo", "r1", &id).unwrap();
+            fx.seal_done(&id, 1, 1, &sha, &format!("# report {id}\n"));
+        }
+        crate::round::advance(&ctx, "demo").unwrap();
+        let record = crate::round::load(&fx.project, "r1").unwrap();
+        let reviewer = record.reviewer.clone().expect("reviewer bound");
+        let started = thread::load(&fx.project, &reviewer).unwrap();
+        assert_eq!(started.role, "reviewer");
+        assert_eq!(started.machine, "oci");
+        assert_eq!(started.machine_id, "oci-id");
     }
 }

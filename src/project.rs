@@ -149,10 +149,6 @@ pub struct Settings {
     pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
-    /// The project's default machine (SPEC-remote §4.1): a saved machine
-    /// label/id, or `local`. Empty means `local`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub machine: String,
     /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
     /// default of item 24: on for a `claude` coordinator, off otherwise
     /// (`talk::enabled`). Never written by `new`, so the default applies.
@@ -186,7 +182,6 @@ impl Default for Settings {
             // text the user has half-typed (docs/herdr-notes.md, stage 2). With
             // `false` the ticker shows a herdr notification instead.
             nudge: false,
-            machine: String::new(),
             talk: None,
             roles: std::collections::BTreeMap::new(),
             repos: Vec::new(),
@@ -429,13 +424,6 @@ impl Project {
         let text = std::fs::read_to_string(self.project_md())
             .with_context(|| format!("could not read {}", self.project_md().display()))?;
         parse_project_md(&text)
-    }
-
-    /// The project's default machine (SPEC-remote §4.1). Empty means `local`.
-    pub fn machine(&self) -> String {
-        self.read_project_md()
-            .map(|(settings, _)| settings.machine)
-            .unwrap_or_default()
     }
 
     pub fn status(&self) -> Status {
