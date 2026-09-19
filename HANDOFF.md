@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T19:51:39-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-19T19:51:49-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 7 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
@@ -46,11 +46,11 @@ Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (workin
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (19 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (28 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | bb64e02 | 0 | Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c' |
+| `/Users/rolfie/projects/herdr-ade` | `main` | 37fbe71 | 0 | Merge commit 'ad94e7031ca8410f94d90e4ff7b6c5142b63ec97' |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -130,19 +130,19 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (19 ahead, 0 
 Last commits on the integration branch:
 
 ```
+37fbe71 Merge commit 'ad94e7031ca8410f94d90e4ff7b6c5142b63ec97'
+e02e3a7 checkpoint(r28): HANDOFF after merging the round
 bb64e02 Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c'
 4177ce0 checkpoint(r25): HANDOFF after merging the round
 e0257a3 Merge commit '9a19ab64a28e60f0460ae13c198762b9c9ea9ba4'
-f9d1f3c docs(review): round r28 verdict
-3a782af review(round): keep retry on the current manifest
-9a19ab6 docs(review): refresh round r25 verdict after r26
+ad94e70 review(talk): round r29 verdict
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0066.md`, `tasks/t-0060.md`, `tasks/review-r29.md`, `tasks/review-r28.md`, `tasks/t-0061.md`, `tasks/t-0065.md`, `tasks/review-r26.md`, `tasks/t-0059.md`, `tasks/review-r25.md`, `tasks/t-0058.md`, `tasks/t-0057.md`, `tasks/t-0056.md`
-- verdicts: `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`, `tasks/reviews/code-r23.md`, `tasks/reviews/code-r22.md`, `tasks/reviews/code-r20.md`, `tasks/reviews/code-r19.md`, `tasks/reviews/code-r18.md`, `tasks/reviews/code-r15.md`, `tasks/reviews/code-r14.md`, `tasks/reviews/code-r12.md`
+- briefs: `tasks/t-0067.md`, `tasks/t-0066.md`, `tasks/t-0060.md`, `tasks/review-r29.md`, `tasks/review-r28.md`, `tasks/t-0061.md`, `tasks/t-0065.md`, `tasks/review-r26.md`, `tasks/t-0059.md`, `tasks/review-r25.md`, `tasks/t-0058.md`, `tasks/t-0057.md`
+- verdicts: `tasks/reviews/code-r29.md`, `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`, `tasks/reviews/code-r23.md`, `tasks/reviews/code-r22.md`, `tasks/reviews/code-r20.md`, `tasks/reviews/code-r19.md`, `tasks/reviews/code-r18.md`, `tasks/reviews/code-r15.md`, `tasks/reviews/code-r14.md`
 
 ### Pickup
 
@@ -154,5 +154,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 6c22d8cf-cae6-47e2-a930-fd9207175aea
 ```
 
-Round `r28` was merged into `main` at verdict commit `f9d1f3c389c26a14f56fb9da48d8d0e83699194c`; this checkpoint is its child.
+Round `r29` was merged into `main` at verdict commit `ad94e7031ca8410f94d90e4ff7b6c5142b63ec97`; this checkpoint is its child.
 
