@@ -56,8 +56,9 @@ Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start fa
 You choose the role, never a model. The roles table in `~/.config/herdr-ade/config.toml` fixes each role's model and effort: a lane runs the role's `default`, and that is the whole choice. There is no picker and no per-task model decision.
 
 - Pick a role with `--role <name>` when the work is not a lane: `reviewer`, `critic`, `drafter`, `research`, `planner`.
-- Pass `--recipe <id>` only to escalate a stalled lane. The id must sit in the role's `escalate` list, and only after Rolf says so. A row outside the role's `allowed` list is refused.
-- Do not name a model in the task text and do not try to change a running lane's model or effort. A restart reuses the recorded launch unless you pass `--recipe`.
+- `--recipe <id>` pins a row from the role's `allowed` list. Use it only when Rolf has explicitly chosen that override.
+- Rows in `escalate` are stronger options for a stalled lane. Do not move one into `allowed` or start a replacement lane on it until Rolf says so.
+- Do not name a model in the task text and do not try to change a running lane's model or effort. A restart reuses the recorded launch.
 
 ## Tasks
 

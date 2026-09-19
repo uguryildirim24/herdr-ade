@@ -194,8 +194,17 @@ pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
             .map(|front| (front, ""))
             .context("PROJECT.md front matter has no closing `+++` line")?,
     };
-    let settings: Settings =
+    let value: toml::Value =
         toml::from_str(front).context("PROJECT.md front matter does not parse")?;
+    if value
+        .as_table()
+        .is_some_and(|table| table.contains_key("jev"))
+    {
+        bail!("picker_removed: PROJECT.md jev is gone; the lane picker was removed");
+    }
+    let settings: Settings = value
+        .try_into()
+        .context("PROJECT.md front matter does not parse")?;
     Ok((settings, body.trim_start_matches('\n').to_string()))
 }
 

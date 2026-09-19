@@ -645,7 +645,7 @@ impl crate::dialogue::PairFilter for DialoguePair {
 #[derive(Debug, Default, Clone)]
 pub struct ResolveInput<'a> {
     pub role: &'a str,
-    /// `--recipe <id>`: pins one allowed row, default or escalate.
+    /// `--recipe <id>`: pins one row from the role's `allowed` list.
     pub recipe: Option<&'a str>,
     /// PROJECT.md front matter `kind`/`args` pin.
     pub project_pin: Option<Recipe>,
