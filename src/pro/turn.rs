@@ -808,6 +808,7 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
+            ready_timeout_ms: None,
         }
         .write(layout)
         .unwrap();
@@ -1005,6 +1006,7 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
+            ready_timeout_ms: None,
         };
         lane.write(&layout).unwrap();
         let out = dir.path().join("answer.md");
@@ -1051,6 +1053,7 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
+            ready_timeout_ms: None,
         }
         .write(&layout)
         .unwrap();
