@@ -14,9 +14,9 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T17:47:15-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-19T17:59:55-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
-Workspace `w1G` (Adeherdr), 5 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
+Workspace `w1G` (Adeherdr), 6 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
 Coordinator session id `6c22d8cf-cae6-47e2-a930-fd9207175aea`.
 
@@ -24,27 +24,29 @@ Coordinator session id `6c22d8cf-cae6-47e2-a930-fd9207175aea`.
 
 | name | kind | status | pane | tab (label) | cwd | tokens | last title |
 |---|---|---|---|---|---|---|---|
-| hp-adeherdr-t-0042 | pi | working | `w1G:p1V` | `w1G:t1Q` (t-0042) | `/Users/rolfie/projects/herdr/.worktrees/t-0042` | done=1 lane=t-0042 project=adeherdr rank=3 review=working thread=t-0042 | π - t-0042 |
-| hp-adeherdr-t-0044 | pi | done | `w1G:p1X` | `w1G:t1S` (t-0044) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0044` | done=1 lane=t-0044 project=adeherdr rank=1 review=ready-for-review thread=t-0044 | π - t-0044 |
-| hp-adeherdr-t-0045 | pi | done | `w1G:p1Y` | `w1G:t1T` (t-0045) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0045` | done=1 lane=t-0045 project=adeherdr rank=1 review=ready-for-review thread=t-0045 | π - t-0045 |
+| hp-adeherdr-t-0042 | pi | done | `w1G:p1V` | `w1G:t1Q` (t-0042) | `/Users/rolfie/projects/herdr/.worktrees/t-0042` | project=adeherdr rank=1 review=ready-for-review thread=t-0042 | π - t-0042 |
+| hp-adeherdr-t-0046 | pi | done | `w1G:p1Z` | `w1G:t1V` (t-0046) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0046` | project=adeherdr rank=1 review=ready-for-review thread=t-0046 | π - t-0046 |
+| hp-adeherdr-t-0047 | pi | done | `w1G:p10` | `w1G:t1W` (t-0047) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0047` | done=1 lane=t-0047 project=adeherdr rank=3 review=working thread=t-0047 | π - t-0047 |
+| hp-adeherdr-t-0048 | pi | working | `w1G:p21` | `w1G:t1X` (t-0048) | `/Users/rolfie/projects/herdr/.worktrees/t-0048` | project=adeherdr rank=3 review=working thread=t-0048 | π - t-0048 |
 
 Start lines as they run now (from `pane process-info`), for restarting a worker that is gone:
 
 ```bash
 herdr agent start hp-adeherdr-t-0042 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
-herdr agent start hp-adeherdr-t-0044 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
-herdr agent start hp-adeherdr-t-0045 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0046 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0047 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0048 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
 ```
 
-Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (working), `w1J` Venator (idle), `w1K` Elicio (idle)
+Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done), `w1J` Venator (idle), `w1K` Elicio (idle)
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (6 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (7 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | 388ff21 | 0 | docs(review): round r19 verdict |
+| `/Users/rolfie/projects/herdr-ade` | `main` | fdcb26b | 0 | docs(review): round r20 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -57,6 +59,7 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (6 ahead, 0 b
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r19` | `review/r19` | de89ab7 | 0 | docs(tasks): t-0045 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r2` | `review/r2` | b07aa74 | 0 | docs(tasks): t-0005 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r2-2` | `review/r2-2` | c191a33 | 0 | docs(tasks): t-0007 |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r20` | `review/r20` | babc448 | 0 | docs(tasks): t-0047 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r4` | `review/r4` | 689e079 | 0 | docs(tasks): t-0011 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r5` | `review/r5` | 008f9ac | 0 | docs(tasks): t-0012 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r6` | `review/r6` | 910649d | 0 | docs(tasks): t-0014 |
@@ -94,25 +97,27 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (6 ahead, 0 b
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0037` | `hp/adeherdr/t-0037-review-r15-this-check-reads-the-change-t` | 2c394d4 | 0 | docs(review): round r15 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0041` | `hp/adeherdr/t-0041-project-screen-lane-1-plan-card-decision` | ff87a6a | 0 | checkpoint(r18): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0043` | `hp/adeherdr/t-0043-review-r18-this-round-checks-the-records` | a4b9685 | 0 | docs(review): round r18 verdict |
-| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0044` | `hp/adeherdr/t-0044-box-readiness-check-calls-the-box-s-pi-h` | 6d486fd | 0 | fix(pi): box readiness check calls herdr-pi, not herdr-ade |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0044` | `hp/adeherdr/t-0044-box-readiness-check-calls-the-box-s-pi-h` | 243c609 | 0 | checkpoint(r19): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0045` | `hp/adeherdr/t-0045-review-r19-this-round-checks-the-fix-tha` | 388ff21 | 0 | docs(review): round r19 verdict |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0046` | `hp/adeherdr/t-0046-box-health-rows-bash-probe-on-linux-no-r` | 6e82cd7 | 0 | fix(pi): bash probe for the wrapper row and an absent pro relay row |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0047` | `hp/adeherdr/t-0047-review-r20-this-round-checks-the-health` | fdcb26b | 0 | docs(review): round r20 verdict |
 
 Last commits on the integration branch:
 
 ```
-388ff21 docs(review): round r19 verdict
-d12791a Merge commit '6d486fd0fa6931861c7af77196e87478b1e4fc6d' into hp/adeherdr/t-0045-review-r19-this-round-checks-the-fix-tha
-de89ab7 docs(tasks): t-0045
-7db59cc review(r19): brief for revision 1
-6d486fd fix(pi): box readiness check calls herdr-pi, not herdr-ade
-a101883 docs(tasks): t-0044
+fdcb26b docs(review): round r20 verdict
+e6b7296 review(pi): keep doctor fakes honest under bash
+d725fb8 Merge commit '6e82cd748fe54a7e37f93a091809da002d736d31' into hp/adeherdr/t-0047-review-r20-this-round-checks-the-health
+babc448 docs(tasks): t-0047
+f6f6f4e review(r20): brief for revision 1
+6e82cd7 fix(pi): bash probe for the wrapper row and an absent pro relay row
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0045.md`, `tasks/review-r19.md`, `tasks/t-0044.md`, `tasks/t-0043.md`, `tasks/review-r18.md`, `tasks/t-0041.md`, `tasks/t-0037.md`, `tasks/review-r15.md`, `tasks/t-0035.md`, `tasks/t-0034.md`, `tasks/review-r14.md`, `tasks/t-0031.md`
-- verdicts: `tasks/reviews/code-r19.md`, `tasks/reviews/code-r18.md`, `tasks/reviews/code-r15.md`, `tasks/reviews/code-r14.md`, `tasks/reviews/code-r12.md`, `tasks/reviews/code-r13.md`, `tasks/reviews/code-r11.md`, `tasks/reviews/code-r9.md`, `tasks/reviews/code-r10.md`, `tasks/reviews/code-r7.md`, `tasks/reviews/code-r6.md`, `tasks/reviews/code-r5.md`
+- briefs: `tasks/t-0047.md`, `tasks/review-r20.md`, `tasks/t-0046.md`, `tasks/t-0045.md`, `tasks/review-r19.md`, `tasks/t-0044.md`, `tasks/t-0043.md`, `tasks/review-r18.md`, `tasks/t-0041.md`, `tasks/t-0037.md`, `tasks/review-r15.md`, `tasks/t-0035.md`
+- verdicts: `tasks/reviews/code-r20.md`, `tasks/reviews/code-r19.md`, `tasks/reviews/code-r18.md`, `tasks/reviews/code-r15.md`, `tasks/reviews/code-r14.md`, `tasks/reviews/code-r12.md`, `tasks/reviews/code-r13.md`, `tasks/reviews/code-r11.md`, `tasks/reviews/code-r9.md`, `tasks/reviews/code-r10.md`, `tasks/reviews/code-r7.md`, `tasks/reviews/code-r6.md`
 
 ### Pickup
 
@@ -124,5 +129,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 6c22d8cf-cae6-47e2-a930-fd9207175aea
 ```
 
-Round `r19` was merged into `main` at verdict commit `388ff21b6a6f7389ca7b21769eba067ec77dd426`; this checkpoint is its child.
+Round `r20` was merged into `main` at verdict commit `fdcb26b28039a144a90f3fadd66210e654dcfb71`; this checkpoint is its child.
 
