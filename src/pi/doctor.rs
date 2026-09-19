@@ -2,8 +2,8 @@
 //!
 //! One page, fail closed. Never opens a browser, never prints a secret, never
 //! contacts a provider: `pi auth check --no-refresh` with stdin closed and a
-//! short timeout. `npm root -g` runs inside `zsh -lic` like every other login
-//! shell probe.
+//! short timeout. `npm root -g` runs inside `$SHELL -lic` like every other
+//! login-shell probe.
 
 use std::path::{Path, PathBuf};
 
@@ -580,8 +580,9 @@ fn auth_check(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> Resul
 fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row {
     let link = env.home.join(".local/bin/pi");
     // The spec writes `command -v -a pi`; that is a bash form and zsh rejects
-    // it (`zsh: command not found: -v`). `whence -va` is zsh's own form.
-    let output = match runner.run(&sh::Cmd::new("zsh", sh::SHORT).args(["-lic", "whence -va pi"])) {
+    // it (`zsh: command not found: -v`). `whence -va` is zsh's own form, run
+    // through the machine's own login shell (`$SHELL -lic`).
+    let output = match sh::login_shell(runner, "whence -va pi") {
         Ok(output) => output,
         Err(error) => return Row::fail("wrapper on PATH", format!("{error:#}")),
     };
@@ -603,7 +604,7 @@ fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row 
         return Row::fail(
             "wrapper on PATH",
             format!(
-                "`zsh -lic 'whence -va pi'` finds `{first}` first; expected {}",
+                "`$SHELL -lic 'whence -va pi'` finds `{first}` first; expected {}",
                 link.display()
             ),
         );
