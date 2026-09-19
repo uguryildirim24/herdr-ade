@@ -12301,6 +12301,7 @@ appuy
 appuyed
 appuying
 appuys
+apr
 apractic
 apraxia
 apraxia's
@@ -16017,6 +16018,7 @@ aufait
 aufgabe
 aufgabes
 aufs
+aug
 augend
 augend's
 augends
@@ -61890,6 +61892,7 @@ debuting
 debuts
 debye
 debyes
+dec
 decachord
 decachords
 decad
@@ -90834,6 +90837,7 @@ feaze
 feazed
 feazes
 feazing
+feb
 febricities
 febricity
 febricity's
@@ -98359,6 +98363,7 @@ fretty
 fretwork
 fretwork's
 fretworks
+fri
 friabilities
 friability
 friability's
@@ -132175,6 +132180,7 @@ jampot
 jampot's
 jampots
 jams
+jan
 jane
 janes
 jangle
@@ -133796,6 +133802,7 @@ juking
 jukskei
 juku
 jukus
+jul
 julep
 julep's
 juleps
@@ -133866,6 +133873,7 @@ jumpsuit
 jumpsuit's
 jumpsuits
 jumpy
+jun
 juncaceous
 junco
 junco's
@@ -157492,6 +157500,7 @@ momuses
 momzer
 momzerim
 momzers
+mon
 mona
 monachal
 monachism
@@ -168444,6 +168453,7 @@ nousles
 nousling
 nouveau
 nouvelle
+nov
 nova
 nova's
 novaculite
@@ -170204,6 +170214,7 @@ ocotillos
 ocrea
 ocreae
 ocreate
+oct
 octa
 octachord
 octachordal
@@ -228800,6 +228811,7 @@ sentries
 sentry
 sentry's
 senza
+sep
 sepad
 sepadded
 sepadding
@@ -260772,6 +260784,7 @@ thrutching
 thruway
 thruway's
 thruways
+thu
 thud
 thud's
 thudded
@@ -268194,6 +268207,7 @@ tucutucos
 tude
 tude's
 tudes
+tue
 tufa
 tufaceous
 tufas

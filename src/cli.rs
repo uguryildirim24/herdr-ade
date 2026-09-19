@@ -1026,7 +1026,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 }
                 Ok(())
             } else {
-                talk::run(ctx, &slug)
+                talk::screen::run(ctx, &slug)
             }
         }
         Command::Board {
