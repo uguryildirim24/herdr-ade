@@ -1451,6 +1451,40 @@ mod tests {
     }
 
     #[test]
+    fn courier_helper_answers_only_after_the_taken_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("ade");
+        let dir = root.join("demo/events");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
+        let script = courier_helper(&root.to_string_lossy(), "default");
+        let command = format!("sh -c {}", crate::remote::quote(&script));
+        let run = |stdin: &str| {
+            crate::runner::RealRunner
+                .run(
+                    &crate::runner::Cmd::new("sh", Duration::from_secs(5))
+                        .args(["-c", &command])
+                        .env("HOME", home.path().display().to_string())
+                        .stdin(stdin.to_string()),
+                )
+                .unwrap()
+        };
+        let skipped = run("demo\tt-0001-1-1\n");
+        assert!(skipped.success(), "{}", skipped.error_text());
+        assert!(
+            !skipped.stdout.contains("event\tdemo"),
+            "{}",
+            skipped.stdout
+        );
+        let fresh = run("");
+        assert!(
+            fresh.stdout.contains("event\tdemo\tt-0001-1-1"),
+            "{}",
+            fresh.stdout
+        );
+    }
+
+    #[test]
     fn a_box_lane_signal_waits_until_the_coordinator_can_receive_it() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -1615,6 +1649,7 @@ mod tests {
             thread::allocate(project, |t| {
                 t.machine = "box".into();
                 t.machine_id = "1".into();
+                t.pane_id = "w2:p1".into();
             })
             .unwrap();
         }
@@ -1633,6 +1668,7 @@ mod tests {
             "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
              event\talpha\tt-0001-1-1\t/box/alpha/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\talpha\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n\
+             bootstrap\talpha\tt-0001\t\tw2:p1\n\
              event\tbeta\tt-0001-1-1\t/box/beta/events/t-0001-1-1.toml\t{event_hash}\t/box/beta/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\tbeta\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n"
         );
@@ -1679,6 +1715,10 @@ mod tests {
                 .unwrap()
                 .report_path
                 .contains(&artifact_hash)
+        );
+        assert_eq!(
+            thread::load(&alpha, "t-0001").unwrap().bootstrap,
+            "acknowledged"
         );
 
         // The cursor now skips the same envelopes: no second fetch.
