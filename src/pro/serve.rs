@@ -11,6 +11,13 @@
 //! token in `serve.json`. In-flight rules: one turn per session at a time and
 //! the same overall limit a Pro turn uses. A failed turn feeds the two-hour
 //! breaker.
+//!
+//! The relay also gives the model one text-protocol tool. The bridge's
+//! browser-only mode forwards no local tools ("Local tools unavailable"), so
+//! the first message of every session carries [`RELAY_PROTOCOL`]: the model may
+//! end an answer with `READ <path>` or `LIST <path>` lines. The relay answers
+//! those on the same Codex thread under a `=== <path> ===` header and keeps the
+//! request answer to itself; only a final answer reaches pi.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -36,6 +43,43 @@ pub const MODEL_ID: &str = super::provider::MODEL_ID;
 /// Read timeout while waiting for a request header block.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The folders the model may read even without `--read-root`.
+pub const DEFAULT_READ_ROOT: &str = "/home/agent/projects";
+/// One refused path's answer line, whatever the reason.
+pub const REFUSED: &str = "refused: outside the readable folders";
+/// Request rounds served per pi request before the last answer is returned.
+pub const MAX_REQUEST_ROUNDS: usize = 8;
+/// One file's text cap; a larger file is cut with a note.
+pub const FILE_MAX_BYTES: usize = 200 * 1024;
+/// One round's combined text cap.
+pub const ROUND_MAX_BYTES: usize = 1024 * 1024;
+/// One `LIST`'s entry cap.
+pub const LIST_MAX_ENTRIES: usize = 500;
+/// The note the model sees when it keeps asking past the round budget.
+pub const REQUEST_BUDGET_NOTE: &str =
+    "[relay: the 8-request budget is spent; this answer is final]";
+/// The relay-owned preamble added to the first message of every session (the
+/// relay already builds that message; the shared Pro home's instruction file
+/// stays the packet lane's, so this text never reaches a packet turn).
+pub const RELAY_PROTOCOL: &str = "\
+Relay access: this session can read files for you. At the very end of an
+answer you may ask for files, one request per line and nothing after them:
+READ <absolute path>
+LIST <absolute directory>
+The relay answers on this same thread with the file's text or the folder's
+entries, each under a `=== <path> ===` header. Use absolute paths. Do not emit
+a request line when the answer is final.";
+
+/// `<state dir>/relay`: the relay's own files, so a failed request leaves a trace.
+pub fn relay_dir(layout: &Layout) -> PathBuf {
+    layout.root.join("relay")
+}
+
+/// `<state dir>/relay/serve.log`: one line per request and per refusal.
+pub fn serve_log(layout: &Layout) -> PathBuf {
+    relay_dir(layout).join("serve.log")
+}
+
 unsafe extern "C" {
     fn setsid() -> i32;
 }
@@ -47,6 +91,9 @@ pub struct ServeState {
     pub pid: u32,
     pub started: String,
     pub token: String,
+    /// The folders the model may read, default root plus `--read-root`.
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
 }
 
 impl ServeState {
@@ -114,7 +161,7 @@ fn relay_healthy(state: &ServeState) -> bool {
 }
 
 /// `herdr-pro serve`: start the daemon unless one is already running.
-pub fn start(layout: &Layout) -> Result<bool> {
+pub fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
     if let Some(state) = ServeState::read(layout)
         && pid_alive(state.pid)
     {
@@ -133,10 +180,15 @@ pub fn start(layout: &Layout) -> Result<bool> {
     }
     layout.ensure()?;
     let exe = std::env::current_exe().context("could not find this binary's own path")?;
+    let mut args: Vec<String> = vec!["serve-run".into()];
+    for root in read_roots {
+        args.push("--read-root".into());
+        args.push(root.display().to_string());
+    }
     let mut command = Command::new(exe);
     command
         .env("HERDR_PRO_STATE_DIR", layout.root.display().to_string())
-        .args(["serve-run"])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -172,9 +224,44 @@ pub fn start(layout: &Layout) -> Result<bool> {
     )
 }
 
+/// The effective readable roots: the default plus every `--read-root`, each
+/// resolved so a symlinked root and a canonical path still match. Duplicates
+/// are dropped.
+pub fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from(DEFAULT_READ_ROOT)];
+    roots.extend(extra.iter().cloned());
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        if !resolved.contains(&root) {
+            resolved.push(root);
+        }
+    }
+    resolved
+}
+
+/// The readable roots recorded in `serve.json`, or the default when there is
+/// no relay state yet.
+pub fn readable_roots(layout: &Layout) -> Vec<PathBuf> {
+    match ServeState::read(layout) {
+        Some(state) if !state.read_roots.is_empty() => state.read_roots,
+        _ => vec![PathBuf::from(DEFAULT_READ_ROOT)],
+    }
+}
+
+/// The last non-empty `serve.log` line, for the doctor's relay row.
+pub fn last_log_line(layout: &Layout) -> Option<String> {
+    let text = std::fs::read_to_string(serve_log(layout)).ok()?;
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::to_string)
+}
+
 /// `herdr-pro serve-run`: the foreground server (started detached by `serve`).
-pub fn run(layout: &Layout, env: &Env) -> Result<()> {
+pub fn run(layout: &Layout, env: &Env, extra_roots: &[PathBuf]) -> Result<()> {
     layout.ensure()?;
+    let read_roots = effective_read_roots(extra_roots);
     let inflight_limit = env.inflight_limit()?;
     // One relay per state dir: a stale pid lets a fresh one take over.
     if let Some(state) = ServeState::read(layout)
@@ -194,6 +281,7 @@ pub fn run(layout: &Layout, env: &Env) -> Result<()> {
         pid: std::process::id(),
         started: super::now_rfc3339(),
         token: token.clone(),
+        read_roots: read_roots.clone(),
     }
     .write(layout)?;
     // The relay's own cwd, trusted so Codex never prompts for it.
@@ -201,16 +289,20 @@ pub fn run(layout: &Layout, env: &Env) -> Result<()> {
     write_provider(layout, port, &token)?;
     let bridge_port = BRIDGE_PORT;
     let relay = Arc::new(Relay {
-        env: env.clone(),
         layout: layout.clone(),
         token,
         port,
-        bridge_port,
         sessions: Mutex::new(HashMap::new()),
         inflight: Mutex::new(HashMap::new()),
         inflight_limit,
-        seq: AtomicU64::new(0),
         failures: Mutex::new(Vec::new()),
+        read_roots,
+        codex: Box::new(RealCodex {
+            env: env.clone(),
+            layout: layout.clone(),
+            bridge_port,
+            seq: AtomicU64::new(0),
+        }),
     });
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else {
@@ -313,17 +405,35 @@ struct Session {
     codex_id: Option<String>,
 }
 
+/// What one relay turn produced: the final Codex outcome plus what the model
+/// asked for along the way.
+#[derive(Debug, Clone)]
+struct RelayTurn {
+    outcome: CodexOutcome,
+    rounds: usize,
+    files: usize,
+}
+
+/// One Codex turn. The real one spawns `codex exec`; the tests script answers.
+trait Codex: Send + Sync {
+    fn turn(
+        &self,
+        resume: Option<&str>,
+        prompt: &str,
+        sink: &mut dyn FnMut(&str, &Value) -> Result<()>,
+    ) -> Result<CodexOutcome>;
+}
+
 struct Relay {
-    env: Env,
     layout: Layout,
     token: String,
     port: u16,
-    bridge_port: u16,
     sessions: Mutex<HashMap<String, Session>>,
     inflight: Mutex<HashMap<String, ()>>,
     inflight_limit: usize,
-    seq: AtomicU64,
     failures: Mutex<Vec<Instant>>,
+    read_roots: Vec<PathBuf>,
+    codex: Box<dyn Codex>,
 }
 
 impl Relay {
@@ -368,12 +478,14 @@ impl Relay {
         };
         let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let key = session_key(&request.headers, &body);
+        let bytes_in = request.body.len();
 
         // Fail closed before spending a Codex turn.
         if state::cooldown_active(&self.layout, jiff::Timestamp::now()) {
             let until = state::cooldown_until(&self.layout)
                 .map(|u| u.to_string())
                 .unwrap_or_default();
+            let _ = self.record_request(&key, bytes_in, "cooldown", 0, 0, None);
             return write_json_error(
                 stream,
                 503,
@@ -386,6 +498,7 @@ impl Relay {
         {
             let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
             if inflight.contains_key(&key) {
+                let _ = self.record_request(&key, bytes_in, "busy", 0, 0, None);
                 return write_json_error(
                     stream,
                     429,
@@ -393,6 +506,7 @@ impl Relay {
                 );
             }
             if inflight.len() >= limit {
+                let _ = self.record_request(&key, bytes_in, "busy", 0, 0, None);
                 return write_json_error(
                     stream,
                     429,
@@ -416,12 +530,217 @@ impl Relay {
         let prompt = build_prompt(&body, first);
 
         let result = if want_stream {
-            self.stream_turn(stream, &key, resume.as_deref(), &prompt)
+            self.stream_turn(stream, &key, resume.as_deref(), &prompt, bytes_in)
         } else {
-            self.json_turn(stream, &key, resume.as_deref(), &prompt)
+            self.json_turn(stream, &key, resume.as_deref(), &prompt, bytes_in)
         };
         drop(guard);
         result
+    }
+
+    /// Run the Codex turns for one pi request, serving the model's file
+    /// requests until it produces a final answer.
+    fn converse(&self, key: &str, resume: Option<&str>, prompt: &str) -> Result<RelayTurn> {
+        let mut resume_id = resume.map(str::to_string);
+        let mut prompt = prompt.to_string();
+        let mut rounds = 0usize;
+        let mut files = 0usize;
+        loop {
+            let mut noop = |_: &str, _: &Value| Ok(());
+            let mut outcome = self.codex.turn(resume_id.as_deref(), &prompt, &mut noop)?;
+            if let Some(id) = &outcome.codex_id {
+                resume_id = Some(id.clone());
+            }
+            outcome.answer = strip_bridge_note(&outcome.answer);
+            let (body, requests) = split_requests(&outcome.answer);
+            if requests.is_empty() {
+                outcome.answer = body;
+                return Ok(RelayTurn {
+                    outcome,
+                    rounds,
+                    files,
+                });
+            }
+            if rounds >= MAX_REQUEST_ROUNDS {
+                outcome.answer = if body.is_empty() {
+                    REQUEST_BUDGET_NOTE.to_string()
+                } else {
+                    format!("{body}\n\n{REQUEST_BUDGET_NOTE}")
+                };
+                return Ok(RelayTurn {
+                    outcome,
+                    rounds,
+                    files,
+                });
+            }
+            let (message, served) = self.execute_requests(key, &requests);
+            files += served;
+            rounds += 1;
+            prompt = message;
+        }
+    }
+
+    /// Answer the model's requests as one follow-up message. Returns the
+    /// message and the number of files or folders actually served.
+    fn execute_requests(&self, key: &str, requests: &[FileRequest]) -> (String, usize) {
+        let mut sections: Vec<String> = Vec::new();
+        let mut budget = ROUND_MAX_BYTES;
+        let mut served = 0usize;
+        for request in requests {
+            let label = request.path().display().to_string();
+            let (text, ok) = self.one_request(request, &mut budget);
+            if ok {
+                served += 1;
+            } else {
+                let _ = state::append_line(
+                    &serve_log(&self.layout),
+                    &format!("{} session={key} refused {label}", super::now_rfc3339()),
+                );
+            }
+            sections.push(format!("=== {label} ===\n{text}"));
+        }
+        (sections.join("\n\n"), served)
+    }
+
+    fn one_request(&self, request: &FileRequest, budget: &mut usize) -> (String, bool) {
+        if *budget == 0 {
+            return ("[relay: this round's read budget is spent]".into(), false);
+        }
+        let raw = request.path().display().to_string();
+        let path = match self.resolve_allowed(&raw) {
+            Ok(path) => path,
+            Err(refusal) => return (refusal, false),
+        };
+        let (text, ok) = match request {
+            FileRequest::Read(_) => self.render_read(&path, *budget),
+            FileRequest::List(_) => self.render_list(&path),
+        };
+        *budget = budget.saturating_sub(text.len());
+        (text, ok)
+    }
+
+    /// Resolve a requested path, or return the one refusal line.
+    fn resolve_allowed(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        let path = Path::new(raw);
+        if !path.is_absolute() {
+            return Err(REFUSED.to_string());
+        }
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return Err(format!("error: could not read {raw}"));
+        };
+        if !self
+            .read_roots
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
+            return Err(REFUSED.to_string());
+        }
+        if forbidden_path(&canonical) {
+            return Err(REFUSED.to_string());
+        }
+        Ok(canonical)
+    }
+
+    fn render_read(&self, path: &Path, budget: usize) -> (String, bool) {
+        let limit = FILE_MAX_BYTES.min(budget);
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => return (format!("error: {error}"), false),
+        };
+        let mut buf = Vec::new();
+        if let Err(error) = file.take((limit + 1) as u64).read_to_end(&mut buf) {
+            return (format!("error: {error}"), false);
+        }
+        if buf.contains(&0) {
+            return ("refused: binary file".into(), false);
+        }
+        let over_file = buf.len() > FILE_MAX_BYTES;
+        if buf.len() > limit {
+            buf.truncate(limit);
+        }
+        match String::from_utf8(buf) {
+            Ok(mut text) => {
+                if over_file {
+                    text.push_str(&format!(
+                        "\n[truncated: the file is larger than {} KB]",
+                        FILE_MAX_BYTES / 1024
+                    ));
+                } else if limit < FILE_MAX_BYTES {
+                    text.push_str("\n[truncated: this round's read budget is spent]");
+                }
+                (text, true)
+            }
+            Err(_) => ("refused: binary file".into(), false),
+        }
+    }
+
+    fn render_list(&self, path: &Path) -> (String, bool) {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => return (format!("error: {error}"), false),
+        };
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let (kind, size) = match entry.metadata() {
+                Ok(meta) if meta.is_dir() => ("dir".to_string(), String::new()),
+                Ok(meta) if meta.is_file() => ("file".to_string(), meta.len().to_string()),
+                Ok(_) => ("other".to_string(), String::new()),
+                Err(_) => ("?".to_string(), String::new()),
+            };
+            rows.push((name, kind, size));
+        }
+        rows.sort();
+        let cut = rows.len() > LIST_MAX_ENTRIES;
+        rows.truncate(LIST_MAX_ENTRIES);
+        let mut lines: Vec<String> = rows
+            .into_iter()
+            .map(|(name, kind, size)| {
+                if size.is_empty() {
+                    format!("{name}\t{kind}")
+                } else {
+                    format!("{name}\t{kind}\t{size}")
+                }
+            })
+            .collect();
+        if cut {
+            lines.push(format!(
+                "[more than {LIST_MAX_ENTRIES} entries; the list was cut]"
+            ));
+        }
+        (lines.join("\n"), true)
+    }
+
+    /// Append the one log line and the `usage.jsonl` line for one request.
+    #[allow(clippy::too_many_arguments)]
+    fn record_request(
+        &self,
+        key: &str,
+        bytes_in: usize,
+        outcome: &str,
+        rounds: usize,
+        files: usize,
+        codex_exit: Option<i32>,
+    ) -> Result<()> {
+        let exit = codex_exit
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "-".into());
+        state::append_line(
+            &serve_log(&self.layout),
+            &format!(
+                "{} session={key} bytes_in={bytes_in} rounds={rounds} files={files} outcome={outcome} codex_exit={exit}",
+                super::now_rfc3339()
+            ),
+        )?;
+        let usage = json!({
+            "ts": super::now_rfc3339(),
+            "relay": true,
+            "session": key,
+            "rounds": rounds,
+            "files": files,
+            "outcome": outcome,
+        });
+        state::append_line(&self.layout.usage(), &usage.to_string())
     }
 
     fn stream_turn(
@@ -430,17 +749,78 @@ impl Relay {
         key: &str,
         resume: Option<&str>,
         prompt: &str,
+        bytes_in: usize,
     ) -> Result<()> {
         write_sse_headers(stream)?;
+        let response_id = new_response_id();
         let mut sse = Sse { stream };
-        let mut sink = |kind: &str, data: &Value| sse.send(kind, data);
-        match self.run_codex(resume, prompt, &mut sink) {
-            Ok(outcome) => {
-                self.remember(key, &outcome);
+        sse.send(
+            "response.created",
+            &json!({"type":"response.created","response":{"id":response_id,"status":"in_progress"}}),
+        )?;
+        match self.converse(key, resume, prompt) {
+            Ok(turn) => {
+                self.remember(key, &turn.outcome);
+                let _ = self.record_request(
+                    key,
+                    bytes_in,
+                    "ok",
+                    turn.rounds,
+                    turn.files,
+                    turn.outcome.exit_code,
+                );
+                let answer = turn.outcome.answer.clone();
+                let message = json!({
+                    "id": turn.outcome.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": answer, "annotations": []}]
+                });
+                sse.send(
+                    "response.output_item.added",
+                    &json!({
+                        "type":"response.output_item.added",
+                        "output_index": 0,
+                        "item":{"id":turn.outcome.message_id,"type":"message","role":"assistant","status":"in_progress","content":[]}
+                    }),
+                )?;
+                if !answer.is_empty() {
+                    sse.send(
+                        "response.output_text.delta",
+                        &json!({
+                            "type":"response.output_text.delta",
+                            "output_index": 0,
+                            "delta": answer
+                        }),
+                    )?;
+                }
+                sse.send(
+                    "response.output_item.done",
+                    &json!({
+                        "type":"response.output_item.done",
+                        "output_index": 0,
+                        "item": message
+                    }),
+                )?;
+                sse.send(
+                    "response.completed",
+                    &json!({
+                        "type":"response.completed",
+                        "response":{
+                            "id": response_id,
+                            "object": "response",
+                            "status": "completed",
+                            "output": [message],
+                            "usage": turn.outcome.usage,
+                        }
+                    }),
+                )?;
                 sse.end()
             }
             Err(error) => {
                 let message = self.failure_message(&error);
+                let _ = self.record_request(key, bytes_in, "failed", 0, 0, None);
                 let _ = sse.send(
                     "response.failed",
                     &json!({
@@ -459,31 +839,40 @@ impl Relay {
         key: &str,
         resume: Option<&str>,
         prompt: &str,
+        bytes_in: usize,
     ) -> Result<()> {
-        let mut noop = |_: &str, _: &Value| Ok(());
-        match self.run_codex(resume, prompt, &mut noop) {
-            Ok(outcome) => {
-                self.remember(key, &outcome);
+        match self.converse(key, resume, prompt) {
+            Ok(turn) => {
+                self.remember(key, &turn.outcome);
+                let _ = self.record_request(
+                    key,
+                    bytes_in,
+                    "ok",
+                    turn.rounds,
+                    turn.files,
+                    turn.outcome.exit_code,
+                );
                 write_json(
                     stream,
                     200,
                     &json!({
-                        "id": outcome.response_id,
+                        "id": turn.outcome.response_id,
                         "object": "response",
                         "status": "completed",
                         "output": [{
-                            "id": outcome.message_id,
+                            "id": turn.outcome.message_id,
                             "type": "message",
                             "role": "assistant",
                             "status": "completed",
-                            "content": [{"type": "output_text", "text": outcome.answer, "annotations": []}]
+                            "content": [{"type": "output_text", "text": turn.outcome.answer, "annotations": []}]
                         }],
-                        "usage": outcome.usage,
+                        "usage": turn.outcome.usage,
                     }),
                 )
             }
             Err(error) => {
                 let message = self.failure_message(&error);
+                let _ = self.record_request(key, bytes_in, "failed", 0, 0, None);
                 write_json(
                     stream,
                     200,
@@ -531,7 +920,17 @@ impl Relay {
             Err(breaker) => format!("{message}; {breaker:#}"),
         }
     }
+}
 
+/// The real Codex: one `codex exec --json` turn per call.
+struct RealCodex {
+    env: Env,
+    layout: Layout,
+    bridge_port: u16,
+    seq: AtomicU64,
+}
+
+impl RealCodex {
     fn run_codex(
         &self,
         resume: Option<&str>,
@@ -633,7 +1032,9 @@ impl Relay {
             return Err(anyhow::anyhow!("{message}"));
         }
         state.finish(sink)?;
-        Ok(state.into_outcome())
+        let mut outcome = state.into_outcome();
+        outcome.exit_code = status.code();
+        Ok(outcome)
     }
 
     fn spawn_codex(&self, resume: Option<&str>, _prompt: &str, out_file: &Path) -> Result<Child> {
@@ -660,6 +1061,17 @@ impl Relay {
             .stderr(Stdio::piped())
             .spawn()
             .context("could not start `codex exec`; is codex on PATH?")
+    }
+}
+
+impl Codex for RealCodex {
+    fn turn(
+        &self,
+        resume: Option<&str>,
+        prompt: &str,
+        sink: &mut dyn FnMut(&str, &Value) -> Result<()>,
+    ) -> Result<CodexOutcome> {
+        self.run_codex(resume, prompt, sink)
     }
 }
 
@@ -729,6 +1141,8 @@ pub struct CodexOutcome {
     pub answer: String,
     pub codex_id: Option<String>,
     pub usage: Value,
+    /// The `codex exec` process exit code, for the relay log.
+    pub exit_code: Option<i32>,
 }
 
 /// The Responses-API view of one `codex exec --json` stream.
@@ -923,6 +1337,7 @@ impl StreamState {
             answer: self.answer,
             codex_id: self.codex_id,
             usage: self.usage,
+            exit_code: None,
         }
     }
 }
@@ -975,8 +1390,9 @@ fn sha256_hex(text: &str) -> String {
     out
 }
 
-/// The prompt for one turn: the first turn carries the instructions, later
-/// turns carry only the new user message (Codex already holds the thread).
+/// The prompt for one turn: the first turn carries the relay protocol and the
+/// pi instructions, later turns carry only the new user message (Codex already
+/// holds the thread).
 pub fn build_prompt(body: &Value, first: bool) -> String {
     let user = last_user_text(body);
     if !first {
@@ -987,12 +1403,14 @@ pub fn build_prompt(body: &Value, first: bool) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    match (instructions.is_empty(), user.trim().is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => user,
-        (false, true) => instructions.to_string(),
-        (false, false) => format!("{instructions}\n\n{user}"),
+    let mut parts: Vec<&str> = vec![RELAY_PROTOCOL];
+    if !instructions.is_empty() {
+        parts.push(instructions);
     }
+    if !user.trim().is_empty() {
+        parts.push(user.trim());
+    }
+    parts.join("\n\n")
 }
 
 fn item_text(item: &Value) -> String {
@@ -1035,6 +1453,105 @@ fn last_user_text(body: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The relay's one text protocol: trailing request lines in an answer.
+// ---------------------------------------------------------------------------
+
+/// One line the model may put at the end of an answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileRequest {
+    Read(PathBuf),
+    List(PathBuf),
+}
+
+impl FileRequest {
+    pub fn path(&self) -> &Path {
+        match self {
+            FileRequest::Read(path) | FileRequest::List(path) => path,
+        }
+    }
+}
+
+/// `READ <absolute path>` or `LIST <absolute directory>`, else `None`.
+pub fn parse_request(line: &str) -> Option<FileRequest> {
+    let line = line.trim();
+    for (keyword, list) in [("READ ", false), ("LIST ", true)] {
+        if let Some(rest) = line.strip_prefix(keyword) {
+            let path = rest.trim();
+            if !path.is_empty() {
+                return Some(if list {
+                    FileRequest::List(PathBuf::from(path))
+                } else {
+                    FileRequest::Read(PathBuf::from(path))
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Split the trailing request lines off an answer. Returns the answer body
+/// without them and the requests in the order the model wrote them.
+pub fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
+    let mut lines: Vec<&str> = answer.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let mut requests: Vec<FileRequest> = Vec::new();
+    while let Some(line) = lines.last() {
+        match parse_request(line) {
+            Some(request) => {
+                requests.push(request);
+                lines.pop();
+            }
+            None => break,
+        }
+    }
+    requests.reverse();
+    (lines.join("\n").trim_end().to_string(), requests)
+}
+
+/// Drop the bridge's "Local tools unavailable" blockquote: the leading `>`
+/// lines and the blank line that closes them.
+pub fn strip_bridge_note(answer: &str) -> String {
+    let mut lines = answer.lines().peekable();
+    while lines.peek().is_some_and(|line| line.starts_with('>')) {
+        lines.next();
+    }
+    if lines.peek().is_some_and(|line| line.trim().is_empty()) {
+        lines.next();
+    }
+    lines.collect::<Vec<&str>>().join("\n")
+}
+
+/// A path the relay never serves: the credential names and `.git/objects`.
+fn forbidden_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    for needle in ["auth.json", ".env", "id_", ".pem", "token"] {
+        if text.contains(needle) {
+            return true;
+        }
+    }
+    let parts: Vec<String> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == ".git" && pair[1] == "objects")
+}
+
+fn new_response_id() -> String {
+    format!(
+        "resp_{}",
+        hex(&std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_be_bytes())
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,7 +1729,10 @@ mod tests {
                 {"role": "user", "content": [{"type": "input_text", "text": "two"}]}
             ]
         });
-        assert_eq!(build_prompt(&body, true), "You are Pro.\n\ntwo");
+        assert_eq!(
+            build_prompt(&body, true),
+            format!("{RELAY_PROTOCOL}\n\nYou are Pro.\n\ntwo")
+        );
         assert_eq!(build_prompt(&body, false), "two");
     }
 
@@ -1293,5 +1813,203 @@ mod tests {
             .unwrap();
         assert_eq!(state.failure.as_deref(), Some("rate limit"));
         assert!(!state.completed);
+    }
+
+    // --- the request-line protocol, driven by a scripted Codex -------------
+
+    use std::collections::VecDeque;
+
+    struct FakeInner {
+        answers: Mutex<VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
+        resumes: Mutex<Vec<Option<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeCodex(Arc<FakeInner>);
+
+    impl FakeCodex {
+        fn new(answers: Vec<String>) -> FakeCodex {
+            FakeCodex(Arc::new(FakeInner {
+                answers: Mutex::new(answers.into()),
+                prompts: Mutex::new(Vec::new()),
+                resumes: Mutex::new(Vec::new()),
+            }))
+        }
+
+        fn prompt_count(&self) -> usize {
+            self.0.prompts.lock().unwrap().len()
+        }
+
+        fn prompt(&self, index: usize) -> String {
+            self.0.prompts.lock().unwrap()[index].clone()
+        }
+
+        fn resume(&self, index: usize) -> Option<String> {
+            self.0.resumes.lock().unwrap()[index].clone()
+        }
+    }
+
+    impl Codex for FakeCodex {
+        fn turn(
+            &self,
+            resume: Option<&str>,
+            prompt: &str,
+            sink: &mut dyn FnMut(&str, &Value) -> Result<()>,
+        ) -> Result<CodexOutcome> {
+            self.0.prompts.lock().unwrap().push(prompt.to_string());
+            self.0
+                .resumes
+                .lock()
+                .unwrap()
+                .push(resume.map(str::to_string));
+            let answer = self
+                .0
+                .answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            sink(
+                "response.created",
+                &json!({"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}),
+            )?;
+            Ok(CodexOutcome {
+                response_id: "resp_test".into(),
+                message_id: "msg_test".into(),
+                answer,
+                codex_id: Some("tid-1".into()),
+                usage: json!({}),
+                exit_code: Some(0),
+            })
+        }
+    }
+
+    fn relay_with(root: &Path, answers: Vec<String>) -> (Arc<Relay>, FakeCodex) {
+        let layout = Layout::for_test(root.join("pro"));
+        layout.ensure().unwrap();
+        let read_roots = effective_read_roots(&[root.to_path_buf()]);
+        let codex = FakeCodex::new(answers);
+        let relay = Arc::new(Relay {
+            layout,
+            token: "test-token".into(),
+            port: 0,
+            sessions: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            inflight_limit: 2,
+            failures: Mutex::new(Vec::new()),
+            read_roots,
+            codex: Box::new(codex.clone()),
+        });
+        (relay, codex)
+    }
+
+    #[test]
+    fn trailing_requests_are_split_and_only_the_final_answer_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.md"), "alpha").unwrap();
+        std::fs::write(root.join("b.md"), "beta").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/inner.md"), "inner").unwrap();
+        let first = format!(
+            "let me look\nREAD {}\nREAD {}\nLIST {}",
+            root.join("a.md").display(),
+            root.join("b.md").display(),
+            root.join("sub").display()
+        );
+        let (relay, codex) = relay_with(root, vec![first, "final answer".into()]);
+        let turn = relay.converse("session:test", None, "hello").unwrap();
+        assert_eq!(turn.outcome.answer, "final answer");
+        assert_eq!(turn.rounds, 1);
+        assert_eq!(turn.files, 3);
+        assert_eq!(codex.prompt_count(), 2);
+        assert_eq!(codex.resume(1).as_deref(), Some("tid-1"));
+        let follow_up = codex.prompt(1);
+        let sections = follow_up
+            .lines()
+            .filter(|line| line.starts_with("=== "))
+            .count();
+        assert_eq!(sections, 3, "{follow_up}");
+        assert!(follow_up.contains("alpha"), "{follow_up}");
+        assert!(follow_up.contains("beta"), "{follow_up}");
+        assert!(follow_up.contains("inner.md"), "{follow_up}");
+    }
+
+    #[test]
+    fn a_refused_path_is_one_line_and_the_next_answer_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (relay, codex) = relay_with(
+            dir.path(),
+            vec!["let me look\nREAD /etc/passwd".into(), "done".into()],
+        );
+        let turn = relay.converse("session:test", None, "hello").unwrap();
+        assert_eq!(turn.outcome.answer, "done");
+        assert_eq!(turn.rounds, 1);
+        assert_eq!(turn.files, 0);
+        let follow_up = codex.prompt(1);
+        assert!(follow_up.contains("=== /etc/passwd ==="), "{follow_up}");
+        assert!(follow_up.contains(REFUSED), "{follow_up}");
+    }
+
+    #[test]
+    fn the_round_budget_stops_after_eight_follow_ups() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.md"), "alpha").unwrap();
+        let answers: Vec<String> = (1..=9)
+            .map(|i| format!("turn {i}\nREAD {}", root.join("a.md").display()))
+            .collect();
+        let (relay, codex) = relay_with(root, answers);
+        let turn = relay.converse("session:test", None, "hello").unwrap();
+        assert_eq!(turn.rounds, MAX_REQUEST_ROUNDS);
+        assert_eq!(turn.files, MAX_REQUEST_ROUNDS);
+        assert_eq!(codex.prompt_count(), MAX_REQUEST_ROUNDS + 1);
+        assert!(turn.outcome.answer.ends_with(REQUEST_BUDGET_NOTE));
+    }
+
+    #[test]
+    fn the_bridge_note_is_stripped() {
+        assert_eq!(
+            strip_bridge_note("> Local tools unavailable\n>\nactual answer"),
+            "actual answer"
+        );
+        assert_eq!(
+            strip_bridge_note("> Local tools unavailable\n\nactual answer"),
+            "actual answer"
+        );
+        assert_eq!(strip_bridge_note("plain answer"), "plain answer");
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_truncated_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let big = root.join("big.txt");
+        std::fs::write(&big, "a".repeat(FILE_MAX_BYTES + 1024)).unwrap();
+        let (relay, codex) = relay_with(
+            root,
+            vec![format!("need it\nREAD {}", big.display()), "ok".into()],
+        );
+        let turn = relay.converse("session:test", None, "hello").unwrap();
+        assert_eq!(turn.outcome.answer, "ok");
+        assert_eq!(turn.files, 1);
+        assert!(
+            codex
+                .prompt(1)
+                .contains("[truncated: the file is larger than 200 KB]"),
+            "{}",
+            codex.prompt(1)
+        );
+    }
+
+    #[test]
+    fn credential_names_and_git_objects_are_forbidden() {
+        let root = Path::new("/home/agent/projects");
+        for name in ["auth.json", ".env", "id_rsa", "key.pem", "token.txt"] {
+            assert!(forbidden_path(&root.join(name)), "{name} was not refused");
+        }
+        assert!(forbidden_path(&root.join("x/.git/objects/ab/cd")));
+        assert!(!forbidden_path(&root.join("readme.md")));
     }
 }
