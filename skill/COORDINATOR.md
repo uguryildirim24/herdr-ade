@@ -81,6 +81,7 @@ Keep the file short: it is printed every turn and costs tokens.
 - `hp thread list <slug>` and `hp thread show <slug> <id>` print records with live state. The home copy of a thread's report is `threads/<id>.md`; files it produced for the user are in `library/<id>/`.
 - A thread under "Waiting on you" that is blocked needs the user in that thread's pane. Tell the user which thread and where. Do not try to answer its permission prompt.
 - When the user has looked at a finished thread, run `hp thread ack <slug> <id>`.
+- `hp thread resolve <slug> <id>` makes the final copy, then closes the thread's pane and tab through Herdr so its idle agent stops using memory. The worktree and branch stay; `--remove-worktree` removes the worktree too, and `--keep-pane` leaves the pane open.
 - `hp overview <slug>` prints all threads grouped by what needs the user.
 
 ## Memory
@@ -131,7 +132,7 @@ A round is a set of lanes that are reviewed and merged together (`hp round show 
 
 - `hp round open <slug> <round> --branch <integration branch> --plain "<sentence>"`, then `hp round admit <slug> <round> <thread>` per lane. A lane is complete when it runs `hp done`; its sealed sha is pinned automatically.
 - `hp round review <slug> <round>` commits the review brief and creates `review/<round>`. Start the reviewer thread with the printed line, then `hp round reviewer <slug> <round> <thread>`.
-- `hp round merge <slug> <round>` merges only on an exact MERGE verdict at the verdict commit for the pinned candidate, then writes the checkpoint. Run it again after any failure: it resumes and never merges twice.
+- `hp round merge <slug> <round>` merges only on an exact MERGE verdict at the verdict commit for the pinned candidate, then writes the checkpoint. It lands even when the integration branch moved after the review brief (a second round's brief, or a `thread start` task commit), with a merge commit when needed; a real conflict still refuses. Run it again after any failure: it resumes and never merges twice.
 - `hp dialogue start|critic|turn|commit` runs a spec dialogue; `hp checkpoint <slug>` writes `HANDOFF.md` and `HANDOFF.json` as one commit; `hp pickup <slug>` re-links live workers and prints start lines for gone ones.
 
 ## Never without the user asking in chat

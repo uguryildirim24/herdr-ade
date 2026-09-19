@@ -59,6 +59,8 @@ impl World {
             },
         );
         world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        // `thread resolve` closes the lane's tab through herdr.
+        world.runner.on("tab close", ok(r#"{"result":{}}"#));
         world
     }
 
@@ -411,6 +413,52 @@ fn every_resolve_copies_first_and_remove_worktree_needs_a_complete_copy() {
     assert_eq!(reopened.status, Status::Open);
     assert!(reopened.resolved_reason.is_empty());
     assert_eq!(world.runner.count("agent start"), 0);
+}
+
+#[test]
+fn resolve_closes_the_pane_unless_keep_pane() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd)
+    );
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+
+    // --keep-pane leaves the pane and its agent running.
+    threads::resolve(
+        &ctx,
+        "demo",
+        "t-0001",
+        &ResolveArgs {
+            keep_pane: true,
+            ..ResolveArgs::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(world.runner.count("tab close"), 0);
+
+    // A plain resolve closes the pane and its tab.
+    threads::resolve(
+        &ctx,
+        "demo",
+        "t-0001",
+        &ResolveArgs {
+            reopen: true,
+            ..ResolveArgs::default()
+        },
+    )
+    .unwrap();
+    threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+    assert_eq!(
+        thread::load(&project, "t-0001").unwrap().status,
+        Status::Resolved
+    );
 }
 
 /// A1 review H5: only `working` stopped a removal; an idle lane with no
