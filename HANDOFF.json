@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0022.md",
+      "tasks/review-r11.md",
       "tasks/t-0024.md",
       "tasks/review-r10.md",
       "tasks/review-r9.md",
@@ -20,15 +22,14 @@
       "tasks/t-0017.md",
       "tasks/t-0015.md",
       "tasks/t-0014.md",
-      "tasks/review-r7.md",
-      "tasks/review-r6.md",
-      "tasks/t-0013.md"
+      "tasks/review-r7.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r9.md",
       "tasks/reviews/code-r10.md",
       "tasks/reviews/code-r7.md",
       "tasks/reviews/code-r6.md",
@@ -41,19 +42,21 @@
       "tasks/reviews/code-plugin-r1-b.md"
     ]
   },
-  "generated": "2026-09-19T15:13:37-04:00",
+  "generated": "2026-09-19T15:24:34-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0024-review-r10-the-harness-starts-its-own-ch",
       "main",
-      "hp/adeherdr/t-0020-herdr-pro-serve-pro-through-a-local-rela",
-      "review/r10",
       "hp/adeherdr/t-0022-review-r9-box-lanes-start-side",
-      "hp/adeherdr/t-0017-box-lanes-start-side-a-lane-starts-and-s",
+      "hp/adeherdr/t-0025-review-r11-this-check-reads-the-relay-th",
       "hp/adeherdr/t-0023-box-lanes-completion-side-the-courier-br",
-      "review/r9",
+      "review/r11",
       "hp/adeherdr/t-0018-harness-the-context-tells-a-coordinator",
       "hp/adeherdr/t-0019-herdr-pro-pictures-from-screenshots-and",
+      "hp/adeherdr/t-0024-review-r10-the-harness-starts-its-own-ch",
+      "hp/adeherdr/t-0020-herdr-pro-serve-pro-through-a-local-rela",
+      "review/r10",
+      "hp/adeherdr/t-0017-box-lanes-start-side-a-lane-starts-and-s",
+      "review/r9",
       "hp/adeherdr/t-0013-gpt-image-gen-a-picture-profile-on-the-b",
       "hp/adeherdr/t-0015-review-r7-the-picture-maker",
       "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
@@ -77,22 +80,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "e8091fd docs(review): round r10 verdict",
-      "b41e9d8 review(pro): start a fresh lane for picture references",
-      "0a0958e review(round): keep one reviewer and read hook envelope",
-      "999ee37 Merge commit '8e3ccf1163ed758f513c5fd6992b20d8306bc5a2' into hp/adeherdr/t-0024-review-r10-the-harness-starts-its-own-ch",
-      "f9b455f Merge commit '1e9f356804f1e1907b4e73f4a64402772835b5d7' into hp/adeherdr/t-0024-review-r10-the-harness-starts-its-own-ch",
-      "f9ae7d2 docs(tasks): t-0024"
+      "3cd3a9a Merge commit 'd360c1f0c66059aa048ec48f4aee01bafce9a216'",
+      "d360c1f docs(review): round r9 verdict",
+      "cf76f5c review(remote): verify both repository URLs",
+      "f37c4ec review(remote): fail closed box starts",
+      "01747e1 review(r11): brief for revision 1",
+      "ca94e81 checkpoint(r10): HANDOFF after merging the round"
     ],
-    "remote": "15 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "e8091fd",
+        "head": "3cd3a9a",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r10 verdict"
+        "subject": "Merge commit 'd360c1f0c66059aa048ec48f4aee01bafce9a216'"
       },
       {
         "branch": "review/r1",
@@ -107,6 +110,13 @@
         "head": "f9ae7d2",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r10",
         "subject": "docs(tasks): t-0024"
+      },
+      {
+        "branch": "review/r11",
+        "dirty": 0,
+        "head": "2c59e5d",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r11",
+        "subject": "docs(tasks): t-0025"
       },
       {
         "branch": "review/r2",
@@ -258,16 +268,16 @@
       {
         "branch": "hp/adeherdr/t-0018-harness-the-context-tells-a-coordinator",
         "dirty": 0,
-        "head": "1e9f356",
+        "head": "ca94e81",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0018",
-        "subject": "feat(round): advance starts the reviewer through a herdr hook"
+        "subject": "checkpoint(r10): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0019-herdr-pro-pictures-from-screenshots-and",
         "dirty": 0,
-        "head": "8e3ccf1",
+        "head": "ca94e81",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0019",
-        "subject": "feat(pro): nest lanes under the caller in herdr's agent tree"
+        "subject": "checkpoint(r10): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0020-herdr-pro-serve-pro-through-a-local-rela",
@@ -278,17 +288,17 @@
       },
       {
         "branch": "hp/adeherdr/t-0022-review-r9-box-lanes-start-side",
-        "dirty": 3,
-        "head": "6a99a3f",
+        "dirty": 0,
+        "head": "d360c1f",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0022",
-        "subject": "Merge commit '6d517cb2060b13fc90ec4b8642b63a0ae0cff4fd' into hp/adeherdr/t-0022-review-r9-box-lanes-start-side"
+        "subject": "docs(review): round r9 verdict"
       },
       {
         "branch": "hp/adeherdr/t-0023-box-lanes-completion-side-the-courier-br",
-        "dirty": 11,
-        "head": "d64488a",
+        "dirty": 0,
+        "head": "789bf54",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0023",
-        "subject": "docs(tasks): t-0023"
+        "subject": "feat(remote): the courier imports box completions"
       },
       {
         "branch": "hp/adeherdr/t-0024-review-r10-the-harness-starts-its-own-ch",
@@ -296,6 +306,13 @@
         "head": "e8091fd",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0024",
         "subject": "docs(review): round r10 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0025-review-r11-this-check-reads-the-relay-th",
+        "dirty": 1,
+        "head": "19aee7f",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0025",
+        "subject": "review(pro): fail setup on a broken relay provider"
       }
     ]
   },
@@ -320,34 +337,12 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r10",
-    "verdict": "e8091fd22760655cd0a1fd0c6f28b00c941b75b9"
+    "round": "r9",
+    "verdict": "d360c1f0c66059aa048ec48f4aee01bafce9a216"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
-    {
-      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0020",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0020",
-      "pane_id": "w1G:pZ",
-      "pane_label": null,
-      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0020--/2026-09-19T19-01-25-302Z_01a0bb0b-74b6-7223-99a4-06d5bf6ca9bd.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:tV",
-      "tab_label": "t-0020",
-      "title": "π - t-0020",
-      "tokens": {
-        "done": "1",
-        "lane": "t-0020",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0020"
-      }
-    },
     {
       "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0022",
       "kind": "pi",
@@ -361,6 +356,8 @@
       "tab_label": "t-0022",
       "title": "π - t-0022",
       "tokens": {
+        "done": "1",
+        "lane": "t-0022",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
@@ -369,51 +366,29 @@
       }
     },
     {
-      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0023",
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0025",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0023",
-      "pane_id": "w1G:p12",
+      "name": "hp-adeherdr-t-0025",
+      "pane_id": "w1G:p14",
       "pane_label": null,
-      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0023--/2026-09-19T19-03-50-218Z_01a0bb0d-aac9-75a2-b3f6-ac53f48bd3fa.jsonl",
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0025--/2026-09-19T19-14-20-604Z_01a0bb17-493c-717e-b855-f64aa98885a1.jsonl",
       "start_args": [],
       "status": "working",
-      "tab_id": "w1G:tY",
-      "tab_label": "t-0023",
-      "title": "π - t-0023",
+      "tab_id": "w1G:t0",
+      "tab_label": "t-0025",
+      "title": "π - t-0025",
       "tokens": {
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
         "review": "working",
-        "thread": "t-0023"
-      }
-    },
-    {
-      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0024",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0024",
-      "pane_id": "w1G:p13",
-      "pane_label": null,
-      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0024--/2026-09-19T19-05-17-045Z_01a0bb0e-fdf4-71f7-9893-f6c2cb315a35.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:tZ",
-      "tab_label": "t-0024",
-      "title": "π - t-0024",
-      "tokens": {
-        "done": "1",
-        "lane": "t-0024",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0024"
+        "thread": "t-0025"
       }
     }
   ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 6
+    "tabs": 4
   }
 }
