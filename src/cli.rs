@@ -321,6 +321,11 @@ enum RoundCommand {
         #[arg(long, hide = true, value_name = "PHASE")]
         stop_after: Option<String>,
     },
+    /// Start the review and reviewer for every ready round; announce verdicts
+    Advance {
+        /// Project slug; omit to use the hook's workspace
+        slug: Option<String>,
+    },
     /// Show the round's record and merge phase
     Show { slug: String, round: String },
     /// Run the ticker's pass for rounds, asks, talk and the board once
@@ -494,6 +499,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 }
                 Ok(())
             }
+            RoundCommand::Advance { slug } => match slug {
+                Some(slug) => round::advance(ctx, &slug),
+                None => round::advance_event(ctx),
+            },
             RoundCommand::Show { slug, round: id } => {
                 print!("{}", round::show(ctx, &slug, &id)?);
                 Ok(())
