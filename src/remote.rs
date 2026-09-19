@@ -56,33 +56,47 @@ struct SavedMachine {
 pub fn machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
-    _config_dir: &Path,
+    config_dir: &Path,
     machine: &str,
 ) -> Result<MachineProfile> {
+    optional_machine_profile(runner, herdr_bin, config_dir, machine)?
+        .with_context(|| format!("unknown_machine: `{machine}` is not a saved profile"))
+}
+
+/// The saved profile when it exists. A missing profile is distinct from a
+/// failed or malformed machine list so callers never silently skip box work.
+pub fn optional_machine_profile(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    _config_dir: &Path,
+    machine: &str,
+) -> Result<Option<MachineProfile>> {
     if machine.is_empty() || machine == MACHINE_LOCAL {
-        return Ok(MachineProfile {
+        return Ok(Some(MachineProfile {
             id: MACHINE_LOCAL.into(),
             label: MACHINE_LOCAL.into(),
             target: String::new(),
             session: String::new(),
-        });
+        }));
     }
-    let found = saved_machines(runner, herdr_bin)?
+    let Some(found) = saved_machines(runner, herdr_bin)?
         .into_iter()
         .find(|m| m.label == machine || m.id == machine)
-        .with_context(|| format!("unknown_machine: `{machine}` is not a saved profile"))?;
+    else {
+        return Ok(None);
+    };
     if !found.enabled {
         bail!("machine_disabled: `{}` is disabled", found.label);
     }
     if found.id.is_empty() || found.target.is_empty() || found.session.is_empty() {
         bail!("machine_profile_invalid: `{machine}` is incomplete");
     }
-    Ok(MachineProfile {
+    Ok(Some(MachineProfile {
         id: found.id,
         label: found.label,
         target: found.target,
         session: found.session,
-    })
+    }))
 }
 
 fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachine>> {

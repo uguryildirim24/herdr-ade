@@ -1706,14 +1706,16 @@ fn harness_install_builds_and_installs_each_repo_kind() {
     );
     world.runner.on("cargo build", ok(""));
     world.runner.on("cp ", ok(""));
+    world.runner.on("mv -f", ok(""));
     world.runner.on("--version", ok("installed version\n"));
-    // No `machine list` rule: `oci` is not saved, so no box step.
+    world.runner.on("machine list --json", ok("[]"));
 
     crate::harness::install(&world.ctx()).unwrap();
 
     let calls = world.runner.calls.borrow();
     let builds: Vec<_> = calls.iter().filter(|c| c.program == "cargo").collect();
     assert_eq!(builds.len(), 2, "one build per repo");
+    assert!(builds.iter().all(|call| call.own_group));
     let plugin_build = builds
         .iter()
         .find(|c| c.cwd.as_deref() == Some(Path::new(&plugin)))
@@ -1742,7 +1744,7 @@ fn harness_install_builds_and_installs_each_repo_kind() {
 
     let installs: Vec<String> = calls
         .iter()
-        .filter(|c| c.program == "cp")
+        .filter(|c| c.program == "mv")
         .map(|c| c.args.last().cloned().unwrap_or_default())
         .collect();
     assert!(
@@ -1791,6 +1793,7 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     );
     with_box.runner.on("cargo build", ok(""));
     with_box.runner.on("cp ", ok(""));
+    with_box.runner.on("mv -f", ok(""));
     with_box.runner.on("--version", ok("installed version\n"));
     with_box.runner.on("ssh", ok(""));
     with_box.runner.on(
@@ -1809,7 +1812,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         scripts.iter().all(|s| s.contains("git fetch --quiet")
             && s.contains("git merge --ff-only")
             && s.contains("cargo build --release --locked")
-            && s.contains("cp target/release/")),
+            && s.contains("cp target/release/")
+            && s.contains("mv -f $HOME/.local/bin/.")),
         "{scripts:?}"
     );
     drop(calls);
@@ -1825,12 +1829,30 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     );
     without_box.runner.on("cargo build", ok(""));
     without_box.runner.on("cp ", ok(""));
+    without_box.runner.on("mv -f", ok(""));
     without_box
         .runner
         .on("--version", ok("installed version\n"));
+    without_box.runner.on("machine list --json", ok("[]"));
     without_box.runner.on("ssh", ok(""));
     crate::harness::install(&without_box.ctx()).unwrap();
     assert_eq!(without_box.runner.count("ssh"), 0);
+}
+
+#[test]
+fn harness_install_does_not_treat_a_failed_machine_list_as_no_box() {
+    let world = World::new();
+    let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
+    write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
+    world
+        .runner
+        .on("machine list --json", fail(1, "machine list unavailable"));
+
+    let error = crate::harness::install(&world.ctx())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("machine_list_failed"), "{error}");
+    assert_eq!(world.runner.count("cargo build"), 0);
 }
 
 #[test]

@@ -1397,9 +1397,13 @@ pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<M
         }
     }
     let _ = crate::board::refresh(ctx, &project);
-    if matches!(&outcome, Ok(MergeOutcome::Checkpointed { .. }))
-        && crate::harness::is_harness_repo(&ctx.config_dir, &record.repo)
+    if matches!(
+        &outcome,
+        Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
+    ) && crate::harness::is_harness_repo(&ctx.config_dir, &record.repo)
     {
+        // Repeat this on a no-op: the prior process may have died after the
+        // checkpoint commit and before the coordinator saw the instruction.
         println!("run ha harness install");
     }
     outcome
