@@ -151,10 +151,11 @@ pub fn ssh(
     timeout: Duration,
 ) -> Result<Output> {
     check_target(target)?;
+    let script = crate::contracts::with_box_path(script);
     let mut cmd = Cmd::new("ssh", timeout).args(SSH_OPTIONS).args([
         "--",
         target,
-        &format!("sh -c {}", quote(script)),
+        &format!("sh -c {}", quote(&script)),
     ]);
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
@@ -268,9 +269,10 @@ pub fn ssh_courier(
     check_target(target)?;
     let mut args = multiplex_options(control_dir);
     args.extend(SSH_OPTIONS.iter().map(|s| (*s).to_string()));
+    let script = crate::contracts::with_box_path(script);
     args.push("--".into());
     args.push(target.to_string());
-    args.push(format!("sh -c {}", quote(script)));
+    args.push(format!("sh -c {}", quote(&script)));
     runner.run(&Cmd::new("ssh", timeout).args(args).stdin(cursor))
 }
 
@@ -462,6 +464,25 @@ mod tests {
         drop(calls);
         assert!(ssh(&runner, "-oProxyCommand=evil", "true", None, SSH_TIMEOUT).is_err());
         assert!(ssh(&runner, "host; rm -rf ~", "true", None, SSH_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn every_ssh_script_carries_the_box_path() {
+        let expected = format!("sh -c 'PATH={} true'", crate::contracts::BOX_PATH);
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(""));
+        ssh(&runner, "box", "true", None, SSH_TIMEOUT).unwrap();
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[0].args.last().unwrap(), &expected);
+        drop(calls);
+
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(""));
+        let dir = tempfile::tempdir().unwrap();
+        ssh_courier(&runner, "box", dir.path(), "true", "", SSH_TIMEOUT).unwrap();
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[0].args.last().unwrap(), &expected);
+        drop(calls);
     }
 
     #[test]

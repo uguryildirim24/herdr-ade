@@ -808,6 +808,15 @@ mod tests {
             .find(|call| call.program == "ssh")
             .unwrap()
             .display();
+        let script = calls
+            .iter()
+            .find(|call| call.program == "ssh")
+            .and_then(|call| call.args.last())
+            .unwrap();
+        assert!(
+            script.starts_with(&format!("sh -c 'PATH={}", crate::contracts::BOX_PATH)),
+            "{script}"
+        );
         assert!(
             ssh.contains("\"$HOME/.local/bin/claude\" auth status"),
             "{ssh}"
