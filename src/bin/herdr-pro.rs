@@ -137,6 +137,7 @@ fn run(cli: &Cli) -> Result<bool> {
                     name: name.clone(),
                     parent: Some(parent.clone()),
                     cwd: cwd.clone(),
+                    profile: None,
                 },
             )?;
             println!(

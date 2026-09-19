@@ -25,6 +25,20 @@ Read the packet and reply with the full answer in markdown.
 You have no tools and you never ask for one.
 ";
 
+/// The Codex config profile that makes one picture on Codex's own backend.
+/// `--profile <name>` layers `<home>/<name>.config.toml` on the pinned base
+/// (Codex 0.155 removed `[profiles]` tables from `config.toml`).
+pub const IMAGE_PROFILE: &str = "gpt-image-gen";
+
+/// The image profile's `model_instructions_file`.
+pub const IMAGE_INSTRUCTIONS: &str = "\
+You are a picture maker on Codex.
+Make one picture from the request you receive.
+Call the image tool exactly once with the request's prompt and its size.
+If the tool only offers fixed sizes, pick the nearest and say which.
+Reply with one line naming the picture and nothing else. Use no other tools.
+";
+
 /// The home's `AGENTS.md`: the packet and TURN contract, nothing of Rolf's.
 pub const AGENTS_MD: &str = "\
 # Pro
@@ -88,6 +102,29 @@ fn apply_pins(table: &mut toml::Table, home: &Path) {
     }
 }
 
+/// The image profile file: Codex's own backend, Astra high, the image tool on,
+/// and a short picture-maker instruction file. It carries no bridge route.
+fn render_image_profile(home: &Path) -> Result<String> {
+    let mut table = toml::Table::new();
+    table.insert("model".into(), "gpt-6-astra".into());
+    table.insert("model_reasoning_effort".into(), "high".into());
+    table.insert(
+        "model_instructions_file".into(),
+        Value::String(
+            home.join("instructions-gpt-image-gen.md")
+                .display()
+                .to_string(),
+        ),
+    );
+    let mut features = toml::Table::new();
+    features.insert("image_generation".into(), true.into());
+    table.insert("features".into(), Value::Table(features));
+    let body = toml::to_string(&table).context("could not serialize the image profile")?;
+    Ok(format!(
+        "# Written by herdr-pro. The plugin owns this file.\n{body}"
+    ))
+}
+
 /// Read the home's config, or a fresh pinned table when it does not exist yet.
 fn read_config(path: &Path, home: &Path) -> Result<toml::Table> {
     match std::fs::read_to_string(path) {
@@ -123,6 +160,14 @@ pub fn init(layout: &Layout) -> Result<()> {
     state::write_atomic(&config, &render(&table)?)?;
     state::write_atomic(&home.join("instructions.md"), INSTRUCTIONS)?;
     state::write_atomic(&home.join("AGENTS.md"), AGENTS_MD)?;
+    state::write_atomic(
+        &home.join("instructions-gpt-image-gen.md"),
+        IMAGE_INSTRUCTIONS,
+    )?;
+    state::write_atomic(
+        &home.join(format!("{IMAGE_PROFILE}.config.toml")),
+        &render_image_profile(&home)?,
+    )?;
     Ok(())
 }
 
@@ -159,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn init_writes_the_pinned_config_and_the_two_files() {
+    fn init_writes_the_pinned_config_and_the_files() {
         let (_dir, layout) = layout();
         init(&layout).unwrap();
         let home = layout.codex_home();
@@ -184,6 +229,23 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.join("AGENTS.md")).unwrap(),
             AGENTS_MD
+        );
+        // The picture profile is a separate Codex 0.155 config file, laid over
+        // the base by `--profile gpt-image-gen`; it carries no bridge route.
+        let profile: toml::Table = std::fs::read_to_string(home.join("gpt-image-gen.config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(profile["model"].as_str(), Some("gpt-6-astra"));
+        assert_eq!(profile["model_reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(
+            profile["features"]["image_generation"].as_bool(),
+            Some(true)
+        );
+        assert!(!profile.contains_key("openai_base_url"));
+        assert_eq!(
+            std::fs::read_to_string(home.join("instructions-gpt-image-gen.md")).unwrap(),
+            IMAGE_INSTRUCTIONS
         );
     }
 
