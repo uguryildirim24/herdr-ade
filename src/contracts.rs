@@ -45,6 +45,10 @@ pub const BOX_PATH: &str =
 pub const BOX_HOME: &str = "/home/ubuntu";
 /// The plugin binary and ADE root on the box (SPEC-remote §4.2 step 6).
 pub const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
+/// The pi binary on the box: `setup`, `login`, `doctor` and `check` are
+/// `herdr-pi` verbs, so a pi readiness probe never runs through [`BOX_BIN`]
+/// (SPEC-remote §4.2 step 6).
+pub const BOX_PI_BIN: &str = "/home/ubuntu/.local/bin/herdr-pi";
 pub const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";
 /// The box's per-lane build folders (SPEC-remote §3.2).
 pub const BOX_BUILD: &str = "/home/ubuntu/build/lanes";
