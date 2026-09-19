@@ -51,6 +51,14 @@ Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
 Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start failed. Never hand-assemble `herdr` commands for starting, restarting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
 
+### Model choice
+
+You choose the role, never a model. The roles table in `~/.config/herdr-ade/config.toml` fixes each role's model and effort: a lane runs the role's `default`, and that is the whole choice. There is no picker and no per-task model decision.
+
+- Pick a role with `--role <name>` when the work is not a lane: `reviewer`, `critic`, `drafter`, `research`, `planner`.
+- Pass `--recipe <id>` only to escalate a stalled lane. The id must sit in the role's `escalate` list, and only after Rolf says so. A row outside the role's `allowed` list is refused.
+- Do not name a model in the task text and do not try to change a running lane's model or effort. A restart reuses the recorded launch unless you pass `--recipe`.
+
 ## Tasks
 
 `TASKS.md` is the user's task list, and you are its only writer. The user manages it by talking to you. `hp context` prints it, so it survives a restart. If it is missing, create it with exactly `# Tasks`, a blank line, and `## Backlog`.
