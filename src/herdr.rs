@@ -449,6 +449,40 @@ impl<'a> Herdr<'a> {
         })
     }
 
+    /// Types one command line into a pane's own shell (SPEC-remote §3.3).
+    pub fn pane_run(&self, pane: &str, command: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "run", pane, command], CALL_TIMEOUT)
+            .map(|_| ())
+    }
+
+    /// `pane read` prints text, not a JSON reply, so this returns it verbatim.
+    pub fn pane_read_text(&self, pane: &str, source: &str) -> Result<String, HerdrError> {
+        let out = self
+            .runner
+            .run(
+                &self
+                    .cmd(CALL_TIMEOUT)
+                    .args(["pane", "read", pane, "--source", source, "--format", "text"]),
+            )
+            .map_err(|e| HerdrError {
+                code: "unreachable".into(),
+                message: format!("{e:#}"),
+            })?;
+        if !out.success() {
+            return Err(HerdrError {
+                code: "failed".into(),
+                message: format!("`herdr pane read`: {}", out.error_text()),
+            });
+        }
+        Ok(out.stdout)
+    }
+
+    /// Closes a whole workspace, used to clean up a probe pane.
+    pub fn workspace_close(&self, workspace: &str) -> Result<(), HerdrError> {
+        self.call(&["workspace", "close", workspace], CALL_TIMEOUT)
+            .map(|_| ())
+    }
+
     /// `agent start` with `--parent` and `ready_timeout_ms` (SPEC-ADE D2, D3).
     pub fn agent_start_opts(&self, opts: &AgentStart<'_>) -> Result<Agent, HerdrError> {
         let timeout_ms = opts.ready_timeout_ms.to_string();

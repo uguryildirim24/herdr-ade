@@ -41,6 +41,8 @@ pub const MACHINE_LOCAL: &str = "local";
 /// (SPEC-remote §3.3, check c C4).
 pub const BOX_PATH: &str =
     "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
+/// The box user's home, the cwd for a doctor probe pane (SPEC-remote §3.3).
+pub const BOX_HOME: &str = "/home/ubuntu";
 /// The plugin binary and ADE root on the box (SPEC-remote §4.2 step 6).
 pub const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
 pub const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";

@@ -325,8 +325,9 @@ pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
 pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch) -> Result<()> {
     let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
         .context("pi_args_forbidden: a pi launch names no --provider")?;
-    let target = remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
-    crate::pi_ade::check_on_machine(ctx.runner, &target, &provider)
+    let profile =
+        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+    crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
         .with_context(|| format!("pi_not_ready: provider {provider} on `{machine}`"))
 }
 

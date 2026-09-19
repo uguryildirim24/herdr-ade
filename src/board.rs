@@ -213,7 +213,7 @@ pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     let states = agent_states(ctx, project);
     let (mut working, mut done, mut waiting, mut stuck) = (0, 0, 0, 0);
     for t in thread::list(project) {
-        if t.status == thread::Status::Resolved || t.is_remote() {
+        if t.status == thread::Status::Resolved {
             continue;
         }
         let attempt = crate::round::thread_attempt(project, &t.id).unwrap_or(1);
@@ -221,8 +221,18 @@ pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
             Some(e) if e.payload.done.is_some() => done += 1,
             Some(e) if e.payload.waiting.is_some() => waiting += 1,
             _ => {
-                let state = states.as_ref().and_then(|s| s.get(&t.pane_id).cloned());
-                if t.status == thread::Status::Failed || state.as_deref() == Some("blocked") {
+                // A box lane's live state lives on the box; the Mac record's
+                // last state and group are the view it has (SPEC-remote §5).
+                let state = if t.is_remote() {
+                    Some(t.last_state.clone())
+                } else {
+                    states.as_ref().and_then(|s| s.get(&t.pane_id).cloned())
+                };
+                let waiting_on_you = t.is_remote() && t.last_group == "waiting-on-you";
+                if t.status == thread::Status::Failed
+                    || state.as_deref() == Some("blocked")
+                    || waiting_on_you
+                {
                     stuck += 1;
                 } else {
                     working += 1;
@@ -251,6 +261,14 @@ pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
             "a lane finished"
         } else {
             "a lane asked for help"
+        };
+        let machine = thread::load(project, &e.thread)
+            .ok()
+            .filter(|t| t.is_remote() && !t.machine.is_empty())
+            .map(|t| t.machine);
+        let what = match machine {
+            Some(machine) => format!("{what} on machine `{machine}`"),
+            None => what.to_string(),
         };
         (e.created.clone(), what)
     });
@@ -293,4 +311,69 @@ pub fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
         send(ctx, project, &pairs)?;
     }
     Ok(refused)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
+    use crate::paths::{Ctx, Env};
+    use crate::runner::fake::FakeRunner;
+
+    #[test]
+    fn a_box_lane_is_counted_and_the_last_line_names_its_machine() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        crate::thread::allocate(&project, |t| {
+            t.status = crate::thread::Status::Open;
+            t.machine = "oci".into();
+            t.machine_id = "1".into();
+            t.last_group = "working".into();
+        })
+        .unwrap();
+        let event = Event {
+            id: "t-0001-1-1".into(),
+            op: "t-0001-1-1".into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            created: "2026-09-19T00:00:00Z".into(),
+            payload: EventPayload {
+                done: Some(DonePayload {
+                    sha: "abc".into(),
+                    report_path: ".reports/t-0001.md".into(),
+                    artifact: "def".into(),
+                }),
+                waiting: None,
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+
+        let runner = FakeRunner::new();
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let values: std::collections::BTreeMap<String, String> =
+            compute(&ctx, &project).into_iter().collect();
+        assert!(
+            values["ade_lanes"].contains("1 done"),
+            "{}",
+            values["ade_lanes"]
+        );
+        assert!(
+            values["ade_last"].contains("on machine `oci`"),
+            "{}",
+            values["ade_last"]
+        );
+    }
 }

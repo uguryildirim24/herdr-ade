@@ -126,17 +126,33 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
             event.id
         );
     }
+    // A box lane's DONE is not typed until the Mac itself holds the pinned code
+    // commit: fetch the lane branch from the configured GitHub URL and check
+    // the event's sha is reachable there (SPEC-remote §4.3, gate R5).
+    if lane.is_remote()
+        && let Some(done) = &event.payload.done
+    {
+        verify_published_sha(ctx, project, &lane, &done.sha)?;
+    }
     let kind = if event.payload.done.is_some() {
         "done"
     } else {
         "waiting"
     };
+    // A box lane's summary names its machine (SPEC-remote §5).
+    let place = if lane.is_remote() {
+        format!(" on machine `{}`", lane.machine)
+    } else {
+        String::new()
+    };
     let summary = match (&event.payload.done, &event.payload.waiting) {
         (Some(done), None) => format!(
-            "{} completed with report {} at {}",
-            event.thread, done.report_path, done.sha
+            "{}{} completed with report {} at {}",
+            event.thread, place, done.report_path, done.sha
         ),
-        (None, Some(waiting)) => format!("{} is waiting: {}", event.thread, waiting.text),
+        (None, Some(waiting)) => {
+            format!("{}{} is waiting: {}", event.thread, place, waiting.text)
+        }
         _ => bail!("event_payload_invalid: {}", event.id),
     };
     inbox::write_event(project, event, kind, &summary)?;
@@ -184,6 +200,55 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
         &event.id,
         crate::contracts::DeliveryState::Submitted,
     )
+}
+
+/// The configured publish URL for a repository (SPEC-remote §4.1): the
+/// project's own row wins, then the committed Mac→box map.
+fn publish_url_for(project: &Project, repo: &str) -> Option<String> {
+    if let Ok((settings, _)) = project.read_project_md()
+        && let Some(row) = settings.repos.iter().find(|row| row.path == repo)
+        && let Some(url) = &row.publish_url
+    {
+        return Some(url.clone());
+    }
+    crate::remote::box_repo_for(repo).map(|row| row.publish_url.to_string())
+}
+
+/// Before a box lane's DONE is typed, the Mac fetches the lane branch from the
+/// URL-matched GitHub remote and checks the event's sha is reachable there
+/// (SPEC-remote §4.3, gate R5). A failed fetch or an absent commit leaves the
+/// event undelivered; the next pass retries.
+fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) -> Result<()> {
+    if sha.is_empty() {
+        bail!("published_sha_missing: the done event has no sha");
+    }
+    if lane.branch.is_empty() {
+        bail!("published_branch_missing: {} has no lane branch", lane.id);
+    }
+    let url = publish_url_for(project, &lane.repo)
+        .with_context(|| format!("box_repo_unmapped: {} has no publish URL", lane.repo))?;
+    let remote = crate::remote::remote_for_url(ctx.runner, &lane.repo, &url)?;
+    let git = |args: &[&str]| {
+        ctx.runner.run(
+            &crate::runner::Cmd::new("git", Duration::from_secs(60))
+                .args(["-C", lane.repo.as_str()])
+                .args(args.iter().copied()),
+        )
+    };
+    let out = git(&[
+        "fetch",
+        "--quiet",
+        remote.as_str(),
+        &format!("refs/heads/{}", lane.branch),
+    ])?;
+    if !out.success() {
+        bail!("published_fetch_failed: {url}: {}", out.error_text());
+    }
+    let out = git(&["merge-base", "--is-ancestor", sha, "FETCH_HEAD"])?;
+    if !out.success() {
+        bail!("published_sha_missing: {sha} is not reachable on {url}");
+    }
+    Ok(())
 }
 
 /// D11: records the digest of `config.toml` and `RULES.md`; when it moved
@@ -264,6 +329,11 @@ pub struct Memory {
     pub outage_secs: i64,
     pub tick: u64,
     pub machines: BTreeMap<String, MachineMemory>,
+    /// This tick's one courier pass per due machine (SPEC-remote §4.3). The
+    /// pass is machine-level, not project-level, so a later project on the same
+    /// machine reuses it instead of moving the cadence. An `Err` is this
+    /// tick's unreachable reason.
+    pub machine_views: BTreeMap<String, Result<CourierOutcome, String>>,
 }
 
 impl Memory {
@@ -279,6 +349,7 @@ impl Memory {
                 .unwrap_or(DEFAULT_OUTAGE_SECS),
             tick: 0,
             machines: BTreeMap::new(),
+            machine_views: BTreeMap::new(),
         }
     }
 
@@ -362,51 +433,118 @@ pub struct BoxEnvelope {
     pub artifact_hash: String,
 }
 
+/// One completion receipt the box wrote at seal (D5): the event bytes and
+/// report bytes the box itself hashed. The Mac compares both with its own
+/// before the taken cursor advances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionReceipt {
+    pub slug: String,
+    pub event: String,
+    pub event_hash: String,
+    /// Empty for a `waiting` receipt.
+    pub artifact_hash: String,
+}
+
+/// One bootstrap receipt the box wrote when its lane ran `skill lane` (D14).
+/// The courier carries it to the Mac, which marks the thread's receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapReceipt {
+    pub slug: String,
+    pub thread: String,
+    pub brief_hash: String,
+    pub pane: String,
+}
+
 /// What one box helper call returned, after the taken cursor it was asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CourierManifest {
     pub boot_id: String,
     pub free_bytes: u64,
+    /// Box-local `herdr agent list` JSON; `None` when the box server did not
+    /// answer this pass.
+    pub agents: Option<String>,
+    /// Box-local `herdr pane list` JSON; `None` when it did not answer.
+    pub panes: Option<String>,
     pub envelopes: Vec<BoxEnvelope>,
+    pub receipts: Vec<CompletionReceipt>,
+    pub bootstraps: Vec<BootstrapReceipt>,
 }
 
-/// The stable identity a courier pass resolved and the boot it saw, so the
-/// caller can key its lane state and detect a reboot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The stable identity a courier pass resolved and the live facts it read, so
+/// the caller can key lane state, detect a reboot and needs no second bridge.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CourierOutcome {
     pub machine_id: String,
     pub boot_id: String,
+    /// `None` when the box's own server did not answer: the pass still imports
+    /// sealed events, but changes no lane state.
+    pub agents: Option<Vec<Agent>>,
+    pub panes: Option<Vec<Pane>>,
 }
 
-/// The box-local helper: it reads the box ADE root after the taken cursor and
-/// prints one tab-separated record per fact (SPEC-remote §4.3). It makes no
-/// bridge call; the courier's `herdr --machine` lists are the live view.
-pub fn courier_helper(box_root: &str) -> String {
-    let root = crate::remote::quote(box_root);
-    format!(
-        "set -u\n\
-         root={root}\n\
-         printf 'boot\\t%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)\"\n\
-         avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\n\
-         printf 'free\\t%s\\n' \"${{avail:-0}}\"\n\
-         [ -d \"$root\" ] || exit 0\n\
-         for dir in \"$root\"/*/events; do\n\
-           [ -d \"$dir\" ] || continue\n\
-           slug=${{dir%/events}}; slug=${{slug##*/}}\n\
-           for f in \"$dir\"/*.toml; do\n\
-             [ -f \"$f\" ] || continue\n\
-             id=${{f##*/}}; id=${{id%.toml}}\n\
-             case \"$id\" in .*) continue;; esac\n\
-             h=$(sha256sum \"$f\" | cut -d' ' -f1)\n\
-             a=$(sed -n 's/^artifact = \"\\([^\"]*\\)\"/\\1/p' \"$f\" | head -n1)\n\
-             if [ -n \"$a\" ]; then\n\
-               printf 'event\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$slug\" \"$id\" \"$f\" \"$h\" \"$root/$slug/artifacts/$a\" \"$a\"\n\
-             else\n\
-               printf 'event\\t%s\\t%s\\t%s\\t%s\\t-\\t-\\n' \"$slug\" \"$id\" \"$f\" \"$h\"\n\
-             fi\n\
-           done\n\
-         done\n"
-    )
+/// The box-local helper: it recovers an interrupted box D5 operation, reads
+/// the box server's own live lists, and prints one tab-separated record per
+/// fact after the taken cursor it reads on stdin (SPEC-remote §4.3). It makes
+/// no `herdr --machine` bridge call; the courier's one SSH trip carries both
+/// the helper and the batched `scp`.
+const COURIER_HELPER: &str = r#"set -u
+root=__ROOT__
+herdr_bin="$HOME/.local/bin/herdr"
+cursor=$(mktemp)
+trap 'rm -f "$cursor"' EXIT
+cat > "$cursor"
+printf 'boot\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
+printf 'free\t%s\n' "${avail:-0}"
+"$HOME/.local/bin/herdr-ade" --root "$HOME/.herdr-ade" recover >/dev/null 2>&1 || true
+if [ -x "$herdr_bin" ]; then
+  a=$("$herdr_bin" --session __SESSION__ agent list 2>/dev/null | tr -d '\n')
+  p=$("$herdr_bin" --session __SESSION__ pane list 2>/dev/null | tr -d '\n')
+  if [ -n "$a" ]; then printf 'agents\t%s\n' "$a"; else printf 'agents\t-\n'; fi
+  if [ -n "$p" ]; then printf 'panes\t%s\n' "$p"; else printf 'panes\t-\n'; fi
+else
+  printf 'agents\t-\n'
+  printf 'panes\t-\n'
+fi
+[ -d "$root" ] || exit 0
+for dir in "$root"/*/events; do
+  [ -d "$dir" ] || continue
+  slug=${dir%/events}; slug=${slug##*/}
+  for f in "$dir"/*.toml; do
+    [ -f "$f" ] || continue
+    id=${f##*/}; id=${id%.toml}
+    case "$id" in .*) continue;; esac
+    key=$(printf '%s\t%s' "$slug" "$id")
+    if grep -Fqx "$key" "$cursor" 2>/dev/null; then continue; fi
+    h=$(sha256sum "$f" | cut -d' ' -f1)
+    a=$(sed -n 's/^artifact = "\([^"]*\)"/\1/p' "$f" | head -n1)
+    if [ -n "$a" ]; then
+      printf 'event\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$f" "$h" "$root/$slug/artifacts/$a" "$a"
+    else
+      printf 'event\t%s\t%s\t%s\t%s\t-\t-\n' "$slug" "$id" "$f" "$h"
+    fi
+    rec="$root/$slug/receipts/$id.toml"
+    if [ -f "$rec" ]; then
+      eh=$(sed -n 's/^event_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
+      ah=$(sed -n 's/^artifact_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
+      printf 'receipt\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$eh" "$ah"
+    fi
+  done
+done
+for f in "$root"/*/.state/bootstrap/*.json; do
+  [ -f "$f" ] || continue
+  slug=${f%%/.state/bootstrap/*}; slug=${slug##*/}
+  thread=${f##*/}; thread=${thread%.json}
+  brief=$(sed -n 's/.*"brief_hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)
+  pane=$(sed -n 's/.*"pane"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)
+  printf 'bootstrap\t%s\t%s\t%s\t%s\n' "$slug" "$thread" "$brief" "$pane"
+done
+"#;
+
+pub fn courier_helper(box_root: &str, session: &str) -> String {
+    COURIER_HELPER
+        .replace("__ROOT__", &crate::remote::quote(box_root))
+        .replace("__SESSION__", &crate::remote::quote(session))
 }
 
 /// Parses the helper's tab-separated output. An unknown record is refused so a
@@ -418,6 +556,32 @@ pub fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
         match fields.as_slice() {
             ["boot", id] => manifest.boot_id = (*id).to_string(),
             ["free", bytes] => manifest.free_bytes = bytes.trim().parse().unwrap_or(0),
+            ["agents", json] => {
+                if *json != "-" && !json.is_empty() {
+                    manifest.agents = Some((*json).to_string());
+                }
+            }
+            ["panes", json] => {
+                if *json != "-" && !json.is_empty() {
+                    manifest.panes = Some((*json).to_string());
+                }
+            }
+            ["receipt", slug, event, event_hash, artifact_hash] => {
+                manifest.receipts.push(CompletionReceipt {
+                    slug: (*slug).to_string(),
+                    event: (*event).to_string(),
+                    event_hash: (*event_hash).to_string(),
+                    artifact_hash: (*artifact_hash).to_string(),
+                });
+            }
+            ["bootstrap", slug, thread, brief_hash, pane] => {
+                manifest.bootstraps.push(BootstrapReceipt {
+                    slug: (*slug).to_string(),
+                    thread: (*thread).to_string(),
+                    brief_hash: (*brief_hash).to_string(),
+                    pane: (*pane).to_string(),
+                });
+            }
             [
                 "event",
                 slug,
@@ -454,12 +618,34 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// One courier pass for one project on one machine (SPEC-remote §4.3): one
-/// multiplexed helper call, one batched `scp`, hash checks, and a create-only
-/// import into the Mac's canonical ledger. Returns the box's boot id, so the
-/// caller can push GONE after a reboot. The box keeps its copies; only the
-/// taken cursor advances, and only after the import is durable.
-pub fn courier(ctx: &Ctx, project: &Project, machine: &str) -> Result<CourierOutcome> {
+/// Parses one box-local `herdr <list> --json` reply into its list. A reply
+/// carrying `error` is a refusal; a missing list is an empty one.
+fn parse_box_list<T: serde::de::DeserializeOwned>(json: &str, field: &str) -> Result<Vec<T>> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("the box herdr list is not JSON")?;
+    if let Some(error) = value.get("error") {
+        bail!(
+            "box herdr {field} failed: {}",
+            error.get("message").and_then(|m| m.as_str()).unwrap_or("")
+        );
+    }
+    let list = value
+        .get("result")
+        .and_then(|result| result.get(field))
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(Vec::new()));
+    serde_json::from_value(list)
+        .map_err(|error| anyhow::anyhow!("the box herdr {field} reply changed: {error}"))
+}
+
+/// One courier pass for one saved machine, covering every project with lanes
+/// on it (SPEC-remote §4.3): one multiplexed helper call, the helper reads the
+/// box's own live lists, then one batched `scp` per project over that same
+/// connection, hash checks, receipt checks, and a create-only import into the
+/// Mac's canonical ledger. The box keeps its copies; only the taken cursor
+/// advances, and only after the import is durable. Returns the box's live
+/// facts, so the caller can key lane state and push GONE after a reboot.
+pub fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
     let profile =
         crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
     if profile.is_local() {
@@ -470,21 +656,60 @@ pub fn courier(ctx: &Ctx, project: &Project, machine: &str) -> Result<CourierOut
     }
     let target = profile.target.clone();
     let control = ctx.root.join(".state/remote");
-    let script = courier_helper(crate::contracts::BOX_ROOT);
-    let out = crate::remote::ssh_courier(ctx.runner, &target, &control, &script, COURIER_TIMEOUT)?;
+
+    // The taken cursor, per project: the helper answers after it.
+    let mut states = BTreeMap::new();
+    let mut cursor = String::new();
+    for project in projects {
+        let state = events::remote_state(project, &profile.id);
+        for id in state.taken.keys() {
+            cursor.push_str(&project.slug);
+            cursor.push('\t');
+            cursor.push_str(id);
+            cursor.push('\n');
+        }
+        states.insert(project.slug.clone(), state);
+    }
+
+    let script = courier_helper(crate::contracts::BOX_ROOT, &profile.session);
+    let out = crate::remote::ssh_courier(
+        ctx.runner,
+        &target,
+        &control,
+        &script,
+        &cursor,
+        COURIER_TIMEOUT,
+    )?;
     if !out.success() {
         bail!("courier helper on {target}: {}", out.error_text());
     }
     let manifest = parse_courier_manifest(&out.stdout)
         .with_context(|| format!("courier helper on {target}"))?;
 
-    let mut state = events::remote_state(project, &profile.id);
-    let wanted: Vec<&BoxEnvelope> = manifest
-        .envelopes
+    let agents = match &manifest.agents {
+        Some(json) => Some(parse_box_list::<Agent>(json, "agents")?),
+        None => None,
+    };
+    let panes = match &manifest.panes {
+        Some(json) => Some(parse_box_list::<Pane>(json, "panes")?),
+        None => None,
+    };
+    let receipts: BTreeMap<(String, String), &CompletionReceipt> = manifest
+        .receipts
         .iter()
-        .filter(|env| env.slug == project.slug && !state.taken.contains_key(&env.event))
+        .map(|receipt| ((receipt.slug.clone(), receipt.event.clone()), receipt))
         .collect();
-    if !wanted.is_empty() {
+
+    for project in projects {
+        let mut state = states.remove(&project.slug).unwrap_or_default();
+        let wanted: Vec<&BoxEnvelope> = manifest
+            .envelopes
+            .iter()
+            .filter(|env| env.slug == project.slug && !state.taken.contains_key(&env.event))
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
         let staging = ctx
             .root
             .join(".state/remote/staging")
@@ -510,6 +735,21 @@ pub fn courier(ctx: &Ctx, project: &Project, machine: &str) -> Result<CourierOut
                     env.event_hash
                 );
             }
+            // The box's own receipt must agree with the fetched bytes before
+            // the cursor moves (D5, SPEC-remote §4.3).
+            let receipt = receipts
+                .get(&(env.slug.clone(), env.event.clone()))
+                .with_context(|| {
+                    format!("receipt_missing: no completion receipt for {}", env.event)
+                })?;
+            if receipt.event_hash != env.event_hash {
+                bail!(
+                    "receipt_mismatch: {} box receipt says {}, fetched {}",
+                    env.event,
+                    receipt.event_hash,
+                    env.event_hash
+                );
+            }
             let artifact = if env.artifact_path.is_empty() {
                 None
             } else {
@@ -522,6 +762,14 @@ pub fn courier(ctx: &Ctx, project: &Project, machine: &str) -> Result<CourierOut
                         env.artifact_hash
                     );
                 }
+                if receipt.artifact_hash != env.artifact_hash {
+                    bail!(
+                        "receipt_mismatch: {} artifact receipt is {}, fetched {}",
+                        env.event,
+                        receipt.artifact_hash,
+                        env.artifact_hash
+                    );
+                }
                 Some(bytes)
             };
             events::import_box_event(project, &profile.id, &bytes, artifact.as_deref())?;
@@ -530,15 +778,43 @@ pub fn courier(ctx: &Ctx, project: &Project, machine: &str) -> Result<CourierOut
                 .insert(env.event.clone(), env.event_hash.clone());
         }
         let _ = std::fs::remove_dir_all(&staging);
+        // The boot id is left for `remote_attention` to advance: it must see
+        // the change to type GONE for the pre-reboot lanes.
+        state.last_pass = project::now();
+        events::save_remote_state(project, &profile.id, &state)?;
     }
-    // The boot id is left for `remote_attention` to advance: it must see the
-    // change to type GONE for the pre-reboot lanes.
-    state.last_pass = project::now();
-    events::save_remote_state(project, &profile.id, &state)?;
+
+    apply_bootstraps(projects, &manifest.bootstraps);
+
     Ok(CourierOutcome {
         machine_id: profile.id,
         boot_id: manifest.boot_id,
+        agents,
+        panes,
     })
+}
+
+/// Carries a box lane's bootstrap receipt to the Mac record (D14): the thread
+/// is marked only when the receipt's brief hash and pane still match it.
+fn apply_bootstraps(projects: &[&Project], receipts: &[BootstrapReceipt]) {
+    for receipt in receipts {
+        let Some(project) = projects.iter().find(|project| project.slug == receipt.slug) else {
+            continue;
+        };
+        let Ok(lane) = thread::load(project, &receipt.thread) else {
+            continue;
+        };
+        if !lane.is_remote()
+            || lane.pane_id != receipt.pane
+            || (!lane.launch.brief_hash.is_empty() && lane.launch.brief_hash != receipt.brief_hash)
+            || lane.bootstrap == "acknowledged"
+        {
+            continue;
+        }
+        let _ = thread::update(project, &receipt.thread, |lane| {
+            lane.bootstrap = "acknowledged".into();
+        });
+    }
 }
 
 /// One successful pass's live facts for a machine's box lanes.
@@ -574,13 +850,26 @@ pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> V
         state.gone.clear();
         state.missing.clear();
     }
-    let mut lines: Vec<String> = Vec::new();
+    enum Signal {
+        Blocked(String),
+        Gone(String),
+    }
+    impl Signal {
+        fn line(&self) -> String {
+            match self {
+                Signal::Blocked(lane) => format!("BLOCKED {lane}"),
+                Signal::Gone(lane) => format!("GONE {lane}"),
+            }
+        }
+    }
+
+    let mut signals = Vec::new();
     for lane in threads {
         let live = thread::live_state(lane, agents, panes, now);
         let blocked = live.agent_state.as_deref() == Some("blocked");
         if blocked {
-            if state.blocked.insert(lane.id.clone()) {
-                lines.push(format!("BLOCKED {}", lane.id));
+            if !state.blocked.contains(&lane.id) {
+                signals.push(Signal::Blocked(lane.id.clone()));
             }
         } else {
             state.blocked.remove(&lane.id);
@@ -592,18 +881,24 @@ pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> V
             *count += 1;
         }
         let missing = *state.missing.get(&lane.id).unwrap_or(&0);
-        if (boot_changed || missing >= 2) && state.gone.insert(lane.id.clone()) {
-            lines.push(format!("GONE {}", lane.id));
+        if (boot_changed || missing >= 2) && !state.gone.contains(&lane.id) {
+            signals.push(Signal::Gone(lane.id.clone()));
         }
     }
-    for line in lines {
+    for signal in signals {
+        let line = signal.line();
         match type_remote_line(ctx, project, &line) {
-            Ok(true) => {}
-            Ok(false) => {
-                // The writer is suspended or the coordinator is not ready;
-                // the state stays marked so the line is not typed twice, and
-                // `deliver_events` retries the sealed events on a later tick.
-            }
+            Ok(true) => match signal {
+                Signal::Blocked(lane) => {
+                    state.blocked.insert(lane);
+                }
+                Signal::Gone(lane) => {
+                    state.gone.insert(lane);
+                }
+            },
+            // A suspended or busy writer has not consumed the transition. Do
+            // not mark it: the next successful pass must try again.
+            Ok(false) => {}
             Err(error) => errors.push(error.context(format!("remote line `{line}`"))),
         }
     }
@@ -1114,12 +1409,20 @@ mod tests {
 
     #[test]
     fn courier_manifest_parses_records_and_refuses_junk() {
-        let text = "boot\tboot-1\nfree\t1234\n\
+        let text = "boot\tboot-1\nfree\t1234\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
+                    receipt\tdemo\tt-0001-1-1\tabc\tdef\n\
+                    bootstrap\tdemo\tt-0001\tabcd\tw1:p2\n\
                     event\tdemo\tt-0001-1-1\t/r/demo/events/t-0001-1-1.toml\tabc\t/r/demo/artifacts/def\tdef\n\
                     event\tdemo\tt-0002-1-1\t/r/demo/events/t-0002-1-1.toml\tabc\t-\t-\n";
         let manifest = parse_courier_manifest(text).unwrap();
         assert_eq!(manifest.boot_id, "boot-1");
         assert_eq!(manifest.free_bytes, 1234);
+        assert!(manifest.agents.is_some());
+        assert!(manifest.panes.is_none());
+        assert_eq!(manifest.receipts.len(), 1);
+        assert_eq!(manifest.receipts[0].artifact_hash, "def");
+        assert_eq!(manifest.bootstraps.len(), 1);
+        assert_eq!(manifest.bootstraps[0].pane, "w1:p2");
         assert_eq!(manifest.envelopes.len(), 2);
         assert_eq!(manifest.envelopes[0].artifact_hash, "def");
         assert!(manifest.envelopes[1].artifact_path.is_empty());
@@ -1128,18 +1431,61 @@ mod tests {
 
     #[test]
     fn courier_helper_survives_a_hostile_box_root() {
-        let script = courier_helper("/home/it's a $(box)");
+        let script = courier_helper("/home/it's a $(box)", "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
+        // A throwaway HOME so the script's box recovery never touches the real
+        // ADE root; the box binaries are absent there.
+        let home = tempfile::tempdir().unwrap();
         let out = crate::runner::RealRunner
-            .run(&crate::runner::Cmd::new("sh", Duration::from_secs(5)).args(["-c", &command]))
+            .run(
+                &crate::runner::Cmd::new("sh", Duration::from_secs(5))
+                    .args(["-c", &command])
+                    .env("HOME", home.path().display().to_string()),
+            )
             .unwrap();
         assert!(out.success(), "{}", out.error_text());
         assert!(out.stdout.contains("boot\t"), "{}", out.stdout);
         assert!(out.stdout.contains("free\t"), "{}", out.stdout);
+        assert!(out.stdout.contains("agents\t-\n"), "{}", out.stdout);
+        assert!(out.stdout.contains("panes\t-\n"), "{}", out.stdout);
     }
 
     #[test]
-    fn a_box_lane_absent_twice_is_pushed_gone_once() {
+    fn courier_helper_answers_only_after_the_taken_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("ade");
+        let dir = root.join("demo/events");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
+        let script = courier_helper(&root.to_string_lossy(), "default");
+        let command = format!("sh -c {}", crate::remote::quote(&script));
+        let run = |stdin: &str| {
+            crate::runner::RealRunner
+                .run(
+                    &crate::runner::Cmd::new("sh", Duration::from_secs(5))
+                        .args(["-c", &command])
+                        .env("HOME", home.path().display().to_string())
+                        .stdin(stdin.to_string()),
+                )
+                .unwrap()
+        };
+        let skipped = run("demo\tt-0001-1-1\n");
+        assert!(skipped.success(), "{}", skipped.error_text());
+        assert!(
+            !skipped.stdout.contains("event\tdemo"),
+            "{}",
+            skipped.stdout
+        );
+        let fresh = run("");
+        assert!(
+            fresh.stdout.contains("event\tdemo\tt-0001-1-1"),
+            "{}",
+            fresh.stdout
+        );
+    }
+
+    #[test]
+    fn a_box_lane_signal_waits_until_the_coordinator_can_receive_it() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let lane = thread::allocate(&project, |t| {
@@ -1193,25 +1539,13 @@ mod tests {
             },
         );
         let state = events::remote_state(&project, "abc");
-        assert!(state.gone.contains(&lane.id), "{state:?}");
-        // A later pass does not repeat the line.
-        let before = state.gone.len();
-        remote_attention(
-            &ctx,
-            &project,
-            RemoteView {
-                machine_id: "abc",
-                threads: &threads,
-                agents: &[],
-                panes: &[],
-                boot_id: "boot-1",
-                now,
-            },
+        assert!(
+            !state.gone.contains(&lane.id),
+            "a missing coordinator must not consume GONE: {state:?}"
         );
-        assert_eq!(events::remote_state(&project, "abc").gone.len(), before);
 
-        // A reboot clears the per-boot GONE set so every open lane is pushed
-        // again, and the new boot id is recorded.
+        // A reboot records the new boot but still leaves GONE pending while
+        // there is no coordinator to receive it.
         remote_attention(
             &ctx,
             &project,
@@ -1226,7 +1560,7 @@ mod tests {
         );
         let state = events::remote_state(&project, "abc");
         assert_eq!(state.boot_id, "boot-2");
-        assert!(state.gone.contains(&lane.id));
+        assert!(!state.gone.contains(&lane.id));
     }
 
     #[test]
@@ -1266,5 +1600,242 @@ mod tests {
             outage.record(true, "", at("2026-09-17T11:32:00Z"), 600),
             None
         );
+    }
+
+    fn box_event_bytes(id: &str, artifact: &str) -> Vec<u8> {
+        let event = crate::contracts::Event {
+            id: id.into(),
+            op: id.into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            created: "2026-09-19T00:00:00Z".into(),
+            payload: crate::contracts::EventPayload {
+                done: Some(crate::contracts::DonePayload {
+                    sha: "abc".into(),
+                    report_path: ".reports/t-0001.md".into(),
+                    artifact: artifact.into(),
+                }),
+                waiting: None,
+            },
+        };
+        events::bytes(&event).unwrap()
+    }
+
+    fn courier_ctx<'a>(
+        root: &'a std::path::Path,
+        env: &'a crate::paths::Env,
+        runner: &'a dyn crate::runner::Runner,
+    ) -> Ctx<'a> {
+        Ctx {
+            env,
+            root: root.to_path_buf(),
+            config_dir: root.join("cfg"),
+            runner,
+            detached_ticker: false,
+        }
+    }
+
+    #[test]
+    fn courier_imports_every_project_on_the_machine_after_the_taken_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let alpha = project::create(root.path(), "alpha", "", vec![]).unwrap();
+        let beta = project::create(root.path(), "beta", "", vec![]).unwrap();
+        for project in [&alpha, &beta] {
+            thread::allocate(project, |t| {
+                t.machine = "box".into();
+                t.machine_id = "1".into();
+                t.pane_id = "w2:p1".into();
+            })
+            .unwrap();
+        }
+        let report = b"report body\n";
+        let artifact_hash = thread::sha256_hex(report);
+        let event = box_event_bytes("t-0001-1-1", &artifact_hash);
+        let event_hash = thread::sha256_hex(&event);
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on(
+            "machine list --json",
+            crate::runner::fake::ok(
+                r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#,
+            ),
+        );
+        let manifest = format!(
+            "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
+             event\talpha\tt-0001-1-1\t/box/alpha/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/artifacts/{artifact_hash}\t{artifact_hash}\n\
+             receipt\talpha\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n\
+             bootstrap\talpha\tt-0001\t\tw2:p1\n\
+             event\tbeta\tt-0001-1-1\t/box/beta/events/t-0001-1-1.toml\t{event_hash}\t/box/beta/artifacts/{artifact_hash}\t{artifact_hash}\n\
+             receipt\tbeta\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n"
+        );
+        let manifest_for_ssh = manifest.clone();
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |_| Ok(crate::runner::fake::ok(&manifest_for_ssh)),
+        );
+        let event_bytes = event.clone();
+        let report_bytes = report.to_vec();
+        let artifact_for_scp = artifact_hash.clone();
+        runner.on_fn(
+            |cmd| cmd.program == "scp",
+            move |cmd| {
+                let dir = std::path::PathBuf::from(cmd.args.last().unwrap().trim_end_matches('/'));
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("t-0001-1-1.toml"), &event_bytes)?;
+                std::fs::write(dir.join(&artifact_for_scp), &report_bytes)?;
+                Ok(crate::runner::fake::ok(""))
+            },
+        );
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = courier_ctx(root.path(), &env, &runner);
+        let outcome = courier(&ctx, &[&alpha, &beta], "box").unwrap();
+        assert_eq!(outcome.machine_id, "1");
+        assert_eq!(outcome.boot_id, "boot-1");
+        assert_eq!(events::list(&alpha).len(), 1);
+        assert_eq!(events::list(&beta).len(), 1);
+        assert!(
+            events::remote_state(&alpha, "1")
+                .taken
+                .contains_key("t-0001-1-1")
+        );
+        assert!(
+            events::remote_state(&beta, "1")
+                .taken
+                .contains_key("t-0001-1-1")
+        );
+        let imported = events::load(&alpha, "t-0001-1-1").unwrap();
+        assert!(
+            imported
+                .payload
+                .done
+                .unwrap()
+                .report_path
+                .contains(&artifact_hash)
+        );
+        assert_eq!(
+            thread::load(&alpha, "t-0001").unwrap().bootstrap,
+            "acknowledged"
+        );
+
+        // The cursor now skips the same envelopes: no second fetch.
+        let before = runner.count("scp");
+        courier(&ctx, &[&alpha, &beta], "box").unwrap();
+        assert_eq!(runner.count("scp"), before);
+    }
+
+    #[test]
+    fn courier_refuses_a_receipt_that_disagrees_with_the_fetched_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let alpha = project::create(root.path(), "alpha", "", vec![]).unwrap();
+        thread::allocate(&alpha, |t| {
+            t.machine = "box".into();
+            t.machine_id = "1".into();
+        })
+        .unwrap();
+        let report = b"report body\n";
+        let artifact_hash = thread::sha256_hex(report);
+        let event = box_event_bytes("t-0001-1-1", &artifact_hash);
+        let event_hash = thread::sha256_hex(&event);
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on(
+            "machine list --json",
+            crate::runner::fake::ok(
+                r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#,
+            ),
+        );
+        let manifest = format!(
+            "boot\tboot-1\nfree\t100\nagents\t-\npanes\t-\n\
+             event\talpha\tt-0001-1-1\t/box/alpha/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/artifacts/{artifact_hash}\t{artifact_hash}\n\
+             receipt\talpha\tt-0001-1-1\tdeadbeef\t{artifact_hash}\n"
+        );
+        let manifest_for_ssh = manifest.clone();
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |_| Ok(crate::runner::fake::ok(&manifest_for_ssh)),
+        );
+        let event_bytes = event.clone();
+        let report_bytes = report.to_vec();
+        let artifact_for_scp = artifact_hash.clone();
+        runner.on_fn(
+            |cmd| cmd.program == "scp",
+            move |cmd| {
+                let dir = std::path::PathBuf::from(cmd.args.last().unwrap().trim_end_matches('/'));
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("t-0001-1-1.toml"), &event_bytes)?;
+                std::fs::write(dir.join(&artifact_for_scp), &report_bytes)?;
+                Ok(crate::runner::fake::ok(""))
+            },
+        );
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = courier_ctx(root.path(), &env, &runner);
+        let error = courier(&ctx, &[&alpha], "box").unwrap_err().to_string();
+        assert!(error.contains("receipt_mismatch"), "{error}");
+        assert!(events::list(&alpha).is_empty());
+        assert!(
+            events::remote_state(&alpha, "1").taken.is_empty(),
+            "the cursor must not move on a receipt mismatch"
+        );
+    }
+
+    #[test]
+    fn a_done_event_is_not_delivered_until_its_sha_is_on_the_publish_remote() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(
+            root.path(),
+            "demo",
+            "",
+            vec![crate::project::Repo {
+                path: "/repo".into(),
+                machine: None,
+                box_path: Some("/box/repo".into()),
+                publish_url: Some("https://github.com/uguryildirim24/herdr-ade.git".into()),
+            }],
+        )
+        .unwrap();
+        let lane = thread::allocate(&project, |t| {
+            t.machine = "box".into();
+            t.machine_id = "1".into();
+            t.repo = "/repo".into();
+            t.branch = "hp/demo/t-0001".into();
+        })
+        .unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+
+        let fetch_fails = crate::runner::fake::FakeRunner::new();
+        fetch_fails.on(
+            "git -C /repo remote get-url fork",
+            crate::runner::fake::ok("https://github.com/uguryildirim24/herdr-ade.git\n"),
+        );
+        fetch_fails.on("git -C /repo remote", crate::runner::fake::ok("fork\n"));
+        fetch_fails.on(
+            "git -C /repo fetch",
+            crate::runner::fake::fail(1, "could not fetch"),
+        );
+        let ctx = courier_ctx(root.path(), &env, &fetch_fails);
+        let error = verify_published_sha(&ctx, &project, &lane, "abc")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("published_fetch_failed"), "{error}");
+
+        let sha_absent = crate::runner::fake::FakeRunner::new();
+        sha_absent.on(
+            "git -C /repo remote get-url fork",
+            crate::runner::fake::ok("https://github.com/uguryildirim24/herdr-ade.git\n"),
+        );
+        sha_absent.on("git -C /repo remote", crate::runner::fake::ok("fork\n"));
+        sha_absent.on("git -C /repo fetch", crate::runner::fake::ok(""));
+        sha_absent.on(
+            "git -C /repo merge-base --is-ancestor",
+            crate::runner::fake::fail(1, "not an ancestor"),
+        );
+        let ctx = courier_ctx(root.path(), &env, &sha_absent);
+        let error = verify_published_sha(&ctx, &project, &lane, "abc")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("published_sha_missing"), "{error}");
     }
 }
