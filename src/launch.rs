@@ -91,6 +91,69 @@ struct RawRole {
     escalate: Option<Vec<String>>,
 }
 
+/// The ready-made rows the plugin ships: research on agy and the Fable
+/// planner. A config row may not reuse one.
+fn builtin_recipes() -> Vec<(&'static str, Recipe)> {
+    vec![
+        (
+            "agy_gemini_flash",
+            Recipe {
+                kind: "agy".into(),
+                provider: "agy".into(),
+                args: vec![
+                    "--model".into(),
+                    "gemini-3.8-flash-high".into(),
+                    "--dangerously-skip-permissions".into(),
+                ],
+                ready_timeout_ms: 60_000,
+                enabled: true,
+                plain: "the web research helper".into(),
+                ..Recipe::default()
+            },
+        ),
+        (
+            "claude_fable_xhigh",
+            Recipe {
+                kind: "claude".into(),
+                provider: "claude".into(),
+                args: vec![
+                    "--model".into(),
+                    "claude-fable-5-1".into(),
+                    "--effort".into(),
+                    "xhigh".into(),
+                    "--dangerously-skip-permissions".into(),
+                ],
+                ready_timeout_ms: 90_000,
+                enabled: true,
+                plain: "the planning helper".into(),
+                ..Recipe::default()
+            },
+        ),
+    ]
+}
+
+/// The ready-made roles the plugin ships. Config rows override them.
+fn builtin_roles() -> BTreeMap<String, RoleConfig> {
+    let mut roles = BTreeMap::new();
+    roles.insert(
+        "research".to_string(),
+        RoleConfig {
+            default: "agy_gemini_flash".into(),
+            allowed: vec!["agy_gemini_flash".into()],
+            escalate: Vec::new(),
+        },
+    );
+    roles.insert(
+        "planner".to_string(),
+        RoleConfig {
+            default: "claude_fable_xhigh".into(),
+            allowed: vec!["claude_fable_xhigh".into()],
+            escalate: Vec::new(),
+        },
+    );
+    roles
+}
+
 /// Parse the safety file's roles and recipes. An absent file is the shipped
 /// default.
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
@@ -105,12 +168,19 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
         toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?
     };
 
-    let mut recipes: BTreeMap<String, Recipe> = BTreeMap::new();
+    let builtins = builtin_recipes();
+    let mut recipes: BTreeMap<String, Recipe> = builtins
+        .iter()
+        .map(|(id, recipe)| ((*id).to_string(), recipe.clone()))
+        .collect();
     for (id, recipe) in raw.recipes {
+        if builtins.iter().any(|(builtin, _)| *builtin == id) {
+            bail!("recipe_builtin: `{id}` is a ready-made row; use another id");
+        }
         recipes.insert(id, recipe);
     }
 
-    let mut roles: BTreeMap<String, RoleConfig> = BTreeMap::new();
+    let mut roles = builtin_roles();
     let mut inline_without_plain = Vec::new();
     for (name, value) in raw.roles {
         let raw_role: RawRole = value
@@ -1061,6 +1131,35 @@ escalate = ["claude_opus_high"]
             .unwrap_err();
             assert!(error.to_string().contains("role_not_resolved"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn builtin_research_and_planner_roles_resolve() {
+        let world = World::new();
+        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
+        world.runner.on("agent start --help", ok(KINDS_HELP));
+        let ctx = world.ctx();
+        let research = resolve_launch(
+            &ctx,
+            &ResolveInput {
+                role: "research",
+                ..ResolveInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(research.recipe_id, "agy_gemini_flash");
+        assert_eq!(research.kind, "agy");
+        let planner = resolve_launch(
+            &ctx,
+            &ResolveInput {
+                role: "planner",
+                ..ResolveInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(planner.recipe_id, "claude_fable_xhigh");
+        assert_eq!(planner.kind, "claude");
+        assert!(planner.args.contains(&"xhigh".to_string()));
     }
 
     #[test]
