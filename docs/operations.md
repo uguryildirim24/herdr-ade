@@ -48,6 +48,7 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `thread start <project> --title T --plain S [--role R] [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | New thread: the brief `tasks/<id>.md` is committed on the integration branch (`--base`, else the checked-out branch), then a git worktree from that commit and a tab under the coordinator, with `--parent` on launch. The kind and args come from the role. `--plain` is required. Returns before the agent is up. Remote starts are refused. |
 | `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
 | `thread resolve <project> <id> [--remove-worktree] [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy: close the pane and tab through Herdr (`--keep-pane` leaves them), and optionally remove the worktree (the branch is kept). |
+| `pickup [<project>] [--all] [--start] [--dry-run]` | Re-link live threads to the coordinator pane: local lanes from the session, box lanes from the courier's box-local lists (one SSH per machine). Gone threads print start lines, or restart through their launch records with `--start` when the project's `start_threads` is `auto`. `--all` covers every active project. |
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
 | `plan show [--json]`, `plan set`, `plan step add\|edit\|link\|unlink\|remove\|move`, `plan sync` | The plan card: goal, end result and up to seven steps. A step is `done` only when all its bound work has landed in a merged round. |
 | `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list [--json]`, `decide show <id>` | The log of choices the coordinator made without asking. |
@@ -144,6 +145,8 @@ A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d`
 ## Threads on other machines
 
 Save the machine with `herdr machine add --label <label> <ssh target>` (both machines need Herdr 0.9.1), then list a repo as `--repo /path/on/machine@<label>` or pass `thread start --machine <label>`. The home machine owns the project; only outbound SSH from home is needed, in batch mode, so set up key-based login first.
+
+When you close your Mac session and start a new one, a box lane keeps running on the box but loses the link to its coordinator. `ha pickup` reads each machine once through the courier, re-links the living box lanes under the new coordinator pane, and prints a `herdr --machine <label>` start line for each gone one. `ha pickup --all --start` does that for every active project and restarts the gone lanes, but only where `start_threads = "auto"`.
 
 - The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
 - The box holds two plugin binaries: `/home/ubuntu/.local/bin/herdr-ade` (lane start and `ha`) and `/home/ubuntu/.local/bin/herdr-pi` (pi `setup`, `login`, `doctor` and `check`); no pi verb runs through `herdr-ade`.
