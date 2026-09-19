@@ -1,0 +1,29 @@
+id = "pro-bridge"
+name = "Pro bridge"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Pro (GPT-6) as an ordinary Codex lane on the codex-chatgpt-web bridge; packet in, collector out."
+platforms = ["macos", "linux"]
+
+# Local `herdr plugin link` does not run build commands; build the working tree
+# by hand. The command points at the repo's Cargo.toml because the plugin root
+# is this subdirectory and the binary is built next to herdr-pi.
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "--manifest-path", "../Cargo.toml", "--bin", "herdr-pro"]
+
+# One-shot, idempotent: mark lanes whose pane no longer runs Codex as gone and
+# print (never run) one resume line each.
+[[startup]]
+command = ["../target/release/herdr-pro", "reconcile"]
+
+[[actions]]
+id = "doctor"
+title = "Pro: check the bridge and the Codex route"
+contexts = ["workspace"]
+command = ["../target/release/herdr-pro", "doctor"]
+
+[[actions]]
+id = "reconcile"
+title = "Pro: find lanes to resume"
+contexts = ["workspace"]
+command = ["../target/release/herdr-pro", "reconcile"]
