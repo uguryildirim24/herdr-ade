@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0007.md",
+      "tasks/t-0003.md",
+      "tasks/review-r2.md",
       "tasks/t-0004.md",
       "tasks/review-r1.md",
       "tasks/t-0001.md",
@@ -19,39 +22,41 @@
       "tasks/review-plugin-r1-b.md",
       "tasks/review-plugin-r1.md",
       "tasks/ade-pi.md",
-      "tasks/ade-picker.md",
-      "tasks/ade-rounds.md",
-      "tasks/ade-outbox.md",
-      "tasks/ade-core.md"
+      "tasks/ade-picker.md"
     ],
-    "handoff": [],
+    "handoff": [
+      "HANDOFF.md"
+    ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r2.md",
       "tasks/reviews/code-r1.md",
       "tasks/reviews/code-plugin-r2.md",
       "tasks/reviews/code-plugin-r1.md",
       "tasks/reviews/code-plugin-r1-b.md"
     ]
   },
-  "generated": "2026-09-19T12:58:12-04:00",
+  "generated": "2026-09-19T13:11:01-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0004-review-r1-word-check-fix",
+      "hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
       "main",
+      "review/r2-2",
       "hp/adeherdr/t-0005-review-r2-herdr-pro",
+      "hp/adeherdr/t-0001-plain-language-check-everyday-words-pass",
+      "hp/adeherdr/t-0004-review-r1-word-check-fix",
       "review/r2",
       "review/r1",
-      "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro",
-      "hp/adeherdr/t-0001-plain-language-check-everyday-words-pass"
+      "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro"
     ],
     "integration_branch": "main",
     "integration_log": [
-      "356c0fa docs(review): round r1 verdict",
-      "5dcf624 review(skill): remove coordinator approval restriction",
-      "1f52ea0 review(plain): clean current clippy lints",
-      "a785ceb Merge commit '76da26869bf4fe58790dc12397c9239adfcc2a22' into hp/adeherdr/t-0004-review-r1-word-check-fix",
-      "fc61993 docs(tasks): t-0004",
-      "b719725 review(r1): brief for revision 1"
+      "65ba6ca docs(review): round r2 verdict",
+      "fe2fa9f review(pro): make turns and breaker fail closed",
+      "8073ca2 Merge commit 'bb878913c254b1edae0895b91747438b584cc7ed' into hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
+      "c191a33 docs(tasks): t-0007",
+      "7efa98f review(r2): brief for revision 1",
+      "c482aa9 checkpoint(r1): HANDOFF after merging the round"
     ],
     "remote": "8 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
@@ -59,9 +64,9 @@
       {
         "branch": "main",
         "dirty": 0,
-        "head": "356c0fa",
+        "head": "65ba6ca",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r1 verdict"
+        "subject": "docs(review): round r2 verdict"
       },
       {
         "branch": "review/r1",
@@ -78,11 +83,18 @@
         "subject": "docs(tasks): t-0005"
       },
       {
+        "branch": "review/r2-2",
+        "dirty": 0,
+        "head": "c191a33",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r2-2",
+        "subject": "docs(tasks): t-0007"
+      },
+      {
         "branch": "hp/adeherdr/t-0001-plain-language-check-everyday-words-pass",
         "dirty": 0,
-        "head": "76da268",
+        "head": "c482aa9",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0001",
-        "subject": "fix(plain): everyday words pass and one block per turn"
+        "subject": "checkpoint(r1): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0003-herdr-pro-the-pro-bridge-plugin-spec-pro",
@@ -100,10 +112,17 @@
       },
       {
         "branch": "hp/adeherdr/t-0005-review-r2-herdr-pro",
-        "dirty": 5,
-        "head": "8d2f38f",
+        "dirty": 0,
+        "head": "ae593fb",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0005",
-        "subject": "merge: admit herdr-pro lane for review"
+        "subject": "review(pro): round r2 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0007-review-r2-second-pass-re-apply-the-herdr",
+        "dirty": 0,
+        "head": "65ba6ca",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0007",
+        "subject": "docs(review): round r2 verdict"
       }
     ]
   },
@@ -128,78 +147,38 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r1",
-    "verdict": "356c0fa90c6146dfac7b3c10fba5a5a6e58599b4"
+    "round": "r2",
+    "verdict": "65ba6ca40b78ee9d1ed5876719f1f41d88139761"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
     {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0004",
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0007",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0004",
-      "pane_id": "w1G:pA",
+      "name": "hp-adeherdr-t-0007",
+      "pane_id": "w1G:pD",
       "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0004--/2026-09-19T16-52-18-818Z_01a0ba95-4102-77d3-ba84-eae544323369.jsonl",
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0007--/2026-09-19T17-08-39-275Z_01a0baa4-36eb-7126-a729-09f2ce0b7d19.jsonl",
       "start_args": [],
-      "status": "idle",
-      "tab_id": "w1G:t6",
-      "tab_label": "t-0004",
-      "title": "π - t-0004",
+      "status": "done",
+      "tab_id": "w1G:t9",
+      "tab_label": "t-0007",
+      "title": "π - t-0007",
       "tokens": {
         "done": "1",
-        "lane": "t-0004",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0004"
-      }
-    },
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0005",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0005",
-      "pane_id": "w1G:pB",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0005--/2026-09-19T16-52-38-811Z_01a0ba95-8f1a-75cf-83ae-148a061d0a5a.jsonl",
-      "start_args": [],
-      "status": "working",
-      "tab_id": "w1G:t7",
-      "tab_label": "t-0005",
-      "title": "π - t-0005",
-      "tokens": {
+        "lane": "t-0007",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
         "review": "working",
-        "thread": "t-0005"
-      }
-    },
-    {
-      "cwd": "/Users/rolfie/projects/herdr/.worktrees/t-0006",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0006",
-      "pane_id": "w1G:pC",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-.worktrees-t-0006--/2026-09-19T16-52-58-512Z_01a0ba95-dc0f-722b-acf5-964d1ed82343.jsonl",
-      "start_args": [],
-      "status": "working",
-      "tab_id": "w1G:t8",
-      "tab_label": "t-0006",
-      "title": "π - t-0006",
-      "tokens": {
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "3",
-        "review": "working",
-        "thread": "t-0006"
+        "thread": "t-0007"
       }
     }
   ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 5
+    "tabs": 3
   }
 }
