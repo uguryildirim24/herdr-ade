@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T19:51:26-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-19T19:51:39-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 7 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
@@ -46,11 +46,11 @@ Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (workin
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (12 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (19 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | e0257a3 | 0 | Merge commit '9a19ab64a28e60f0460ae13c198762b9c9ea9ba4' |
+| `/Users/rolfie/projects/herdr-ade` | `main` | bb64e02 | 0 | Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c' |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -116,7 +116,7 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (12 ahead, 0 
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0050` | `hp/adeherdr/t-0050-lanes-and-reviews-go-to-the-box-by-defau` | 6c4e315 | 0 | checkpoint(r24): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0051` | `hp/adeherdr/t-0051-a-finished-lane-s-line-always-reaches-th` | 3c979e2 | 0 | checkpoint(r22): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0052` | `hp/adeherdr/t-0052-review-r22-this-round-checks-the-rule-th` | f934860 | 0 | docs(review): round r22 verdict |
-| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0054` | `hp/adeherdr/t-0054-every-coordinator-may-evolve-the-harness` | d7776e7 | 0 | feat(harness): any coordinator may evolve the harness |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0054` | `hp/adeherdr/t-0054-every-coordinator-may-evolve-the-harness` | 4177ce0 | 0 | checkpoint(r25): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0055` | `hp/adeherdr/t-0055-a-new-session-picks-up-box-lanes-and-can` | 38ab23d | 0 | checkpoint(r26): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0056` | `hp/adeherdr/t-0056-review-r23-this-round-checks-the-fix-tha` | 7e07548 | 0 | docs(review): round r23 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0057` | `hp/adeherdr/t-0057-project-screen-lane-2-the-overview-above` | 21ff8fb | 0 | feat(talk): put the project overview above the conversation |
@@ -130,19 +130,19 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (12 ahead, 0 
 Last commits on the integration branch:
 
 ```
+bb64e02 Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c'
+4177ce0 checkpoint(r25): HANDOFF after merging the round
 e0257a3 Merge commit '9a19ab64a28e60f0460ae13c198762b9c9ea9ba4'
+f9d1f3c docs(review): round r28 verdict
+3a782af review(round): keep retry on the current manifest
 9a19ab6 docs(review): refresh round r25 verdict after r26
-93f9731 Merge branch 'main' into hp/adeherdr/t-0060-review-r25-this-round-checks-the-rule-th
-a1539d8 review(r29): brief for revision 1
-8d1d068 review(r28): brief for revision 1
-38ab23d checkpoint(r26): HANDOFF after merging the round
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0060.md`, `tasks/review-r29.md`, `tasks/review-r28.md`, `tasks/t-0061.md`, `tasks/t-0065.md`, `tasks/review-r26.md`, `tasks/t-0059.md`, `tasks/review-r25.md`, `tasks/t-0058.md`, `tasks/t-0057.md`, `tasks/t-0056.md`, `tasks/review-r24.md`
-- verdicts: `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`, `tasks/reviews/code-r23.md`, `tasks/reviews/code-r22.md`, `tasks/reviews/code-r20.md`, `tasks/reviews/code-r19.md`, `tasks/reviews/code-r18.md`, `tasks/reviews/code-r15.md`, `tasks/reviews/code-r14.md`, `tasks/reviews/code-r12.md`, `tasks/reviews/code-r13.md`
+- briefs: `tasks/t-0066.md`, `tasks/t-0060.md`, `tasks/review-r29.md`, `tasks/review-r28.md`, `tasks/t-0061.md`, `tasks/t-0065.md`, `tasks/review-r26.md`, `tasks/t-0059.md`, `tasks/review-r25.md`, `tasks/t-0058.md`, `tasks/t-0057.md`, `tasks/t-0056.md`
+- verdicts: `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`, `tasks/reviews/code-r23.md`, `tasks/reviews/code-r22.md`, `tasks/reviews/code-r20.md`, `tasks/reviews/code-r19.md`, `tasks/reviews/code-r18.md`, `tasks/reviews/code-r15.md`, `tasks/reviews/code-r14.md`, `tasks/reviews/code-r12.md`
 
 ### Pickup
 
@@ -154,5 +154,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 6c22d8cf-cae6-47e2-a930-fd9207175aea
 ```
 
-Round `r25` was merged into `main` at verdict commit `9a19ab64a28e60f0460ae13c198762b9c9ea9ba4`; this checkpoint is its child.
+Round `r28` was merged into `main` at verdict commit `f9d1f3c389c26a14f56fb9da48d8d0e83699194c`; this checkpoint is its child.
 

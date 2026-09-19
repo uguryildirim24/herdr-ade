@@ -11,6 +11,7 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0066.md",
       "tasks/t-0060.md",
       "tasks/review-r29.md",
       "tasks/review-r28.md",
@@ -21,14 +22,14 @@
       "tasks/review-r25.md",
       "tasks/t-0058.md",
       "tasks/t-0057.md",
-      "tasks/t-0056.md",
-      "tasks/review-r24.md"
+      "tasks/t-0056.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r28.md",
       "tasks/reviews/code-r25.md",
       "tasks/reviews/code-r26.md",
       "tasks/reviews/code-r24.md",
@@ -39,14 +40,14 @@
       "tasks/reviews/code-r18.md",
       "tasks/reviews/code-r15.md",
       "tasks/reviews/code-r14.md",
-      "tasks/reviews/code-r12.md",
-      "tasks/reviews/code-r13.md"
+      "tasks/reviews/code-r12.md"
     ]
   },
-  "generated": "2026-09-19T19:51:26-04:00",
+  "generated": "2026-09-19T19:51:39-04:00",
   "git": {
     "branches": [
       "main",
+      "hp/adeherdr/t-0054-every-coordinator-may-evolve-the-harness",
       "hp/adeherdr/t-0065-rounds-recover-from-a-merge-conflict-lan",
       "hp/adeherdr/t-0067-review-r29-this-round-checks-the-project",
       "hp/adeherdr/t-0066-review-r28-a-rejected-or-failed-review-s",
@@ -62,7 +63,6 @@
       "hp/adeherdr/t-0050-lanes-and-reviews-go-to-the-box-by-defau",
       "hp/adeherdr/t-0059-review-r24-the-rule-that-sends-new-lanes",
       "review/r26",
-      "hp/adeherdr/t-0054-every-coordinator-may-evolve-the-harness",
       "review/r24",
       "hp/adeherdr/t-0049-every-box-command-runs-with-the-fixed-bo",
       "hp/adeherdr/t-0056-review-r23-this-round-checks-the-fix-tha",
@@ -127,22 +127,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
+      "bb64e02 Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c'",
+      "4177ce0 checkpoint(r25): HANDOFF after merging the round",
       "e0257a3 Merge commit '9a19ab64a28e60f0460ae13c198762b9c9ea9ba4'",
-      "9a19ab6 docs(review): refresh round r25 verdict after r26",
-      "93f9731 Merge branch 'main' into hp/adeherdr/t-0060-review-r25-this-round-checks-the-rule-th",
-      "a1539d8 review(r29): brief for revision 1",
-      "8d1d068 review(r28): brief for revision 1",
-      "38ab23d checkpoint(r26): HANDOFF after merging the round"
+      "f9d1f3c docs(review): round r28 verdict",
+      "3a782af review(round): keep retry on the current manifest",
+      "9a19ab6 docs(review): refresh round r25 verdict after r26"
     ],
-    "remote": "12 ahead, 0 behind origin/main",
+    "remote": "19 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "e0257a3",
+        "head": "bb64e02",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit '9a19ab64a28e60f0460ae13c198762b9c9ea9ba4'"
+        "subject": "Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c'"
       },
       {
         "branch": "review/r1",
@@ -602,9 +602,9 @@
       {
         "branch": "hp/adeherdr/t-0054-every-coordinator-may-evolve-the-harness",
         "dirty": 0,
-        "head": "d7776e7",
+        "head": "4177ce0",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0054",
-        "subject": "feat(harness): any coordinator may evolve the harness"
+        "subject": "checkpoint(r25): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0055-a-new-session-picks-up-box-lanes-and-can",
@@ -692,8 +692,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r25",
-    "verdict": "9a19ab64a28e60f0460ae13c198762b9c9ea9ba4"
+    "round": "r28",
+    "verdict": "f9d1f3c389c26a14f56fb9da48d8d0e83699194c"
   },
   "session": "default",
   "unlinked_agents": [],
