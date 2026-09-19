@@ -707,79 +707,79 @@ pub fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Courie
             .iter()
             .filter(|env| env.slug == project.slug && !state.taken.contains_key(&env.event))
             .collect();
-        if wanted.is_empty() {
-            continue;
-        }
-        let staging = ctx
-            .root
-            .join(".state/remote/staging")
-            .join(&profile.id)
-            .join(&project.slug);
-        let _ = std::fs::remove_dir_all(&staging);
-        let mut paths = Vec::new();
-        for env in &wanted {
-            paths.push(env.event_path.clone());
-            if !env.artifact_path.is_empty() {
-                paths.push(env.artifact_path.clone());
+        if !wanted.is_empty() {
+            let staging = ctx
+                .root
+                .join(".state/remote/staging")
+                .join(&profile.id)
+                .join(&project.slug);
+            let _ = std::fs::remove_dir_all(&staging);
+            let mut paths = Vec::new();
+            for env in &wanted {
+                paths.push(env.event_path.clone());
+                if !env.artifact_path.is_empty() {
+                    paths.push(env.artifact_path.clone());
+                }
             }
-        }
-        crate::remote::fetch_batch(ctx.runner, &target, &control, &paths, &staging)?;
-        for env in &wanted {
-            let bytes = std::fs::read(staging.join(basename(&env.event_path)))
-                .with_context(|| format!("staged event {}", env.event))?;
-            let got = thread::sha256_hex(&bytes);
-            if got != env.event_hash {
-                bail!(
-                    "event_hash_mismatch: {} is {got}, the helper said {}",
-                    env.event,
-                    env.event_hash
-                );
-            }
-            // The box's own receipt must agree with the fetched bytes before
-            // the cursor moves (D5, SPEC-remote §4.3).
-            let receipt = receipts
-                .get(&(env.slug.clone(), env.event.clone()))
-                .with_context(|| {
-                    format!("receipt_missing: no completion receipt for {}", env.event)
-                })?;
-            if receipt.event_hash != env.event_hash {
-                bail!(
-                    "receipt_mismatch: {} box receipt says {}, fetched {}",
-                    env.event,
-                    receipt.event_hash,
-                    env.event_hash
-                );
-            }
-            let artifact = if env.artifact_path.is_empty() {
-                None
-            } else {
-                let bytes = std::fs::read(staging.join(basename(&env.artifact_path)))
-                    .with_context(|| format!("staged artifact {}", env.artifact_hash))?;
+            crate::remote::fetch_batch(ctx.runner, &target, &control, &paths, &staging)?;
+            for env in &wanted {
+                let bytes = std::fs::read(staging.join(basename(&env.event_path)))
+                    .with_context(|| format!("staged event {}", env.event))?;
                 let got = thread::sha256_hex(&bytes);
-                if got != env.artifact_hash {
+                if got != env.event_hash {
                     bail!(
-                        "artifact_hash_mismatch: staged bytes are {got}, the helper said {}",
-                        env.artifact_hash
-                    );
-                }
-                if receipt.artifact_hash != env.artifact_hash {
-                    bail!(
-                        "receipt_mismatch: {} artifact receipt is {}, fetched {}",
+                        "event_hash_mismatch: {} is {got}, the helper said {}",
                         env.event,
-                        receipt.artifact_hash,
-                        env.artifact_hash
+                        env.event_hash
                     );
                 }
-                Some(bytes)
-            };
-            events::import_box_event(project, &profile.id, &bytes, artifact.as_deref())?;
-            state
-                .taken
-                .insert(env.event.clone(), env.event_hash.clone());
+                // The box's own receipt must agree with the fetched bytes before
+                // the cursor moves (D5, SPEC-remote §4.3).
+                let receipt = receipts
+                    .get(&(env.slug.clone(), env.event.clone()))
+                    .with_context(|| {
+                        format!("receipt_missing: no completion receipt for {}", env.event)
+                    })?;
+                if receipt.event_hash != env.event_hash {
+                    bail!(
+                        "receipt_mismatch: {} box receipt says {}, fetched {}",
+                        env.event,
+                        receipt.event_hash,
+                        env.event_hash
+                    );
+                }
+                let artifact = if env.artifact_path.is_empty() {
+                    None
+                } else {
+                    let bytes = std::fs::read(staging.join(basename(&env.artifact_path)))
+                        .with_context(|| format!("staged artifact {}", env.artifact_hash))?;
+                    let got = thread::sha256_hex(&bytes);
+                    if got != env.artifact_hash {
+                        bail!(
+                            "artifact_hash_mismatch: staged bytes are {got}, the helper said {}",
+                            env.artifact_hash
+                        );
+                    }
+                    if receipt.artifact_hash != env.artifact_hash {
+                        bail!(
+                            "receipt_mismatch: {} artifact receipt is {}, fetched {}",
+                            env.event,
+                            receipt.artifact_hash,
+                            env.artifact_hash
+                        );
+                    }
+                    Some(bytes)
+                };
+                events::import_box_event(project, &profile.id, &bytes, artifact.as_deref())?;
+                state
+                    .taken
+                    .insert(env.event.clone(), env.event_hash.clone());
+            }
+            let _ = std::fs::remove_dir_all(&staging);
         }
-        let _ = std::fs::remove_dir_all(&staging);
-        // The boot id is left for `remote_attention` to advance: it must see
-        // the change to type GONE for the pre-reboot lanes.
+        // A successful answer refreshes remote age even when no envelope was
+        // new. The boot id is left for `remote_attention` to advance: it must
+        // see the change to type GONE for the pre-reboot lanes.
         state.last_pass = project::now();
         events::save_remote_state(project, &profile.id, &state)?;
     }
@@ -941,7 +941,12 @@ pub struct Transition {
 }
 
 fn thread_label(t: &Thread) -> String {
-    format!("{} \"{}\"", t.id, t.title)
+    let label = format!("{} \"{}\"", t.id, t.title);
+    if t.is_remote() {
+        format!("{label} on machine `{}`", t.machine)
+    } else {
+        label
+    }
 }
 
 /// Step 1's inbox items, written after the copies so a Ready for review item
@@ -993,7 +998,7 @@ pub fn write_thread_items(
         if change.to == Group::WaitingOnYou && !t.pane_id.is_empty() {
             summary.push_str(&format!("; it needs the user in pane {}", t.pane_id));
             if t.is_remote() {
-                summary.push_str(&format!(" on machine `{}` (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)", t.machine));
+                summary.push_str(" (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)");
             }
         }
         inbox::write(project, "thread-state", &t.id, &summary, "")?;
@@ -1408,6 +1413,21 @@ mod tests {
     }
 
     #[test]
+    fn every_box_lane_message_label_names_its_machine() {
+        let lane = Thread {
+            id: "t-0001".into(),
+            title: "cloud work".into(),
+            machine: "oci".into(),
+            machine_id: "profile-1".into(),
+            ..Thread::default()
+        };
+        assert_eq!(
+            thread_label(&lane),
+            "t-0001 \"cloud work\" on machine `oci`"
+        );
+    }
+
+    #[test]
     fn courier_manifest_parses_records_and_refuses_junk() {
         let text = "boot\tboot-1\nfree\t1234\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
                     receipt\tdemo\tt-0001-1-1\tabc\tdef\n\
@@ -1645,7 +1665,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let alpha = project::create(root.path(), "alpha", "", vec![]).unwrap();
         let beta = project::create(root.path(), "beta", "", vec![]).unwrap();
-        for project in [&alpha, &beta] {
+        let gamma = project::create(root.path(), "gamma", "", vec![]).unwrap();
+        for project in [&alpha, &beta, &gamma] {
             thread::allocate(project, |t| {
                 t.machine = "box".into();
                 t.machine_id = "1".into();
@@ -1692,7 +1713,7 @@ mod tests {
         );
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let ctx = courier_ctx(root.path(), &env, &runner);
-        let outcome = courier(&ctx, &[&alpha, &beta], "box").unwrap();
+        let outcome = courier(&ctx, &[&alpha, &beta, &gamma], "box").unwrap();
         assert_eq!(outcome.machine_id, "1");
         assert_eq!(outcome.boot_id, "boot-1");
         assert_eq!(events::list(&alpha).len(), 1);
@@ -1706,6 +1727,10 @@ mod tests {
             events::remote_state(&beta, "1")
                 .taken
                 .contains_key("t-0001-1-1")
+        );
+        assert!(
+            !events::remote_state(&gamma, "1").last_pass.is_empty(),
+            "a project with no new envelope still heard from the box"
         );
         let imported = events::load(&alpha, "t-0001-1-1").unwrap();
         assert!(
@@ -1723,7 +1748,7 @@ mod tests {
 
         // The cursor now skips the same envelopes: no second fetch.
         let before = runner.count("scp");
-        courier(&ctx, &[&alpha, &beta], "box").unwrap();
+        courier(&ctx, &[&alpha, &beta, &gamma], "box").unwrap();
         assert_eq!(runner.count("scp"), before);
     }
 

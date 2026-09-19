@@ -400,7 +400,10 @@ pub fn write_receipt(project: &Project, event: &Event) -> Result<()> {
         event_hash,
         artifact,
         artifact_hash,
-        created: project::now(),
+        // Derive this from the immutable event. If sealing crashes after the
+        // receipt write but before the op marker, X2b must reproduce exactly
+        // the same receipt on a later courier pass.
+        created: event.created.clone(),
     };
     let path = receipt_path(project, &event.id)?;
     let mut text = toml::to_string(&receipt)?;
@@ -665,6 +668,7 @@ mod tests {
         assert_eq!(receipt.event, event.id);
         assert_eq!(receipt.event_hash, hash_bytes(&bytes(&event).unwrap()));
         assert_eq!(receipt.artifact_hash, "def");
+        assert_eq!(receipt.created, event.created);
         write_receipt(&project, &event).unwrap();
         let mut changed = event.clone();
         changed.payload.done.as_mut().unwrap().artifact = "other".into();
