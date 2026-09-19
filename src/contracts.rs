@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 /// One `[recipes.<id>]` row: the full D2 row plus `provider` (reserved for the
-/// pi move, question 25), `enabled` and `plain`.
+/// pi move, question 25), `enabled`, `plain` and the per-lane `machine`
+/// (SPEC-remote D2/D4, §4.1). An empty `machine` means the project default.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Recipe {
@@ -14,6 +15,8 @@ pub struct Recipe {
     pub provider: String,
     pub enabled: bool,
     pub plain: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine: String,
 }
 
 impl Default for Recipe {
@@ -26,8 +29,105 @@ impl Default for Recipe {
             provider: String::new(),
             enabled: true,
             plain: String::new(),
+            machine: String::new(),
         }
     }
+}
+
+/// The `local` machine sentinel: the Mac itself (SPEC-remote §4.1).
+pub const MACHINE_LOCAL: &str = "local";
+
+/// The box's PATH, passed to every box lane's `tab create --env`
+/// (SPEC-remote §3.3, check c C4).
+pub const BOX_PATH: &str =
+    "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
+/// The plugin binary and ADE root on the box (SPEC-remote §4.2 step 6).
+pub const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
+pub const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";
+/// The box's per-lane build folders (SPEC-remote §3.2).
+pub const BOX_BUILD: &str = "/home/ubuntu/build/lanes";
+
+/// The fixed box command prefix `/home/ubuntu/.local/bin/herdr-ade --root
+/// /home/ubuntu/.herdr-ade` (SPEC-remote D12/D14, §4.2 step 6).
+pub fn box_prefix() -> String {
+    format!("{BOX_BIN} --root {BOX_ROOT}")
+}
+
+/// The box path of one lane's card (SPEC-remote §4.3).
+pub fn box_lane_card(slug: &str, thread: &str) -> String {
+    format!("{BOX_ROOT}/{slug}/lanes/{thread}.toml")
+}
+
+/// A saved machine's stable profile (SPEC-remote §4.1). `id` is the plugin's
+/// identity; `label` is renameable and is only shown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineProfile {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    pub session: String,
+}
+
+impl MachineProfile {
+    pub fn is_local(&self) -> bool {
+        self.id == MACHINE_LOCAL || self.label == MACHINE_LOCAL
+    }
+}
+
+/// One row of the Mac→box repository map (SPEC-remote §4.1). The plugin never
+/// derives a box path from a Mac path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoxRepoMap {
+    pub mac: &'static str,
+    pub box_path: &'static str,
+    pub publish_url: &'static str,
+}
+
+/// The committed default map: the two tool repositories. Other projects add
+/// their own row before first remote use.
+pub const BOX_REPOS: &[BoxRepoMap] = &[
+    BoxRepoMap {
+        mac: "/home/agent/projects/herdr",
+        box_path: "/home/ubuntu/projects/herdr",
+        publish_url: "https://github.com/uguryildirim24/herdr.git",
+    },
+    BoxRepoMap {
+        mac: "/home/agent/projects/herdr-ade",
+        box_path: "/home/ubuntu/projects/herdr-ade",
+        publish_url: "https://github.com/uguryildirim24/herdr-ade.git",
+    },
+];
+
+/// The box's copy of one lane's start record (SPEC-remote §4.2 step 5, §4.3).
+/// Written by the Mac after the box pane id exists; the box validates
+/// `HERDR_ADE_LAUNCH`, `HERDR_PANE_ID`, cwd and process identity against it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct LaneCard {
+    pub project: String,
+    pub thread: String,
+    pub attempt: u32,
+    pub brief_hash: String,
+    pub role: String,
+    pub kind: String,
+    pub pane_id: String,
+    /// The renameable label the board shows.
+    pub machine_label: String,
+    /// The stable profile id the Mac supplied (SPEC-remote §4.1).
+    pub machine_id: String,
+    /// The box clone and checkout paths; never derived from the Mac path.
+    pub box_repo: String,
+    pub box_worktree: String,
+    /// The brief commit `B` the box fetch verified as `FETCH_HEAD`.
+    pub brief_commit: String,
+    /// The lane branch and the URL-matched remote it publishes to
+    /// (SPEC-remote §4.2 step 7). `ha done` checks the published ref.
+    pub branch: String,
+    pub publish_url: String,
+    pub recipient: Recipient,
+    /// The exact line typed at start (SPEC-remote §4.2 step 6).
+    pub start_line: String,
+    pub created: String,
 }
 
 /// The thread record's `launch` object: the chosen recipe's full D2 row.
@@ -49,6 +149,10 @@ pub struct Launch {
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
     /// never rereads live config.
     pub compact_reason: String,
+    /// The per-lane machine the roles-table row chose, empty for the project
+    /// default (SPEC-remote D2/D4, §4.1).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine: String,
 }
 
 /// Process identity from `pane process-info` once the agent is ready
@@ -504,6 +608,7 @@ mod tests {
             provider: "cursor".into(),
             enabled: true,
             plain: "the usual coding helper".into(),
+            machine: String::new(),
         };
         both(&recipe);
         both(&Launch {
@@ -517,6 +622,7 @@ mod tests {
             recipe_id: "agy_gemini_flash".into(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
+            machine: "oci".into(),
         });
     }
 

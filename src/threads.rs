@@ -153,51 +153,20 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         .repo
         .as_ref()
         .and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
-    let machine = args
-        .machine
-        .clone()
-        .or_else(|| listed.and_then(|r| r.machine.clone()))
-        .unwrap_or_default();
-    let repo = match (&args.repo, machine.is_empty()) {
-        (None, false) => bail!(
-            "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
-        ),
-        (None, true) => String::new(),
-        // A remote path is stored as it is on its own machine.
-        (Some(repo), false) => repo.clone(),
-        (Some(repo), true) => {
-            let path = std::fs::canonicalize(repo)
-                .with_context(|| format!("repository {repo} does not exist"))?
-                .to_string_lossy()
-                .into_owned();
-            if !settings
-                .repos
-                .iter()
-                .any(|r| r.path == path || &r.path == repo)
-            {
-                eprintln!("warning: {path} is not listed in `repos` in PROJECT.md");
-            }
-            path
-        }
-    };
-    if !machine.is_empty() && listed.is_none() {
-        eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
-    }
-
-    let open_count = thread::list(&project)
-        .iter()
-        .filter(|t| t.status == Status::Open || t.status == Status::Starting)
-        .count();
-    if open_count as u32 >= settings.max_parallel_threads {
-        eprintln!(
-            "warning: {open_count} threads are already open; max_parallel_threads is {}",
-            settings.max_parallel_threads
-        );
-    }
-
     check_birth_plain(&args.plain)?;
-    if !machine.is_empty() {
-        bail!("remote_not_admissible");
+    // A box lane needs a repository: no repository means a tab in this Mac's
+    // project workspace, which is local (SPEC-remote §4.2).
+    let explicit_remote = args
+        .machine
+        .as_deref()
+        .is_some_and(|m| !m.is_empty() && m != crate::contracts::MACHINE_LOCAL)
+        || listed
+            .and_then(|r| r.machine.as_deref())
+            .is_some_and(|m| !m.is_empty() && m != crate::contracts::MACHINE_LOCAL);
+    if args.repo.is_none() && explicit_remote {
+        bail!(
+            "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
+        );
     }
     let role = args
         .role
@@ -223,9 +192,85 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             sibling: None,
         },
     )?;
-    if launch.kind == "pi" {
+
+    // The machine is resolved independently of the kind (SPEC-remote §4.1):
+    // `--machine`, else the roles-table row, else the project default, else
+    // this Mac. An unknown or disabled machine refuses; there is no fallback.
+    let chosen = args
+        .machine
+        .clone()
+        .filter(|m| !m.is_empty())
+        .or_else(|| listed.and_then(|r| r.machine.clone()))
+        .or_else(|| (!launch.machine.is_empty()).then(|| launch.machine.clone()))
+        .or_else(|| {
+            let default = project.machine();
+            (!default.is_empty()).then_some(default)
+        })
+        .unwrap_or_else(|| crate::contracts::MACHINE_LOCAL.to_string());
+    let remote_choice = chosen != crate::contracts::MACHINE_LOCAL;
+    if remote_choice && args.repo.is_none() {
+        bail!(
+            "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
+        );
+    }
+    let repo = match (&args.repo, remote_choice) {
+        (None, true) => unreachable!(),
+        (None, false) => String::new(),
+        // A remote path is stored as it is on its own machine.
+        (Some(repo), true) => repo.clone(),
+        (Some(repo), false) => {
+            let path = std::fs::canonicalize(repo)
+                .with_context(|| format!("repository {repo} does not exist"))?
+                .to_string_lossy()
+                .into_owned();
+            if !settings
+                .repos
+                .iter()
+                .any(|r| r.path == path || &r.path == repo)
+            {
+                eprintln!("warning: {path} is not listed in `repos` in PROJECT.md");
+            }
+            path
+        }
+    };
+    let profile =
+        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &chosen)?;
+    let machine = if profile.is_local() {
+        String::new()
+    } else {
+        profile.label.clone()
+    };
+    if !machine.is_empty() && project::machine_held(&ctx.root, &machine) {
+        bail!(
+            "machine_held: `{machine}` is held; run `ha machine release {machine}` when the fork refresh or resize is done"
+        );
+    }
+    if !machine.is_empty() && listed.is_none() {
+        eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
+    }
+
+    let open_count = thread::list(&project)
+        .iter()
+        .filter(|t| t.status == Status::Open || t.status == Status::Starting)
+        .count();
+    if open_count as u32 >= settings.max_parallel_threads {
+        eprintln!(
+            "warning: {open_count} threads are already open; max_parallel_threads is {}",
+            settings.max_parallel_threads
+        );
+    }
+
+    // A box lane's provider readiness runs on the box through the courier
+    // (SPEC-remote §4.1); the Mac's login is irrelevant to it. The local pi
+    // check stays for local lanes.
+    if launch.kind == "pi" && machine.is_empty() {
         pi_ready(ctx, &launch)?;
     }
+    let machine_id = if machine.is_empty() {
+        String::new()
+    } else {
+        profile.id.clone()
+    };
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = if repo.is_empty() {
@@ -235,6 +280,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         };
         t.repo = repo.clone();
         t.machine = machine.clone();
+        t.machine_id = machine_id.clone();
         t.agent = launch.kind.clone();
         t.base = args.base.clone().unwrap_or_default();
         t.role = role.to_string();
@@ -282,73 +328,299 @@ fn place_and_brief(
     id: &str,
     restart: bool,
 ) -> Result<Thread> {
-    let slug = &project.slug;
     let record = thread::load(project, id)?;
-    let runner = ctx.runner;
 
     let placed = match record.kind {
         Kind::Worktree if record.is_remote() => {
-            // The same steps on the thread's own machine: git over ssh, herdr
-            // through `--machine`.
-            let target = remote::ssh_target(
-                runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                &record.machine,
-            )?;
-            let (origin, base) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
-            let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_create(
-                &record.repo,
-                &branch,
-                &base,
-                &record.title,
-            )?;
-            thread::update(project, id, |t| {
-                t.origin = origin;
-                t.base = base;
-                t.branch = branch;
-                t.worktree_path = path;
-                t.cwd = cwd;
-                t.workspace_id = created.workspace_id;
-                t.tab_id = created.tab_id;
-                t.pane_id = created.pane_id;
-            })?
+            place_box_worktree(ctx, project, view, &record, restart)?
         }
         Kind::Worktree => place_ade_worktree(ctx, project, view, &record)?,
+        Kind::Tab if record.is_remote() => {
+            bail!("a box lane needs a repository; a task with no repository runs on this Mac")
+        }
         Kind::Tab => place_ade_tab(ctx, project, view, &record)?,
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
     };
-    write_brief(ctx, project, &placed, restart)?;
+    write_brief(ctx, project, &placed)?;
     finish_placement(project, view, id)
 }
 
-/// The thread directory and the git exclude; on a remote machine also
-/// `brief.md`. A local brief was written and hashed before its tab existed
-/// (D9, D14) and is never rewritten here.
-fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> Result<()> {
-    if !placed.is_remote() {
-        return prepare_local_dir(ctx, project, placed);
+/// The thread directory is local bookkeeping; on a box lane the committed
+/// brief travels by git (D9) and there is nothing to write here.
+fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
+    if placed.is_remote() {
+        return Ok(());
     }
-    let dir = thread::thread_dir(&placed.cwd, &project.slug, &placed.id);
-    let with_dir = Thread {
-        thread_dir: dir.clone(),
-        ..placed.clone()
+    prepare_local_dir(ctx, project, placed)
+}
+
+/// The box start side (SPEC-remote §4.2 steps 2–5): commit the brief `B` on
+/// the Mac integration branch, push only the lane branch to the URL-matched
+/// remote, one ssh call to fetch and create the box worktree, create the box
+/// tab through machine routing, then write the lane card. The brief is never
+/// copied; it travels by git (D9).
+fn place_box_worktree(
+    ctx: &Ctx,
+    project: &Project,
+    view: &SessionView,
+    record: &Thread,
+    restart: bool,
+) -> Result<Thread> {
+    let runner = ctx.runner;
+    let (settings, _) = project.read_project_md()?;
+    let label = crate::project::display_name(&settings.name, &project.slug);
+    let (box_repo, publish_url) = match settings
+        .repos
+        .iter()
+        .find(|r| r.path == record.repo)
+        .and_then(|r| Some((r.box_path.clone()?, r.publish_url.clone()?)))
+    {
+        Some(pair) => pair,
+        None => {
+            let map = crate::remote::box_repo_for(&record.repo).with_context(|| {
+                format!(
+                    "box_repo_unmapped: {} has no Mac-to-box row; add one before the first box start",
+                    record.repo
+                )
+            })?;
+            (map.box_path.to_string(), map.publish_url.to_string())
+        }
     };
-    let task = std::fs::read_to_string(thread::task_path(project, &placed.id)).unwrap_or_default();
-    let prefix = crate::coordinator::current_prefix(&ctx.root)?;
-    let brief = thread::with_lane_skill(
-        &prefix,
-        &thread::brief_for(project, &with_dir, &task, restart)?,
-    );
     let target = remote::ssh_target(
-        ctx.runner,
+        runner,
         &ctx.env.herdr_bin(),
         &ctx.config_dir,
-        &placed.machine,
+        &record.machine,
     )?;
-    remote::write_brief(ctx.runner, &target, &placed.cwd, &dir, &brief)?;
-    thread::update(project, &placed.id, |t| t.thread_dir = dir)?;
+    let box_worktree = format!("{box_repo}/.worktrees/{}", record.id);
+    let branch = if record.branch.is_empty() {
+        thread::branch_name(&project.slug, &record.id, &record.title)
+    } else {
+        record.branch.clone()
+    };
+    let dir = thread::thread_dir(&box_worktree, &project.slug, &record.id);
+
+    // A restart reuses the brief commit already on the record; a first start
+    // commits it (D9). The brief is never rewritten.
+    let reusable = restart && !record.base.is_empty() && !record.launch.brief_hash.is_empty();
+    let (base, brief_hash) = if reusable {
+        push_branch(runner, &record.repo, &publish_url, &branch, &record.base)?;
+        (record.base.clone(), record.launch.brief_hash.clone())
+    } else {
+        let task =
+            std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
+        let stub = Thread {
+            thread_dir: dir.clone(),
+            ..record.clone()
+        };
+        let brief = thread::brief_for(project, &stub, &task, restart)?;
+        let committed = format!("plain: {}\n\n{brief}", record.plain);
+        let rel = format!("tasks/{}.md", record.id);
+        let brief_hash = thread::sha256_hex(committed.as_bytes());
+        let integration = integration_branch(runner, record)?;
+        let repo_lock = crate::git::lock(runner, &record.repo)?;
+        if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
+            eprintln!("warning: {error:#}");
+        }
+        let head =
+            crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
+        let sha = crate::git::commit_files_locked(
+            runner,
+            Path::new(&record.repo),
+            &integration,
+            &[(rel.as_str(), committed.as_str())],
+            &format!("docs(tasks): {}", record.id),
+            &head,
+            &repo_lock.common_dir.join("herdr-ade-tmp"),
+        )?;
+        drop(repo_lock);
+        ensure_branch(runner, &record.repo, &branch, &sha)?;
+        push_branch(runner, &record.repo, &publish_url, &branch, &sha)?;
+        (sha, brief_hash)
+    };
+
+    thread::update(project, &record.id, |t| {
+        t.base = base.clone();
+        t.branch = branch.clone();
+        t.worktree_path = box_worktree.clone();
+        t.thread_dir = dir.clone();
+        t.launch.brief_hash = brief_hash.clone();
+        t.partial = Some("worktree_add".into());
+    })?;
+
+    // Starts for one box repository serialize on the Mac (SPEC-remote §4.2
+    // step 3).
+    let lock_id = if record.machine_id.is_empty() {
+        record.machine.as_str()
+    } else {
+        record.machine_id.as_str()
+    };
+    let _box_lock = project::box_lock(&ctx.root, lock_id, &box_repo)?;
+
+    remote::provision(
+        runner,
+        &target,
+        &remote::Provision {
+            box_repo: &box_repo,
+            worktree: &box_worktree,
+            branch: &branch,
+            base: &base,
+            publish_url: &publish_url,
+        },
+    )?;
+
+    // Step 4: reuse the recorded box workspace when the box still lists it,
+    // else create it with the box clone as cwd; then the lane tab.
+    let herdr = view.herdr.on_machine(&record.machine);
+    let panes = herdr.pane_list().unwrap_or_default();
+    let workspace = if !record.workspace_id.is_empty()
+        && panes.iter().any(|p| p.workspace_id == record.workspace_id)
+    {
+        record.workspace_id.clone()
+    } else {
+        herdr
+            .workspace_create_env(Path::new(&box_repo), &label, false, &[])
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .workspace_id
+    };
+    let spec = crate::contracts::RoleSpec {
+        kind: record.launch.kind.clone(),
+        args: record.launch.args.clone(),
+        env: record.launch.env.clone(),
+        ready_timeout_ms: record.launch.ready_timeout_ms,
+    };
+    let attempt = record.attempt.max(1);
+    let env = project::tab_env(
+        &project.slug,
+        &record.id,
+        attempt,
+        &brief_hash,
+        &record.machine,
+        &spec,
+    );
+    let created = herdr
+        .tab_create_env(
+            &workspace,
+            Path::new(&box_worktree),
+            &record.id,
+            false,
+            &env,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cwd = herdr
+        .pane_cwd(&created.pane_id)
+        .unwrap_or_else(|_| box_worktree.clone());
+    let cwd = if cwd.is_empty() {
+        box_worktree.clone()
+    } else {
+        cwd
+    };
+
+    // Step 5: the lane card, now that the pane id exists.
+    let recipient = project
+        .coordinator()
+        .map(|c| {
+            let attempt = c.attempt();
+            crate::contracts::Recipient {
+                pane: c.pane_id,
+                coordinator_attempt: attempt,
+            }
+        })
+        .unwrap_or_default();
+    let start_line = thread::launch_prompt(
+        "",
+        &project.slug,
+        &Thread {
+            machine: record.machine.clone(),
+            ..record.clone()
+        },
+    );
+    let card = crate::contracts::LaneCard {
+        project: project.slug.clone(),
+        thread: record.id.clone(),
+        attempt,
+        brief_hash: brief_hash.clone(),
+        role: record.role.clone(),
+        kind: record.launch.kind.clone(),
+        pane_id: created.pane_id.clone(),
+        machine_label: record.machine.clone(),
+        machine_id: record.machine_id.clone(),
+        box_repo: box_repo.clone(),
+        box_worktree: box_worktree.clone(),
+        brief_commit: base.clone(),
+        branch: branch.clone(),
+        publish_url: publish_url.clone(),
+        recipient,
+        start_line,
+        created: crate::project::now(),
+    };
+    let card_path = crate::contracts::box_lane_card(&project.slug, &record.id);
+    remote::provision_card(
+        runner,
+        &target,
+        &project.slug,
+        &card_path,
+        &toml::to_string(&card)?,
+    )?;
+
+    thread::update(project, &record.id, |t| {
+        t.cwd = cwd.clone();
+        t.worktree_path = box_worktree.clone();
+        t.workspace_id = created.workspace_id.clone();
+        t.tab_id = created.tab_id.clone();
+        t.pane_id = created.pane_id.clone();
+        t.partial = None;
+    })
+}
+
+/// The integration branch the brief commits on: `--base`, else the branch the
+/// repository has checked out (D9).
+fn integration_branch(runner: &dyn Runner, record: &Thread) -> Result<String> {
+    if !record.base.is_empty() {
+        return Ok(record.base.clone());
+    }
+    git(
+        runner,
+        &record.repo,
+        &["symbolic-ref", "--short", "HEAD"],
+        GIT_TIMEOUT,
+    )
+    .context(
+        "integration_branch_required: the repository is on a detached HEAD; pass --base <branch>",
+    )
+}
+
+/// Creates the lane branch at `sha`, tolerating a retry that left it at the
+/// same commit. Never moves an existing ref (D9).
+fn ensure_branch(runner: &dyn Runner, repo: &str, branch: &str, sha: &str) -> Result<()> {
+    if let Ok(existing) = crate::git::rev_parse(runner, repo, &format!("refs/heads/{branch}")) {
+        if existing == sha {
+            return Ok(());
+        }
+        bail!("lane branch {branch} already exists at {existing}, not {sha}");
+    }
+    let out =
+        runner.run(&Cmd::new("git", GIT_TIMEOUT).args(["-C", repo, "branch", branch, sha]))?;
+    if !out.success() {
+        bail!("git branch {branch}: {}", out.error_text());
+    }
+    Ok(())
+}
+
+/// Pushes the lane branch by URL, never by remote name and never with force
+/// (SPEC-remote §4.2 step 2).
+fn push_branch(runner: &dyn Runner, repo: &str, url: &str, branch: &str, sha: &str) -> Result<()> {
+    let out = runner.run(&Cmd::new("git", Duration::from_secs(60)).args([
+        "-C",
+        repo,
+        "push",
+        "--quiet",
+        url,
+        &format!("{sha}:refs/heads/{branch}"),
+    ]))?;
+    if !out.success() {
+        bail!("push of {branch} to {url}: {}", out.error_text());
+    }
     Ok(())
 }
 
@@ -466,6 +738,7 @@ fn place_ade_worktree(
         &record.id,
         record.attempt.max(1),
         &brief_hash,
+        "",
         &spec,
     );
     match view
@@ -567,6 +840,7 @@ fn place_ade_tab(
         &record.id,
         record.attempt.max(1),
         &brief_hash,
+        "",
         &spec,
     );
     let created = view
@@ -737,30 +1011,37 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     let (agents, panes) = lists_for(&view, &record)?;
     let now = jiff::Timestamp::now();
     let live = thread::live_state(&record, &agents, &panes, now);
+    if record.is_remote() {
+        // A box lane restarts from its brief: the same refusals, then the
+        // exact start line again (SPEC-remote §6). The new attempt gets its
+        // own tab; the brief commit is reused, never rewritten.
+        let _ = restart_plan(&record, &live, false, now)?;
+        thread::update(&project, id, |t| {
+            t.attempt = t.attempt.max(1).saturating_add(1);
+            t.launch.attempt = t.attempt;
+        })?;
+        if !record.tab_id.is_empty() {
+            let _ = view
+                .herdr
+                .on_machine(&record.machine)
+                .tab_close(&record.tab_id);
+        }
+        return place_and_brief(ctx, &project, &view, id, true);
+    }
     let branch_exists = record.kind == Kind::Worktree && record.worktree_path.is_empty() && {
         let branch = thread::branch_name(slug, id, &record.title);
-        if record.is_remote() {
-            let target = remote::ssh_target(
-                ctx.runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                &record.machine,
-            )?;
-            remote::branch_exists(ctx.runner, &target, &record.repo, &branch)?
-        } else {
-            git(
-                ctx.runner,
-                &record.repo,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}"),
-                ],
-                GIT_TIMEOUT,
-            )
-            .is_ok()
-        }
+        git(
+            ctx.runner,
+            &record.repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+            GIT_TIMEOUT,
+        )
+        .is_ok()
     };
 
     let plan = restart_plan(&record, &live, branch_exists, now)?;
@@ -770,21 +1051,6 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     })?;
     match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
-        RestartPlan::ReusePane if record.is_remote() => {}
-        RestartPlan::Reopen if record.is_remote() => {
-            let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_open(
-                &record.repo,
-                &record.worktree_path,
-                &record.title,
-            )?;
-            thread::update(&project, id, |t| {
-                t.worktree_path = path;
-                t.cwd = cwd;
-                t.workspace_id = created.workspace_id;
-                t.tab_id = created.tab_id;
-                t.pane_id = created.pane_id;
-            })?;
-        }
         RestartPlan::ReusePane | RestartPlan::Reopen => {
             // The live pane is a bare shell whose HERDR_ADE_LAUNCH names the
             // previous attempt; the new attempt gets its own tab (D14).
@@ -797,7 +1063,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
         }
     }
     let placed = thread::load(&project, id)?;
-    write_brief(ctx, &project, &placed, true)?;
+    write_brief(ctx, &project, &placed)?;
     finish_placement(&project, &view, id)
 }
 
@@ -984,20 +1250,16 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     }
 }
 
-/// The final report and library copy, storing the new report hash.
+/// The final report and library copy, storing the new report hash. A box
+/// lane's report and library arrive through the Mac courier (the second lane),
+/// never through a second copy path; until then the copy is partial.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
     let copied = if record.is_remote() {
-        match remote::ssh_target(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            &record.machine,
-        ) {
-            Ok(target) => thread::copy_home_remote(project, record, true, ctx.runner, &target),
-            Err(error) => thread::Copied {
-                outcome: CopyOutcome::Failed(format!("{error:#}")),
-                report_hash: None,
-            },
+        thread::Copied {
+            outcome: CopyOutcome::Partial(vec![
+                "a box lane's report and library arrive through the Mac courier".into(),
+            ]),
+            report_hash: None,
         }
     } else {
         thread::copy_home_local(project, record, true, ctx.runner)
@@ -1747,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn ade_start_refuses_remote_and_empty_plain() {
+    fn ade_start_refuses_an_empty_plain() {
         let world = crate::scenarios::World::new();
         let _project = world.project("demo", "a.sock");
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&_project));
@@ -1769,24 +2031,17 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(missing.contains("plain_missing"), "{missing}");
+    }
 
-        let remote = start(
-            &ctx,
-            "demo",
-            StartArgs {
-                title: "X".into(),
-                repo: Some("/repo".into()),
-                machine: Some("box".into()),
-                base: None,
-                task: "Do the thing.".into(),
-                plain: "The lane does the work.".into(),
-                role: None,
-                recipe: None,
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(remote.contains("remote_not_admissible"), "{remote}");
+    #[test]
+    fn a_held_machine_refuses_a_new_box_start() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!project::machine_held(root.path(), "oci"));
+        project::machine_hold(root.path(), "oci").unwrap();
+        assert!(project::machine_held(root.path(), "oci"));
+        assert!(project::machine_release(root.path(), "oci").unwrap());
+        assert!(!project::machine_held(root.path(), "oci"));
+        assert!(!project::machine_release(root.path(), "oci").unwrap());
     }
 
     #[test]
