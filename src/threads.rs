@@ -365,9 +365,7 @@ fn resolve_placement(
             profile.label
         );
     }
-    if launch.kind == "pi"
-        && let Err(error) = box_pi_ready(ctx, &profile.label, launch)
-    {
+    if let Err(error) = box_launch_ready(ctx, &profile, launch) {
         if !fallback {
             return Err(error);
         }
@@ -401,15 +399,42 @@ pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
         .with_context(|| format!("pi_not_ready: provider {provider}"))
 }
 
+/// Box readiness: pi launches run their provider check on the box; every
+/// other kind still proves SSH reachability before placement can choose it.
+fn box_launch_ready(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
+    if launch.kind == "pi" {
+        let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+            .context("pi_args_forbidden: a pi launch names no --provider")?;
+        return crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
+            .with_context(|| format!("pi_not_ready: provider {provider} on `{}`", profile.label));
+    }
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        "true",
+        None,
+        remote::SSH_TIMEOUT,
+    )?;
+    if !out.success() {
+        bail!(
+            "machine_unreachable: `{}` did not answer: {}",
+            profile.label,
+            out.error_text()
+        );
+    }
+    Ok(())
+}
+
 /// Box pi readiness: the check runs on the box, never against the Mac login
 /// (SPEC-remote §4.1, SPEC-pi §3.4).
 pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch) -> Result<()> {
-    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-        .context("pi_args_forbidden: a pi launch names no --provider")?;
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
-    crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
-        .with_context(|| format!("pi_not_ready: provider {provider} on `{machine}`"))
+    box_launch_ready(ctx, &profile, launch)
 }
 
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
@@ -2438,6 +2463,28 @@ mod tests {
         project::machine_hold(&ctx.root, "oci-id").unwrap();
         let started = start(
             &ctx,
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert!(started.machine.is_empty());
+        assert_eq!(
+            say_lines(&fx.project),
+            vec!["the box was not ready, so this lane runs here".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unreachable_box_falls_back_to_this_mac() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        fx.world.runner.on(
+            "sh -c true",
+            crate::runner::fake::fail(255, "connection refused"),
+        );
+        stub_box(&fx);
+        let started = start(
+            &fx.world.ctx(),
             "demo",
             start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
         )
