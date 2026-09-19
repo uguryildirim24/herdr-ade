@@ -125,11 +125,18 @@ pub fn now() -> String {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Repo {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// The box clone path for this repository (SPEC-remote §4.1). When
+    /// present, the project's own row wins over the committed default map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_path: Option<String>,
+    /// The URL-matched remote the lane branch publishes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_url: Option<String>,
 }
 
 /// `PROJECT.md` front matter. `repos` is last so the TOML tables follow the
@@ -142,6 +149,10 @@ pub struct Settings {
     pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
+    /// The project's default machine (SPEC-remote §4.1): a saved machine
+    /// label/id, or `local`. Empty means `local`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine: String,
     /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
     /// default of item 24: on for a `claude` coordinator, off otherwise
     /// (`talk::enabled`). Never written by `new`, so the default applies.
@@ -175,6 +186,7 @@ impl Default for Settings {
             // text the user has half-typed (docs/herdr-notes.md, stage 2). With
             // `false` the ticker shows a herdr notification instead.
             nudge: false,
+            machine: String::new(),
             talk: None,
             roles: std::collections::BTreeMap::new(),
             repos: Vec::new(),
@@ -333,6 +345,36 @@ pub struct ProjectLock {
     _file: File,
 }
 
+/// Held while a box start fetches and creates its worktree, keyed by the
+/// stable profile id and the box repository so starts for one box repository
+/// serialize (SPEC-remote §4.2 step 3).
+pub struct BoxLock {
+    _file: File,
+}
+
+pub fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<BoxLock> {
+    let dir = root.join(".locks");
+    std::fs::create_dir_all(&dir)?;
+    let mut hasher = Sha256::new();
+    hasher.update(machine_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(box_repo.as_bytes());
+    let key: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = dir.join(format!("{key}.lock"));
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open box lock {}", path.display()))?;
+    file.lock()?;
+    Ok(BoxLock { _file: file })
+}
+
 impl Project {
     /// An existing project. Validates the slug before building any path.
     pub fn load(root: &Path, slug: &str) -> Result<Project> {
@@ -389,6 +431,13 @@ impl Project {
         parse_project_md(&text)
     }
 
+    /// The project's default machine (SPEC-remote §4.1). Empty means `local`.
+    pub fn machine(&self) -> String {
+        self.read_project_md()
+            .map(|(settings, _)| settings.machine)
+            .unwrap_or_default()
+    }
+
     pub fn status(&self) -> Status {
         read_json::<ProjectState>(&self.state_dir().join("project.json"))
             .unwrap_or_default()
@@ -421,6 +470,38 @@ impl Project {
     pub fn safety(&self, config_dir: &Path) -> Result<Safety> {
         load_safety(config_dir, &self.canonical_dir())
     }
+}
+
+/// `ha machine hold <machine>`: new box starts are held until released
+/// (SPEC-remote §2.4). The marker lives under the ADE root, not on the box.
+pub fn machine_hold(root: &Path, machine: &str) -> Result<PathBuf> {
+    let path = machine_hold_path(root, machine)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, b"")?;
+    Ok(path)
+}
+
+/// Removes the hold. Returns whether one was present.
+pub fn machine_release(root: &Path, machine: &str) -> Result<bool> {
+    let path = machine_hold_path(root, machine)?;
+    Ok(std::fs::remove_file(&path).is_ok())
+}
+
+pub fn machine_held(root: &Path, machine: &str) -> bool {
+    machine_hold_path(root, machine).is_ok_and(|path| path.exists())
+}
+
+fn machine_hold_path(root: &Path, machine: &str) -> Result<PathBuf> {
+    if machine.is_empty()
+        || machine
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+    {
+        bail!("`{machine}` is not a machine name");
+    }
+    Ok(root.join(".machines").join(format!("{machine}.hold")))
 }
 
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -568,17 +649,42 @@ pub fn launch_recipe(spec: &RoleSpec, attempt: u32, brief_hash: String, policy: 
 }
 
 /// `--env` values for `tab create`, including `HERDR_ADE_LAUNCH` (SPEC-ADE D4).
+/// A box lane also gets the box PATH and its own `CARGO_TARGET_DIR`
+/// (SPEC-remote §§3.3, 4.2).
 pub fn tab_env(
     slug: &str,
     thread: &str,
     attempt: u32,
     brief_hash: &str,
+    machine: &str,
     spec: &RoleSpec,
 ) -> Vec<String> {
     let mut env = vec![format!(
         "HERDR_ADE_LAUNCH={slug}/{thread}/{attempt}/{brief_hash}"
     )];
-    env.extend(spec.env.iter().cloned());
+    let remote = !machine.is_empty() && machine != crate::contracts::MACHINE_LOCAL;
+    if remote {
+        // These three values are the box binding, wrapper path and isolated
+        // build folder. A recipe cannot replace them with Mac-side values.
+        env.extend(
+            spec.env
+                .iter()
+                .filter(|value| {
+                    !["HERDR_ADE_LAUNCH", "PATH", "CARGO_TARGET_DIR"]
+                        .iter()
+                        .any(|key| value.starts_with(&format!("{key}=")))
+                })
+                .cloned(),
+        );
+        env.push(format!("PATH={}", crate::contracts::BOX_PATH));
+        env.push(format!(
+            "CARGO_TARGET_DIR={}/{slug}-{thread}",
+            crate::contracts::BOX_BUILD
+        ));
+    } else {
+        // Keep the established local-lane argv unchanged.
+        env.extend(spec.env.iter().cloned());
+    }
     if spec.kind == "dsh" {
         if !env.iter().any(|e| e.starts_with("DSH_PERMISSION_MODE=")) {
             env.push("DSH_PERMISSION_MODE=danger-full-access".into());
@@ -657,12 +763,14 @@ pub fn parse_repo_arg(arg: &str) -> Repo {
             return Repo {
                 path: path.to_string(),
                 machine: Some(machine.to_string()),
+                ..Repo::default()
             };
         }
     }
     Repo {
         path: arg.to_string(),
         machine: None,
+        ..Repo::default()
     }
 }
 
@@ -699,13 +807,13 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         .map(|repo| match repo.machine {
             // A remote path is stored as it is on its own machine.
             Some(_) => repo,
-            None => Repo {
-                path: std::fs::canonicalize(&repo.path)
+            None => {
+                let path = std::fs::canonicalize(&repo.path)
                     .or_else(|_| std::path::absolute(&repo.path))
                     .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or(repo.path),
-                machine: None,
-            },
+                    .unwrap_or_else(|_| repo.path.clone());
+                Repo { path, ..repo }
+            }
         })
         .collect();
     let settings = Settings {
@@ -865,11 +973,13 @@ mod tests {
             vec![
                 Repo {
                     path: "/srv/app".into(),
-                    machine: Some("box".into())
+                    machine: Some("box".into()),
+                    ..Repo::default()
                 },
                 Repo {
                     path: "/no/such/repo".into(),
-                    machine: None
+                    machine: None,
+                    ..Repo::default()
                 },
             ]
         );
@@ -1067,7 +1177,7 @@ mod tests {
         };
         let recipe = launch_recipe(&spec, 1, "bh".into(), "ph".into());
         assert_eq!(recipe.ready_timeout_ms, 20_000);
-        let env = tab_env("demo", "t-0001", 1, "abcd", &spec);
+        let env = tab_env("demo", "t-0001", 1, "abcd", "", &spec);
         assert!(
             env.iter()
                 .any(|e| e == "HERDR_ADE_LAUNCH=demo/t-0001/1/abcd")

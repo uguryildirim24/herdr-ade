@@ -1,11 +1,14 @@
-//! Lane-facing verbs: durable completion, waiting, and role skills.
+//! Lane-facing verbs: durable completion, waiting, and role skills. On the box
+//! the same verbs run against the lane card and seal locally; delivery and the
+//! ticker stay on the Mac (SPEC-remote §4.3).
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::{OpKind, Recipient, Requested};
+use crate::contracts::{LaneCard, OpKind, Recipient, Requested};
+use crate::herdr::Herdr;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::{ops, steps, thread, ticker};
@@ -14,6 +17,21 @@ use crate::{ops, steps, thread, ticker};
 struct Binding {
     project: Project,
     thread: thread::Thread,
+    /// Present when this pane is a box lane: the identity comes from the card,
+    /// and there is no Mac-side delivery or ticker here.
+    card: Option<LaneCard>,
+}
+
+impl Binding {
+    fn recipient(&self) -> Result<Recipient> {
+        if let Some(card) = &self.card {
+            if card.recipient.pane.is_empty() {
+                bail!("recipient_unavailable: lane card has no coordinator pane");
+            }
+            return Ok(card.recipient.clone());
+        }
+        recipient(&self.project)
+    }
 }
 
 pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
@@ -22,8 +40,19 @@ pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
         bail!("report_path_invalid: a report path has no spaces or control characters");
     }
     let binding = current_lane(ctx)?;
-    let recipient = recipient(&binding.project)?;
+    let recipient = binding.recipient()?;
     let attempt = binding.thread.attempt.max(1);
+    // A box lane publishes its branch before `done`; the published ref is part
+    // of the completion validation (SPEC-remote §4.3).
+    if let Some(card) = &binding.card {
+        ops::check_published_ref(
+            ctx.runner,
+            Path::new(&binding.thread.cwd),
+            &card.branch,
+            &card.publish_url,
+            sha,
+        )?;
+    }
     let op = ops::reserve(
         &binding.project,
         ops::Reservation {
@@ -42,15 +71,12 @@ pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     let cwd = Path::new(&binding.thread.cwd);
     ops::stage_done(&binding.project, &op.op, cwd, ctx.runner)?;
     let event = ops::seal(&binding.project, &op.op, |candidate| {
-        validate_current(
-            &binding.project,
-            &binding.thread.id,
-            candidate.attempt,
-            candidate,
-        )
+        validate_current(&binding, candidate.attempt, candidate)
     })?;
-    steps::deliver_event(ctx, &binding.project, &event)?;
-    ticker::start(ctx)?;
+    if binding.card.is_none() {
+        steps::deliver_event(ctx, &binding.project, &event)?;
+        ticker::start(ctx)?;
+    }
     println!("sealed {}", event.id);
     Ok(())
 }
@@ -58,7 +84,7 @@ pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
 pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
     let binding = current_lane(ctx)?;
     let text = bounded_waiting(text)?;
-    let recipient = recipient(&binding.project)?;
+    let recipient = binding.recipient()?;
     let attempt = binding.thread.attempt.max(1);
     let op = ops::reserve(
         &binding.project,
@@ -74,15 +100,12 @@ pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
     )?;
     ops::stage_waiting(&binding.project, &op.op)?;
     let event = ops::seal(&binding.project, &op.op, |candidate| {
-        validate_current(
-            &binding.project,
-            &binding.thread.id,
-            candidate.attempt,
-            candidate,
-        )
+        validate_current(&binding, candidate.attempt, candidate)
     })?;
-    steps::deliver_event(ctx, &binding.project, &event)?;
-    ticker::start(ctx)?;
+    if binding.card.is_none() {
+        steps::deliver_event(ctx, &binding.project, &event)?;
+        ticker::start(ctx)?;
+    }
     println!("sealed {}", event.id);
     Ok(())
 }
@@ -100,17 +123,11 @@ fn recipient(project: &Project) -> Result<Recipient> {
     })
 }
 
-fn validate_current(
-    project: &Project,
-    id: &str,
-    attempt: u32,
-    op: &crate::contracts::Op,
-) -> Result<()> {
-    let current = thread::load(project, id)?;
-    if current.attempt.max(1) != attempt || current.pane_id != pane_id()? {
+fn validate_current(binding: &Binding, attempt: u32, op: &crate::contracts::Op) -> Result<()> {
+    if binding.thread.attempt.max(1) != attempt || binding.thread.pane_id != pane_id()? {
         bail!("stale_attempt: lane binding changed before seal");
     }
-    let recipient = recipient(project)?;
+    let recipient = binding.recipient()?;
     if recipient != op.recipient {
         bail!("recipient_changed: coordinator binding changed before seal");
     }
@@ -119,6 +136,53 @@ fn validate_current(
 
 fn current_lane(ctx: &Ctx) -> Result<Binding> {
     let pane = pane_id()?;
+    let mut matches = box_lanes(ctx, &pane)?;
+    if matches.is_empty() {
+        matches = local_lanes(ctx, &pane)?;
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => bail!("lane_binding_not_found: HERDR_PANE_ID is not a recorded lane"),
+        _ => bail!("lane_binding_ambiguous: pane is recorded by more than one project"),
+    }
+}
+
+/// Box lanes on this machine: the lane card under `<root>/<slug>/lanes/`.
+fn box_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
+    let mut matches = Vec::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let dir = ctx.root.join(&slug).join("lanes");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(card) = toml::from_str::<LaneCard>(&text) else {
+                continue;
+            };
+            if card.pane_id != pane {
+                continue;
+            }
+            let project = Project::load(&ctx.root, &slug)?;
+            validate_card(ctx, &card)?;
+            matches.push(Binding {
+                project,
+                thread: thread_from_card(&card),
+                card: Some(card),
+            });
+        }
+    }
+    Ok(matches)
+}
+
+/// The local scan: a thread record whose pane is this pane.
+fn local_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
     let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
     let cwd = std::env::current_dir()
         .ok()
@@ -136,11 +200,8 @@ fn current_lane(ctx: &Ctx) -> Result<Binding> {
             continue;
         }
         for lane in thread::list(&project) {
-            if lane.pane_id != pane {
+            if lane.pane_id != pane || lane.is_remote() {
                 continue;
-            }
-            if lane.is_remote() {
-                bail!("remote_not_admissible: completion is local only");
             }
             let recorded = std::fs::canonicalize(&lane.cwd).ok();
             if cwd.is_some() && recorded.is_some() && cwd != recorded {
@@ -149,14 +210,78 @@ fn current_lane(ctx: &Ctx) -> Result<Binding> {
             matches.push(Binding {
                 project: project.clone(),
                 thread: lane,
+                card: None,
             });
         }
     }
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => bail!("lane_binding_not_found: HERDR_PANE_ID is not a recorded local lane"),
-        _ => bail!("lane_binding_ambiguous: pane is recorded by more than one project"),
+    Ok(matches)
+}
+
+fn thread_from_card(card: &LaneCard) -> thread::Thread {
+    thread::Thread {
+        id: card.thread.clone(),
+        attempt: card.attempt,
+        role: card.role.clone(),
+        pane_id: card.pane_id.clone(),
+        cwd: card.box_worktree.clone(),
+        worktree_path: card.box_worktree.clone(),
+        repo: card.box_repo.clone(),
+        branch: card.branch.clone(),
+        machine: card.machine_label.clone(),
+        machine_id: card.machine_id.clone(),
+        launch: crate::contracts::Launch {
+            kind: card.kind.clone(),
+            brief_hash: card.brief_hash.clone(),
+            attempt: card.attempt,
+            ..crate::contracts::Launch::default()
+        },
+        ..thread::Thread::default()
     }
+}
+
+/// The card is the box's authority: `HERDR_ADE_LAUNCH`, the pane and cwd must
+/// match, and the pane's live process must look like the card's kind
+/// (SPEC-remote §4.3).
+fn validate_card(ctx: &Ctx, card: &LaneCard) -> Result<()> {
+    let launch = project::LaunchEnv::from_process()
+        .context("bootstrap_mismatch: HERDR_ADE_LAUNCH is missing or malformed")?;
+    if launch.project != card.project
+        || launch.thread != card.thread
+        || launch.attempt != card.attempt
+        || launch.brief_hash != card.brief_hash
+    {
+        bail!("bootstrap_mismatch: launch receipt does not match the lane card");
+    }
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .context("bootstrap_mismatch: cwd cannot be resolved")?;
+    if cwd.to_string_lossy() != card.box_worktree {
+        bail!("bootstrap_mismatch: cwd is not the card's box worktree");
+    }
+    let socket = std::env::var("HERDR_SOCKET_PATH")
+        .context("bootstrap_mismatch: HERDR_SOCKET_PATH is missing")?;
+    if socket.is_empty() {
+        bail!("bootstrap_mismatch: HERDR_SOCKET_PATH is empty");
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let info = herdr.pane_process_info(&card.pane_id).map_err(|error| {
+        anyhow::anyhow!("bootstrap_mismatch: pane process is unavailable: {error}")
+    })?;
+    let kind = card.kind.as_str();
+    // The agent, a shell that started it, or the plugin running `done` all
+    // count; anything else is a replacement, never this attempt.
+    let known = info.foreground_processes.iter().any(|p| {
+        let name = p.name.as_str();
+        let argv0 = p.argv0.as_deref().unwrap_or("");
+        name == kind
+            || name.contains(kind)
+            || argv0.contains(kind)
+            || matches!(name, "sh" | "bash" | "zsh" | "-zsh" | "herdr-ade" | "ha")
+    });
+    if !known {
+        bail!("bootstrap_mismatch: pane process does not match kind `{kind}`");
+    }
+    Ok(())
 }
 
 fn pane_id() -> Result<String> {
@@ -194,7 +319,7 @@ struct BootstrapReceipt {
 
 /// Prints the selected role skill and runtime-only rules. A lane call also
 /// records the bootstrap receipt from `HERDR_ADE_LAUNCH` when its binding
-/// matches. A1 can project the same receipt onto its extended thread record.
+/// matches. A box lane prints the fixed box prefix, never the Mac's path.
 pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
     match role {
         "coordinator" => print!("{}", include_str!("../skill/COORDINATOR.md")),
@@ -210,10 +335,12 @@ pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
                 );
             }
             acknowledge_bootstrap(&binding)?;
-            print!(
-                "{}",
-                crate::thread::commands_line(&crate::coordinator::current_prefix(&ctx.root)?)
-            );
+            let prefix = if binding.card.is_some() {
+                crate::contracts::box_prefix()
+            } else {
+                crate::coordinator::current_prefix(&ctx.root)?
+            };
+            print!("{}", crate::thread::commands_line(&prefix));
             print!(
                 "{}",
                 match role {
@@ -279,9 +406,11 @@ fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
             acknowledged: project::now(),
         },
     )?;
-    thread::update(&binding.project, &binding.thread.id, |t| {
-        t.bootstrap = "acknowledged".into();
-    })?;
+    if binding.card.is_none() {
+        thread::update(&binding.project, &binding.thread.id, |t| {
+            t.bootstrap = "acknowledged".into();
+        })?;
+    }
     Ok(())
 }
 
@@ -310,6 +439,46 @@ mod tests {
         assert_eq!(bounded_waiting("  need\nhelp\0 ").unwrap(), "needhelp");
         assert!(bounded_waiting("\n\0").is_err());
         assert!(bounded_waiting(&"x".repeat(501)).is_err());
+    }
+
+    #[test]
+    fn a_box_card_builds_the_lane_identity() {
+        let card = LaneCard {
+            project: "demo".into(),
+            thread: "t-0001".into(),
+            attempt: 2,
+            brief_hash: "abcd".into(),
+            role: "lane".into(),
+            kind: "pi".into(),
+            pane_id: "w1:p2".into(),
+            machine_label: "oci".into(),
+            machine_id: "abc".into(),
+            box_repo: "/home/ubuntu/projects/demo".into(),
+            box_worktree: "/home/ubuntu/projects/demo/.worktrees/t-0001".into(),
+            brief_commit: "b0b0".into(),
+            branch: "hp/demo/t-0001".into(),
+            publish_url: "https://github.com/uguryildirim24/demo.git".into(),
+            recipient: Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 3,
+            },
+            start_line: "Run the box skill".into(),
+            created: "2026-09-19T00:00:00Z".into(),
+        };
+        let lane = thread_from_card(&card);
+        assert_eq!(lane.id, "t-0001");
+        assert_eq!(lane.attempt, 2);
+        assert_eq!(lane.launch.brief_hash, "abcd");
+        assert!(lane.is_remote());
+
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let binding = Binding {
+            project,
+            thread: lane,
+            card: Some(card),
+        };
+        assert_eq!(binding.recipient().unwrap().coordinator_attempt, 3);
     }
 
     #[test]
