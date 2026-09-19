@@ -50,12 +50,14 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
     project::write_json(&project.state_dir().join("ticker.json"), state)
 }
 
-/// Delivers every sealed event whose first transport submission is not yet in
-/// its journal. The event, not the typed line or report hash, is authoritative.
+/// Delivers every sealed event whose transport submission is not yet in its
+/// journal. The event, not the typed line or report hash, is authoritative.
 /// Each event is independent: one that cannot be delivered never holds back
-/// the others. An event with any journal line (submitted, acknowledged or
-/// handled) is not typed again, and one for a superseded lane attempt is
-/// left as it is, sealed and undelivered.
+/// the others. An event whose journal already holds `submitted` is not typed
+/// again; one read before its line went out (`acknowledged` or `handled` with
+/// no `submitted`) is still typed once, so the wake-up always happens. An
+/// event for a superseded lane attempt is left as it is, sealed and
+/// undelivered.
 pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
     for event in crate::events::list(project) {
@@ -66,7 +68,7 @@ pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
                 continue;
             }
         };
-        if !states.is_empty() {
+        if states.contains(&crate::contracts::DeliveryState::Submitted) {
             // Typed to a coordinator that has since been replaced and never
             // acknowledged: the current one gets a recipient-changed item.
             let settled = states.iter().any(|s| {
@@ -91,6 +93,8 @@ pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
             }
             continue;
         }
+        // No `submitted` yet: fresh, or read before its wake-up line was
+        // typed. Both still owe exactly one typed line.
         if thread::load(project, &event.thread)
             .is_ok_and(|lane| lane.attempt.max(1) != event.attempt)
         {
@@ -1407,9 +1411,123 @@ pub fn routines(
 mod tests {
     use super::*;
     use crate::runner::Runner as _;
+    use crate::scenarios::{World, agent_json};
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
+    }
+
+    /// A project with a ready coordinator in its bound pane, and the fake
+    /// runner answering `agent prompt`.
+    fn delivery_world() -> (World, Project) {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world
+            .runner
+            .on("agent prompt", crate::runner::fake::ok(r#"{"result":{}}"#));
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w1", "w1:t1", "w1:p1", &cwd, "hp-demo-coordinator", "idle")
+        );
+        (world, project)
+    }
+
+    /// A lane with one sealed `done` event bound to the project's coordinator.
+    fn sealed_done(project: &Project, id: &str) -> crate::contracts::Event {
+        let coordinator = project.coordinator().unwrap();
+        let event = crate::contracts::Event {
+            id: format!("{id}-1-1"),
+            op: format!("{id}-1-1"),
+            thread: id.into(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient {
+                pane: coordinator.pane_id.clone(),
+                coordinator_attempt: coordinator.attempt(),
+            },
+            created: "2026-09-19T00:00:00Z".into(),
+            payload: crate::contracts::EventPayload {
+                done: Some(crate::contracts::DonePayload {
+                    sha: "abc".into(),
+                    report_path: ".reports/lane.md".into(),
+                    artifact: "def".into(),
+                }),
+                waiting: None,
+            },
+        };
+        crate::events::seal_create_if_absent(project, &event).unwrap();
+        event
+    }
+
+    fn typed_lines(world: &World) -> Vec<String> {
+        world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|cmd| cmd.display().contains("agent prompt"))
+            .map(|cmd| cmd.display())
+            .collect()
+    }
+
+    #[test]
+    fn an_event_read_before_its_line_is_typed_is_repaired() {
+        let (world, project) = delivery_world();
+        thread::allocate(&project, |t| {
+            t.title = "Lane".into();
+            t.status = Status::Open;
+        })
+        .unwrap();
+        let event = sealed_done(&project, "t-0001");
+        // The coordinator read the inbox item in the same window as the seal,
+        // before the ticker had typed the wake-up line.
+        crate::events::append_delivery(
+            &project,
+            &event.id,
+            crate::contracts::DeliveryState::Acknowledged,
+        )
+        .unwrap();
+
+        let ctx = world.ctx();
+        deliver_events(&ctx, &project).unwrap();
+
+        let lines = typed_lines(&world);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("DONE t-0001"), "{}", lines[0]);
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![
+                crate::contracts::DeliveryState::Acknowledged,
+                crate::contracts::DeliveryState::Submitted
+            ]
+        );
+
+        // Once repaired, the wake-up is never typed a second time.
+        deliver_events(&ctx, &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    #[test]
+    fn a_normal_event_is_typed_once_and_not_retyped() {
+        let (world, project) = delivery_world();
+        thread::allocate(&project, |t| {
+            t.title = "Lane".into();
+            t.status = Status::Open;
+        })
+        .unwrap();
+        let event = sealed_done(&project, "t-0001");
+
+        let ctx = world.ctx();
+        deliver_events(&ctx, &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![crate::contracts::DeliveryState::Submitted]
+        );
+
+        deliver_events(&ctx, &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
     }
 
     #[test]
