@@ -59,9 +59,12 @@ Expect one interruption per thread under the default settings: **a new worktree 
 When a thread finishes it writes a report. The report is copied to `threads/<id>.md` in the project folder and the thread moves to Ready for review. Tell the coordinator you've looked (it runs `thread ack`), or resolve the thread:
 
 ```bash
-herdr-projects thread resolve billing t-0001                     # keep the worktree
-herdr-projects thread resolve billing t-0001 --remove-worktree   # remove it; the branch is kept
+herdr-projects thread resolve billing t-0001                     # close its pane, keep the worktree
+herdr-projects thread resolve billing t-0001 --remove-worktree   # remove the worktree too; the branch is kept
+herdr-projects thread resolve billing t-0001 --keep-pane         # leave the pane and its agent open
 ```
+
+Resolving closes the thread's pane and tab through Herdr, so its idle agent stops using memory; the worktree and branch stay unless you pass `--remove-worktree`.
 
 ## Check your setup
 
