@@ -492,7 +492,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     lane.workspace_id = pane.workspace_id;
     lane.state = "ready".into();
     lane.stopped = false;
-    if wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
+    if lane.profile.is_none() && wait_for_rollout(env, &mut lane, ROLLOUT_TIMEOUT).is_none() {
         let reason = screen_reason(runner, &bin, &lane.pane_id);
         let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
         bail!(
