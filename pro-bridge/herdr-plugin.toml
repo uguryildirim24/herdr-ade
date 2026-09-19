@@ -16,6 +16,11 @@ command = ["cargo", "build", "--release", "--locked", "--manifest-path", "../Car
 [[startup]]
 command = ["../target/release/herdr-pro", "reconcile"]
 
+# One-shot, idempotent: start the local relay that makes Pro a plain pi lane.
+# A live pid in `serve.json` makes it exit 0. The relay serves pi on loopback.
+[[startup]]
+command = ["../target/release/herdr-pro", "serve"]
+
 [[actions]]
 id = "doctor"
 title = "Pro: check the bridge and the Codex route"
