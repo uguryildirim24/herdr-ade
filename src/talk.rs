@@ -46,6 +46,10 @@ pub enum Entry {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         means: Option<String>,
+        /// The round whose successful merge this line is landing evidence for
+        /// (SPEC-talk §6.1). Omitted on ordinary say entries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        landed_round: Option<String>,
     },
     Ask {
         id: String,
@@ -471,7 +475,7 @@ pub fn render(project: &Project, line: &Line) -> Option<String> {
             TalkRequestState::Submitted => Some("  (sent)".into()),
             _ => None,
         },
-        Entry::Say { what, means } => Some(match means {
+        Entry::Say { what, means, .. } => Some(match means {
             Some(m) => format!("coordinator: {what}\n  for you: {m}"),
             None => format!("coordinator: {what}"),
         }),
@@ -867,6 +871,7 @@ mod tests {
             Entry::Say {
                 what: "One.".into(),
                 means: None,
+                landed_round: None,
             },
         )
         .unwrap();
@@ -885,6 +890,7 @@ mod tests {
             Entry::Say {
                 what: "Two.".into(),
                 means: None,
+                landed_round: None,
             },
         )
         .unwrap();
@@ -894,6 +900,7 @@ mod tests {
             Entry::Say {
                 what: "Three.".into(),
                 means: None,
+                landed_round: None,
             },
         )
         .unwrap();
@@ -916,6 +923,7 @@ mod tests {
         let big = Entry::Say {
             what: "x".repeat(MAX_ENTRY_BYTES),
             means: None,
+            landed_round: None,
         };
         assert!(
             format!("{:#}", append(&fx.project, None, big).unwrap_err())

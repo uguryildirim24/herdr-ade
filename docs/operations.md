@@ -49,6 +49,9 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
 | `thread resolve <project> <id> [--remove-worktree] [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy: close the pane and tab through Herdr (`--keep-pane` leaves them), and optionally remove the worktree (the branch is kept). |
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
+| `plan show [--json]`, `plan set`, `plan step add\|edit\|link\|unlink\|remove\|move`, `plan sync` | The plan card: goal, end result and up to seven steps. A step is `done` only when all its bound work has landed in a merged round. |
+| `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list [--json]`, `decide show <id>` | The log of choices the coordinator made without asking. |
+| `say --what S [--means S] [--landed-round R]` | One checked line on the board and in talk. `--landed-round` marks it as landing evidence for a merged round. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. `delete` moves the folder to `.trash/`. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
@@ -56,6 +59,21 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a pane gone with no report, or blocked for 30 seconds); **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. Threads idle for `auto_resolve_days` are resolved after a final copy home.
 
 `focus` replaces any sidebar view another tool has set, and `unfocus` clears whatever view is set, because Herdr holds a single one. `focus` covers local threads only.
+
+## Plans and choices
+
+The project screen reads two records the coordinator keeps. They are ordinary files in the project folder; reading them never creates a plan, makes a decision, resolves a lane or answers a question.
+
+- **The plan card** is `<project>/plan.toml`, written under `<project>/.plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, one of seven end-result kinds (`screen`, `command`, `background`, `document`, `picture`, `number`, `finding`) with its fixed sentence, and up to seven ordered steps. A step's `state` is a projection, never a status the coordinator can set: it is `done` only when every bound thread's carrying round has merged with that work included and every bound round has merged, `running` when some required work has started or landed, and `left` otherwise. The shared refresh runs after a thread or round membership change, at each round merge and at each checkpoint, and derives the states from the durable records. `plan sync` is the manual form.
+- **The decision log** is `<project>/decisions.jsonl`, appended under `<project>/.decisions.lock`; it is history, not the conversation journal. Each line is one checked plain sentence with class `what-you-get`, `money`, `undo` or `routine`, and optional retry `key`, `basis`, `replaces` and `request` links. A `replaces` record preserves the original instead of editing it; the old choice stops being current only when the replacement is valid. A `--key` retry with the same payload returns the existing record, and the same key with different content fails.
+
+**Authority boundary.** `what-you-get`, `money` and `undo` are consequential: the coordinator asks before acting, and records one only with `--basis request:<id>` for an existing human message or `--basis ask:<id>@<revision>` for a current, nonzero answered ask. The plugin checks the reference exists and has that provenance; it cannot check that the permission really covers the choice, so the coordinator must. A `no` answer authorizes nothing. `routine` needs no basis. This is not an approval bypass.
+
+**The three-ask cap.** At most three open asks may exist at once, counting a recorded ask whose publication is still pending. Creation, re-asking and answering serialize through `<project>/asks/.open.lock`, so concurrent writers cannot each claim the last slot; a fourth creation fails and records nothing. The newest open ask is re-asked as one merged question: its identifier stays and its revision advances. A project already above the cap can create nothing new until the count is within bounds; its existing asks stay visible.
+
+**Recovery.** A plan or decision write is atomic, so a reader sees an old or a new complete record. A stale `--expect` fails and changes nothing. A decision log whose last line is cut is not read as a decision and blocks further appends until the file is repaired. A failed plan refresh is reported on its own line and never rolls back a merge; the screen reads the authoritative records and shows that the plan needs to catch up until persistence catches up.
+
+When Rolf asks in chat to change a recorded choice, the coordinator treats it like any other message, records the replacement with its `request` link, and says in plain words what will change. Message acceptance is not completion, and a replacement's wording must not claim finished work before it exists.
 
 ## Safety settings
 

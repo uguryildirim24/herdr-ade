@@ -295,7 +295,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 
     match place_and_brief(ctx, &project, &view, &id, false) {
-        Ok(thread) => Ok(thread),
+        Ok(thread) => {
+            refresh_plan(ctx, &project);
+            Ok(thread)
+        }
         Err(error) => {
             // Nothing is cleaned up automatically; `thread restart` retries.
             let message = format!("{error:#}");
@@ -1152,6 +1155,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
             t.status = Status::Open;
             t.resolved_reason.clear();
         })?;
+        refresh_plan(ctx, &project);
         println!(
             "{id} is open again. Nothing was started; `thread restart {slug} {id}` brings its agent back."
         );
@@ -1236,7 +1240,17 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
             record.worktree_path, resolved.branch
         );
     }
+    refresh_plan(ctx, &project);
     Ok(())
+}
+
+/// The shared plan refresh at a thread lifecycle change. A refresh failure is
+/// reported on its own line; it never fails the lifecycle operation
+/// (SPEC-talk §6.5).
+pub fn refresh_plan(ctx: &Ctx, project: &Project) {
+    if let Err(e) = crate::plan::refresh(ctx, project) {
+        eprintln!("note: the plan refresh failed: {e:#}");
+    }
 }
 
 /// Close the thread's pane and its tab through herdr, the same closing
@@ -1497,6 +1511,26 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The rounds whose manifest includes `thread`: its carrying rounds. This is
+/// durable membership, never inferred from branch names or commits
+/// (SPEC-talk §6.5).
+pub fn carrying_rounds(project: &Project, thread: &str) -> Vec<String> {
+    crate::round::list(project)
+        .into_iter()
+        .filter(|r| r.manifest.members.iter().any(|m| m.thread == thread))
+        .map(|r| r.round)
+        .collect()
+}
+
+/// True when the round's merge reached the checkpointed phase: its required
+/// work landed (SPEC-talk §6.5).
+pub fn round_landed(project: &Project, round: &str) -> bool {
+    crate::round::read_merge(project, round)
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.phase == crate::contracts::MergePhase::Checkpointed)
 }
 
 /// A thread with its live state and group, for `thread list`, `thread show`
