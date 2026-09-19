@@ -21,6 +21,7 @@ Always `--no-skills`. Never `--approve` or `-a`. Never `--session`, `-c`,
 
 | Role | Provider | Model | Thinking |
 |---|---|---|---|
+| DeepSeek through OpenCode Go | `opencode-go` | `deepseek-v4.1-flash` | `high` |
 | OpenCode Muse | `opencode-go` | `muse-spark-1.3-contributor` | `high` |
 | Kimi k3 | `kimi-coding` | `k3` | `high` |
 | ChatGPT Sol (escalate only) | `openai-codex` | `gpt-5.6-sol` | `high` |
