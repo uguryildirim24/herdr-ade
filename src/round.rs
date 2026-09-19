@@ -923,11 +923,25 @@ and commit that file alone as the verdict commit V (its only parent is C):\n\n\
 
 impl MergeIntent {
     /// True when the integration branch holds what this intent merged to, or
-    /// still holds B and the merge has not run. Both the intent and the
-    /// checkpoint phase may resume from here.
+    /// still holds the recorded merge start. Both the intent and checkpoint
+    /// phases may resume from here.
     fn at_or_past_merge(&self, head: &str) -> bool {
         head == self.expected_old || head == self.verdict || self.merged.as_deref() == Some(head)
     }
+}
+
+/// Recognize the ref move if the process died after creating a moved-head
+/// merge commit but before recording it. An arbitrary descendant of V is not
+/// the merge result: its parents and tree must be exactly the clean merge.
+fn is_unrecorded_merge_result(git: &Git, intent: &MergeIntent, head: &str) -> Result<bool> {
+    if head == intent.verdict {
+        return Ok(true);
+    }
+    if git.parents(head)? != [intent.expected_old.clone(), intent.verdict.clone()] {
+        return Ok(false);
+    }
+    let actual_tree = git.run(&["rev-parse", &format!("{head}^{{tree}}")])?;
+    Ok(actual_tree == git.merge_tree(&intent.expected_old, &intent.verdict)?)
 }
 
 /// Test-only fault injection: stop right after the named phase boundary
@@ -1170,10 +1184,10 @@ fn effect_merge(
         let already = intent.merged.clone().filter(|merged| head == *merged);
         let merged = match already {
             Some(merged) => merged,
-            // The branch already holds V (a crash after the fast-forward, or
-            // an old-format record from before `merged` existed): record it
-            // and merge nothing again.
-            None if git.is_ancestor(&intent.verdict, &head)? => head.clone(),
+            // The branch already holds exactly the ref result (a crash after
+            // the update, or an old-format record from before `merged`
+            // existed): record it and merge nothing again.
+            None if is_unrecorded_merge_result(git, &intent, &head)? => head.clone(),
             None => {
                 let b = record
                     .expected_head
