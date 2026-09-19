@@ -53,8 +53,7 @@ pub struct RoleConfig {
     pub default: String,
     pub allowed: Vec<String>,
     pub escalate: Vec<String>,
-    /// The role's machine choice (SPEC-remote D2, §4.1). Empty means the
-    /// recipe's own row, then the project default.
+    /// The role's machine choice (SPEC-remote D2, §4.1). Empty means local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine: String,
 }
@@ -287,7 +286,6 @@ fn builtin_pi_recipes(
                 provider: row.provider.to_string(),
                 enabled: row.enabled,
                 plain: row.plain.to_string(),
-                machine: String::new(),
             },
         );
     }
@@ -334,7 +332,6 @@ fn parse_role(
                 .clone()
                 .filter(|plain| !plain.trim().is_empty())
                 .unwrap_or_else(|| "the usual helper".to_string()),
-            machine: raw.machine.clone().unwrap_or_default(),
         };
         recipes.insert(id.clone(), recipe);
         return Ok(RoleConfig {
@@ -677,17 +674,15 @@ pub fn resolve_launch(ctx: &Ctx, input: &ResolveInput) -> Result<Launch> {
     let config = parse_launch_config(&ctx.config_dir)?;
     let kinds = agent_kinds(ctx.env, ctx.runner)?;
     validate_config(&config, &kinds)?;
-    // The role's machine choice overrides its recipe's own row (SPEC-remote
-    // §4.1). An empty role row keeps the recipe's `machine`.
+    // The role row is the one machine switch (SPEC-remote §4.1). An empty
+    // role row keeps the launch local.
     let role_machine = config
         .roles
         .get(input.role)
         .map(|row| row.machine.clone())
         .unwrap_or_default();
     let finish = |mut launch: Launch| -> Launch {
-        if !role_machine.is_empty() {
-            launch.machine = role_machine.clone();
-        }
+        launch.machine = role_machine.clone();
         launch
     };
 
@@ -813,7 +808,7 @@ fn launch_from(recipe: &Recipe, policy_hash: &str, role: &str) -> Launch {
         recipe_id: String::new(),
         reason: String::new(),
         compact_reason: compact_reason(role, &recipe.plain),
-        machine: recipe.machine.clone(),
+        machine: String::new(),
     }
 }
 
