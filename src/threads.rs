@@ -99,8 +99,7 @@ pub struct StartArgs {
     pub plain: String,
     /// A roles-table row; `lane` when empty (SPEC-ADE D2).
     pub role: Option<String>,
-    /// `--recipe <id>`: pins one allowed recipe; the picker is skipped
-    /// (SPEC-jev-picker v2 §3 step 1).
+    /// `--recipe <id>`: pins one allowed recipe.
     pub recipe: Option<String>,
 }
 
@@ -205,9 +204,8 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("lane");
-    // The picker resolves and validates the launch before any tab or
-    // worktree exists, without the project lock (SPEC-jev-picker v2 §3 step
-    // 5, SPEC-ADE D2, item 48).
+    // The roles table resolves and validates the launch before any tab or
+    // worktree exists (SPEC-ADE D2, item 48).
     let project_pin = settings
         .roles
         .get(role)
@@ -216,24 +214,13 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             args: over.args.clone().unwrap_or_default(),
             ..crate::contracts::Recipe::default()
         });
-    let repo_name = Path::new(&repo)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned());
     let launch = crate::launch::resolve_launch(
         ctx,
-        &project,
         &crate::launch::ResolveInput {
             role,
-            task: &args.task,
             recipe: args.recipe.as_deref(),
             project_pin,
             sibling: None,
-            opted_in: settings.jev,
-            round: None,
-            title: Some(args.title.trim()),
-            sentence: Some(args.plain.trim()),
-            repo: repo_name.as_deref(),
-            policy: None,
         },
     )?;
     if launch.kind == "pi" {
@@ -1563,7 +1550,7 @@ mod tests {
         // Registered first: the first matching rule answers.
         world.runner.on(
             "agent start --help",
-            ok("      --kind <KIND>\n          [possible values: pi, claude, cursor]\n"),
+            ok("      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n"),
         );
         world.runner.on(
             "HERDR_ADE_LAUNCH",

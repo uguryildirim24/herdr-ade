@@ -524,9 +524,8 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         repo,
                         integration: branch,
                     },
-                    &crate::launch::PickerPair(crate::launch::parse_picker_config(
+                    &crate::launch::DialoguePair(crate::launch::parse_launch_config(
                         &ctx.config_dir,
-                        false,
                     )?),
                 )?;
                 println!("dialogue {} recorded on {}", d.topic, d.branch);
@@ -739,7 +738,7 @@ enum ThreadCommand {
         /// Role from the roles table (default: lane)
         #[arg(long, value_name = "ROLE")]
         role: Option<String>,
-        /// Pin this recipe; the picker is skipped
+        /// Pin this recipe from the role's allowed list
         #[arg(long, value_name = "ID")]
         recipe: Option<String>,
     },

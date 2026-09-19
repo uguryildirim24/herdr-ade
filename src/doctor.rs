@@ -312,7 +312,7 @@ fn report(
                 check(&mut out, row.ok, &row.label, row.detail.clone());
             }
         }
-        Err(error) => check(&mut out, Some(false), "picker", format!("{error:#}")),
+        Err(error) => check(&mut out, Some(false), "recipes", format!("{error:#}")),
     }
 
     // Machines that projects use need an SSH target for report and library copies.

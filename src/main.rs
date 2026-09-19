@@ -15,7 +15,6 @@ mod glossary;
 mod herdr;
 mod hook;
 mod inbox;
-mod jev;
 mod lane;
 mod launch;
 mod lifecycle;
