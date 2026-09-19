@@ -2192,7 +2192,7 @@ criteria = {{ true = "Web research with citations.", false = "Implementation, re
         let error = validate_config(&bad, &kinds).unwrap_err();
         assert!(error.to_string().contains("gate_is_default"), "{error:#}");
 
-        config.recipes.get_mut("cursor_grok_xhigh").unwrap().plain = "the biorhythm helper".into();
+        config.recipes.get_mut("cursor_grok_xhigh").unwrap().plain = "the zorbulate helper".into();
         let error = validate_config(&config, &kinds).unwrap_err();
         assert!(
             error.to_string().contains("recipe_reason_not_plain"),

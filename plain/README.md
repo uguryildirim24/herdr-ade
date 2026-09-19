@@ -5,14 +5,18 @@ The checker does not write them.
 
 ## `words.txt`
 
-Everyday English, 5000 words, lowercase, unique, sorted.
+Everyday English, 292747 words, lowercase, unique, sorted.
 
 - Source: SCOWL (Spell Checker Oriented Word Lists),
   <https://github.com/en-wl/wordlist> and <http://wordlist.aspell.net/>.
 - Version: SCOWL 2020.12.07 (`rel-2020.12.07`, commit `5ef55f9c4273`).
-- Cut: `final/english-words.10` (most common band: Moby 1000, Internet 1000,
-  and Brian Kelk frequency class 16) plus enough of `final/english-words.20`
-  (Kelk frequency classes 7–15) to reach 5000 ASCII alphabetic words.
+- Cut: every `final/*-words.<size>` and `final/*-contractions.<size>` band with
+  `size <= 80` (the huge cut), all spelling dialects (english, american,
+  british, british_z, canadian, australian and the variant bands). SCOWL's
+  bands are disjoint frequency bands, not nested files, so the list is their
+  union. Inflected and possessive forms come from the bands; a possessive's
+  base word is kept too. Only tokens of `[a-z]` plus interior `'` and `-` are
+  kept, so accented spellings and proper names are dropped.
 - Licence: the SCOWL collective-work grant (Copyright 2000-2018 Kevin
   Atkinson) permits use, copy, modify, distribute and sell of these word
   lists, provided the copyright notice and permission notice appear in
