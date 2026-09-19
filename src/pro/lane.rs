@@ -23,8 +23,7 @@ const READY_TIMEOUT_MS: u64 = 120_000;
 /// After the agent is ready, wait this long for Codex to write its session
 /// rollout. A trust prompt never creates one, so a missing rollout means the
 /// lane is not usable. The wait ends on an event; this is only the outer
-/// bound so nothing hangs forever. A lane recipe's `ready_timeout_ms`
-/// replaces it.
+/// bound so nothing hangs forever.
 const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The rollout poll interval.
@@ -45,9 +44,6 @@ pub struct StartOptions {
     /// Reference pictures Codex attaches at start (`--image`), used by the
     /// picture lane.
     pub images: Vec<PathBuf>,
-    /// The lane recipe's `ready_timeout_ms`, when the caller has one. `None`
-    /// uses [`ROLLOUT_TIMEOUT`].
-    pub ready_timeout_ms: Option<u64>,
 }
 
 /// The four `-c` overrides every Pro Codex process carries (spec Design,
@@ -318,16 +314,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// The outer bound for the rollout wait: the lane recipe's `ready_timeout_ms`
-/// when it carries one, else the shipped constant. Zero means "use the
-/// constant".
-fn rollout_timeout(recipe_ms: Option<u64>) -> Duration {
-    recipe_ms
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(ROLLOUT_TIMEOUT)
-}
-
 /// Poll for the rollout after the agent is ready. A trust prompt never writes
 /// one, so this is the second half of "never report ready before the session
 /// exists". The wait ends on the rollout, the trust prompt, a blocked agent or
@@ -494,10 +480,9 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         state: "ready".into(),
         stopped: false,
         last_turn: None,
-        ready_timeout_ms: opts.ready_timeout_ms,
     };
     if opts.profile.is_none() {
-        let timeout = rollout_timeout(opts.ready_timeout_ms);
+        let timeout = ROLLOUT_TIMEOUT;
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
             RolloutWait::Ready(_) => {}
             RolloutWait::TrustPrompt => {
@@ -652,7 +637,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     lane.state = "ready".into();
     lane.stopped = false;
     if lane.profile.is_none() {
-        let timeout = rollout_timeout(lane.ready_timeout_ms);
+        let timeout = ROLLOUT_TIMEOUT;
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
             RolloutWait::Ready(_) => {}
             RolloutWait::TrustPrompt => {
@@ -834,7 +819,6 @@ mod tests {
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
                 images: Vec::new(),
-                ready_timeout_ms: None,
             },
         )
         .unwrap_err();
@@ -885,7 +869,6 @@ mod tests {
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
                 images: Vec::new(),
-                ready_timeout_ms: None,
             },
         )
         .unwrap();
@@ -944,7 +927,6 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
-            ready_timeout_ms: None,
         }
     }
 
@@ -1029,6 +1011,7 @@ mod tests {
 
     #[test]
     fn the_outer_bound_still_fails_without_a_rollout() {
+        assert_eq!(ROLLOUT_TIMEOUT, Duration::from_secs(180));
         let dir = tempfile::tempdir().unwrap();
         let (env, _layout) = test_env(dir.path());
         let mut lane = test_lane(dir.path());
@@ -1074,14 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn the_bound_is_the_recipe_value_else_the_constant() {
-        assert_eq!(rollout_timeout(None), ROLLOUT_TIMEOUT);
-        assert_eq!(rollout_timeout(Some(0)), ROLLOUT_TIMEOUT);
-        assert_eq!(rollout_timeout(Some(45_000)), Duration::from_secs(45));
-        assert_eq!(ROLLOUT_TIMEOUT, Duration::from_secs(180));
-    }
-
-    #[test]
     fn reconcile_marks_a_dead_pane_gone_and_prints_one_line() {
         let dir = tempfile::tempdir().unwrap();
         let (env, layout) = test_env(dir.path());
@@ -1099,7 +1074,6 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
-            ready_timeout_ms: None,
         }
         .write(&layout)
         .unwrap();
@@ -1131,7 +1105,6 @@ mod tests {
             state: "ready".into(),
             stopped: false,
             last_turn: None,
-            ready_timeout_ms: None,
         }
         .write(&layout)
         .unwrap();
@@ -1169,7 +1142,6 @@ mod tests {
                 cwd: Some(cwd.display().to_string()),
                 profile: None,
                 images: Vec::new(),
-                ready_timeout_ms: None,
             },
         )
         .unwrap_err();
@@ -1206,7 +1178,6 @@ mod tests {
                 cwd: Some(dir.path().display().to_string()),
                 profile: None,
                 images: Vec::new(),
-                ready_timeout_ms: None,
             },
         )
         .unwrap_err();
@@ -1234,7 +1205,6 @@ mod tests {
             cwd: Some(dir.display().to_string()),
             profile: Some(home::IMAGE_PROFILE.into()),
             images,
-            ready_timeout_ms: None,
         }
     }
 
