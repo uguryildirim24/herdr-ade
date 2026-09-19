@@ -1202,7 +1202,7 @@ fn remote_world() -> (World, Project) {
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
     );
     (world, project)
 }
@@ -1293,7 +1293,7 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
         .on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{}}"#)));
     scripted.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
     );
     scripted.runner.on("ssh", ok("boot\tboot-1\nfree\t1\n"));
     scripted
@@ -1354,7 +1354,7 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
         .on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{"panes":[]}}"#)));
     scripted.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
     );
     scripted.runner.on("ssh", ok("boot\tboot-1\nfree\t1\n"));
     scripted
