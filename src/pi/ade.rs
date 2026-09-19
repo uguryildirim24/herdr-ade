@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].args.last().unwrap(),
-            "sh -c 'HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go'"
+            "sh -c 'PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go'"
         );
         drop(calls);
     }
