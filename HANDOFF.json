@@ -11,6 +11,7 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0015.md",
       "tasks/t-0014.md",
       "tasks/review-r7.md",
       "tasks/review-r6.md",
@@ -21,14 +22,14 @@
       "tasks/review-r4.md",
       "tasks/t-0010.md",
       "tasks/t-0009.md",
-      "tasks/t-0008.md",
-      "tasks/t-0007.md"
+      "tasks/t-0008.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r7.md",
       "tasks/reviews/code-r6.md",
       "tasks/reviews/code-r5.md",
       "tasks/reviews/code-r4.md",
@@ -39,16 +40,16 @@
       "tasks/reviews/code-plugin-r1-b.md"
     ]
   },
-  "generated": "2026-09-19T14:23:30-04:00",
+  "generated": "2026-09-19T14:27:19-04:00",
   "git": {
     "branches": [
       "main",
-      "hp/adeherdr/t-0014-review-r6-the-four-harness-fixes",
       "hp/adeherdr/t-0015-review-r7-the-picture-maker",
+      "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
+      "hp/adeherdr/t-0014-review-r6-the-four-harness-fixes",
       "review/r7",
       "hp/adeherdr/t-0013-gpt-image-gen-a-picture-profile-on-the-b",
       "review/r6",
-      "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
       "hp/adeherdr/t-0009-herdr-pro-v2-a-dedicated-pro-codex-home",
       "hp/adeherdr/t-0012-review-r5-the-worker-s-own-small-home",
       "review/r5",
@@ -66,22 +67,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
+      "885d1c2 Merge commit '38d04f92ee177119f28a58d5e9c0528ee5d80668'",
+      "38d04f9 docs(review): round r7 verdict",
+      "6269d09 review(pro): make picture calls isolated and repeatable",
+      "524b0f0 checkpoint(r6): HANDOFF after merging the round",
       "f32aa85 Merge commit '8bbc45191a635039dcc9c61eaed83953997ae1a0'",
-      "8bbc451 docs(review): round r6 verdict",
-      "89d545d review(r7): brief for revision 1",
-      "b694958 review(harness): reject unrecorded merge descendants",
-      "04fa700 review(harness): retain the moved merge head across retries",
-      "14de1cc review(harness): close panes after automatic resolution"
+      "8bbc451 docs(review): round r6 verdict"
     ],
-    "remote": "13 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "f32aa85",
+        "head": "885d1c2",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit '8bbc45191a635039dcc9c61eaed83953997ae1a0'"
+        "subject": "Merge commit '38d04f92ee177119f28a58d5e9c0528ee5d80668'"
       },
       {
         "branch": "review/r1",
@@ -170,9 +171,9 @@
       {
         "branch": "hp/adeherdr/t-0008-harness-fixes-resolve-closes-the-pane-me",
         "dirty": 0,
-        "head": "29bf80c",
+        "head": "524b0f0",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0008",
-        "subject": "fix(round): merge lands when the integration branch moved"
+        "subject": "checkpoint(r6): HANDOFF after merging the round"
       },
       {
         "branch": "hp/adeherdr/t-0009-herdr-pro-v2-a-dedicated-pro-codex-home",
@@ -218,10 +219,10 @@
       },
       {
         "branch": "hp/adeherdr/t-0015-review-r7-the-picture-maker",
-        "dirty": 4,
-        "head": "da5963c",
+        "dirty": 0,
+        "head": "38d04f9",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0015",
-        "subject": "Merge commit 'e45bb7a8bec36a133ccbbb823e0d82e9a49626e9' into hp/adeherdr/t-0015-review-r7-the-picture-maker"
+        "subject": "docs(review): round r7 verdict"
       }
     ]
   },
@@ -229,7 +230,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "done",
+      "status": "working",
       "workspace_id": "w1H"
     },
     {
@@ -246,34 +247,12 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r6",
-    "verdict": "8bbc45191a635039dcc9c61eaed83953997ae1a0"
+    "round": "r7",
+    "verdict": "38d04f92ee177119f28a58d5e9c0528ee5d80668"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0014",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0014",
-      "pane_id": "w1G:pP",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0014--/2026-09-19T18-11-40-064Z_01a0badd-e7a0-70e2-884a-bb1afd213989.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:tJ",
-      "tab_label": "t-0014",
-      "title": "π - t-0014",
-      "tokens": {
-        "done": "1",
-        "lane": "t-0014",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0014"
-      }
-    },
     {
       "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0015",
       "kind": "pi",
@@ -282,15 +261,17 @@
       "pane_label": null,
       "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0015--/2026-09-19T18-19-58-187Z_01a0bae5-816b-7060-a819-10bfd6174ecb.jsonl",
       "start_args": [],
-      "status": "working",
+      "status": "done",
       "tab_id": "w1G:tN",
       "tab_label": "t-0015",
       "title": "π - t-0015",
       "tokens": {
+        "done": "1",
+        "lane": "t-0015",
         "parent": "w1G:p1",
         "project": "adeherdr",
-        "rank": "3",
-        "review": "working",
+        "rank": "1",
+        "review": "ready-for-review",
         "thread": "t-0015"
       }
     }
@@ -298,6 +279,6 @@
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 4
+    "tabs": 3
   }
 }
