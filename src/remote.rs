@@ -262,6 +262,7 @@ pub fn ssh_courier(
     target: &str,
     control_dir: &Path,
     script: &str,
+    cursor: &str,
     timeout: Duration,
 ) -> Result<Output> {
     check_target(target)?;
@@ -270,7 +271,7 @@ pub fn ssh_courier(
     args.push("--".into());
     args.push(target.to_string());
     args.push(format!("sh -c {}", quote(script)));
-    runner.run(&Cmd::new("ssh", timeout).args(args))
+    runner.run(&Cmd::new("ssh", timeout).args(args).stdin(cursor))
 }
 
 /// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per

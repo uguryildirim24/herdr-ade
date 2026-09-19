@@ -147,6 +147,10 @@ enum Command {
     /// Run by herdr's action menu
     #[command(hide = true)]
     Action { id: String },
+    /// Recover an interrupted box completion before the courier reads the box
+    /// (run by the courier helper on the box)
+    #[command(hide = true)]
+    Recover,
     /// Run inside a plugin popup pane
     #[command(hide = true)]
     Pane { id: String },
@@ -1155,6 +1159,7 @@ pub fn run() -> Result<()> {
             },
         ),
         Command::Action { id } => actions::run_action(&ctx, &id),
+        Command::Recover => crate::ops::recover_box(&ctx),
         Command::Pane { id } => actions::run_pane(&ctx, &id),
         Command::Safety { command } => match command {
             SafetyCommand::Show { slug } => {
