@@ -966,7 +966,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
 /// Close the thread's pane and its tab through herdr, the same closing
 /// `herdr tab close <tab>` does. A tab herdr no longer knows, or a session it
 /// cannot reach, has nothing to close and is not an error.
-fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
+pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
     if record.tab_id.is_empty() {
         return Ok(false);
     }

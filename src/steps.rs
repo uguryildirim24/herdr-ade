@@ -643,11 +643,12 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
             t.id
         );
     }
-    thread::update(project, &t.id, |t| {
+    let resolved = thread::update(project, &t.id, |t| {
         t.status = Status::Resolved;
         t.resolved_reason = reason.to_string();
         t.prompt_pending = false;
     })?;
+    threads::close_pane(ctx, project, &resolved)?;
     Ok(true)
 }
 
