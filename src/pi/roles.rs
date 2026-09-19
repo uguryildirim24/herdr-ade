@@ -126,6 +126,15 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             true,
             "the long task helper",
         ),
+        recipe(
+            "pi_pro",
+            "pro",
+            "pro",
+            "high",
+            true,
+            true,
+            "the strongest paid chat model, used as a worker",
+        ),
     ]
 }
 
@@ -189,7 +198,7 @@ mod tests {
         let providers = enabled_providers();
         assert_eq!(
             providers,
-            vec!["opencode-go", "openai-codex", "kimi-coding"]
+            vec!["opencode-go", "openai-codex", "kimi-coding", "pro"]
         );
         assert!(!providers.contains(&"cursor"));
     }
