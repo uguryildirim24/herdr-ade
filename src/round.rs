@@ -685,6 +685,252 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
     Ok(record)
 }
 
+// ------------------------------------------------------------------ advance
+
+/// `ha round advance`: move every open round of the project forward, once.
+///
+/// Idempotent and safe to run any number of times. It runs `round review`
+/// and starts the reviewer only for a round whose members are all pinned and
+/// that has no review branch yet; a round never gets a second reviewer. A
+/// MERGE verdict is announced (inbox plus a `say` line) but never merged;
+/// any other verdict gets one inbox item. A reviewer thread that is gone
+/// becomes one inbox item. This is what the `pane.agent_status_changed` hook
+/// and the ticker call.
+pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    // One advance at a time, across processes (the hook and the ticker).
+    let _advance = advance_lock(&project)?;
+    let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+    let events = sealed_events(&project)?;
+    for listed in list(&project) {
+        let round = listed.round.clone();
+        if read_merge(&project, &round)?.is_some() {
+            continue;
+        }
+        // The pins are the input: refresh them before deciding.
+        {
+            let _lock = project.lock()?;
+            let mut record = load(&project, &round)?;
+            if refresh_pins(&project, &mut record, &events)? {
+                save(&project, &record)?;
+            }
+        }
+        let record = load(&project, &round)?;
+        if record.review_branch.is_none() {
+            let ready = !record.manifest.members.is_empty()
+                && record.manifest.members.iter().all(|m| m.pin.is_some());
+            if !ready {
+                continue;
+            }
+            let outcome = review(ctx, slug, &round)?;
+            match start_reviewer(ctx, &project, &round, &outcome.review_branch, &prefix) {
+                Ok(thread) => {
+                    bind_reviewer(ctx, slug, &round, &thread.id)?;
+                }
+                Err(error) => announce_once(
+                    ctx,
+                    &project,
+                    &round,
+                    "reviewer-start-failed",
+                    &format!(
+                        "Round {round}: the reviewer thread did not start ({error:#}); start it by hand from `{}`",
+                        outcome.review_branch
+                    ),
+                    None,
+                )?,
+            }
+            continue;
+        }
+        let Some(reviewer) = record.reviewer.clone() else {
+            // The review branch exists but no reviewer was ever bound (for
+            // example, `round review` was run by hand). Leave it to the
+            // coordinator; `round review`/`round reviewer` stay manual.
+            continue;
+        };
+        let git = Git::new(ctx.runner, &record.repo);
+        if let Some(verdict) = read_verdict(&project, &record, &git) {
+            announce_once(
+                ctx,
+                &project,
+                &round,
+                &format!("verdict:{verdict}"),
+                &verdict_summary(&round, &verdict),
+                (verdict == "MERGE").then(|| verdict_say(&record)),
+            )?;
+            continue;
+        }
+        if reviewer_gone(ctx, &project, &reviewer) {
+            let base = record.review_branch.as_deref().unwrap_or("review/<round>");
+            announce_once(
+                ctx,
+                &project,
+                &round,
+                &format!("reviewer-gone:{reviewer}"),
+                &format!(
+                    "Round {round}: the reviewer thread {reviewer} is gone; start a new reviewer by hand with `{prefix} thread start {slug} --role reviewer --base {base}`, then `{prefix} round reviewer {slug} {round} <thread>`"
+                ),
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The hook's entry point: advance the project whose coordinator or thread
+/// the event's pane belongs to, or every project when it belongs to none.
+/// A lane lives in its own workspace, so its thread record is the map from
+/// the envelope to the project.
+pub fn advance_event(ctx: &Ctx) -> Result<()> {
+    let workspace = ctx.env.var("HERDR_WORKSPACE_ID");
+    let pane = ctx.env.var("HERDR_PANE_ID");
+    let slugs = project::list_slugs(&ctx.root);
+    let mut matched = Vec::new();
+    for slug in &slugs {
+        let project = Project::load(&ctx.root, slug)?;
+        let by_coordinator = project.coordinator().is_some_and(|record| {
+            workspace.is_some_and(|w| record.workspace_id == w)
+                || pane.is_some_and(|p| record.pane_id == p)
+        });
+        let by_thread = thread::list(&project).iter().any(|t| {
+            workspace.is_some_and(|w| t.workspace_id == w) || pane.is_some_and(|p| t.pane_id == p)
+        });
+        if by_coordinator || by_thread {
+            matched.push(slug.clone());
+        }
+    }
+    let targets = if matched.is_empty() { slugs } else { matched };
+    for slug in targets {
+        advance(ctx, &slug)?;
+    }
+    Ok(())
+}
+
+fn advance_lock(project: &Project) -> Result<std::fs::File> {
+    let dir = project.state_dir();
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("advance.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// The reviewer task: the review brief, the pinned members with their report
+/// paths, and the round's gates. No project-specific prose.
+fn start_reviewer(
+    ctx: &Ctx,
+    project: &Project,
+    round: &str,
+    review_branch: &str,
+    prefix: &str,
+) -> Result<thread::Thread> {
+    let record = load(project, round)?;
+    let task = reviewer_task(project, &record, prefix)?;
+    crate::threads::start(
+        ctx,
+        &project.slug,
+        crate::threads::StartArgs {
+            title: format!("Review {round}: {}", record.plain),
+            repo: (!record.repo.is_empty()).then(|| record.repo.clone()),
+            machine: None,
+            base: Some(review_branch.to_string()),
+            task,
+            plain: record.plain.clone(),
+            role: Some("reviewer".into()),
+            recipe: None,
+        },
+    )
+}
+
+fn reviewer_task(project: &Project, record: &RoundRecord, prefix: &str) -> Result<String> {
+    let events = sealed_events(project)?;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Run `{prefix} skill reviewer`, then read `{}` and do what it says.\n\n",
+        review_brief_path(&record.round)
+    ));
+    out.push_str("## Pinned lanes and their reports\n\n");
+    for member in &record.manifest.members {
+        let pin = member.pin.as_ref().context("round_not_complete")?;
+        let report = events
+            .iter()
+            .find(|event| event.id == pin.event)
+            .and_then(|event| event.payload.done.as_ref())
+            .map(|done| done.report_path.clone())
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- {}: sha `{}`, report `{}`\n",
+            member.thread, pin.sha, report
+        ));
+    }
+    out.push_str("\n## Gates\n\n");
+    if record.gates.is_empty() {
+        out.push_str("- (none listed in PROJECT.md)\n");
+    }
+    for gate in &record.gates {
+        out.push_str(&format!("- `{gate}`\n"));
+    }
+    Ok(out)
+}
+
+fn verdict_summary(round: &str, verdict: &str) -> String {
+    match verdict {
+        "MERGE" => format!("Round {round} has a merge verdict; run `round merge {round}`"),
+        other => format!("Round {round} has a {other} verdict; read the review and decide"),
+    }
+}
+
+/// A `say` line that passes the plain check: the round is a born name, so it
+/// is written in its gloss form and the command stays in the inbox item.
+fn verdict_say(record: &RoundRecord) -> String {
+    format!(
+        "{} ({}) It has a merge verdict.",
+        record.plain.trim(),
+        record.round
+    )
+}
+
+/// True when the reviewer thread is gone: its record is missing, it is
+/// resolved, or its pane closed after it was launched.
+fn reviewer_gone(ctx: &Ctx, project: &Project, reviewer: &str) -> bool {
+    let rows = crate::threads::rows(ctx, project);
+    match rows.iter().find(|row| row.thread.id == reviewer) {
+        None => true,
+        Some(row) => {
+            row.group == thread::Group::Resolved
+                || (!row.thread.prompt_pending && row.note == "pane closed")
+        }
+    }
+}
+
+/// Writes the one inbox item (and, for a merge verdict, the one `say` line)
+/// for a state. The state is recorded first, so a crash cannot announce twice.
+fn announce_once(
+    ctx: &Ctx,
+    project: &Project,
+    round: &str,
+    token: &str,
+    summary: &str,
+    say_what: Option<String>,
+) -> Result<()> {
+    {
+        let _lock = project.lock()?;
+        let mut record = load(project, round)?;
+        if record.announced.as_deref() == Some(token) {
+            return Ok(());
+        }
+        record.announced = Some(token.to_string());
+        save(project, &record)?;
+    }
+    crate::inbox::write(project, "round-advance", round, summary, "")?;
+    if let Some(what) = say_what {
+        let _ = crate::ask::say(ctx, &project.slug, &what, None);
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------- review
 
 pub fn review_brief_path(round: &str) -> String {
@@ -1078,6 +1324,14 @@ pub fn validate_verdict(git: &Git, record: &RoundRecord, v: &str) -> Result<Stri
         }
     }
     Ok(c)
+}
+
+/// The verdict recorded by the reviewer's sealed `done` sha, when it parses.
+/// Read-only: it never merges and never fails a round.
+pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Option<String> {
+    let v = verdict_commit(project, record).ok()?;
+    let text = git.show_file(&v, &verdict_path(&record.round)).ok()??;
+    parse_verdict(&text).ok().map(|v| v.verdict)
 }
 
 /// `ha round merge` (D6, item 34). Resumes from `merge.toml` when present.
@@ -1642,6 +1896,10 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             }
             _ => {}
         }
+    }
+    // The safety net for a missed hook: one advance pass per tick.
+    if let Err(error) = advance(ctx, &project.slug) {
+        eprintln!("round advance: {error:#}");
     }
     let _ = crate::ask::tick(ctx, project);
     let _ = crate::talk::tick(ctx, project);
@@ -2461,5 +2719,99 @@ mod tests {
     fn fence_is_longer_than_any_inner_run() {
         assert_eq!(fence_for("plain"), "```");
         assert_eq!(fence_for("a ```` b"), "`````");
+    }
+
+    /// The `advance` proof: two pinned lanes get one reviewer thread, and a
+    /// second `advance` changes nothing.
+    #[test]
+    fn advance_starts_one_reviewer_and_never_a_second() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        // A reviewer role that needs no pi login.
+        std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
+        std::fs::write(
+            fx.world.home.path().join("cfg/config.toml"),
+            "[roles.reviewer]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
+        )
+        .unwrap();
+        fx.world.runner.on(
+            "agent start --help",
+            crate::runner::fake::ok(
+                "      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n",
+            ),
+        );
+        fx.world.runner.on(
+            "tab create",
+            crate::runner::fake::ok(
+                r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
+            ),
+        );
+
+        open_r1(&fx);
+        let lanes = vec![fx.lane(1), fx.lane(2)];
+        for (id, sha) in &lanes {
+            admit(&ctx, "demo", "r1", id).unwrap();
+            fx.seal_done(id, 1, 1, sha, &format!("# report {id}\n"));
+        }
+
+        advance(&ctx, "demo").unwrap();
+
+        let record = load(&fx.project, "r1").unwrap();
+        let branch = record.review_branch.clone().expect("review ran");
+        assert!(branch.starts_with("review/r1"), "{branch}");
+        let reviewer = record.reviewer.clone().expect("reviewer bound");
+        let started = thread::load(&fx.project, &reviewer).unwrap();
+        assert_eq!(started.role, "reviewer");
+        assert_eq!(started.title, format!("Review r1: {PLAIN}"));
+        assert!(!started.base.is_empty(), "the reviewer has a base commit");
+
+        let task = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer)).unwrap();
+        assert!(task.contains("skill reviewer"), "{task}");
+        assert!(task.contains("tasks/review-r1.md"), "{task}");
+        for (id, sha) in &lanes {
+            assert!(task.contains(id), "{task}");
+            assert!(task.contains(sha), "{task}");
+            assert!(task.contains(&format!(".reports/{id}.md")), "{task}");
+        }
+
+        advance(&ctx, "demo").unwrap();
+        let again = load(&fx.project, "r1").unwrap();
+        assert_eq!(again.reviewer, Some(reviewer.clone()));
+        assert_eq!(again.review_branch, Some(branch));
+        let reviewers = thread::list(&fx.project)
+            .into_iter()
+            .filter(|t| t.role == "reviewer")
+            .count();
+        assert_eq!(reviewers, 1, "one reviewer per round, ever");
+    }
+
+    /// A MERGE verdict is announced once: one inbox item and one `say` line.
+    #[test]
+    fn advance_announces_a_merge_verdict_once() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+
+        advance(&ctx, "demo").unwrap();
+        let announcements = |project: &Project| {
+            crate::inbox::unhandled(project)
+                .into_iter()
+                .filter(|item| item.kind == "round-advance")
+                .count()
+        };
+        assert_eq!(announcements(&fx.project), 1);
+        let says = crate::talk::read(&fx.project)
+            .lines
+            .iter()
+            .filter(|line| {
+                matches!(&line.entry, crate::talk::Entry::Say { what, .. } if what.contains("merge verdict"))
+            })
+            .count();
+        assert_eq!(says, 1, "one say line for the verdict");
+
+        // The same verdict is never announced twice.
+        advance(&ctx, "demo").unwrap();
+        assert_eq!(announcements(&fx.project), 1);
     }
 }

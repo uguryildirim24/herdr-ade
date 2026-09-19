@@ -294,6 +294,10 @@ pub struct RoundRecord {
     /// The reviewer thread whose sealed `done` sha is `V` (SPEC-ADE D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<String>,
+    /// What `round advance` last announced for this round (a verdict or a
+    /// gone reviewer), so each state is announced once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announced: Option<String>,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
@@ -547,6 +551,7 @@ mod tests {
             frozen_revision: Some(2),
             review_branch: Some("review/r1".into()),
             reviewer: Some("t-0003".into()),
+            announced: Some("verdict:MERGE".into()),
         });
         both(&MergeIntent {
             op: "merge-r1".into(),
