@@ -21,6 +21,7 @@ pub mod home;
 pub mod image;
 pub mod lane;
 pub mod packet;
+pub mod provider;
 pub mod state;
 pub mod turn;
 
