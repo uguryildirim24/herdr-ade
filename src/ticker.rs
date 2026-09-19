@@ -701,14 +701,16 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
 }
 
 /// One remote machine: one `agent list` (and `pane list`) through
-/// `herdr --machine`, one ssh call for every report hash, then the same thread
-/// pass, copies and launches as for local threads. If the machine cannot be
-/// reached nothing is read: no state, no group change, no copy, no inbox item.
+/// `herdr --machine`, then the same thread pass and launches as for local
+/// threads. The report bytes, sealed events and boot id arrive through the
+/// courier (the second lane); this pass never reads a report hash or copies a
+/// file. If the machine cannot be reached nothing is read: no state, no group
+/// change, no inbox item.
 fn remote_pass(
     pass: &LaunchPass<'_>,
     machine: &str,
     may_start: &mut bool,
-    copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>,
+    _copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>,
     errors: &mut Vec<anyhow::Error>,
 ) -> Result<Vec<Transition>, String> {
     let ctx = pass.ctx;
@@ -718,55 +720,11 @@ fn remote_pass(
     let remote = herdr.on_machine(machine);
     let agents = remote.agent_list().map_err(|e| e.to_string())?;
     let panes = remote.pane_list().map_err(|e| e.to_string())?;
-    let target =
-        crate::remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)
-            .map_err(|e| format!("{e:#}"))?;
-    let dirs: Vec<(String, String)> = threads
-        .iter()
-        .filter(|t| !t.thread_dir.is_empty())
-        .map(|t| (t.id.clone(), t.thread_dir.clone()))
-        .collect();
-    let hashes =
-        crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
     let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
-    let pass = thread_pass(
-        project,
-        &prefix,
-        &remote,
-        threads,
-        &agents,
-        &panes,
-        Some(&hashes),
-    )
-    .map_err(|e| format!("{e:#}"))?;
+    let pass = thread_pass(project, &prefix, &remote, threads, &agents, &panes, None)
+        .map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
-
-    for t in threads {
-        let Some(hash) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
-            continue;
-        };
-        let copied = thread::copy_home_remote(project, t, true, ctx.runner, &target);
-        match copied.outcome {
-            thread::CopyOutcome::Failed(error) => errors.push(anyhow::anyhow!(
-                "{}: copy from {machine} failed: {error}",
-                t.id
-            )),
-            outcome => {
-                if let thread::CopyOutcome::Partial(notes) = outcome {
-                    copy_notes.insert(t.id.clone(), notes);
-                }
-                let hash = copied.report_hash.unwrap_or_else(|| hash.clone());
-                errors.extend(
-                    thread::update(project, &t.id, |t| {
-                        t.report_hash = hash;
-                        t.last_report_change = project::now();
-                    })
-                    .err(),
-                );
-            }
-        }
-    }
     launch_pass(
         &LaunchPass {
             ctx,

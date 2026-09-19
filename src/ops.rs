@@ -140,6 +140,33 @@ pub fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
     Ok(op)
 }
 
+/// The published lane ref must equal `sha` before a box `done` stages
+/// (SPEC-remote §4.3): one `git ls-remote` against the URL-matched remote.
+pub fn check_published_ref(
+    runner: &dyn Runner,
+    worktree: &Path,
+    branch: &str,
+    publish_url: &str,
+    sha: &str,
+) -> Result<()> {
+    let out = runner.run(
+        &Cmd::new("git", std::time::Duration::from_secs(30))
+            .args(["-C", &worktree.to_string_lossy()])
+            .args(["ls-remote", publish_url, &format!("refs/heads/{branch}")]),
+    )?;
+    if !out.success() {
+        bail!("published_ref_check_failed: {}", out.error_text());
+    }
+    let found = out.stdout.split_whitespace().next().unwrap_or("");
+    if found.is_empty() {
+        bail!("lane_ref_not_published: `{branch}` is not on {publish_url}");
+    }
+    if found != sha {
+        bail!("published_ref_mismatch: `{branch}` is {found} on {publish_url}, not {sha}");
+    }
+    Ok(())
+}
+
 /// Stage a `done` without the project lock. Git is invoked only here, then the
 /// revision-1 marker is advanced under the lock.
 pub fn stage_done(project: &Project, id: &str, worktree: &Path, runner: &dyn Runner) -> Result<Op> {

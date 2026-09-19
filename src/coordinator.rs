@@ -174,6 +174,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         "coordinator",
         launch.attempt,
         &launch.brief_hash,
+        "",
         &spec,
     );
     let (workspace_id, tab_id, pane_id) = if let Some(record) = reusable {

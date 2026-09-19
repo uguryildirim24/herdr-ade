@@ -100,6 +100,11 @@ enum Command {
         #[command(subcommand)]
         command: ThreadCommand,
     },
+    /// Hold or release new box-lane starts on a saved machine (SPEC-remote §2.4)
+    Machine {
+        #[command(subcommand)]
+        command: MachineCommand,
+    },
     /// Routines: scheduled prompts and watched commands
     Routine {
         #[command(subcommand)]
@@ -724,7 +729,7 @@ enum ThreadCommand {
         title: String,
         #[arg(long, value_name = "PATH")]
         repo: Option<String>,
-        #[arg(long, value_name = "LABEL")]
+        #[arg(long, value_name = "LABEL|ID|local")]
         machine: Option<String>,
         /// The integration branch the brief is committed on (default: the checked-out branch)
         #[arg(long, value_name = "BRANCH")]
@@ -808,6 +813,14 @@ fn read_text(file: &str) -> Result<String> {
     } else {
         std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("could not read {file}: {e}"))
     }
+}
+
+#[derive(Subcommand)]
+enum MachineCommand {
+    /// Refuse new box-lane starts on this machine
+    Hold { machine: String },
+    /// Allow new box-lane starts again
+    Release { machine: String },
 }
 
 #[derive(Subcommand)]
@@ -948,6 +961,25 @@ pub fn run() -> Result<()> {
                     .and_then(|record| pane.as_deref().map(|pane| (pane, record.attempt())));
                 let moved = inbox::done_bound(&project, &ids, all, binding)?;
                 println!("{moved} item(s) moved to inbox/done");
+                Ok(())
+            }
+        },
+        Command::Machine { command } => match command {
+            MachineCommand::Hold { machine } => {
+                let path = project::machine_hold(&ctx.root, &machine)?;
+                println!(
+                    "machine `{machine}` is held; new box starts are refused ({})",
+                    path.display()
+                );
+                Ok(())
+            }
+            MachineCommand::Release { machine } => {
+                let removed = project::machine_release(&ctx.root, &machine)?;
+                if removed {
+                    println!("machine `{machine}` is released");
+                } else {
+                    println!("machine `{machine}` was not held");
+                }
                 Ok(())
             }
         },

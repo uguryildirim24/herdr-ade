@@ -54,6 +54,10 @@ pub struct Thread {
     pub branch: String,
     pub base: String,
     pub machine: String,
+    /// The stable saved-profile id the lane resolved to (SPEC-remote §4.1).
+    /// Empty on a local lane; a renamed label does not change it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine_id: String,
     pub worktree_path: String,
     pub thread_dir: String,
     pub workspace_id: String,
@@ -218,6 +222,15 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     let id = &t.id;
     let role = if t.role.is_empty() { "lane" } else { &t.role };
+    if t.is_remote() {
+        // The box lane runs the plugin on the box, so the birth line carries
+        // the fixed box prefix, never the Mac's `current_exe` (D12/D14).
+        return format!(
+            "Run {} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.",
+            crate::contracts::box_prefix(),
+            t.machine
+        );
+    }
     match t.kind {
         Kind::Worktree if !t.is_remote() => {
             format!("Run {prefix} skill {role}, then read tasks/{id}.md and do what it says.")
@@ -700,129 +713,6 @@ pub fn copy_home_local(
         }
     }
 
-    let outcome = if notes.is_empty() {
-        CopyOutcome::Complete
-    } else {
-        CopyOutcome::Partial(notes)
-    };
-    Copied {
-        outcome,
-        report_hash,
-    }
-}
-
-/// The same copy for a thread on a saved machine: the report with `scp`, the
-/// library with rsync over ssh, after checking on the machine (without
-/// following links) what is a real directory and a regular file.
-pub fn copy_home_remote(
-    project: &Project,
-    thread: &Thread,
-    with_library: bool,
-    runner: &dyn Runner,
-    target: &str,
-) -> Copied {
-    use crate::remote;
-    let failed = |error: String| Copied {
-        outcome: CopyOutcome::Failed(error),
-        report_hash: None,
-    };
-    if thread.thread_dir.is_empty() {
-        return Copied {
-            outcome: CopyOutcome::Complete,
-            report_hash: None,
-        };
-    }
-    let found = match remote::layout(runner, target, &thread.thread_dir) {
-        Ok(found) => found,
-        Err(error) => return failed(format!("{error:#}")),
-    };
-    if found.absent {
-        return Copied {
-            outcome: CopyOutcome::Complete,
-            report_hash: None,
-        };
-    }
-    if !found.dir_ok {
-        return Copied {
-            outcome: CopyOutcome::Partial(vec![format!(
-                "{} on {target} is a symbolic link; nothing was copied",
-                thread.thread_dir
-            )]),
-            report_hash: None,
-        };
-    }
-    let mut notes = Vec::new();
-    let mut report_hash = None;
-    if found.report_ok {
-        let tmp = project.dir().join("threads").join(format!(
-            ".{}.fetch.{}.tmp",
-            thread.id,
-            std::process::id()
-        ));
-        let fetched = remote::fetch_file(runner, target, &thread.report_path(), &tmp)
-            .and_then(|()| Ok(std::fs::read(&tmp)?));
-        let _ = std::fs::remove_file(&tmp);
-        match fetched {
-            Ok(bytes) => {
-                let written = project
-                    .lock()
-                    .and_then(|_lock| write_atomic(&home_report_path(project, &thread.id), &bytes));
-                if let Err(error) = written {
-                    return failed(format!("{error:#}"));
-                }
-                report_hash = Some(sha256_hex(&bytes));
-            }
-            Err(error) => return failed(format!("{error:#}")),
-        }
-    } else if found.report_is_other {
-        notes.push(format!(
-            "{} on {target} is not a regular file; it was not copied",
-            thread.report_path()
-        ));
-    }
-
-    if with_library {
-        if found.library_is_link {
-            notes.push(format!(
-                "{} on {target} is a symbolic link; the library was not copied",
-                thread.library_path()
-            ));
-        } else if found.library_ok && found.library_kb > LIBRARY_CAP_KB {
-            notes.push(format!(
-                "the library is {} MB, over the {} MB cap; nothing from it was copied",
-                found.library_kb / 1024,
-                LIBRARY_CAP_KB / 1024
-            ));
-        } else if found.library_ok {
-            notes.extend(
-                found
-                    .symlinks
-                    .iter()
-                    .map(|p| format!("{p} is a symbolic link; it was not copied")),
-            );
-            let target_dir = project.dir().join("library").join(&thread.id);
-            let made = project.lock().and_then(|_lock| {
-                if !target_dir.is_dir() {
-                    std::fs::create_dir(&target_dir)?;
-                }
-                Ok(())
-            });
-            if let Err(error) = made {
-                return Copied {
-                    outcome: CopyOutcome::Failed(format!("{error:#}")),
-                    report_hash,
-                };
-            }
-            if let Err(error) =
-                remote::fetch_dir(runner, target, &thread.library_path(), &target_dir)
-            {
-                return Copied {
-                    outcome: CopyOutcome::Failed(format!("{error:#}")),
-                    report_hash,
-                };
-            }
-        }
-    }
     let outcome = if notes.is_empty() {
         CopyOutcome::Complete
     } else {

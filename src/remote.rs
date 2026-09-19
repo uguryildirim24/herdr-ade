@@ -1,5 +1,6 @@
-//! ssh, scp and rsync to saved machines, and the one quoting helper. No other
-//! code builds a string that a shell will parse.
+//! ssh, scp and the one quoting helper, plus the box provision call and the
+//! courier's scp ingress options. No other code builds a string that a shell
+//! will parse.
 
 use std::path::Path;
 use std::time::Duration;
@@ -7,10 +8,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::contracts::{BOX_REPOS, BoxRepoMap, MACHINE_LOCAL, MachineProfile};
 use crate::runner::{Cmd, Output, Runner};
 
 pub const SSH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
+#[allow(dead_code)]
 pub const COPY_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_OPTIONS: [&str; 4] = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"];
 
@@ -42,6 +45,8 @@ struct SavedMachine {
     label: String,
     #[serde(default)]
     target: String,
+    #[serde(default)]
+    session: String,
 }
 
 /// The SSH target of a saved machine: from `herdr machine list --json`, else
@@ -52,12 +57,7 @@ pub fn ssh_target(
     config_dir: &Path,
     machine: &str,
 ) -> Result<String> {
-    let listed = runner
-        .run(&Cmd::new(herdr_bin, SSH_TIMEOUT).args(["machine", "list", "--json"]))
-        .ok()
-        .filter(Output::success)
-        .and_then(|out| serde_json::from_str::<Vec<SavedMachine>>(&out.stdout).ok())
-        .unwrap_or_default();
+    let listed = saved_machines(runner, herdr_bin);
     if let Some(found) = listed
         .iter()
         .find(|m| m.label == machine || m.id == machine)
@@ -67,6 +67,58 @@ pub fn ssh_target(
     }
     configured_target(config_dir, machine)
         .with_context(|| format!("machine `{machine}` has no SSH target: it is not in `herdr machine list`, and config.toml has no [machines.{machine}] ssh"))
+}
+
+/// The stable profile of one saved machine (SPEC-remote §4.1). `local` is a
+/// real profile with no SSH target.
+pub fn machine_profile(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    config_dir: &Path,
+    machine: &str,
+) -> Result<MachineProfile> {
+    if machine.is_empty() || machine == MACHINE_LOCAL {
+        return Ok(MachineProfile {
+            id: MACHINE_LOCAL.into(),
+            label: MACHINE_LOCAL.into(),
+            target: String::new(),
+            session: String::new(),
+        });
+    }
+    if let Some(found) = saved_machines(runner, herdr_bin)
+        .into_iter()
+        .find(|m| m.label == machine || m.id == machine)
+    {
+        return Ok(MachineProfile {
+            id: if found.id.is_empty() {
+                found.label.clone()
+            } else {
+                found.id
+            },
+            label: found.label,
+            target: found.target,
+            session: found.session,
+        });
+    }
+    // A `[machines.<label>] ssh` row without a saved profile: the label is
+    // both identity and name.
+    let target = configured_target(config_dir, machine)
+        .with_context(|| format!("machine `{machine}` is not a saved profile"))?;
+    Ok(MachineProfile {
+        id: machine.to_string(),
+        label: machine.to_string(),
+        target,
+        session: "default".into(),
+    })
+}
+
+fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Vec<SavedMachine> {
+    runner
+        .run(&Cmd::new(herdr_bin, SSH_TIMEOUT).args(["machine", "list", "--json"]))
+        .ok()
+        .filter(Output::success)
+        .and_then(|out| serde_json::from_str::<Vec<SavedMachine>>(&out.stdout).ok())
+        .unwrap_or_default()
 }
 
 fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
@@ -87,6 +139,51 @@ fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
         .remove(machine)
         .map(|e| e.ssh)
         .filter(|s| !s.is_empty())
+}
+
+/// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box
+/// path is never derived from the Mac path.
+pub fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
+    BOX_REPOS.iter().find(|row| row.mac == mac_path)
+}
+
+/// The URL-matched remote name in `repo`, never by remote name alone. An
+/// `origin` pointing upstream is only a fallback when nothing matches. The
+/// second lane's courier calls this to fetch the lane commit (SPEC-remote
+/// §4.3); the start side pushes by URL directly.
+#[allow(dead_code)]
+pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
+    let out = runner.run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote"]))?;
+    if !out.success() {
+        bail!("git remote in {repo}: {}", out.error_text());
+    }
+    let mut fallback = String::new();
+    for name in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let got = runner
+            .run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote", "get-url", name]))?;
+        let got = got.stdout.trim().to_string();
+        if same_url(&got, url) {
+            return Ok(name.to_string());
+        }
+        if name == "origin" {
+            fallback = name.to_string();
+        }
+    }
+    if fallback.is_empty() {
+        bail!("no_url_remote: {repo} has no remote whose URL is {url}");
+    }
+    Ok(fallback)
+}
+
+#[allow(dead_code)]
+fn same_url(a: &str, b: &str) -> bool {
+    fn norm(url: &str) -> String {
+        url.trim()
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_string()
+    }
+    norm(a) == norm(b)
 }
 
 fn check_target(target: &str) -> Result<()> {
@@ -121,169 +218,106 @@ pub fn ssh(
     runner.run(&cmd)
 }
 
-/// Origin URL and base ref of a repository on the machine, after a fetch whose
-/// failure is not an error. One ssh call.
-pub fn repo_info(
-    runner: &dyn Runner,
-    target: &str,
-    repo: &str,
-    base: &str,
-) -> Result<(String, String)> {
+/// One box start's git effect (SPEC-remote §4.2 step 3): the box fetches the
+/// lane branch, verifies `FETCH_HEAD = B`, and creates the worktree from it
+/// under the box clone. One SSH call; nothing is copied.
+pub struct Provision<'a> {
+    pub box_repo: &'a str,
+    pub worktree: &'a str,
+    pub branch: &'a str,
+    pub base: &'a str,
+    pub publish_url: &'a str,
+}
+
+pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Result<()> {
     let script = format!(
-        "cd {repo} && git rev-parse --show-toplevel >/dev/null || exit 3\n\
-         o=$(git remote get-url origin 2>/dev/null || true)\n\
-         if [ -n \"$o\" ]; then git fetch origin >/dev/null 2>&1 || true; fi\n\
-         b={base}\n\
-         if [ -z \"$b\" ]; then b=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || git rev-parse --abbrev-ref HEAD); fi\n\
-         if [ \"$b\" = HEAD ]; then b=$(git rev-parse HEAD); fi\n\
-         printf '%s\\n%s\\n' \"$o\" \"$b\"",
-        repo = quote(repo),
-        base = quote(base),
+        "set -e\n\
+         cd {repo} || exit 3\n\
+         git rev-parse --show-toplevel >/dev/null || exit 3\n\
+         git fetch --quiet {url} {branch} || exit 4\n\
+         test \"$(git rev-parse FETCH_HEAD)\" = {base} || {{ echo fetch_head_mismatch >&2; exit 5; }}\n\
+         if [ ! -d {wt} ]; then\n\
+           if git show-ref --verify --quiet {ref}; then\n\
+             git worktree add --quiet {wt} {branch}\n\
+           else\n\
+             git worktree add --quiet -b {branch} {wt} FETCH_HEAD\n\
+             git branch --set-upstream-to=origin/{branch} {branch} >/dev/null 2>&1 || true\n\
+           fi\n\
+         fi\n\
+         test -d {wt} || {{ echo worktree_missing >&2; exit 6; }}\n\
+         git -C {wt} rev-parse HEAD\n",
+        repo = quote(req.box_repo),
+        wt = quote(req.worktree),
+        branch = quote(req.branch),
+        base = quote(req.base),
+        url = quote(req.publish_url),
+        ref = quote(&format!("refs/heads/{}", req.branch)),
     );
     let out = ssh(runner, target, &script, None, SSH_START_TIMEOUT)?;
     if !out.success() {
-        bail!(
-            "{repo} on {target} is not a usable git repository: {}",
-            out.error_text()
-        );
+        bail!("box provision on {target} failed: {}", out.error_text());
     }
-    let mut lines = out.stdout.lines();
-    let origin = lines.next().unwrap_or("").trim().to_string();
-    let base = lines.next().unwrap_or("").trim().to_string();
-    if base.is_empty() {
-        bail!("could not find a base ref in {repo} on {target}");
-    }
-    Ok((origin, base))
+    Ok(())
 }
 
-/// Creates the thread directory, keeps it out of git, and writes the brief
-/// from standard input. One ssh call, so handshakes do not eat the start budget.
-pub fn write_brief(
+/// The box's lane card: created after the pane id exists (SPEC-remote §4.2
+/// step 5). One SSH call, card bytes on stdin. A minimal `PROJECT.md` is
+/// written when the box has none, so the box's own `ha` can resolve it.
+pub fn provision_card(
     runner: &dyn Runner,
     target: &str,
-    cwd: &str,
-    thread_dir: &str,
-    brief: &str,
+    slug: &str,
+    path: &str,
+    card: &str,
 ) -> Result<()> {
+    let lanes_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+    let project_dir = lanes_dir.rsplit_once('/').map_or(lanes_dir, |(d, _)| d);
+    let project_md = format!("{project_dir}/PROJECT.md");
+    let state_dir = format!("{project_dir}/.state");
     let script = format!(
         "set -e\n\
-         d={dir}\n\
-         mkdir -p \"$d/library\"\n\
-         cd {cwd}\n\
-         if ex=$(git rev-parse --git-path info/exclude 2>/dev/null); then\n\
-           mkdir -p \"$(dirname \"$ex\")\"\n\
-           grep -qxF '.herdr-project/' \"$ex\" 2>/dev/null || printf '%s\\n' '.herdr-project/' >> \"$ex\"\n\
-         fi\n\
-         cat > \"$d/brief.md\"",
-        dir = quote(thread_dir),
-        cwd = quote(cwd),
+         mkdir -p \"$(dirname {path})\"\n\
+         mkdir -p {state_dir}\n\
+         cat > {path}\n\
+         pm={pm}\n\
+         if [ ! -f \"$pm\" ]; then\n\
+           printf '+++\\nname = \"%s\"\\n+++\\n' {slug} > \"$pm\"\n\
+         fi",
+        path = quote(path),
+        state_dir = quote(&state_dir),
+        pm = quote(&project_md),
+        slug = quote(slug),
     );
-    let out = ssh(runner, target, &script, Some(brief), SSH_START_TIMEOUT)?;
+    let out = ssh(runner, target, &script, Some(card), SSH_START_TIMEOUT)?;
     if !out.success() {
         bail!(
-            "could not write the brief on {target}: {}",
+            "could not write the lane card on {target}: {}",
             out.error_text()
         );
     }
     Ok(())
 }
 
-/// Whether a branch exists in a repository on the machine.
-pub fn branch_exists(runner: &dyn Runner, target: &str, repo: &str, branch: &str) -> Result<bool> {
-    let script = format!(
-        "cd {} && git rev-parse --verify --quiet {} >/dev/null",
-        quote(repo),
-        quote(&format!("refs/heads/{branch}"))
-    );
-    Ok(ssh(runner, target, &script, None, SSH_TIMEOUT)?.success())
-}
-
-/// Report hashes for every given thread on one machine, in one ssh call. Only
-/// a regular file inside a real (not symlinked) directory is hashed; anything
-/// else yields no hash. `sha256sum`, falling back to `shasum -a 256`.
-pub fn report_hashes(
-    runner: &dyn Runner,
-    target: &str,
-    threads: &[(String, String)],
-) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut script = String::from(
-        "h() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | cut -d' ' -f1; }\n",
-    );
-    for (id, dir) in threads {
-        script.push_str(&format!(
-            "d={dir}; if [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -f \"$d/report.md\" ] && [ ! -L \"$d/report.md\" ]; then printf '%s %s\\n' {id} \"$(h \"$d/report.md\")\"; else printf '%s -\\n' {id}; fi\n",
-            dir = quote(dir),
-            id = quote(id),
-        ));
-    }
-    let out = ssh(runner, target, &script, None, SSH_TIMEOUT)?;
-    if !out.success() {
-        bail!("ssh {target}: {}", out.error_text());
-    }
-    Ok(out
-        .stdout
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(_, hash)| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
-        .map(|(id, hash)| (id.to_string(), hash.to_string()))
-        .collect())
-}
-
-/// What the machine says about a thread directory before anything is copied.
-#[derive(Debug, Default, PartialEq)]
-pub struct RemoteLayout {
-    pub absent: bool,
-    pub dir_ok: bool,
-    pub report_ok: bool,
-    pub report_is_other: bool,
-    pub library_ok: bool,
-    pub library_is_link: bool,
-    pub library_kb: u64,
-    pub symlinks: Vec<String>,
-}
-
-pub fn layout(runner: &dyn Runner, target: &str, thread_dir: &str) -> Result<RemoteLayout> {
-    let script = format!(
-        "d={dir}\n\
-         if [ ! -e \"$d\" ]; then echo absent; exit 0; fi\n\
-         if [ -d \"$d\" ] && [ ! -L \"$d\" ]; then echo dir_ok; else exit 0; fi\n\
-         if [ -f \"$d/report.md\" ] && [ ! -L \"$d/report.md\" ]; then echo report_ok; elif [ -e \"$d/report.md\" ] || [ -L \"$d/report.md\" ]; then echo report_other; fi\n\
-         if [ -L \"$d/library\" ]; then echo library_link; elif [ -d \"$d/library\" ]; then echo library_ok; echo \"kb $(du -sk \"$d/library\" | cut -f1)\"; find \"$d/library\" -type l | head -20 | sed 's/^/link /'; fi",
-        dir = quote(thread_dir),
-    );
-    let out = ssh(runner, target, &script, None, SSH_TIMEOUT)?;
-    if !out.success() {
-        bail!("ssh {target}: {}", out.error_text());
-    }
-    let mut found = RemoteLayout::default();
-    for line in out.stdout.lines() {
-        match line {
-            "absent" => found.absent = true,
-            "dir_ok" => found.dir_ok = true,
-            "report_ok" => found.report_ok = true,
-            "report_other" => found.report_is_other = true,
-            "library_ok" => found.library_ok = true,
-            "library_link" => found.library_is_link = true,
-            other => {
-                if let Some(kb) = other.strip_prefix("kb ") {
-                    found.library_kb = kb.trim().parse().unwrap_or(0);
-                } else if let Some(link) = other.strip_prefix("link ") {
-                    found.symlinks.push(pr_safe(link));
-                }
-            }
-        }
-    }
-    Ok(found)
-}
-
-/// Remote file names are outside text; keep them printable and short.
-fn pr_safe(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(200).collect()
+/// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per
+/// pass. The second lane's courier passes these on the helper and `scp` calls.
+#[allow(dead_code)]
+pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
+    let dir = control_dir.join("ssh");
+    let _ = std::fs::create_dir_all(&dir);
+    vec![
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={}/%C", dir.display()),
+        "-o".into(),
+        "ControlPersist=10".into(),
+    ]
 }
 
 /// Copies one remote file to a local path with `scp`. A path scp cannot carry
 /// unchanged in every mode (spaces, quotes, globs) is fetched with `ssh cat`
-/// through the quoting helper instead.
+/// through the quoting helper instead. The second lane's ingress calls this.
+#[allow(dead_code)]
 pub fn fetch_file(
     runner: &dyn Runner,
     target: &str,
@@ -317,29 +351,37 @@ pub fn fetch_file(
     Ok(())
 }
 
-/// `rsync -rt` over ssh, without `-l`, so symbolic links are skipped.
-pub fn fetch_dir(
+/// The courier's batched `scp` over its multiplexed connection (SPEC-remote
+/// §4.3): every plain path in one call. A path scp cannot carry safely is
+/// refused here and fetched with [`fetch_file`]. The second lane's courier
+/// calls this; the start side never does.
+#[allow(dead_code)]
+pub fn fetch_batch(
     runner: &dyn Runner,
     target: &str,
-    remote_dir: &str,
+    control_dir: &Path,
+    remote_paths: &[String],
     local_dir: &Path,
 ) -> Result<()> {
     check_target(target)?;
-    if !is_plain(remote_dir) {
-        bail!(
-            "the library path on {target} has characters rsync cannot carry safely; it was not copied"
-        );
+    if remote_paths.is_empty() {
+        return Ok(());
     }
-    let out = runner.run(&Cmd::new("rsync", COPY_TIMEOUT).args([
-        "-rt".to_string(),
-        "-e".to_string(),
-        format!("ssh {}", SSH_OPTIONS.join(" ")),
-        "--".to_string(),
-        format!("{target}:{remote_dir}/"),
-        format!("{}/", local_dir.to_string_lossy()),
-    ]))?;
+    if let Some(bad) = remote_paths.iter().find(|path| !is_plain(path)) {
+        bail!("the box path `{bad}` has characters scp cannot carry safely");
+    }
+    std::fs::create_dir_all(local_dir)?;
+    let mut args = multiplex_options(control_dir);
+    args.extend(SSH_OPTIONS.iter().map(|s| (*s).to_string()));
+    args.push("-q".into());
+    args.push("--".into());
+    for path in remote_paths {
+        args.push(format!("{target}:{path}"));
+    }
+    args.push(format!("{}/", local_dir.display()));
+    let out = runner.run(&Cmd::new("scp", COPY_TIMEOUT).args(args))?;
     if !out.success() {
-        bail!("rsync from {target}: {}", out.error_text());
+        bail!("scp from {target}: {}", out.error_text());
     }
     Ok(())
 }
@@ -400,19 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn the_brief_script_works_against_a_real_repository_with_a_hostile_path() {
-        // The same script, run locally through `sh -c` instead of ssh.
+    fn the_card_script_works_against_a_real_directory_with_a_hostile_path() {
         let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("it's a $(repo)");
-        std::fs::create_dir(&repo).unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["init", "-q"])
-            .output()
-            .unwrap();
-        let cwd = repo.to_string_lossy().into_owned();
-        let dir = format!("{cwd}/.herdr-project/demo-t-0001");
+        let dir = root.path().join("it's a $(box)");
+        let card = dir.join("lanes/t-0001.toml");
+        let card_s = card.to_string_lossy().into_owned();
         let runner = FakeRunner::new();
         runner.on_fn(
             |cmd| cmd.program == "ssh",
@@ -424,36 +458,13 @@ mod tests {
                 })
             },
         );
-        write_brief(&runner, "box", &cwd, &dir, "the brief").unwrap();
-        write_brief(&runner, "box", &cwd, &dir, "the brief, again").unwrap();
+        provision_card(&runner, "box", "demo", &card_s, "thread = \"t-0001\"\n").unwrap();
         assert_eq!(
-            std::fs::read_to_string(format!("{dir}/brief.md")).unwrap(),
-            "the brief, again"
+            std::fs::read_to_string(&card).unwrap(),
+            "thread = \"t-0001\"\n"
         );
-        assert!(Path::new(&format!("{dir}/library")).is_dir());
-        let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
-        assert_eq!(exclude.matches(".herdr-project/").count(), 1);
-
-        let hashes = report_hashes(&runner, "box", &[("t-0001".into(), dir.clone())]).unwrap();
-        assert!(hashes.is_empty());
-        std::fs::write(format!("{dir}/report.md"), "r").unwrap();
-        let hashes = report_hashes(&runner, "box", &[("t-0001".into(), dir.clone())]).unwrap();
-        assert_eq!(hashes["t-0001"], crate::thread::sha256_hex(b"r"));
-
-        std::os::unix::fs::symlink("/etc/passwd", format!("{dir}/library/link")).unwrap();
-        let found = layout(&runner, "box", &dir).unwrap();
-        assert!(found.dir_ok && found.report_ok && found.library_ok && !found.library_is_link);
-        assert_eq!(found.symlinks.len(), 1);
-
-        // A symlinked report is never hashed.
-        std::fs::remove_file(format!("{dir}/report.md")).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", format!("{dir}/report.md")).unwrap();
-        assert!(
-            report_hashes(&runner, "box", &[("t-0001".into(), dir.clone())])
-                .unwrap()
-                .is_empty()
-        );
-        assert!(layout(&runner, "box", &dir).unwrap().report_is_other);
+        let project = std::fs::read_to_string(dir.join("PROJECT.md")).unwrap();
+        assert!(project.contains("name = \"demo\""), "{project}");
     }
 
     #[test]
@@ -505,6 +516,17 @@ mod tests {
         );
         assert!(ssh_target(&runner, "herdr", config.path(), "nope").is_err());
 
+        let profile = machine_profile(&runner, "herdr", config.path(), "m1").unwrap();
+        assert_eq!(profile.id, "abc");
+        assert_eq!(profile.label, "m1");
+        assert_eq!(profile.target, "m1.local");
+        assert_eq!(profile.session, "default");
+        assert!(
+            machine_profile(&runner, "herdr", config.path(), "local")
+                .unwrap()
+                .is_local()
+        );
+
         let broken = FakeRunner::new();
         broken.on("machine list --json", fail(1, "no"));
         assert_eq!(
@@ -514,7 +536,55 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_remote_paths_never_reach_scp_or_rsync() {
+    fn the_box_repo_map_is_path_exact_and_the_url_remote_is_chosen_by_url() {
+        let row = box_repo_for("/home/agent/projects/herdr").unwrap();
+        assert_eq!(row.box_path, "/home/ubuntu/projects/herdr");
+        assert!(box_repo_for("/home/agent/projects/herdr-ade").is_some());
+        assert!(box_repo_for("/home/agent/projects/other").is_none());
+
+        let runner = FakeRunner::new();
+        runner.on(
+            "git -C /repo remote get-url fork",
+            ok("https://github.com/uguryildirim24/herdr.git\n"),
+        );
+        runner.on(
+            "git -C /repo remote get-url origin",
+            ok("https://github.com/herdrdev/herdr.git\n"),
+        );
+        runner.on("git -C /repo remote", ok("fork\norigin\n"));
+        assert_eq!(
+            remote_for_url(
+                &runner,
+                "/repo",
+                "https://github.com/uguryildirim24/herdr.git"
+            )
+            .unwrap(),
+            "fork"
+        );
+    }
+
+    #[test]
+    fn provision_verifies_fetch_head_and_creates_the_worktree() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok("abc123\n"));
+        let req = Provision {
+            box_repo: "/home/ubuntu/projects/herdr",
+            worktree: "/home/ubuntu/projects/herdr/.worktrees/t-0001",
+            branch: "hp/demo/t-0001",
+            base: "b0b0",
+            publish_url: "https://github.com/uguryildirim24/herdr.git",
+        };
+        provision(&runner, "box", &req).unwrap();
+        let calls = runner.calls.borrow();
+        let script = calls[0].args.last().unwrap();
+        assert!(script.contains("git fetch --quiet"));
+        assert!(script.contains("FETCH_HEAD"));
+        assert!(script.contains("git worktree add"));
+        drop(calls);
+    }
+
+    #[test]
+    fn unsafe_remote_paths_never_reach_scp() {
         let runner = FakeRunner::new();
         runner.on("ssh", ok("file body"));
         runner.on("scp", ok(""));
@@ -533,7 +603,16 @@ mod tests {
         );
         fetch_file(&runner, "box", "/wt/repo/report.md", &dir.path().join("r2")).unwrap();
         assert_eq!(runner.count("scp"), 1);
-        assert!(fetch_dir(&runner, "box", "/wt/my repo/library", dir.path()).is_err());
-        assert_eq!(runner.count("rsync"), 0);
+        assert!(
+            fetch_batch(
+                &runner,
+                "box",
+                dir.path(),
+                &["/wt/my repo/report.md".into()],
+                dir.path()
+            )
+            .is_err()
+        );
+        assert_eq!(runner.count("scp"), 1);
     }
 }
