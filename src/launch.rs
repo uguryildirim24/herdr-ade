@@ -614,10 +614,8 @@ fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
                 bail!("recipe_permission_missing: `{id}` has no permission flag");
             }
         }
-        "cursor" => {
-            if !has("--force") {
-                bail!("recipe_permission_missing: `{id}` has no permission flag");
-            }
+        "cursor" if !has("--force") => {
+            bail!("recipe_permission_missing: `{id}` has no permission flag");
         }
         _ => {}
     }

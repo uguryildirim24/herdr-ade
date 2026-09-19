@@ -417,6 +417,7 @@ pub struct TalkInbound {
 }
 
 /// One JSON object on `talk/journal.jsonl` (SPEC-ADE D18 items 2 and 6).
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TalkJournalRecord {
     pub seq: u64,
