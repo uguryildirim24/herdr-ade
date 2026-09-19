@@ -55,6 +55,7 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `plan show [--json]`, `plan set`, `plan step add\|edit\|link\|unlink\|remove\|move`, `plan sync` | The plan card: goal, end result and up to seven steps. A step is `done` only when all its bound work has landed in a merged round. |
 | `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list [--json]`, `decide show <id>` | The log of choices the coordinator made without asking. |
 | `say --what S [--means S] [--landed-round R]` | One checked line on the board and in talk. `--landed-round` marks it as landing evidence for a merged round. |
+| `talk <project> [--replay]` | The project screen, or a conversation-only text replay for copying. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
 | `harness install` | Build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. `delete` moves the folder to `.trash/`. |
@@ -63,6 +64,24 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a pane gone with no report, or blocked for 30 seconds); **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. Threads idle for `auto_resolve_days` are resolved after a final copy home.
 
 `focus` replaces any sidebar view another tool has set, and `unfocus` clears whatever view is set, because Herdr holds a single one. `focus` covers local threads only.
+
+## Project screen
+
+`ha talk <project>` opens an alternate screen: goal, end result, completed-step count, running work, five recent landings, and questions with five current choices. The conversation stays below. At 80 pane columns the overview scrolls separately above chat; below 80 (or in a short pane) the overview and chat share one scroll area, starting at the goal. Open questions stay beside chat or above the composer. Every active work row remains reachable; closing a handed-in lane does not make its work land.
+
+- `F2`: full overview, without losing input or prior scroll positions.
+- `F6`: change scroll area; `Page up`, `Page down`, `Home`, `End`: move within it. `End` in chat resumes following new messages. The wheel scrolls the area under it; clicking a question selects it, never answers it.
+- `Tab`: next open question, returning from full overview if needed. Selection stays put when another question arrives.
+- `0` to the displayed choice count: answer only with an empty composer and a visible selected card. A pasted digit, a digit after a space, or a digit with cards hidden is message text. Answers bind to the revision actually drawn, not a replacement arriving later.
+- `Enter`: send; `Esc`: clear; arrows and `Backspace`: edit; `Ctrl+C`: restore the normal terminal and leave the shell usable.
+
+Type an ordinary message to change a recorded choice. `queued`, `sent`, `unsure`, and `accepted` describe delivery, not completion. `/…`, `!stop`, `!native`, and `!back` keep their existing handling; suspension shows `other tab`.
+
+The screen is read-only until an explicit message, answer or command. It reuses the plan projection, current decision fold, durable thread/round records, published asks and verified landing references. Remote work is marked `box last seen`: the courier's stored state is not a fresh remote probe. Local records refresh every 250 ms; one shared herdr poll every three seconds supplies local live state. Missing records show honest empty or error text, not guessed completion.
+
+Colours come from herdr's `[theme.custom]` in `$XDG_CONFIG_HOME/herdr/config.toml`, otherwise its platform config directory. Invalid tokens fall back individually to the carried catppuccin palette; the pane background remains the terminal default.
+
+For copying, run `ha talk <project> --replay`: folded conversation only, no live overview, network calls or resending. After the coordinator installs a new binary, restart each existing talk tab with `Ctrl+C`, then `ha talk <project>` in that same shell. `ha open` does not restart a stopped command in an existing tab. Restarting the screen sends nothing.
 
 ## Plans and choices
 

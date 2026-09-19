@@ -1,6 +1,6 @@
 //! The plugin-owned conversation surface (SPEC-ADE D18): `ha talk <slug>`.
 //!
-//! A line-oriented program in its own tab, no alternate screen. It renders
+//! An alternate-screen project view in its own tab. The conversation renders
 //! only `talk/journal.jsonl`: checked coordinator messages, Rolf's own lines,
 //! asks with their numbered choices, `say` lines and fixed notices. Rolf's
 //! input is a recoverable request (`queued`, `submitted`, `uncertain`,
@@ -15,7 +15,7 @@
 //! `talk = true | false` in `PROJECT.md` front matter overrides.
 
 use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,6 +26,11 @@ use crate::contracts::{HumanMessage, Recipient, TalkInbound, TalkRequestState};
 use crate::herdr::Herdr;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
+
+mod overview;
+pub mod screen;
+mod theme;
+pub mod view;
 
 /// Entries are bounded (D18 item 6).
 pub const MAX_ENTRY_BYTES: usize = 64 * 1024;
@@ -41,6 +46,8 @@ pub enum Entry {
     Rolf {
         request: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<AnswerRef>,
     },
     Say {
         what: String,
@@ -63,6 +70,12 @@ pub enum Entry {
     Notice {
         id: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AnswerRef {
+    pub id: String,
+    pub revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,7 +278,9 @@ pub fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
     let mut text: std::collections::BTreeMap<String, String> = Default::default();
     for line in &journal.lines {
         match &line.entry {
-            Entry::Rolf { request, text: t } => {
+            Entry::Rolf {
+                request, text: t, ..
+            } => {
                 text.insert(request.clone(), t.clone());
             }
             Entry::Inbound(inbound) => {
@@ -390,6 +405,15 @@ pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkR
 
 /// Rolf typed a line: journal the intent first, then hand it to the writer.
 pub fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
+    submit_with_answer(ctx, project, text, None)
+}
+
+fn submit_with_answer(
+    ctx: &Ctx,
+    project: &Project,
+    text: &str,
+    answer: Option<AnswerRef>,
+) -> Result<(String, TalkRequestState)> {
     let request = format!(
         "q-{}-{}",
         jiff::Timestamp::now().as_millisecond(),
@@ -401,6 +425,7 @@ pub fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkR
         Entry::Rolf {
             request: request.clone(),
             text: text.to_string(),
+            answer,
         },
     )?;
     append(
@@ -412,7 +437,9 @@ pub fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkR
             recipient: recipient(project),
         }),
     )?;
-    let sent = deliver_queued(ctx, project)?;
+    // The request is durable now. Delivery failure leaves it queued; it must
+    // not keep the composer full and tempt a second submission.
+    let sent = deliver_queued(ctx, project).unwrap_or_default();
     let state = sent
         .iter()
         .find(|(r, _)| *r == request)
@@ -439,261 +466,78 @@ pub fn mark_accepted(project: &Project) -> Result<usize> {
     Ok(submitted.len())
 }
 
-// --------------------------------------------------------------- surface
-
-pub fn header(project: &Project) -> String {
-    let kind = coordinator_kind(project);
-    let coord = project.coordinator().unwrap_or_default();
-    let who = project
-        .read_project_md()
-        .ok()
-        .map(|(s, _)| s.name)
-        .filter(|n| !n.is_empty())
-        .map(|n| format!("the coordinator of {n}"))
-        .unwrap_or_else(|| "the coordinator".into());
-    let mut out = format!(
-        "talking to {who}; its own pane is {}; chat there is {}",
-        if coord.pane_id.is_empty() {
-            "not open yet"
-        } else {
-            coord.pane_id.as_str()
+/// Ordinary input keeps the existing commands and delivery path. Numeric
+/// answering is exclusively the screen's last-drawn binding, never text parsing.
+pub fn handle(ctx: &Ctx, project: &Project, line: &str) -> Result<()> {
+    match line.trim() {
+        "!stop" => {
+            if let Some((h, pane)) = coordinator_herdr(ctx, project) {
+                h.call(
+                    &["agent", "send-keys", &pane, "esc"],
+                    Duration::from_secs(10),
+                )
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            }
+        }
+        "!native" => {
+            set_suspended(project, true)?;
+            notice(ctx, project, "native_on");
+        }
+        "!back" => match coordinator_state(ctx, project).as_deref() {
+            Some("idle" | "done" | "working") => {
+                set_suspended(project, false)?;
+                notice(ctx, project, "native_off");
+                deliver_queued(ctx, project)?;
+            }
+            _ => notice(ctx, project, "native_not_ready"),
         },
-        crate::adapters::chat_label(&kind)
-    );
-    if kind != "claude" {
-        out.push_str("; ");
-        out.push_str(crate::adapters::surface_label(&kind));
+        _ => {
+            submit(ctx, project, line.trim_end_matches(['\n', '\r']))?;
+        }
     }
-    out
+    Ok(())
 }
 
-/// One journal line as the surface shows it; `None` for bookkeeping lines.
-pub fn render(project: &Project, line: &Line) -> Option<String> {
-    match &line.entry {
-        Entry::Rolf { text, .. } => Some(format!("you: {text}")),
-        Entry::Inbound(i) => match i.state {
-            TalkRequestState::Submitted => Some("  (sent)".into()),
-            _ => None,
-        },
-        Entry::Say { what, means, .. } => Some(match means {
-            Some(m) => format!("coordinator: {what}\n  for you: {m}"),
-            None => format!("coordinator: {what}"),
-        }),
-        Entry::Ask { id, revision } => Some(
-            match crate::ask::load_revision(project, id, *revision)
-                .ok()
-                .flatten()
-            {
-                Some(ask) => {
-                    let mut s = String::from("question:\n");
-                    if let Some(w) = &ask.what {
-                        s.push_str(&format!("  {w}\n"));
-                    }
-                    if let Some(m) = &ask.means {
-                        s.push_str(&format!("  {m}\n"));
-                    }
-                    s.push_str(crate::ask::numbered(&ask).trim_end());
-                    s
-                }
-                None => "question: (this question could not be shown)".into(),
-            },
-        ),
-        Entry::Answer { choice, .. } => Some(format!("you answered {choice}")),
-        Entry::Notice { id } => crate::ask::notice_text(id).map(|t| format!("notice: {t}")),
-    }
-}
-
-/// The surface's state: the ask binding captured when the prompt was drawn
-/// is frozen until the line is submitted (item 35).
-pub struct Surface<'a> {
-    ctx: &'a Ctx<'a>,
-    project: Project,
-    pub binding: Option<(String, u32)>,
-    pub shown: u64,
-}
-
-impl<'a> Surface<'a> {
-    pub fn new(ctx: &'a Ctx<'a>, project: Project) -> Self {
-        Surface {
+fn answer(ctx: &Ctx, project: &Project, target: &view::Target, choice: u32) -> Result<()> {
+    match crate::ask::answer(
+        ctx,
+        &project.slug,
+        &target.id,
+        target.revision,
+        choice,
+        "talk",
+    ) {
+        Ok(a) => {
+            let text = format!(
+                "ANSWER {}@{} {choice}: Rolf chose \"{}\"",
+                target.id, target.revision, a.text
+            );
+            submit_with_answer(
+                ctx,
+                project,
+                &text,
+                Some(AnswerRef {
+                    id: target.id.clone(),
+                    revision: target.revision,
+                }),
+            )?;
+        }
+        Err(e) => notice(
             ctx,
             project,
-            binding: None,
-            shown: 0,
-        }
+            if e.to_string().starts_with("ask_revision_stale") {
+                "ask_redrawn"
+            } else {
+                "ask_not_found"
+            },
+        ),
     }
-
-    /// Journal lines not yet shown, rendered. Display only; never re-sends.
-    pub fn new_output(&mut self) -> Vec<String> {
-        let journal = read(&self.project);
-        let mut out = Vec::new();
-        let shown = self.shown;
-        for line in journal.lines.iter().filter(|l| l.seq > shown) {
-            if let Some(text) = render(&self.project, line) {
-                out.push(text);
-            }
-            self.shown = line.seq;
-        }
-        out
-    }
-
-    /// Draws the prompt and freezes the binding to the newest open ask.
-    pub fn draw_prompt(&mut self) -> String {
-        self.binding = crate::ask::newest_open(&self.project).map(|a| (a.id, a.revision));
-        match &self.binding {
-            Some((id, rev)) => {
-                let n = crate::ask::load_revision(&self.project, id, *rev)
-                    .ok()
-                    .flatten()
-                    .map_or(0, |a| a.choices.len());
-                format!("answer 0 to {n} for the question above, or type a message > ")
-            }
-            None => "> ".into(),
-        }
-    }
-
-    /// Handles one typed line and returns what to print.
-    pub fn handle(&mut self, input: &str) -> Result<Vec<String>> {
-        let line = input.trim_end_matches(['\n', '\r']);
-        let ctx = self.ctx;
-        let project = &self.project;
-        if line.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        match line.trim() {
-            "!stop" => {
-                if let Some((h, pane)) = coordinator_herdr(ctx, project) {
-                    h.call(
-                        &["agent", "send-keys", &pane, "esc"],
-                        Duration::from_secs(10),
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-                }
-                return Ok(vec!["  (escape sent)".into()]);
-            }
-            "!native" => {
-                set_suspended(project, true)?;
-                notice(ctx, project, "native_on");
-                return Ok(Vec::new());
-            }
-            "!back" => {
-                match coordinator_state(ctx, project).as_deref() {
-                    Some("idle") | Some("done") | Some("working") => {
-                        set_suspended(project, false)?;
-                        notice(ctx, project, "native_off");
-                        deliver_queued(ctx, project)?;
-                    }
-                    _ => notice(ctx, project, "native_not_ready"),
-                }
-                return Ok(Vec::new());
-            }
-            _ => {}
-        }
-        let trimmed = line.trim();
-        if !trimmed.is_empty()
-            && trimmed.chars().all(|c| c.is_ascii_digit())
-            && let Some((id, rev)) = self.binding.clone()
-        {
-            let newest = crate::ask::newest_open(project).map(|a| (a.id, a.revision));
-            if newest != Some((id.clone(), rev)) {
-                notice(ctx, project, "ask_redrawn");
-                return Ok(Vec::new());
-            }
-            let choice: u32 = trimmed.parse().unwrap_or(u32::MAX);
-            return match crate::ask::answer(ctx, &project.slug, &id, rev, choice, "talk") {
-                Ok(a) => {
-                    let line = format!("ANSWER {id}@{rev} {choice}: Rolf chose \"{}\"", a.text);
-                    let _ = submit(ctx, project, &line);
-                    Ok(Vec::new())
-                }
-                Err(e) if format!("{e}").starts_with("ask_choice_out_of_range") => {
-                    Ok(vec![format!("  {}", e)])
-                }
-                Err(_) => {
-                    notice(ctx, project, "ask_not_found");
-                    Ok(Vec::new())
-                }
-            };
-        }
-        // A number typed while an ask appeared under an unbound prompt is not
-        // chat: the prompt is drawn again with the question (D18).
-        if !trimmed.is_empty()
-            && trimmed.chars().all(|c| c.is_ascii_digit())
-            && crate::ask::newest_open(project).is_some()
-        {
-            notice(ctx, project, "ask_redrawn");
-            return Ok(Vec::new());
-        }
-        // `/...` passes through unchanged for CLI slash commands.
-        submit(ctx, project, line)?;
-        Ok(Vec::new())
-    }
+    Ok(())
 }
 
-/// `ha talk <slug> --replay`: the journal rendered once. Never sends.
 pub fn replay(ctx: &Ctx, slug: &str) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
-    let mut out = header(&project);
-    out.push('\n');
-    for line in read(&project).lines {
-        if let Some(text) = render(&project, &line) {
-            out.push_str(&text);
-            out.push('\n');
-        }
-    }
-    Ok(out)
-}
-
-/// `ha talk <slug>`: the surface loop. Stdin is read on its own thread so new
-/// journal lines show while Rolf has not typed.
-pub fn run(ctx: &Ctx, slug: &str) -> Result<()> {
-    let project = Project::load(&ctx.root, slug)?;
-    let mut surface = Surface::new(ctx, project.clone());
-    println!("{}", header(&project));
-    for line in surface.new_output() {
-        println!("{line}");
-    }
-    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            if tx.send(line.ok()).is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(None);
-    });
-    let mut prompt = surface.draw_prompt();
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(Some(line)) => {
-                for out in surface.handle(&line)? {
-                    println!("{out}");
-                }
-                for out in surface.new_output() {
-                    println!("{out}");
-                }
-                prompt = surface.draw_prompt();
-                print!("{prompt}");
-                std::io::stdout().flush()?;
-            }
-            Ok(None) => return Ok(()),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let fresh = surface.new_output();
-                if !fresh.is_empty() {
-                    println!();
-                    for out in fresh {
-                        println!("{out}");
-                    }
-                    // The binding stays frozen until this input is submitted.
-                    print!("{prompt}");
-                    std::io::stdout().flush()?;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-    }
+    Ok(view::Conversation::load(&project, &read(&project)).replay())
 }
 
 // ------------------------------------------------------------ tab and tick
@@ -1050,16 +894,15 @@ mod tests {
     fn native_suspends_the_writer_and_back_rechecks_readiness() {
         let (fx, _) = talk_fixture("idle");
         let ctx = fx.world.ctx();
-        let mut s = Surface::new(&ctx, fx.project.clone());
-        s.handle("!native").unwrap();
+        handle(&ctx, &fx.project, "!native").unwrap();
         assert!(writer_suspended(&fx.project));
-        s.handle("while you are there").unwrap();
+        handle(&ctx, &fx.project, "while you are there").unwrap();
         assert_eq!(fx.world.runner.count("agent prompt"), 0);
         set_state(&fx, "blocked");
-        s.handle("!back").unwrap();
+        handle(&ctx, &fx.project, "!back").unwrap();
         assert!(writer_suspended(&fx.project));
         set_state(&fx, "idle");
-        s.handle("!back").unwrap();
+        handle(&ctx, &fx.project, "!back").unwrap();
         assert!(!writer_suspended(&fx.project));
         assert_eq!(
             fx.world
@@ -1076,7 +919,7 @@ mod tests {
                 "native_off"
             ]
         );
-        s.handle("!stop").unwrap();
+        handle(&ctx, &fx.project, "!stop").unwrap();
         assert_eq!(fx.world.runner.count("agent send-keys w1:p1 esc"), 1);
     }
 
@@ -1084,9 +927,7 @@ mod tests {
     fn slash_commands_pass_through_unchanged() {
         let (fx, _) = talk_fixture("idle");
         let ctx = fx.world.ctx();
-        Surface::new(&ctx, fx.project.clone())
-            .handle("/compact\n")
-            .unwrap();
+        handle(&ctx, &fx.project, "/compact\n").unwrap();
         assert_eq!(fx.world.runner.count("agent prompt w1:p1 /compact"), 1);
     }
 
@@ -1104,69 +945,6 @@ mod tests {
             },
         )
         .unwrap()
-    }
-
-    #[test]
-    fn a_digit_answers_the_frozen_binding_and_a_redrawn_ask_refuses_it() {
-        let (fx, _) = talk_fixture("idle");
-        let ctx = fx.world.ctx();
-        open_ask(&fx, None);
-        let mut s = Surface::new(&ctx, fx.project.clone());
-        assert!(s.draw_prompt().starts_with("answer 0 to 2"));
-        assert_eq!(s.binding, Some(("a-1".into(), 1)));
-        // A revision lands while Rolf types: the frozen binding is refused.
-        open_ask(&fx, Some("a-1"));
-        s.handle("1").unwrap();
-        assert!(crate::ask::answer_of(&fx.project, "a-1", 1).is_none());
-        assert!(crate::ask::answer_of(&fx.project, "a-1", 2).is_none());
-        assert_eq!(notices(&fx), ["ask_redrawn"]);
-        s.draw_prompt();
-        assert_eq!(s.binding, Some(("a-1".into(), 2)));
-        let out = s.handle("7").unwrap();
-        assert!(out[0].contains("ask_choice_out_of_range"), "{out:?}");
-        s.handle("2").unwrap();
-        assert_eq!(
-            crate::ask::answer_of(&fx.project, "a-1", 2).unwrap().choice,
-            2
-        );
-        assert_eq!(
-            fx.world
-                .runner
-                .count("agent prompt w1:p1 ANSWER a-1@2 2: Rolf chose \"stop it now\""),
-            1
-        );
-        s.draw_prompt();
-        assert_eq!(s.binding, None);
-        s.handle("3").unwrap();
-        assert_eq!(
-            fx.world.runner.count("agent prompt w1:p1 3"),
-            1,
-            "no open ask: a digit is a message"
-        );
-    }
-
-    #[test]
-    fn header_labels_follow_the_coordinator_kind() {
-        let fx = fixture();
-        let h = header(&fx.project);
-        assert!(h.contains("chat there is checked after display"), "{h}");
-        assert!(enabled(&fx.project));
-        fx.project
-            .update_coordinator(|c| c.launch.kind = "codex".into())
-            .unwrap();
-        let h = header(&fx.project);
-        assert!(
-            h.contains("chat there is not checked; chat: shown only through say and ask"),
-            "{h}"
-        );
-        assert!(!enabled(&fx.project));
-        let md = std::fs::read_to_string(fx.project.project_md()).unwrap();
-        std::fs::write(
-            fx.project.project_md(),
-            md.replacen("+++\n", "+++\ntalk = true\n", 1),
-        )
-        .unwrap();
-        assert!(enabled(&fx.project));
     }
 
     #[test]
@@ -1191,7 +969,13 @@ mod tests {
             calls,
             "replay makes no herdr call"
         );
-        assert!(a.contains("coordinator: The first lane is done.\n  for you: You can read its report now.\nyou: thanks\n  (sent)\nquestion:\n"), "{a}");
+        assert!(
+            a.contains("The first lane is done.")
+                && a.contains("thanks")
+                && a.contains("sent")
+                && a.contains("question"),
+            "{a}"
+        );
     }
 
     #[test]
