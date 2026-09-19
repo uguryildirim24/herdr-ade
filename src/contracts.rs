@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 /// One `[recipes.<id>]` row: the full D2 row plus `provider` (reserved for the
-/// pi move, question 25), `enabled`, `plain` and the per-lane `machine`
-/// (SPEC-remote D2/D4, §4.1). An empty `machine` means the project default.
+/// pi move, question 25), `enabled` and `plain`. Machine placement belongs to
+/// the role row, not to a model recipe.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Recipe {
@@ -15,8 +15,6 @@ pub struct Recipe {
     pub provider: String,
     pub enabled: bool,
     pub plain: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub machine: String,
 }
 
 impl Default for Recipe {
@@ -29,7 +27,6 @@ impl Default for Recipe {
             provider: String::new(),
             enabled: true,
             plain: String::new(),
-            machine: String::new(),
         }
     }
 }
@@ -169,8 +166,8 @@ pub struct Launch {
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
     /// never rereads live config.
     pub compact_reason: String,
-    /// The per-lane machine the roles-table row chose, empty for the project
-    /// default (SPEC-remote D2/D4, §4.1).
+    /// The machine the role row chose; empty keeps the launch local
+    /// (SPEC-remote D2/D4, §4.1).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine: String,
 }
@@ -829,7 +826,6 @@ mod tests {
             provider: "cursor".into(),
             enabled: true,
             plain: "the usual coding helper".into(),
-            machine: String::new(),
         };
         both(&recipe);
         both(&Launch {
