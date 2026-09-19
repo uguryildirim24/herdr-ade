@@ -966,19 +966,38 @@ pub fn run() -> Result<()> {
         },
         Command::Machine { command } => match command {
             MachineCommand::Hold { machine } => {
-                let path = project::machine_hold(&ctx.root, &machine)?;
+                let profile = crate::remote::machine_profile(
+                    ctx.runner,
+                    &ctx.env.herdr_bin(),
+                    &ctx.config_dir,
+                    &machine,
+                )?;
+                if profile.is_local() {
+                    bail!("machine_local: the Mac cannot be held as a box");
+                }
+                let path = project::machine_hold(&ctx.root, &profile.id)?;
                 println!(
-                    "machine `{machine}` is held; new box starts are refused ({})",
+                    "machine `{}` is held; new box starts are refused ({})",
+                    profile.label,
                     path.display()
                 );
                 Ok(())
             }
             MachineCommand::Release { machine } => {
-                let removed = project::machine_release(&ctx.root, &machine)?;
+                let profile = crate::remote::machine_profile(
+                    ctx.runner,
+                    &ctx.env.herdr_bin(),
+                    &ctx.config_dir,
+                    &machine,
+                )?;
+                if profile.is_local() {
+                    bail!("machine_local: the Mac is not a box hold");
+                }
+                let removed = project::machine_release(&ctx.root, &profile.id)?;
                 if removed {
-                    println!("machine `{machine}` is released");
+                    println!("machine `{}` is released", profile.label);
                 } else {
-                    println!("machine `{machine}` was not held");
+                    println!("machine `{}` was not held", profile.label);
                 }
                 Ok(())
             }

@@ -531,6 +531,7 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
         // A pi provider that stopped being ready (an expired login) fails
         // the thread at once instead of launching into it (SPEC-pi §3.4).
         if t.launch.kind == "pi"
+            && !t.is_remote()
             && let Err(error) = crate::threads::pi_ready(pass.ctx, &t.launch)
         {
             let message = format!("{error:#}");
@@ -557,20 +558,19 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             } else {
                 t.launch.ready_timeout_ms
             };
-            let agent =
-                pass.herdr
-                    .on_machine(&t.machine)
-                    .agent_start_opts(&crate::herdr::AgentStart {
-                        name: &t.agent_name,
-                        kind: &t.launch.kind,
-                        pane: &t.pane_id,
-                        agent_args: &t.launch.args,
-                        parent: parent.as_deref(),
-                        ready_timeout_ms: timeout,
-                    })?;
+            let agent = pass.herdr.on_machine(t.machine_route()).agent_start_opts(
+                &crate::herdr::AgentStart {
+                    name: &t.agent_name,
+                    kind: &t.launch.kind,
+                    pane: &t.pane_id,
+                    agent_args: &t.launch.args,
+                    parent: parent.as_deref(),
+                    ready_timeout_ms: timeout,
+                },
+            )?;
             let process = pass
                 .herdr
-                .on_machine(&t.machine)
+                .on_machine(t.machine_route())
                 .pane_process_info(&t.pane_id)
                 .ok()
                 .and_then(|info| info.identity(&t.launch.kind));
@@ -828,7 +828,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let mut state = steps::load_state(project);
     let before = state.clone();
     let remote_threads = open_threads(project, true);
-    let mut machines: Vec<String> = remote_threads.iter().map(|t| t.machine.clone()).collect();
+    let mut machines: Vec<String> = remote_threads
+        .iter()
+        .map(|t| t.machine_route().to_string())
+        .collect();
     machines.sort();
     machines.dedup();
     for machine in machines {
@@ -837,7 +840,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         }
         let threads: Vec<thread::Thread> = remote_threads
             .iter()
-            .filter(|t| t.machine == machine)
+            .filter(|t| t.machine_route() == machine)
             .cloned()
             .collect();
         let outcome = remote_pass(

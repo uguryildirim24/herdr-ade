@@ -97,6 +97,16 @@ impl Thread {
         !self.machine.is_empty()
     }
 
+    /// The stable saved-profile id used for machine routing. The label is
+    /// display-only and may be renamed without changing an attempt's identity.
+    pub fn machine_route(&self) -> &str {
+        if self.machine_id.is_empty() {
+            &self.machine
+        } else {
+            &self.machine_id
+        }
+    }
+
     pub fn report_path(&self) -> String {
         format!("{}/report.md", self.thread_dir)
     }

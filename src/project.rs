@@ -662,14 +662,29 @@ pub fn tab_env(
     let mut env = vec![format!(
         "HERDR_ADE_LAUNCH={slug}/{thread}/{attempt}/{brief_hash}"
     )];
-    if !machine.is_empty() && machine != crate::contracts::MACHINE_LOCAL {
+    let remote = !machine.is_empty() && machine != crate::contracts::MACHINE_LOCAL;
+    if remote {
+        // These three values are the box binding, wrapper path and isolated
+        // build folder. A recipe cannot replace them with Mac-side values.
+        env.extend(
+            spec.env
+                .iter()
+                .filter(|value| {
+                    !["HERDR_ADE_LAUNCH", "PATH", "CARGO_TARGET_DIR"]
+                        .iter()
+                        .any(|key| value.starts_with(&format!("{key}=")))
+                })
+                .cloned(),
+        );
         env.push(format!("PATH={}", crate::contracts::BOX_PATH));
         env.push(format!(
             "CARGO_TARGET_DIR={}/{slug}-{thread}",
             crate::contracts::BOX_BUILD
         ));
+    } else {
+        // Keep the established local-lane argv unchanged.
+        env.extend(spec.env.iter().cloned());
     }
-    env.extend(spec.env.iter().cloned());
     if spec.kind == "dsh" {
         if !env.iter().any(|e| e.starts_with("DSH_PERMISSION_MODE=")) {
             env.push("DSH_PERMISSION_MODE=danger-full-access".into());

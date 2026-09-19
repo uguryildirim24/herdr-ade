@@ -74,7 +74,7 @@ pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: G
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let _ = herdr.on_machine(&thread.machine).pane_report_tokens(
+    let _ = herdr.on_machine(thread.machine_route()).pane_report_tokens(
         &thread.pane_id,
         &pairs,
         coordinator::TOKEN_TTL,
@@ -84,7 +84,7 @@ pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: G
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
     if !thread.pane_id.is_empty() {
         let _ = herdr
-            .on_machine(&thread.machine)
+            .on_machine(thread.machine_route())
             .pane_clear_tokens(&thread.pane_id, &["project", "thread", "review", "rank"]);
     }
 }
@@ -159,10 +159,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let explicit_remote = args
         .machine
         .as_deref()
-        .is_some_and(|m| !m.is_empty() && m != crate::contracts::MACHINE_LOCAL)
-        || listed
-            .and_then(|r| r.machine.as_deref())
-            .is_some_and(|m| !m.is_empty() && m != crate::contracts::MACHINE_LOCAL);
+        .is_some_and(|m| !m.is_empty() && m != crate::contracts::MACHINE_LOCAL);
     if args.repo.is_none() && explicit_remote {
         bail!(
             "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
@@ -200,7 +197,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         .machine
         .clone()
         .filter(|m| !m.is_empty())
-        .or_else(|| listed.and_then(|r| r.machine.clone()))
         .or_else(|| (!launch.machine.is_empty()).then(|| launch.machine.clone()))
         .or_else(|| {
             let default = project.machine();
@@ -240,7 +236,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     } else {
         profile.label.clone()
     };
-    if !machine.is_empty() && project::machine_held(&ctx.root, &machine) {
+    if !machine.is_empty() && project::machine_held(&ctx.root, &profile.id) {
         bail!(
             "machine_held: `{machine}` is held; run `ha machine release {machine}` when the fork refresh or resize is done"
         );
@@ -263,8 +259,14 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     // A box lane's provider readiness runs on the box through the courier
     // (SPEC-remote §4.1); the Mac's login is irrelevant to it. The local pi
     // check stays for local lanes.
-    if launch.kind == "pi" && machine.is_empty() {
-        pi_ready(ctx, &launch)?;
+    if launch.kind == "pi" {
+        if machine.is_empty() {
+            pi_ready(ctx, &launch)?;
+        } else {
+            eprintln!(
+                "pi_ready skipped on the Mac for box lane `{machine}`; box readiness is checked on the box"
+            );
+        }
     }
     let machine_id = if machine.is_empty() {
         String::new()
@@ -386,12 +388,13 @@ fn place_box_worktree(
             (map.box_path.to_string(), map.publish_url.to_string())
         }
     };
-    let target = remote::ssh_target(
+    let profile = remote::machine_profile(
         runner,
         &ctx.env.herdr_bin(),
         &ctx.config_dir,
-        &record.machine,
+        record.machine_route(),
     )?;
+    let target = profile.target.clone();
     let box_worktree = format!("{box_repo}/.worktrees/{}", record.id);
     let branch = if record.branch.is_empty() {
         thread::branch_name(&project.slug, &record.id, &record.title)
@@ -433,8 +436,8 @@ fn place_box_worktree(
             &head,
             &repo_lock.common_dir.join("herdr-ade-tmp"),
         )?;
-        drop(repo_lock);
         ensure_branch(runner, &record.repo, &branch, &sha)?;
+        drop(repo_lock);
         push_branch(runner, &record.repo, &publish_url, &branch, &sha)?;
         (sha, brief_hash)
     };
@@ -450,12 +453,7 @@ fn place_box_worktree(
 
     // Starts for one box repository serialize on the Mac (SPEC-remote §4.2
     // step 3).
-    let lock_id = if record.machine_id.is_empty() {
-        record.machine.as_str()
-    } else {
-        record.machine_id.as_str()
-    };
-    let _box_lock = project::box_lock(&ctx.root, lock_id, &box_repo)?;
+    let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
 
     remote::provision(
         runner,
@@ -469,9 +467,9 @@ fn place_box_worktree(
         },
     )?;
 
-    // Step 4: reuse the recorded box workspace when the box still lists it,
-    // else create it with the box clone as cwd; then the lane tab.
-    let herdr = view.herdr.on_machine(&record.machine);
+    // Step 4: route by the stable profile id. Reuse the recorded box workspace
+    // when the box still lists it, else create it with the box clone as cwd.
+    let herdr = view.herdr.on_machine(&profile.id);
     let panes = herdr.pane_list().unwrap_or_default();
     let workspace = if !record.workspace_id.is_empty()
         && panes.iter().any(|p| p.workspace_id == record.workspace_id)
@@ -993,7 +991,7 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
     if !record.is_remote() {
         return Ok((view.agents.clone(), view.panes.clone()));
     }
-    let herdr = view.herdr.on_machine(&record.machine);
+    let herdr = view.herdr.on_machine(record.machine_route());
     let unreachable = |e: crate::herdr::HerdrError| {
         anyhow::anyhow!("machine `{}` is unreachable: {e}", record.machine)
     };
@@ -1023,7 +1021,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
         if !record.tab_id.is_empty() {
             let _ = view
                 .herdr
-                .on_machine(&record.machine)
+                .on_machine(record.machine_route())
                 .tab_close(&record.tab_id);
         }
         return place_and_brief(ctx, &project, &view, id, true);
@@ -1085,7 +1083,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     let (agents, _) = lists_for(&view, &record)?;
     let state = prompt_state(&record, &agents)?;
     view.herdr
-        .on_machine(&record.machine)
+        .on_machine(record.machine_route())
         .agent_prompt(&record.pane_id, text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(state)
@@ -1241,7 +1239,7 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     };
     match view
         .herdr
-        .on_machine(&record.machine)
+        .on_machine(record.machine_route())
         .tab_close(&record.tab_id)
     {
         Ok(()) => Ok(true),
@@ -1293,16 +1291,17 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     if workspace_open {
         return view
             .herdr
-            .on_machine(&record.machine)
+            .on_machine(record.machine_route())
             .worktree_remove(&record.workspace_id)
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
-    let target = remote::ssh_target(
+    let target = remote::machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
         &ctx.config_dir,
-        &record.machine,
-    )?;
+        record.machine_route(),
+    )?
+    .target;
     let script = format!(
         "cd {} && git worktree remove {}",
         remote::quote(&record.repo),
