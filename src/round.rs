@@ -680,6 +680,12 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
     {
         bail!("reviewer_is_member: `{thread_id}` is a lane of `{round}`");
     }
+    if let Some(reviewer) = record.reviewer.as_deref() {
+        if reviewer == thread_id {
+            return Ok(record);
+        }
+        bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
+    }
     record.reviewer = Some(thread_id.to_string());
     save(&project, &record)?;
     Ok(record)
@@ -781,8 +787,19 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
 /// A lane lives in its own workspace, so its thread record is the map from
 /// the envelope to the project.
 pub fn advance_event(ctx: &Ctx) -> Result<()> {
-    let workspace = ctx.env.var("HERDR_WORKSPACE_ID");
-    let pane = ctx.env.var("HERDR_PANE_ID");
+    let event = ctx
+        .env
+        .var("HERDR_PLUGIN_EVENT_JSON")
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let data = event.as_ref().and_then(|event| event.get("data"));
+    let workspace = ctx.env.var("HERDR_WORKSPACE_ID").or_else(|| {
+        data.and_then(|data| data.get("workspace_id"))
+            .and_then(serde_json::Value::as_str)
+    });
+    let pane = ctx.env.var("HERDR_PANE_ID").or_else(|| {
+        data.and_then(|data| data.get("pane_id"))
+            .and_then(serde_json::Value::as_str)
+    });
     let slugs = project::list_slugs(&ctx.root);
     let mut matched = Vec::new();
     for slug in &slugs {
