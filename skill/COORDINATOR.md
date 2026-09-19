@@ -45,7 +45,7 @@ hp thread start <slug> --title "<short title>" --repo <path> --task-file - <<'TA
 TASK
 ```
 
-Leave out `--repo` for a task with no repository. Add `--machine <label>` for a repository on a saved SSH machine. The thread automatically gets the project instructions and memory, so the task only needs what is specific to it.
+Leave out `--repo` for a task with no repository. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (the role's `machine` row); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. The thread automatically gets the project instructions and memory, so the task only needs what is specific to it.
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
