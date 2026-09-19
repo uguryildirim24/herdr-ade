@@ -227,8 +227,8 @@ pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 3] {
         ),
         (
             "opencode-go",
-            "OpenCode Go (the Muse row)",
-            "`/login`, pick \"Use an API key\", OpenCode Go, and paste the Go plan's key. Go serves muse-spark-1.3-contributor.",
+            "OpenCode Go (the DeepSeek and Muse rows)",
+            "`/login`, pick \"Use an API key\", OpenCode Go, and paste the Go plan's key. Go serves deepseek-v4.1-flash and muse-spark-1.3-contributor.",
         ),
         (
             "kimi-coding",
