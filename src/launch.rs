@@ -39,6 +39,11 @@ pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, the usual choice.";
 /// The compact `ade_last` form.
 pub const COMPACT_LIMIT: usize = 80;
 
+/// Effort values the Claude CLI accepts.
+pub const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// Effort values the agy CLI accepts (`agy --help`).
+pub const AGY_EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
 /// One role's recipe lists: the `default` it launches with, the `allowed` rows
 /// a `--recipe` pin may name, and the `escalate` rows reserved for a stalled
 /// lane when Rolf asks.
@@ -373,19 +378,14 @@ fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
     let args: Vec<&str> = recipe.args.iter().map(String::as_str).collect();
     let has = |flag: &str| args.contains(&flag);
     match recipe.kind.as_str() {
-        "claude" | "agy" => {
-            // "Names Opus or Fable" reads every arg, not only the `--model`
-            // value: `-m claude-opus-5` or `--model=claude-opus-5` names Opus
-            // too, and the CLI accepts both.
-            let names_capped = args.iter().any(|arg| {
-                let arg = arg.to_ascii_lowercase();
-                arg.contains("opus") || arg.contains("fable")
-            });
-            if names_capped && effort_value(&args).as_deref() != Some("high") {
-                bail!(
-                    "recipe_effort_forbidden: `{id}` names Opus or Fable without `--effort high`"
-                );
+        "claude" => {
+            check_effort(id, &args, &CLAUDE_EFFORTS)?;
+            if !has("--dangerously-skip-permissions") {
+                bail!("recipe_permission_missing: `{id}` has no permission flag");
             }
+        }
+        "agy" => {
+            check_effort(id, &args, &AGY_EFFORTS)?;
             if !has("--dangerously-skip-permissions") {
                 bail!("recipe_permission_missing: `{id}` has no permission flag");
             }
@@ -394,6 +394,17 @@ fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
             bail!("recipe_permission_missing: `{id}` has no permission flag");
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The check only verifies the effort is one of the values the CLI knows; the
+/// recipe table no longer caps Opus or Fable.
+fn check_effort(id: &str, args: &[&str], known: &[&str]) -> Result<()> {
+    if let Some(effort) = effort_value(args)
+        && !known.contains(&effort.as_str())
+    {
+        bail!("recipe_effort_unknown: `{id}` names effort {effort:?}");
     }
     Ok(())
 }
@@ -1004,20 +1015,33 @@ escalate = ["claude_opus_high"]
             error.to_string().contains("recipe_permission_missing"),
             "{error:#}"
         );
+        // Opus at xhigh is allowed now; only an unknown effort fails.
+        resolve(Recipe {
+            kind: "claude".into(),
+            args: vec![
+                "--model".into(),
+                "claude-opus-5".into(),
+                "--effort".into(),
+                "xhigh".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+            ..Recipe::default()
+        })
+        .unwrap();
         let error = resolve(Recipe {
             kind: "claude".into(),
             args: vec![
                 "--model".into(),
                 "claude-opus-5".into(),
                 "--effort".into(),
-                "max".into(),
+                "turbo".into(),
                 "--dangerously-skip-permissions".into(),
             ],
             ..Recipe::default()
         })
         .unwrap_err();
         assert!(
-            error.to_string().contains("recipe_effort_forbidden"),
+            error.to_string().contains("recipe_effort_unknown"),
             "{error:#}"
         );
     }
