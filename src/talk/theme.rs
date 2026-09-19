@@ -67,29 +67,86 @@ impl Theme {
             ("red", &mut t.red),
             ("peach", &mut t.peach),
         ] {
-            if let Some(color) = custom.get(name).and_then(|v| v.as_str()).and_then(rgb) {
+            if let Some(color) = custom.get(name).and_then(|v| v.as_str()).and_then(color) {
                 *token = color;
             }
         }
         t
     }
 }
-fn rgb(s: &str) -> Option<Color> {
-    let hex = s.strip_prefix('#')?;
-    if hex.len() != 6 || !hex.is_ascii() {
-        return None;
+
+/// Accept the same color spellings as herdr. Unlike herdr's general parser,
+/// an unknown value returns `None` so this screen can keep that token's
+/// carried fallback as the project-screen contract requires.
+fn color(value: &str) -> Option<Color> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "reset" | "default" | "none" | "transparent") {
+        return Some(Color::Reset);
     }
-    let n = u32::from_str_radix(hex, 16).ok()?;
-    Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
+    if let Some(hex) = value.strip_prefix('#')
+        && hex.is_ascii()
+    {
+        match hex.len() {
+            6 => {
+                let n = u32::from_str_radix(hex, 16).ok()?;
+                return Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8));
+            }
+            3 => {
+                let mut digits = hex.chars().map(|c| c.to_digit(16).map(|n| n as u8));
+                let (r, g, b) = (digits.next()??, digits.next()??, digits.next()??);
+                return Some(Color::Rgb(r * 17, g * 17, b * 17));
+            }
+            _ => {}
+        }
+    }
+    if let Some(inner) = value
+        .strip_prefix("rgb(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let mut parts = inner.split(',').map(str::trim);
+        let (r, g, b) = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        if parts.next().is_none() {
+            return Some(Color::Rgb(r, g, b));
+        }
+    }
+    Some(match value.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" | "purple" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "white" => Color::White,
+        "gray" | "grey" => Color::Gray,
+        "darkgray" | "darkgrey" => Color::DarkGray,
+        "lightred" => Color::LightRed,
+        "lightgreen" => Color::LightGreen,
+        "lightyellow" => Color::LightYellow,
+        "lightblue" => Color::LightBlue,
+        "lightmagenta" => Color::LightMagenta,
+        "lightcyan" => Color::LightCyan,
+        _ => return None,
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn custom_accent_and_per_token_fallback() {
-        let t = Theme::parse("[theme.custom]\naccent = '#123456'\ntext = 'bad'\n");
+    fn herdr_color_spellings_and_per_token_fallback() {
+        let t = Theme::parse(
+            "[theme.custom]\naccent = '#123456'\ntext = 'rgb(1, 2, 3)'\ngreen = '#0f8'\nyellow = 'blue'\npanel_bg = 'default'\nred = 'bad'\n",
+        );
         assert_eq!(t.accent, Color::Rgb(18, 52, 86));
-        assert_eq!(t.text, Theme::default().text);
+        assert_eq!(t.text, Color::Rgb(1, 2, 3));
+        assert_eq!(t.green, Color::Rgb(0, 255, 136));
+        assert_eq!(t.yellow, Color::Blue);
+        assert_eq!(t.panel_bg, Color::Reset);
+        assert_eq!(t.red, Theme::default().red);
         assert_eq!(Theme::parse("not toml").accent, Theme::default().accent);
     }
 }
