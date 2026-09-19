@@ -455,16 +455,26 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
 
 /// Plugin default for a day-one role when the safety file has no row.
 pub fn default_role_spec(name: &str) -> RoleSpec {
-    if name == "pro" {
-        RoleSpec {
+    match name {
+        "pro" => RoleSpec {
             kind: "chatgpt".into(),
             ..RoleSpec::default()
-        }
-    } else {
-        RoleSpec {
+        },
+        // The coordinator runs on Claude Opus at xhigh (Rolf, 2026-09-19).
+        "coordinator" => RoleSpec {
+            kind: "claude".into(),
+            args: vec![
+                "--model".into(),
+                "claude-opus-5".into(),
+                "--effort".into(),
+                "xhigh".into(),
+            ],
+            ..RoleSpec::default()
+        },
+        _ => RoleSpec {
             kind: "claude".into(),
             ..RoleSpec::default()
-        }
+        },
     }
 }
 
