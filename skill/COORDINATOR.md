@@ -72,6 +72,7 @@ Keep the file short: it is printed every turn and costs tokens.
 - `hp thread list <slug>` and `hp thread show <slug> <id>` print records with live state. The home copy of a thread's report is `threads/<id>.md`; files it produced for the user are in `library/<id>/`.
 - A thread under "Waiting on you" that is blocked needs the user in that thread's pane. Tell the user which thread and where. Do not try to answer its permission prompt.
 - When the user has looked at a finished thread, run `hp thread ack <slug> <id>`.
+- `hp thread resolve <slug> <id>` makes the final copy, then closes the thread's pane and tab through Herdr so its idle agent stops using memory. The worktree and branch stay; `--remove-worktree` removes the worktree too, and `--keep-pane` leaves the pane open.
 - `hp overview <slug>` prints all threads grouped by what needs the user.
 
 ## Memory

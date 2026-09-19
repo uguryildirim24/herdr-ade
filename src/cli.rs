@@ -782,7 +782,7 @@ enum ThreadCommand {
     Resolve {
         slug: String,
         id: String,
-        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied"])]
+        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied", "keep_pane"])]
         reopen: bool,
         /// Also remove the worktree (never forced; the branch is kept)
         #[arg(long)]
@@ -793,6 +793,9 @@ enum ThreadCommand {
         /// With --remove-worktree: accept losing what could not be copied
         #[arg(long, requires = "remove_worktree")]
         discard_uncopied: bool,
+        /// Leave the lane's pane and tab open instead of closing them
+        #[arg(long)]
+        keep_pane: bool,
     },
 }
 
@@ -1038,6 +1041,7 @@ pub fn run() -> Result<()> {
                 remove_worktree,
                 skip_copy,
                 discard_uncopied,
+                keep_pane,
             } => threads::resolve(
                 &ctx,
                 &slug,
@@ -1047,6 +1051,7 @@ pub fn run() -> Result<()> {
                     remove_worktree,
                     skip_copy,
                     discard_uncopied,
+                    keep_pane,
                 },
             ),
         },
