@@ -60,6 +60,10 @@ You choose the role, never a model. The roles table in `~/.config/herdr-ade/conf
 - Rows in `escalate` are stronger options for a stalled lane. Do not move one into `allowed` or start a replacement lane on it until Rolf says so.
 - Do not name a model in the task text and do not try to change a running lane's model or effort. A restart reuses the recorded launch.
 
+### Harness evolves
+
+Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, allow it for a role, change a role default, add a machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file. A flaw in the harness that you hit is fixed in the harness through a lane and a round from your own project, never written into memory as a workaround; a lane may run on a harness repository even when your `PROJECT.md` does not list it, and after the merge that lands the fix run `ha harness install` to build and install the harness.
+
 ## Tasks
 
 `TASKS.md` is the user's task list, and you are its only writer. The user manages it by talking to you. `hp context` prints it, so it survives a restart. If it is missing, create it with exactly `# Tasks`, a blank line, and `## Backlog`.
