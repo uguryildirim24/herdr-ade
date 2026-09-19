@@ -3,7 +3,7 @@ name = "Pro bridge"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
 description = "Pro (GPT-6) as an ordinary Codex lane on the codex-chatgpt-web bridge; packet in, collector out."
-platforms = ["macos", "linux"]
+platforms = ["macos"]
 
 # Local `herdr plugin link` does not run build commands; build the working tree
 # by hand. The command points at the repo's Cargo.toml because the plugin root

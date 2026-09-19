@@ -27,7 +27,9 @@ SPEC: `herdr/tasks/pro-bridge/SPEC-pro-bridge.md` v2 (on the fork branch
 
 ## State
 
-Under `~/.herdr-ade/pro-bridge` (override with `HERDR_PRO_STATE_DIR`):
+Under `~/.herdr-ade/pro-bridge` (override with `HERDR_PRO_STATE_DIR`). Turn
+concurrency defaults to 2; `HERDR_PRO_MAX_INFLIGHT` may set it from 1 through
+the hard maximum of 4:
 
 ```
 lanes/<name>.toml      pane, parent, cwd, session_id, rollout, state
@@ -37,12 +39,14 @@ inflight/<tag>.lock    one per running collector (mtime liveness)
 usage.jsonl            one line per Pro send
 cooldown-until         RFC 3339; the 2 h breaker
 start.lock             flock; one Codex start at a time
+turn.lock              flock; turn admission and the two-turn cap are atomic
 bridge-state.json      last /healthz pid and version
 ```
 
-Lane states: `starting → ready → in_turn → answered | failed → ready`, plus
-`sign_in_required`, `bridge_down`, `cooldown`, `gone`. Only a ready herdr
-agent (`idle`/`done`) accepts a turn.
+Lane states: `starting → ready → in_turn → ready`, plus
+`sign_in_required`, `bridge_down`, `cooldown`, `gone`. The turn record keeps
+`delivered` or `failed`; only a ready herdr agent (`idle`/`done`) accepts a
+turn.
 
 ## Turn
 

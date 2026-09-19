@@ -5,7 +5,6 @@
 //! at the bridge with `-c` overrides. Rolf's `~/.codex` is never written.
 
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -19,30 +18,6 @@ use super::{Env, Layout, MODEL, bridge, doctor};
 /// `agent start` waits this long for a ready agent; a trust or sign-in prompt
 /// shows as a blocked screen and the start times out.
 const READY_TIMEOUT_MS: u64 = 120_000;
-
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-
-const LOCK_EX: i32 = 2;
-
-/// `flock` on `start.lock`, so two starts never race a Codex migration.
-struct StartLock {
-    _file: File,
-}
-
-impl StartLock {
-    fn acquire(layout: &Layout) -> Result<StartLock> {
-        layout.ensure()?;
-        let file = File::create(layout.start_lock())
-            .with_context(|| format!("could not open {}", layout.start_lock().display()))?;
-        // SAFETY: flock takes an open fd and a flag; it blocks until granted.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
-            bail!("could not take the start lock");
-        }
-        Ok(StartLock { _file: file })
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -217,6 +192,12 @@ fn write_lane_with_rollout(
 ) {
     let rollout = find_rollout(&env.lane_codex_home(), &lane.cwd, started, session_id);
     if let Some(rollout) = rollout {
+        if lane.session_id.is_none()
+            && let Some(meta) = session_meta(&rollout)
+            && !meta.id.is_empty()
+        {
+            lane.session_id = Some(meta.id);
+        }
         lane.rollout = Some(rollout.display().to_string());
     }
     let _ = layout;
@@ -225,6 +206,12 @@ fn write_lane_with_rollout(
 /// `herdr-pro start`: doctor, one serialized Codex start, then record.
 pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOptions) -> Result<Lane> {
     layout.ensure()?;
+    state::check_name(&opts.name)?;
+    if let Ok(existing) = Lane::read(layout, &opts.name)
+        && existing.stopped
+    {
+        bail!("lane `{}` was stopped; use a new lane name", opts.name);
+    }
     if let Err(error) = doctor::gate(env, layout, runner) {
         return Err(anyhow::anyhow!("WAITING pro-bridge {error:#}"));
     }
@@ -253,13 +240,13 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     }
 
     let bin = env.herdr_bin();
-    let _lock = StartLock::acquire(layout)?;
+    let _lock = state::FileLock::acquire(&layout.start_lock())?;
     let workspace = workspace_for(env, runner, &bin, opts.parent.as_deref()).unwrap_or_default();
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &cwd_text, &opts.name, &env_pairs)
         .context("could not create the lane tab")?;
     let started = jiff::Timestamp::now();
-    let agent = herdr_cli::agent_start(
+    let agent = match herdr_cli::agent_start(
         runner,
         &bin,
         &herdr_cli::StartSpec {
@@ -270,13 +257,18 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
             extra: &codex_args(port),
             ready_timeout_ms: READY_TIMEOUT_MS,
         },
-    )
-    .map_err(|error| blocked_reason(runner, &bin, &pane.pane_id, error))?;
+    ) {
+        Ok(agent) => agent,
+        Err(error) => {
+            let error = blocked_reason(runner, &bin, &pane.pane_id, error);
+            let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+            return Err(error);
+        }
+    };
     if agent.blocked() {
-        bail!(
-            "WAITING pro-bridge the lane is blocked: {}",
-            screen_reason(runner, &bin, &pane.pane_id)
-        );
+        let reason = screen_reason(runner, &bin, &pane.pane_id);
+        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        bail!("WAITING pro-bridge the lane is blocked: {reason}");
     }
 
     let session_id = agent
@@ -299,7 +291,10 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
         last_turn: None,
     };
     write_lane_with_rollout(env, layout, &mut lane, session_id.as_deref(), started);
-    lane.write(layout)?;
+    if let Err(error) = lane.write(layout) {
+        let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+        return Err(error);
+    }
     Ok(lane)
 }
 
@@ -325,6 +320,15 @@ fn screen_reason(runner: &dyn Runner, bin: &str, pane: &str) -> String {
 /// `herdr-pro resume`: start the lane again and resume its Codex thread.
 pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
     let mut lane = Lane::read(layout, name)?;
+    if lane.stopped {
+        bail!("lane `{name}` was stopped and cannot be resumed");
+    }
+    if lane.state != "gone" {
+        bail!("lane `{name}` is {}, not gone", lane.state);
+    }
+    if state::cooldown_active(layout, jiff::Timestamp::now()) {
+        bail!("WAITING pro-bridge cooldown is active");
+    }
     let session = lane
         .session_id
         .clone()
@@ -346,14 +350,14 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     }
 
     let bin = env.herdr_bin();
-    let _lock = StartLock::acquire(layout)?;
+    let _lock = state::FileLock::acquire(&layout.start_lock())?;
     let workspace = workspace_for(env, runner, &bin, lane.parent.as_deref())
         .unwrap_or_else(|| lane.workspace_id.clone());
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &lane.cwd, name, &env_pairs)
         .context("could not create the resume tab")?;
     let started = jiff::Timestamp::now();
-    let agent = herdr_cli::agent_start(
+    let agent = match herdr_cli::agent_start(
         runner,
         &bin,
         &herdr_cli::StartSpec {
@@ -364,13 +368,18 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
             extra: &codex_resume_args(port, &session),
             ready_timeout_ms: READY_TIMEOUT_MS,
         },
-    )
-    .map_err(|error| blocked_reason(runner, &bin, &pane.pane_id, error))?;
+    ) {
+        Ok(agent) => agent,
+        Err(error) => {
+            let error = blocked_reason(runner, &bin, &pane.pane_id, error);
+            let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+            return Err(error);
+        }
+    };
     if agent.blocked() {
-        bail!(
-            "WAITING pro-bridge the resumed lane is blocked: {}",
-            screen_reason(runner, &bin, &pane.pane_id)
-        );
+        let reason = screen_reason(runner, &bin, &pane.pane_id);
+        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        bail!("WAITING pro-bridge the resumed lane is blocked: {reason}");
     }
     lane.pane_id = pane.pane_id;
     lane.tab_id = pane.tab_id;
@@ -378,7 +387,10 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     lane.state = "ready".into();
     lane.stopped = false;
     write_lane_with_rollout(env, layout, &mut lane, Some(&session), started);
-    lane.write(layout)?;
+    if let Err(error) = lane.write(layout) {
+        let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+        return Err(error);
+    }
     Ok(lane)
 }
 
@@ -407,6 +419,8 @@ pub fn reconcile(env: &Env, layout: &Layout, runner: &dyn Runner) -> Result<Vec<
 /// `herdr-pro stop`: the plugin's stop switch. Mark the lane stopped and close
 /// its tab so reconcile never brings it back.
 pub fn stop(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
+    let _start = state::FileLock::acquire(&layout.start_lock())?;
+    let _turn = state::FileLock::acquire(&layout.turn_lock())?;
     let mut lane = Lane::read(layout, name)?;
     lane.stopped = true;
     lane.state = "gone".into();

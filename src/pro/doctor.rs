@@ -96,10 +96,17 @@ pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> 
             } else {
                 "draining"
             };
-            rows.push(Row::ok(
-                "bridge",
-                format!("{accepting} on port {port}, version {}", health.version),
-            ));
+            if health.accepting {
+                rows.push(Row::ok(
+                    "bridge",
+                    format!("{accepting} on port {port}, version {}", health.version),
+                ));
+            } else {
+                rows.push(Row::fail(
+                    "bridge",
+                    format!("{accepting} on port {port}; resume it before a turn"),
+                ));
+            }
             if health.major_seen() {
                 rows.push(Row::ok(
                     "bridge version",
@@ -122,9 +129,9 @@ pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> 
                     "bridge mode",
                     format!("{mode}; Pro runs in browser-only (never Full or Zero Risk)"),
                 )),
-                None => rows.push(Row::warn(
+                None => rows.push(Row::fail(
                     "bridge mode",
-                    "the bridge config was not readable; expected browser-only",
+                    "the bridge did not report its mode and the config was not readable; expected browser-only",
                 )),
             }
         }
@@ -157,30 +164,38 @@ pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> 
 }
 
 fn codex_route_row(env: &Env) -> Row {
-    let path = env.lane_codex_home().join("config.toml");
+    // This is always Rolf's everyday Codex home, even when Pro uses its own
+    // home. The invariant is that daily Codex never inherits the bridge.
+    let path = env.codex_home().join("config.toml");
     if !path.exists() {
         return Row::ok("~/.codex route", "no config.toml");
     }
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Row::warn(
+        return Row::fail(
             "~/.codex route",
-            format!("{} is unreadable", path.display()),
+            format!(
+                "{} is unreadable, so the route cannot be checked",
+                path.display()
+            ),
         );
     };
     let Ok(table) = text.parse::<toml::Table>() else {
-        return Row::warn(
+        return Row::fail(
             "~/.codex route",
-            format!("{} does not parse", path.display()),
+            format!(
+                "{} does not parse, so the route cannot be checked",
+                path.display()
+            ),
         );
     };
     match table.get("openai_base_url").and_then(|v| v.as_str()) {
-        Some(url) if url.contains(&format!("127.0.0.1:{}", super::BRIDGE_PORT)) => Row::fail(
+        Some(url) if local_bridge_url(url, super::BRIDGE_PORT) => Row::fail(
             "~/.codex route",
             format!(
                 "openai_base_url points at the bridge ({url}); run `codex-chatgpt-web route disconnect`"
             ),
         ),
-        Some(url) if url.contains(&format!("127.0.0.1:{}", super::FALLBACK_PORT)) => Row::fail(
+        Some(url) if local_bridge_url(url, super::FALLBACK_PORT) => Row::fail(
             "~/.codex route",
             format!("openai_base_url points at the bridge fallback ({url}); remove it"),
         ),
@@ -190,6 +205,12 @@ fn codex_route_row(env: &Env) -> Row {
         ),
         None => Row::ok("~/.codex route", "no openai_base_url override"),
     }
+}
+
+fn local_bridge_url(url: &str, port: u16) -> bool {
+    ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|host| url.contains(&format!("{host}:{port}")))
 }
 
 fn codex_login_row(env: &Env, runner: &dyn Runner) -> Row {
