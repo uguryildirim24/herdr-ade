@@ -728,22 +728,24 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
         let Some(reviewer) = record.reviewer.clone() else {
             // The review branch for the current revision: one `round review`
             // just made, or the one an earlier pass left behind. A round
-            // whose members are all pinned and that has no review branch yet
-            // runs `round review` first; a frozen round whose current review
-            // revision already has its branch starts the reviewer here,
-            // exactly like a fresh round. This covers the state `round
+            // whose members are all pinned and that has no current review
+            // branch runs `round review` first; a frozen round whose current
+            // review revision already has its branch starts the reviewer
+            // here, exactly like a fresh round. This covers the state `round
             // review` leaves after a REJECT and the state a failed start
-            // leaves, whatever `announced` says.
-            let review_branch = match record.review_branch.clone() {
-                Some(branch) => branch,
-                None => {
-                    let ready = !record.manifest.members.is_empty()
-                        && record.manifest.members.iter().all(|m| m.pin.is_some());
-                    if !ready {
-                        continue;
-                    }
-                    review(ctx, slug, &round)?.review_branch
-                }
+            // leaves, whatever `announced` says. Never start from a branch
+            // made stale by a changed or missing pin.
+            let ready = !record.manifest.members.is_empty()
+                && record.manifest.members.iter().all(|m| m.pin.is_some());
+            if !ready {
+                continue;
+            }
+            let current_hash = manifest_hash(&record);
+            let review_is_current = record.frozen_revision == Some(record.manifest.revision)
+                && record.manifest_hash.as_deref() == Some(current_hash.as_str());
+            let review_branch = match (record.review_branch.clone(), review_is_current) {
+                (Some(branch), true) => branch,
+                _ => review(ctx, slug, &round)?.review_branch,
             };
             match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
                 Ok(thread) => {
@@ -3080,6 +3082,47 @@ mod tests {
 
         let record = load(&fx.project, "r1").unwrap();
         assert!(record.reviewer.is_some(), "the start is retried");
+    }
+
+    /// A failed start must not let a reviewer begin from the old branch if a
+    /// lane restarts before the retry. It waits for the new pin, writes the
+    /// next review revision, and only then starts the reviewer.
+    #[test]
+    fn advance_never_retries_a_reviewer_on_a_stale_manifest() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (lanes, _) = reviewed(&fx);
+        let first_branch = load(&fx.project, "r1").unwrap().review_branch.unwrap();
+
+        fx.set_attempt(&lanes[0].0, 2);
+        advance(&ctx, "demo").unwrap();
+        let waiting = load(&fx.project, "r1").unwrap();
+        assert!(waiting.reviewer.is_none());
+        assert_eq!(
+            waiting.review_branch.as_deref(),
+            Some(first_branch.as_str())
+        );
+        assert!(waiting.manifest.members[0].pin.is_none());
+        assert_eq!(
+            thread::list(&fx.project)
+                .into_iter()
+                .filter(|t| t.role == "reviewer")
+                .count(),
+            0,
+            "an incomplete manifest gets no reviewer"
+        );
+
+        let wt = fx.repo.join(".worktrees/lane-1");
+        let repaired = commit_file(&wt, "src/lane1.rs", "// attempt 2\n", "retry lane 1");
+        fx.seal_done(&lanes[0].0, 2, 1, &repaired, "# retry report\n");
+        advance(&ctx, "demo").unwrap();
+
+        let retried = load(&fx.project, "r1").unwrap();
+        assert_eq!(retried.review_branch.as_deref(), Some("review/r1-2"));
+        assert!(retried.reviewer.is_some());
+        assert_eq!(retried.frozen_revision, Some(retried.manifest.revision));
+        assert_eq!(retried.manifest_hash, Some(manifest_hash(&retried)));
     }
 
     /// A reviewer that is gone is reported once and never replaced.
