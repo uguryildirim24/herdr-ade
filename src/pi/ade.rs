@@ -65,6 +65,36 @@ pub fn check_with(
     doctor::check_with(&layout(root), &env, &Adapter(runner), provider)
 }
 
+/// Box pi readiness (SPEC-remote §4.1, SPEC-pi §3.4, item 101): the check runs
+/// on the box through its own wrapper and login store. A Mac login never
+/// counts, and the model is resolved from the box's shared store.
+pub fn check_on_machine(
+    runner: &dyn crate::runner::Runner,
+    target: &str,
+    provider: &str,
+) -> Result<()> {
+    let script = format!(
+        "HERDR_ADE_ROOT={root} {bin} check {provider}",
+        root = crate::remote::quote(crate::contracts::BOX_ROOT),
+        bin = crate::remote::quote(crate::contracts::BOX_BIN),
+        provider = crate::remote::quote(provider),
+    );
+    let out = crate::remote::ssh(
+        runner,
+        target,
+        &script,
+        None,
+        crate::remote::SSH_START_TIMEOUT,
+    )?;
+    if out.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "pi_not_ready on the box for `{provider}`: {}",
+        out.error_text()
+    )
+}
+
 /// The pi doctor rows through the plugin's runner, for `doctor`.
 pub fn doctor_rows_with(
     runner: &dyn crate::runner::Runner,

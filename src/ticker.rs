@@ -529,19 +529,26 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
         }
         *may_start = false;
         // A pi provider that stopped being ready (an expired login) fails
-        // the thread at once instead of launching into it (SPEC-pi §3.4).
-        if t.launch.kind == "pi"
-            && let Err(error) = crate::threads::pi_ready(pass.ctx, &t.launch)
-        {
-            let message = format!("{error:#}");
-            errors.extend(
-                thread::update(pass.project, &t.id, |t| {
-                    t.status = thread::Status::Failed;
-                    t.error = message;
-                })
-                .err(),
-            );
-            continue;
+        // the thread at once instead of launching into it (SPEC-pi §3.4). A
+        // box lane's readiness is read on the box, never from the Mac login
+        // (SPEC-remote §4.1).
+        if t.launch.kind == "pi" {
+            let readiness = if t.is_remote() {
+                crate::threads::box_pi_ready(pass.ctx, &t.machine, &t.launch)
+            } else {
+                crate::threads::pi_ready(pass.ctx, &t.launch)
+            };
+            if let Err(error) = readiness {
+                let message = format!("{error:#}");
+                errors.extend(
+                    thread::update(pass.project, &t.id, |t| {
+                        t.status = thread::Status::Failed;
+                        t.error = message;
+                    })
+                    .err(),
+                );
+                continue;
+            }
         }
         let launched = (|| -> Result<()> {
             thread::update(pass.project, &t.id, |t| t.launch_attempts += 1)?;
@@ -737,6 +744,21 @@ fn remote_pass(
         may_start,
         errors,
     );
+    // The courier: one multiplexed helper call and one batched `scp`, then the
+    // D8 BLOCKED/GONE lines for this machine's box lanes (SPEC-remote §4.3).
+    let courier = steps::courier(ctx, project, machine).map_err(|e| format!("{e:#}"))?;
+    errors.extend(steps::remote_attention(
+        ctx,
+        project,
+        steps::RemoteView {
+            machine_id: &courier.machine_id,
+            threads,
+            agents: &agents,
+            panes: &panes,
+            boot_id: &courier.boot_id,
+            now: jiff::Timestamp::now(),
+        },
+    ));
     Ok(pass.transitions)
 }
 
@@ -856,6 +878,15 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         );
         let event =
             memory.record_machine(&machine, outcome.as_ref().err().map(String::as_str), now);
+        // After the configured outage period, type one unreachable BLOCKED per
+        // open box lane, then stay quiet until the machine answers again
+        // (SPEC-remote §4.3). A failed pass never invents GONE.
+        if matches!(&event, Some(steps::OutageEvent::Down)) {
+            for lane in &threads {
+                let line = format!("BLOCKED {} machine {machine} unreachable", lane.id);
+                errors.extend(steps::type_remote_line(ctx, project, &line).err());
+            }
+        }
         match outcome {
             Ok(found) => transitions.extend(found),
             Err(error) => errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}")),

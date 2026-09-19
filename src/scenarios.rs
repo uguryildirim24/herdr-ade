@@ -1295,7 +1295,7 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
         "machine list --json",
         ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
     );
-    scripted.runner.on("ssh", ok("t-0001 -\n"));
+    scripted.runner.on("ssh", ok("boot\tboot-1\nfree\t1\n"));
     scripted
         .runner
         .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
@@ -1356,7 +1356,7 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
         "machine list --json",
         ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#),
     );
-    scripted.runner.on("ssh", ok("t-0001 -\n"));
+    scripted.runner.on("ssh", ok("boot\tboot-1\nfree\t1\n"));
     scripted
         .runner
         .on("agent list", ok(r#"{"result":{"agents":[]}}"#));
