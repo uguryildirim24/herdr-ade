@@ -76,7 +76,7 @@ pub fn check_on_machine(
     let script = format!(
         "HERDR_ADE_ROOT={root} {bin} check {provider}",
         root = crate::remote::quote(crate::contracts::BOX_ROOT),
-        bin = crate::remote::quote(crate::contracts::BOX_BIN),
+        bin = crate::remote::quote(crate::contracts::BOX_PI_BIN),
         provider = crate::remote::quote(provider),
     );
     let out = crate::remote::ssh(
@@ -111,7 +111,7 @@ pub fn doctor_rows_with(
 mod tests {
     use super::*;
     use crate::pi::sh::Runner as _;
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok};
 
     /// Scripted through the plugin's own FakeRunner: the adapter carries the
     /// argv and env across unchanged.
@@ -135,5 +135,39 @@ mod tests {
         assert!(calls[0].own_group, "a timeout must reach zsh's children");
         drop(calls);
         let _ = (&env, &layout);
+    }
+
+    /// The readiness check runs on the box through `herdr-pi`, never the plugin
+    /// binary, and names the provider.
+    #[test]
+    fn the_box_readiness_check_calls_the_pi_binary_with_the_provider() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok("{}"));
+        check_on_machine(&runner, "me@box", "opencode-go").unwrap();
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].args.last().unwrap(),
+            "sh -c 'HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go'"
+        );
+        drop(calls);
+    }
+
+    /// A non-zero exit surfaces the box's own stderr, not a Mac-side guess.
+    #[test]
+    fn a_box_readiness_refusal_surfaces_the_box_stderr() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", fail(1, "error: unrecognized subcommand 'check'\n"));
+        let error = check_on_machine(&runner, "me@box", "opencode-go")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("pi_not_ready on the box for `opencode-go`"),
+            "{error}"
+        );
+        assert!(
+            error.contains("error: unrecognized subcommand 'check'"),
+            "{error}"
+        );
     }
 }
