@@ -469,7 +469,7 @@ pub fn refresh(_ctx: &Ctx, project: &Project) -> Result<bool> {
 }
 
 /// Flips every step's persisted state to the state its bindings derive.
-fn project_states(project: &Project, plan: &mut Plan) -> bool {
+pub(crate) fn project_states(project: &Project, plan: &mut Plan) -> bool {
     let mut changed = false;
     for step in &mut plan.steps {
         let state = derive_state(project, step);
