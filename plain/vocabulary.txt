@@ -59,7 +59,6 @@ pane
 panes
 parent
 payload
-picker
 pickup
 policy
 process

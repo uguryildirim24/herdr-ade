@@ -1,10 +1,9 @@
 //! Pinned pi integration for `herdr-ade` (SPEC-pi v2 §3).
 //!
 //! The library owns pi itself: the pinned npm prefix, the wrapper the login
-//! shell finds, one shared pi folder for every lane, the D2 rows and Jev
-//! recipe ids, resume helpers, doctor
-//! rows, and the guard extension that turns a provider failure into
-//! `blocked` / `WAITING` instead of a silent `done`.
+//! shell finds, one shared pi folder for every lane, the D2 rows, resume
+//! helpers, doctor rows, and the guard extension that turns a provider failure
+//! into `blocked` / `WAITING` instead of a silent `done`.
 //!
 //! The module compiles into two targets: the `herdr-ade` binary and the thin
 //! `herdr-pi` binary (setup, login instructions, doctor, check). It therefore
