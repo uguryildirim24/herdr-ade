@@ -155,6 +155,29 @@ pub fn format_check(text: &str, result: &CheckResult) -> String {
         .join("\n")
 }
 
+/// One checked plain sentence for a coordinator-written field (plan step,
+/// result sentence, decision line). Uses the project registry so a born name
+/// may appear in gloss form, and requires exactly one sentence. Returns the
+/// trimmed text.
+pub fn check_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("plain_envelope: required field {field} is missing or empty");
+    }
+    let result = plain::check(trimmed, &registry(project));
+    if !result.passed() {
+        bail!("plain_refused: {field}: {}", format_check(trimmed, &result));
+    }
+    let sentences = trimmed
+        .split(['.', '?', '!', '\n'])
+        .filter(|s| !s.trim().is_empty())
+        .count();
+    if sentences != 1 {
+        bail!("plain_refused: {field}: write one sentence of at most 25 words");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Checks a text for Rolf's plane; the error carries the check's output.
 pub fn gate(project: &Project, text: &str) -> Result<()> {
     let result = plain::check(text, &registry(project));

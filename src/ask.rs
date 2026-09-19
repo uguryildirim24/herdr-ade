@@ -100,6 +100,42 @@ fn ask_dir(project: &Project, id: &str) -> PathBuf {
     asks_dir(project).join(id)
 }
 
+/// At most three open asks, including one whose publication is still pending
+/// (SPEC-talk §6.7).
+pub const MAX_OPEN_ASKS: usize = 3;
+
+/// The shared ask-set lock, `<project>/asks/.open.lock`. Creation, re-asking
+/// and answering take it inside the project lock so concurrent writers cannot
+/// each claim the third slot.
+struct AskSetLock {
+    _file: std::fs::File,
+}
+
+fn ask_set_lock(project: &Project) -> Result<AskSetLock> {
+    let dir = asks_dir(project);
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".open.lock"))?;
+    file.lock()?;
+    Ok(AskSetLock { _file: file })
+}
+
+/// Refuses a fourth co-existing open ask. Re-asking an existing id replaces
+/// its revision and does not count as a new ask.
+fn enforce_ask_cap(project: &Project, reask: Option<&str>) -> Result<()> {
+    if reask.is_some() {
+        return Ok(());
+    }
+    let open = open_asks(project).len();
+    if open >= MAX_OPEN_ASKS {
+        bail!("ask_cap: {open} asks are already open; reask the newest one as one merged question");
+    }
+    Ok(())
+}
+
 fn rev_path(project: &Project, id: &str, revision: u32) -> PathBuf {
     ask_dir(project, id).join(format!("r{revision}.toml"))
 }
@@ -304,11 +340,16 @@ pub fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let binding = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
     let record = {
         let _lock = project.lock()?;
+        let _set = ask_set_lock(&project)?;
+        enforce_ask_cap(&project, new.reask.as_deref())?;
         let (id, revision) = match &new.reask {
             Some(id) => {
                 let r = latest_revision(&project, id);
                 if r == 0 {
                     bail!("ask_unknown: `{id}` has never been asked");
+                }
+                if answer_of(&project, id, r).is_some() {
+                    bail!("ask_closed: `{id}` revision {r} is already answered");
                 }
                 (id.clone(), r + 1)
             }
@@ -364,6 +405,7 @@ pub fn answer(
     let project = Project::load(&ctx.root, slug)?;
     let answer = {
         let _lock = project.lock()?;
+        let _set = ask_set_lock(&project)?;
         let latest = latest_revision(&project, id);
         if latest == 0 {
             bail!("ask_unknown: `{id}` has never been asked");
@@ -438,6 +480,30 @@ pub fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<()>
         &HumanMessage::Say {
             what: what.trim().to_string(),
             means: means.map(|m| m.trim().to_string()),
+            landed_round: None,
+        },
+    )
+    .map(|_| ())
+}
+
+/// The landing line for a merged round (SPEC-talk §6.1). It publishes under
+/// `landed:<round>` so a repeated merge publishes once, and it validates that
+/// the round actually merged and checkpointed.
+pub fn say_landed(
+    ctx: &Ctx,
+    slug: &str,
+    what: &str,
+    means: Option<&str>,
+    round: &str,
+) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    publish(
+        ctx,
+        &project,
+        &HumanMessage::Say {
+            what: what.trim().to_string(),
+            means: means.map(|m| m.trim().to_string()),
+            landed_round: Some(round.to_string()),
         },
     )
     .map(|_| ())
@@ -511,7 +577,7 @@ pub fn publish_keyed(
     let g = glossary::registry(project);
     let mut problems = Vec::new();
     match msg {
-        HumanMessage::Say { what, means } => {
+        HumanMessage::Say { what, means, .. } => {
             problems.extend(say_problems("what", what, &g));
             if let Some(means) = means {
                 problems.extend(say_problems("means", means, &g));
@@ -527,15 +593,30 @@ pub fn publish_keyed(
         bail!("plain_refused:\n{}", problems.join("\n"));
     }
     match msg {
-        HumanMessage::Say { what, means } => {
+        HumanMessage::Say {
+            what,
+            means,
+            landed_round,
+        } => {
+            if let Some(round) = landed_round {
+                let merged = crate::round::read_merge(project, round)?
+                    .is_some_and(|m| m.phase == crate::contracts::MergePhase::Checkpointed);
+                if !merged {
+                    bail!("landed_round_unmerged: `{round}` has not merged and checkpointed");
+                }
+            }
             let line = board_line(what, 80);
             glossary::gate(project, &line).context("the board line failed the check")?;
+            // A landing line is idempotent under `landed:<round>` regardless
+            // of the caller's key.
+            let landed_key = landed_round.as_ref().map(|round| format!("landed:{round}"));
             let seq = crate::talk::append(
                 project,
-                key,
+                landed_key.as_deref().or(key),
                 crate::talk::Entry::Say {
                     what: what.clone(),
                     means: means.clone(),
+                    landed_round: landed_round.clone(),
                 },
             )?;
             if seq.is_none() {
@@ -645,7 +726,7 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::round::testkit::fixture;
+    use crate::round::testkit::{Fx, fixture};
     use crate::runner::fake::ok;
     use crate::scenarios::World;
 
@@ -899,6 +980,7 @@ mod tests {
         let msg = HumanMessage::Say {
             what: "The review is done.".into(),
             means: None,
+            landed_round: None,
         };
         let first = publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
         let second =
@@ -1088,5 +1170,74 @@ mod tests {
         );
         // An invented sentence for a term fails R2.
         assert!(glossary::gate(&fx.project, "The quotient is a thing.").is_err());
+    }
+
+    fn ask_again(fx: &Fx) -> Result<Ask> {
+        ask(&fx.world.ctx(), "demo", keep_or_stop())
+    }
+
+    #[test]
+    fn a_fourth_open_ask_is_refused_without_a_partial_record() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        for _ in 0..3 {
+            ask_again(&fx).unwrap();
+        }
+        assert_eq!(open_asks(&fx.project).len(), 3);
+        let journal = journal_kinds(&fx.project).len();
+        let e = format!("{:#}", ask_again(&fx).unwrap_err());
+        assert!(e.starts_with("ask_cap"), "{e}");
+        assert_eq!(open_asks(&fx.project).len(), 3);
+        assert_eq!(
+            journal_kinds(&fx.project).len(),
+            journal,
+            "no partial record"
+        );
+        assert!(!rev_path(&fx.project, "a-4", 1).exists());
+        // Answering one frees a slot.
+        answer(&ctx, "demo", "a-1", 1, 1, "test").unwrap();
+        ask_again(&fx).unwrap();
+        assert_eq!(open_asks(&fx.project).len(), 3);
+    }
+
+    #[test]
+    fn a_pending_publication_counts_against_the_cap() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        // No board or notification rule: each ask is recorded but unpublished.
+        for _ in 0..3 {
+            ask(&world.ctx(), "demo", keep_or_stop()).unwrap();
+        }
+        assert_eq!(open_asks(&project).len(), 3);
+        assert!(!published_marker(&project, "a-1", 1).exists());
+        let e = format!(
+            "{:#}",
+            ask(&world.ctx(), "demo", keep_or_stop()).unwrap_err()
+        );
+        assert!(e.starts_with("ask_cap"), "{e}");
+        assert_eq!(open_asks(&project).len(), 3);
+    }
+
+    #[test]
+    fn reasking_the_newest_keeps_the_identifier_and_the_cap() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        for _ in 0..3 {
+            ask_again(&fx).unwrap();
+        }
+        let merged = ask(
+            &ctx,
+            "demo",
+            NewAsk {
+                reask: Some("a-3".into()),
+                ..keep_or_stop()
+            },
+        )
+        .unwrap();
+        assert_eq!((merged.id.as_str(), merged.revision), ("a-3", 2));
+        assert_eq!(open_asks(&fx.project).len(), 3, "the cap is unchanged");
+        assert!(journal_kinds(&fx.project).contains(&"ask a-3@2".to_string()));
+        let ids: Vec<String> = open_asks(&fx.project).into_iter().map(|a| a.id).collect();
+        assert!(ids.contains(&"a-1".to_string()) && ids.contains(&"a-2".to_string()));
     }
 }
