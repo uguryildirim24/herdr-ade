@@ -364,6 +364,71 @@ pub fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
     }
 }
 
+/// The receipt written when a `done` or `waiting` event is sealed (D5): the
+/// bytes the sealer itself hashed. The courier carries it to the Mac, which
+/// compares it with the fetched bytes before the taken cursor advances.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct Receipt {
+    pub event: String,
+    pub event_hash: String,
+    /// The content-addressed artifact name; empty for `waiting`.
+    pub artifact: String,
+    pub artifact_hash: String,
+    pub created: String,
+}
+
+fn receipts_dir(project: &Project) -> PathBuf {
+    project.dir().join("receipts")
+}
+
+pub fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
+    validate_id(id)?;
+    Ok(receipts_dir(project).join(format!("{id}.toml")))
+}
+
+/// Writes the receipt create-only. A retry with the same bytes is a no-op;
+/// different bytes for a sealed event are corruption.
+pub fn write_receipt(project: &Project, event: &Event) -> Result<()> {
+    let event_hash = hash_bytes(&bytes(event)?);
+    let (artifact, artifact_hash) = match &event.payload.done {
+        Some(done) => (done.artifact.clone(), done.artifact.clone()),
+        None => (String::new(), String::new()),
+    };
+    let receipt = Receipt {
+        event: event.id.clone(),
+        event_hash,
+        artifact,
+        artifact_hash,
+        created: project::now(),
+    };
+    let path = receipt_path(project, &event.id)?;
+    let mut text = toml::to_string(&receipt)?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::create_dir_all(receipts_dir(project))?;
+    let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let actual = std::fs::read_to_string(&path).unwrap_or_default();
+            if actual == text {
+                return Ok(());
+            }
+            bail!(
+                "receipt_conflict: {} already has different bytes",
+                path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not write {}", path.display()));
+        }
+    };
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    sync_parent(&path)
+}
+
 pub fn load(project: &Project, id: &str) -> Result<Event> {
     let path = event_path(project, id)?;
     let text = std::fs::read_to_string(&path)
@@ -589,6 +654,26 @@ mod tests {
         assert_eq!(remote_state(&project, "abc"), state);
         assert!(remote_state(&project, "other").taken.is_empty());
         assert!(save_remote_state(&project, "../escape", &state).is_err());
+    }
+
+    #[test]
+    fn a_completion_receipt_is_create_only_and_records_the_hashes() {
+        let (_root, project, event) = fixture();
+        write_receipt(&project, &event).unwrap();
+        let path = receipt_path(&project, &event.id).unwrap();
+        let receipt: Receipt = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(receipt.event, event.id);
+        assert_eq!(receipt.event_hash, hash_bytes(&bytes(&event).unwrap()));
+        assert_eq!(receipt.artifact_hash, "def");
+        write_receipt(&project, &event).unwrap();
+        let mut changed = event.clone();
+        changed.payload.done.as_mut().unwrap().artifact = "other".into();
+        assert!(
+            write_receipt(&project, &changed)
+                .unwrap_err()
+                .to_string()
+                .contains("receipt_conflict")
+        );
     }
 
     #[test]
