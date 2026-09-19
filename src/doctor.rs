@@ -346,7 +346,7 @@ fn report(
                     &format!("machine {machine}"),
                     format!("ssh target {}", profile.target),
                 );
-                for (ok, label, detail) in box_rows(runner, &profile) {
+                for (ok, label, detail) in box_rows(runner, &bin, &profile) {
                     check(&mut out, ok, &label, detail);
                 }
             }
@@ -368,6 +368,7 @@ fn report(
 /// gate. One read-only SSH call.
 fn box_rows(
     runner: &dyn Runner,
+    herdr_bin: &str,
     profile: &crate::contracts::MachineProfile,
 ) -> Vec<(Option<bool>, String, String)> {
     let label = &profile.label;
@@ -393,14 +394,18 @@ fn box_rows(
          printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
          printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
          printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
-         for p in pi claude codex agy; do\n\
+         for p in claude codex agy; do\n\
            if [ -x \"$HOME/.local/bin/$p\" ]; then printf 'login_%s\\tok\\n' \"$p\"; else printf 'login_%s\\tmissing\\n' \"$p\"; fi\n\
-         done\n\
-         for p in node cargo just; do\n\
-           case \"$p\" in node) c=/usr/local/bin/node;; *) c=\"$HOME/.cargo/bin/$p\";; esac\n\
-           if [ -x \"$c\" ]; then printf 'tool_%s\\t%s\\n' \"$p\" \"$c\"; else printf 'tool_%s\\tmissing\\n' \"$p\"; fi\n\
          done\n",
     );
+    // Pi readiness is read on the box through its own wrapper and login store
+    // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
+    for provider in crate::pi::roles::enabled_providers() {
+        let provider = crate::remote::quote(provider);
+        script.push_str(&format!(
+            "HERDR_ADE_ROOT=\"$HOME/.herdr-ade\" \"$HOME/.local/bin/herdr-pi\" check {provider} >/dev/null 2>&1 && printf 'pi_%s\\tok\\n' {provider} || printf 'pi_%s\\tfail\\n' {provider}\n"
+        ));
+    }
     for repo in repos {
         let path = crate::remote::quote(repo.box_path);
         script.push_str(&format!(
@@ -482,12 +487,67 @@ fn box_rows(
         format!("box {label} gh"),
         format!("gh auth status: {}", fact("gh")),
     ));
-    for kind in ["pi", "claude", "codex", "agy"] {
+    for kind in ["claude", "codex", "agy"] {
         let value = fact(&format!("login_{kind}"));
         rows.push((
             env_bool(&value, &["ok"]),
             format!("box {label} login {kind}"),
             format!("{}: {value}", "$HOME/.local/bin"),
+        ));
+    }
+    // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
+    // answers `type -a -P pi` and `command -v` in its own shell.
+    match box_pane_probe(runner, herdr_bin, profile) {
+        Ok(answer) => {
+            let (pi, tools) = parse_box_probe(&answer);
+            let wrapper = "/home/ubuntu/.local/bin/pi";
+            rows.push((
+                if pi == wrapper {
+                    Some(true)
+                } else {
+                    Some(false)
+                },
+                format!("box {label} wrapper"),
+                if pi.is_empty() {
+                    "the box pane did not answer `type -a -P pi`".into()
+                } else {
+                    format!("`type -a -P pi` first hit: {pi}")
+                },
+            ));
+            let missing: Vec<&str> = ["cargo", "just", "claude", "codex", "agy", "node"]
+                .into_iter()
+                .filter(|tool| {
+                    !tools
+                        .iter()
+                        .any(|found| found.ends_with(&format!("/{tool}")))
+                })
+                .collect();
+            rows.push((
+                if missing.is_empty() {
+                    Some(true)
+                } else {
+                    Some(false)
+                },
+                format!("box {label} tools"),
+                if missing.is_empty() {
+                    tools.join(" ")
+                } else {
+                    format!("the pane cannot find: {}", missing.join(" "))
+                },
+            ));
+        }
+        Err(error) => rows.push((
+            Some(false),
+            format!("box {label} wrapper"),
+            format!("the box pane probe failed: {error:#}"),
+        )),
+    }
+    for provider in crate::pi::roles::enabled_providers() {
+        let value = fact(&format!("pi_{provider}"));
+        rows.push((
+            env_bool(&value, &["ok"]),
+            format!("box {label} pi {provider}"),
+            format!("herdr-pi check {provider}: {value}"),
         ));
     }
     let nproc: u64 = fact("nproc").parse().unwrap_or(0);
@@ -529,6 +589,69 @@ fn parse_facts(text: &str) -> std::collections::BTreeMap<String, String> {
         .filter_map(|line| line.split_once('\t'))
         .map(|(key, value)| (key.to_string(), value.trim().to_string()))
         .collect()
+}
+
+/// The probe a fresh box pane runs in its own Bash shell (SPEC-remote §3.3).
+const BOX_PROBE: &str = "printf '@@pi '; type -a -P pi 2>/dev/null | head -n1; \
+                         printf '@@cmd\\n'; command -v cargo just claude codex agy node 2>/dev/null; \
+                         printf '@@done\\n'";
+
+/// Creates a fresh box pane with the lane PATH, runs [`BOX_PROBE`] in that
+/// pane's own shell, reads the answer and closes the workspace. This is the
+/// §3.3 probe: never a bare `ssh` command string, never `bash -lic`.
+fn box_pane_probe(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    profile: &crate::contracts::MachineProfile,
+) -> Result<String> {
+    let herdr = Herdr::new(herdr_bin, "", runner).on_machine(&profile.id);
+    let env = vec![format!("PATH={}", crate::contracts::BOX_PATH)];
+    let created = herdr
+        .workspace_create_env(
+            Path::new(crate::contracts::BOX_HOME),
+            "ha-doctor-probe",
+            false,
+            &env,
+        )
+        .map_err(|error| anyhow::anyhow!("box probe pane: {error}"))?;
+    let pane = created.pane_id.clone();
+    let answer = (|| -> Result<String> {
+        herdr
+            .pane_run(&pane, BOX_PROBE)
+            .map_err(|error| anyhow::anyhow!("box probe run: {error}"))?;
+        for _ in 0..50 {
+            let text = herdr
+                .pane_read_text(&pane, "recent")
+                .map_err(|error| anyhow::anyhow!("box probe read: {error}"))?;
+            if text.contains("@@done") {
+                return Ok(text);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::bail!("the box pane did not answer the probe in time")
+    })();
+    let _ = herdr.workspace_close(&created.workspace_id);
+    answer
+}
+
+/// The `@@pi` first hit and the `command -v` paths from a probe answer.
+fn parse_box_probe(text: &str) -> (String, Vec<String>) {
+    let mut pi = String::new();
+    let mut tools = Vec::new();
+    let mut in_tools = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("@@pi ") {
+            pi = rest.trim().to_string();
+        } else if line == "@@cmd" {
+            in_tools = true;
+        } else if line == "@@done" {
+            in_tools = false;
+        } else if in_tools && !line.is_empty() {
+            tools.push(line.to_string());
+        }
+    }
+    (pi, tools)
 }
 
 fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
@@ -597,7 +720,7 @@ mod tests {
     }
 
     fn box_facts() -> String {
-        [
+        let mut lines: Vec<String> = [
             "host\tremote-host",
             "boot\tenabled",
             "server\therdr 0.9.1",
@@ -610,18 +733,32 @@ mod tests {
             "git_email\trolf@example.com",
             "gh\tok",
             "rules\tabc",
-            "login_pi\tok",
             "login_claude\tok",
             "login_codex\tok",
             "login_agy\tok",
-            "tool_node\t/usr/local/bin/node",
-            "tool_cargo\t/home/ubuntu/.cargo/bin/cargo",
-            "tool_just\t/home/ubuntu/.cargo/bin/just",
             "repo /home/ubuntu/projects/herdr\tok",
             "repo /home/ubuntu/projects/herdr-ade\tok",
         ]
-        .join("\n")
-            + "\n"
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for provider in crate::pi::roles::enabled_providers() {
+            lines.push(format!("pi_{provider}\tok"));
+        }
+        lines.join("\n") + "\n"
+    }
+
+    fn probe_fakes(runner: &FakeRunner) {
+        runner.on(
+            "workspace create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+        );
+        runner.on("pane run", ok(r#"{"result":{}}"#));
+        runner.on(
+            "pane read",
+            ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/home/ubuntu/.local/bin/claude\n/home/ubuntu/.local/bin/codex\n/home/ubuntu/.local/bin/agy\n/usr/local/bin/node\n@@done\n"),
+        );
+        runner.on("workspace close", ok(r#"{"result":{}}"#));
     }
 
     fn box_profile() -> crate::contracts::MachineProfile {
@@ -637,7 +774,8 @@ mod tests {
     fn box_rows_read_the_box_and_gate_on_free_disk() {
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
-        let rows = box_rows(&runner, &box_profile());
+        probe_fakes(&runner);
+        let rows = box_rows(&runner, "herdr", &box_profile());
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -645,7 +783,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("no row {label}"))
         };
         assert_eq!(find("box oci boot").0, Some(true));
-        assert_eq!(find("box oci login pi").0, Some(true));
+        assert_eq!(find("box oci wrapper").0, Some(true));
+        assert!(
+            find("box oci wrapper")
+                .1
+                .contains("/home/ubuntu/.local/bin/pi")
+        );
+        assert_eq!(find("box oci tools").0, Some(true));
         assert_eq!(
             find("box oci repo /home/ubuntu/projects/herdr").0,
             Some(true)
@@ -658,18 +802,35 @@ mod tests {
             "ssh",
             ok(&box_facts().replace("df_free\t100000000000", "df_free\t5000000000")),
         );
+        probe_fakes(&runner);
         assert_eq!(find_row(&runner, "box oci capacity").0, Some(false));
 
         let runner = FakeRunner::new();
         runner.on("ssh", fail(255, "ssh: connect timed out"));
-        let rows = box_rows(&runner, &box_profile());
+        let rows = box_rows(&runner, "herdr", &box_profile());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, None);
         assert!(rows[0].2.contains("unreachable"));
     }
 
+    #[test]
+    fn box_wrapper_probe_fails_closed_when_the_pane_answers_another_path() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&box_facts()));
+        runner.on(
+            "workspace create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+        );
+        runner.on("pane run", ok(r#"{"result":{}}"#));
+        runner.on("pane read", ok("@@pi /usr/local/bin/pi\n@@cmd\n@@done\n"));
+        runner.on("workspace close", ok(r#"{"result":{}}"#));
+        let row = find_row(&runner, "box oci wrapper");
+        assert_eq!(row.0, Some(false));
+        assert!(row.2.contains("/usr/local/bin/pi"), "{}", row.2);
+    }
+
     fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
-        box_rows(runner, &box_profile())
+        box_rows(runner, "herdr", &box_profile())
             .into_iter()
             .find(|(_, name, _)| name == label)
             .unwrap_or_else(|| panic!("no row {label}"))

@@ -139,12 +139,20 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
     } else {
         "waiting"
     };
+    // A box lane's summary names its machine (SPEC-remote §5).
+    let place = if lane.is_remote() {
+        format!(" on machine `{}`", lane.machine)
+    } else {
+        String::new()
+    };
     let summary = match (&event.payload.done, &event.payload.waiting) {
         (Some(done), None) => format!(
-            "{} completed with report {} at {}",
-            event.thread, done.report_path, done.sha
+            "{}{} completed with report {} at {}",
+            event.thread, place, done.report_path, done.sha
         ),
-        (None, Some(waiting)) => format!("{} is waiting: {}", event.thread, waiting.text),
+        (None, Some(waiting)) => {
+            format!("{}{} is waiting: {}", event.thread, place, waiting.text)
+        }
         _ => bail!("event_payload_invalid: {}", event.id),
     };
     inbox::write_event(project, event, kind, &summary)?;

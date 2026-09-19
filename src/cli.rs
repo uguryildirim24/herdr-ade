@@ -278,6 +278,9 @@ enum Command {
     /// Publish the board rows now, or print them
     Board {
         slug: String,
+        /// Print one lane's board line (names its machine, SPEC-remote §5)
+        #[arg(long, value_name = "THREAD")]
+        thread: Option<String>,
         #[arg(long)]
         print: bool,
     },
@@ -696,8 +699,22 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 talk::run(ctx, &slug)
             }
         }
-        Command::Board { slug, print } => {
+        Command::Board {
+            slug,
+            thread,
+            print,
+        } => {
             let project = Project::load(&ctx.root, &slug)?;
+            if let Some(id) = thread {
+                let lane = crate::thread::load(&project, &id)?;
+                let machine = if lane.is_remote() && !lane.machine.is_empty() {
+                    format!("on machine `{}`", lane.machine)
+                } else {
+                    "on this Mac".to_string()
+                };
+                println!("{}\t{}\t{}", lane.id, lane.last_group, machine);
+                return Ok(());
+            }
             if print {
                 for (k, v) in board::compute(ctx, &project) {
                     let verdict = match board::check_value(&project, &v) {
