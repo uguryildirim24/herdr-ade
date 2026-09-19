@@ -3,16 +3,17 @@
 //! write an inbox item when it changed".
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::herdr::Herdr;
+use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 use crate::thread::{self, CopyOutcome, Group, Status, Thread};
 use crate::threads;
-use crate::{inbox, pr, routine};
+use crate::{events, inbox, pr, routine};
 
 pub const NUDGE_TEXT: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
@@ -140,7 +141,10 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
     };
     inbox::write_event(project, event, kind, &summary)?;
 
-    if !lane.pane_id.is_empty() {
+    // A box lane's tokens were set by the box's own `ha done`; the Mac has no
+    // socket into that server, so delivery never projects them again
+    // (SPEC-remote §4.3).
+    if !lane.is_remote() && !lane.pane_id.is_empty() {
         let _ = herdr.pane_clear_tokens(&lane.pane_id, &["done", "waiting"]);
         let value = event
             .payload
@@ -339,6 +343,317 @@ pub fn write_machine_outage(
         .map(|_| ()),
         None => Ok(()),
     }
+}
+
+// ---------------------------------------------------------------- courier
+
+/// The courier's helper timeout (SPEC-remote §4.3): one short-lived call.
+pub const COURIER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One envelope the box helper reported (SPEC-remote §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxEnvelope {
+    pub slug: String,
+    pub event: String,
+    pub event_path: String,
+    pub event_hash: String,
+    /// Empty for a `waiting` envelope.
+    pub artifact_path: String,
+    pub artifact_hash: String,
+}
+
+/// What one box helper call returned, after the taken cursor it was asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CourierManifest {
+    pub boot_id: String,
+    pub free_bytes: u64,
+    pub envelopes: Vec<BoxEnvelope>,
+}
+
+/// The stable identity a courier pass resolved and the boot it saw, so the
+/// caller can key its lane state and detect a reboot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CourierOutcome {
+    pub machine_id: String,
+    pub boot_id: String,
+}
+
+/// The box-local helper: it reads the box ADE root after the taken cursor and
+/// prints one tab-separated record per fact (SPEC-remote §4.3). It makes no
+/// bridge call; the courier's `herdr --machine` lists are the live view.
+pub fn courier_helper(box_root: &str) -> String {
+    let root = crate::remote::quote(box_root);
+    format!(
+        "set -u\n\
+         root={root}\n\
+         printf 'boot\\t%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)\"\n\
+         avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\n\
+         printf 'free\\t%s\\n' \"${{avail:-0}}\"\n\
+         [ -d \"$root\" ] || exit 0\n\
+         for dir in \"$root\"/*/events; do\n\
+           [ -d \"$dir\" ] || continue\n\
+           slug=${{dir%/events}}; slug=${{slug##*/}}\n\
+           for f in \"$dir\"/*.toml; do\n\
+             [ -f \"$f\" ] || continue\n\
+             id=${{f##*/}}; id=${{id%.toml}}\n\
+             case \"$id\" in .*) continue;; esac\n\
+             h=$(sha256sum \"$f\" | cut -d' ' -f1)\n\
+             a=$(sed -n 's/^artifact = \"\\([^\"]*\\)\"/\\1/p' \"$f\" | head -n1)\n\
+             if [ -n \"$a\" ]; then\n\
+               printf 'event\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$slug\" \"$id\" \"$f\" \"$h\" \"$root/$slug/artifacts/$a\" \"$a\"\n\
+             else\n\
+               printf 'event\\t%s\\t%s\\t%s\\t%s\\t-\\t-\\n' \"$slug\" \"$id\" \"$f\" \"$h\"\n\
+             fi\n\
+           done\n\
+         done\n"
+    )
+}
+
+/// Parses the helper's tab-separated output. An unknown record is refused so a
+/// helper version mismatch is loud, not silently empty.
+pub fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
+    let mut manifest = CourierManifest::default();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["boot", id] => manifest.boot_id = (*id).to_string(),
+            ["free", bytes] => manifest.free_bytes = bytes.trim().parse().unwrap_or(0),
+            [
+                "event",
+                slug,
+                event,
+                path,
+                hash,
+                artifact_path,
+                artifact_hash,
+            ] => {
+                manifest.envelopes.push(BoxEnvelope {
+                    slug: (*slug).to_string(),
+                    event: (*event).to_string(),
+                    event_path: (*path).to_string(),
+                    event_hash: (*hash).to_string(),
+                    artifact_path: if *artifact_path == "-" {
+                        String::new()
+                    } else {
+                        (*artifact_path).to_string()
+                    },
+                    artifact_hash: if *artifact_hash == "-" {
+                        String::new()
+                    } else {
+                        (*artifact_hash).to_string()
+                    },
+                });
+            }
+            _ => bail!("courier_manifest_invalid: {line}"),
+        }
+    }
+    Ok(manifest)
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// One courier pass for one project on one machine (SPEC-remote §4.3): one
+/// multiplexed helper call, one batched `scp`, hash checks, and a create-only
+/// import into the Mac's canonical ledger. Returns the box's boot id, so the
+/// caller can push GONE after a reboot. The box keeps its copies; only the
+/// taken cursor advances, and only after the import is durable.
+pub fn courier(ctx: &Ctx, project: &Project, machine: &str) -> Result<CourierOutcome> {
+    let profile =
+        crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+    if profile.is_local() {
+        bail!("courier called for the local machine");
+    }
+    if profile.target.is_empty() {
+        bail!("machine `{machine}` has no SSH target");
+    }
+    let target = profile.target.clone();
+    let control = ctx.root.join(".state/remote");
+    let script = courier_helper(crate::contracts::BOX_ROOT);
+    let out = crate::remote::ssh_courier(ctx.runner, &target, &control, &script, COURIER_TIMEOUT)?;
+    if !out.success() {
+        bail!("courier helper on {target}: {}", out.error_text());
+    }
+    let manifest = parse_courier_manifest(&out.stdout)
+        .with_context(|| format!("courier helper on {target}"))?;
+
+    let mut state = events::remote_state(project, &profile.id);
+    let wanted: Vec<&BoxEnvelope> = manifest
+        .envelopes
+        .iter()
+        .filter(|env| env.slug == project.slug && !state.taken.contains_key(&env.event))
+        .collect();
+    if !wanted.is_empty() {
+        let staging = ctx
+            .root
+            .join(".state/remote/staging")
+            .join(&profile.id)
+            .join(&project.slug);
+        let _ = std::fs::remove_dir_all(&staging);
+        let mut paths = Vec::new();
+        for env in &wanted {
+            paths.push(env.event_path.clone());
+            if !env.artifact_path.is_empty() {
+                paths.push(env.artifact_path.clone());
+            }
+        }
+        crate::remote::fetch_batch(ctx.runner, &target, &control, &paths, &staging)?;
+        for env in &wanted {
+            let bytes = std::fs::read(staging.join(basename(&env.event_path)))
+                .with_context(|| format!("staged event {}", env.event))?;
+            let got = thread::sha256_hex(&bytes);
+            if got != env.event_hash {
+                bail!(
+                    "event_hash_mismatch: {} is {got}, the helper said {}",
+                    env.event,
+                    env.event_hash
+                );
+            }
+            let artifact = if env.artifact_path.is_empty() {
+                None
+            } else {
+                let bytes = std::fs::read(staging.join(basename(&env.artifact_path)))
+                    .with_context(|| format!("staged artifact {}", env.artifact_hash))?;
+                let got = thread::sha256_hex(&bytes);
+                if got != env.artifact_hash {
+                    bail!(
+                        "artifact_hash_mismatch: staged bytes are {got}, the helper said {}",
+                        env.artifact_hash
+                    );
+                }
+                Some(bytes)
+            };
+            events::import_box_event(project, &profile.id, &bytes, artifact.as_deref())?;
+            state
+                .taken
+                .insert(env.event.clone(), env.event_hash.clone());
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    // The boot id is left for `remote_attention` to advance: it must see the
+    // change to type GONE for the pre-reboot lanes.
+    state.last_pass = project::now();
+    events::save_remote_state(project, &profile.id, &state)?;
+    Ok(CourierOutcome {
+        machine_id: profile.id,
+        boot_id: manifest.boot_id,
+    })
+}
+
+/// One successful pass's live facts for a machine's box lanes.
+pub struct RemoteView<'a> {
+    pub machine_id: &'a str,
+    pub threads: &'a [Thread],
+    pub agents: &'a [Agent],
+    pub panes: &'a [Pane],
+    pub boot_id: &'a str,
+    pub now: jiff::Timestamp,
+}
+
+/// The D8 amendment for box lanes: the fork has no push across machines, so
+/// the plugin's one serialized writer types `BLOCKED` and `GONE` exactly once
+/// per transition. A boot-id change types GONE for every open box lane; a pane
+/// or agent absent on two consecutive successful passes does the same.
+pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> Vec<anyhow::Error> {
+    let RemoteView {
+        machine_id,
+        threads,
+        agents,
+        panes,
+        boot_id,
+        now,
+    } = view;
+    let mut errors = Vec::new();
+    let mut state = events::remote_state(project, machine_id);
+    let boot_changed = !state.boot_id.is_empty() && !boot_id.is_empty() && state.boot_id != boot_id;
+    if !boot_id.is_empty() {
+        state.boot_id = boot_id.to_string();
+    }
+    if boot_changed {
+        state.gone.clear();
+        state.missing.clear();
+    }
+    enum Signal {
+        Blocked(String),
+        Gone(String),
+    }
+    impl Signal {
+        fn line(&self) -> String {
+            match self {
+                Signal::Blocked(lane) => format!("BLOCKED {lane}"),
+                Signal::Gone(lane) => format!("GONE {lane}"),
+            }
+        }
+    }
+
+    let mut signals = Vec::new();
+    for lane in threads {
+        let live = thread::live_state(lane, agents, panes, now);
+        let blocked = live.agent_state.as_deref() == Some("blocked");
+        if blocked {
+            if !state.blocked.contains(&lane.id) {
+                signals.push(Signal::Blocked(lane.id.clone()));
+            }
+        } else {
+            state.blocked.remove(&lane.id);
+        }
+        if live.pane_exists {
+            state.missing.insert(lane.id.clone(), 0);
+        } else {
+            let count = state.missing.entry(lane.id.clone()).or_insert(0);
+            *count += 1;
+        }
+        let missing = *state.missing.get(&lane.id).unwrap_or(&0);
+        if (boot_changed || missing >= 2) && !state.gone.contains(&lane.id) {
+            signals.push(Signal::Gone(lane.id.clone()));
+        }
+    }
+    for signal in signals {
+        let line = signal.line();
+        match type_remote_line(ctx, project, &line) {
+            Ok(true) => match signal {
+                Signal::Blocked(lane) => {
+                    state.blocked.insert(lane);
+                }
+                Signal::Gone(lane) => {
+                    state.gone.insert(lane);
+                }
+            },
+            // A suspended or busy writer has not consumed the transition. Do
+            // not mark it: the next successful pass must try again.
+            Ok(false) => {}
+            Err(error) => errors.push(error.context(format!("remote line `{line}`"))),
+        }
+    }
+    if let Err(error) = events::save_remote_state(project, machine_id, &state) {
+        errors.push(error.context("remote state"));
+    }
+    errors
+}
+
+/// Types one line into the coordinator through the same serialized writer D5
+/// uses (SPEC-remote §4.3). Returns whether it was typed.
+pub fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool> {
+    let Some(record) = project.coordinator() else {
+        return Ok(false);
+    };
+    if record.pane_id.is_empty() {
+        return Ok(false);
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+    let _writer = crate::talk::writer_lock(project)?;
+    if crate::talk::writer_suspended(project) {
+        return Ok(false);
+    }
+    let ready = herdr.agent_list()?.into_iter().any(|agent| {
+        agent.pane_id == record.pane_id && agent.name == record.agent_name && agent.ready()
+    });
+    if !ready {
+        return Ok(false);
+    }
+    herdr.agent_prompt(&record.pane_id, text)?;
+    Ok(true)
 }
 
 /// A group change seen in the cheap pass.
@@ -810,9 +1125,115 @@ pub fn routines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::Runner as _;
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn courier_manifest_parses_records_and_refuses_junk() {
+        let text = "boot\tboot-1\nfree\t1234\n\
+                    event\tdemo\tt-0001-1-1\t/r/demo/events/t-0001-1-1.toml\tabc\t/r/demo/artifacts/def\tdef\n\
+                    event\tdemo\tt-0002-1-1\t/r/demo/events/t-0002-1-1.toml\tabc\t-\t-\n";
+        let manifest = parse_courier_manifest(text).unwrap();
+        assert_eq!(manifest.boot_id, "boot-1");
+        assert_eq!(manifest.free_bytes, 1234);
+        assert_eq!(manifest.envelopes.len(), 2);
+        assert_eq!(manifest.envelopes[0].artifact_hash, "def");
+        assert!(manifest.envelopes[1].artifact_path.is_empty());
+        assert!(parse_courier_manifest("nonsense\n").is_err());
+    }
+
+    #[test]
+    fn courier_helper_survives_a_hostile_box_root() {
+        let script = courier_helper("/home/it's a $(box)");
+        let command = format!("sh -c {}", crate::remote::quote(&script));
+        let out = crate::runner::RealRunner
+            .run(&crate::runner::Cmd::new("sh", Duration::from_secs(5)).args(["-c", &command]))
+            .unwrap();
+        assert!(out.success(), "{}", out.error_text());
+        assert!(out.stdout.contains("boot\t"), "{}", out.stdout);
+        assert!(out.stdout.contains("free\t"), "{}", out.stdout);
+    }
+
+    #[test]
+    fn a_box_lane_signal_waits_until_the_coordinator_can_receive_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let lane = thread::allocate(&project, |t| {
+            t.machine = "oci".into();
+            t.machine_id = "abc".into();
+            t.pane_id = "w9:p9".into();
+            t.workspace_id = "w9".into();
+            t.tab_id = "w9:t9".into();
+            t.cwd = "/box/wt".into();
+            t.agent_name = "lane".into();
+        })
+        .unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let now = at("2026-09-19T00:00:00Z");
+        let threads = [lane.clone()];
+        remote_attention(
+            &ctx,
+            &project,
+            RemoteView {
+                machine_id: "abc",
+                threads: &threads,
+                agents: &[],
+                panes: &[],
+                boot_id: "boot-1",
+                now,
+            },
+        );
+        assert!(
+            !events::remote_state(&project, "abc")
+                .gone
+                .contains(&lane.id)
+        );
+        remote_attention(
+            &ctx,
+            &project,
+            RemoteView {
+                machine_id: "abc",
+                threads: &threads,
+                agents: &[],
+                panes: &[],
+                boot_id: "boot-1",
+                now,
+            },
+        );
+        let state = events::remote_state(&project, "abc");
+        assert!(
+            !state.gone.contains(&lane.id),
+            "a missing coordinator must not consume GONE: {state:?}"
+        );
+
+        // A reboot records the new boot but still leaves GONE pending while
+        // there is no coordinator to receive it.
+        remote_attention(
+            &ctx,
+            &project,
+            RemoteView {
+                machine_id: "abc",
+                threads: &threads,
+                agents: &[],
+                panes: &[],
+                boot_id: "boot-2",
+                now,
+            },
+        );
+        let state = events::remote_state(&project, "abc");
+        assert_eq!(state.boot_id, "boot-2");
+        assert!(!state.gone.contains(&lane.id));
     }
 
     #[test]

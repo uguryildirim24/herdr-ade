@@ -332,13 +332,24 @@ fn report(
         );
     }
     for machine in machines {
-        match crate::remote::ssh_target(runner, &bin, config_dir, &machine) {
-            Ok(target) => check(
+        match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
+            Ok(profile) if profile.is_local() => check(
                 &mut out,
                 Some(true),
                 &format!("machine {machine}"),
-                format!("ssh target {target}"),
+                "on this Mac".into(),
             ),
+            Ok(profile) => {
+                check(
+                    &mut out,
+                    Some(true),
+                    &format!("machine {machine}"),
+                    format!("ssh target {}", profile.target),
+                );
+                for (ok, label, detail) in box_rows(runner, &profile) {
+                    check(&mut out, ok, &label, detail);
+                }
+            }
             Err(error) => check(
                 &mut out,
                 Some(false),
@@ -349,6 +360,183 @@ fn report(
     }
 
     (out, healthy)
+}
+
+/// One saved machine's box rows (SPEC-remote §§2–3, R11): boot service,
+/// server, host, listeners, repository mapping, Git identity and GitHub
+/// reach, per-kind logins, and live CPU/RAM/disk capacity with the 12 GB
+/// gate. One read-only SSH call.
+fn box_rows(
+    runner: &dyn Runner,
+    profile: &crate::contracts::MachineProfile,
+) -> Vec<(Option<bool>, String, String)> {
+    let label = &profile.label;
+    if profile.target.is_empty() {
+        return vec![(
+            Some(false),
+            format!("box {label}"),
+            "has no SSH target".into(),
+        )];
+    }
+    let repos: Vec<&crate::contracts::BoxRepoMap> = crate::contracts::BOX_REPOS.iter().collect();
+    let mut script = String::from(
+        "set -u\n\
+         printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
+         printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
+         printf 'server\\t%s\\n' \"$(\"$HOME/.local/bin/herdr\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
+         printf 'tailscale\\t%s\\n' \"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"\n\
+         printf 'nproc\\t%s\\n' \"$(nproc 2>/dev/null || echo 0)\"\n\
+         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
+         printf 'df_free\\t%s\\n' \"$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\"\n\
+         printf 'listeners\\t%s\\n' \"$(ss -tln 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')\"\n\
+         printf 'git_name\\t%s\\n' \"$(git config --global user.name 2>/dev/null || true)\"\n\
+         printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
+         printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
+         printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
+         for p in pi claude codex agy; do\n\
+           if [ -x \"$HOME/.local/bin/$p\" ]; then printf 'login_%s\\tok\\n' \"$p\"; else printf 'login_%s\\tmissing\\n' \"$p\"; fi\n\
+         done\n\
+         for p in node cargo just; do\n\
+           case \"$p\" in node) c=/usr/local/bin/node;; *) c=\"$HOME/.cargo/bin/$p\";; esac\n\
+           if [ -x \"$c\" ]; then printf 'tool_%s\\t%s\\n' \"$p\" \"$c\"; else printf 'tool_%s\\tmissing\\n' \"$p\"; fi\n\
+         done\n",
+    );
+    for repo in repos {
+        let path = crate::remote::quote(repo.box_path);
+        script.push_str(&format!(
+            "if [ -d {path}/.git ]; then printf 'repo %s\\tok\\n' {path}; else printf 'repo %s\\tmissing\\n' {path}; fi\n"
+        ));
+    }
+    let facts = match crate::remote::ssh(runner, &profile.target, &script, None, TOOL_TIMEOUT) {
+        Ok(out) if out.success() => parse_facts(&out.stdout),
+        Ok(out) => {
+            return vec![(
+                None,
+                format!("box {label}"),
+                format!("unreachable: {}", out.error_text()),
+            )];
+        }
+        Err(error) => {
+            return vec![(
+                None,
+                format!("box {label}"),
+                format!("unreachable: {error:#}"),
+            )];
+        }
+    };
+    let fact = |key: &str| facts.get(key).cloned().unwrap_or_default();
+    let mut rows = Vec::new();
+    rows.push((
+        env_bool(&fact("boot"), &["enabled"]),
+        format!("box {label} boot"),
+        format!("systemd user unit herdr.service: {}", fact("boot")),
+    ));
+    rows.push((
+        if fact("server").starts_with("herdr") {
+            Some(true)
+        } else {
+            None
+        },
+        format!("box {label} server"),
+        format!("{} ({})", fact("server"), "$HOME/.local/bin/herdr"),
+    ));
+    let tailscale = fact("tailscale");
+    rows.push((
+        if tailscale.is_empty() {
+            None
+        } else {
+            Some(true)
+        },
+        format!("box {label} host"),
+        format!("{} (Tailscale {tailscale})", fact("host")),
+    ));
+    rows.push((
+        Some(true),
+        format!("box {label} listeners"),
+        format!(
+            "{} non-loopback TCP listeners (check `ss -tln`)",
+            fact("listeners")
+        ),
+    ));
+    for repo in crate::contracts::BOX_REPOS.iter() {
+        let key = format!("repo {}", repo.box_path);
+        let value = fact(&key);
+        rows.push((
+            env_bool(&value, &["ok"]),
+            format!("box {label} repo {}", repo.box_path),
+            format!("clone {value}"),
+        ));
+    }
+    let git = format!("{} <{}>", fact("git_name"), fact("git_email"));
+    rows.push((
+        if fact("git_name").is_empty() || fact("git_email").is_empty() {
+            Some(false)
+        } else {
+            Some(true)
+        },
+        format!("box {label} git"),
+        git,
+    ));
+    rows.push((
+        env_bool(&fact("gh"), &["ok"]),
+        format!("box {label} gh"),
+        format!("gh auth status: {}", fact("gh")),
+    ));
+    for kind in ["pi", "claude", "codex", "agy"] {
+        let value = fact(&format!("login_{kind}"));
+        rows.push((
+            env_bool(&value, &["ok"]),
+            format!("box {label} login {kind}"),
+            format!("{}: {value}", "$HOME/.local/bin"),
+        ));
+    }
+    let nproc: u64 = fact("nproc").parse().unwrap_or(0);
+    let mem_gb = fact("mem_avail_kb")
+        .parse::<u64>()
+        .map(|kb| kb as f64 / 1_000_000.0)
+        .unwrap_or(0.0);
+    let disk_gb = fact("df_free")
+        .parse::<u64>()
+        .map(|bytes| bytes as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
+    let cpu_fit = nproc.saturating_sub(1);
+    let mem_fit = (mem_gb / 4.0) as u64;
+    let disk_fit = (disk_gb / 5.0) as u64;
+    let fits = cpu_fit.min(mem_fit).min(disk_fit);
+    let capacity_ok = disk_gb >= 12.0;
+    rows.push((
+        if capacity_ok { Some(true) } else { Some(false) },
+        format!("box {label} capacity"),
+        format!(
+            "{nproc} OCPU, {mem_gb:.1} GB RAM free, {disk_gb:.1} GB disk free; about {fits} more lane(s) fit; refuses below 12 GB free"
+        ),
+    ));
+    let rules = fact("rules");
+    rows.push((
+        if rules.is_empty() { None } else { Some(true) },
+        format!("box {label} rules"),
+        if rules.is_empty() {
+            "no generated RULES.md recorded".into()
+        } else {
+            format!("RULES.md sha256 {rules}")
+        },
+    ));
+    rows
+}
+
+fn parse_facts(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+        .collect()
+}
+
+fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
+    if ok.contains(&value) {
+        Some(true)
+    } else {
+        Some(false)
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +594,85 @@ mod tests {
         assert!(text.contains("plugin:     herdr-ade"), "{text}");
         assert!(text.contains("crate:      herdr-ade"), "{text}");
         assert!(text.contains("prefix:"), "{text}");
+    }
+
+    fn box_facts() -> String {
+        [
+            "host\toci-pi",
+            "boot\tenabled",
+            "server\therdr 0.9.1",
+            "tailscale\t100.91.36.88",
+            "nproc\t16",
+            "mem_avail_kb\t40000000",
+            "df_free\t100000000000",
+            "listeners\t2",
+            "git_name\tuguryildirim24",
+            "git_email\trolf@example.com",
+            "gh\tok",
+            "rules\tabc",
+            "login_pi\tok",
+            "login_claude\tok",
+            "login_codex\tok",
+            "login_agy\tok",
+            "tool_node\t/usr/local/bin/node",
+            "tool_cargo\t/home/ubuntu/.cargo/bin/cargo",
+            "tool_just\t/home/ubuntu/.cargo/bin/just",
+            "repo /home/ubuntu/projects/herdr\tok",
+            "repo /home/ubuntu/projects/herdr-ade\tok",
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    fn box_profile() -> crate::contracts::MachineProfile {
+        crate::contracts::MachineProfile {
+            id: "abc".into(),
+            label: "oci".into(),
+            target: "me@box".into(),
+            session: "default".into(),
+        }
+    }
+
+    #[test]
+    fn box_rows_read_the_box_and_gate_on_free_disk() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&box_facts()));
+        let rows = box_rows(&runner, &box_profile());
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(_, name, _)| name == label)
+                .map(|(ok, _, detail)| (*ok, detail.clone()))
+                .unwrap_or_else(|| panic!("no row {label}"))
+        };
+        assert_eq!(find("box oci boot").0, Some(true));
+        assert_eq!(find("box oci login pi").0, Some(true));
+        assert_eq!(
+            find("box oci repo /home/ubuntu/projects/herdr").0,
+            Some(true)
+        );
+        assert_eq!(find("box oci capacity").0, Some(true));
+        assert!(find("box oci capacity").1.contains("refuses below 12 GB"));
+
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok(&box_facts().replace("df_free\t100000000000", "df_free\t5000000000")),
+        );
+        assert_eq!(find_row(&runner, "box oci capacity").0, Some(false));
+
+        let runner = FakeRunner::new();
+        runner.on("ssh", fail(255, "ssh: connect timed out"));
+        let rows = box_rows(&runner, &box_profile());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, None);
+        assert!(rows[0].2.contains("unreachable"));
+    }
+
+    fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
+        box_rows(runner, &box_profile())
+            .into_iter()
+            .find(|(_, name, _)| name == label)
+            .unwrap_or_else(|| panic!("no row {label}"))
     }
 
     #[test]

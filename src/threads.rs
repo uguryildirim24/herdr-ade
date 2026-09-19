@@ -256,16 +256,14 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         );
     }
 
-    // A box lane's provider readiness runs on the box through the courier
-    // (SPEC-remote §4.1); the Mac's login is irrelevant to it. The local pi
-    // check stays for local lanes.
+    // A box lane's provider readiness runs on the box (SPEC-remote §4.1); the
+    // Mac's login is irrelevant to it. The local pi check stays for local
+    // lanes.
     if launch.kind == "pi" {
         if machine.is_empty() {
             pi_ready(ctx, &launch)?;
         } else {
-            eprintln!(
-                "pi_ready skipped on the Mac for box lane `{machine}`; box readiness is checked on the box"
-            );
+            box_pi_ready(ctx, &machine, &launch)?;
         }
     }
     let machine_id = if machine.is_empty() {
@@ -320,6 +318,17 @@ pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
     crate::pi_ade::check_with(ctx.runner, &ctx.root, &provider)
         .map(|_| ())
         .with_context(|| format!("pi_not_ready: provider {provider}"))
+}
+
+/// Box pi readiness: the check runs on the box, never against the Mac login
+/// (SPEC-remote §4.1, SPEC-pi §3.4).
+pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch) -> Result<()> {
+    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+        .context("pi_args_forbidden: a pi launch names no --provider")?;
+    let profile =
+        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+    crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
+        .with_context(|| format!("pi_not_ready: provider {provider} on `{machine}`"))
 }
 
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
@@ -1256,12 +1265,7 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
 /// never through a second copy path; until then the copy is partial.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
     let copied = if record.is_remote() {
-        thread::Copied {
-            outcome: CopyOutcome::Partial(vec![
-                "a box lane's report and library arrive through the Mac courier".into(),
-            ]),
-            report_hash: None,
-        }
+        imported_report(project, record)
     } else {
         thread::copy_home_local(project, record, true, ctx.runner)
     };
@@ -1274,6 +1278,40 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
         });
     }
     copied
+}
+
+/// A box lane's report arrives as the courier's imported artifact
+/// (SPEC-remote §4.3). Once the current attempt has a sealed `done` whose
+/// artifact is on the Mac and hashes to its name, the copy is complete: no box
+/// path is copied and there is no second transport. The D4 removal gate reads
+/// this same artifact.
+fn imported_report(project: &Project, record: &Thread) -> thread::Copied {
+    let attempt = record.attempt.max(1);
+    let hash = crate::events::list(project)
+        .into_iter()
+        .filter(|event| event.thread == record.id && event.attempt == attempt)
+        .find_map(|event| event.payload.done)
+        .map(|done| done.artifact);
+    match hash {
+        Some(hash) => match std::fs::read(crate::events::artifact_path(project, &hash)) {
+            Ok(bytes) if thread::sha256_hex(&bytes) == hash => thread::Copied {
+                outcome: CopyOutcome::Complete,
+                report_hash: Some(hash),
+            },
+            _ => thread::Copied {
+                outcome: CopyOutcome::Partial(vec![format!(
+                    "the sealed report artifact {hash} is not on the Mac yet"
+                )]),
+                report_hash: None,
+            },
+        },
+        None => thread::Copied {
+            outcome: CopyOutcome::Partial(vec![
+                "a box lane's report arrives through the Mac courier; no sealed done yet".into(),
+            ]),
+            report_hash: None,
+        },
+    }
 }
 
 /// Never forces. herdr's or git's refusal (for example uncommitted changes) is
