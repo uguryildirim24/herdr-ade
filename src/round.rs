@@ -706,12 +706,15 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 /// `ha round advance`: move every open round of the project forward, once.
 ///
 /// Idempotent and safe to run any number of times. It runs `round review`
-/// and starts the reviewer only for a round whose members are all pinned and
-/// that has no review branch yet; a round never gets a second reviewer. A
-/// MERGE verdict is announced (inbox plus a `say` line) but never merged;
-/// any other verdict gets one inbox item. A reviewer thread that is gone
-/// becomes one inbox item. This is what the `pane.agent_status_changed` hook
-/// and the ticker call.
+/// and starts the reviewer for a round whose members are all pinned and that
+/// has no review branch yet; it also starts the reviewer for a frozen round
+/// whose current review revision already has its review branch but no bound
+/// reviewer (after a REJECT was repaired with `round review`, or after an
+/// earlier start failed), writing the review task for that revision. A round
+/// never gets a second reviewer. A MERGE verdict is announced (inbox plus a
+/// `say` line) but never merged; any other verdict gets one inbox item. A
+/// reviewer thread that is gone becomes one inbox item. This is what the
+/// `pane.agent_status_changed` hook and the ticker call.
 pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     // One advance at a time, across processes (the hook and the ticker).
@@ -732,35 +735,48 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             }
         }
         let record = load(&project, &round)?;
-        if record.review_branch.is_none() {
+        let Some(reviewer) = record.reviewer.clone() else {
+            // The review branch for the current revision: one `round review`
+            // just made, or the one an earlier pass left behind. A round
+            // whose members are all pinned and that has no current review
+            // branch runs `round review` first; a frozen round whose current
+            // review revision already has its branch starts the reviewer
+            // here, exactly like a fresh round. This covers the state `round
+            // review` leaves after a REJECT and the state a failed start
+            // leaves, whatever `announced` says. Never start from a branch
+            // made stale by a changed or missing pin.
             let ready = !record.manifest.members.is_empty()
                 && record.manifest.members.iter().all(|m| m.pin.is_some());
             if !ready {
                 continue;
             }
-            let outcome = review(ctx, slug, &round)?;
-            match start_reviewer(ctx, &project, &round, &outcome.review_branch, &prefix) {
+            let current_hash = manifest_hash(&record);
+            let review_is_current = record.frozen_revision == Some(record.manifest.revision)
+                && record.manifest_hash.as_deref() == Some(current_hash.as_str());
+            let review_branch = match (record.review_branch.clone(), review_is_current) {
+                (Some(branch), true) => branch,
+                _ => review(ctx, slug, &round)?.review_branch,
+            };
+            match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
                 Ok(thread) => {
                     bind_reviewer(ctx, slug, &round, &thread.id)?;
                 }
-                Err(error) => announce_once(
-                    ctx,
-                    &project,
-                    &round,
-                    "reviewer-start-failed",
-                    &format!(
-                        "Round {round}: the reviewer thread did not start ({error:#}); start it by hand from `{}`",
-                        outcome.review_branch
-                    ),
-                    None,
-                )?,
+                Err(error) => {
+                    // A full thread cap or a machine that is not ready is
+                    // not final: the next pass retries. The announcement is
+                    // written once per state.
+                    announce_once(
+                        ctx,
+                        &project,
+                        &round,
+                        "reviewer-start-failed",
+                        &format!(
+                            "Round {round}: the reviewer thread did not start ({error:#}); it is retried on the next pass, or start it by hand from `{review_branch}`"
+                        ),
+                        None,
+                    )?;
+                }
             }
-            continue;
-        }
-        let Some(reviewer) = record.reviewer.clone() else {
-            // The review branch exists but no reviewer was ever bound (for
-            // example, `round review` was run by hand). Leave it to the
-            // coordinator; `round review`/`round reviewer` stay manual.
             continue;
         };
         let git = Git::new(ctx.runner, &record.repo);
@@ -845,7 +861,8 @@ fn advance_lock(project: &Project) -> Result<std::fs::File> {
 }
 
 /// The reviewer task: the review brief, the pinned members with their report
-/// paths, and the round's gates. No project-specific prose.
+/// paths, the round's gates, and, for a re-review, one line naming the
+/// earlier verdict and its review file. No project-specific prose.
 fn start_reviewer(
     ctx: &Ctx,
     project: &Project,
@@ -854,7 +871,8 @@ fn start_reviewer(
     prefix: &str,
 ) -> Result<thread::Thread> {
     let record = load(project, round)?;
-    let task = reviewer_task(project, &record, prefix)?;
+    let git = Git::new(ctx.runner, &record.repo);
+    let task = reviewer_task(project, &record, prefix, &git)?;
     crate::threads::start(
         ctx,
         &project.slug,
@@ -871,7 +889,12 @@ fn start_reviewer(
     )
 }
 
-fn reviewer_task(project: &Project, record: &RoundRecord, prefix: &str) -> Result<String> {
+fn reviewer_task(
+    project: &Project,
+    record: &RoundRecord,
+    prefix: &str,
+    git: &Git,
+) -> Result<String> {
     let events = sealed_events(project)?;
     let mut out = String::new();
     out.push_str(&format!(
@@ -899,7 +922,51 @@ fn reviewer_task(project: &Project, record: &RoundRecord, prefix: &str) -> Resul
     for gate in &record.gates {
         out.push_str(&format!("- `{gate}`\n"));
     }
+    if let Some((verdict, path, branch)) = earlier_review(git, record)? {
+        out.push_str(&format!(
+            "\nThis is a re-review of `{}`; the earlier verdict was {verdict}. Read the earlier review file `{path}` at `{branch}` for the previous findings.\n",
+            record.round
+        ));
+    }
     Ok(out)
+}
+
+/// The review branch that `branch` supersedes: `review/r1-2` follows
+/// `review/r1`, `review/r1-3` follows `review/r1-2`; `review/r1` has none.
+fn previous_review_branch(round: &str, branch: &str) -> Option<String> {
+    let base = format!("review/{round}");
+    let suffix = branch.strip_prefix(base.as_str())?;
+    let n: u32 = if suffix.is_empty() {
+        1
+    } else {
+        suffix.strip_prefix('-')?.parse().ok()?
+    };
+    (n > 1).then(|| {
+        if n == 2 {
+            base
+        } else {
+            format!("{base}-{}", n - 1)
+        }
+    })
+}
+
+/// The verdict and review file of the revision this round's current review
+/// branch supersedes, when there is one. Read-only.
+fn earlier_review(git: &Git, record: &RoundRecord) -> Result<Option<(String, String, String)>> {
+    let Some(branch) = record.review_branch.as_deref() else {
+        return Ok(None);
+    };
+    let Some(previous) = previous_review_branch(&record.round, branch) else {
+        return Ok(None);
+    };
+    let path = verdict_path(&record.round);
+    let Some(text) = git.show_file(&previous, &path)? else {
+        return Ok(None);
+    };
+    let Ok(verdict) = parse_verdict(&text) else {
+        return Ok(None);
+    };
+    Ok(Some((verdict.verdict, path, previous)))
 }
 
 fn verdict_summary(round: &str, verdict: &str) -> String {
@@ -2263,6 +2330,29 @@ mod tests {
         git(&fx.repo, &["rev-parse", "refs/heads/main"])
     }
 
+    /// A reviewer role that needs no pi login, so `advance` can start a
+    /// reviewer against the fake runner.
+    fn reviewer_ready(fx: &Fx) {
+        std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
+        std::fs::write(
+            fx.world.home.path().join("cfg/config.toml"),
+            "[roles.reviewer]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
+        )
+        .unwrap();
+        fx.world.runner.on(
+            "agent start --help",
+            crate::runner::fake::ok(
+                "      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n",
+            ),
+        );
+        fx.world.runner.on(
+            "tab create",
+            crate::runner::fake::ok(
+                r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
+            ),
+        );
+    }
+
     fn phase(fx: &Fx) -> MergePhase {
         read_merge(&fx.project, "r1").unwrap().unwrap().phase
     }
@@ -2890,25 +2980,7 @@ mod tests {
     fn advance_starts_one_reviewer_and_never_a_second() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        // A reviewer role that needs no pi login.
-        std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
-        std::fs::write(
-            fx.world.home.path().join("cfg/config.toml"),
-            "[roles.reviewer]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
-        )
-        .unwrap();
-        fx.world.runner.on(
-            "agent start --help",
-            crate::runner::fake::ok(
-                "      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n",
-            ),
-        );
-        fx.world.runner.on(
-            "tab create",
-            crate::runner::fake::ok(
-                r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
-            ),
-        );
+        reviewer_ready(&fx);
 
         open_r1(&fx);
         let lanes = vec![fx.lane(1), fx.lane(2)];
@@ -3002,5 +3074,147 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// A REJECT is repaired with `round review`; the next `advance` starts
+    /// and binds a reviewer on the new review branch, and its task names the
+    /// earlier verdict and review file. A second `advance` is a no-op.
+    #[test]
+    fn advance_starts_the_re_review_after_a_reject() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("REJECT", "r1"));
+        // The rejected lane repairs its work and seals a new done, so the
+        // manifest moves and `round review` writes a new revision.
+        let wt = fx.repo.join(".worktrees/lane-1");
+        let repaired = commit_file(&wt, "src/lane1.rs", "// repaired\n", "repair lane 1");
+        fx.seal_done(&lanes[0].0, 1, 2, &repaired, "# repaired report\n");
+        let outcome = review(&ctx, "demo", "r1").unwrap();
+        assert_eq!(outcome.review_branch, "review/r1-2");
+        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
+
+        advance(&ctx, "demo").unwrap();
+
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.review_branch.as_deref(), Some("review/r1-2"));
+        let reviewer = record.reviewer.clone().expect("the re-review is bound");
+        let task = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer)).unwrap();
+        assert!(task.contains("re-review"), "{task}");
+        assert!(task.contains("REJECT"), "{task}");
+        assert!(task.contains("tasks/reviews/code-r1.md"), "{task}");
+        assert!(task.contains("review/r1`"), "{task}");
+
+        advance(&ctx, "demo").unwrap();
+        let again = load(&fx.project, "r1").unwrap();
+        assert_eq!(again.reviewer, Some(reviewer.clone()));
+        assert_eq!(again.review_branch.as_deref(), Some("review/r1-2"));
+        let reviewers = thread::list(&fx.project)
+            .into_iter()
+            .filter(|t| t.role == "reviewer")
+            .count();
+        assert_eq!(reviewers, 1, "the re-review is not started twice");
+    }
+
+    /// The state a failed reviewer start leaves: the review branch exists,
+    /// no reviewer is bound, and the failure is recorded. `advance` retries
+    /// instead of treating the record as final.
+    #[test]
+    fn advance_retries_a_failed_reviewer_start() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (_, _) = reviewed(&fx);
+        {
+            let mut record = load(&fx.project, "r1").unwrap();
+            assert!(record.review_branch.is_some() && record.reviewer.is_none());
+            record.announced = Some("reviewer-start-failed".into());
+            save(&fx.project, &record).unwrap();
+        }
+
+        advance(&ctx, "demo").unwrap();
+
+        let record = load(&fx.project, "r1").unwrap();
+        assert!(record.reviewer.is_some(), "the start is retried");
+    }
+
+    /// A failed start must not let a reviewer begin from the old branch if a
+    /// lane restarts before the retry. It waits for the new pin, writes the
+    /// next review revision, and only then starts the reviewer.
+    #[test]
+    fn advance_never_retries_a_reviewer_on_a_stale_manifest() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (lanes, _) = reviewed(&fx);
+        let first_branch = load(&fx.project, "r1").unwrap().review_branch.unwrap();
+
+        fx.set_attempt(&lanes[0].0, 2);
+        advance(&ctx, "demo").unwrap();
+        let waiting = load(&fx.project, "r1").unwrap();
+        assert!(waiting.reviewer.is_none());
+        assert_eq!(
+            waiting.review_branch.as_deref(),
+            Some(first_branch.as_str())
+        );
+        assert!(waiting.manifest.members[0].pin.is_none());
+        assert_eq!(
+            thread::list(&fx.project)
+                .into_iter()
+                .filter(|t| t.role == "reviewer")
+                .count(),
+            0,
+            "an incomplete manifest gets no reviewer"
+        );
+
+        let wt = fx.repo.join(".worktrees/lane-1");
+        let repaired = commit_file(&wt, "src/lane1.rs", "// attempt 2\n", "retry lane 1");
+        fx.seal_done(&lanes[0].0, 2, 1, &repaired, "# retry report\n");
+        advance(&ctx, "demo").unwrap();
+
+        let retried = load(&fx.project, "r1").unwrap();
+        assert_eq!(retried.review_branch.as_deref(), Some("review/r1-2"));
+        assert!(retried.reviewer.is_some());
+        assert_eq!(retried.frozen_revision, Some(retried.manifest.revision));
+        assert_eq!(retried.manifest_hash, Some(manifest_hash(&retried)));
+    }
+
+    /// A reviewer that is gone is reported once and never replaced.
+    #[test]
+    fn advance_reports_a_gone_reviewer_and_never_replaces_it() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (_, _) = reviewed(&fx);
+        let reviewer = fx.thread("Reviewer");
+        bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
+        thread::update(&fx.project, &reviewer, |t| {
+            t.status = thread::Status::Resolved
+        })
+        .unwrap();
+
+        advance(&ctx, "demo").unwrap();
+
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.reviewer, Some(reviewer.clone()));
+        let announcements = crate::inbox::unhandled(&fx.project)
+            .into_iter()
+            .filter(|item| item.kind == "round-advance")
+            .collect::<Vec<_>>();
+        assert_eq!(announcements.len(), 1, "one gone report");
+        assert!(
+            announcements[0].summary.contains("is gone"),
+            "{announcements:?}"
+        );
+
+        // The same gone state is announced once.
+        advance(&ctx, "demo").unwrap();
+        assert_eq!(
+            crate::inbox::unhandled(&fx.project)
+                .into_iter()
+                .filter(|item| item.kind == "round-advance")
+                .count(),
+            1
+        );
     }
 }
