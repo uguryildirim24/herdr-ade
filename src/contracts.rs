@@ -34,6 +34,10 @@ impl Default for Recipe {
 /// The `local` machine sentinel: the Mac itself (SPEC-remote §4.1).
 pub const MACHINE_LOCAL: &str = "local";
 
+/// The local machine's display label, the one herdr's sidebar shows. It is the
+/// machine part of a cross-machine `parent` token (the fork lane t-0053 form).
+pub const MACHINE_LOCAL_LABEL: &str = "Local";
+
 /// The box's PATH, passed to every box lane's `tab create --env`
 /// (SPEC-remote §3.3, check c C4).
 pub const BOX_PATH: &str =
