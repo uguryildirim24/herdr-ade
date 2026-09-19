@@ -147,10 +147,6 @@ pub struct Settings {
     /// (`talk::enabled`). Never written by `new`, so the default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub talk: Option<bool>,
-    /// The project opts in to the picker's call out (SPEC-jev-picker v2
-    /// question 13). Off unless written.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub jev: bool,
     /// Per-role `kind`/`args` overrides (SPEC-ADE D2). Arrays replace.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub roles: std::collections::BTreeMap<String, RoleOverride>,
@@ -180,7 +176,6 @@ impl Default for Settings {
             // `false` the ticker shows a herdr notification instead.
             nudge: false,
             talk: None,
-            jev: false,
             roles: std::collections::BTreeMap::new(),
             repos: Vec::new(),
         }
@@ -491,15 +486,15 @@ fn apply_override(base: RoleSpec, over: &RoleOverride) -> Result<RoleSpec> {
     Ok(out)
 }
 
-/// A role's row for a launch the picker never resolves (the coordinator,
+/// A role's row for a launch the roles table never starts (the coordinator,
 /// an adopted pane): the `default` recipe of `[roles.<name>]` in the one
-/// roles table (SPEC-jev-picker v2 §2), else the plugin default, then the
-/// PROJECT.md override. Arrays replace, never merge (SPEC-ADE D2).
+/// roles table, else the plugin default, then the PROJECT.md override.
+/// Arrays replace, never merge (SPEC-ADE D2).
 pub fn resolve_role(config_dir: &Path, settings: &Settings, role: &str) -> Result<RoleSpec> {
     if role.is_empty() {
         bail!("a role name is required");
     }
-    let config = crate::launch::parse_picker_config(config_dir, false)?;
+    let config = crate::launch::parse_launch_config(config_dir)?;
     let mut spec = match config.roles.get(role) {
         Some(row) => {
             let recipe = config.recipes.get(&row.default).with_context(|| {
@@ -1019,12 +1014,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_role_field_is_refused_and_picker_keys_are_skipped() {
+    fn unknown_role_field_is_refused_and_picker_keys_are_gone() {
         let config = tempfile::tempdir().unwrap();
         let settings = Settings::default();
         std::fs::write(
             config.path().join("config.toml"),
-            "[roles]\nresolver = \"off\"\n\n[roles.lane]\nkind = \"claude\"\nbootstrap = true\n",
+            "[roles.lane]\nkind = \"claude\"\nbootstrap = true\n",
         )
         .unwrap();
         let err = format!(
@@ -1038,8 +1033,11 @@ mod tests {
             "[roles]\nresolver = \"off\"\n\n[roles.lane]\nkind = \"claude\"\n",
         )
         .unwrap();
-        let spec = resolve_role(config.path(), &settings, "lane").unwrap();
-        assert_eq!(spec.kind, "claude");
+        let err = format!(
+            "{:#}",
+            resolve_role(config.path(), &settings, "lane").unwrap_err()
+        );
+        assert!(err.contains("picker_removed"), "{err}");
     }
 
     #[test]

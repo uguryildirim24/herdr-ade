@@ -1,5 +1,4 @@
-//! The `kind = "pi"` rows for the roles table and the Jev picker
-//! (SPEC-pi v2 §3.4, §3.5).
+//! The `kind = "pi"` rows for the roles table (SPEC-pi v2 §3.4, §3.5).
 //!
 //! One pi row replaces its native twin in exactly the list the twin was in.
 //! Cursor is not replaced: `cursor_grok_xhigh` stays native while the port
@@ -10,15 +9,15 @@ use anyhow::Result;
 
 use super::launch;
 
-/// One ready-made recipe row. Fields line up with Jev v2's `Recipe` plus
-/// `model_family` and the D17 `plain` phrase; A4 maps them into its table.
+/// One ready-made recipe row. Fields line up with `Recipe` plus
+/// `model_family` and the D17 `plain` phrase.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PiRecipe {
-    /// Jev recipe id.
+    /// Recipe id.
     pub id: &'static str,
     /// D2 kind; always `pi`.
     pub kind: &'static str,
-    /// The Jev `provider` column; must equal `--provider` in `args`.
+    /// The `provider` column; must equal `--provider` in `args`.
     pub provider: &'static str,
     /// The pair filter compares this, not a CLI-shaped model string.
     pub model_family: &'static str,
@@ -27,7 +26,7 @@ pub struct PiRecipe {
     /// Always empty for pi: the wrapper supplies the folder, no secret.
     pub env: Vec<String>,
     pub ready_timeout_ms: u64,
-    /// The Jev v2 recipe switch; disabled rows wait for Rolf.
+    /// The recipe switch; disabled rows wait for Rolf.
     pub enabled: bool,
     /// May a start-time `allowed` list carry it?
     pub start_time_allowed: bool,

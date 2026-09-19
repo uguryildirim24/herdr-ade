@@ -6,8 +6,8 @@
 //! and only then advances the turn. A delayed turn-N line never completes
 //! turn N+1: the commit names `n`.
 //!
-//! The pair filter is the hook point for lane A4 (the picker): `start` asks
-//! it whether the drafter and critic roles may work as a pair.
+//! The pair filter: `start` asks it whether the drafter and critic roles may
+//! work as a pair, and pins the critic's recipe off the drafter's model.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,9 +22,9 @@ use crate::round::Git;
 use crate::round::repo::{commit_files_on_branch, repo_lock};
 use crate::thread::sha256_hex;
 
-/// The picker checks the pair (`crate::launch::PickerPair`). `Ok(Some(id))`
-/// pins the critic's recipe so its `thread start` line cannot land on the
-/// drafter's model; `Err` carries the refusal to print.
+/// The pair check (`crate::launch::DialoguePair`). `Ok(Some(id))` pins the
+/// critic's recipe so its `thread start` line cannot land on the drafter's
+/// model; `Err` carries the refusal to print.
 pub trait PairFilter {
     fn check(&self, drafter: &str, critic: &str) -> std::result::Result<Option<String>, String>;
 }

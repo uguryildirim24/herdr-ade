@@ -582,8 +582,8 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             thread::update(pass.project, &t.id, |rec| {
                 thread::bind_identity(rec, &socket, &agent, process);
             })?;
-            // The board says which helper took the task (SPEC-jev-picker v2
-            // §3 Publication); the value is plain-checked there.
+            // The board says which helper took the task; the value is
+            // plain-checked there.
             if !t.launch.compact_reason.is_empty() {
                 let _ = crate::board::publish_value(
                     pass.ctx,
@@ -665,8 +665,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         first_error = first_error.or(Some(error));
     }
     // The ops pass (A2) and the rounds pass (A3) run in the slow pass,
-    // outside the project lock (SPEC-ADE item 57). The picker (A4) has no
-    // tick: it runs at launch time.
+    // outside the project lock (SPEC-ADE item 57).
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(
         coordinator_recorded == 1
