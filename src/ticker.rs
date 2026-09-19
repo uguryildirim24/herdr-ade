@@ -3,6 +3,7 @@
 //! Everything it does is "check on an interval, compare with last time, act".
 //! It exits on request through a stop file, never through signals.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -311,6 +312,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
+    memory.machine_views.clear();
     let mut reachable = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
         let Ok(project) = Project::load(&ctx.root, &slug) else {
@@ -325,12 +327,88 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             Err(error) => log.line(&format!("{slug}: {error:#}")),
         }
     }
+    // One courier pass per due machine, covering every project with lanes on
+    // it (SPEC-remote §4.3). This runs before the per-project slow pass so the
+    // first project cannot starve the cadence of the others.
+    let project_refs: Vec<&Project> = reachable.iter().map(|(project, _)| project).collect();
+    for error in machine_passes(ctx, &project_refs, memory, log) {
+        log.line(&format!("{error:#}"));
+    }
     for (project, seen) in &reachable {
         for error in tick_slow(ctx, project, seen, memory) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
     }
     !reachable.is_empty()
+}
+
+/// One courier pass per saved machine that has lanes, once per fourth tick.
+/// The cadence lives per machine in `Memory`, not per project, and every
+/// project with lanes on that machine shares the one SSH trip.
+fn machine_passes(
+    ctx: &Ctx,
+    projects: &[&Project],
+    memory: &mut Memory,
+    log: &Log,
+) -> Vec<anyhow::Error> {
+    let now = jiff::Timestamp::now();
+    let mut by_machine: BTreeMap<String, Vec<(Project, Vec<thread::Thread>)>> = BTreeMap::new();
+    for project in projects {
+        let remote = open_threads(project, true);
+        let mut seen_machines: Vec<String> = Vec::new();
+        for t in &remote {
+            if !seen_machines
+                .iter()
+                .any(|m| m.as_str() == t.machine_route())
+            {
+                seen_machines.push(t.machine_route().to_string());
+            }
+        }
+        for machine in seen_machines {
+            let threads: Vec<thread::Thread> = remote
+                .iter()
+                .filter(|t| t.machine_route() == machine)
+                .cloned()
+                .collect();
+            by_machine
+                .entry(machine)
+                .or_default()
+                .push(((*project).clone(), threads));
+        }
+    }
+    let mut errors = Vec::new();
+    for (machine, entries) in by_machine {
+        if !memory.machine_is_due(&machine) {
+            continue;
+        }
+        let projects: Vec<&Project> = entries.iter().map(|(project, _)| project).collect();
+        let outcome = steps::courier(ctx, &projects, &machine);
+        let reason = outcome.as_ref().err().map(|e| format!("{e:#}"));
+        let event = memory.record_machine(&machine, reason.as_deref(), now);
+        // After the configured outage period, type one unreachable BLOCKED per
+        // open box lane, then stay quiet until the machine answers again
+        // (SPEC-remote §4.3). A failed pass never invents GONE.
+        if matches!(&event, Some(steps::OutageEvent::Down)) {
+            for (project, threads) in &entries {
+                for lane in threads {
+                    let line = format!("BLOCKED {} machine {machine} unreachable", lane.id);
+                    if let Err(error) = steps::type_remote_line(ctx, project, &line) {
+                        log.line(&format!("{error:#}"));
+                    }
+                }
+            }
+        }
+        let Some((first, _)) = entries.first() else {
+            continue;
+        };
+        if let Err(error) = steps::write_machine_outage(first, &machine, event, memory) {
+            errors.push(error.context("machine outage"));
+        }
+        memory
+            .machine_views
+            .insert(machine, outcome.map_err(|e| format!("{e:#}")));
+    }
+    errors
 }
 
 #[cfg(test)]
@@ -359,11 +437,21 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
+    memory.machine_views.clear();
     match tick_cheap(ctx, project)? {
-        Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
-            Some(error) => Err(error),
-            None => Ok(true),
-        },
+        Some(seen) => {
+            let log = Log {
+                path: std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id())),
+            };
+            let projects = [project];
+            for error in machine_passes(ctx, &projects, memory, &log) {
+                log.line(&format!("{error:#}"));
+            }
+            match tick_slow(ctx, project, &seen, memory).into_iter().next() {
+                Some(error) => Err(error),
+                None => Ok(true),
+            }
+        }
         None => Ok(false),
     }
 }
@@ -529,20 +617,26 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
         }
         *may_start = false;
         // A pi provider that stopped being ready (an expired login) fails
-        // the thread at once instead of launching into it (SPEC-pi §3.4).
-        if t.launch.kind == "pi"
-            && !t.is_remote()
-            && let Err(error) = crate::threads::pi_ready(pass.ctx, &t.launch)
-        {
-            let message = format!("{error:#}");
-            errors.extend(
-                thread::update(pass.project, &t.id, |t| {
-                    t.status = thread::Status::Failed;
-                    t.error = message;
-                })
-                .err(),
-            );
-            continue;
+        // the thread at once instead of launching into it (SPEC-pi §3.4). A
+        // box lane's readiness is read on the box, never from the Mac login
+        // (SPEC-remote §4.1).
+        if t.launch.kind == "pi" {
+            let readiness = if t.is_remote() {
+                crate::threads::box_pi_ready(pass.ctx, t.machine_route(), &t.launch)
+            } else {
+                crate::threads::pi_ready(pass.ctx, &t.launch)
+            };
+            if let Err(error) = readiness {
+                let message = format!("{error:#}");
+                errors.extend(
+                    thread::update(pass.project, &t.id, |t| {
+                        t.status = thread::Status::Failed;
+                        t.error = message;
+                    })
+                    .err(),
+                );
+                continue;
+            }
         }
         let launched = (|| -> Result<()> {
             thread::update(pass.project, &t.id, |t| t.launch_attempts += 1)?;
@@ -700,15 +794,15 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     }
 }
 
-/// One remote machine: one `agent list` (and `pane list`) through
-/// `herdr --machine`, then the same thread pass and launches as for local
-/// threads. The report bytes, sealed events and boot id arrive through the
-/// courier (the second lane); this pass never reads a report hash or copies a
-/// file. If the machine cannot be reached nothing is read: no state, no group
-/// change, no inbox item.
+/// One remote machine: the courier's one helper call already read the box's
+/// live `agent list`/`pane list`, so this pass uses that view instead of a
+/// second `herdr --machine` bridge. It then runs the same thread pass and
+/// launches as for local threads. The report bytes and sealed events arrived
+/// through the courier; this pass never reads a report hash or copies a file.
 fn remote_pass(
     pass: &LaunchPass<'_>,
     machine: &str,
+    view: &steps::CourierOutcome,
     may_start: &mut bool,
     _copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>,
     errors: &mut Vec<anyhow::Error>,
@@ -718,8 +812,12 @@ fn remote_pass(
     let herdr = pass.herdr;
     let threads = pass.threads;
     let remote = herdr.on_machine(machine);
-    let agents = remote.agent_list().map_err(|e| e.to_string())?;
-    let panes = remote.pane_list().map_err(|e| e.to_string())?;
+    let (agents, panes) = match (&view.agents, &view.panes) {
+        (Some(agents), Some(panes)) => (agents.clone(), panes.clone()),
+        // The box server did not answer: the sealed events were still imported,
+        // but no lane state changes and no GONE is invented (SPEC-remote §4.3).
+        _ => return Ok(Vec::new()),
+    };
 
     let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
     let pass = thread_pass(project, &prefix, &remote, threads, &agents, &panes, None)
@@ -737,6 +835,19 @@ fn remote_pass(
         may_start,
         errors,
     );
+    // The D8 BLOCKED/GONE lines for this machine's box lanes (SPEC-remote §4.3).
+    errors.extend(steps::remote_attention(
+        ctx,
+        project,
+        steps::RemoteView {
+            machine_id: &view.machine_id,
+            threads,
+            agents: &agents,
+            panes: &panes,
+            boot_id: &view.boot_id,
+            now: jiff::Timestamp::now(),
+        },
+    ));
     Ok(pass.transitions)
 }
 
@@ -824,7 +935,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         &mut errors,
     );
 
-    // Remote threads, one machine at a time, every fourth tick.
+    // Remote threads, one machine at a time, from this tick's courier views.
+    // A machine with no view was not due this tick (SPEC-remote §4.3).
     let mut state = steps::load_state(project);
     let before = state.clone();
     let remote_threads = open_threads(project, true);
@@ -835,15 +947,22 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     machines.sort();
     machines.dedup();
     for machine in machines {
-        if !memory.machine_is_due(&machine) {
+        let Some(view) = memory.machine_views.get(&machine) else {
             continue;
-        }
+        };
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}"));
+                continue;
+            }
+        };
         let threads: Vec<thread::Thread> = remote_threads
             .iter()
             .filter(|t| t.machine_route() == machine)
             .cloned()
             .collect();
-        let outcome = remote_pass(
+        match remote_pass(
             &LaunchPass {
                 ctx,
                 project,
@@ -853,17 +972,14 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
                 panes: &[],
             },
             &machine,
+            view,
             &mut may_start,
             &mut copy_notes,
             &mut errors,
-        );
-        let event =
-            memory.record_machine(&machine, outcome.as_ref().err().map(String::as_str), now);
-        match outcome {
+        ) {
             Ok(found) => transitions.extend(found),
-            Err(error) => errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}")),
+            Err(error) => errors.push(anyhow::anyhow!("{machine}: {error}")),
         }
-        errors.extend(steps::write_machine_outage(project, &machine, event, memory).err());
     }
 
     errors.extend(
