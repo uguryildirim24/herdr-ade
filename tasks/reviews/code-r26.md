@@ -1,10 +1,10 @@
 +++
 verdict = "MERGE"
 round = "r26"
-candidate = "1d4f51ef918cb70b0efe650be2229f1c0d3aef03"
+candidate = "cf82556a95c7249a60606a114e401c796f3e2bf0"
 manifest_hash = "3a59cb0ea225b0e3257c4eb41212d46c51e883439aa54e24c50987b1a638dd79"
 policy_hash = "941e9ea13a16368ca1ee73b91e4a1dc137816aed5c9c2f6e7e6acea90d78dfbd"
-gates = []
+gates = ["PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --check", "PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --locked", "PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy --all-targets --locked -- -D warnings"]
 +++
 
 # Review
@@ -19,19 +19,24 @@ The review fixed five recovery defects before accepting it: `--all` now uses eac
 
 The machine-qualified token will become visible as cross-machine nesting when the fork change described by t-0053 lands; writing that token now is the intended interface.
 
+## Integration update
+
+Round r24 was merged into the candidate. Its default-placement paragraph precedes the pickup paragraph in `docs/operations.md`. The merged r24 reachability test was also corrected to match the fixed-PATH SSH probe it exercises.
+
 ## Gates
 
-The brief listed no project gates, so `gates` is empty.
-
-Supplemental review checks:
-
 ```text
-$ cargo test --locked checkpoint::tests::pickup_ -- --nocapture
-running 6 tests
-...
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 389 filtered out
+$ PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --check
+(no output)
 
-$ cargo clippy --all-targets --locked -- -D warnings
-Checking herdr-ade v0.1.0 (...)
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.84s
+$ PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --locked
+running 4 tests
+...
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy --all-targets --locked -- -D warnings
+Compiling herdr-ade v0.1.0 (...)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.86s
 ```
+
+The four test binaries passed 403, 56, 78 and 4 tests: 541 total.
