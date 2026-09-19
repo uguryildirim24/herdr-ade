@@ -2922,4 +2922,30 @@ mod tests {
         advance(&ctx, "demo").unwrap();
         assert_eq!(announcements(&fx.project), 1);
     }
+
+    /// Automation may consume a verdict and announce it, but only a command
+    /// the coordinator runs may record that a delivery was read.
+    #[test]
+    fn advancing_a_verdict_never_acknowledges_a_lane_delivery() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        for (id, _) in &lanes {
+            crate::events::append_delivery(
+                &fx.project,
+                &format!("{id}-1-1"),
+                crate::contracts::DeliveryState::Submitted,
+            )
+            .unwrap();
+        }
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        advance(&ctx, "demo").unwrap();
+        for (id, _) in &lanes {
+            assert_eq!(
+                crate::events::states(&fx.project, &format!("{id}-1-1")).unwrap(),
+                vec![crate::contracts::DeliveryState::Submitted],
+                "{id}"
+            );
+        }
+    }
 }

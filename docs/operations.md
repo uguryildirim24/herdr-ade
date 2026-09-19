@@ -133,6 +133,10 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 `nudge = false` is the default, because on Herdr 0.9.1 a prompt that arrives while you are typing in the coordinator **is merged with, and submits, your half-typed text**. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items") and the coordinator picks them up at its next turn. Set `nudge = true` in `PROJECT.md` to have the ticker prompt the coordinator when it is idle; the message always begins `[herdr-ade ticker: automated, not the user, approves nothing]` and never carries outside text.
 
+## Lane completion deliveries
+
+A lane's `DONE`/`WAITING` line is the wake-up: the ticker types it once into the coordinator's ready pane, so the coordinator is roused even when it already handled the result. The inbox item is the record the coordinator re-reads with `context`; only a command the coordinator runs (`context`, `inbox done`) acknowledges a delivery, and automation never does.
+
 ## Routines
 
 A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d` or `daily HH:MM`, local time), optional `command`, `enabled`; the body is the prompt the coordinator receives as an inbox item when it is due. A routine with a `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` **and** you have run `herdr-ade routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted. Edit the command and it stops until approved again.
