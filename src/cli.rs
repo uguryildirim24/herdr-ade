@@ -190,6 +190,11 @@ enum Command {
         #[command(subcommand)]
         command: RoundCommand,
     },
+    /// Build and install the harness repositories after a merge
+    Harness {
+        #[command(subcommand)]
+        command: HarnessCommand,
+    },
     /// The spec dialogue between a drafter and a critic (SPEC-ADE D7)
     Dialogue {
         #[command(subcommand)]
@@ -380,6 +385,12 @@ enum RoundCommand {
     Show { slug: String, round: String },
     /// Run the ticker's pass for rounds, asks, talk and the board once
     Tick { slug: String },
+}
+
+#[derive(Subcommand)]
+enum HarnessCommand {
+    /// Build every repository in `[harness]` and install it, then the saved box
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -1571,6 +1582,9 @@ pub fn run() -> Result<()> {
         | Command::Term { .. }
         | Command::Talk { .. }
         | Command::Board { .. }) => run_rounds(&ctx, command),
+        Command::Harness { command } => match command {
+            HarnessCommand::Install => crate::harness::install(&ctx),
+        },
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),
