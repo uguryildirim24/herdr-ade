@@ -878,9 +878,12 @@ fn table_rows(ctx: &Ctx, config: &LaunchConfig, rows: &mut Vec<DoctorRow>) {
             continue;
         }
         let exe = kind_executable(kind);
-        let output = ctx
-            .runner
-            .run(&Cmd::new("zsh", HELP_TIMEOUT).args(["-lic", &format!("command -v {exe}")]));
+        // The machine's own login shell, never a hard-coded zsh (SPEC-remote
+        // §3.3): zsh is absent on the box.
+        let output = ctx.runner.run(
+            &Cmd::new(crate::pi::sh::shell(), HELP_TIMEOUT)
+                .args(["-lic", &format!("command -v {exe}")]),
+        );
         match output {
             Ok(output) if output.success() && !output.stdout.trim().is_empty() => {
                 rows.push(DoctorRow {
