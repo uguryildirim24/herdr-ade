@@ -11,6 +11,7 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0067.md",
       "tasks/t-0066.md",
       "tasks/t-0060.md",
       "tasks/review-r29.md",
@@ -21,14 +22,14 @@
       "tasks/t-0059.md",
       "tasks/review-r25.md",
       "tasks/t-0058.md",
-      "tasks/t-0057.md",
-      "tasks/t-0056.md"
+      "tasks/t-0057.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r29.md",
       "tasks/reviews/code-r28.md",
       "tasks/reviews/code-r25.md",
       "tasks/reviews/code-r26.md",
@@ -39,11 +40,10 @@
       "tasks/reviews/code-r19.md",
       "tasks/reviews/code-r18.md",
       "tasks/reviews/code-r15.md",
-      "tasks/reviews/code-r14.md",
-      "tasks/reviews/code-r12.md"
+      "tasks/reviews/code-r14.md"
     ]
   },
-  "generated": "2026-09-19T19:51:39-04:00",
+  "generated": "2026-09-19T19:51:49-04:00",
   "git": {
     "branches": [
       "main",
@@ -127,22 +127,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
+      "37fbe71 Merge commit 'ad94e7031ca8410f94d90e4ff7b6c5142b63ec97'",
+      "e02e3a7 checkpoint(r28): HANDOFF after merging the round",
       "bb64e02 Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c'",
       "4177ce0 checkpoint(r25): HANDOFF after merging the round",
       "e0257a3 Merge commit '9a19ab64a28e60f0460ae13c198762b9c9ea9ba4'",
-      "f9d1f3c docs(review): round r28 verdict",
-      "3a782af review(round): keep retry on the current manifest",
-      "9a19ab6 docs(review): refresh round r25 verdict after r26"
+      "ad94e70 review(talk): round r29 verdict"
     ],
-    "remote": "19 ahead, 0 behind origin/main",
+    "remote": "28 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "bb64e02",
+        "head": "37fbe71",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'f9d1f3c389c26a14f56fb9da48d8d0e83699194c'"
+        "subject": "Merge commit 'ad94e7031ca8410f94d90e4ff7b6c5142b63ec97'"
       },
       {
         "branch": "review/r1",
@@ -692,8 +692,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r28",
-    "verdict": "f9d1f3c389c26a14f56fb9da48d8d0e83699194c"
+    "round": "r29",
+    "verdict": "ad94e7031ca8410f94d90e4ff7b6c5142b63ec97"
   },
   "session": "default",
   "unlinked_agents": [],
