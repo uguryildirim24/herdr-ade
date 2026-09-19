@@ -350,6 +350,13 @@ pub fn doctor_rows_with(
     // each enabled provider: a login or a named missing-login failure.
     if layout.wrapper().is_file() {
         for provider in providers {
+            // The `pro` relay only exists on the machine running the bridge,
+            // so a missing provider row is informational. A `pro` provider
+            // that is present but not logged in stays a failure.
+            if *provider == "pro" && !provider::has_provider(&layout.models(), "pro") {
+                rows.push(Row::ok("provider pro", "not on this machine (no relay)"));
+                continue;
+            }
             match auth_check(runner, layout, provider) {
                 Ok(()) => rows.push(Row::ok(format!("provider {provider}"), "login ready")),
                 Err(error) => rows.push(Row::fail(
@@ -596,33 +603,26 @@ fn auth_check(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> Resul
 }
 
 fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row {
+    wrapper_path_row_with(runner, env, layout, &sh::shell())
+}
+
+/// The selected probe and parse, with the login shell named so the tests can
+/// drive `/bin/bash` and `/bin/zsh` on any host.
+fn wrapper_path_row_with(runner: &dyn sh::Runner, env: &Env, layout: &Layout, shell: &str) -> Row {
     let link = env.home.join(".local/bin/pi");
-    // The spec writes `command -v -a pi`; that is a bash form and zsh rejects
-    // it (`zsh: command not found: -v`). `whence -va` is zsh's own form, run
-    // through the machine's own login shell (`$SHELL -lic`).
-    let output = match sh::login_shell(runner, "whence -va pi") {
+    // `whence` is zsh and `type -a` is bash, so the machine's own login shell
+    // picks its own word; anything else gets POSIX `command -v`.
+    let script = path_probe(shell);
+    let output = match runner.run(&sh::Cmd::new(shell, sh::SHORT).args(["-lic", script])) {
         Ok(output) => output,
         Err(error) => return Row::fail("wrapper on PATH", format!("{error:#}")),
     };
-    let list: Vec<String> = output
-        .stdout
-        .lines()
-        .chain(output.stderr.lines())
-        // Only `pi is ...` lines: a login shell's rc files may print their
-        // own lines, and one with " is " in it is not a resolution of pi.
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("pi is ")
-                .map(|p| p.trim().to_string())
-        })
-        .filter(|p| !p.is_empty())
-        .collect();
-    let first = list.first().cloned().unwrap_or_default();
+    let first = first_pi_path(&output);
     if first != link.display().to_string() {
         return Row::fail(
             "wrapper on PATH",
             format!(
-                "`$SHELL -lic 'whence -va pi'` finds `{first}` first; expected {}",
+                "`$SHELL -lic '{script}'` finds `{first}` first; expected {}",
                 link.display()
             ),
         );
@@ -656,6 +656,34 @@ fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row 
             format!("{} does not resolve: {error}", link.display()),
         ),
     }
+}
+
+/// The login shell's own "where is this word" builtin.
+fn path_probe(shell: &str) -> &'static str {
+    match Path::new(shell).file_name().and_then(|name| name.to_str()) {
+        Some("bash") => "type -a pi",
+        Some("zsh") => "whence -va pi",
+        _ => "command -v pi",
+    }
+}
+
+/// The first path a probe names, from stdout or stderr. `type -a` and
+/// `whence -va` print `pi is /path`; `command -v` prints the bare path. A
+/// login rc file may print its own lines, so a `pi is ...` line must name an
+/// absolute path and a bare line must itself be the `pi` path.
+fn first_pi_path(output: &sh::Output) -> String {
+    for line in output.stdout.lines().chain(output.stderr.lines()) {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pi is ") {
+            let path = rest.trim();
+            if path.starts_with('/') {
+                return path.to_string();
+            }
+        } else if Path::new(line).file_name().and_then(|name| name.to_str()) == Some("pi") {
+            return line.to_string();
+        }
+    }
+    String::new()
 }
 
 fn pinned_range(layout: &Layout) -> Option<String> {
@@ -788,6 +816,14 @@ mod tests {
         std::os::unix::fs::symlink(layout.wrapper(), env.home.join(".local/bin/pi")).unwrap();
     }
 
+    /// Merge the `pro` relay provider into the shared `models.json`.
+    fn add_pro(layout: &Layout) {
+        let text = std::fs::read_to_string(layout.models()).unwrap();
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value["providers"]["pro"] = serde_json::json!({"apiKey": "tok"});
+        std::fs::write(layout.models(), serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
     #[test]
     fn a_good_install_passes_every_scripted_row() {
         let dir = tempfile::tempdir().unwrap();
@@ -840,6 +876,106 @@ mod tests {
             )),
         );
         assert_eq!(wrapper_path_row(&runner, &env, &layout).level, Level::Fail);
+    }
+
+    #[test]
+    fn the_probe_uses_the_login_shells_own_word() {
+        assert_eq!(path_probe("/bin/bash"), "type -a pi");
+        assert_eq!(path_probe("/bin/zsh"), "whence -va pi");
+        assert_eq!(path_probe("zsh"), "whence -va pi");
+        assert_eq!(path_probe("/usr/bin/fish"), "command -v pi");
+    }
+
+    #[test]
+    fn the_probe_parse_takes_the_first_path() {
+        let out = |stdout: &str, stderr: &str| sh::Output {
+            code: Some(0),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            timed_out: false,
+        };
+        // bash `type -a pi`
+        assert_eq!(
+            first_pi_path(&out("pi is /one/pi\npi is /two/pi\n", "")),
+            "/one/pi"
+        );
+        // zsh `whence -va pi`
+        assert_eq!(
+            first_pi_path(&out("pi is /one/pi\npi is /two/pi\n", "")),
+            "/one/pi"
+        );
+        // POSIX `command -v pi` prints the bare path
+        assert_eq!(first_pi_path(&out("/three/pi\n", "")), "/three/pi");
+        // rc chatter and a function are not a resolution
+        assert_eq!(
+            first_pi_path(&out(
+                "fnm: this shell is ready\n/etc/profile.d/x.sh: ready\npi is a function\npi is /four/pi\n",
+                ""
+            )),
+            "/four/pi"
+        );
+        // stderr counts too
+        assert_eq!(first_pi_path(&out("", "pi is /five/pi\n")), "/five/pi");
+        assert_eq!(first_pi_path(&out("", "")), "");
+    }
+
+    #[test]
+    fn the_wrapper_row_probes_bash_on_a_bash_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[]);
+        link_into(&env, &layout);
+        let link = env.home.join(".local/bin/pi");
+        let runner = FakeRunner::new();
+        runner.on(
+            "bash -lic type -a pi",
+            ok(&format!("pi is {}\n", link.display())),
+        );
+        let row = wrapper_path_row_with(&runner, &env, &layout, "/bin/bash");
+        assert_eq!(row.level, Level::Ok, "{row:?}");
+        assert_eq!(runner.count("type -a pi"), 1);
+        assert_eq!(runner.count("whence"), 0);
+    }
+
+    #[test]
+    fn the_pro_row_is_informational_when_the_relay_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = scripted(&env);
+        let rows = doctor_rows_with(&env, &layout, &runner, &["pro"]);
+        let row = rows.iter().find(|r| r.label == "provider pro").unwrap();
+        assert_eq!(row.level, Level::Ok, "{row:?}");
+        assert_eq!(row.detail, "not on this machine (no relay)");
+        assert_eq!(runner.count("auth check"), 0);
+    }
+
+    #[test]
+    fn a_present_pro_provider_still_needs_a_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        add_pro(&layout);
+
+        let runner = scripted(&env);
+        runner.on("auth check --provider pro", ok(r#"{"status":"ready"}"#));
+        let rows = doctor_rows_with(&env, &layout, &runner, &["pro"]);
+        let row = rows.iter().find(|r| r.label == "provider pro").unwrap();
+        assert_eq!(row.level, Level::Ok, "{row:?}");
+        assert_eq!(row.detail, "login ready");
+
+        let runner = scripted(&env);
+        runner.on(
+            "auth check --provider pro",
+            fail(
+                1,
+                r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
+            ),
+        );
+        let rows = doctor_rows_with(&env, &layout, &runner, &["pro"]);
+        let row = rows.iter().find(|r| r.label == "provider pro").unwrap();
+        assert_eq!(row.level, Level::Fail, "{row:?}");
+        assert!(row.detail.contains("credentials_not_configured"), "{row:?}");
     }
 
     #[test]
