@@ -1,0 +1,608 @@
+//! Read-only projection of the existing project records. Step state comes
+//! from plan::project_states, the very same projection used by plan sync.
+use super::{Entry, Journal, view::Conversation};
+use crate::{
+    contracts::StepState,
+    decide, glossary,
+    herdr::{Agent, Pane},
+    paths::Ctx,
+    plan,
+    project::Project,
+    round,
+    thread::{self, Group, Status},
+    threads,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const HEADINGS: [&str; 6] = [
+    "Goal",
+    "What you get at the end",
+    "How far along",
+    "Running now",
+    "Finished lately",
+    "Needs you",
+];
+pub const EMPTY: [&str; 6] = [
+    "Your goal is not written down yet.",
+    "The end result is not written down yet.",
+    "The steps are not written down yet.",
+    "Nothing is running now.",
+    "Nothing has landed yet.",
+    "No question is waiting here.",
+];
+pub const GOAL_INVALID: &str = "Your goal needs a plain sentence.";
+pub const TASK_INVALID: &str = "This task needs a plain description.";
+pub const STEP_INVALID: &str = "This step needs a plain description.";
+pub const DECISION_INVALID: &str = "This choice needs a plain description.";
+pub const CATCH_UP: &str = "The plan needs to catch up.";
+pub const RUNNING_ERROR: &str = "I could not read the running work.";
+pub const FINISHED_ERROR: &str = "I could not read the finished work.";
+pub const DECISIONS_ERROR: &str = "I could not read the choices.";
+pub const NO_DECISIONS: &str = "No choices have been recorded yet.";
+pub const CHANGE: &str = "Tell me what to change in the chat.";
+pub const ASK_WARNING: &str = "More than three questions are waiting here.";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tone {
+    #[default]
+    Text,
+    Heading,
+    Dim,
+    Green,
+    Yellow,
+    Red,
+    Peach,
+    Accent,
+}
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub text: String,
+    pub prefix: String,
+    pub tone: Tone,
+}
+impl Row {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            prefix: String::new(),
+            tone: Tone::Text,
+        }
+    }
+    pub fn full_text(&self) -> String {
+        if self.prefix.is_empty() {
+            self.text.clone()
+        } else {
+            format!("{} {}", self.prefix, self.text)
+        }
+    }
+}
+#[derive(Default)]
+pub struct Overview {
+    pub sections: [Vec<Row>; 6],
+    pub progress: Option<(usize, usize)>,
+    pub active: usize,
+    pub needs: usize,
+    pub name: String,
+}
+
+/// One shared poll for all local rows and the coordinator. Remote records
+/// are the courier's last observation, never a claim of fresh connectivity.
+#[derive(Default)]
+pub struct Live {
+    pub agents: Vec<Agent>,
+    pub panes: Vec<Pane>,
+    pub reachable: bool,
+    pub state: String,
+    groups: BTreeMap<String, Group>,
+}
+impl Live {
+    pub fn poll(&mut self, ctx: &Ctx, project: &Project) {
+        if let Some(view) = threads::session_view(ctx, project) {
+            self.agents = view.agents;
+            self.panes = view.panes;
+            self.reachable = true;
+            let pane = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
+            self.state = self
+                .agents
+                .iter()
+                .find(|a| a.pane_id == pane)
+                .map(|a| a.agent_status.clone())
+                .unwrap_or_else(|| "gone".into());
+            for t in thread::list(project).into_iter().filter(|t| !t.is_remote()) {
+                let now = jiff::Timestamp::now();
+                let live = thread::live_state(&t, &self.agents, &self.panes, now);
+                self.groups
+                    .insert(t.id.clone(), thread::group(&t, &live, now));
+            }
+        } else {
+            self.reachable = false;
+        }
+    }
+    pub fn state(&self, project: &Project) -> &str {
+        if super::writer_suspended(project) {
+            "other tab"
+        } else if !self.reachable {
+            "unreachable"
+        } else {
+            match self.state.as_str() {
+                "idle" | "working" | "blocked" | "done" | "gone" => &self.state,
+                _ => "unreachable",
+            }
+        }
+    }
+    fn group(&self, t: &thread::Thread) -> Group {
+        if !t.is_remote()
+            && let Some(group) = self.groups.get(&t.id)
+        {
+            return *group;
+        }
+        Group::from_token(&t.last_group).unwrap_or(Group::Working)
+    }
+}
+
+fn checked(project: &Project, text: &str) -> bool {
+    !text.trim().is_empty()
+        && !text.chars().any(char::is_control)
+        && glossary::name_in(project, text).is_none()
+        && glossary::gate(project, text).is_ok()
+}
+fn safe(project: &Project, text: &str, fallback: &str) -> String {
+    if checked(project, text) {
+        text.to_string()
+    } else {
+        fallback.into()
+    }
+}
+fn tagged(project: &Project, prefix: &str, text: &str, tone: Tone, fallback: &str) -> Row {
+    let composed = format!("{prefix} {text}");
+    Row {
+        prefix: prefix.into(),
+        text: if checked(project, &composed) {
+            text.into()
+        } else {
+            fallback.into()
+        },
+        tone,
+    }
+}
+
+/// Unlike thread::list, do not silently equate unreadable records with an
+/// empty project. Preserve every readable row and add an explicit failure.
+fn records<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> (Vec<T>, bool) {
+    let mut result = Vec::new();
+    let mut failed = false;
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) if e.path().extension().is_some_and(|ext| ext == "toml") => {
+                        match std::fs::read_to_string(e.path())
+                            .ok()
+                            .and_then(|s| toml::from_str(&s).ok())
+                        {
+                            Some(record) => result.push(record),
+                            None => failed = true,
+                        }
+                    }
+                    Err(_) => failed = true,
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => failed = e.kind() != std::io::ErrorKind::NotFound,
+    }
+    (result, failed)
+}
+
+impl Overview {
+    pub fn load(
+        project: &Project,
+        journal: &Journal,
+        conversation: &Conversation,
+        live: &Live,
+    ) -> Self {
+        let mut out = Self::default();
+        match project.read_project_md() {
+            Ok((s, _)) => {
+                out.name = safe(project, &s.name, "Your project");
+                out.sections[0].push(Row::text(if s.goal.is_empty() {
+                    EMPTY[0].into()
+                } else {
+                    safe(project, &s.goal, GOAL_INVALID)
+                }));
+            }
+            Err(_) => {
+                out.name = "Your project".into();
+                out.sections[0].push(Row::text(GOAL_INVALID));
+            }
+        }
+        if let Ok(Some(mut card)) = plan::load(project) {
+            if card.schema == 1
+                && let Some(sentence) = crate::contracts::plan_kind_sentence(&card.kind)
+                && card.what_you_get == sentence
+                && checked(project, &card.does)
+            {
+                out.sections[1].push(Row::text(sentence));
+                out.sections[1].push(Row::text(card.does.clone()));
+            }
+            let drift = plan::project_states(project, &mut card);
+            let goal_drift = project
+                .read_project_md()
+                .is_ok_and(|(s, _)| s.goal != card.goal);
+            if !card.steps.is_empty() {
+                out.progress = Some((
+                    card.steps
+                        .iter()
+                        .filter(|s| s.state == StepState::Done)
+                        .count(),
+                    card.steps.len(),
+                ));
+                for step in card.steps {
+                    let tone = match step.state {
+                        StepState::Done => Tone::Green,
+                        StepState::Running => Tone::Yellow,
+                        StepState::Left => Tone::Dim,
+                    };
+                    out.sections[2].push(tagged(
+                        project,
+                        step.state.word(),
+                        &step.text,
+                        tone,
+                        STEP_INVALID,
+                    ));
+                }
+            }
+            if out.sections[2].is_empty() {
+                out.sections[2].push(Row::text(EMPTY[2]));
+            }
+            if drift || goal_drift {
+                out.sections[2].push(Row::text(CATCH_UP));
+            }
+        }
+        let (mut tasks, failed) = records::<thread::Thread>(&project.dir().join("threads"));
+        tasks.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
+        let (rounds, rounds_failed) =
+            records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));
+        for t in tasks {
+            let carrying: Vec<_> = rounds
+                .iter()
+                .filter(|r| r.manifest.members.iter().any(|m| m.thread == t.id))
+                .map(|r| r.round.clone())
+                .collect();
+            if !carrying.is_empty() && carrying.iter().all(|r| threads::round_landed(project, r)) {
+                continue;
+            }
+            let pending_pin = rounds.iter().any(|r| {
+                !threads::round_landed(project, &r.round)
+                    && r.manifest
+                        .members
+                        .iter()
+                        .any(|m| m.thread == t.id && m.pin.is_some())
+            });
+            if t.status == Status::Resolved && !pending_pin {
+                continue;
+            }
+            let group = if t.status == Status::Resolved {
+                Group::ReadyForReview
+            } else {
+                live.group(&t)
+            };
+            let (state, tone) = match group {
+                Group::WaitingOnYou => {
+                    out.needs += 1;
+                    ("needs you", Tone::Red)
+                }
+                Group::ReadyForReview | Group::Landing => ("checking", Tone::Yellow),
+                _ => ("working", Tone::Yellow),
+            };
+            let mut suffix = String::new();
+            if t.is_remote() {
+                suffix.push_str(" box");
+            }
+            if t.is_remote() || !live.reachable {
+                suffix.push_str(" last seen");
+            }
+            let text = format!("{}{suffix}", safe(project, &t.plain, TASK_INVALID));
+            let fallback = format!("{TASK_INVALID}{suffix}");
+            out.sections[3].push(tagged(project, state, &text, tone, &fallback));
+            // Error strings may contain internal detail; only a checked plain
+            // explanation can accompany the retained work row.
+            if !t.error.is_empty() && checked(project, &t.error) {
+                out.sections[3].push(Row::text(t.error));
+            }
+            out.active += 1;
+        }
+        if failed || rounds_failed {
+            out.sections[3].push(Row::text(RUNNING_ERROR));
+        }
+        let mut landed = BTreeSet::new();
+        let mut evidence_failed = rounds_failed || journal.skipped > 0;
+        for l in journal.lines.iter().rev() {
+            if let Entry::Say {
+                what,
+                landed_round: Some(id),
+                ..
+            } = &l.entry
+            {
+                match round::read_merge(project, id) {
+                    Ok(Some(m)) if m.phase == crate::contracts::MergePhase::Checkpointed => {
+                        if landed.insert(id) {
+                            out.sections[4].push(Row::text(safe(
+                                project,
+                                what,
+                                "This finished work needs a plain description.",
+                            )));
+                        }
+                    }
+                    Ok(None) | Err(_) => evidence_failed = true,
+                    _ => {}
+                }
+                if out.sections[4].len() == 5 {
+                    break;
+                }
+            }
+        }
+        if evidence_failed
+            || (out.sections[4].is_empty()
+                && rounds
+                    .iter()
+                    .any(|r| threads::round_landed(project, &r.round)))
+        {
+            out.sections[4].push(Row::text(FINISHED_ERROR));
+        }
+        out.needs += conversation.open.len();
+        for a in &conversation.open {
+            out.sections[5].push(Row::text(safe(
+                project,
+                &a.question,
+                "This question needs a plain sentence.",
+            )));
+        }
+        if out.sections[5].is_empty() {
+            out.sections[5].push(Row::text(EMPTY[5]));
+        }
+        if conversation.open.len() > 3 {
+            out.sections[5].push(Row::text(ASK_WARNING));
+        }
+        out.sections[5].push(Row {
+            text: "Decided for you".into(),
+            prefix: String::new(),
+            tone: Tone::Heading,
+        });
+        let choices = decide::current(project);
+        let choices_failed = match std::fs::read_to_string(decide::decisions_path(project)) {
+            Ok(text) => {
+                !text.ends_with('\n') && !text.is_empty()
+                    || text.lines().any(|line| {
+                        !line.trim().is_empty()
+                            && serde_json::from_str::<crate::contracts::Decision>(line).is_err()
+                    })
+            }
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        };
+        if choices.is_empty() && !choices_failed {
+            out.sections[5].push(Row::text(NO_DECISIONS));
+        }
+        for d in choices.into_iter().rev().take(5) {
+            let (prefix, tone) = match d.class.as_str() {
+                "what-you-get" => ("result", Tone::Accent),
+                "money" => ("money", Tone::Yellow),
+                "undo" => ("undo", Tone::Peach),
+                _ => ("routine", Tone::Dim),
+            };
+            out.sections[5].push(tagged(project, prefix, &d.line, tone, DECISION_INVALID));
+        }
+        if choices_failed {
+            out.sections[5].push(Row::text(DECISIONS_ERROR));
+        }
+        out.sections[5].push(Row::text(CHANGE));
+        for (i, rows) in out.sections.iter_mut().enumerate() {
+            if rows.is_empty() {
+                rows.push(Row::text(EMPTY[i]));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::round::testkit::fixture;
+    #[test]
+    fn one_fake_poll_supplies_all_local_rows_and_outage_keeps_last_state() {
+        let fx = fixture();
+        let a = fx.thread("First");
+        let b = fx.thread("Second");
+        for id in [&a, &b] {
+            thread::update(&fx.project, id, |t| t.plain = "Build the screen.".into()).unwrap();
+        }
+        let mut live = Live::default();
+        live.poll(&fx.world.ctx(), &fx.project);
+        assert_eq!(fx.world.runner.count("agent list"), 1);
+        assert_eq!(fx.world.runner.count("pane list"), 1);
+        assert_eq!(
+            live.group(&thread::load(&fx.project, &a).unwrap()),
+            Group::WaitingOnYou
+        );
+        *fx.world.agents.borrow_mut() = "unreadable reply".into();
+        live.poll(&fx.world.ctx(), &fx.project);
+        assert!(!live.reachable);
+        assert_eq!(live.state(&fx.project), "unreachable");
+        let before = fx.world.runner.calls.borrow().len();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &live,
+        );
+        assert_eq!(o.needs, 2);
+        assert_eq!(o.active, 2);
+        assert!(o.sections[3].iter().all(|r| {
+            r.full_text()
+                .contains("needs you Build the screen. last seen")
+        }));
+        assert_eq!(fx.world.runner.calls.borrow().len(), before);
+    }
+
+    #[test]
+    fn handed_in_closed_work_stays_until_real_merge_and_only_landings_finish() {
+        use crate::round::testkit::{commit_file, git};
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lane, sha) = fx.lane(1);
+        thread::update(&fx.project, &lane, |t| {
+            t.plain = "Build the first screen.".into();
+            t.last_group = "ready-for-review".into();
+        })
+        .unwrap();
+        plan::set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
+        plan::step_add(
+            &ctx,
+            "demo",
+            "Build the first screen.",
+            vec![lane.clone()],
+            vec![],
+            1,
+        )
+        .unwrap();
+        round::open(
+            &ctx,
+            "demo",
+            round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The first screen is ready.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        let review = round::review(&ctx, "demo", "r1").unwrap();
+        thread::update(&fx.project, &lane, |t| t.status = Status::Resolved).unwrap();
+        crate::ask::say(&ctx, "demo", "The lane has finished.", None).unwrap();
+        let snapshot = || {
+            let journal = super::super::read(&fx.project);
+            Overview::load(
+                &fx.project,
+                &journal,
+                &Conversation::load(&fx.project, &journal),
+                &Live::default(),
+            )
+        };
+        let o = snapshot();
+        assert_eq!(o.progress, Some((0, 1)));
+        assert!(
+            o.sections[3]
+                .iter()
+                .any(|r| r.prefix == "checking" && r.text.contains("Build the first screen."))
+        );
+        assert_eq!(o.sections[4][0].text, EMPTY[4]);
+        git(&review.worktree, &["merge", "-q", "--no-edit", &sha]);
+        let candidate = git(&review.worktree, &["rev-parse", "HEAD"]);
+        let r = round::load(&fx.project, "r1").unwrap();
+        let front = format!(
+            "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{candidate}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll gates pass.\n",
+            r.manifest_hash.unwrap(),
+            r.policy_hash
+        );
+        let verdict = commit_file(
+            &review.worktree,
+            &round::verdict_path("r1"),
+            &front,
+            "verdict",
+        );
+        let reviewer = fx.thread("Reviewer");
+        fx.seal_done(&reviewer, 1, 1, &verdict, "# verdict report\n");
+        round::bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
+        round::merge(&ctx, "demo", "r1", None).unwrap();
+        // Even stale unresolved process state cannot bring landed work back.
+        thread::update(&fx.project, &lane, |t| t.status = Status::Open).unwrap();
+        let o = snapshot();
+        assert_eq!(o.progress, Some((1, 1)));
+        assert!(
+            !o.sections[3]
+                .iter()
+                .any(|r| r.text.contains("Build the first screen."))
+        );
+        assert_eq!(o.sections[4].len(), 1);
+        assert_ne!(o.sections[4][0].text, EMPTY[4]);
+        assert!(!o.sections[4][0].text.contains("lane has finished"));
+    }
+
+    #[test]
+    fn fixture_projection_is_read_only_and_keeps_all_work() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        plan::set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
+        for n in 0..18 {
+            let id = fx.thread("work");
+            thread::update(&fx.project, &id, |t| {
+                t.plain = format!("Show task number {n}.");
+                t.last_group = "working".into();
+                if n == 0 {
+                    t.machine = "oci".into();
+                }
+            })
+            .unwrap();
+        }
+        plan::step_add(
+            &ctx,
+            "demo",
+            "Show pretend trades.",
+            vec!["t-0001".into()],
+            vec![],
+            1,
+        )
+        .unwrap();
+        decide::decide(
+            &ctx,
+            "demo",
+            decide::NewDecision {
+                line: "I kept the words short.",
+                class: "routine",
+                key: None,
+                basis: None,
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap();
+        crate::ask::ask(
+            &ctx,
+            "demo",
+            crate::ask::NewAsk {
+                question: "May I spend five dollars on this check?".into(),
+                choices: vec!["Keep it running.".into(), "Stop it now.".into()],
+                what: None,
+                means: None,
+                round: None,
+                reask: None,
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(plan::plan_path(&fx.project)).unwrap();
+        let j = super::super::read(&fx.project);
+        let c = Conversation::load(&fx.project, &j);
+        let o = Overview::load(&fx.project, &j, &c, &Live::default());
+        assert_eq!(o.active, 18);
+        assert_eq!(o.needs, 1);
+        assert_eq!(o.progress, Some((0, 1)));
+        assert!(o.sections[3][0].full_text().contains("box last seen"));
+        assert!(
+            o.sections[5]
+                .iter()
+                .any(|r| r.full_text() == "routine I kept the words short.")
+        );
+        for r in o.sections.iter().flatten() {
+            assert!(
+                glossary::gate(&fx.project, &r.full_text()).is_ok(),
+                "{}",
+                r.full_text()
+            );
+        }
+        assert_eq!(before, std::fs::read(plan::plan_path(&fx.project)).unwrap());
+        assert_eq!(o.sections[4][0].text, EMPTY[4]);
+    }
+}

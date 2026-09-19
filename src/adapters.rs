@@ -100,18 +100,6 @@ pub fn get(kind: &str) -> Option<&'static Adapter> {
     ADAPTERS.iter().find(|adapter| adapter.kind == kind)
 }
 
-/// The `talk` header's native-chat clause for a coordinator kind.
-pub fn chat_label(kind: &str) -> &'static str {
-    get(kind).map_or("not checked", |adapter| adapter.chat)
-}
-
-/// The `talk` header's surface clause for a coordinator kind.
-pub fn surface_label(kind: &str) -> &'static str {
-    get(kind).map_or("chat: shown only through say and ask", |adapter| {
-        adapter.surface
-    })
-}
-
 /// Capability labels are evidence-based. Installation alone never promotes a
 /// row; acceptance writes the project-local qualification marker after its
 /// installed-CLI test passes.

@@ -457,6 +457,7 @@ mod tests {
             crate::talk::Entry::Rolf {
                 request: request.into(),
                 text: "Put more detail beside those choices.".into(),
+                answer: None,
             },
         )
         .unwrap();
