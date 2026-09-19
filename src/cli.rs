@@ -712,8 +712,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } else {
                     "on this Mac".to_string()
                 };
-                let age = crate::board::age(&lane.updated).unwrap_or_default();
-                println!("{}\t{}\t{}\t{age} ago", lane.id, lane.last_group, machine);
+                let since = if lane.is_remote() {
+                    crate::events::remote_state(&project, lane.machine_route()).last_pass
+                } else {
+                    lane.updated.clone()
+                };
+                let age = crate::board::age(&since)
+                    .map(|age| format!("{age} ago"))
+                    .unwrap_or_else(|| "not heard yet".into());
+                println!("{}\t{}\t{}\t{age}", lane.id, lane.last_group, machine);
                 return Ok(());
             }
             if print {

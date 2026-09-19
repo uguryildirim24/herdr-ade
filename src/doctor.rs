@@ -394,9 +394,9 @@ fn box_rows(
          printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
          printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
          printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
-         for p in claude codex agy; do\n\
-           if [ -x \"$HOME/.local/bin/$p\" ]; then printf 'login_%s\\tok\\n' \"$p\"; else printf 'login_%s\\tmissing\\n' \"$p\"; fi\n\
-         done\n",
+         \"$HOME/.local/bin/claude\" auth status >/dev/null 2>&1 && printf 'login_claude\\tok\\n' || printf 'login_claude\\tmissing\\n'\n\
+         \"$HOME/.local/bin/codex\" login status >/dev/null 2>&1 && printf 'login_codex\\tok\\n' || printf 'login_codex\\tmissing\\n'\n\
+         \"$HOME/.local/bin/agy\" models >/dev/null 2>&1 && printf 'login_agy\\tok\\n' || printf 'login_agy\\tmissing\\n'\n",
     );
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
@@ -412,7 +412,13 @@ fn box_rows(
             "if [ -d {path}/.git ]; then printf 'repo %s\\tok\\n' {path}; else printf 'repo %s\\tmissing\\n' {path}; fi\n"
         ));
     }
-    let facts = match crate::remote::ssh(runner, &profile.target, &script, None, TOOL_TIMEOUT) {
+    let facts = match crate::remote::ssh(
+        runner,
+        &profile.target,
+        &script,
+        None,
+        crate::remote::SSH_START_TIMEOUT,
+    ) {
         Ok(out) if out.success() => parse_facts(&out.stdout),
         Ok(out) => {
             return vec![(
@@ -492,7 +498,7 @@ fn box_rows(
         rows.push((
             env_bool(&value, &["ok"]),
             format!("box {label} login {kind}"),
-            format!("{}: {value}", "$HOME/.local/bin"),
+            format!("{kind} authentication: {value}"),
         ));
     }
     // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
@@ -796,6 +802,22 @@ mod tests {
         );
         assert_eq!(find("box oci capacity").0, Some(true));
         assert!(find("box oci capacity").1.contains("refuses below 12 GB"));
+        let calls = runner.calls.borrow();
+        let ssh = calls
+            .iter()
+            .find(|call| call.program == "ssh")
+            .unwrap()
+            .display();
+        assert!(
+            ssh.contains("\"$HOME/.local/bin/claude\" auth status"),
+            "{ssh}"
+        );
+        assert!(
+            ssh.contains("\"$HOME/.local/bin/codex\" login status"),
+            "{ssh}"
+        );
+        assert!(ssh.contains("\"$HOME/.local/bin/agy\" models"), "{ssh}");
+        drop(calls);
 
         let runner = FakeRunner::new();
         runner.on(
