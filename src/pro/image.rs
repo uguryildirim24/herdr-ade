@@ -206,7 +206,6 @@ fn ensure_lane(
         runner,
         &lane::StartOptions {
             name: name.to_string(),
-            parent: None,
             cwd: Some(cwd_text),
             profile: Some(home::IMAGE_PROFILE.to_string()),
             images: pictures.to_vec(),
@@ -361,6 +360,7 @@ mod tests {
             &[
                 ("HERDR_BIN_PATH", "/h/herdr"),
                 ("HERDR_PRO_STATE_DIR", state.to_str().unwrap()),
+                ("HERDR_PANE_ID", "wC:p1"),
                 ("HERDR_WORKSPACE_ID", "wC"),
             ],
         );
@@ -411,6 +411,7 @@ mod tests {
             start.contains(&format!("--image {}", image.display())),
             "{start}"
         );
+        assert!(start.contains("--parent wC:p1"), "{start}");
         let sent = calls
             .iter()
             .map(|cmd| cmd.display())

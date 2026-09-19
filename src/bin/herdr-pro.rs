@@ -48,9 +48,6 @@ enum Command {
         /// Lane name (the herdr agent name)
         #[arg(long)]
         name: String,
-        /// The coordinator pane that owns the lane
-        #[arg(long)]
-        parent: String,
         /// A trusted directory; default: the current directory
         #[arg(long)]
         cwd: Option<String>,
@@ -146,14 +143,13 @@ fn run(cli: &Cli) -> Result<bool> {
             login(&layout);
             Ok(true)
         }
-        Command::Start { name, parent, cwd } => {
+        Command::Start { name, cwd } => {
             let lane = lane::start(
                 &env,
                 &layout,
                 &runner,
                 &lane::StartOptions {
                     name: name.clone(),
-                    parent: Some(parent.clone()),
                     cwd: cwd.clone(),
                     profile: None,
                     images: Vec::new(),
