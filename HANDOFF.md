@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T15:28:10-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-19T15:51:46-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 4 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
@@ -24,29 +24,30 @@ Coordinator session id `6c22d8cf-cae6-47e2-a930-fd9207175aea`.
 
 | name | kind | status | pane | tab (label) | cwd | tokens | last title |
 |---|---|---|---|---|---|---|---|
-| hp-adeherdr-t-0025 | pi | done | `w1G:p14` | `w1G:t0` (t-0025) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0025` | done=1 lane=t-0025 project=adeherdr rank=3 review=working thread=t-0025 | π - t-0025 |
-| hp-adeherdr-t-0026 | pi | working | `w1G:p15` | `w1G:t11` (t-0026) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0026` | project=adeherdr rank=3 review=working thread=t-0026 | π - t-0026 |
+| hp-adeherdr-t-0027 | pi | working | `w1G:p16` | `w1G:t12` (t-0027) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0027` | project=adeherdr rank=3 review=working thread=t-0027 | π - t-0027 |
+| hp-adeherdr-t-0029 | pi | done | `w1G:p18` | `w1G:t14` (t-0029) | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0029` | done=1 lane=t-0029 project=adeherdr rank=1 review=ready-for-review thread=t-0029 | π - t-0029 |
 
 Start lines as they run now (from `pane process-info`), for restarting a worker that is gone:
 
 ```bash
-herdr agent start hp-adeherdr-t-0025 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
-herdr agent start hp-adeherdr-t-0026 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0027 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0029 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
 ```
 
 Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (working), `w1J` Venator (idle), `w1K` Elicio (idle)
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (12 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (8 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | b7f4fe3 | 0 | Merge commit 'fed2f04b7fb95f491d0f3cb58c5a90208212f4eb' |
+| `/Users/rolfie/projects/herdr-ade` | `main` | d93abec | 0 | docs(review): round r13 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r12` | `review/r12` | a6de86a | 0 | docs(tasks): t-0026 |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r13` | `review/r13` | 1d6260b | 0 | docs(tasks): t-0029 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r2` | `review/r2` | b07aa74 | 0 | docs(tasks): t-0005 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r2-2` | `review/r2-2` | c191a33 | 0 | docs(tasks): t-0007 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r4` | `review/r4` | 689e079 | 0 | docs(tasks): t-0011 |
@@ -70,29 +71,32 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (12 ahead, 0 
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0017` | `hp/adeherdr/t-0017-box-lanes-start-side-a-lane-starts-and-s` | d64488a | 0 | docs(tasks): t-0023 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0018` | `hp/adeherdr/t-0018-harness-the-context-tells-a-coordinator` | ca94e81 | 0 | checkpoint(r10): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0019` | `hp/adeherdr/t-0019-herdr-pro-pictures-from-screenshots-and` | ca94e81 | 0 | checkpoint(r10): HANDOFF after merging the round |
-| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0020` | `hp/adeherdr/t-0020-herdr-pro-serve-pro-through-a-local-rela` | 8e55c49 | 0 | feat(pi): setup writes the pro provider and pi_pro joins the rows |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0020` | `hp/adeherdr/t-0020-herdr-pro-serve-pro-through-a-local-rela` | b645bb6 | 0 | checkpoint(r11): HANDOFF after merging the round |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0022` | `hp/adeherdr/t-0022-review-r9-box-lanes-start-side` | d360c1f | 0 | docs(review): round r9 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0023` | `hp/adeherdr/t-0023-box-lanes-completion-side-the-courier-br` | 789bf54 | 0 | feat(remote): the courier imports box completions |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0024` | `hp/adeherdr/t-0024-review-r10-the-harness-starts-its-own-ch` | e8091fd | 0 | docs(review): round r10 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/t-0025` | `hp/adeherdr/t-0025-review-r11-this-check-reads-the-relay-th` | fed2f04 | 0 | docs(review): round r11 verdict |
-| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0026` | `hp/adeherdr/t-0026-review-r12-this-check-reads-the-piece-th` | c849cf3 | 0 | Merge commit '789bf54e5e056442a62f842841804ecdf82007b4' into hp/adeherdr/t-0026-review-r12-this-check-reads-the-piece-th |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0026` | `hp/adeherdr/t-0026-review-r12-this-check-reads-the-piece-th` | 05db9f9 | 0 | docs(review): round r12 verdict |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0027` | `hp/adeherdr/t-0027-repair-the-cloud-box-completion-side-aft` | 33c0e61 | 7 | Merge commit '31bcc5b0cd52d19355fb3899a464367f230896cc' into hp/adeherdr/t-0027-repair-the-cloud-box-completion-side-aft |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0028` | `hp/adeherdr/t-0028-pro-lane-cold-start-waits-on-the-rollout` | 3615183 | 0 | fix(pro): end the rollout wait on an event, not a fixed 30 s |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/t-0029` | `hp/adeherdr/t-0029-review-r13-this-check-reads-the-small-ch` | d93abec | 0 | docs(review): round r13 verdict |
 
 Last commits on the integration branch:
 
 ```
-b7f4fe3 Merge commit 'fed2f04b7fb95f491d0f3cb58c5a90208212f4eb'
-fed2f04 docs(review): round r11 verdict
-61adf51 review(pro): refuse relay startup drift
-c082b97 review(r12): brief for revision 1
-464aae0 checkpoint(r9): HANDOFF after merging the round
-3cd3a9a Merge commit 'd360c1f0c66059aa048ec48f4aee01bafce9a216'
+d93abec docs(review): round r13 verdict
+3bd7158 review(pro): keep the rollout bound local
+4c1e825 Merge commit '36151833cf3fb4da1543b8cbca61d09effc595b7' into review/r13
+1d6260b docs(tasks): t-0029
+aef9cfb review(r13): brief for revision 1
+3615183 fix(pro): end the rollout wait on an event, not a fixed 30 s
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0025.md`, `tasks/review-r12.md`, `tasks/t-0022.md`, `tasks/review-r11.md`, `tasks/t-0024.md`, `tasks/review-r10.md`, `tasks/review-r9.md`, `tasks/t-0020.md`, `tasks/t-0019.md`, `tasks/t-0018.md`, `tasks/t-0017.md`, `tasks/t-0015.md`
-- verdicts: `tasks/reviews/code-r11.md`, `tasks/reviews/code-r9.md`, `tasks/reviews/code-r10.md`, `tasks/reviews/code-r7.md`, `tasks/reviews/code-r6.md`, `tasks/reviews/code-r5.md`, `tasks/reviews/code-r4.md`, `tasks/reviews/code-r2.md`, `tasks/reviews/code-r1.md`, `tasks/reviews/code-plugin-r2.md`, `tasks/reviews/code-plugin-r1.md`, `tasks/reviews/code-plugin-r1-b.md`
+- briefs: `tasks/t-0029.md`, `tasks/review-r13.md`, `tasks/t-0028.md`, `tasks/t-0027.md`, `tasks/t-0025.md`, `tasks/review-r12.md`, `tasks/t-0022.md`, `tasks/review-r11.md`, `tasks/t-0024.md`, `tasks/review-r10.md`, `tasks/review-r9.md`, `tasks/t-0020.md`
+- verdicts: `tasks/reviews/code-r13.md`, `tasks/reviews/code-r11.md`, `tasks/reviews/code-r9.md`, `tasks/reviews/code-r10.md`, `tasks/reviews/code-r7.md`, `tasks/reviews/code-r6.md`, `tasks/reviews/code-r5.md`, `tasks/reviews/code-r4.md`, `tasks/reviews/code-r2.md`, `tasks/reviews/code-r1.md`, `tasks/reviews/code-plugin-r2.md`, `tasks/reviews/code-plugin-r1.md`
 
 ### Pickup
 
@@ -104,5 +108,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 6c22d8cf-cae6-47e2-a930-fd9207175aea
 ```
 
-Round `r11` was merged into `main` at verdict commit `fed2f04b7fb95f491d0f3cb58c5a90208212f4eb`; this checkpoint is its child.
+Round `r13` was merged into `main` at verdict commit `d93abec5bfc43cde32d00bdd4b8eef2f27a2e206`; this checkpoint is its child.
 
