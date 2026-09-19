@@ -175,6 +175,7 @@ pub fn start(layout: &Layout) -> Result<bool> {
 /// `herdr-pro serve-run`: the foreground server (started detached by `serve`).
 pub fn run(layout: &Layout, env: &Env) -> Result<()> {
     layout.ensure()?;
+    let inflight_limit = env.inflight_limit()?;
     // One relay per state dir: a stale pid lets a fresh one take over.
     if let Some(state) = ServeState::read(layout)
         && state.pid != std::process::id()
@@ -196,7 +197,7 @@ pub fn run(layout: &Layout, env: &Env) -> Result<()> {
     }
     .write(layout)?;
     // The relay's own cwd, trusted so Codex never prompts for it.
-    let _ = super::home::trust(layout, &layout.root);
+    super::home::trust(layout, &layout.root).context("could not trust the relay cwd")?;
     write_provider(layout, port, &token)?;
     let bridge_port = BRIDGE_PORT;
     let relay = Arc::new(Relay {
@@ -207,6 +208,7 @@ pub fn run(layout: &Layout, env: &Env) -> Result<()> {
         bridge_port,
         sessions: Mutex::new(HashMap::new()),
         inflight: Mutex::new(HashMap::new()),
+        inflight_limit,
         seq: AtomicU64::new(0),
         failures: Mutex::new(Vec::new()),
     });
@@ -319,6 +321,7 @@ struct Relay {
     bridge_port: u16,
     sessions: Mutex<HashMap<String, Session>>,
     inflight: Mutex<HashMap<String, ()>>,
+    inflight_limit: usize,
     seq: AtomicU64,
     failures: Mutex<Vec<Instant>>,
 }
@@ -379,7 +382,7 @@ impl Relay {
                 ),
             );
         }
-        let limit = self.env.inflight_limit().unwrap_or(super::INFLIGHT_DEFAULT);
+        let limit = self.inflight_limit;
         {
             let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
             if inflight.contains_key(&key) {
@@ -437,12 +440,12 @@ impl Relay {
                 sse.end()
             }
             Err(error) => {
-                self.record_failure();
+                let message = self.failure_message(&error);
                 let _ = sse.send(
                     "response.failed",
                     &json!({
                         "type":"response.failed",
-                        "response":{"status":"failed","error":{"code":"codex_error","message":format!("{error:#}")}}
+                        "response":{"status":"failed","error":{"code":"codex_error","message":message}}
                     }),
                 );
                 sse.end()
@@ -480,13 +483,13 @@ impl Relay {
                 )
             }
             Err(error) => {
-                self.record_failure();
+                let message = self.failure_message(&error);
                 write_json(
                     stream,
                     200,
                     &json!({
                         "status": "failed",
-                        "error": {"code": "codex_error", "message": format!("{error:#}")}
+                        "error": {"code": "codex_error", "message": message}
                     }),
                 )
             }
@@ -508,7 +511,7 @@ impl Relay {
         }
     }
 
-    fn record_failure(&self) {
+    fn record_failure(&self) -> Result<()> {
         let now = Instant::now();
         let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         failures.retain(|at| now.duration_since(*at) <= FAILURE_WINDOW);
@@ -516,7 +519,16 @@ impl Relay {
         if failures.len() >= 2 {
             let until = jiff::Timestamp::now()
                 + jiff::SignedDuration::from_secs(super::COOLDOWN.as_secs() as i64);
-            let _ = state::set_cooldown(&self.layout, until);
+            state::set_cooldown(&self.layout, until).context("could not set the Pro breaker")?;
+        }
+        Ok(())
+    }
+
+    fn failure_message(&self, error: &anyhow::Error) -> String {
+        let message = format!("{error:#}");
+        match self.record_failure() {
+            Ok(()) => message,
+            Err(breaker) => format!("{message}; {breaker:#}"),
         }
     }
 
