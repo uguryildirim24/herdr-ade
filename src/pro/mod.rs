@@ -260,21 +260,26 @@ impl Layout {
     }
 }
 
-/// The plugin root: `HERDR_PRO_STATE_DIR`, else `<ADE root>/pro-bridge`, where
-/// the ADE root is `HERDR_ADE_ROOT`, then `root` in
-/// `~/.config/herdr-ade/config.toml`, then `~/.herdr-ade`.
-pub fn resolve_root(env: &Env) -> Result<PathBuf> {
-    let root = if let Some(dir) = env.var("HERDR_PRO_STATE_DIR") {
-        return absolute(&env.expand_tilde(dir));
-    } else if let Some(dir) = env.var("HERDR_ADE_ROOT") {
+/// The projects root `ha` keeps: `HERDR_ADE_ROOT`, then `root` in
+/// `~/.config/herdr-ade/config.toml`, then `~/.herdr-ade`. The plugin state
+/// sits one level below it, and so does each project's `.state` directory.
+pub fn ade_root(env: &Env) -> Result<PathBuf> {
+    let root = if let Some(dir) = env.var("HERDR_ADE_ROOT") {
         env.expand_tilde(dir)
     } else if let Some(root) = config_root(env)? {
         env.expand_tilde(&root)
     } else {
         env.home.join(".herdr-ade")
     };
-    let root = absolute(&root)?;
-    Ok(root.join("pro-bridge"))
+    absolute(&root)
+}
+
+/// The plugin root: `HERDR_PRO_STATE_DIR`, else `<ADE root>/pro-bridge`.
+pub fn resolve_root(env: &Env) -> Result<PathBuf> {
+    if let Some(dir) = env.var("HERDR_PRO_STATE_DIR") {
+        return absolute(&env.expand_tilde(dir));
+    }
+    Ok(ade_root(env)?.join("pro-bridge"))
 }
 
 fn config_root(env: &Env) -> Result<Option<String>> {
