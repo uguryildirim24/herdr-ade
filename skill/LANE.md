@@ -12,10 +12,10 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 A lane can ask Codex for one mock-up picture. Write the prompt to a file and run:
 
 ```text
-herdr-pro image --prompt-file <file> --size <WxH> --out <png>
+herdr-pro image --prompt-file <file> --size <WxH> --out <png> [--with <png>]...
 ```
 
-The command starts (or reuses) a picture lane on Codex's own backend, spends one Codex turn, and saves the PNG to `--out`; it takes a few minutes. Ask for a picture only when the brief says pictures are wanted. Name the exact pixel size in `--size`; if the tool only offers fixed sizes it picks the nearest and says which one it used.
+The command starts (or reuses) a picture lane on Codex's own backend, spends one Codex turn, and saves the PNG to `--out`; it takes a few minutes. Attach a screenshot or reference picture with `--with <png>` (up to four) instead of describing it. Ask for a picture only when the brief says pictures are wanted. Name the exact pixel size in `--size`; if the tool only offers fixed sizes it picks the nearest and says which one it used.
 
 ## Finish
 

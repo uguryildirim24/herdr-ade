@@ -25,6 +25,8 @@ use super::{Env, Layout};
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// How often the generated-image folder and the lane status are checked.
 const POLL: Duration = Duration::from_secs(2);
+/// The most reference pictures one call may attach (`--with`).
+const MAX_WITH: usize = 4;
 
 /// A picture request: `herdr-pro image`.
 #[derive(Debug, Clone)]
@@ -32,6 +34,8 @@ pub struct ImageOptions {
     pub prompt_file: PathBuf,
     pub size: String,
     pub out: PathBuf,
+    /// Reference pictures Codex sees before it draws.
+    pub with: Vec<PathBuf>,
     pub keep: bool,
 }
 
@@ -55,12 +59,13 @@ pub fn run(
     }
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let cwd = std::path::absolute(&cwd).with_context(|| format!("bad cwd {}", cwd.display()))?;
+    let pictures = reference_pictures(&opts.with)?;
 
     let name = lane_name(layout, &cwd)?;
-    let lane = ensure_lane(env, layout, runner, &name, &cwd)?;
+    let lane = ensure_lane(env, layout, runner, &name, &cwd, &pictures)?;
 
     let result: Result<PathBuf> = (|| {
-        let request = request(&prompt, width, height);
+        let request = request(&prompt, width, height, !pictures.is_empty());
         let started = SystemTime::now();
         herdr_cli::agent_prompt(runner, &env.herdr_bin(), &lane.name, &request)
             .context("could not send the picture request")?;
@@ -81,10 +86,38 @@ pub fn run(
     result
 }
 
+/// The `--with` reference pictures: at most [`MAX_WITH`], each an existing,
+/// readable file. A bad one is refused before the lane starts.
+fn reference_pictures(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if files.len() > MAX_WITH {
+        bail!(
+            "refused: --with takes at most {MAX_WITH} pictures, got {}",
+            files.len()
+        );
+    }
+    let mut pictures = Vec::new();
+    for file in files {
+        let path = std::path::absolute(file)
+            .with_context(|| format!("bad --with path {}", file.display()))?;
+        if !path.is_file() {
+            bail!("refused: --with {} is not a readable file", path.display());
+        }
+        std::fs::File::open(&path)
+            .with_context(|| format!("refused: --with {} is not readable", path.display()))?;
+        pictures.push(path);
+    }
+    Ok(pictures)
+}
+
 /// The one-line request typed into the lane.
-fn request(prompt: &str, width: u32, height: u32) -> String {
+fn request(prompt: &str, width: u32, height: u32, attached: bool) -> String {
+    let pictures = if attached {
+        " The attached pictures show the current screen; keep its palette and layout."
+    } else {
+        ""
+    };
     format!(
-        "Make one picture. Prompt: {}. Size {width}x{height}. Call the image tool exactly once and reply with one line naming the picture.",
+        "Make one picture. Prompt: {}. Size {width}x{height}.{pictures} Call the image tool exactly once and reply with one line naming the picture.",
         prompt.split_whitespace().collect::<Vec<_>>().join(" ")
     )
 }
@@ -151,6 +184,7 @@ fn ensure_lane(
     runner: &dyn Runner,
     name: &str,
     cwd: &Path,
+    pictures: &[PathBuf],
 ) -> Result<Lane> {
     let cwd_text = cwd.display().to_string();
     if let Ok(lane) = Lane::read(layout, name)
@@ -172,9 +206,9 @@ fn ensure_lane(
         runner,
         &lane::StartOptions {
             name: name.to_string(),
-            parent: None,
             cwd: Some(cwd_text),
             profile: Some(home::IMAGE_PROFILE.to_string()),
+            images: pictures.to_vec(),
         },
     )
 }
@@ -276,4 +310,116 @@ fn save_into(source: &Path, out: &Path) -> Result<()> {
             .with_context(|| format!("could not save {} to {}", source.display(), out.display()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pro::sh::fake::{FakeRunner, ok};
+
+    #[test]
+    fn reference_pictures_refuses_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = reference_pictures(&[dir.path().join("nope.png")]).unwrap_err();
+        assert!(error.to_string().contains("--with"), "{error}");
+        std::fs::write(dir.path().join("a-dir"), b"x").unwrap();
+        // A file that exists but cannot be read as a picture is still a file
+        // for this check; a directory is not.
+        let error = reference_pictures(&[dir.path().to_path_buf()]).unwrap_err();
+        assert!(error.to_string().contains("--with"), "{error}");
+    }
+
+    #[test]
+    fn reference_pictures_refuses_more_than_four() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<PathBuf> = (0..MAX_WITH + 1)
+            .map(|n| dir.path().join(format!("{n}.png")))
+            .collect();
+        let error = reference_pictures(&files).unwrap_err();
+        assert!(error.to_string().contains("at most 4"), "{error}");
+    }
+
+    #[test]
+    fn the_request_names_the_attached_pictures() {
+        let attached = request("a dark terminal", 1536, 1024, true);
+        assert!(
+            attached
+                .contains("attached pictures show the current screen; keep its palette and layout"),
+            "{attached}"
+        );
+        let plain = request("a dark terminal", 1536, 1024, false);
+        assert!(!plain.contains("attached pictures"), "{plain}");
+    }
+
+    #[test]
+    fn run_attaches_with_pictures_and_nests_under_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("pro");
+        let env = Env::for_test(
+            dir.path(),
+            &[
+                ("HERDR_BIN_PATH", "/h/herdr"),
+                ("HERDR_PRO_STATE_DIR", state.to_str().unwrap()),
+                ("HERDR_PANE_ID", "wC:p1"),
+                ("HERDR_WORKSPACE_ID", "wC"),
+            ],
+        );
+        let layout = Layout::for_test(&state);
+        layout.ensure().unwrap();
+        let image = dir.path().join("ref.png");
+        std::fs::write(&image, b"png").unwrap();
+        let prompt = dir.path().join("prompt.txt");
+        std::fs::write(&prompt, "a dark terminal window").unwrap();
+        let out = dir.path().join("out.png");
+        let runner = FakeRunner::new();
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"wC:p2","tab_id":"wC:t2","workspace_id":"wC","cwd":"/w"}}}"#),
+        );
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"wC:p2","name":"gpt-image-gen","agent":"codex","agent_status":"idle"}}}"#),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on(
+            "agent list",
+            ok(r#"{"result":{"agents":[{"name":"gpt-image-gen","pane_id":"wC:p2","agent":"codex","agent_status":"blocked"}]}}"#),
+        );
+        runner.on("pane read", ok("waiting on the model\n"));
+        runner.on("tab close", ok(r#"{"result":{}}"#));
+        let error = run(
+            &env,
+            &layout,
+            &runner,
+            &ImageOptions {
+                prompt_file: prompt,
+                size: "1536x1024".into(),
+                out,
+                with: vec![image.clone()],
+                keep: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("blocked"), "{error}");
+        let calls = runner.calls.borrow();
+        let start = calls
+            .iter()
+            .map(|cmd| cmd.display())
+            .find(|line| line.contains("agent start"))
+            .unwrap();
+        assert!(
+            start.contains(&format!("--image {}", image.display())),
+            "{start}"
+        );
+        assert!(start.contains("--parent wC:p1"), "{start}");
+        let sent = calls
+            .iter()
+            .map(|cmd| cmd.display())
+            .find(|line| line.contains("agent prompt"))
+            .unwrap();
+        assert!(
+            sent.contains("attached pictures show the current screen"),
+            "{sent}"
+        );
+    }
 }
