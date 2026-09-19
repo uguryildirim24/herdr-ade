@@ -60,6 +60,9 @@ enum Command {
         /// A trusted directory; default: the current directory
         #[arg(long)]
         cwd: Option<String>,
+        /// The lane recipe's ready timeout in ms; default: 180000
+        #[arg(long, value_name = "MS")]
+        ready_timeout_ms: Option<u64>,
     },
     /// Run one Pro turn: packet in, detached collector out
     Turn {
@@ -175,7 +178,11 @@ fn run(cli: &Cli) -> Result<bool> {
             login(&layout);
             Ok(true)
         }
-        Command::Start { name, cwd } => {
+        Command::Start {
+            name,
+            cwd,
+            ready_timeout_ms,
+        } => {
             let lane = lane::start(
                 &env,
                 &layout,
@@ -185,6 +192,7 @@ fn run(cli: &Cli) -> Result<bool> {
                     cwd: cwd.clone(),
                     profile: None,
                     images: Vec::new(),
+                    ready_timeout_ms: *ready_timeout_ms,
                 },
             )?;
             println!(
