@@ -123,15 +123,33 @@ pub struct SetupReport {
 
 /// Write the `pro` provider into `models.json` when the relay has written its
 /// `serve.json`. Returns the relay base URL that was written.
-fn write_provider(layout: &Layout) -> Option<String> {
-    let ade_root = layout.root.parent()?;
-    let text = std::fs::read_to_string(ade_root.join("pro-bridge/serve.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let port = value.get("port")?.as_u64()? as u16;
-    let token = value.get("token")?.as_str()?.to_string();
+fn write_provider(layout: &Layout) -> Result<Option<String>> {
+    let Some(ade_root) = layout.root.parent() else {
+        return Ok(None);
+    };
+    let state = ade_root.join("pro-bridge/serve.json");
+    let text = match std::fs::read_to_string(&state) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", state.display()));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} does not parse", state.display()))?;
+    let port = value
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .with_context(|| format!("{} has no valid port", state.display()))?;
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .with_context(|| format!("{} has no token", state.display()))?;
     let base = provider::base_url(port);
-    provider::write_merged(&layout.models(), &base, &token).ok()?;
-    Some(base)
+    provider::write_merged(&layout.models(), &base, token)?;
+    Ok(Some(base))
 }
 
 /// Setup: pinned install, shared folder, guard, the running herdr's state
@@ -141,7 +159,7 @@ pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Resu
     let folder = super::folder::ensure(layout)?;
     let wrapper = super::launch::write_wrapper(layout)?;
     let guard = write_guard(layout)?;
-    let provider = write_provider(layout);
+    let provider = write_provider(layout)?;
 
     let integration = runner.run(
         &sh::Cmd::new(env.herdr_bin(), Duration::from_secs(120))
@@ -261,7 +279,7 @@ mod tests {
             r#"{"port":1234,"pid":1,"started":"now","token":"tok"}"#,
         )
         .unwrap();
-        let base = write_provider(&layout).unwrap();
+        let base = write_provider(&layout).unwrap().unwrap();
         assert_eq!(base, "http://127.0.0.1:1234/v1");
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
