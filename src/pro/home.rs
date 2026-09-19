@@ -46,9 +46,12 @@ Reply with the full answer in markdown and nothing else. Your whole reply is
 written verbatim to an output file. Do not narrate, apologize, or ask questions.
 ";
 
-/// Set the pinned keys on `table`, leaving `[projects]` and anything else
-/// alone. The plugin owns this file, so these values always win.
+/// Replace the owned config with the pinned keys, retaining only `[projects]`.
+/// In particular, a stale MCP or plugin entry must not survive a later init.
 fn apply_pins(table: &mut toml::Table, home: &Path) {
+    let projects = table.remove("projects").filter(Value::is_table);
+    table.clear();
+
     table.insert("approval_policy".into(), "never".into());
     table.insert("sandbox_mode".into(), "read-only".into());
     table.insert(
@@ -79,6 +82,10 @@ fn apply_pins(table: &mut toml::Table, home: &Path) {
     agents.insert("enabled".into(), false.into());
     agents.insert("max_depth".into(), 0.into());
     table.insert("agents".into(), Value::Table(agents));
+
+    if let Some(projects) = projects {
+        table.insert("projects".into(), projects);
+    }
 }
 
 /// Read the home's config, or a fresh pinned table when it does not exist yet.
@@ -194,16 +201,19 @@ mod tests {
             table["projects"]["/work/project"]["trust_level"].as_str(),
             Some("trusted")
         );
-        // A later init must keep the trust entry (the config is rewritten).
+        // A later init keeps trust, but removes everything else: this owned
+        // home must never retain an MCP server from a manual or stale edit.
+        let config = home.join("config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[mcp_servers.stale]\ncommand = \"not-allowed\"\n");
+        std::fs::write(&config, text).unwrap();
         init(&layout).unwrap();
-        let table: toml::Table = std::fs::read_to_string(home.join("config.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
+        let table: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
             table["projects"]["/work/project"]["trust_level"].as_str(),
             Some("trusted")
         );
+        assert!(!table.contains_key("mcp_servers"));
         assert_eq!(table["features"]["memories"].as_bool(), Some(false));
     }
 }
