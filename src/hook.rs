@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,15 +13,15 @@ use crate::paths::Ctx;
 use crate::plain;
 use crate::project::{self, Project};
 use crate::remote::quote;
-use crate::runner::Cmd;
 
 const INPUT_LIMIT: usize = 64 * 1024;
 /// The hook input read to find the session; the reply inside it is bounded
 /// by `INPUT_LIMIT`.
 const READ_LIMIT: usize = 4 * 1024 * 1024;
-const MAX_CORRECTIONS: u32 = 3;
+/// One block per turn: a second failed check publishes the fixed notice
+/// instead of asking for another rewrite, so a reply is never lost to a loop.
+const MAX_CORRECTIONS: u32 = 1;
 const DEADLINE_SECS: i64 = 10 * 60;
-const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Binding {
@@ -37,7 +36,6 @@ struct Binding {
 struct Budget {
     turn: String,
     corrections: u32,
-    translator_runs: u32,
     started: String,
     started_second: i64,
 }
@@ -271,7 +269,6 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
             kind,
             session,
             &turn,
-            text,
             "plain_input_too_large: reply exceeds 64 KiB",
         );
     }
@@ -281,15 +278,7 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
             if kind == "cursor" && phase == "observe" {
                 return save_cursor_pending(&project, session, &turn, text, &error.to_string());
             }
-            return failed_check(
-                ctx,
-                &project,
-                kind,
-                session,
-                &turn,
-                text,
-                &error.to_string(),
-            );
+            return failed_check(ctx, &project, kind, session, &turn, &error.to_string());
         }
     };
     if let Some(reason) = messages.iter().find_map(|message| {
@@ -300,7 +289,7 @@ pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result
         if kind == "cursor" && phase == "observe" {
             return save_cursor_pending(&project, session, &turn, text, &reason);
         }
-        return failed_check(ctx, &project, kind, session, &turn, text, &reason);
+        return failed_check(ctx, &project, kind, session, &turn, &reason);
     }
     publish(ctx, &project, session, &turn, &messages)?;
     if kind == "cursor" {
@@ -348,7 +337,6 @@ fn cursor_stop(ctx: &Ctx, project: &Project, kind: &str) -> Result<()> {
         kind,
         &pending.session,
         &pending.turn,
-        &pending.text,
         &pending.reason,
     )
 }
@@ -438,7 +426,6 @@ fn failed_check(
     kind: &str,
     session: &str,
     turn: &str,
-    text: &str,
     reason: &str,
 ) -> Result<()> {
     let mut budget = load_budget(project, session, turn)?;
@@ -448,21 +435,6 @@ fn failed_check(
         budget.corrections += 1;
         save_budget(project, session, &budget)?;
         return correction(kind, reason);
-    }
-    if !expired
-        && budget.translator_runs == 0
-        && let Some(command) = translator_command(&ctx.config_dir)?
-    {
-        budget.translator_runs = 1;
-        save_budget(project, session, &budget)?;
-        if let Some(rewrite) = run_translator(ctx, &command, text, reason)?
-            && let Ok(messages) = parse_envelopes(&rewrite)
-            && messages
-                .iter()
-                .all(|message| validate_message(project, message).is_ok())
-        {
-            return publish(ctx, project, session, turn, &messages);
-        }
     }
     publish(
         ctx,
@@ -579,7 +551,6 @@ fn load_budget(project: &Project, session: &str, turn: &str) -> Result<Budget> {
     Ok(Budget {
         turn: turn.to_string(),
         corrections: 0,
-        translator_runs: 0,
         started: project::now(),
         started_second: jiff::Timestamp::now().as_second(),
     })
@@ -591,44 +562,6 @@ fn save_budget(project: &Project, session: &str, budget: &Budget) -> Result<()> 
         std::fs::create_dir_all(parent)?;
     }
     project::write_json(&path, budget)
-}
-
-#[derive(Deserialize, Default)]
-struct PlainConfig {
-    model: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct Config {
-    #[serde(default)]
-    plain: PlainConfig,
-}
-
-fn translator_command(config_dir: &Path) -> Result<Option<String>> {
-    let path = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
-    };
-    let config: Config = toml::from_str(&text)?;
-    Ok(config
-        .plain
-        .model
-        .filter(|command| !command.trim().is_empty()))
-}
-
-fn run_translator(ctx: &Ctx, command: &str, text: &str, reason: &str) -> Result<Option<String>> {
-    let input = format!("{reason}\n\n{text}");
-    let output = ctx.runner.run(
-        &Cmd::new("/bin/sh", SUBPROCESS_TIMEOUT)
-            .args(["-lc", command])
-            .stdin(input)
-            .own_group(),
-    )?;
-    if output.success() {
-        Ok(Some(output.stdout))
-    } else {
-        Ok(None)
-    }
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Value> {
@@ -749,14 +682,12 @@ mod tests {
                 "claude",
                 "session-one",
                 "same-turn",
-                "bad",
                 "plain_unknown_word: replace it",
             )
             .unwrap();
         }
         let budget = load_budget(&project, "session-one", "same-turn").unwrap();
-        assert_eq!(budget.corrections, 3);
-        assert_eq!(budget.translator_runs, 0);
+        assert_eq!(budget.corrections, 1);
         let lines = crate::talk::read(&project).lines;
         assert_eq!(lines.len(), 1);
         assert_eq!(

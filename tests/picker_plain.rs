@@ -109,6 +109,6 @@ fn the_compact_reason_fits_eighty_characters() {
 #[test]
 fn a_failing_fixture_still_fails() {
     // The test would pass vacuously if the checker accepted anything.
-    let result = check("the biorhythm helper", &Glossary::default());
+    let result = check("the zorbulate helper", &Glossary::default());
     assert!(!result.passed());
 }
