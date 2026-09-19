@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Env, Layout, PI_VERSION, folder, install, launch, roles, sh};
+use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, roles, sh};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -276,6 +276,24 @@ pub fn doctor_rows_with(
         )),
         Ok(false) => rows.push(Row::ok("trust.json", "no true entry")),
         Err(error) => rows.push(Row::fail("trust.json", format!("{error:#}"))),
+    }
+
+    // deepseek compaction: the shared models.json must lower the opencode-go
+    // DeepSeek window so pi compacts near 372k tokens.
+    match provider::missing_overrides(&layout.models()) {
+        Ok(missing) if missing.is_empty() => rows.push(Row::ok(
+            "deepseek compaction",
+            format!("contextWindow {}", provider::DEEPSEEK_CONTEXT_WINDOW),
+        )),
+        Ok(missing) => rows.push(Row::fail(
+            "deepseek compaction",
+            format!(
+                "{} misses contextWindow {}; run `herdr-pi setup`",
+                missing.join(", "),
+                provider::DEEPSEEK_CONTEXT_WINDOW
+            ),
+        )),
+        Err(error) => rows.push(Row::fail("deepseek compaction", format!("{error:#}"))),
     }
 
     // the herdr state hook: the running herdr must call it current.
@@ -750,6 +768,7 @@ mod tests {
     fn installed_layout(dir: &Path) -> Layout {
         let layout = Layout::for_test(dir.join("pi"));
         folder::ensure(&layout).unwrap();
+        crate::pi::provider::write_overrides(&layout.models()).unwrap();
         install::write_guard(&layout).unwrap();
         crate::pi::launch::write_wrapper(&layout).unwrap();
         std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
@@ -927,6 +946,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(codex_row(&env).level, Level::Fail);
+    }
+
+    #[test]
+    fn the_deepseek_compaction_row_is_ok_after_setup_and_names_a_missing_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        link_into(&env, &layout);
+        let row = |layout: &Layout| {
+            doctor_rows_with(&env, layout, &scripted(&env), &[])
+                .into_iter()
+                .find(|r| r.label == "deepseek compaction")
+                .unwrap()
+        };
+        assert_eq!(row(&layout).level, Level::Ok);
+        std::fs::write(layout.models(), "{\"providers\":{}}\n").unwrap();
+        let missing = row(&layout);
+        assert_eq!(missing.level, Level::Fail, "{missing:?}");
+        assert!(
+            missing.detail.contains("deepseek-v4.1-flash"),
+            "{missing:?}"
+        );
     }
 
     #[test]
