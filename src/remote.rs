@@ -143,7 +143,6 @@ pub fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
 /// The URL-matched remote name in `repo`, never by remote name alone. The
 /// second lane's courier calls this to fetch the lane commit (SPEC-remote
 /// §4.3); the start side pushes by URL directly.
-#[allow(dead_code)]
 pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
     let out = runner.run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote"]))?;
     if !out.success() {
@@ -219,6 +218,11 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
         "set -e\n\
          cd {repo} || exit 3\n\
          git rev-parse --show-toplevel >/dev/null || exit 3\n\
+         matched=\n\
+         for name in $(git remote); do\n\
+           test \"$(git remote get-url \"$name\")\" = {url} && matched=1\n\
+         done\n\
+         test -n \"$matched\" || {{ echo box_clone_url_mismatch >&2; exit 4; }}\n\
          git fetch --quiet {url} {branch} || exit 4\n\
          test \"$(git rev-parse FETCH_HEAD)\" = {base} || {{ echo fetch_head_mismatch >&2; exit 5; }}\n\
          if [ -e {wt} ]; then\n\

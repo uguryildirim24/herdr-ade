@@ -388,6 +388,9 @@ fn place_box_worktree(
             (map.box_path.to_string(), map.publish_url.to_string())
         }
     };
+    // Both clones must name the configured publish URL. The push still uses
+    // the URL itself; finding the matching remote only validates this clone.
+    let _ = remote::remote_for_url(runner, &record.repo, &publish_url)?;
     let profile = remote::machine_profile(
         runner,
         &ctx.env.herdr_bin(),
