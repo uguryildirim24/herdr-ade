@@ -1173,7 +1173,7 @@ enum ThreadCommand {
         /// Leave the lane's pane and tab open instead of closing them
         #[arg(long)]
         keep_pane: bool,
-        /// Close a lane or reviewer an open, unmerged round still holds
+        /// Close a lane or reviewer that an open, unmerged round still holds
         #[arg(long)]
         force: bool,
     },

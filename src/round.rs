@@ -344,8 +344,23 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
 /// binds it as the reviewer, if any. A resolved or merged round is finished
 /// and holds nothing back.
 pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<String>> {
-    for record in list(project) {
-        if read_merge(project, &record.round)?.is_some() {
+    let entries = match std::fs::read_dir(rounds_dir(project)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(round) = name.to_str().and_then(|name| name.strip_suffix(".toml")) else {
+            continue;
+        };
+        if validate_round_id(round).is_err() {
+            continue;
+        }
+        // This guard is a safety boundary, not a display. An unreadable round
+        // must block resolution because it may be the record pinning `thread`.
+        let record = load(project, round)?;
+        if read_merge(project, round)?.is_some() {
             continue;
         }
         let pinned = record
@@ -3474,6 +3489,25 @@ mod tests {
         let ctx = fx.world.ctx();
         let (lanes, _) = reviewed(&fx);
         let (id, _) = &lanes[0];
+        let path = round_path(&fx.project, "r1");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, "round = ").unwrap();
+        let unreadable = err(crate::threads::resolve(
+            &ctx,
+            "demo",
+            id,
+            &crate::threads::ResolveArgs {
+                skip_copy: true,
+                keep_pane: true,
+                ..Default::default()
+            },
+        ));
+        assert!(
+            unreadable.starts_with("round_manifest_unavailable"),
+            "{unreadable}"
+        );
+        std::fs::write(&path, saved).unwrap();
+
         let e = err(crate::threads::resolve(
             &ctx,
             "demo",

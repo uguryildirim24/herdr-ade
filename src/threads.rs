@@ -1311,12 +1311,12 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
                 "round_unmerged: `{id}` is pinned in round `{round}`, which has no merge record; run `round merge {round}` first, or pass --force"
             );
         }
-        let _ = crate::ask::say(
+        crate::ask::say(
             ctx,
             slug,
             "the round has not merged, so this lane was closed anyway",
             None,
-        );
+        )?;
     }
 
     // Every path that resolves a thread performs a final copy first.
