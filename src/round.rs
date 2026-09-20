@@ -831,6 +831,7 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 /// `pane.agent_status_changed` hook and the ticker call.
 pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let _scope = crate::ledger::Scope::new(&[&project]);
     // One advance at a time, across processes (the hook and the ticker).
     let _advance = advance_lock(&project)?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
@@ -876,11 +877,19 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
                 (Some(branch), true) => branch,
                 _ => review(ctx, slug, &round)?.review_branch,
             };
+            crate::ledger::retry_after_failure(&project, "reviewer-start-failed", &round);
             match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
                 Ok(thread) => {
+                    crate::ledger::recovered(&project, "reviewer-start-failed", &round);
                     bind_reviewer(ctx, slug, &round, &thread.id)?;
                 }
                 Err(error) => {
+                    crate::ledger::observe(
+                        &project,
+                        "reviewer-start-failed",
+                        &round,
+                        &format!("{error:#}"),
+                    );
                     // A full thread cap or a machine that is not ready is
                     // not final: the next pass retries. The announcement is
                     // written once per state.
@@ -1675,6 +1684,24 @@ pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Optio
 /// `ha round merge` (D6, item 34). Resumes from `merge.toml` when present.
 pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<MergeOutcome> {
     let project = Project::load(&ctx.root, slug)?;
+    let _scope = crate::ledger::Scope::new(&[&project]);
+    crate::ledger::retry_after_failure(&project, "merge-refused", round);
+    let result = merge_inner(ctx, project.clone(), slug, round, stop);
+    if let Err(error) = &result {
+        crate::ledger::observe(&project, "merge-refused", round, &format!("{error:#}"));
+    } else {
+        crate::ledger::recovered(&project, "merge-refused", round);
+    }
+    result
+}
+
+fn merge_inner(
+    ctx: &Ctx,
+    project: Project,
+    slug: &str,
+    round: &str,
+    stop: Option<Stop>,
+) -> Result<MergeOutcome> {
     let record = load(&project, round)?;
     // One merge per round at a time: a second run waits, then reads the
     // first one's record and resumes from it (item 34).
@@ -3050,6 +3077,17 @@ mod tests {
         let (lanes, _) = reviewed(&fx);
         verdict(&fx, &lanes, front("MERGE-AFTER-DECISION", "r1"));
         assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("verdict_not_merge"));
+        let failures = crate::ledger::list(&fx.project).unwrap();
+        let failure = failures.iter().find(|e| e.kind == "merge-refused").unwrap();
+        assert_eq!(failure.subject, "r1");
+        assert!(failure.detail.contains("verdict_not_merge"));
+        assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("verdict_not_merge"));
+        let failures = crate::ledger::list(&fx.project).unwrap();
+        assert_eq!(
+            failures.iter().find(|e| e.id == failure.id).unwrap().count,
+            2
+        );
+        assert!(failures.iter().any(|e| e.kind == "retry"));
 
         // An earlier round's verdict.
         let fx = fixture();
@@ -3279,6 +3317,34 @@ mod tests {
 
     /// The `advance` proof: two pinned lanes get one reviewer thread, and a
     /// second `advance` changes nothing.
+    #[test]
+    fn advance_records_each_failed_reviewer_start_even_when_it_returns_success() {
+        let fx = fixture();
+        reviewed(&fx);
+        std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
+        std::fs::write(
+            fx.world.home.path().join("cfg/config.toml"),
+            "[roles.reviewer]\nkind = \"missing-kind\"\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            advance(&fx.world.ctx(), "demo").unwrap();
+        }
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().announced.as_deref(),
+            Some("reviewer-start-failed")
+        );
+        let entries = crate::ledger::list(&fx.project).unwrap();
+        let failure = entries
+            .iter()
+            .find(|e| e.kind == "reviewer-start-failed")
+            .unwrap();
+        assert_eq!(failure.count, 2);
+        assert_eq!(failure.subject, "r1");
+        assert!(!failure.detail.is_empty());
+        assert!(entries.iter().any(|e| e.kind == "retry"));
+    }
+
     #[test]
     fn advance_starts_one_reviewer_and_never_a_second() {
         let fx = fixture();

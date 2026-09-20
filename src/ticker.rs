@@ -709,6 +709,7 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
+    let _scope = crate::ledger::Scope::new(&[project]);
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -854,6 +855,7 @@ fn remote_pass(
 /// Copies and launches, remote machines, then inbox items, pull requests,
 /// routines, auto-resolve and housekeeping.
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
+    let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
@@ -876,6 +878,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {
             may_start = false;
             let started = (|| -> Result<()> {
+                if record.launch_attempts > 0 {
+                    crate::ledger::observe(project, "retry", "coordinator", "agent launch");
+                }
                 project.update_coordinator(|c| {
                     c.launch_attempts += 1;
                     c.generation += 1;

@@ -318,9 +318,12 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
         acknowledge_bootstrap(&project)?;
     }
     let prefix = current_prefix(&ctx.root)?;
+    // Capture before the read so a concurrent failure is not marked as seen.
+    let read_at = jiff::Timestamp::now().to_string();
     let (text, shown) = digest(ctx, &project, &prefix)?;
     print!("{text}");
     if !peek {
+        crate::ledger::context_read(&project, &read_at)?;
         inbox::mark_seen(&project, &shown)?;
         if let Some(record) = project.coordinator()
             && std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
@@ -419,6 +422,8 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
             tasks.trim()
         }
     );
+
+    out.push_str(&crate::ledger::section(project)?);
 
     let rows = crate::threads::rows(ctx, project);
     let open: Vec<_> = rows
