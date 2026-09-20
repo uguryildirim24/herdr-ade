@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0096.md",
+      "tasks/t-0097.md",
       "tasks/t-0095.md",
       "tasks/review-r43.md",
       "tasks/review-r42.md",
@@ -20,15 +22,14 @@
       "tasks/t-0090.md",
       "tasks/t-0091.md",
       "tasks/review-r39.md",
-      "tasks/review-r38.md",
-      "tasks/t-0084.md",
-      "tasks/t-0089.md"
+      "tasks/review-r38.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r43.md",
       "tasks/reviews/code-r42.md",
       "tasks/reviews/code-r41.md",
       "tasks/reviews/code-r38.md",
@@ -39,16 +40,16 @@
       "tasks/reviews/code-r34.md",
       "tasks/reviews/code-r32.md",
       "tasks/reviews/code-r33.md",
-      "tasks/reviews/code-r30.md",
-      "tasks/reviews/code-r29.md"
+      "tasks/reviews/code-r30.md"
     ]
   },
-  "generated": "2026-09-19T23:24:10-04:00",
+  "generated": "2026-09-19T23:27:04-04:00",
   "git": {
     "branches": [
       "main",
-      "hp/adeherdr/t-0095-review-r42-this-round-checks-that-one-re",
       "hp/adeherdr/t-0096-review-r43-this-round-checks-that-the-ta",
+      "hp/adeherdr/t-0097-e1-the-message-list-stops-repeating-the",
+      "hp/adeherdr/t-0095-review-r42-this-round-checks-that-one-re",
       "review/r43",
       "review/r42",
       "hp/adeherdr/t-0094-e2-a2-one-record-owns-a-round-and-the-bi",
@@ -165,12 +166,12 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "d95ea4d Merge commit '8fbfef7da8b0910f05293b5426725f21ca2f37a9'",
-      "8fbfef7 docs(review): round r42 verdict",
-      "7565962 review(rounds): keep changed inputs out of active reviews",
-      "6b0b245 review(r42): merge t-0094",
-      "e991567 review(r43): brief for revision 1",
-      "f20dd08 docs(tasks): t-0095"
+      "c6e8d56 Merge commit '0b5a0f74b959f829de573d84212e1f2ac53082eb'",
+      "0b5a0f7 docs(review): round r43 verdict",
+      "cf4895b review(round): restart a gone reviewer without removed flags",
+      "04fdd1e docs(tasks): t-0097",
+      "4adfe05 review(routing): keep workflows separate from model choice",
+      "56d371c checkpoint(r42): HANDOFF after merging the round"
     ],
     "remote": "8 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
@@ -178,9 +179,9 @@
       {
         "branch": "main",
         "dirty": 0,
-        "head": "d95ea4d",
+        "head": "c6e8d56",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit '8fbfef7da8b0910f05293b5426725f21ca2f37a9'"
+        "subject": "Merge commit '0b5a0f74b959f829de573d84212e1f2ac53082eb'"
       },
       {
         "branch": "review/r1",
@@ -877,10 +878,10 @@
       },
       {
         "branch": "hp/adeherdr/t-0096-review-r43-this-round-checks-that-the-ta",
-        "dirty": 12,
-        "head": "1c04320",
+        "dirty": 0,
+        "head": "0b5a0f7",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0096",
-        "subject": "review(r43): merge t-0082"
+        "subject": "docs(review): round r43 verdict"
       }
     ]
   },
@@ -905,34 +906,12 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r42",
-    "verdict": "8fbfef7da8b0910f05293b5426725f21ca2f37a9"
+    "round": "r43",
+    "verdict": "0b5a0f74b959f829de573d84212e1f2ac53082eb"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0095",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0095",
-      "pane_id": "w1G:p20",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0095--/2026-09-20T03-15-40-524Z_01a0bccf-f56c-72ff-abd1-96ee72174ecc.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:t2W",
-      "tab_label": "t-0095",
-      "title": "π - t-0095",
-      "tokens": {
-        "done": "1",
-        "lane": "t-0095",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0095"
-      }
-    },
     {
       "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0096",
       "kind": "pi",
@@ -941,11 +920,13 @@
       "pane_label": null,
       "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0096--/2026-09-20T03-16-02-338Z_01a0bcd0-4aa2-7335-a237-b76d6748fbf3.jsonl",
       "start_args": [],
-      "status": "working",
+      "status": "done",
       "tab_id": "w1G:t2X",
       "tab_label": "t-0096",
       "title": "π - t-0096",
       "tokens": {
+        "done": "1",
+        "lane": "t-0096",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
@@ -957,6 +938,6 @@
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 4
+    "tabs": 3
   }
 }
