@@ -155,7 +155,7 @@ fn validate_basis(project: &Project, text: &str) -> Result<String> {
 pub fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
     let project = Project::load(&ctx.root, slug)?;
     check_class(new.class)?;
-    let line = glossary::check_sentence(&project, "line", new.line)?;
+    let line = glossary::check_record_sentence(&project, "line", new.line)?;
     if new.class != "routine" && new.basis.is_none() {
         bail!(
             "decision_authority: a `{}` choice needs --basis with the permission it rests on",
@@ -322,6 +322,51 @@ mod tests {
 
     fn current(fx: &Fx) -> Vec<Decision> {
         fold_current(&read(&fx.project))
+    }
+
+    #[test]
+    fn a_decision_line_may_name_a_file_and_still_keeps_the_length_limit() {
+        let fx = fixture();
+        let record = decide_routine(&fx, "I changed config.toml today.");
+        assert_eq!(record.line, "I changed config.toml today.");
+
+        let two_sentences = decide(
+            &fx.world.ctx(),
+            "demo",
+            NewDecision {
+                line: "I changed config.toml. Then I checked it.",
+                class: "routine",
+                key: None,
+                basis: None,
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            two_sentences.contains("write one sentence"),
+            "{two_sentences}"
+        );
+
+        let long = format!("I changed {}.", vec!["config.toml"; 26].join(" "));
+        let e = format!(
+            "{:#}",
+            decide(
+                &fx.world.ctx(),
+                "demo",
+                NewDecision {
+                    line: &long,
+                    class: "routine",
+                    key: None,
+                    basis: None,
+                    replaces: None,
+                    request: None,
+                }
+            )
+            .unwrap_err()
+        );
+        assert!(e.contains("plain_long_sentence"), "{e}");
     }
 
     fn keyed<'a>(line: &'a str) -> NewDecision<'a> {

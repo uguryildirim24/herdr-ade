@@ -4,6 +4,7 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 
 - Continue the current attempt. A repeated skill call does not restart the task.
 - Do the task in your recorded worktree. If something is missing, report exactly what is missing instead of guessing.
+- The coordinator pushes the integration branch and `main`; a lane never pushes them. A cloud-box lane publishes only its own lane branch before `done` (see *On the cloud box*, below).
 - Keep agent-plane names and technical detail in reports. Messages meant for Rolf use the plugin's plain-language commands.
 - Do not edit project memory. Put durable lessons in your report for the coordinator to decide.
 

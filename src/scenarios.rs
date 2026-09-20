@@ -1501,6 +1501,23 @@ fn the_digest_prints_the_task_list_or_none() {
     assert!(digest.contains("## Tasks (TASKS.md)\n(none)"));
 }
 
+#[test]
+fn the_digest_warns_when_memory_is_over_budget() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    std::fs::create_dir_all(project.dir().join("memory")).unwrap();
+    std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n- state\n").unwrap();
+    std::fs::write(
+        project.dir().join("memory/state.md"),
+        "x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
+    )
+    .unwrap();
+    let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
+    assert!(digest.contains("memory over budget"), "{digest}");
+    assert!(digest.contains("memory/state.md"), "{digest}");
+    assert!(digest.contains("memory/archive/"), "{digest}");
+}
+
 fn parse_json_stdout(out: &crate::runner::Output) -> serde_json::Value {
     if out.stdout.trim().is_empty() {
         return serde_json::json!({});
