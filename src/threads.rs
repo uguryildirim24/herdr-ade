@@ -208,6 +208,12 @@ fn start_with_ticker(
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("lane");
+    if !matches!(
+        role,
+        "lane" | "reviewer" | "critic" | "drafter" | "research" | "planner"
+    ) {
+        bail!("workflow_unknown: `{role}` does not name a lane instruction set");
+    }
     // A box lane still commits and pushes from the Mac clone, so every
     // explicit repository is a local path and follows the same allowlist,
     // local and box lanes alike (SPEC-remote §4.2).

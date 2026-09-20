@@ -98,7 +98,12 @@ fn builtin_recipes() -> BTreeMap<String, Recipe> {
             "--dangerously-skip-permissions".into(),
         ];
         if kind == "claude" {
-            args.extend(["--effort".into(), "xhigh".into()]);
+            let effort = if id == "claude_coordinator_opus" {
+                "high"
+            } else {
+                "xhigh"
+            };
+            args.extend(["--effort".into(), effort.into()]);
         }
         recipes.insert(
             id.into(),

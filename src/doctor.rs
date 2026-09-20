@@ -741,7 +741,13 @@ mod tests {
     #[test]
     fn a_project_over_its_memory_budget_warns_and_does_not_fail() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         std::fs::create_dir_all(project.dir().join("memory")).unwrap();
@@ -752,6 +758,10 @@ mod tests {
         )
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
         let (text, healthy) = report(
             &env,
             &root,
