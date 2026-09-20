@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0101.md",
+      "tasks/t-0102.md",
+      "tasks/review-r46.md",
       "tasks/t-0100.md",
       "tasks/review-r45.md",
       "tasks/t-0099.md",
@@ -19,16 +22,14 @@
       "tasks/t-0096.md",
       "tasks/t-0097.md",
       "tasks/t-0095.md",
-      "tasks/review-r43.md",
-      "tasks/review-r42.md",
-      "tasks/t-0093.md",
-      "tasks/t-0094.md"
+      "tasks/review-r43.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r46.md",
       "tasks/reviews/code-r45.md",
       "tasks/reviews/code-r43.md",
       "tasks/reviews/code-r42.md",
@@ -39,16 +40,18 @@
       "tasks/reviews/code-r37.md",
       "tasks/reviews/code-r36.md",
       "tasks/reviews/code-r34.md",
-      "tasks/reviews/code-r32.md",
-      "tasks/reviews/code-r33.md"
+      "tasks/reviews/code-r32.md"
     ]
   },
-  "generated": "2026-09-20T00:07:17-04:00",
+  "generated": "2026-09-20T00:19:00-04:00",
   "git": {
     "branches": [
+      "main",
+      "hp/adeherdr/t-0101-review-r46-this-round-checks-that-the-pi",
+      "hp/adeherdr/t-0102-e5-the-rundown-shows-only-what-needs-a-d",
+      "review/r46",
       "hp/adeherdr/t-0099-d7-bound-what-dispatch-sends-and-say-wha",
       "hp/adeherdr/t-0100-review-r45-this-round-checks-that-the-me",
-      "main",
       "review/r45",
       "hp/adeherdr/t-0097-e1-the-message-list-stops-repeating-the",
       "review/r44",
@@ -171,12 +174,12 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "2e521c3 docs(review): round r45 verdict",
-      "c36e12c review(context): show r43 failure evidence before acknowledging it",
-      "73f6bfc review(context): retain report updates beyond sealed evidence",
-      "839a273 review(inbox): merge pinned t-0097 preserving escalation tick",
-      "ee6a42f docs(tasks): t-0100",
-      "1421976 review(r45): brief for revision 1"
+      "dac5255 Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821'",
+      "fe08483 docs(review): round r46 verdict",
+      "77927e3 review(round): cover abandonment refusal guards",
+      "5076598 review(dispatch): classify curl timeouts and enforce error byte cap",
+      "56da536 Merge commit '40c93cd78bcd636b12ad2a2f2945b57b4213c288' into hp/adeherdr/t-0101-review-r46-this-round-checks-that-the-pi",
+      "017ee9c docs(tasks): t-0102"
     ],
     "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
@@ -184,9 +187,9 @@
       {
         "branch": "main",
         "dirty": 0,
-        "head": "2e521c3",
+        "head": "dac5255",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r45 verdict"
+        "subject": "Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821'"
       },
       {
         "branch": "review/r1",
@@ -432,6 +435,13 @@
         "head": "ee6a42f",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r45",
         "subject": "docs(tasks): t-0100"
+      },
+      {
+        "branch": "review/r46",
+        "dirty": 0,
+        "head": "43beada",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r46",
+        "subject": "docs(tasks): t-0101"
       },
       {
         "branch": "review/r5",
@@ -932,8 +942,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r45",
-    "verdict": "2e521c36baf5d23f39c93473d533a531644e5035"
+    "round": "r46",
+    "verdict": "fe08483b9ef737d7ae677fe3e5dc67751e8d3821"
   },
   "session": "default",
   "unlinked_agents": [],
