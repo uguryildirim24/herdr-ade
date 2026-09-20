@@ -330,6 +330,25 @@ mod tests {
         let record = decide_routine(&fx, "I changed config.toml today.");
         assert_eq!(record.line, "I changed config.toml today.");
 
+        let two_sentences = decide(
+            &fx.world.ctx(),
+            "demo",
+            NewDecision {
+                line: "I changed config.toml. Then I checked it.",
+                class: "routine",
+                key: None,
+                basis: None,
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            two_sentences.contains("write one sentence"),
+            "{two_sentences}"
+        );
+
         let long = format!("I changed {}.", vec!["config.toml"; 26].join(" "));
         let e = format!(
             "{:#}",

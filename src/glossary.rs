@@ -190,6 +190,9 @@ pub fn check_record_sentence(project: &Project, field: &str, text: &str) -> Resu
     if !result.passed() {
         bail!("plain_refused: {field}: {}", format_check(trimmed, &result));
     }
+    if plain::sentence_count(trimmed) != 1 {
+        bail!("plain_refused: {field}: write one sentence of at most 25 words");
+    }
     Ok(trimmed.to_string())
 }
 
