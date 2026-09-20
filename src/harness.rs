@@ -309,10 +309,13 @@ struct Running {
 }
 
 impl Running {
-    fn capture() -> Option<Running> {
-        let path = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
-        let bytes = std::fs::read(&path).ok()?;
-        Some(Running {
+    fn capture() -> Result<Running> {
+        let current = std::env::current_exe().context("could not find the running executable")?;
+        let path = std::fs::canonicalize(&current)
+            .with_context(|| format!("could not resolve {}", current.display()))?;
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("could not fingerprint {}", path.display()))?;
+        Ok(Running {
             path,
             hash: crate::thread::sha256_hex(&bytes),
         })
@@ -350,7 +353,7 @@ pub fn install(ctx: &Ctx) -> Result<()> {
         );
     }
     let _lock = lock(&ctx.config_dir)?;
-    let running = Running::capture();
+    let running = Running::capture()?;
     let box_target = remote::optional_machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
@@ -365,9 +368,7 @@ pub fn install(ctx: &Ctx) -> Result<()> {
         local_build(ctx, &repo.path, kind)?;
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin)?;
-            if let Some(running) = &running {
-                notice_stale_self(&ctx.env.home.join(".local/bin").join(bin), running)?;
-            }
+            notice_stale_self(&ctx.env.home.join(".local/bin").join(bin), &running)?;
         }
         for bin in kind.binaries() {
             print_version(ctx, bin)?;
