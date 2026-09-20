@@ -952,15 +952,24 @@ fn reviewer_task(
             // The earlier candidate already carries the earlier reviewer's
             // fixes, so merge it over the new base instead of the raw shas.
             out.push_str(&format!(
-                "\n## Repair review\n\nThe integration branch moved after the earlier review. Merge the earlier candidate `{}` into your branch instead of the pinned lane shas; it already carries the earlier reviewer's fixes. The earlier verdict commit is `{}`, its review file is `{}` (branch `{}`).\n",
-                earlier.candidate, earlier.verdict, earlier.verdict_file, earlier.branch
+                "\n## Repair review\n\nThe integration branch moved after the earlier review. Merge the earlier candidate `{}` into your branch instead of the pinned lane shas; it already carries the earlier reviewer's fixes. The earlier verdict was {}, at commit `{}`; its review file is `{}` (branch `{}`).\n",
+                earlier.candidate,
+                earlier.verdict_kind,
+                earlier.verdict_commit,
+                earlier.verdict_file,
+                earlier.branch
             ));
         } else {
             // A new brief: the lanes moved, so merge the pinned shas but read
             // the earlier findings first.
             out.push_str(&format!(
-                "\nThis is a re-review of `{}`; the earlier candidate is `{}` at verdict commit `{}`, with review file `{}` (branch `{}`). Read the earlier review for the previous findings.\n",
-                record.round, earlier.candidate, earlier.verdict, earlier.verdict_file, earlier.branch
+                "\nThis is a re-review of `{}`; the earlier verdict was {}, for candidate `{}` at verdict commit `{}`, with review file `{}` (branch `{}`). Read the earlier review for the previous findings.\n",
+                record.round,
+                earlier.verdict_kind,
+                earlier.candidate,
+                earlier.verdict_commit,
+                earlier.verdict_file,
+                earlier.branch
             ));
         }
     }
@@ -991,7 +1000,8 @@ fn previous_review_branch(round: &str, branch: &str) -> Option<String> {
 /// the manifest hash that revision reviewed. Read-only.
 struct EarlierReview {
     candidate: String,
-    verdict: String,
+    verdict_commit: String,
+    verdict_kind: String,
     verdict_file: String,
     branch: String,
     manifest_hash: String,
@@ -1044,7 +1054,8 @@ fn earlier_review(
     };
     Ok(Some(EarlierReview {
         candidate: c.clone(),
-        verdict: v,
+        verdict_commit: v,
+        verdict_kind: verdict.verdict,
         verdict_file: path,
         branch: previous,
         manifest_hash: verdict.manifest_hash,
@@ -1207,19 +1218,26 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let brief_path = review_brief_path(round);
 
     let git = Git::new(ctx.runner, &record.repo);
+    // A repair only supersedes a completed review. Without a sealed verdict,
+    // a repeated manual command must not clear the live reviewer.
+    let earlier = completed_review(&project, &record, &git);
     let (b, review_branch, worktree, repair) = {
         let _repo = repo_lock(&git)?;
         let head = git
             .branch_head(&record.branch)?
             .with_context(|| format!("branch_missing: `{}`", record.branch))?;
         // A frozen round whose brief is unchanged (the manifest did not move)
-        // is a repair revision: the earlier brief commit B stays, and the next
-        // review branch starts from the current integration head so the
-        // earlier candidate can be merged over it.
+        // is a repair revision only after its reviewer finished. A repeated
+        // manual command must not clear a reviewer that is still working.
+        let same_frozen_manifest = record.frozen_revision == Some(record.manifest.revision)
+            && record.manifest_hash.as_deref() == Some(hash.as_str());
+        if same_frozen_manifest && earlier.is_none() {
+            bail!(
+                "review_in_progress: `{round}` already has a review for this manifest and no sealed verdict"
+            );
+        }
         let frozen = record.expected_head.clone().filter(|b| {
-            record.frozen_revision == Some(record.manifest.revision)
-                && record.manifest_hash.as_deref() == Some(hash.as_str())
-                && git.is_ancestor(b, &head).unwrap_or(false)
+            same_frozen_manifest && earlier.is_some() && git.is_ancestor(b, &head).unwrap_or(false)
         });
         let repair = frozen.is_some();
         let b = match frozen {
@@ -1260,15 +1278,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     };
     // A repair re-review keeps the earlier candidate and verdict for the
     // by-hand start line; the bound reviewer is still on the record here.
-    let earlier = if repair {
-        verdict_commit(&project, &record).ok().and_then(|v| {
-            git.parents(&v)
-                .ok()
-                .and_then(|parents| parents.into_iter().next().map(|c| (c, v)))
-        })
-    } else {
-        None
-    };
+    let earlier = repair.then_some(earlier).flatten();
     {
         let _lock = project.lock()?;
         let mut current = load(&project, round)?;
@@ -1466,6 +1476,32 @@ fn verdict_commit(project: &Project, record: &RoundRecord) -> Result<String> {
         .max_by(|a, b| (&a.0.created, &a.0.id).cmp(&(&b.0.created, &b.0.id)))
         .map(|(_, d)| d.sha.clone())
         .context("verdict_missing: the reviewer has no sealed done event for its current attempt")
+}
+
+/// The structurally valid C and V of the completed review currently bound to
+/// the round. Verdict kinds other than MERGE still count: a repaired lane may
+/// need a re-review after REJECT.
+fn completed_review(
+    project: &Project,
+    record: &RoundRecord,
+    git: &Git,
+) -> Option<(String, String)> {
+    let v = verdict_commit(project, record).ok()?;
+    let parents = git.parents(&v).ok()?;
+    let [c] = parents.as_slice() else {
+        return None;
+    };
+    let text = git.show_file(&v, &verdict_path(&record.round)).ok()??;
+    let verdict = parse_verdict(&text).ok()?;
+    if verdict.candidate != *c
+        || verdict.round != record.round
+        || Some(verdict.manifest_hash.as_str()) != record.manifest_hash.as_deref()
+        || verdict.policy_hash != record.policy_hash
+        || !git.is_ancestor(record.expected_head.as_deref()?, c).ok()?
+    {
+        return None;
+    }
+    Some((c.clone(), v))
 }
 
 /// Every check `ha round merge` makes before the intent (D6). Returns `C`.
@@ -3357,6 +3393,17 @@ mod tests {
         let b = record.expected_head.clone().unwrap();
         let reviewer = record.reviewer.clone().unwrap();
         let started = thread::load(&fx.project, &reviewer).unwrap();
+        // Repeating `round review` while that reviewer is still working does
+        // not clear it or create a repair branch.
+        let error = err(review(&ctx, "demo", "r1"));
+        assert!(error.starts_with("review_in_progress"), "{error}");
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(reviewer.as_str())
+        );
+        let repo_git = Git::new(ctx.runner, &fx.repo);
+        assert!(repo_git.branch_head("review/r1-2").unwrap().is_none());
+
         // The reviewer merges the lanes, fixes and seals the verdict.
         let wt = PathBuf::from(&started.worktree_path);
         let mut args = vec!["merge", "-q", "--no-edit"];
