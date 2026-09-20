@@ -167,6 +167,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             previous_launch.attempt + 1,
             brief_hash,
             project::policy_hash(&ctx.config_dir),
+            "coordinator",
         ),
     };
     let env = project::tab_env(

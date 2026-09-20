@@ -134,6 +134,7 @@ pub fn adopt(
             1,
             String::new(),
             project::policy_hash(&ctx.config_dir),
+            role,
         );
         t.agent = spec.kind.clone();
     })?;
