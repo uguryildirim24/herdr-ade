@@ -568,11 +568,10 @@ mod tests {
         ] {
             let runner = FakeRunner::new();
             runner.on("ls-remote", ok(remote_output));
-            let error = check_published_ref(&runner, worktree, branch, url, "new")
-                .unwrap_err()
-                .to_string();
+            let error = check_published_ref(&runner, worktree, branch, url, "new").unwrap_err();
+            assert!(crate::refusal::is(&error));
             assert_eq!(
-                error,
+                error.to_string(),
                 format!("{reason}; run `{repair}`, then retry `ha done`")
             );
             let calls = runner.calls.borrow();
@@ -745,6 +744,36 @@ mod tests {
         let error = resolve_report(worktree.path(), outside.path().to_str().unwrap()).unwrap_err();
         assert!(crate::refusal::is(&error));
         assert!(error.to_string().contains("report_path_invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn done_resolves_report_symlinks_without_allowing_escape() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let report = worktree.path().join("report.md");
+        std::fs::write(&report, b"result\n").unwrap();
+        std::fs::write(outside.path().join("report.md"), b"outside\n").unwrap();
+        symlink(&report, worktree.path().join("inside.md")).unwrap();
+        symlink(outside.path(), worktree.path().join("escape")).unwrap();
+        assert_eq!(
+            resolve_report(worktree.path(), "inside.md").unwrap(),
+            std::fs::canonicalize(&report).unwrap()
+        );
+        for requested in [
+            "escape/report.md".to_string(),
+            worktree
+                .path()
+                .join("escape/report.md")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            let error = resolve_report(worktree.path(), &requested).unwrap_err();
+            assert!(crate::refusal::is(&error));
+            assert!(error.to_string().starts_with("report_path_invalid:"));
+        }
     }
 
     #[test]
