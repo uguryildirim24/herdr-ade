@@ -34,11 +34,9 @@ pub const PI_VERSION: &str = "0.85.1";
 /// The package's `engines` floor (SPEC-pi v2 §1).
 pub const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
 /// The guard extension's file name and marker (SPEC-pi v2 §3.9).
-pub const GUARD_FILE: &str = "herdr-pi-guard.ts";
+const GUARD_FILE: &str = "herdr-pi-guard.ts";
 /// Version 2: no pre-ADE parent fallback; a context-length error is `error`.
 pub const GUARD_MARKER: &str = "herdr-pi-guard:version=2";
-/// The herdr state hook the running herdr writes (SPEC-pi v2 §3.3).
-pub const HERDR_EXTENSION_FILE: &str = "herdr-agent-state.ts";
 
 /// The process environment, read once, so resolution never depends on plugin
 /// variables that are not there.
@@ -146,10 +144,6 @@ impl Layout {
 
     pub fn guard(&self) -> PathBuf {
         self.extensions().join(GUARD_FILE)
-    }
-
-    pub fn herdr_extension(&self) -> PathBuf {
-        self.extensions().join(HERDR_EXTENSION_FILE)
     }
 
     pub fn sessions(&self) -> PathBuf {

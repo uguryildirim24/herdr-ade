@@ -34,11 +34,11 @@ pub const SETTINGS_JSON: &str = r#"{
 /// The empty provider table setup starts from. `herdr-pro serve` and
 /// `herdr-pi setup` merge the `pro` relay provider into it; nothing else adds
 /// a provider this round (Cursor stays outside pi, decisions 18:05, 18:30).
-pub const MODELS_JSON: &str = "{\n  \"providers\": {}\n}\n";
+const MODELS_JSON: &str = "{\n  \"providers\": {}\n}\n";
 
 /// What setup created; printed by `herdr-pi setup`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FolderReport {
+pub(crate) struct FolderReport {
     pub created_dirs: Vec<std::path::PathBuf>,
     pub wrote_settings: bool,
     pub wrote_models: bool,
@@ -92,7 +92,7 @@ pub fn ensure(layout: &Layout) -> Result<FolderReport> {
 
 /// What doctor needs from `settings.json` (SPEC-pi v2 §3.3, §3.9).
 #[derive(Debug, Clone, PartialEq)]
-pub struct SettingsState {
+pub(crate) struct SettingsState {
     pub trust_never: bool,
     pub skills_disabled: bool,
     pub telemetry_off: bool,

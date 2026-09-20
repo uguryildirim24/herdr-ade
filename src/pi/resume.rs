@@ -28,7 +28,7 @@ pub fn append_resume_session(session: &Path, recipe_args: &[String]) -> Result<V
 
 /// Session-picking flags a recipe may not carry; the r2 replay strip list
 /// must also drop them for pi (`-c` is a boolean, pi has no `-s`).
-pub const SESSION_PICKING: [&str; 9] = [
+const SESSION_PICKING: [&str; 9] = [
     "--session",
     "--fork",
     "--no-session",
@@ -41,7 +41,7 @@ pub const SESSION_PICKING: [&str; 9] = [
 ];
 
 /// What the reviewer's r2 strip list needs to drop for pi, as exact tokens.
-pub fn r2_strip_list() -> Vec<&'static str> {
+fn r2_strip_list() -> Vec<&'static str> {
     SESSION_PICKING.to_vec()
 }
 
@@ -50,7 +50,7 @@ pub fn r2_strip_list() -> Vec<&'static str> {
 /// function treats `-c`, `--continue`, `-r` and `--resume` as taking a value
 /// when the next word has no dash; for pi they are booleans, and eating the
 /// next word would drop a message. `true` = the flag takes a value.
-pub const R2_STRIP_RULES: [(&str, bool); 7] = [
+const R2_STRIP_RULES: [(&str, bool); 7] = [
     ("--session", true),
     ("--fork", true),
     ("--no-session", false),

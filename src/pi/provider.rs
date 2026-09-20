@@ -19,17 +19,17 @@ use super::recipes;
 pub const PROVIDER_ID: &str = "opencode-go";
 
 /// The context size a DeepSeek lane should compact at (Rolf, 2026-09-19).
-pub const DEEPSEEK_COMPACT_AT: u64 = 372_000;
+const DEEPSEEK_COMPACT_AT: u64 = 372_000;
 
 /// pi's default `compaction.reserveTokens` (docs/compaction.md).
-pub const PI_RESERVE_TOKENS: u64 = 16_384;
+const PI_RESERVE_TOKENS: u64 = 16_384;
 
 /// The `contextWindow` that makes pi compact at [`DEEPSEEK_COMPACT_AT`].
 pub const DEEPSEEK_CONTEXT_WINDOW: u64 = DEEPSEEK_COMPACT_AT + PI_RESERVE_TOKENS;
 
 /// The model id of every `opencode-go` recipe row that starts with
 /// `deepseek`, in row order. Derived from the rows, never repeated here.
-pub fn deepseek_models() -> Vec<&'static str> {
+fn deepseek_models() -> Vec<&'static str> {
     recipes::pi_recipes()
         .iter()
         .filter(|row| row.provider == PROVIDER_ID && row.model_family.starts_with("deepseek"))
