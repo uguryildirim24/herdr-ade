@@ -1,4 +1,4 @@
-//! Inbox items: events the ticker leaves for the coordinator.
+//! Inbox items hold messages, not projections of thread or round records.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -34,7 +34,24 @@ fn parse(text: &str) -> Option<Item> {
         .or_else(|| Some((rest.strip_suffix("\n+++")?, "")))?;
     let mut item: Item = toml::from_str(front).ok()?;
     item.body = body.trim_matches('\n').to_string();
-    Some(item)
+    (!removed_kind(&item.kind)).then_some(item)
+}
+
+/// Old projections are ignored on read; no migration or replacement files.
+fn removed_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "thread-state"
+            | "report-available"
+            | "preparation-abandoned"
+            | "round-advance"
+            | "merge-diverged"
+            | "merge-pending"
+            | "pr"
+            | "lineage-mismatch"
+            | "done"
+            | "waiting"
+    )
 }
 
 /// File-name-safe form of a subject (a thread id, routine name, machine label).
@@ -68,6 +85,9 @@ pub fn write(
     summary: &str,
     body: &str,
 ) -> Result<String> {
+    if removed_kind(kind) {
+        bail!("inbox_record_kind: `{kind}` belongs in its owning record");
+    }
     let _lock = project.lock()?;
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
@@ -110,6 +130,9 @@ pub fn write_event(
     kind: &str,
     summary: &str,
 ) -> Result<String> {
+    if removed_kind(kind) {
+        bail!("inbox_record_kind: `{kind}` belongs in its owning record");
+    }
     let _lock = project.lock()?;
     let id = if kind == "recipient-changed" {
         format!("recipient-changed-{}", event.id)
@@ -300,7 +323,9 @@ pub fn done_bound(
                 bail!("coordinator_binding_mismatch: event item `{id}` belongs to another binding");
             }
         }
-        checked.push((from, id, item));
+        if item.is_some() {
+            checked.push((from, id, item));
+        }
     }
     let mut moved = 0;
     for (from, id, item) in checked {
@@ -363,11 +388,11 @@ mod tests {
     fn two_events_in_one_tick_get_two_items() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let a = write(&project, "thread-state", "t-0001", "first", "").unwrap();
-        let b = write(&project, "thread-state", "t-0001", "second\nline", "").unwrap();
+        let a = write(&project, "routine", "nightly", "first", "").unwrap();
+        let b = write(&project, "routine", "nightly", "second\nline", "").unwrap();
         assert_ne!(a, b);
-        assert!(a.ends_with("-thread-state-t-0001-1"), "{a}");
-        assert!(b.ends_with("-thread-state-t-0001-2"), "{b}");
+        assert!(a.ends_with("-routine-nightly-1"), "{a}");
+        assert!(b.ends_with("-routine-nightly-2"), "{b}");
         let items = unhandled(&project);
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].summary, "second line");
@@ -396,6 +421,35 @@ mod tests {
             .unwrap();
         assert!(routine.body.starts_with("Check the build."));
         assert!(routine.body.ends_with("```"));
+    }
+
+    #[test]
+    fn removed_kinds_are_dropped_on_read_not_migrated() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        for kind in [
+            "thread-state",
+            "report-available",
+            "preparation-abandoned",
+            "round-advance",
+            "merge-diverged",
+            "merge-pending",
+            "pr",
+            "lineage-mismatch",
+            "done",
+            "waiting",
+        ] {
+            let path = inbox_dir(&project).join(format!("{kind}.md"));
+            let text = format!("+++\nkind = \"{kind}\"\nid = \"{kind}\"\n+++\n");
+            std::fs::write(&path, &text).unwrap();
+            assert!(write(&project, kind, "x", "stale", "").is_err());
+            assert!(unhandled(&project).is_empty());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        write(&project, "routine", "nightly", "due", "work").unwrap();
+        assert_eq!(unhandled(&project).len(), 1);
+        assert_eq!(done_bound(&project, &[], true, None).unwrap(), 1);
+        assert!(unhandled(&project).is_empty());
     }
 
     #[test]
@@ -434,7 +488,7 @@ mod tests {
             },
         };
         crate::events::seal_create_if_absent(&project, &event).unwrap();
-        let item = write_event(&project, &event, "waiting", "lane waits").unwrap();
+        let item = write_event(&project, &event, "courier-delivery", "lane waits").unwrap();
 
         // This is the `--peek` behavior: merely listing/showing writes no fact.
         assert!(
@@ -475,7 +529,7 @@ mod tests {
             ..event.clone()
         };
         crate::events::seal_create_if_absent(&project, &old).unwrap();
-        let old_item = write_event(&project, &old, "waiting", "lane waits").unwrap();
+        let old_item = write_event(&project, &old, "courier-delivery", "lane waits").unwrap();
         write_item(&project, "routine-1", "body");
         project
             .update_coordinator(|c| {
