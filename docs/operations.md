@@ -26,13 +26,14 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator pane, ticker state, lock
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
-~/.config/herdr-ade/config.toml             the harness settings: roles, recipes, machines and the harness repositories; any coordinator may edit it
+~/.config/herdr-ade/config.toml             executable model recipes, dispatch placement, machines and harness repositories; any coordinator may edit it
+~/.config/herdr-ade/routing.json             editable task-score rubric, weights, cutoffs, confidence floor and model cards
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
 Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The lane is primed with `Run <prefix> skill <role>, then read tasks/<id>.md and do what it says.` The thread directory is `<worktree>/.herdr-project/<project>-<id>/`: `report.md` and `library/` (written by the agent); a tab thread with no repository gets its `brief.md` there instead. That folder, and `.worktrees/`, are added to `info/exclude`. **Git treats them as clean: `git worktree remove` without `--force` deletes the checkout**, which is why `--remove-worktree` insists on a complete copy home first. The binary never calls `herdr worktree remove` for an ADE lane.
 
-`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`), `talk` (default: on for a `claude` coordinator), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. Kind and args come from the roles table in `~/.config/herdr-ade/config.toml` (`[roles.<name>]` with `kind`, `args`, `env`, `ready_timeout_ms`). Day-one roles: `coordinator`, `lane`, `reviewer`, `critic`, `drafter`, `pro`. A project may override `kind` and `args` per role; arrays replace, they do not merge. A kind change without `args` is refused.
+`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`), `talk` (default: on for a `claude` coordinator), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. `[roles.*]` is gone from both files and is refused. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). At dispatch, the full task and repository facts are scored by Jev; `routing.json` maps the scores to a recipe. Workflow labels such as reviewer still select skill text, never a model table.
 
 The birth sentence is required: `thread start` and `thread adopt` take `--plain`. The checker refuses an empty sentence, more than one sentence, or an identifier-shaped token; a thread or round sentence drops the known-word rule, because it is a row on a screen and may name a file. Default role is `lane`. `--passive` on adopt sets the parent token and sends no primer.
 
@@ -47,7 +48,7 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
-| `thread start <project> --title T --plain S [--role R] [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | New thread: the brief `tasks/<id>.md` is committed on the integration branch (`--base`, else the checked-out branch), then a git worktree from that commit and a tab under the coordinator, with `--parent` on launch. The kind and args come from the role. `--plain` is required. Returns before the agent is up. A `lane` or `reviewer` on a repo with a `box_path` runs on the box named by its role's `machine`. |
+| `thread start <project> --title T --plain S [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | The full brief is scored before any worktree or tab exists. Its selected recipe supplies kind and args. The brief `tasks/<id>.md` is committed on the integration branch, then the worktree and tab are created. `--plain` is required; returns before the agent is up. `[dispatch].machine` supplies default box placement for repositories with a box clone. |
 | `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
 | `thread resolve <project> <id> [--remove-worktree] [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy: close the pane and tab through Herdr (`--keep-pane` leaves them), and optionally remove the worktree (the branch is kept). |
 | `pickup [<project>] [--all] [--start] [--dry-run]` | Re-link live threads to the coordinator pane: local lanes from the session, box lanes from the courier's box-local lists (one SSH per machine). Gone threads print start lines, or restart through their launch records with `--start` when the project's `start_threads` is `auto`. `--all` covers every active project. |
@@ -105,6 +106,45 @@ When Rolf asks in chat to change a recorded choice, the coordinator treats it li
 
 A round is a set of lanes that are reviewed and merged together. `hp round advance <slug>` starts the reviewer on its own, including after a REJECT once `hp round review <slug> <round>` makes the next revision. When `hp round merge <slug> <round>` refuses with `merge_conflict` because another round landed first, run `hp round review <slug> <round>`: it keeps the brief commit B, opens the next `review/<round>-<n>` branch from the current integration head and clears the reviewer. The next `hp round advance <slug>` starts a reviewer whose task names the earlier candidate C and verdict commit V, so the reviewer merges C, including the earlier reviewer's fixes, over the new base instead of merging the raw lane shas. A round never gets a second reviewer while one is bound; `hp round reviewer` can replace one that is resolved or gone. A start that does not take says so on standard error and is retried on the next `advance` pass, up to three failures; a round is never left with a bound reviewer whose agent never came up.
 
+## Task-based routing
+
+The coordinator does not choose a model. `thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. The title is a display label, never classifier state. Repository facts include HEAD, tracked paths, status and recent changes. Review dispatch adds the full committed review brief and the pinned lane diffs.
+
+Install the tracked **placeholder** `config/routing.json` at `~/.config/herdr-ade/routing.json` before starting lanes. There is no embedded policy fallback or old-format reader. Keep executable rows in `config.toml`; remove every `[roles.*]` table. A custom model needs a complete executable recipe there and a description/tier card plus a route in `routing.json`. Configured recipe rows replace built-in rows completely, not field by field.
+
+The dispatch process (including a background ticker that starts reviews) must inherit `TYPESAFE_API_KEY`. The client posts to `https://api.typesafe.ai/v1/systemone` with `model: jev-latest` and three parallel Score questions: difficulty, ambiguity and blast radius. Criteria are ordered arrays. No model roster enters the prompt. Exact recipe/model ids are scrubbed; the brief is never reduced to a title or a 2,200-character excerpt. The key travels on curl's stdin, not argv, and is removed from its child environment.
+
+All question instructions, criteria, weights, cutoffs, confidence floor, borderline margin and model descriptions are editable JSON. Each score is divided by its highest level index; the weighted mean is compared with increasing `routes[].up_to` cutoffs. The minimum confidence across questions is used. A low-confidence result moves one route stronger; a score within the margin of a cutoff uses the stronger side. Neither condition blocks or asks permission. HTTP/config/malformed-response failures refuse without silently choosing another model. The first policy is not calibrated; replacing the file needs no rebuild.
+
+Four exclusions are code rules and never call Jev:
+
+- Web **research as the product** goes to agy. State `product = "web-research"` in opening `+++` TOML task front matter. A coding task that cites URLs does not qualify.
+- `requires_claude = true` uses the Claude binary. Coordinators also use the Claude binary, without Jev.
+- `product = "spec"` uses Fable for specification writing. Pro through the relay remains available via a user pin.
+- Rolf's hand pin is `pins[SHA256(exact task-file bytes)] = recipe-id` in `routing.json`. There is no coordinator CLI pin.
+
+`ha failed "<failure and evidence>"` seals a lane-bound event locally or on the box. The ticker/courier consumes it once, assesses the same full task with the failure, and chooses a strictly stronger tier from the current route ladder. It preserves the dirty worktree, replaces only that lane's tab, increments its attempt and tells the replacement what failed. Three upgrades is the hard bound; no stronger route or a fixed exclusion produces a recorded refusal. `waiting` still means missing input, not a model failure. Transport/placement errors are visible and never spin through models indefinitely.
+
+`<project>/.state/dispatch.jsonl` is the append-only dispatch ledger: rubric hash, recipe-policy hash, task hash, full score distributions/confidences, arithmetic result, upgrades and failure evidence. The original task file remains the source of brief bytes. Sealed failure events remain in `events/`; a `failure_event` marker and pending-placement state on the thread make replay safe.
+
+### Measure and replay the policy
+
+```sh
+ha routing-eval config/routing-cases.json
+# Save raw scores from a live evaluation for subsequent offline tuning:
+ha routing-eval labelled-cases.json > results.json
+jq '.cases | map({id, brief, state, expected, response})' results.json > replay.json
+ha routing-eval replay.json
+```
+
+Cases carry `id`, the complete `brief`, repository `state`, `expected` recipe and an optional raw TypeSafe `response`. Saved responses are evaluated offline, so changing weights/cutoffs/model routes costs no inference. Omit `response` to collect fresh task scores with the configured questions (requires the API key). Output is JSON with each selected/expected model, outcome, assessment, and separate totals:
+
+- `over_routed`: easy work sent to a stronger/more expensive tier (money wasted).
+- `under_routed`: hard work sent to a weaker tier (a lane and review wasted).
+- `correct`, `same_tier_wrong` and `errors` are separate.
+
+The three shipped cases use **synthetic**, clearly labelled responses, including intentional mistakes to exercise both counters. They are a plumbing demonstration, not evidence that the rubric is accurate. Tier ordering is a policy assumption, not measured billing data. Capture real labelled briefs before tuning; reuse responses only while the question rubric and criteria still mean the same thing.
+
 ## Safety settings
 
 Set per project in `~/.config/herdr-ade/config.toml`; `safety show <project>` prints the table header to use.
@@ -114,10 +154,8 @@ Set per project in `~/.config/herdr-ade/config.toml`; `safety show <project>` pr
 start_threads = "propose"          # or "auto": the coordinator starts threads without asking
 routine_commands = false           # true lets approved routines run shell commands
 
-[roles.lane]
-kind = "claude"
-args = ["--dangerously-skip-permissions"]
-ready_timeout_ms = 20000
+[dispatch]
+machine = "oci"                    # default placement for repositories with a box clone
 ```
 
 The table is keyed by the project folder's canonical path. It stays when you delete the project and applies to a new project at the same path.
@@ -175,7 +213,7 @@ A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d`
 
 Save the machine with `herdr machine add --label <label> <ssh target>` (both machines need Herdr 0.9.1), then list a repo as `--repo /path/on/machine@<label>` or pass `thread start --machine <label>`. The home machine owns the project; only outbound SSH from home is needed, in batch mode, so set up key-based login first.
 
-A `lane` or `reviewer` runs on the box by default when its repository has a `box_path` (a `PROJECT.md` repo row, or the committed default map) and its role row names one: `[roles.lane] machine = "oci"` and `[roles.reviewer] machine = "oci"` in `~/.config/herdr-ade/config.toml`. Without the key the role stays local. `thread start --machine local` keeps one start on the Mac, and `--machine <label>` still names any saved machine for any role. When a default box start finds the box held, unreachable or not ready, it runs on the Mac instead and says "the box was not ready, so this lane runs here"; an explicit `--machine <label>` still fails as before.
+A lane or review runs on the box by default when its repository has a `box_path` (a `PROJECT.md` repo row, or the committed default map) and `[dispatch] machine = "oci"` in `~/.config/herdr-ade/config.toml`. Without the key it stays local. `thread start --machine local` keeps one start on the Mac, and `--machine <label>` still names any saved machine for any role. When a default box start finds the box held, unreachable or not ready, it runs on the Mac instead and says "the box was not ready, so this lane runs here"; an explicit `--machine <label>` still fails as before.
 
 When you close your Mac session and start a new one, a box lane keeps running on the box but loses the link to its coordinator. `ha pickup` reads each machine once through the courier, re-links the living box lanes under the new coordinator pane, and prints a `herdr --machine <label>` start line for each gone one. `ha pickup --all --start` does that for every active project and restarts the gone lanes, but only where `start_threads = "auto"`.
 

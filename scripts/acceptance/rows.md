@@ -14,7 +14,7 @@ Each row is assembled from parts (see the header of `run`):
 | id | required | title | det / mod / cli parts | live parts |
 |---|---|---|---|---|
 | 1 | yes | ha new and open with claude coordinator: hook before launch, bootstrap acknowledged | mod A2 receipt and hook install | `new --plain`, `open --session`, hook entry, `bootstrap = acknowledged` within 120 s |
-| 2 | yes | round open r1; claude and cursor lanes admitted: tabs, parent, briefs committed first | cli round open refusal and record, GLOSSARY.md; mod A1 brief and launch record | `thread start --role` for a claude and a cursor lane, admit, `parent` tokens, briefs on `main` |
+| 2 | yes | round open r1; claude and cursor lanes admitted: tabs, parent, briefs committed first | cli round open refusal and record, GLOSSARY.md; mod A1 brief and launch record | `thread start --task-file` with full work contracts, admit, `parent` tokens, briefs on `main` |
 | 3 | yes | each lane ha done seals events; peek does not acknowledge; unadmitted ha waiting from a dirty tree | det pins from sealed done events of the current attempt; mod A2 done, waiting, seal | sealed done events per lane, `context --peek` acknowledges nothing |
 | 4 | yes | representative-topology handoff continuity and blocked-then-submitted delivery | det talk delivery while blocked, uncertain never re-sent; mod A2 duplicate consumed once | NOT-RUN until `herdr server restart` (lane/restart-core) is in `C`; the 21-pane topology is scripted by the reviewer |
 | 5 | yes | ha round review: brief commit B precedes review worktree; verdict V; ha done --sha V | det B before `review/r1`, brief contents, fence | `round review` on the live project; the reviewer thread produces `C` and `V` |
@@ -29,7 +29,7 @@ Print format: `STATUS<TAB>id<TAB>title`, the parts indented below, then one
 `REQUIRED` summary line. Exit 0 only when every required row is PASS.
 
 The live parts were written against the verbs and flags SPEC-ADE names. On
-the ade-rounds lane they were never executed: A1's `thread start --role`, A2's
+the ade-rounds lane they were never executed: A1's task-file dispatch, A2's
 `open` hook, receipt, `done` and `waiting` did not exist there. Each live part
 checks its verb first and reports NOT-RUN naming the missing lane, so the
 reviewer sees which part still needs the merged candidate.

@@ -1,374 +1,396 @@
-//! Launch-time resolution: validate the recipe table and return the `Launch`
-//! object the thread record stores. A lane's model is the role's `default`, or
-//! a row the coordinator pins by hand; there is no picker.
-
+//! Dispatch resolves the full work brief, never a coordinator-selected model.
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::contracts::{Launch, Recipe};
 use crate::paths::{Ctx, Env};
 use crate::plain::{self, Glossary};
+use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 
-/// `herdr agent start --help` is a table check, not a launch.
 pub const HELP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Roles that are never launched from the roles table.
-pub const NEVER_RESOLVED: [&str; 2] = ["pro", "coordinator"];
-
-/// The lane picker was removed. A config that still carries one of these keys
-/// fails with `picker_removed` naming the key.
-pub const REMOVED_ROLE_KEYS: [&str; 5] = [
-    "resolver",
-    "jev_model",
-    "jev_timeout_ms",
-    "jev_daily_cap",
-    "floor",
-];
-pub const REMOVED_ROLE_FIELDS: [&str; 2] = ["gates", "cost"];
-pub const REMOVED_RECIPE_FIELDS: [&str; 1] = ["cost"];
-
-/// Reason templates, fixed in the binary and checked at load.
-pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
-/// The default row's sentence, with no picker in the picture.
-pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, the usual choice.";
-/// The compact `ade_last` form.
+pub const MAX_ESCALATIONS: u32 = 3;
 pub const COMPACT_LIMIT: usize = 80;
-
-/// Effort values the Claude CLI accepts.
+pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
+pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, chosen for this work.";
 pub const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-/// Effort values the agy CLI accepts (`agy --help`).
 pub const AGY_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
-/// One role's recipe lists: the `default` it launches with, the `allowed` rows
-/// a `--recipe` pin may name, and the `escalate` rows reserved for a stalled
-/// lane when Rolf asks.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RoleConfig {
-    pub default: String,
-    pub allowed: Vec<String>,
-    pub escalate: Vec<String>,
-    /// The role's machine choice (SPEC-remote D2, §4.1). Empty means local.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchConfig {
     pub machine: String,
 }
 
-/// The safety file's view of `~/.config/herdr-ade/config.toml`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchConfig {
     pub recipes: BTreeMap<String, Recipe>,
-    pub roles: BTreeMap<String, RoleConfig>,
-    /// SHA-256 over the recipes and roles.
+    pub dispatch: DispatchConfig,
     pub policy_hash: String,
-    /// Inline roles written without `plain`: they get the shipped phrase and
-    /// `doctor` warns, never a refusal.
-    pub inline_without_plain: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(default)]
 struct RawConfig {
-    #[serde(default)]
-    roles: BTreeMap<String, toml::Value>,
-    #[serde(default)]
     recipes: BTreeMap<String, Recipe>,
+    dispatch: DispatchConfig,
 }
 
-/// A `[roles.<name>]` table: either an inline row or a recipe reference.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawRole {
-    kind: Option<String>,
-    args: Option<Vec<String>>,
-    env: Option<Vec<String>>,
-    ready_timeout_ms: Option<u64>,
-    provider: Option<String>,
-    enabled: Option<bool>,
-    plain: Option<String>,
-    default: Option<String>,
-    allowed: Option<Vec<String>>,
-    escalate: Option<Vec<String>>,
-    machine: Option<String>,
-}
-
-/// The ready-made rows the plugin ships: research on agy and the Fable
-/// planner. A config row may not reuse one.
-fn builtin_recipes() -> Vec<(&'static str, Recipe)> {
-    vec![
-        (
-            "agy_gemini_flash",
-            Recipe {
-                kind: "agy".into(),
-                provider: "agy".into(),
-                args: vec![
-                    "--model".into(),
-                    "gemini-3.8-flash-high".into(),
-                    "--dangerously-skip-permissions".into(),
-                ],
-                ready_timeout_ms: 60_000,
-                enabled: true,
-                plain: "the web research helper".into(),
-                ..Recipe::default()
-            },
-        ),
-        (
-            "claude_fable_xhigh",
-            Recipe {
-                kind: "claude".into(),
-                provider: "claude".into(),
-                args: vec![
-                    "--model".into(),
-                    "claude-fable-5-1".into(),
-                    "--effort".into(),
-                    "xhigh".into(),
-                    "--dangerously-skip-permissions".into(),
-                ],
-                ready_timeout_ms: 90_000,
-                enabled: true,
-                plain: "the planning helper".into(),
-                ..Recipe::default()
-            },
-        ),
-    ]
-}
-
-/// The ready-made roles the plugin ships. Config rows override them.
-fn builtin_roles() -> BTreeMap<String, RoleConfig> {
-    let mut roles = BTreeMap::new();
-    roles.insert(
-        "research".to_string(),
-        RoleConfig {
-            default: "agy_gemini_flash".into(),
-            allowed: vec!["agy_gemini_flash".into()],
-            escalate: Vec::new(),
-            machine: String::new(),
-        },
-    );
-    roles.insert(
-        "planner".to_string(),
-        RoleConfig {
-            default: "claude_fable_xhigh".into(),
-            allowed: vec!["claude_fable_xhigh".into()],
-            escalate: Vec::new(),
-            machine: String::new(),
-        },
-    );
-    roles
-}
-
-/// Parse the safety file's roles and recipes. An absent file is the shipped
-/// default.
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
     let file = config_dir.join("config.toml");
-    let text = std::fs::read_to_string(&file).unwrap_or_default();
-    let raw: RawConfig = if text.trim().is_empty() {
-        RawConfig::default()
-    } else {
-        let value: toml::Value =
-            toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
-        reject_removed_keys(&value)?;
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
     };
-
-    let builtins = builtin_recipes();
-    let mut recipes: BTreeMap<String, Recipe> = builtins
-        .iter()
-        .map(|(id, recipe)| ((*id).to_string(), recipe.clone()))
-        .collect();
-    for (id, recipe) in raw.recipes {
-        if builtins.iter().any(|(builtin, _)| *builtin == id) {
-            bail!("recipe_builtin: `{id}` is a ready-made row; use another id");
-        }
-        recipes.insert(id, recipe);
-    }
-
-    let mut roles = builtin_roles();
-    let mut inline_without_plain = Vec::new();
-    for (name, value) in raw.roles {
-        let raw_role: RawRole = value
-            .try_into()
-            .with_context(|| format!("[roles.{name}] does not parse"))?;
-        if raw_role.kind.is_some()
-            && raw_role
-                .plain
-                .as_deref()
-                .is_none_or(|p| p.trim().is_empty())
-            && !NEVER_RESOLVED.contains(&name.as_str())
-        {
-            inline_without_plain.push(name.clone());
-        }
-        roles.insert(name.clone(), parse_role(&name, raw_role, &mut recipes)?);
-    }
-    builtin_pi_recipes(&mut recipes, &roles)?;
-
-    let mut config = finish(recipes, roles);
-    config.inline_without_plain = inline_without_plain;
-    Ok(config)
-}
-
-/// Refuse a config that still carries a removed picker key.
-fn reject_removed_keys(root: &toml::Value) -> Result<()> {
-    let Some(root) = root.as_table() else {
-        return Ok(());
-    };
-    if let Some(roles) = root.get("roles").and_then(toml::Value::as_table) {
-        for key in REMOVED_ROLE_KEYS {
-            if roles.contains_key(key) {
-                bail!("picker_removed: [roles] {key} is gone; the lane picker was removed");
-            }
-        }
-        for (name, value) in roles {
-            let Some(role) = value.as_table() else {
-                continue;
-            };
-            for field in REMOVED_ROLE_FIELDS {
-                if role.contains_key(field) {
-                    bail!(
-                        "picker_removed: [roles.{name}] {field} is gone; the lane picker was removed"
-                    );
-                }
-            }
-        }
-    }
-    if let Some(recipes) = root.get("recipes").and_then(toml::Value::as_table) {
-        for (id, value) in recipes {
-            let Some(recipe) = value.as_table() else {
-                continue;
-            };
-            for field in REMOVED_RECIPE_FIELDS {
-                if recipe.contains_key(field) {
-                    bail!(
-                        "picker_removed: [recipes.{id}] {field} is gone; the lane picker was removed"
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The ready-made `kind = "pi"` rows join the table under their own ids; a
-/// config row may not reuse one, and a row that is not start-time allowed
-/// stays out of an `allowed` list.
-fn builtin_pi_recipes(
-    recipes: &mut BTreeMap<String, Recipe>,
-    roles: &BTreeMap<String, RoleConfig>,
-) -> Result<()> {
-    for row in crate::pi::roles::pi_recipes() {
-        if recipes.contains_key(row.id) {
-            bail!(
-                "recipe_builtin: `{}` is a ready-made pi row; use another id",
-                row.id
-            );
-        }
-        if !row.start_time_allowed
-            && let Some(name) = roles
-                .iter()
-                .find(|(_, role)| role.allowed.iter().any(|a| a == row.id))
-                .map(|(name, _)| name)
-        {
-            bail!(
-                "recipe_not_start_time: `{}` may be escalated to, not in [roles.{name}].allowed",
-                row.id
-            );
-        }
-        recipes.insert(
-            row.id.to_string(),
-            Recipe {
-                kind: row.kind.to_string(),
-                args: row.args.clone(),
-                env: row.env.clone(),
-                ready_timeout_ms: row.ready_timeout_ms,
-                provider: row.provider.to_string(),
-                enabled: row.enabled,
-                plain: row.plain.to_string(),
-            },
+    let value: toml::Value = toml::from_str(&text).context("config.toml does not parse")?;
+    if value.get("roles").is_some() {
+        bail!(
+            "roles_removed: remove [roles] and every [roles.*] table from config.toml; keep model rows in [recipes.*]"
         );
     }
-    Ok(())
-}
-
-fn finish(recipes: BTreeMap<String, Recipe>, roles: BTreeMap<String, RoleConfig>) -> LaunchConfig {
-    let policy_hash = policy_hash(&recipes, &roles);
-    LaunchConfig {
+    let raw: RawConfig = value.try_into()?;
+    let mut recipes = builtin_recipes();
+    // A configured row is a complete recipe, not an old inline role or a partial patch.
+    recipes.extend(raw.recipes);
+    let policy_hash =
+        crate::thread::sha256_hex(serde_json::to_vec(&(&recipes, &raw.dispatch))?.as_slice());
+    Ok(LaunchConfig {
         recipes,
-        roles,
+        dispatch: raw.dispatch,
         policy_hash,
-        inline_without_plain: Vec::new(),
-    }
-}
-
-fn parse_role(
-    name: &str,
-    raw: RawRole,
-    recipes: &mut BTreeMap<String, Recipe>,
-) -> Result<RoleConfig> {
-    let inline = raw.kind.is_some();
-    let reference = raw.default.is_some() || raw.allowed.is_some() || raw.escalate.is_some();
-    if inline && reference {
-        bail!("role_form_mixed: [roles.{name}] has an inline row and a recipe reference");
-    }
-    if inline {
-        let kind = raw.kind.clone().unwrap_or_default();
-        if kind.trim().is_empty() {
-            bail!("role_kind_missing: [roles.{name}] has an empty kind");
-        }
-        let id = format!("{name}_inline");
-        let recipe = Recipe {
-            provider: raw.provider.clone().unwrap_or_else(|| kind.clone()),
-            kind,
-            args: raw.args.clone().unwrap_or_default(),
-            env: raw.env.clone().unwrap_or_default(),
-            ready_timeout_ms: raw
-                .ready_timeout_ms
-                .unwrap_or_else(|| Recipe::default().ready_timeout_ms),
-            enabled: raw.enabled.unwrap_or(true),
-            plain: raw
-                .plain
-                .clone()
-                .filter(|plain| !plain.trim().is_empty())
-                .unwrap_or_else(|| "the usual helper".to_string()),
-        };
-        recipes.insert(id.clone(), recipe);
-        return Ok(RoleConfig {
-            default: id.clone(),
-            allowed: vec![id],
-            escalate: Vec::new(),
-            machine: raw.machine.clone().unwrap_or_default(),
-        });
-    }
-    let default = raw.default.clone().unwrap_or_default();
-    if default.trim().is_empty() {
-        bail!("role_default_missing: [roles.{name}] has no default and no inline row");
-    }
-    Ok(RoleConfig {
-        default,
-        allowed: raw.allowed.clone().unwrap_or_default(),
-        escalate: raw.escalate.clone().unwrap_or_default(),
-        machine: raw.machine.clone().unwrap_or_default(),
     })
 }
 
-#[derive(Serialize)]
-struct PolicyView<'a> {
-    recipes: &'a BTreeMap<String, Recipe>,
-    roles: &'a BTreeMap<String, RoleConfig>,
+fn builtin_recipes() -> BTreeMap<String, Recipe> {
+    let mut recipes = BTreeMap::new();
+    for (id, model, plain) in [
+        (
+            "agy_gemini_flash",
+            "gemini-3.8-flash-high",
+            "the web research helper",
+        ),
+        (
+            "claude_fable_xhigh",
+            "claude-fable-5-1",
+            "the planning helper",
+        ),
+        (
+            "claude_coordinator_opus",
+            "claude-opus-5",
+            "the planning helper",
+        ),
+    ] {
+        let kind = if id.starts_with("agy") {
+            "agy"
+        } else {
+            "claude"
+        };
+        let mut args = vec![
+            "--model".into(),
+            model.into(),
+            "--dangerously-skip-permissions".into(),
+        ];
+        if kind == "claude" {
+            args.extend(["--effort".into(), "xhigh".into()]);
+        }
+        recipes.insert(
+            id.into(),
+            Recipe {
+                kind: kind.into(),
+                provider: kind.into(),
+                args,
+                plain: plain.into(),
+                ..Recipe::default()
+            },
+        );
+    }
+    for row in crate::pi::recipes::pi_recipes() {
+        recipes.insert(
+            row.id.into(),
+            Recipe {
+                kind: row.kind.into(),
+                provider: row.provider.into(),
+                args: row.args,
+                env: row.env,
+                ready_timeout_ms: row.ready_timeout_ms,
+                enabled: row.enabled,
+                plain: row.plain.into(),
+            },
+        );
+    }
+    recipes
 }
 
-/// SHA-256 over the recipes and roles.
-fn policy_hash(recipes: &BTreeMap<String, Recipe>, roles: &BTreeMap<String, RoleConfig>) -> String {
-    use sha2::{Digest, Sha256};
-    let view = PolicyView { recipes, roles };
-    let bytes = serde_json::to_string(&view).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(bytes.as_bytes());
-    format!("{:x}", hasher.finalize())
+pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Result<()> {
+    for (id, recipe) in &config.recipes {
+        if !kinds.contains(recipe.kind.trim()) {
+            bail!("recipe_kind_unknown: {id}: {}", recipe.kind);
+        }
+        validate_flags(id, recipe)?;
+        if recipe.kind == "pi" {
+            crate::pi::launch::validate_args(&recipe.args)?;
+            crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args)?;
+        }
+        check_plain(&format!("recipe {id}"), &recipe.plain)?;
+    }
+    Ok(())
 }
 
+/// Optional task front matter describes the deliverable or a hard runtime
+/// requirement, not a model preference. URLs in the body never trigger a rule.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct WorkContract {
+    product: String,
+    requires_claude: bool,
+}
+
+pub fn work_contract(task: &str, workflow: &str) -> Result<Value> {
+    let contract = if workflow == "coordinator" {
+        WorkContract::default()
+    } else if let Some(rest) = task.strip_prefix("+++\n") {
+        let (front, _) = rest
+            .split_once("\n+++\n")
+            .context("task_contract: unclosed front matter")?;
+        toml::from_str::<WorkContract>(front).context("task_contract: describe product and requires_claude; model/recipe/role overrides are forbidden")?
+    } else {
+        WorkContract::default()
+    };
+    if !matches!(
+        contract.product.as_str(),
+        "" | "code" | "web-research" | "spec"
+    ) {
+        bail!("task_contract: product must be code, web-research or spec");
+    }
+    let mut value = serde_json::to_value(contract)?;
+    value["workflow"] = json!(workflow);
+    Ok(value)
+}
+
+#[derive(Debug, Default)]
+pub struct ResolveInput<'a> {
+    pub task: &'a str,
+    pub state: Value,
+    /// Internal workflow label only: determines skill text, never a model role.
+    pub workflow: &'a str,
+    pub previous: Option<&'a Launch>,
+    pub failure: Option<&'a str>,
+}
+
+pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
+    let result = resolve(ctx, project, input);
+    if let Err(error) = &result {
+        ledger(
+            project,
+            json!({"kind":"dispatch-refused", "brief_hash":crate::thread::sha256_hex(input.task.as_bytes()),
+            "failure":input.failure, "error":format!("{error:#}")}),
+        )?;
+    }
+    result
+}
+
+fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
+    if input.task.trim().is_empty() {
+        bail!("dispatch_brief_missing: supply the full task file");
+    }
+    let config = parse_launch_config(&ctx.config_dir)?;
+    validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
+    let policy_path = ctx.config_dir.join("routing.json");
+    let policy_bytes =
+        std::fs::read(&policy_path).context("routing_policy_missing: install routing.json")?;
+    let policy = crate::routing::Policy::parse(&policy_bytes)?;
+    policy.validate_recipes(&config.recipes)?;
+    let work = work_contract(input.task, input.workflow)?;
+    let hash = crate::thread::sha256_hex(input.task.as_bytes());
+    let excluded = policy.exclusion(input.task, &work);
+    let escalations = input
+        .previous
+        .map_or(0, |p| p.escalations.saturating_add(1));
+    if escalations > MAX_ESCALATIONS {
+        bail!("escalation_bound: at most {MAX_ESCALATIONS} model changes per lane");
+    }
+    if input.previous.is_some() && input.failure.is_none_or(|f| f.trim().is_empty()) {
+        bail!("escalation_failure_missing");
+    }
+    // Fixed exclusions are never sent to Jev, including after failure.
+    if excluded.is_some() && input.previous.is_some() {
+        bail!(
+            "escalation_excluded: fixed research, Claude, spec or human-pinned work cannot change models"
+        );
+    }
+    if input.previous.is_some_and(|p| p.strength == 0) {
+        bail!("escalation_tier_missing: the earlier launch has no recorded capability tier");
+    }
+    // A policy edit cannot turn the same recipe into its own escalation.
+    let previous_tier = input.previous.map(|p| {
+        p.strength
+            .max(policy.models.get(&p.recipe_id).map_or(0, |m| m.tier))
+    });
+    let (id, assessment, decision, rule) = if let Some(id) = excluded {
+        (
+            id.to_string(),
+            None,
+            None,
+            if policy.pins.contains_key(&hash) {
+                "human-pin"
+            } else {
+                "exclusion"
+            },
+        )
+    } else {
+        if previous_tier.is_some_and(|tier| {
+            !policy
+                .routes
+                .iter()
+                .any(|r| policy.models[&r.recipe].tier > tier)
+        }) {
+            bail!("escalation_exhausted: no stronger model remains");
+        }
+        let state = crate::routing::scrub(
+            json!({"brief": input.task, "repository": input.state,
+            "failure": input.failure}),
+            &config.recipes,
+        );
+        let assessment = crate::jev::call(ctx, &policy.request(state), &policy.questions)?;
+        let decision = policy.select(&assessment, previous_tier)?;
+        (
+            decision.recipe.clone(),
+            Some(assessment),
+            Some(decision),
+            "jev-scores",
+        )
+    };
+    let recipe = config.recipes.get(&id).context("recipe_unknown")?;
+    if !recipe.enabled {
+        bail!("recipe_disabled: {id}");
+    }
+    if parse_launch_config(&ctx.config_dir)?.policy_hash != config.policy_hash
+        || std::fs::read(&policy_path)? != policy_bytes
+    {
+        bail!("dispatch_policy_changed: config changed during selection; dispatch again");
+    }
+    ledger(
+        project,
+        json!({"kind": if escalations > 0 { "escalation" } else { "pick" },
+        "brief_hash": hash, "recipe": id, "rule": rule, "assessment": assessment, "decision": decision,
+        "low_confidence": decision.as_ref().is_some_and(|d| d.confidence < policy.confidence_floor),
+        "previous": input.previous.map(|p| json!({"recipe":p.recipe_id,"tier":p.strength,"attempt":p.attempt})),
+        "failure": input.failure, "escalations": escalations,
+        "policy_hash": config.policy_hash, "routing_hash": crate::thread::sha256_hex(&policy_bytes)}),
+    )?;
+    Ok(Launch {
+        kind: recipe.kind.clone(),
+        args: recipe.args.clone(),
+        env: recipe.env.clone(),
+        ready_timeout_ms: recipe.ready_timeout_ms,
+        policy_hash: config.policy_hash,
+        attempt: 1,
+        strength: policy.models.get(&id).map_or(0, |m| m.tier),
+        recipe_id: id,
+        escalations,
+        reason: if rule == "human-pin" {
+            pinned_reason(input.workflow, &recipe.plain)
+        } else {
+            usual_reason(input.workflow, &recipe.plain)
+        },
+        compact_reason: compact_reason(input.workflow, &recipe.plain),
+        machine: config.dispatch.machine,
+        ..Launch::default()
+    })
+}
+
+/// Append-only dispatch ledger. No network call is made while holding its lock.
+pub fn ledger(project: &Project, mut row: Value) -> Result<()> {
+    let _lock = project.lock()?;
+    row["at"] = json!(project::now());
+    std::fs::create_dir_all(project.state_dir())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(project.state_dir().join("dispatch.jsonl"))?;
+    writeln!(file, "{row}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Only measured repository facts, never a summary invented from a title.
+pub fn repository_state(ctx: &Ctx, repo: Option<&str>, base: Option<&str>) -> Result<Value> {
+    let Some(repo) = repo else {
+        return Ok(json!({"repository": null}));
+    };
+    let run = |args: &[&str]| -> Result<String> {
+        let out = ctx.runner.run(
+            &Cmd::new("git", HELP_TIMEOUT)
+                .arg("-C")
+                .arg(repo)
+                .args(args.iter().copied()),
+        )?;
+        if !out.success() {
+            bail!(
+                "dispatch_repository: git probe failed: {}",
+                out.error_text()
+            );
+        }
+        Ok(out.stdout)
+    };
+    Ok(
+        json!({"path": repo, "base": base, "head": run(&["rev-parse", "HEAD"])?,
+        "status": run(&["status", "--short"])?, "files": run(&["ls-files"])?,
+        "recent_changes": run(&["log", "-5", "--oneline", "--stat"])?}),
+    )
+}
+
+/// Dialogue workflow labels are not model roles. Selection happens only once
+/// each complete side's brief exists; no model pin is printed by this command.
+pub struct DialoguePair;
+impl crate::dialogue::PairFilter for DialoguePair {
+    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String> {
+        crate::dialogue::same_role(drafter, critic)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorRow {
+    pub ok: Option<bool>,
+    pub label: String,
+    pub detail: String,
+}
+pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
+    let config = parse_launch_config(&ctx.config_dir)?;
+    let valid = validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?).and_then(|()| {
+        crate::routing::Policy::read(&ctx.config_dir.join("routing.json"))?
+            .validate_recipes(&config.recipes)
+    });
+    Ok(vec![
+        DoctorRow {
+            ok: Some(valid.is_ok()),
+            label: "recipes".into(),
+            detail: valid.err().map(|e| format!("{e:#}")).unwrap_or_else(|| {
+                format!(
+                    "{} model recipes; Jev chooses from the full brief",
+                    config.recipes.len()
+                )
+            }),
+        },
+        DoctorRow {
+            ok: Some(
+                ctx.env
+                    .var("TYPESAFE_API_KEY")
+                    .is_some_and(|k| !k.trim().is_empty()),
+            ),
+            label: "Jev".into(),
+            detail: "TYPESAFE_API_KEY must be set in the dispatch process environment".into(),
+        },
+    ])
+}
 /// The kinds `herdr agent start` accepts, read from its `--help`.
 pub fn agent_kinds(env: &Env, runner: &dyn Runner) -> Result<BTreeSet<String>> {
     let bin = env.herdr_bin();
@@ -390,66 +412,6 @@ pub fn parse_kinds(help: &str) -> Option<BTreeSet<String>> {
         .filter(|kind| !kind.is_empty())
         .collect();
     if kinds.is_empty() { None } else { Some(kinds) }
-}
-
-/// Validate the table before any tab or worktree exists.
-pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Result<()> {
-    for (id, recipe) in &config.recipes {
-        if is_unresolved_inline(id) {
-            continue;
-        }
-        let kind = recipe.kind.trim();
-        if kind.is_empty() {
-            bail!("recipe_kind_unknown: recipe `{id}` has no kind");
-        }
-        if !kinds.contains(kind) {
-            bail!(
-                "recipe_kind_unknown: recipe `{id}` uses kind {kind:?}, which `herdr agent start` does not accept"
-            );
-        }
-        validate_flags(id, recipe)?;
-    }
-    for (name, role) in &config.roles {
-        if NEVER_RESOLVED.contains(&name.as_str()) {
-            continue;
-        }
-        if role.default.is_empty() {
-            bail!("role_default_missing: [roles.{name}] has no default");
-        }
-        if !role.allowed.contains(&role.default) {
-            bail!(
-                "role_default_not_allowed: [roles.{name}] default `{}` is not in allowed",
-                role.default
-            );
-        }
-        let mut seen = BTreeSet::new();
-        for id in &role.allowed {
-            let recipe = config
-                .recipes
-                .get(id)
-                .with_context(|| format!("recipe_unknown: [roles.{name}] names `{id}`"))?;
-            if !recipe.enabled {
-                bail!(
-                    "recipe_disabled: `{id}` is enabled = false but is in [roles.{name}].allowed"
-                );
-            }
-            if !seen.insert(id.clone()) {
-                bail!("recipe_duplicate: [roles.{name}] names `{id}` twice");
-            }
-        }
-        for id in &role.escalate {
-            if !config.recipes.contains_key(id) {
-                bail!("recipe_unknown: [roles.{name}] escalate names `{id}`");
-            }
-        }
-    }
-    check_reasons_are_plain(config)
-}
-
-fn is_unresolved_inline(id: &str) -> bool {
-    NEVER_RESOLVED
-        .iter()
-        .any(|role| format!("{role}_inline") == id)
 }
 
 fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
@@ -487,27 +449,6 @@ fn check_effort(id: &str, args: &[&str], known: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Every `plain` phrase and every rendered reason must pass the plain check.
-fn check_reasons_are_plain(config: &LaunchConfig) -> Result<()> {
-    for (id, recipe) in &config.recipes {
-        check_plain(&format!("recipe {id} plain phrase"), &recipe.plain)?;
-    }
-    for (name, role) in &config.roles {
-        for id in &role.allowed {
-            let Some(recipe) = config.recipes.get(id) else {
-                continue;
-            };
-            for sentence in [
-                pinned_reason(name, &recipe.plain),
-                usual_reason(name, &recipe.plain),
-            ] {
-                check_plain(name, &sentence)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn check_plain(context: &str, sentence: &str) -> Result<()> {
     let result = plain::check(sentence, &Glossary::default());
     if !result.passed() {
@@ -522,21 +463,6 @@ fn check_plain(context: &str, sentence: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// The `--model` value of a recipe's args, from `--model <v>` or `model=<v>`.
-pub fn model_value(args: &[&str]) -> Option<String> {
-    let mut index = 0;
-    while index < args.len() {
-        if args[index] == "--model" {
-            return args.get(index + 1).map(|value| (*value).to_string());
-        }
-        if let Some(value) = args[index].strip_prefix("model=") {
-            return Some(value.to_string());
-        }
-        index += 1;
-    }
-    None
 }
 
 fn effort_value(args: &[&str]) -> Option<String> {
@@ -588,797 +514,5 @@ pub fn compact_reason(role: &str, plain: &str) -> String {
     match sentence[..end].rfind(char::is_whitespace) {
         Some(pos) if pos > 0 => sentence[..pos].trim_end().to_string(),
         _ => sentence[..end].trim_end().to_string(),
-    }
-}
-
-/// The pair filter for `dialogue start`: drop every recipe whose model equals
-/// the sibling's (kind alone is not the model).
-pub fn pair_filter(
-    allowed: &[String],
-    recipes: &BTreeMap<String, Recipe>,
-    sibling: Option<&Launch>,
-) -> Vec<String> {
-    let Some(sibling) = sibling else {
-        return allowed.to_vec();
-    };
-    let sibling_model = model_value(&sibling.args.iter().map(String::as_str).collect::<Vec<_>>());
-    let Some(sibling_model) = sibling_model else {
-        return allowed.to_vec();
-    };
-    allowed
-        .iter()
-        .filter(|id| {
-            recipes.get(*id).is_none_or(|recipe| {
-                model_value(&recipe.args.iter().map(String::as_str).collect::<Vec<_>>())
-                    .is_none_or(|model| model != sibling_model)
-            })
-        })
-        .cloned()
-        .collect()
-}
-
-/// The pair filter `dialogue start` uses: the critic role must keep an allowed
-/// row whose model differs from the drafter's default, and that row is pinned
-/// on the critic's start line. Pro is adopted, never launched, so it pairs
-/// with any drafter.
-pub struct DialoguePair(pub LaunchConfig);
-
-impl crate::dialogue::PairFilter for DialoguePair {
-    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<Option<String>, String> {
-        crate::dialogue::same_role(drafter, critic)?;
-        if NEVER_RESOLVED.contains(&critic) {
-            return Ok(None);
-        }
-        let config = &self.0;
-        let row = |name: &str| {
-            config
-                .roles
-                .get(name)
-                .ok_or_else(|| format!("role_unknown: `{name}`"))
-        };
-        let (_, drafted) =
-            role_default(config, row(drafter)?, drafter, None).map_err(|e| format!("{e:#}"))?;
-        let sibling = Launch {
-            kind: drafted.kind,
-            args: drafted.args,
-            ..Launch::default()
-        };
-        role_default(config, row(critic)?, critic, Some(&sibling))
-            .map(|(id, _)| Some(id))
-            .map_err(|e| format!("{e:#}"))
-    }
-}
-
-/// What `resolve_launch` needs from the verb.
-#[derive(Debug, Default, Clone)]
-pub struct ResolveInput<'a> {
-    pub role: &'a str,
-    /// `--recipe <id>`: pins one row from the role's `allowed` list.
-    pub recipe: Option<&'a str>,
-    /// PROJECT.md front matter `kind`/`args` pin.
-    pub project_pin: Option<Recipe>,
-    /// The drafter's resolved launch for a `dialogue start` critic.
-    pub sibling: Option<&'a Launch>,
-}
-
-/// Resolve one launch before any tab or worktree exists.
-pub fn resolve_launch(ctx: &Ctx, input: &ResolveInput) -> Result<Launch> {
-    // Pro is started by pro-mcp and adopted; the coordinator is opened by
-    // `open`. Neither is ever launched from the table.
-    if NEVER_RESOLVED.contains(&input.role) {
-        bail!(
-            "role_not_resolved: role `{}` is never launched from the roles table",
-            input.role
-        );
-    }
-    let config = parse_launch_config(&ctx.config_dir)?;
-    let kinds = agent_kinds(ctx.env, ctx.runner)?;
-    validate_config(&config, &kinds)?;
-    // The role row is the one machine switch (SPEC-remote §4.1). An empty
-    // role row keeps the launch local.
-    let role_machine = config
-        .roles
-        .get(input.role)
-        .map(|row| row.machine.clone())
-        .unwrap_or_default();
-    let finish = |mut launch: Launch| -> Launch {
-        launch.machine = role_machine.clone();
-        launch
-    };
-
-    // A `--recipe <id>` pin.
-    if let Some(id) = input.recipe {
-        let recipe = config
-            .recipes
-            .get(id)
-            .with_context(|| format!("recipe_unknown: `{id}`"))?;
-        let role = config
-            .roles
-            .get(input.role)
-            .with_context(|| format!("role_unknown: `{}`", input.role))?;
-        if !role.allowed.contains(&id.to_string()) {
-            bail!(
-                "recipe_not_allowed: `{id}` is not in the allowed list of role `{}`",
-                input.role
-            );
-        }
-        let mut launch = launch_from(recipe, &config.policy_hash, input.role);
-        launch.recipe_id = id.to_string();
-        launch.reason = pinned_reason(input.role, &recipe.plain);
-        return Ok(finish(launch));
-    }
-
-    let role = config
-        .roles
-        .get(input.role)
-        .with_context(|| format!("role_unknown: `{}`", input.role))?
-        .clone();
-    let default_id = role.default.clone();
-    let default_recipe = config
-        .recipes
-        .get(&default_id)
-        .with_context(|| {
-            format!(
-                "recipe_unknown: [roles.{}] default `{default_id}`",
-                input.role
-            )
-        })?
-        .clone();
-
-    // A PROJECT.md front matter pin for this role.
-    if let Some(pin) = &input.project_pin {
-        if !pin.kind.trim().is_empty() && pin.kind != default_recipe.kind && pin.args.is_empty() {
-            bail!(
-                "role_args_missing: [roles.{}] kind changes without args",
-                input.role
-            );
-        }
-        if !kinds.contains(pin.kind.trim()) {
-            bail!(
-                "recipe_kind_unknown: the PROJECT.md pin for role `{}` uses kind {:?}",
-                input.role,
-                pin.kind
-            );
-        }
-        // A pin that keeps the kind and gives no args keeps the default's args.
-        let mut pin = pin.clone();
-        if pin.kind.trim().is_empty() {
-            pin.kind = default_recipe.kind.clone();
-        }
-        if pin.args.is_empty() {
-            pin.args = default_recipe.args.clone();
-        }
-        validate_flags(&format!("{}_project", input.role), &pin)?;
-        let pin = &pin;
-        let plain = if pin.plain.trim().is_empty() {
-            &default_recipe.plain
-        } else {
-            &pin.plain
-        };
-        let mut launch = launch_from(pin, &config.policy_hash, input.role);
-        launch.recipe_id = format!("{}_project", input.role);
-        launch.reason = pinned_reason(input.role, plain);
-        launch.compact_reason = compact_reason(input.role, plain);
-        return Ok(finish(launch));
-    }
-
-    // The role's default after the pair filter.
-    let (id, recipe) = role_default(&config, &role, input.role, input.sibling)?;
-    Ok(finish(default_launch(
-        &recipe,
-        &id,
-        &config.policy_hash,
-        input.role,
-    )))
-}
-
-/// The role's default after the pair filter: the first remaining allowed row
-/// in file order when the filter removed it.
-fn role_default(
-    config: &LaunchConfig,
-    role: &RoleConfig,
-    name: &str,
-    sibling: Option<&Launch>,
-) -> Result<(String, Recipe)> {
-    let allowed = pair_filter(&role.allowed, &config.recipes, sibling);
-    let id = if allowed.contains(&role.default) {
-        role.default.clone()
-    } else {
-        allowed.first().cloned().with_context(|| {
-            format!("dialogue_same_model: only the drafter's model remains for role `{name}`")
-        })?
-    };
-    let recipe = config
-        .recipes
-        .get(&id)
-        .with_context(|| format!("recipe_unknown: `{id}`"))?
-        .clone();
-    Ok((id, recipe))
-}
-
-fn launch_from(recipe: &Recipe, policy_hash: &str, role: &str) -> Launch {
-    Launch {
-        kind: recipe.kind.clone(),
-        args: recipe.args.clone(),
-        env: recipe.env.clone(),
-        ready_timeout_ms: recipe.ready_timeout_ms,
-        policy_hash: policy_hash.to_string(),
-        attempt: 1,
-        brief_hash: String::new(),
-        skill_hash: crate::thread::sha256_hex(crate::lane::skill_text(role).as_bytes()),
-        recipe_id: String::new(),
-        reason: String::new(),
-        compact_reason: compact_reason(role, &recipe.plain),
-        machine: String::new(),
-    }
-}
-
-fn default_launch(recipe: &Recipe, id: &str, policy_hash: &str, role: &str) -> Launch {
-    let mut launch = launch_from(recipe, policy_hash, role);
-    launch.recipe_id = id.to_string();
-    launch.reason = usual_reason(role, &recipe.plain);
-    launch
-}
-
-/// One `doctor` row: `ok` is `Some(true)`/`Some(false)`/`None` (warn), the
-/// same three marks `doctor` prints.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DoctorRow {
-    pub ok: Option<bool>,
-    pub label: String,
-    pub detail: String,
-}
-
-/// The recipe and role rows for `doctor`.
-pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
-    let config = parse_launch_config(&ctx.config_dir)?;
-    let mut rows = Vec::new();
-    for name in &config.inline_without_plain {
-        rows.push(DoctorRow {
-            ok: None,
-            label: format!("role {name}"),
-            detail: format!(
-                "[roles.{name}] has no plain phrase; the board says \"the usual helper\" until you add one"
-            ),
-        });
-    }
-    table_rows(ctx, &config, &mut rows);
-    Ok(rows)
-}
-
-fn table_rows(ctx: &Ctx, config: &LaunchConfig, rows: &mut Vec<DoctorRow>) {
-    match agent_kinds(ctx.env, ctx.runner) {
-        Ok(kinds) => match validate_config(config, &kinds) {
-            Ok(()) => rows.push(DoctorRow {
-                ok: Some(true),
-                label: "recipes".into(),
-                detail: format!("{} recipe(s) valid", config.recipes.len()),
-            }),
-            Err(error) => rows.push(DoctorRow {
-                ok: Some(false),
-                label: "recipes".into(),
-                detail: format!("{error:#}"),
-            }),
-        },
-        Err(error) => rows.push(DoctorRow {
-            ok: None,
-            label: "recipes".into(),
-            detail: format!("{error:#}"),
-        }),
-    }
-
-    let mut checked_kinds = BTreeSet::new();
-    for recipe in config.recipes.values().filter(|recipe| recipe.enabled) {
-        let kind = recipe.kind.trim();
-        if kind.is_empty() || !checked_kinds.insert(kind.to_string()) {
-            continue;
-        }
-        let exe = kind_executable(kind);
-        // The machine's own login shell, never a hard-coded zsh (SPEC-remote
-        // §3.3): zsh is absent on the box.
-        let output = ctx.runner.run(
-            &Cmd::new(crate::pi::sh::shell(), HELP_TIMEOUT)
-                .args(["-lic", &format!("command -v {exe}")]),
-        );
-        match output {
-            Ok(output) if output.success() && !output.stdout.trim().is_empty() => {
-                rows.push(DoctorRow {
-                    ok: Some(true),
-                    label: format!("kind {kind}"),
-                    detail: output.stdout.trim().to_string(),
-                })
-            }
-            _ => rows.push(DoctorRow {
-                ok: None,
-                label: format!("kind {kind}"),
-                detail: format!("`{exe}` was not found; the launch will fail for this kind"),
-            }),
-        }
-    }
-
-    let codex_in_a_list = config.roles.values().any(|role| {
-        role.default.starts_with("codex_")
-            || role.escalate.iter().any(|id| id.starts_with("codex_"))
-            || role.allowed.iter().any(|id| id.starts_with("codex_"))
-    });
-    if codex_in_a_list {
-        rows.push(DoctorRow {
-            ok: None,
-            label: "codex quota".into(),
-            detail: "Codex usage is not visible to the plugin; disable the recipe by hand when its weekly use runs out"
-                .into(),
-        });
-    }
-    for (id, recipe) in &config.recipes {
-        if id.contains("astra") && recipe.enabled {
-            rows.push(DoctorRow {
-                ok: None,
-                label: format!("recipe {id}"),
-                detail: "the hardest problem helper is enabled; Codex weekly use is not visible to the plugin"
-                    .into(),
-            });
-        }
-    }
-}
-
-/// The executable a kind starts, for the doctor's `command -v`.
-pub fn kind_executable(kind: &str) -> &str {
-    match kind {
-        "cursor" => "cursor-agent",
-        other => other,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runner::fake::ok;
-    use crate::scenarios::World;
-
-    const KINDS_HELP: &str = "Options:\n      --kind <KIND>\n          [possible values: pi, claude, codex, gemini, cursor, devin, agy, opencode, kimi, muse]\n";
-
-    fn config_text() -> String {
-        r#"
-[recipes.cursor_grok_xhigh]
-kind = "cursor"
-provider = "cursor"
-args = ["--model", "cursor-grok-4.6-xhigh", "--force"]
-env = []
-ready_timeout_ms = 30000
-plain = "the usual coding helper"
-
-[recipes.claude_opus_high]
-kind = "claude"
-provider = "claude"
-args = ["--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"]
-env = []
-ready_timeout_ms = 90000
-plain = "the strongest design helper"
-
-[roles.lane]
-default = "cursor_grok_xhigh"
-allowed = ["cursor_grok_xhigh"]
-escalate = ["claude_opus_high"]
-"#
-        .to_string()
-    }
-
-    fn world() -> (World, String) {
-        let world = World::new();
-        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
-        std::fs::write(world.home.path().join("cfg/config.toml"), config_text()).unwrap();
-        world.runner.on("agent start --help", ok(KINDS_HELP));
-        (world, "write the parser".to_string())
-    }
-
-    fn run(world: &World, recipe: Option<&str>) -> Result<Launch> {
-        resolve_launch(
-            &world.ctx(),
-            &ResolveInput {
-                role: "lane",
-                recipe,
-                ..ResolveInput::default()
-            },
-        )
-    }
-
-    #[test]
-    fn the_role_default_launches() {
-        let (world, _task) = world();
-        let launch = run(&world, None).unwrap();
-        assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
-        assert_eq!(launch.kind, "cursor");
-        assert_eq!(
-            launch.reason,
-            "this task runs on the usual coding helper, the usual choice."
-        );
-        assert_eq!(
-            launch.compact_reason,
-            "this task runs on the usual coding helper"
-        );
-    }
-
-    #[test]
-    fn a_recipe_pin_uses_the_allowed_row() {
-        let (world, _task) = world();
-        let launch = run(&world, Some("cursor_grok_xhigh")).unwrap();
-        assert_eq!(launch.recipe_id, "cursor_grok_xhigh");
-        assert_eq!(
-            launch.reason,
-            "You chose the usual coding helper for this task."
-        );
-    }
-
-    #[test]
-    fn a_recipe_outside_the_allowed_list_is_refused() {
-        let (world, _task) = world();
-        let error = run(&world, Some("claude_opus_high")).unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_not_allowed"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn a_project_pin_keeps_the_default_plain_and_refuses_an_unknown_kind() {
-        let (world, _task) = world();
-        let ctx = world.ctx();
-        let pin = Recipe {
-            kind: "claude".into(),
-            args: vec![
-                "--model".into(),
-                "claude-opus-5".into(),
-                "--effort".into(),
-                "high".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-            ..Recipe::default()
-        };
-        let launch = resolve_launch(
-            &ctx,
-            &ResolveInput {
-                role: "lane",
-                project_pin: Some(pin),
-                ..ResolveInput::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(launch.kind, "claude");
-        assert_eq!(
-            launch.reason,
-            "You chose the usual coding helper for this task."
-        );
-
-        let pin = Recipe {
-            kind: "nope".into(),
-            args: vec!["--x".into()],
-            ..Recipe::default()
-        };
-        let error = resolve_launch(
-            &ctx,
-            &ResolveInput {
-                role: "lane",
-                project_pin: Some(pin),
-                ..ResolveInput::default()
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_kind_unknown"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn a_project_pin_passes_the_flag_checks() {
-        let (world, _task) = world();
-        let ctx = world.ctx();
-        let resolve = |pin: Recipe| {
-            resolve_launch(
-                &ctx,
-                &ResolveInput {
-                    role: "lane",
-                    project_pin: Some(pin),
-                    ..ResolveInput::default()
-                },
-            )
-        };
-        let launch = resolve(Recipe {
-            kind: "cursor".into(),
-            ..Recipe::default()
-        })
-        .unwrap();
-        assert_eq!(
-            launch.args,
-            ["--model", "cursor-grok-4.6-xhigh", "--force"],
-            "{launch:?}"
-        );
-        let error = resolve(Recipe {
-            kind: "claude".into(),
-            ..Recipe::default()
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("role_args_missing"), "{error:#}");
-        let error = resolve(Recipe {
-            kind: "cursor".into(),
-            args: vec!["--model".into(), "cursor-grok-4.6-xhigh".into()],
-            ..Recipe::default()
-        })
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_permission_missing"),
-            "{error:#}"
-        );
-        // Opus at xhigh is allowed now; only an unknown effort fails.
-        resolve(Recipe {
-            kind: "claude".into(),
-            args: vec![
-                "--model".into(),
-                "claude-opus-5".into(),
-                "--effort".into(),
-                "xhigh".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-            ..Recipe::default()
-        })
-        .unwrap();
-        let error = resolve(Recipe {
-            kind: "claude".into(),
-            args: vec![
-                "--model".into(),
-                "claude-opus-5".into(),
-                "--effort".into(),
-                "turbo".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-            ..Recipe::default()
-        })
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_effort_unknown"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn pro_and_the_coordinator_never_resolve() {
-        let (world, _task) = world();
-        let ctx = world.ctx();
-        for role in ["pro", "coordinator"] {
-            let error = resolve_launch(
-                &ctx,
-                &ResolveInput {
-                    role,
-                    ..ResolveInput::default()
-                },
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("role_not_resolved"), "{error:#}");
-        }
-    }
-
-    #[test]
-    fn builtin_research_and_planner_roles_resolve() {
-        let world = World::new();
-        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
-        world.runner.on("agent start --help", ok(KINDS_HELP));
-        let ctx = world.ctx();
-        let research = resolve_launch(
-            &ctx,
-            &ResolveInput {
-                role: "research",
-                ..ResolveInput::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(research.recipe_id, "agy_gemini_flash");
-        assert_eq!(research.kind, "agy");
-        let planner = resolve_launch(
-            &ctx,
-            &ResolveInput {
-                role: "planner",
-                ..ResolveInput::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(planner.recipe_id, "claude_fable_xhigh");
-        assert_eq!(planner.kind, "claude");
-        assert!(planner.args.contains(&"xhigh".to_string()));
-    }
-
-    #[test]
-    fn a_removed_picker_key_is_a_named_error() {
-        let home = tempfile::tempdir().unwrap();
-        for text in [
-            "[roles]\nresolver = \"off\"\n",
-            "[roles]\njev_daily_cap = 200\n[roles.lane]\ndefault = \"x\"\nallowed = [\"x\"]\n",
-            "[recipes.x]\nkind = \"claude\"\ncost = \"upgrade\"\n",
-            "[roles.lane]\ndefault = \"x\"\nallowed = [\"x\"]\n[[roles.lane.gates]]\nrecipe = \"x\"\n",
-        ] {
-            std::fs::write(home.path().join("config.toml"), text).unwrap();
-            let error = parse_launch_config(home.path()).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("picker_removed"),
-                "{text}: {error:#}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_role_may_not_mix_an_inline_row_with_a_reference() {
-        let mut roles = BTreeMap::new();
-        roles.insert(
-            "lane".to_string(),
-            toml::Value::Table(
-                toml::from_str::<toml::Table>("kind = \"claude\"\ndefault = \"x\"\n").unwrap(),
-            ),
-        );
-        let raw = RawConfig {
-            roles,
-            recipes: BTreeMap::new(),
-        };
-        let raw_role: RawRole = raw.roles.into_iter().next().unwrap().1.try_into().unwrap();
-        let error = parse_role("lane", raw_role, &mut BTreeMap::new()).unwrap_err();
-        assert!(error.to_string().contains("role_form_mixed"), "{error:#}");
-    }
-
-    #[test]
-    fn a_d2_inline_role_becomes_its_own_recipe() {
-        let mut recipes = BTreeMap::new();
-        let raw = RawRole {
-            kind: Some("claude".into()),
-            args: Some(vec!["--dangerously-skip-permissions".into()]),
-            ..RawRole::default()
-        };
-        let role = parse_role("lane", raw, &mut recipes).unwrap();
-        assert_eq!(role.default, "lane_inline");
-        assert_eq!(role.allowed, ["lane_inline"]);
-        assert_eq!(recipes["lane_inline"].kind, "claude");
-        assert_eq!(recipes["lane_inline"].plain, "the usual helper");
-    }
-
-    #[test]
-    fn the_reason_templates_are_plain_and_the_compact_form_fits() {
-        let glossary = Glossary::default();
-        for sentence in [
-            usual_reason("lane", "the usual coding helper"),
-            pinned_reason("reviewer", "the strongest design helper"),
-            usual_reason("research", "the web research helper"),
-            usual_reason("planner", "the planning helper"),
-        ] {
-            let result = plain::check(&sentence, &glossary);
-            assert!(result.passed(), "{sentence}: {:?}", result.violations);
-        }
-        let compact = compact_reason("lane", "the web research helper");
-        assert_eq!(compact, "this task runs on the web research helper");
-        assert!(compact.len() <= COMPACT_LIMIT);
-        let long = compact_reason("lane", &"helper ".repeat(30));
-        assert!(long.len() <= COMPACT_LIMIT, "{long}");
-    }
-
-    #[test]
-    fn the_critic_pair_filter_drops_the_drafters_model() {
-        let sibling = Launch {
-            args: vec!["--model".into(), "cursor-grok-4.6-xhigh".into()],
-            ..Launch::default()
-        };
-        let allowed = vec![
-            "cursor_grok_xhigh".to_string(),
-            "claude_opus_high".to_string(),
-        ];
-        let mut recipes = BTreeMap::new();
-        recipes.insert(
-            "cursor_grok_xhigh".into(),
-            Recipe {
-                args: vec!["--model".into(), "cursor-grok-4.6-xhigh".into()],
-                ..Recipe::default()
-            },
-        );
-        recipes.insert(
-            "claude_opus_high".into(),
-            Recipe {
-                args: vec!["--model".into(), "claude-opus-5".into()],
-                ..Recipe::default()
-            },
-        );
-        assert_eq!(
-            pair_filter(&allowed, &recipes, Some(&sibling)),
-            ["claude_opus_high"]
-        );
-        assert_eq!(pair_filter(&allowed, &recipes, None), allowed);
-
-        use crate::dialogue::PairFilter;
-        let row = |default: &str| RoleConfig {
-            default: default.into(),
-            allowed: allowed.clone(),
-            ..RoleConfig::default()
-        };
-        let mut config = parse_launch_config(Path::new("/nonexistent")).unwrap();
-        config.recipes = recipes;
-        config
-            .roles
-            .insert("drafter".into(), row("cursor_grok_xhigh"));
-        config
-            .roles
-            .insert("critic".into(), row("cursor_grok_xhigh"));
-        let pair = DialoguePair(config);
-        assert_eq!(
-            pair.check("drafter", "critic").unwrap().as_deref(),
-            Some("claude_opus_high")
-        );
-        assert_eq!(pair.check("drafter", "pro").unwrap(), None);
-        assert!(
-            pair.check("drafter", "ghost")
-                .unwrap_err()
-                .contains("role_unknown")
-        );
-    }
-
-    #[test]
-    fn validation_refuses_bad_tables() {
-        let kinds = parse_kinds(KINDS_HELP).unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("config.toml"), config_text()).unwrap();
-        let mut config = parse_launch_config(home.path()).unwrap();
-
-        let mut bad = config.clone();
-        bad.recipes.get_mut("cursor_grok_xhigh").unwrap().kind = "nope".into();
-        let error = validate_config(&bad, &kinds).unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_kind_unknown"),
-            "{error:#}"
-        );
-
-        let mut bad = config.clone();
-        bad.recipes.get_mut("cursor_grok_xhigh").unwrap().args =
-            vec!["--model".into(), "cursor-grok-4.6-xhigh".into()];
-        let error = validate_config(&bad, &kinds).unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_permission_missing"),
-            "{error:#}"
-        );
-
-        let mut bad = config.clone();
-        bad.roles.get_mut("lane").unwrap().default = "claude_opus_high".into();
-        bad.roles.get_mut("lane").unwrap().allowed = vec!["cursor_grok_xhigh".into()];
-        let error = validate_config(&bad, &kinds).unwrap_err();
-        assert!(
-            error.to_string().contains("role_default_not_allowed"),
-            "{error:#}"
-        );
-
-        config.recipes.get_mut("cursor_grok_xhigh").unwrap().plain = "the zorbulate helper".into();
-        let error = validate_config(&config, &kinds).unwrap_err();
-        assert!(
-            error.to_string().contains("recipe_reason_not_plain"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn doctor_warns_on_an_inline_role_without_plain_and_lists_recipes() {
-        let world = World::new();
-        std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
-        std::fs::write(
-            world.home.path().join("cfg/config.toml"),
-            "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\n\n[roles.pro]\nkind = \"chatgpt\"\n",
-        )
-        .unwrap();
-        world.runner.on("agent start --help", ok(KINDS_HELP));
-        world.runner.on_fn(
-            |cmd| cmd.display().contains("zsh -lic"),
-            |_| Ok(ok("/usr/local/bin/claude\n")),
-        );
-        let ctx = world.ctx();
-        let config = parse_launch_config(&ctx.config_dir).unwrap();
-        assert_eq!(config.inline_without_plain, ["lane"]);
-        let rows = doctor_rows(&ctx).unwrap();
-        let lane = rows.iter().find(|row| row.label == "role lane").unwrap();
-        assert_eq!(lane.ok, None, "{lane:?}");
-        assert!(
-            rows.iter()
-                .any(|row| row.label == "recipes" && row.ok == Some(true)),
-            "{rows:?}"
-        );
     }
 }

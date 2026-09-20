@@ -18,6 +18,16 @@ herdr-pro image --prompt-file <file> --size <WxH> --out <png> [--with <png>]...
 
 The command starts (or reuses) a picture lane on Codex's own backend, spends one Codex turn, and saves the PNG to `--out`; it takes a few minutes. Attach a screenshot or reference picture with `--with <png>` (up to four) instead of describing it. Ask for a picture only when the brief says pictures are wanted. Name the exact pixel size in `--size`; if the tool only offers fixed sizes it picks the nearest and says which one it used.
 
+## If this attempt fails
+
+When your approach fails and a stronger model is needed, preserve the worktree and run:
+
+```text
+hp failed "<what failed, what you tried, and the evidence>"
+```
+
+This seals a failure event. The harness scores the full brief again with that failure, records the upgrade, and starts a stronger model in the same worktree. No settings edit or permission step is needed. Do not keep editing after sealing it. The ladder stops after at most three upgrades or when no stronger model remains. Research, spec, Claude-required and user-pinned work keep their fixed model and report the refusal instead. Use `waiting` for missing input, not for a failed approach.
+
 ## Finish
 
 Commit the finished work, write the report named by your brief, then run:
@@ -41,5 +51,5 @@ A brief that says you run on the cloud box named `oci` runs on a saved machine, 
 - The brief was committed on the Mac's integration branch as `B` and reaches the box through your lane branch. Read `tasks/<id>.md` in your checkout; there is no `brief.md`.
 - Every kind logs in once per machine. If your kind is not signed in on the box, stop and run `ha waiting "<kind> is not signed in on the box"`; never copy a Mac credential across.
 - Publish before done: commit your code, push the lane branch to the URL-matched remote, then run `ha done`. A `done` without the published ref is refused.
-- `ha done` and `ha waiting` seal locally on the box. They do not deliver to the coordinator; the Mac courier carries the sealed event home.
+- `ha done`, `ha waiting` and `ha failed` seal locally on the box. They do not deliver to the coordinator; the Mac courier carries the sealed event home.
 - After a reboot or a resize the old attempt is GONE. The coordinator restarts you from the exact start line in the brief; never resume a cold shell.

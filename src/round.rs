@@ -1019,7 +1019,19 @@ fn start_reviewer(
 ) -> Result<thread::Thread> {
     let record = load(project, round)?;
     let git = Git::new(ctx.runner, &record.repo);
-    let task = reviewer_task(project, &record, prefix, &git)?;
+    let mut task = reviewer_task(project, &record, prefix, &git)?;
+    // Selection sees the actual review package, not a one-line instruction
+    // naming a file it cannot read. Include the committed brief and diff.
+    task.push_str("\n## Review brief\n\n");
+    task.push_str(&git.run(&[
+        "show",
+        &format!("{review_branch}:{}", review_brief_path(round)),
+    ])?);
+    task.push_str("\n## Changes under review\n\n");
+    for member in &record.manifest.members {
+        let pin = member.pin.as_ref().context("round_not_complete")?;
+        task.push_str(&git.run(&["diff", &format!("{}...{}", record.branch, pin.sha), "--"])?);
+    }
     crate::threads::start_during_advance(
         ctx,
         &project.slug,
@@ -1030,8 +1042,7 @@ fn start_reviewer(
             base: Some(review_branch.to_string()),
             task,
             plain: record.plain.clone(),
-            role: Some("reviewer".into()),
-            recipe: None,
+            workflow: Some("reviewer".into()),
         },
     )
 }
@@ -2571,6 +2582,7 @@ pub mod testkit {
                         artifact,
                     }),
                     waiting: None,
+                    failed: None,
                 },
             )
         }
@@ -2583,6 +2595,7 @@ pub mod testkit {
                 EventPayload {
                     done: None,
                     waiting: Some(WaitingPayload { text: text.into() }),
+                    failed: None,
                 },
             )
         }
@@ -2729,7 +2742,7 @@ mod tests {
         std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
         std::fs::write(
             fx.world.home.path().join("cfg/config.toml"),
-            "[roles.reviewer]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
+            "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
         )
         .unwrap();
         fx.world.runner.on(
@@ -3466,6 +3479,24 @@ mod tests {
         let started = thread::load(&fx.project, &reviewer).unwrap();
         assert_eq!(started.role, "reviewer");
         assert_eq!(started.title, format!("Review r1: {PLAIN}"));
+        assert_eq!(started.launch.recipe_id, "test_claude");
+        assert_eq!(
+            fx.world.runner.count("/usr/bin/curl"),
+            1,
+            "review uses the task scorer"
+        );
+        let calls = fx.world.runner.calls.borrow();
+        let curl = calls.iter().find(|c| c.program == "/usr/bin/curl").unwrap();
+        let encoded = curl
+            .stdin
+            .as_ref()
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("data = "))
+            .unwrap();
+        let body: String = serde_json::from_str(encoded).unwrap();
+        assert!(body.contains("Review brief") && body.contains("Changes under review"));
+        drop(calls);
         assert!(!started.base.is_empty(), "the reviewer has a base commit");
 
         let task = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer)).unwrap();
