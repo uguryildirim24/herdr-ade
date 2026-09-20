@@ -71,12 +71,23 @@ fn load(project: &Project) -> Result<State> {
             .with_context(|| format!("ledger.jsonl row {} does not parse", i + 1))?
         {
             Line::Failure(entry) => {
-                if entry.kind != "retry" && !entry.closed {
-                    state
-                        .pending
-                        .insert((entry.kind.clone(), entry.subject.clone()));
-                }
+                let pending_key = (entry.kind.clone(), entry.subject.clone());
+                let is_retry = entry.kind == "retry";
+                let closed = entry.closed;
                 state.entries.insert(entry.id.clone(), entry);
+                if !is_retry {
+                    if !closed {
+                        state.pending.insert(pending_key);
+                    } else if state.pending.contains(&pending_key)
+                        && !state.entries.values().any(|entry| {
+                            !entry.closed
+                                && entry.kind == pending_key.0
+                                && entry.subject == pending_key.1
+                        })
+                    {
+                        state.pending.remove(&pending_key);
+                    }
+                }
             }
             Line::ContextRead { at } => {
                 if time_cmp(&at, &state.context_read).is_gt() {
@@ -359,11 +370,16 @@ impl Runner for RecordingRunner<'_> {
         });
         let result = self.0.run(cmd);
         match &result {
-            Ok(out) if out.success() => PROJECTS.with(|projects| {
-                for project in projects.borrow().iter() {
-                    recovered(project, "command-failed", &subject);
-                }
-            }),
+            Ok(out)
+                if out.success()
+                    || (cmd.nonzero_is_data && out.code.is_some() && !out.timed_out) =>
+            {
+                PROJECTS.with(|projects| {
+                    for project in projects.borrow().iter() {
+                        recovered(project, "command-failed", &subject);
+                    }
+                })
+            }
             Ok(out) => observe_current(
                 "command-failed",
                 &subject,
@@ -409,6 +425,8 @@ mod tests {
         done(&p, &a.id).unwrap();
         assert!(list(&p).unwrap().is_empty());
         assert!(show(&p, &a.id).unwrap().closed);
+        retry_after_failure(&p, "start", "r1");
+        assert!(list(&p).unwrap().is_empty());
         assert_eq!(record(&p, "start", "r1", "bad start").unwrap().count, 3);
         assert_ne!(record(&p, "start", "r2", "bad start").unwrap().id, a.id);
         assert!(done(&p, "missing").is_err());
@@ -477,6 +495,25 @@ mod tests {
     }
 
     #[test]
+    fn closing_one_detail_keeps_another_failure_for_the_same_operation_pending() {
+        let (_root, p) = fixture();
+        let first = record(&p, "start", "r1", "offline").unwrap();
+        let second = record(&p, "start", "r1", "login expired").unwrap();
+        done(&p, &first.id).unwrap();
+        retry_after_failure(&p, "start", "r1");
+        let retry = list(&p)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == "retry")
+            .unwrap();
+        assert_eq!(retry.count, 1);
+
+        done(&p, &second.id).unwrap();
+        retry_after_failure(&p, "start", "r1");
+        assert_eq!(show(&p, &retry.id).unwrap().count, 1);
+    }
+
+    #[test]
     fn broken_journals_are_reported_not_overwritten() {
         let (_root, p) = fixture();
         std::fs::write(p.dir().join("ledger.jsonl"), "{unfinished").unwrap();
@@ -510,7 +547,8 @@ mod tests {
     fn a_real_nonzero_command_is_recorded_without_changing_its_result() {
         let (_root, p) = fixture();
         let _scope = Scope::new(&[&p]);
-        let out = RecordingRunner(&crate::runner::RealRunner)
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        let out = runner
             .run(
                 &Cmd::new("sh", Duration::from_secs(5))
                     .args(["-c", "echo out; echo broken >&2; exit 7"]),
@@ -523,5 +561,15 @@ mod tests {
         assert!(entries[0].subject.contains("sh"));
         assert!(entries[0].detail.contains("broken"));
         assert!(entries[0].detail.contains("out"));
+
+        let probe = runner
+            .run(
+                &Cmd::new("sh", Duration::from_secs(5))
+                    .args(["-c", "exit 1"])
+                    .nonzero_is_data(),
+            )
+            .unwrap();
+        assert_eq!(probe.code, Some(1));
+        assert_eq!(list(&p).unwrap().len(), 1);
     }
 }

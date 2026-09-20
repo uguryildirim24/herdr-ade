@@ -40,8 +40,9 @@ Malformed or torn journal rows produce an error; they are never silently dropped
 ## Observation sites
 
 - CLI failures and nonzero, timed-out, or unspawnable child commands through the
-  ADE runner, preserving their original outcomes. Child evidence includes argv,
-  exit status, stdout and stderr, but not environment or stdin.
+  ADE runner, preserving their original outcomes. Predicate commands whose
+  nonzero status is a valid negative answer are not failures. Child evidence
+  includes argv, exit status, stdout and stderr, but not environment or stdin.
 - Failed reviewer starts in `round advance`, even when advance returns success.
 - Merge refusals, including head changes, conflicts and wrong verdicts.
 - Thread error/blocked transitions and failed launches with zero attempts.
