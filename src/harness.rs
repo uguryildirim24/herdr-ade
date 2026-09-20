@@ -204,13 +204,45 @@ fn print_version(ctx: &Ctx, bin: &str) -> Result<()> {
     Ok(())
 }
 
+/// The box's PATH for a build, exported before the zig probe and the cargo
+/// call. The box keeps zig in `$HOME/.local/bin`, which a non-login SSH shell
+/// does not otherwise carry.
+const BOX_BUILD_PATH: &str = "/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin";
+
+/// Resolve the box's zig on the box for a fork build, as a shell snippet.
+///
+/// The repository-local `<box_path>/.target/rebase/zig-0.16.0/zig` wins when it
+/// exists; otherwise a `zig` on PATH. With neither, or with a version other
+/// than 0.16.0, the snippet prints `harness_box_zig_*` on stderr and exits
+/// nonzero, so `box_build` reports it on the `harness_box_failed` line. The Mac
+/// side never runs this: `zig_path` stays the Mac-shaped path there.
+fn box_zig_script(box_path: &str) -> String {
+    format!(
+        "herdr_repo_zig={repo}/.target/rebase/zig-0.16.0/zig\n\
+         if [ -x \"$herdr_repo_zig\" ]; then\n\
+         ZIG=\"$herdr_repo_zig\"\n\
+         elif command -v zig >/dev/null 2>&1; then\n\
+         ZIG=\"$(command -v zig)\"\n\
+         else\n\
+         echo \"harness_box_zig_missing: no zig found: neither $herdr_repo_zig nor a zig on PATH\" >&2\n\
+         exit 1\n\
+         fi\n\
+         herdr_zig_version=\"$(\"$ZIG\" version)\"\n\
+         if [ \"$herdr_zig_version\" != \"0.16.0\" ]; then\n\
+         echo \"harness_box_zig_version: $ZIG reports zig $herdr_zig_version, not 0.16.0\" >&2\n\
+         exit 1\n\
+         fi\n\
+         export ZIG",
+        repo = remote::quote(box_path),
+    )
+}
+
 fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> {
-    let mut env = format!(
-        "PATH=/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin DEVELOPER_DIR={DEVELOPER_DIR}"
-    );
-    if kind == Kind::Fork {
-        env.push_str(&format!(" ZIG={}/.target/rebase/zig-0.16.0/zig", box_path));
-    }
+    let zig = if kind == Kind::Fork {
+        format!("\n{}", box_zig_script(box_path))
+    } else {
+        String::new()
+    };
     let mut installs = String::new();
     for bin in kind.binaries() {
         installs.push_str(&format!(
@@ -224,9 +256,12 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
          cd {path}\n\
          git fetch --quiet\n\
          git merge --ff-only @{{u}}\n\
-         {env} cargo build --release --locked\n\
+         export PATH={build_path}\n\
+         export DEVELOPER_DIR={DEVELOPER_DIR}{zig}\n\
+         cargo build --release --locked\n\
          mkdir -p $HOME/.local/bin{installs}",
         path = remote::quote(box_path),
+        build_path = BOX_BUILD_PATH,
     );
     let out = remote::ssh(ctx.runner, target, &script, None, BOX_BUILD_TIMEOUT)?;
     if !out.success() {
@@ -304,4 +339,134 @@ pub fn install(ctx: &Ctx) -> Result<()> {
         println!("the running server keeps its image; a live handoff is Rolf's call");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::fake::{FakeRunner, ok};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Write an executable `zig` that answers `zig version` with `version`.
+    fn fake_zig(path: &Path, version: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Run the box zig snippet for `box_path` with `path` as PATH and print the
+    /// resolved `ZIG` on success; on failure the snippet's stderr comes back.
+    fn resolve(box_path: &Path, path: &Path) -> std::process::Output {
+        let script = format!(
+            "{}\nprintf '%s\\n' \"$ZIG\"",
+            box_zig_script(box_path.to_str().unwrap())
+        );
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn box_zig_prefers_the_repository_local_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let box_path = root.path().join("herdr");
+        let local = box_path.join(".target/rebase/zig-0.16.0/zig");
+        fake_zig(&local, "0.16.0");
+        let bin = root.path().join("bin");
+        fake_zig(&bin.join("zig"), "0.16.0");
+        let out = resolve(&box_path, &bin);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            local.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn box_zig_falls_back_to_the_box_path() {
+        let root = tempfile::tempdir().unwrap();
+        let box_path = root.path().join("herdr");
+        std::fs::create_dir_all(&box_path).unwrap();
+        let bin = root.path().join("bin");
+        let zig = bin.join("zig");
+        fake_zig(&zig, "0.16.0");
+        let out = resolve(&box_path, &bin);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            zig.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn box_zig_missing_names_both_places() {
+        let root = tempfile::tempdir().unwrap();
+        let box_path = root.path().join("herdr");
+        std::fs::create_dir_all(&box_path).unwrap();
+        let empty = root.path().join("bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        let out = resolve(&box_path, &empty);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("harness_box_zig_missing"), "{stderr}");
+        let local = box_path.join(".target/rebase/zig-0.16.0/zig");
+        assert!(stderr.contains(local.to_str().unwrap()), "{stderr}");
+        assert!(stderr.contains("PATH"), "{stderr}");
+    }
+
+    #[test]
+    fn box_zig_wrong_version_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let box_path = root.path().join("herdr");
+        let local = box_path.join(".target/rebase/zig-0.16.0/zig");
+        fake_zig(&local, "0.15.0");
+        let empty = root.path().join("bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        let out = resolve(&box_path, &empty);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("harness_box_zig_version"), "{stderr}");
+        assert!(stderr.contains("0.15.0"), "{stderr}");
+        assert!(stderr.contains("0.16.0"), "{stderr}");
+    }
+
+    #[test]
+    fn box_build_for_the_fork_resolves_zig_on_the_box() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(""));
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        box_build(&ctx, "box", "/home/ubuntu/projects/herdr", Kind::Fork).unwrap();
+        let calls = runner.calls.borrow();
+        let script = calls.last().unwrap().args.last().unwrap();
+        assert!(script.contains("herdr_repo_zig"), "{script}");
+        assert!(script.contains("command -v zig"), "{script}");
+        assert!(script.contains("harness_box_zig_missing"), "{script}");
+        assert!(script.contains("harness_box_zig_version"), "{script}");
+        assert!(script.contains("export ZIG"), "{script}");
+        assert!(
+            !script.contains("ZIG=/home/ubuntu/projects/herdr/.target"),
+            "{script}"
+        );
+    }
 }
