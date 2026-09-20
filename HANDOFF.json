@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0109.md",
+      "tasks/review-r50.md",
+      "tasks/t-0108.md",
       "tasks/t-0107.md",
       "tasks/review-r49.md",
       "tasks/t-0106.md",
@@ -19,16 +22,14 @@
       "tasks/review-r48.md",
       "tasks/t-0103.md",
       "tasks/review-r47.md",
-      "tasks/t-0101.md",
-      "tasks/t-0102.md",
-      "tasks/review-r46.md",
-      "tasks/t-0100.md"
+      "tasks/t-0101.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r50.md",
       "tasks/reviews/code-r49.md",
       "tasks/reviews/code-r48.md",
       "tasks/reviews/code-r47.md",
@@ -39,15 +40,17 @@
       "tasks/reviews/code-r41.md",
       "tasks/reviews/code-r38.md",
       "tasks/reviews/code-r39.md",
-      "tasks/reviews/code-r35.md",
-      "tasks/reviews/code-r37.md"
+      "tasks/reviews/code-r35.md"
     ]
   },
-  "generated": "2026-09-20T02:47:47-04:00",
+  "generated": "2026-09-20T04:51:42-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0107-review-r49-this-round-checks-that-a-refu",
+      "hp/adeherdr/t-0109-review-r50-this-round-checks-that-a-ques",
       "main",
+      "review/r50",
+      "hp/adeherdr/t-0108-e7-a-question-answered-is-not-a-failure",
+      "hp/adeherdr/t-0107-review-r49-this-round-checks-that-a-refu",
       "review/r49",
       "hp/adeherdr/t-0105-e6-d10-designed-refusals-are-not-failure",
       "hp/adeherdr/t-0106-d9-a-reviewer-on-the-box-can-seal-its-ow",
@@ -182,22 +185,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "a8a46b4 review(ade): record r49 MERGE verdict",
-      "fd38b90 review(ade): cover publication refusal markers and report symlinks",
-      "49ff01d review(ade): merge pinned cloud reviewer publication changes",
-      "15f14da Merge commit '566bcfbc8e073aaa7ea159bf1407946a8f8da4e4' into hp/adeherdr/t-0107-review-r49-this-round-checks-that-a-refu",
-      "5796465 docs(tasks): t-0107",
-      "b7d87d6 review(r49): brief for revision 2"
+      "e94ca28 docs(review): round r50 verdict",
+      "41af076 review(git): keep optional branch queries in the local namespace",
+      "7e40f42 Merge commit '47002d8f9234d828db85fcb8b1ed30bb8cd04ad6' into hp/adeherdr/t-0109-review-r50-this-round-checks-that-a-ques",
+      "a00f467 docs(tasks): t-0109",
+      "5375a97 review(r50): brief for revision 1",
+      "47002d8 fix(ledger): separate probe answers from command failures"
     ],
-    "remote": "10 ahead, 0 behind origin/main",
+    "remote": "7 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "a8a46b4",
+        "head": "e94ca28",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(ade): record r49 MERGE verdict"
+        "subject": "docs(review): round r50 verdict"
       },
       {
         "branch": "review/r1",
@@ -478,6 +481,13 @@
         "head": "008f9ac",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r5",
         "subject": "docs(tasks): t-0012"
+      },
+      {
+        "branch": "review/r50",
+        "dirty": 0,
+        "head": "a00f467",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r50",
+        "subject": "docs(tasks): t-0109"
       },
       {
         "branch": "review/r6",
@@ -954,7 +964,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "working",
+      "status": "done",
       "workspace_id": "w1H"
     },
     {
@@ -971,8 +981,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r49",
-    "verdict": "a8a46b439b7aa55869f8a80121538214abd18e08"
+    "round": "r50",
+    "verdict": "e94ca287f249f0a08dbb56727dd2de45f24353fd"
   },
   "session": "default",
   "unlinked_agents": [],
