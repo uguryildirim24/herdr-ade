@@ -444,7 +444,7 @@ fn record_note(layout: &Layout, turn: &mut Turn, note: Result<(), String>) {
 
 /// The breaker: write the cooldown and drain the bridge so Codex retries get a
 /// local 503. Returns the detail line.
-pub fn trip_breaker(
+fn trip_breaker(
     env: &Env,
     layout: &Layout,
     runner: &dyn Runner,
@@ -545,7 +545,7 @@ fn write_answer(requested: &Path, answer: &str) -> Result<PathBuf> {
 
 /// What the completed turn's events say.
 #[derive(Debug, PartialEq)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     Delivered(String),
     Cooldown(String),
     Failed(String),

@@ -42,7 +42,7 @@ pub const TOOL_OUTPUT_TOKEN_LIMIT: u64 = 60_000;
 pub const PACKET_MAX_BYTES: usize = 200 * 1024;
 pub const PACKET_MAX_TOKENS: u64 = 60_000;
 /// In flight: default 2, hard max 4 (upstream browser cap is 5; never 5).
-pub const INFLIGHT_DEFAULT: usize = 2;
+const INFLIGHT_DEFAULT: usize = 2;
 pub const INFLIGHT_MAX: usize = 4;
 /// Turn timeout: Pro turns can last an hour (fold notes item 3).
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(120 * 60);
@@ -192,7 +192,7 @@ impl Layout {
         self.root.join("lanes")
     }
 
-    pub fn packets(&self) -> PathBuf {
+    fn packets(&self) -> PathBuf {
         self.root.join("packets")
     }
 

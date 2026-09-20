@@ -44,24 +44,24 @@ pub const MODEL_ID: &str = super::provider::MODEL_ID;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The folders the model may read even without `--read-root`.
-pub const DEFAULT_READ_ROOT: &str = "/Users/rolfie/projects";
+const DEFAULT_READ_ROOT: &str = "/Users/rolfie/projects";
 /// One refused path's answer line, whatever the reason.
-pub const REFUSED: &str = "refused: outside the readable folders";
+const REFUSED: &str = "refused: outside the readable folders";
 /// Request rounds served per pi request before the last answer is returned.
-pub const MAX_REQUEST_ROUNDS: usize = 8;
+const MAX_REQUEST_ROUNDS: usize = 8;
 /// One file's text cap; a larger file is cut with a note.
-pub const FILE_MAX_BYTES: usize = 200 * 1024;
+const FILE_MAX_BYTES: usize = 200 * 1024;
 /// One round's combined text cap.
-pub const ROUND_MAX_BYTES: usize = 1024 * 1024;
+const ROUND_MAX_BYTES: usize = 1024 * 1024;
 /// One `LIST`'s entry cap.
-pub const LIST_MAX_ENTRIES: usize = 500;
+const LIST_MAX_ENTRIES: usize = 500;
 /// The note the model sees when it keeps asking past the round budget.
-pub const REQUEST_BUDGET_NOTE: &str =
+const REQUEST_BUDGET_NOTE: &str =
     "[relay: the 8-request budget is spent; this answer is final]";
 /// The relay-owned preamble added to the first message of every session (the
 /// relay already builds that message; the shared Pro home's instruction file
 /// stays the packet lane's, so this text never reaches a packet turn).
-pub const RELAY_PROTOCOL: &str = "\
+const RELAY_PROTOCOL: &str = "\
 Relay access: this session can read files for you. At the very end of an
 answer you may ask for files, one request per line and nothing after them:
 READ <absolute path>
@@ -71,12 +71,12 @@ entries, each under a `=== <path> ===` header. Use absolute paths. Do not emit
 a request line when the answer is final.";
 
 /// `<state dir>/relay`: the relay's own files, so a failed request leaves a trace.
-pub fn relay_dir(layout: &Layout) -> PathBuf {
+fn relay_dir(layout: &Layout) -> PathBuf {
     layout.root.join("relay")
 }
 
 /// `<state dir>/relay/serve.log`: one line per request and per refusal.
-pub fn serve_log(layout: &Layout) -> PathBuf {
+fn serve_log(layout: &Layout) -> PathBuf {
     relay_dir(layout).join("serve.log")
 }
 
@@ -227,7 +227,7 @@ pub fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
 /// The effective readable roots: the default plus every `--read-root`, each
 /// resolved so a symlinked root and a canonical path still match. Duplicates
 /// are dropped.
-pub fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
+fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from(DEFAULT_READ_ROOT)];
     roots.extend(extra.iter().cloned());
     let mut resolved: Vec<PathBuf> = Vec::new();
@@ -1180,7 +1180,7 @@ fn child_path(env: &Env) -> String {
 
 /// What one Codex turn produced.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CodexOutcome {
+pub(crate) struct CodexOutcome {
     pub response_id: String,
     pub message_id: String,
     pub answer: String,
@@ -1389,7 +1389,7 @@ impl StreamState {
 
 /// The session key: an explicit `conversation`, else the pi session header,
 /// else the `instructions` hash plus `X-Herdr-Lane`.
-pub fn session_key(headers: &HashMap<String, String>, body: &Value) -> String {
+fn session_key(headers: &HashMap<String, String>, body: &Value) -> String {
     if let Some(conversation) = body.get("conversation") {
         if let Some(id) = conversation.as_str()
             && !id.is_empty()
@@ -1438,7 +1438,7 @@ fn sha256_hex(text: &str) -> String {
 /// The prompt for one turn: the first turn carries the relay protocol and the
 /// pi instructions, later turns carry only the new user message (Codex already
 /// holds the thread).
-pub fn build_prompt(body: &Value, first: bool) -> String {
+fn build_prompt(body: &Value, first: bool) -> String {
     let user = last_user_text(body);
     if !first {
         return user;
@@ -1506,7 +1506,7 @@ fn last_user_text(body: &Value) -> String {
 
 /// One line the model may put at the end of an answer.
 #[derive(Debug, Clone, PartialEq)]
-pub enum FileRequest {
+pub(crate) enum FileRequest {
     Read(PathBuf),
     List(PathBuf),
 }
@@ -1520,7 +1520,7 @@ impl FileRequest {
 }
 
 /// `READ <absolute path>` or `LIST <absolute directory>`, else `None`.
-pub fn parse_request(line: &str) -> Option<FileRequest> {
+fn parse_request(line: &str) -> Option<FileRequest> {
     let line = line.trim();
     for (keyword, list) in [("READ ", false), ("LIST ", true)] {
         if let Some(rest) = line.strip_prefix(keyword) {
@@ -1539,7 +1539,7 @@ pub fn parse_request(line: &str) -> Option<FileRequest> {
 
 /// Split the trailing request lines off an answer. Returns the answer body
 /// without them and the requests in the order the model wrote them.
-pub fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
+fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
     let mut lines: Vec<&str> = answer.lines().collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
@@ -1562,7 +1562,7 @@ pub fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
 ///
 /// Only punctuation observed from the bridge is unescaped; ordinary
 /// backslashes (including those in paths) stay untouched.
-pub fn unescape_bridge_markdown(answer: &str) -> String {
+fn unescape_bridge_markdown(answer: &str) -> String {
     let mut chars = answer.chars().peekable();
     let mut plain = String::with_capacity(answer.len());
     while let Some(ch) = chars.next() {
@@ -1597,7 +1597,7 @@ pub fn unescape_bridge_markdown(answer: &str) -> String {
 
 /// Drop the bridge's "Local tools unavailable" blockquote: the leading `>`
 /// lines and the blank line that closes them.
-pub fn strip_bridge_note(answer: &str) -> String {
+fn strip_bridge_note(answer: &str) -> String {
     let mut lines = answer.lines().peekable();
     while lines.peek().is_some_and(|line| line.starts_with('>')) {
         lines.next();

@@ -31,7 +31,7 @@ You have no tools and you never ask for one.
 pub const IMAGE_PROFILE: &str = "gpt-image-gen";
 
 /// The image profile's `model_instructions_file`.
-pub const IMAGE_INSTRUCTIONS: &str = "\
+const IMAGE_INSTRUCTIONS: &str = "\
 You are a picture maker on Codex.
 Make one picture from the request you receive.
 Call the image tool exactly once with the request's prompt and its size.
@@ -40,7 +40,7 @@ Reply with one line naming the picture and nothing else. Use no other tools.
 ";
 
 /// The home's `AGENTS.md`: the packet and TURN contract, nothing of Rolf's.
-pub const AGENTS_MD: &str = "\
+const AGENTS_MD: &str = "\
 # Pro
 
 The plugin feeds you one packet and collects one answer.

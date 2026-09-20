@@ -32,7 +32,7 @@ const ROLLOUT_POLL: Duration = Duration::from_millis(250);
 /// The exact trust prompt Codex shows for an untrusted directory (2026-09-19
 /// live run, Codex 0.155.1). It does not always read as `blocked`, so the
 /// screen is checked too.
-pub const TRUST_PROMPT: &str = "Do you trust the contents of this directory?";
+const TRUST_PROMPT: &str = "Do you trust the contents of this directory?";
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -63,13 +63,13 @@ pub fn codex_args(port: u16) -> Vec<String> {
 
 /// The `--profile` overrides for a lane that runs on Codex's own backend
 /// (Codex 0.155 reads `<name>.config.toml` from the home).
-pub fn profile_args(profile: &str) -> Vec<String> {
+fn profile_args(profile: &str) -> Vec<String> {
     vec!["--profile".into(), profile.into()]
 }
 
 /// The pictures a picture lane attaches at start: Codex's `--image <file>`
 /// (repeatable; `codex --help`, 0.155.1).
-pub fn image_args(files: &[PathBuf]) -> Vec<String> {
+fn image_args(files: &[PathBuf]) -> Vec<String> {
     let mut args = Vec::new();
     for file in files {
         args.push("--image".into());
@@ -105,14 +105,14 @@ fn coordinator_pane(env: &Env) -> Option<String> {
 
 /// The pane a lane started by this call sits under: the caller's own herdr
 /// pane, else the project's coordinator pane, else none.
-pub fn parent_pane(env: &Env) -> Option<String> {
+fn parent_pane(env: &Env) -> Option<String> {
     env.var("HERDR_PANE_ID")
         .map(str::to_string)
         .or_else(|| coordinator_pane(env))
 }
 
 /// The resume line for a profile lane: `codex resume --profile <name>`.
-pub fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
+fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
     vec![
         "resume".into(),
         "--profile".into(),
@@ -123,7 +123,7 @@ pub fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
 
 /// The start line, with `resume <id>` first for a resume (spec, "Resume after
 /// a cold restart").
-pub fn codex_resume_args(port: u16, session_id: &str) -> Vec<String> {
+fn codex_resume_args(port: u16, session_id: &str) -> Vec<String> {
     let mut args = vec!["resume".to_string()];
     args.extend(codex_args(port));
     args.push(session_id.to_string());

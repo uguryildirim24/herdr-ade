@@ -20,13 +20,13 @@ pub struct Packet {
 }
 
 /// A rough token estimate: four bytes per token, rounded up.
-pub fn estimate_tokens(bytes: usize) -> u64 {
+fn estimate_tokens(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(4)
 }
 
 /// The reason a path must not enter a packet, if any (spec §3, the
 /// secret-name filter).
-pub fn secret_reason(path: &Path) -> Option<&'static str> {
+fn secret_reason(path: &Path) -> Option<&'static str> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())

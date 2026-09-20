@@ -16,7 +16,7 @@ use super::{Env, SEEN_BRIDGE_MAJORS};
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Health {
+pub(crate) struct Health {
     pub version: String,
     pub major: u64,
     pub accepting: bool,
@@ -101,7 +101,7 @@ fn bridge_config(env: &Env) -> Option<Value> {
 }
 
 /// The control token the two `/admin` calls need.
-pub fn control_token(env: &Env) -> Option<String> {
+fn control_token(env: &Env) -> Option<String> {
     bridge_config(env)?
         .get("controlToken")
         .and_then(Value::as_str)
@@ -155,19 +155,6 @@ fn admin(runner: &dyn Runner, env: &Env, port: u16, path: &str) -> Result<String
         bail!("bridge {path} did not reach the requested state");
     }
     Ok(output.stdout.trim().to_string())
-}
-
-/// A `GET /healthz` body, for `doctor --json`.
-pub fn health_json(port: u16, health: &Health) -> Value {
-    serde_json::json!({
-        "port": port,
-        "version": health.version,
-        "major": health.major,
-        "major_seen": health.major_seen(),
-        "accepting_turns": health.accepting,
-        "pid": health.pid,
-        "mode": health.mode,
-    })
 }
 
 #[cfg(test)]
