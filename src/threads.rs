@@ -2794,8 +2794,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewer_advance_lands_on_the_box() {
-        let (fx, _remote) = box_fixture();
+    fn a_box_reviewer_can_publish_its_verdict_and_seal_without_a_manual_coordinator_push() {
+        use crate::contracts::{OpKind, Recipient, Requested};
+        use crate::ops;
+        use crate::round::testkit::{commit_file, git};
+
+        let (fx, remote) = box_fixture();
         write_config(
             &fx,
             "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n",
@@ -2824,5 +2828,115 @@ mod tests {
         assert_eq!(started.role, "reviewer");
         assert_eq!(started.machine, "oci");
         assert_eq!(started.machine_id, "oci-id");
+
+        // advance already publishes the starting commit, before V exists.
+        ops::check_published_ref(
+            ctx.runner,
+            &fx.repo,
+            &started.branch,
+            &remote,
+            &started.base,
+        )
+        .unwrap();
+        let skill = crate::lane::skill_text(&started.role);
+        assert!(skill.contains("publish V on **your own lane branch**"));
+        assert!(
+            skill.contains("Never push `main`, the integration branch, or another lane's branch")
+        );
+        let brief = git(
+            &fx.repo,
+            &["show", &format!("{}:tasks/review-r1.md", started.base)],
+        );
+        assert!(brief.contains("Follow the reviewer skill's Done instructions"));
+
+        // A separate clone stands in for the box; only herdr/ssh are faked.
+        let box_repo = fx.world.home.path().join("box reviewer's clone");
+        git(
+            &fx.repo,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                &started.branch,
+                &remote,
+                box_repo.to_str().unwrap(),
+            ],
+        );
+        git(&box_repo, &["config", "user.name", "Reviewer"]);
+        git(&box_repo, &["config", "user.email", "reviewer@example.com"]);
+        git(&box_repo, &["config", "commit.gpgsign", "false"]);
+        for member in &record.manifest.members {
+            let sha = &member.pin.as_ref().unwrap().sha;
+            git(&box_repo, &["fetch", "-q", fx.repo.to_str().unwrap(), sha]);
+            git(&box_repo, &["merge", "--no-edit", sha]);
+        }
+        let candidate = git(&box_repo, &["rev-parse", "HEAD"]);
+        let verdict = commit_file(
+            &box_repo,
+            "tasks/reviews/code-r1.md",
+            &format!(
+                "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{candidate}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll lanes checked.\n",
+                record.manifest_hash.as_deref().unwrap(),
+                record.policy_hash,
+            ),
+            "review(r1): verdict",
+        );
+        assert_ne!(started.base, verdict);
+        let error =
+            ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &verdict)
+                .unwrap_err()
+                .to_string();
+        assert!(error.starts_with("published_ref_mismatch:"), "{error}");
+        // The reviewer follows the refusal's command. No coordinator push,
+        // force, integration branch update or direct event fixture is needed.
+        let repair = error
+            .split("; run `")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap();
+        let repaired = std::process::Command::new("sh")
+            .args(["-c", repair])
+            .output()
+            .unwrap();
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &verdict)
+            .unwrap();
+        assert_eq!(git(&fx.repo, &["rev-parse", &started.branch]), started.base);
+        assert_eq!(
+            git(&fx.repo, &["ls-remote", &remote, "refs/heads/main"]),
+            ""
+        );
+
+        let box_root = fx.world.home.path().join("box-root");
+        let box_project = project::create(&box_root, "demo", "", vec![]).unwrap();
+        let op = ops::reserve(
+            &box_project,
+            ops::Reservation {
+                thread: &started.id,
+                attempt: started.attempt,
+                kind: OpKind::Done,
+                recipient: Recipient {
+                    pane: "w1:p1".into(),
+                    coordinator_attempt: 1,
+                },
+                round: None,
+                requested: Requested::Done {
+                    sha: verdict.clone(),
+                    report_path: "tasks/reviews/code-r1.md".into(),
+                },
+                helper_pid: std::process::id(),
+            },
+        )
+        .unwrap();
+        ops::stage_done(&box_project, &op.op, &box_repo, ctx.runner).unwrap();
+        let event = ops::seal(&box_project, &op.op, |_| Ok(())).unwrap();
+        assert_eq!(event.payload.done.unwrap().sha, verdict);
+        assert_eq!(crate::events::list(&box_project).len(), 1);
     }
 }
