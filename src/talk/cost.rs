@@ -50,18 +50,48 @@ pub struct Cost {
 /// The whole cost view. Filesystem only; no command runs.
 pub fn load(ctx: &Ctx, project: &Project) -> Cost {
     let lanes = thread::list(project);
-    let today = local_date(&crate::project::now());
+    let now = crate::project::now();
+    let now_stamp = now.parse::<jiff::Timestamp>().ok();
+    let today = local_date(&now);
     let sessions = ctx.root.join("pi/agent/sessions");
+    let (pro, pro_failed) = pro_sends(&ctx.root.join("pro-bridge/usage.jsonl"), today.as_deref());
     let mut per_lane: BTreeMap<String, Totals> = BTreeMap::new();
     let mut today_totals = Totals::default();
-    let mut failed = false;
+    let mut failed = pro_failed;
     for t in &lanes {
-        if t.worktree_path.is_empty() {
-            continue;
-        }
-        let dir = sessions.join(session_dir_name(&t.worktree_path));
-        let (all, day, lane_failed) = read_pi_sessions(&dir, today.as_deref());
+        let (mut all, mut day, lane_failed) = if t.worktree_path.is_empty() {
+            (Totals::default(), Totals::default(), false)
+        } else {
+            let dir = sessions.join(session_dir_name(&t.worktree_path));
+            read_pi_sessions(&dir, today.as_deref())
+        };
         failed |= lane_failed;
+
+        // The old Pro packet path records a lane name but no tokens or money.
+        // Attribute only names belonging to this project; never charge every
+        // project for a shared usage file.
+        for name in [&t.id, &t.agent_name] {
+            if let Some((all_runs, day_runs)) = pro.get(name) {
+                all.runs += all_runs;
+                day.runs += day_runs;
+                all.unknown = true;
+                if day_runs > &0 {
+                    day.unknown = true;
+                }
+            }
+        }
+
+        // A box session and a provider without usage still have one measured
+        // fact: how long the lane has existed. Show that rather than zero.
+        if all.tokens == 0 && all.micros == 0 {
+            let (elapsed, elapsed_today) = lane_elapsed(t, now_stamp);
+            all.minutes = all.minutes.max(elapsed);
+            all.unknown = true;
+            if let Some(minutes) = elapsed_today {
+                day.minutes = day.minutes.max(minutes);
+                day.unknown = true;
+            }
+        }
         today_totals.merge(&day);
         per_lane.insert(t.id.clone(), all);
     }
@@ -72,21 +102,6 @@ pub fn load(ctx: &Ctx, project: &Project) -> Cost {
     };
     for (id, totals) in &per_lane {
         cost.lanes.push((id.clone(), totals.clone()));
-    }
-    // Pro sends carry no tokens or money; count them and say so.
-    let (pro_runs, pro_failed) =
-        pro_sends(&ctx.root.join("pro-bridge/usage.jsonl"), today.as_deref());
-    if pro_runs > 0 {
-        cost.today.runs += pro_runs;
-        cost.today.unknown = true;
-    }
-    cost.failed |= pro_failed;
-    // A lane whose worktree is not on this machine has no readable usage.
-    if lanes
-        .iter()
-        .any(|t| t.is_remote() && t.status != thread::Status::Resolved)
-    {
-        cost.today.unknown = true;
     }
     if let Some((round, members)) = current_round(project) {
         let mut totals = Totals::default();
@@ -149,6 +164,9 @@ fn read_pi_sessions(dir: &Path, today: Option<&str>) -> (Totals, Totals, bool) {
             }
         };
         let mut saw_usage = false;
+        let mut saw_today = false;
+        let mut saw_today_usage = false;
+        let mut all_span: Option<(jiff::Timestamp, jiff::Timestamp)> = None;
         let mut day_span: Option<(jiff::Timestamp, jiff::Timestamp)> = None;
         for line in text.lines() {
             let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -156,6 +174,7 @@ fn read_pi_sessions(dir: &Path, today: Option<&str>) -> (Totals, Totals, bool) {
             };
             let at = value.get("timestamp").and_then(Value::as_str);
             let is_today = at.and_then(local_date).as_deref() == today;
+            saw_today |= is_today;
             let Some(usage) = value
                 .get("message")
                 .and_then(|message| message.get("usage"))
@@ -176,7 +195,14 @@ fn read_pi_sessions(dir: &Path, today: Option<&str>) -> (Totals, Totals, bool) {
             all.tokens += tokens;
             all.micros += micros;
             all.runs += 1;
+            if let Some(stamp) = at.and_then(|at| at.parse::<jiff::Timestamp>().ok()) {
+                all_span = Some(match all_span {
+                    Some((low, high)) => (low.min(stamp), high.max(stamp)),
+                    None => (stamp, stamp),
+                });
+            }
             if is_today {
+                saw_today_usage = true;
                 day.tokens += tokens;
                 day.micros += micros;
                 day.runs += 1;
@@ -188,11 +214,16 @@ fn read_pi_sessions(dir: &Path, today: Option<&str>) -> (Totals, Totals, bool) {
                 }
             }
         }
+        if let Some((low, high)) = all_span {
+            all.minutes += ((high.as_second() - low.as_second()).max(0) / 60) as u64;
+        }
         if let Some((low, high)) = day_span {
             day.minutes += ((high.as_second() - low.as_second()).max(0) / 60) as u64;
         }
         if !saw_usage {
             all.unknown = true;
+        }
+        if saw_today && !saw_today_usage {
             day.unknown = true;
         }
     }
@@ -200,18 +231,25 @@ fn read_pi_sessions(dir: &Path, today: Option<&str>) -> (Totals, Totals, bool) {
 }
 
 /// `usage.jsonl` records one Pro send per line: a time, a lane and a tag. No
-/// tokens or money exist, so this counts sends only.
-fn pro_sends(path: &Path, today: Option<&str>) -> (u64, bool) {
+/// tokens or money exist, so this counts all-time and today's sends by lane.
+fn pro_sends(path: &Path, today: Option<&str>) -> (BTreeMap<String, (u64, u64)>, bool) {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return (0, false),
-        Err(_) => return (0, true),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return (BTreeMap::new(), false);
+        }
+        Err(_) => return (BTreeMap::new(), true),
     };
-    let mut runs = 0;
+    let mut runs = BTreeMap::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        let Some(lane) = value.get("lane").and_then(Value::as_str) else {
+            continue;
+        };
+        let entry = runs.entry(lane.to_string()).or_insert((0, 0));
+        entry.0 += 1;
         if value
             .get("ts")
             .and_then(Value::as_str)
@@ -219,10 +257,52 @@ fn pro_sends(path: &Path, today: Option<&str>) -> (u64, bool) {
             .as_deref()
             == today
         {
-            runs += 1;
+            entry.1 += 1;
         }
     }
     (runs, false)
+}
+
+/// All-time elapsed minutes and, when the lane overlaps today, today's part.
+fn lane_elapsed(lane: &thread::Thread, now: Option<jiff::Timestamp>) -> (u64, Option<u64>) {
+    let (Some(start), Some(now)) = (lane.created.parse::<jiff::Timestamp>().ok(), now) else {
+        return (0, None);
+    };
+    let end = if lane.status == thread::Status::Resolved {
+        lane.updated.parse::<jiff::Timestamp>().ok()
+    } else if matches!(lane.last_state.as_str(), "done" | "gone") {
+        lane.last_state_change.parse::<jiff::Timestamp>().ok()
+    } else {
+        Some(now)
+    };
+    let Some(end) = end else {
+        return (0, None);
+    };
+    let all = ((end.as_second() - start.as_second()).max(0) / 60) as u64;
+
+    // Use real local midnight boundaries, including 23- and 25-hour daylight
+    // saving days, then take this lane's overlap with that interval.
+    let tz = jiff::tz::TimeZone::system();
+    let date = now.to_zoned(tz.clone()).date();
+    let Some(day_start) = date
+        .to_zoned(tz.clone())
+        .ok()
+        .map(|zoned| zoned.timestamp())
+    else {
+        return (all, None);
+    };
+    let Some(day_end) = date
+        .tomorrow()
+        .ok()
+        .and_then(|tomorrow| tomorrow.to_zoned(tz).ok())
+        .map(|zoned| zoned.timestamp())
+    else {
+        return (all, None);
+    };
+    let low = start.max(day_start);
+    let high = end.min(day_end);
+    let today = (high >= low).then(|| ((high.as_second() - low.as_second()) / 60) as u64);
+    (all, today)
 }
 
 /// The newest round that has not successfully merged, with its member lanes.
@@ -317,6 +397,7 @@ mod tests {
         assert!(!failed);
         assert_eq!(all.tokens, 1399);
         assert_eq!(all.micros, 9_750_000);
+        assert_eq!(all.minutes, 670);
         assert_eq!(today.tokens, 400);
         assert_eq!(today.micros, 750_000);
         assert_eq!(today.minutes, 10);
@@ -333,5 +414,20 @@ mod tests {
         let (empty, _, failed) = read_pi_sessions(&dir.path().join("nope"), Some("2026-09-20"));
         assert!(empty.is_empty());
         assert!(!failed);
+    }
+
+    #[test]
+    fn a_lane_without_usage_reports_elapsed_time() {
+        let start: jiff::Timestamp = "2026-09-20T12:00:00Z".parse().unwrap();
+        let end: jiff::Timestamp = "2026-09-20T13:30:00Z".parse().unwrap();
+        let lane = thread::Thread {
+            created: start.to_string(),
+            updated: end.to_string(),
+            status: thread::Status::Resolved,
+            ..thread::Thread::default()
+        };
+        let (all, day) = lane_elapsed(&lane, Some(end));
+        assert_eq!(all, 90);
+        assert_eq!(day, Some(90));
     }
 }
