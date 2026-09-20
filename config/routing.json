@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "PLACEHOLDER task-score policy. Not calibrated. Replace rubric and cutoffs after t-0083 evaluation. The three task scores are independent of the model roster; saved responses can be rerouted without inference.",
+  "note": "Initial task-score policy from t-0083 research. Not calibrated: tune it only against real labelled cases. The three task scores are independent of the model roster; saved responses can be rerouted without inference.",
   "model": "jev-latest",
   "questions": {
     "difficulty": {
@@ -19,7 +19,7 @@
       "criteria": ["Isolated text or test-only change", "Local feature with easy rollback", "Shared behavior, multiple consumers or build/install path", "Durable state, security boundary or cross-system failure risk"]
     }
   },
-  "weights": {"difficulty": 0.5, "ambiguity": 0.2, "blast_radius": 0.3},
+  "weights": {"difficulty": 0.5, "ambiguity": 0.3, "blast_radius": 0.2},
   "models": {
     "pi_opencode_deepseek": {"tier": 1, "description": "DeepSeek V4.1 Flash high: fast inexpensive bounded coding."},
     "pi_kimi_k3": {"tier": 2, "description": "Kimi K3 high: long-context reading and multi-file implementation."},

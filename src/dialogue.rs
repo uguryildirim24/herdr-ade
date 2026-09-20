@@ -6,8 +6,8 @@
 //! and only then advances the turn. A delayed turn-N line never completes
 //! turn N+1: the commit names `n`.
 //!
-//! The pair filter: `start` asks it whether the drafter and critic roles may
-//! work as a pair, and pins the critic's recipe off the drafter's model.
+//! The pair check keeps the two instruction sets distinct. Model selection
+//! happens later from each side's full brief.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -187,7 +187,7 @@ pub fn start(
         crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "herdr-ade".into());
     let coord = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
     let mut next = format!(
-        "drafter: write a full brief with `product = \"spec\"` in its TOML front matter, then {prefix} thread start {slug} --title \"Draft {}\" --repo {} --plain \"{}\" --task-file <brief>\n",
+        "drafter: write a full brief with `product = \"spec\"` in its TOML front matter, then {prefix} thread start {slug} --title \"Draft {}\" --repo {} --workflow drafter --plain \"{}\" --task-file <brief>\n",
         d.topic, d.repo, d.plain
     );
     if d.critic == "pro" {
@@ -197,7 +197,7 @@ pub fn start(
         ));
     } else {
         next.push_str(&format!(
-            "critic:  {prefix} thread start {slug} --title \"Check {}\" --repo {} --plain \"<sentence>\" --task-file <full review brief>, then\n         {prefix} dialogue critic {slug} {} --pane <its pane>\n",
+            "critic:  {prefix} thread start {slug} --title \"Check {}\" --repo {} --workflow critic --plain \"<sentence>\" --task-file <full review brief>, then\n         {prefix} dialogue critic {slug} {} --pane <its pane>\n",
             d.topic, d.repo, d.topic
         ));
     }
@@ -445,7 +445,9 @@ mod tests {
             ("lane/spec-shapes", "main")
         );
         assert!(
-            next.contains("--title \"Draft shapes\"") && next.contains("--role pro --passive"),
+            next.contains("--title \"Draft shapes\"")
+                && next.contains("--workflow drafter")
+                && next.contains("--role pro --passive"),
             "{next}"
         );
         let e = format!(

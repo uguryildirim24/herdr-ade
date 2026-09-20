@@ -55,7 +55,7 @@ Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start fa
 
 You do not choose; describe the work well, because that description is what picks the model. Write a full task file with scope, constraints and gates, not a one-line title. The harness sends that brief and repository facts to Jev in the background. Jev scores the task; the editable policy turns those scores into a model. Low confidence upgrades the model and is logged; it never asks you to choose.
 
-- `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table.
+- `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions during a spec dialogue; it does not select a model.
 - Describe hard exceptions in the task's opening `+++` TOML front matter: `product = "web-research"` when the deliverable is web research; `product = "spec"` for writing a specification; `requires_claude = true` for a Claude-only runtime requirement. A coding task that reads a web page is still coding, not web research.
 - `round advance` still starts the review. Its full brief and pinned changes go through the same picker.
 - A lane calls `ha failed "<failure and evidence>"` to ask for a stronger model. The harness keeps its worktree and replaces its attempt automatically, with no permission or settings step. A lane can climb at most three times; fixed exceptions cannot climb.

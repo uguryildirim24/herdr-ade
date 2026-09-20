@@ -1185,6 +1185,9 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
+        /// Instruction set for this lane; this never selects its model
+        #[arg(long, value_name = "FLOW")]
+        workflow: Option<String>,
         /// Birth sentence (SPEC-ADE D17 item 6)
         #[arg(long)]
         plain: Option<String>,
@@ -1539,6 +1542,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 machine,
                 base,
                 task_file,
+                workflow,
                 plain,
             } => {
                 let task = read_text(&task_file)?;
@@ -1552,7 +1556,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         base,
                         task,
                         plain: plain.unwrap_or_default(),
-                        workflow: None,
+                        workflow,
                     },
                 )?;
                 println!(
