@@ -498,48 +498,155 @@ fn composer_layout(input: &Composer, width: usize) -> (Vec<Line<'static>>, usize
     (rows.into_iter().map(Line::from).collect(), caret.0, caret.1)
 }
 
-fn overview_doc(o: &Overview, width: usize, narrow: bool, t: Theme) -> Document {
+fn overview_doc(o: &Overview, width: usize, narrow: bool, t: Theme, full: bool) -> Document {
     let mut d = Document::default();
     for (section, rows) in o.sections.iter().enumerate() {
         let key = format!("overview-{section}");
-        d.prose(
-            &key,
-            vec![bold(overview::HEADINGS[section], t.accent)],
-            width.saturating_sub(1),
-            1,
-        );
+        if full {
+            d.prose(
+                &key,
+                vec![bold(overview::HEADINGS[section], t.accent)],
+                width.saturating_sub(1),
+                1,
+            );
+        } else {
+            d.push(
+                &key,
+                one_line("", overview::HEADINGS[section], "", Tone::Heading, width, t),
+            );
+        }
         if section == 2
             && let Some((done, total)) = o.progress
         {
             let cells = if narrow { 10 } else { 20 };
-            let filled = cells * done / total;
-            d.prose(
-                "progress",
-                vec![
+            if full {
+                let mut spans = vec![
                     span(format!("{done} of {total} done"), t.green),
                     Span::raw("  "),
-                    span("█".repeat(filled), t.green),
-                    span("░".repeat(cells - filled), t.surface1),
-                ],
-                width.saturating_sub(1),
-                1,
-            );
+                ];
+                spans.extend(progress_spans(done, total, cells, t));
+                d.prose("progress", spans, width.saturating_sub(1), 1);
+            } else {
+                let label = format!("{done} of {total} done");
+                let available_cells = width.saturating_sub(1 + label.width() + 2).min(cells);
+                let mut spans = vec![Span::raw(" "), span(label, t.green)];
+                if available_cells > 0 {
+                    spans.push(Span::raw("  "));
+                    spans.extend(progress_spans(done, total, available_cells, t));
+                }
+                d.push("progress", Line::from(spans));
+            }
         }
         for (i, row) in rows.iter().enumerate() {
-            let spans = if row.tone == Tone::Heading {
-                vec![bold(row.full_text(), t.accent)]
-            } else if row.prefix.is_empty() {
-                vec![span(row.text.clone(), t.text)]
+            if full {
+                let spans = if row.tone == Tone::Heading {
+                    vec![bold(row.full_text(), t.accent)]
+                } else {
+                    let mut spans = Vec::new();
+                    if !row.prefix.is_empty() {
+                        spans.push(span(format!("{} ", row.prefix), tone(t, row.tone)));
+                    }
+                    spans.push(span(row.text.clone(), t.text));
+                    if !row.marker.is_empty() {
+                        spans.push(span(format!(" {}", row.marker), t.overlay0));
+                    }
+                    spans
+                };
+                d.prose(&format!("{key}-{i}"), spans, width.saturating_sub(1), 1);
             } else {
-                vec![
-                    span(format!("{} ", row.prefix), tone(t, row.tone)),
-                    span(row.text.clone(), t.text),
-                ]
-            };
-            d.prose(&format!("{key}-{i}"), spans, width.saturating_sub(1), 1);
+                d.push(
+                    &format!("{key}-{i}"),
+                    one_line(&row.prefix, &row.text, &row.marker, row.tone, width, t),
+                );
+            }
         }
     }
     d
+}
+
+fn progress_spans(done: usize, total: usize, cells: usize, t: Theme) -> Vec<Span<'static>> {
+    let filled = cells * done / total;
+    vec![
+        span("█".repeat(filled), t.green),
+        span("░".repeat(cells - filled), t.surface1),
+    ]
+}
+
+/// One compact overview row as exactly one terminal line: the one-cell
+/// indent, the row's prefix and right marker, and the text cut to the cells
+/// left between them. The full overview keeps wrapping the whole text.
+fn one_line(
+    prefix: &str,
+    text: &str,
+    marker: &str,
+    row_tone: Tone,
+    width: usize,
+    t: Theme,
+) -> Line<'static> {
+    let avail = width.saturating_sub(1).max(1);
+    if row_tone == Tone::Heading {
+        return Line::from(vec![Span::raw(" "), bold(clip(text, avail), t.accent)]);
+    }
+    let lead = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix} ")
+    };
+    let marker_room = avail
+        .saturating_sub(lead.width())
+        .saturating_sub(usize::from(!text.is_empty()));
+    let marker = if marker.is_empty() || marker_room <= 1 {
+        String::new()
+    } else {
+        format!(" {}", clip(marker, marker_room - 1))
+    };
+    let text_budget = avail.saturating_sub(lead.width() + marker.width());
+    let mut spans = vec![Span::raw(" ")];
+    if !lead.is_empty() {
+        spans.push(span(lead, tone(t, row_tone)));
+    }
+    spans.push(span(clip(text, text_budget), t.text));
+    if !marker.is_empty() {
+        spans.push(span(marker, t.overlay0));
+    }
+    Line::from(spans)
+}
+
+/// Cut `text` to at most `max` terminal cells. When it does not fit, the
+/// last whole word shown is followed by one ellipsis; a word wider than the
+/// whole row is cut at the cell boundary. Whitespace collapses.
+fn clip(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.into();
+    }
+    let Some(budget) = max.checked_sub(1) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let gap = usize::from(used > 0);
+        if used + gap + word.width() > budget {
+            if used == 0 {
+                for ch in word.chars() {
+                    let cw = ch.width().unwrap_or(0);
+                    if used + cw > budget {
+                        break;
+                    }
+                    out.push(ch);
+                    used += cw;
+                }
+            }
+            break;
+        }
+        if gap == 1 {
+            out.push(' ');
+        }
+        out.push_str(word);
+        used += gap + word.width();
+    }
+    out.push('…');
+    out
 }
 fn delivery_color(state: crate::contracts::TalkRequestState, t: Theme) -> Color {
     use crate::contracts::TalkRequestState::*;
@@ -1033,7 +1140,7 @@ fn draw(
         );
     } else {
         header(f, Rect { height: hh, ..area }, o, state, c, capability, t);
-        let odoc = overview_doc(o, w as usize, narrow, t);
+        let odoc = overview_doc(o, w as usize, narrow, t, app.full);
         if app.full {
             app.regions.push((Area::Full, body));
             viewport(f, body, &odoc, &mut app.full_scroll, t, true);
@@ -1418,6 +1525,70 @@ mod tests {
             assert!(text.contains("Show task number 29."), "{text}");
             assert!(text.contains("Decided for you"));
         }
+    }
+    #[test]
+    fn a_long_overview_row_is_one_cut_line_but_complete_in_the_full_overview() {
+        let long = "The goal sentence runs on well past the width of one overview line.";
+        let mut o = Overview::default();
+        o.sections[0].push(overview::Row {
+            text: long.into(),
+            prefix: String::new(),
+            marker: String::new(),
+            tone: Tone::Text,
+        });
+        o.sections[3].push(overview::Row {
+            text: long.into(),
+            prefix: "checking".into(),
+            marker: "box last seen".into(),
+            tone: Tone::Yellow,
+        });
+        o.progress = Some((2, 5));
+        let lines = |d: &Document| -> Vec<String> {
+            d.lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let compact = lines(&overview_doc(&o, 40, true, Theme::default(), false));
+        assert_eq!(
+            compact
+                .iter()
+                .filter(|line| line.starts_with(" The goal"))
+                .count(),
+            1,
+            "{compact:?}"
+        );
+        let row = compact
+            .iter()
+            .find(|line| line.starts_with(" The goal"))
+            .unwrap();
+        assert!(row.ends_with('…'), "{row:?}");
+        assert!(row.width() <= 40, "{row:?}");
+        let marked = compact
+            .iter()
+            .find(|line| line.contains("checking"))
+            .unwrap();
+        assert!(
+            marked.contains('…') && marked.ends_with("box last seen"),
+            "{marked:?}"
+        );
+        assert!(
+            compact.iter().all(|line| line.width() <= 40)
+                && !compact.iter().any(|line| line.contains("overview")),
+            "{compact:?}"
+        );
+        let tiny = lines(&overview_doc(&o, 20, true, Theme::default(), false));
+        assert!(tiny.iter().all(|line| line.width() <= 20), "{tiny:?}");
+        assert_eq!(
+            tiny.iter()
+                .filter(|line| line.contains("2 of 5 done"))
+                .count(),
+            1
+        );
+        let full = lines(&overview_doc(&o, 40, true, Theme::default(), true));
+        let full = full.join(" ");
+        assert!(full.contains("overview line."), "{full:?}");
+        assert!(full.contains("box last seen"), "{full:?}");
     }
     #[test]
     fn numeric_binding_hidden_cards_typing_paste_and_invalid_choice() {
