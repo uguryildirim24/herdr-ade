@@ -29,6 +29,9 @@ pub use repo::Git;
 /// stops and leaves the failure for a human. A refused start and a reviewer
 /// whose agent never came up both count (E3/D1).
 pub const MAX_REVIEWER_START_FAILURES: u32 = 3;
+/// The reviewer can read committed inputs from its checkout. Its priming task
+/// is only an index plus as much full source material as comfortably fits.
+pub const REVIEW_TASK_BYTE_CAP: usize = 128 * 1024;
 
 /// A bound reviewer with no launch attempt is a failed start once this many
 /// seconds have passed since its record was written. The ticker starts at
@@ -533,9 +536,10 @@ fn require_branch_available(
             let other_git = Git::new(ctx.runner, &record.repo);
             if std::fs::canonicalize(other_git.common_dir()?)? == common {
                 bail!(
-                    "round_head_reserved: `{slug}/{}` owns `{branch}` in phase {:?}; merge that round before opening or reviewing `{except}`, or use another integration branch",
+                    "round_head_reserved: `{slug}/{}` owns `{branch}` in phase {:?}; finish it, or run `round abandon {slug} {} --reason <why>` before opening or reviewing `{except}` (another integration branch is also independent)",
                     record.round,
-                    record.phase
+                    record.phase,
+                    record.round
                 );
             }
         }
@@ -980,6 +984,41 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
     Ok(record)
 }
 
+pub fn abandon(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<RoundRecord> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("round_abandon_reason_missing: say why `{round}` cannot proceed");
+    }
+    let project = Project::load(&ctx.root, slug)?;
+    let _operation = operation_lock(&project, round)?;
+    let record = {
+        let _lock = project.lock()?;
+        let mut record = load(&project, round)?;
+        if record.phase.closed() {
+            bail!(
+                "round_closed: `{round}` is {:?}; its ending cannot be changed",
+                record.phase
+            );
+        }
+        if record.merge.is_some() {
+            bail!(
+                "round_abandon_refused: `{round}` has begun its merge transaction; finish or repair that transaction"
+            );
+        }
+        record.phase = RoundPhase::Abandoned;
+        record.review_intent = None;
+        record.verdict = None;
+        record.abandoned_reason = Some(reason.to_string());
+        save(&project, &record)?;
+        record
+    };
+    if let Err(e) = crate::plan::refresh(ctx, &project) {
+        eprintln!("note: the plan refresh failed: {e:#}");
+    }
+    let _ = crate::board::refresh(ctx, &project);
+    Ok(record)
+}
+
 pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
@@ -1246,32 +1285,87 @@ fn start_reviewer(
 ) -> Result<thread::Thread> {
     let record = load(project, round)?;
     let git = Git::new(ctx.runner, &record.repo);
-    let mut task = reviewer_task(project, &record, prefix, &git)?;
-    // Selection sees the actual review package, not a one-line instruction
-    // naming a file it cannot read. Include the committed brief and diff.
-    task.push_str("\n## Review brief\n\n");
-    task.push_str(&git.run(&[
-        "show",
-        &format!("{review_branch}:{}", review_brief_path(round)),
-    ])?);
-    task.push_str("\n## Changes under review\n\n");
+    let brief_path = review_brief_path(round);
+    let brief = git.run(&["show", &format!("{review_branch}:{brief_path}")])?;
+    let mut changes = Vec::new();
     for member in &record.manifest.members {
         let pin = member.pin.as_ref().context("round_not_complete")?;
-        task.push_str(&git.run(&["diff", &format!("{}...{}", record.branch, pin.sha), "--"])?);
+        let range = format!("{}...{}", record.branch, pin.sha);
+        changes.push((
+            member.thread.clone(),
+            range.clone(),
+            git.run(&["diff", &range, "--"])?,
+        ));
     }
-    crate::threads::start_during_advance(
-        ctx,
-        &project.slug,
-        crate::threads::StartArgs {
-            title: format!("Review {round}: {}", record.plain),
-            repo: (!record.repo.is_empty()).then(|| record.repo.clone()),
-            machine: None,
-            base: Some(review_branch.to_string()),
-            task,
-            plain: record.plain.clone(),
-            workflow: Some("reviewer".into()),
-        },
-    )
+
+    let mut task = reviewer_task(project, &record, prefix, &git)?;
+    task.push_str("\n## Review inputs\n\n");
+    task.push_str(&format!(
+        "The task is capped at {REVIEW_TASK_BYTE_CAP} bytes. Read every source named here with repository tools; a source absent from the inline sections was deliberately omitted, not empty.\n\n- Review brief: `{brief_path}` on the checked-out review branch `{review_branch}` ({} bytes).\n",
+        brief.len()
+    ));
+    for (thread, range, diff) in &changes {
+        task.push_str(&format!(
+            "- Changes for `{thread}`: `git diff {range} --` ({} bytes).\n",
+            diff.len()
+        ));
+    }
+    if task.len() > REVIEW_TASK_BYTE_CAP {
+        bail!(
+            "review_task_too_large: the input index alone is {} bytes; cap is {REVIEW_TASK_BYTE_CAP}",
+            task.len()
+        );
+    }
+    let inline = |task: &mut String, heading: &str, content: &str| -> bool {
+        let section = format!("\n## {heading}\n\n{content}\n");
+        if task.len() + section.len() <= REVIEW_TASK_BYTE_CAP {
+            task.push_str(&section);
+            true
+        } else {
+            false
+        }
+    };
+    let mut omitted_sources = Vec::new();
+    // The committed review brief is the question; diffs are cheaper evidence.
+    // Keep whole sources only—partial patches and reports are misleading.
+    if !inline(&mut task, "Inlined review brief", &brief) {
+        omitted_sources.push(serde_json::json!({
+            "kind": "review_brief", "path": brief_path, "revision": review_branch,
+            "bytes": brief.len()
+        }));
+    }
+    for (thread, range, diff) in &changes {
+        if !inline(&mut task, &format!("Inlined changes for {thread}"), diff) {
+            omitted_sources.push(serde_json::json!({
+                "kind": "pinned_diff", "thread": thread, "range": range,
+                "bytes": diff.len()
+            }));
+        }
+    }
+    let args = crate::threads::StartArgs {
+        title: format!("Review {round}: {}", record.plain),
+        repo: (!record.repo.is_empty()).then(|| record.repo.clone()),
+        machine: None,
+        base: Some(review_branch.to_string()),
+        task,
+        plain: record.plain.clone(),
+        workflow: Some("reviewer".into()),
+    };
+    if omitted_sources.is_empty() {
+        crate::threads::start_during_advance(ctx, &project.slug, args)
+    } else {
+        crate::threads::start_during_advance_bounded(
+            ctx,
+            &project.slug,
+            args,
+            serde_json::json!({
+                "cut": true,
+                "review_task_byte_cap": REVIEW_TASK_BYTE_CAP,
+                "omitted_sources": omitted_sources,
+                "note": "The reviewer task names every omitted source for tool-based reading."
+            }),
+        )
+    }
 }
 
 fn reviewer_task(
@@ -1530,7 +1624,8 @@ fn reviewer_start_failed(
 /// The retry bound was reached: say so once and leave the round for a human.
 fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &str) -> Result<()> {
     eprintln!(
-        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand"
+        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand or run `round abandon {} {round} --reason <why>`",
+        project.slug
     );
     announce_once(
         ctx,
@@ -1538,7 +1633,8 @@ fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &
         round,
         "reviewer-start-exhausted",
         &format!(
-            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer`, or `thread restart`"
+            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer`, use `thread restart`, or end it with `round abandon {} {round} --reason <why>`",
+            project.slug
         ),
         None,
     )
@@ -2697,6 +2793,9 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
             .unwrap_or_default()
     );
     out.push_str(&format!("phase: {:?}\n", record.phase));
+    if let Some(reason) = &record.abandoned_reason {
+        out.push_str(&format!("abandoned because: {reason}\n"));
+    }
     for m in &record.manifest.members {
         match &m.pin {
             Some(p) => out.push_str(&format!(
@@ -3229,7 +3328,9 @@ mod tests {
             },
         ));
         assert!(
-            e.starts_with("round_head_reserved") && e.contains("r1") && e.contains("merge"),
+            e.starts_with("round_head_reserved")
+                && e.contains("r1")
+                && e.contains("round abandon demo r1"),
             "{e}"
         );
         assert_eq!(main_head(&fx), b);
@@ -3242,6 +3343,40 @@ mod tests {
             OpenArgs {
                 round: "r2".into(),
                 branch: "other".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn abandon_records_a_reason_and_releases_the_integration_branch() {
+        let fx = fixture();
+        reviewed(&fx);
+        let record = abandon(
+            &fx.world.ctx(),
+            "demo",
+            "r1",
+            "the reviewer could not be dispatched",
+        )
+        .unwrap();
+        assert_eq!(record.phase, RoundPhase::Abandoned);
+        assert_eq!(
+            record.abandoned_reason.as_deref(),
+            Some("the reviewer could not be dispatched")
+        );
+        assert!(
+            show(&fx.world.ctx(), "demo", "r1")
+                .unwrap()
+                .contains("abandoned because: the reviewer could not be dispatched")
+        );
+        open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
                 plain: Some(PLAIN.into()),
                 repo: None,
             },
@@ -4044,6 +4179,59 @@ mod tests {
     /// The `advance` proof: two pinned lanes get one reviewer thread, and a
     /// second `advance` changes nothing.
     #[test]
+    fn large_review_sources_are_referenced_instead_of_primed() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (id, _) = fx.lane(1);
+        let wt = fx.repo.join(".worktrees/lane-1");
+        let sha = commit_file(
+            &wt,
+            "generated.json",
+            &format!("LARGE-DIFF-MARKER{}", "x".repeat(200_000)),
+            "large generated case",
+        );
+        admit(&fx.world.ctx(), "demo", "r1", &id).unwrap();
+        fx.seal_done(
+            &id,
+            1,
+            1,
+            &sha,
+            &format!("# report\nLARGE-REPORT-MARKER{}", "y".repeat(160_000)),
+        );
+
+        advance(&fx.world.ctx(), "demo").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        let reviewer = record.reviewer.unwrap();
+        let task = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer)).unwrap();
+        assert!(task.len() <= REVIEW_TASK_BYTE_CAP);
+        assert!(task.contains("tasks/review-r1.md"));
+        assert!(task.contains(&format!("git diff main...{sha} --")));
+        assert!(task.contains("deliberately omitted, not empty"));
+        assert!(!task.contains("LARGE-DIFF-MARKER"));
+        assert!(!task.contains("LARGE-REPORT-MARKER"));
+
+        let calls = fx.world.runner.calls.borrow();
+        let curl = calls.iter().find(|c| c.program == "/usr/bin/curl").unwrap();
+        let encoded = curl
+            .stdin
+            .as_ref()
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("data = "))
+            .unwrap();
+        let body: String = serde_json::from_str(encoded).unwrap();
+        assert!(body.len() <= crate::jev::REQUEST_BYTE_CAP);
+        assert!(body.contains("omitted_sources"));
+        assert!(!body.contains("LARGE-DIFF-MARKER"));
+        assert!(!body.contains("LARGE-REPORT-MARKER"));
+        let ledger =
+            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
+        assert!(ledger.contains("dispatch-input-truncated"));
+        assert!(ledger.contains("source_truncation"));
+    }
+
+    #[test]
     fn advance_starts_one_reviewer_and_never_a_second() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -4081,7 +4269,8 @@ mod tests {
             .find_map(|l| l.strip_prefix("data = "))
             .unwrap();
         let body: String = serde_json::from_str(encoded).unwrap();
-        assert!(body.contains("Review brief") && body.contains("Changes under review"));
+        assert!(body.contains("Review inputs") && body.contains("git diff"));
+        assert!(body.len() <= crate::jev::REQUEST_BYTE_CAP);
         drop(calls);
         assert!(!started.base.is_empty(), "the reviewer has a base commit");
 
