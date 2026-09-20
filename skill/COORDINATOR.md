@@ -147,11 +147,11 @@ A round is a set of lanes that are reviewed and merged together (`hp round show 
 - `hp round open <slug> <round> --branch <integration branch> --plain "<sentence>"`, then `hp round admit <slug> <round> <thread>` per lane. A lane is complete when it runs `hp done`; its sealed sha is pinned automatically.
 - When every lane in a round is pinned, the harness starts the review on its own; the review does not wait for runs, only for pins. A herdr hook runs `hp round advance <slug>` when a lane's agent changes state, and the ticker runs the same pass as a safety net. It runs `round review` if needed, starts the reviewer thread, and binds it. You do not start reviewers by hand. To add focus to a running reviewer, use `hp thread prompt <slug> <id>`. `hp round review` and `hp round reviewer` stay as manual recovery commands; a gone reviewer is reported, and `hp round reviewer` can replace it. After a REJECT, `hp round review <slug> <round>` makes the next revision and the next `advance` starts its reviewer. After `round merge` reports `merge_conflict`, run `round review` and then `round advance`; the repair reviewer merges the earlier candidate over the new base.
 - `hp round advance <slug>` also announces a verdict once: a MERGE verdict gets an inbox item and a `say` line naming `hp round merge`; any other verdict gets an inbox item. It never merges.
-- `hp round merge <slug> <round>` merges only on an exact MERGE verdict at the verdict commit for the pinned candidate, then writes the checkpoint. It lands even when the integration branch moved after the review brief (a second round's brief, or a `thread start` task commit), with a merge commit when needed; a real conflict still refuses. Run it again after any failure: it resumes and never merges twice. Read its exit before anything that follows it, never behind a pipe.
+- `hp round merge <slug> <round>` lands the round and writes the checkpoint. Run it again after a failure to resume the recorded transaction.
 - `hp dialogue start|critic|turn|commit` runs a spec dialogue; `hp checkpoint <slug>` writes `HANDOFF.md` and `HANDOFF.json` as one commit; `hp pickup <slug>` re-links live workers and prints start lines for gone ones.
 
 ## Never without the user asking in chat
 
 Force-push, delete branches, remove worktrees, resolve threads, delete or archive the project.
 
-Never merge except through `hp round merge`, which merges only on an exact MERGE verdict at the verdict commit for the pinned candidate. A MERGE-AFTER-DECISION verdict waits for Rolf: ask him with `hp ask`.
+Use `hp round merge` to land reviewed work. Bring a MERGE-AFTER-DECISION verdict to Rolf with `hp ask`.

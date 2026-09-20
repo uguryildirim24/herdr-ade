@@ -3,9 +3,9 @@
 //!
 //! Authority: `.state/rounds/r<n>.toml` holds the admitted set, its revision,
 //! the gate list and `policy_hash` (item 33). Membership is never inferred
-//! from events; only the per-member completion pins are refreshed from sealed
-//! `done` events under `events/`. The merge record `.state/rounds/r<n>/merge.toml`
-//! carries the merge intent and the checkpoint intent (item 34).
+//! from events. Completion events are ingested into this record; the merge
+//! and checkpoint intents live here too. Git and report files are checked
+//! evidence, never a competing source of lifecycle state.
 //!
 //! Lock order: the project lock is never held while the repository lock is
 //! taken, and git never runs under the project lock (D4).
@@ -16,7 +16,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::contracts::{
-    CheckpointIntent, CompletionPin, Event, ManifestMember, MergeIntent, MergePhase, RoundRecord,
+    CheckpointIntent, CompletionPin, Event, ManifestMember, MergeIntent, MergePhase, ReviewIntent,
+    RoundPhase, RoundRecord,
 };
 use crate::paths::Ctx;
 use crate::project::{self, Project, write_atomic};
@@ -292,6 +293,7 @@ pub fn merge_path(project: &Project, round: &str) -> PathBuf {
 /// `round_manifest_unavailable`: membership is never rebuilt (item 33).
 pub fn load(project: &Project, round: &str) -> Result<RoundRecord> {
     validate_round_id(round)?;
+    let _record_lock = record_lock(project, round)?;
     let path = round_path(project, round);
     let text = std::fs::read_to_string(&path).map_err(|e| {
         anyhow::anyhow!(
@@ -299,16 +301,120 @@ pub fn load(project: &Project, round: &str) -> Result<RoundRecord> {
             path.display()
         )
     })?;
-    toml::from_str(&text).map_err(|e| {
+    let mut record: RoundRecord = toml::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
             "round_manifest_unavailable: {} does not parse ({e}); membership is not rebuilt from events",
             path.display()
         )
-    })
+    })?;
+    if record.round != round {
+        bail!(
+            "round_state_mismatch: {} names `{}` instead of `{round}`; restore the round record before retrying",
+            path.display(),
+            record.round
+        );
+    }
+    let shape: toml::Value = toml::from_str(&text)?;
+    // One-time, in-place migration. Once phase exists, the old sidecar is
+    // never an input again (even if interrupted before its removal).
+    if shape.get("phase").is_none() {
+        let legacy = merge_path(project, round);
+        record.merge = match std::fs::read_to_string(&legacy) {
+            Ok(text) => Some(
+                toml::from_str(&text)
+                    .with_context(|| format!("merge_record_unreadable: {}", legacy.display()))?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        record.phase = match &record.merge {
+            Some(intent) => phase_for_merge(intent),
+            None if record.expected_head.is_some() => RoundPhase::UnderReview,
+            None => RoundPhase::Admitting,
+        };
+        write_atomic(&path, toml::to_string(&record)?.as_bytes())?;
+        if legacy.exists() {
+            std::fs::remove_file(legacy)?;
+        }
+    } else if merge_path(project, round).exists() {
+        eprintln!(
+            "round_obsolete_output: `{round}` owns its merge transaction; remove obsolete {} (it is not read)",
+            merge_path(project, round).display()
+        );
+    }
+    validate_record(&record)?;
+    Ok(record)
+}
+
+fn validate_record(record: &RoundRecord) -> Result<()> {
+    if let Some(intent) = &record.merge {
+        if record.phase != phase_for_merge(intent) {
+            bail!(
+                "round_state_mismatch: `{}` phase disagrees with its merge transaction; restore the round record before retrying",
+                record.round
+            );
+        }
+    } else if matches!(
+        record.phase,
+        RoundPhase::Merging | RoundPhase::Checkpointing | RoundPhase::Merged | RoundPhase::Diverged
+    ) {
+        bail!(
+            "round_state_mismatch: `{}` phase requires a merge transaction; restore the round record before retrying",
+            record.round
+        );
+    }
+    if (record.phase == RoundPhase::PreparingReview) != record.review_intent.is_some() {
+        bail!(
+            "round_state_mismatch: `{}` phase disagrees with its review output intent; restore the round record before retrying",
+            record.round
+        );
+    }
+    let verdict_phase = matches!(
+        record.phase,
+        RoundPhase::PreparingReview
+            | RoundPhase::VerdictIn
+            | RoundPhase::Merging
+            | RoundPhase::Checkpointing
+            | RoundPhase::Merged
+            | RoundPhase::Diverged
+    );
+    if record.phase == RoundPhase::VerdictIn && record.verdict.is_none()
+        || record.verdict.is_some() && !verdict_phase
+    {
+        bail!(
+            "round_state_mismatch: `{}` phase disagrees with its accepted verdict; restore the round record before retrying",
+            record.round
+        );
+    }
+    Ok(())
+}
+
+fn operation_lock(project: &Project, round: &str) -> Result<std::fs::File> {
+    validate_round_id(round)?;
+    std::fs::create_dir_all(rounds_dir(project))?;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(rounds_dir(project).join(format!("{round}.operation.lock")))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn record_lock(project: &Project, round: &str) -> Result<std::fs::File> {
+    std::fs::create_dir_all(rounds_dir(project))?;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(rounds_dir(project).join(format!("{round}.lock")))?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn save(project: &Project, record: &RoundRecord) -> Result<()> {
-    std::fs::create_dir_all(rounds_dir(project))?;
+    validate_record(record)?;
+    let _record_lock = record_lock(project, &record.round)?;
     write_atomic(
         &round_path(project, &record.round),
         toml::to_string(record)?.as_bytes(),
@@ -332,28 +438,107 @@ pub fn list(project: &Project) -> Vec<RoundRecord> {
 }
 
 pub fn read_merge(project: &Project, round: &str) -> Result<Option<MergeIntent>> {
-    let path = merge_path(project, round);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).map(Some).map_err(|e| {
-            anyhow::anyhow!(
-                "merge_record_unreadable: {} does not parse ({e})",
-                path.display()
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => bail!(
-            "merge_record_unreadable: {} cannot be read ({e})",
-            path.display()
-        ),
+    Ok(load(project, round)?.merge)
+}
+
+fn phase_for_merge(intent: &MergeIntent) -> RoundPhase {
+    match intent.phase {
+        MergePhase::Intent => RoundPhase::Merging,
+        MergePhase::Merged => RoundPhase::Checkpointing,
+        MergePhase::Checkpointed => RoundPhase::Merged,
+        MergePhase::MergeDiverged => RoundPhase::Diverged,
     }
 }
 
 fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<()> {
-    std::fs::create_dir_all(merge_dir(project, round))?;
-    write_atomic(
-        &merge_path(project, round),
-        toml::to_string(intent)?.as_bytes(),
-    )
+    let _lock = project.lock()?;
+    let mut record = load(project, round)?;
+    record.phase = phase_for_merge(intent);
+    record.merge = Some(intent.clone());
+    save(project, &record)
+}
+
+fn require_mutable(record: &RoundRecord) -> Result<()> {
+    if record.phase.closed() || record.merge.is_some() {
+        bail!(
+            "round_closed: `{}` is {:?}; use a new round for new work",
+            record.round,
+            record.phase
+        );
+    }
+    Ok(())
+}
+
+fn require_editable(record: &RoundRecord) -> Result<()> {
+    require_mutable(record)?;
+    if record.phase == RoundPhase::PreparingReview {
+        bail!(
+            "round_output_pending: `{}` has a recorded review output intent; finish it with `round review {}` before changing the round",
+            record.round,
+            record.round
+        );
+    }
+    Ok(())
+}
+
+/// A manifest change supersedes the active review. Keep the old review branch
+/// metadata so the next review can name its predecessor, but do not leave its
+/// reviewer or verdict bound to the new inputs.
+fn return_to_admitting(record: &mut RoundRecord) {
+    record.phase = RoundPhase::Admitting;
+    record.reviewer = None;
+    record.verdict = None;
+    record.announced = None;
+    record.reviewer_start_failures = 0;
+}
+
+/// Safety callers must not use the display list, which skips broken records.
+fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
+    if !rounds_dir(project).exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(rounds_dir(project))? {
+        let name = entry?.file_name();
+        if let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".toml"))
+            && validate_round_id(id).is_ok()
+        {
+            records.push(load(project, id)?);
+        }
+    }
+    Ok(records)
+}
+
+/// Called under the repository lock, before taking the project lock. Other
+/// projects and worktree paths can name the same integration ref.
+fn require_branch_available(
+    ctx: &Ctx,
+    project: &Project,
+    git: &Git,
+    branch: &str,
+    except: &str,
+) -> Result<()> {
+    let common = std::fs::canonicalize(git.common_dir()?)?;
+    for slug in project::list_slugs(&ctx.root) {
+        let other = Project::load(&ctx.root, &slug)?;
+        for record in checked_list(&other)? {
+            if (slug == project.slug && record.round == except)
+                || record.branch != branch
+                || record.phase.closed()
+            {
+                continue;
+            }
+            let other_git = Git::new(ctx.runner, &record.repo);
+            if std::fs::canonicalize(other_git.common_dir()?)? == common {
+                bail!(
+                    "round_head_reserved: `{slug}/{}` owns `{branch}` in phase {:?}; merge that round before opening or reviewing `{except}`, or use another integration branch",
+                    record.round,
+                    record.phase
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The open round (no merge record yet) that pins this thread as a lane or
@@ -376,7 +561,7 @@ pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<Stri
         // This guard is a safety boundary, not a display. An unreadable round
         // must block resolution because it may be the record pinning `thread`.
         let record = load(project, round)?;
-        if read_merge(project, round)?.is_some() {
+        if record.phase.closed() {
             continue;
         }
         let pinned = record
@@ -389,6 +574,15 @@ pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<Stri
         }
     }
     Ok(None)
+}
+
+pub fn require_resolvable(project: &Project, thread: &str) -> Result<()> {
+    if let Some(round) = open_round_pinning(project, thread)? {
+        bail!(
+            "round_unmerged: `{thread}` is held by round `{round}`; run `round merge {round}` to completion before resolving it"
+        );
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------- thread reads
@@ -472,15 +666,22 @@ fn done_pin(events: &[Event], round: &str, thread: &str, attempt: u32) -> Option
         })
 }
 
-/// Refreshes the completion projection (item 33). A first pin does not bump
-/// the revision; a changed or removed pin (a later attempt, a superseding
-/// done) does, which makes an existing review stale.
+/// Ingest completions while admitting. Frozen pins are authoritative: a
+/// changed event reports drift, and only explicit admit/review may repin.
 pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event]) -> Result<bool> {
     let mut changed = false;
     let mut bump = false;
     for member in &mut record.manifest.members {
         let pin = member_pin(project, &record.round, &member.thread, events)?;
         if member.pin != pin {
+            if record.phase != RoundPhase::Admitting {
+                bail!(
+                    "review_stale: `{}` has different completion evidence for `{}`; the recorded pin was kept; run `round review {}` to accept new inputs",
+                    record.round,
+                    member.thread,
+                    record.round
+                );
+            }
             if member.pin.is_some() {
                 bump = true;
             }
@@ -673,6 +874,8 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
         ..Default::default()
     };
     {
+        let _repo = repo_lock(&git)?;
+        require_branch_available(ctx, &project, &git, &record.branch, &record.round)?;
         let _lock = project.lock()?;
         if round_path(&project, &args.round).exists() {
             bail!("round_exists: `{}` is already open", args.round);
@@ -723,13 +926,10 @@ fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
 
 pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
+    let _operation = operation_lock(&project, round)?;
     let lane = thread::load(&project, thread_id)?;
     let record = load(&project, round)?;
-    if let Some(merge) = read_merge(&project, round)?
-        && merge.phase == MergePhase::Checkpointed
-    {
-        bail!("round_closed: `{round}` is merged and checkpointed");
-    }
+    require_editable(&record)?;
     // Refuse a pin that already landed before any record changes, and never
     // run git under the project lock (D4).
     if !record.repo.is_empty() {
@@ -744,11 +944,8 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
-        if let Some(merge) = read_merge(&project, round)?
-            && merge.phase == MergePhase::Checkpointed
-        {
-            bail!("round_closed: `{round}` is merged and checkpointed");
-        }
+        require_editable(&record)?;
+        let before = record.manifest.clone();
         if !record
             .manifest
             .members
@@ -762,7 +959,14 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
             record.manifest.revision += 1;
         }
         let events = sealed_events(&project)?;
+        let previous_phase = record.phase;
+        record.phase = RoundPhase::Admitting;
         refresh_pins(&project, &mut record, &events)?;
+        if record.manifest != before {
+            return_to_admitting(&mut record);
+        } else {
+            record.phase = previous_phase;
+        }
         save(&project, &record)?;
         record
     };
@@ -776,19 +980,19 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
 
 pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
+    let _operation = operation_lock(&project, round)?;
     thread::validate_id(thread_id)?;
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
-        if read_merge(&project, round)?.is_some() {
-            bail!("round_merging: `{round}` has a merge record; membership is fixed");
-        }
+        require_editable(&record)?;
         let before = record.manifest.members.len();
         record.manifest.members.retain(|m| m.thread != thread_id);
         if record.manifest.members.len() == before {
             bail!("not_a_member: `{thread_id}` is not admitted to `{round}`");
         }
         record.manifest.revision += 1;
+        return_to_admitting(&mut record);
         save(&project, &record)?;
         record
     };
@@ -803,9 +1007,11 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
 /// Manual repair only: `advance` is the path that starts and binds a reviewer.
 pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
+    let _operation = operation_lock(&project, round)?;
     thread::load(&project, thread_id)?;
     let _lock = project.lock()?;
     let mut record = load(&project, round)?;
+    require_editable(&record)?;
     if record.expected_head.is_none() {
         bail!("review_missing: run `round review {round}` first");
     }
@@ -817,6 +1023,11 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
     {
         bail!("reviewer_is_member: `{thread_id}` is a lane of `{round}`");
     }
+    if record.verdict.is_some() && record.reviewer.as_deref() != Some(thread_id) {
+        bail!(
+            "verdict_already_accepted: `{round}` already pins its reviewer verdict; run `round review {round}` to start a new review"
+        );
+    }
     if let Some(reviewer) = record.reviewer.as_deref() {
         if reviewer == thread_id {
             return Ok(record);
@@ -827,6 +1038,8 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
             bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
         }
     }
+    record.verdict = None;
+    record.phase = RoundPhase::UnderReview;
     record.reviewer = Some(thread_id.to_string());
     save(&project, &record)?;
     Ok(record)
@@ -858,7 +1071,17 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
     let _advance = advance_lock(&project)?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
     let events = sealed_events(&project)?;
-    for listed in list(&project) {
+    for listed in checked_list(&project)? {
+        if listed.phase.closed() {
+            continue;
+        }
+        if listed.manifest.members.is_empty() {
+            bail!(
+                "round_empty: `{}` has no members; run `round admit {} <thread>` before advancing",
+                listed.round,
+                listed.round
+            );
+        }
         let round = listed.round.clone();
         if read_merge(&project, &round)?.is_some() {
             continue;
@@ -935,7 +1158,8 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             continue;
         }
         let current_hash = manifest_hash(&record);
-        let review_is_current = record.frozen_revision == Some(record.manifest.revision)
+        let review_is_current = record.phase != RoundPhase::PreparingReview
+            && record.frozen_revision == Some(record.manifest.revision)
             && record.manifest_hash.as_deref() == Some(current_hash.as_str());
         let review_branch = match (record.review_branch.clone(), review_is_current) {
             (Some(branch), true) => branch,
@@ -1386,20 +1610,25 @@ pub struct ReviewOutcome {
 /// only: `advance` runs this on its own when a round is ready for review.
 pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let project = Project::load(&ctx.root, slug)?;
+    let _operation = operation_lock(&project, round)?;
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
-        if read_merge(&project, round)?.is_some() {
-            bail!("round_merging: `{round}` already has a merge record");
-        }
+        require_mutable(&record)?;
         let events = sealed_events(&project)?;
+        let phase = record.phase;
+        record.phase = RoundPhase::Admitting;
         if refresh_pins(&project, &mut record, &events)? {
+            record.phase = phase;
             save(&project, &record)?;
         }
+        record.phase = phase;
         record
     };
     if record.manifest.members.is_empty() {
-        bail!("round_empty: no lane is admitted to `{round}`");
+        bail!(
+            "round_empty: no lane is admitted to `{round}`; run `round admit {round} <thread>` first"
+        );
     }
     let missing: Vec<&str> = record
         .manifest
@@ -1444,6 +1673,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let earlier = completed_review(&project, &record, &git);
     let (b, review_branch, worktree, repair) = {
         let _repo = repo_lock(&git)?;
+        require_branch_available(ctx, &project, &git, &record.branch, round)?;
         let head = git
             .branch_head(&record.branch)?
             .with_context(|| format!("branch_missing: `{}`", record.branch))?;
@@ -1452,49 +1682,115 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         // manual command must not clear a reviewer that is still working.
         let same_frozen_manifest = record.frozen_revision == Some(record.manifest.revision)
             && record.manifest_hash.as_deref() == Some(hash.as_str());
-        if same_frozen_manifest && earlier.is_none() {
+        if same_frozen_manifest && earlier.is_none() && record.review_intent.is_none() {
             bail!(
                 "review_in_progress: `{round}` already has a review for this manifest and no sealed verdict"
             );
         }
-        let frozen = record.expected_head.clone().filter(|b| {
-            same_frozen_manifest && earlier.is_some() && git.is_ancestor(b, &head).unwrap_or(false)
-        });
-        let repair = frozen.is_some();
-        let b = match frozen {
-            Some(b) => b,
-            None => commit_files_on_branch(
+        let intent = match record.review_intent.clone() {
+            Some(intent) => intent,
+            None => {
+                if let Some(b) = &record.expected_head
+                    && !git.is_ancestor(b, &head)?
+                {
+                    bail!(
+                        "round_git_mismatch: `{round}` records brief {b}, absent from `{}`; restore that branch before reviewing",
+                        record.branch
+                    );
+                }
+                let frozen = record
+                    .expected_head
+                    .clone()
+                    .filter(|_| same_frozen_manifest && earlier.is_some());
+                let mut branch = format!("review/{round}");
+                let mut n = 2;
+                while git.branch_head(&branch)?.is_some() {
+                    branch = format!("review/{round}-{n}");
+                    n += 1;
+                }
+                let intent = ReviewIntent {
+                    head: head.clone(),
+                    branch,
+                    brief: brief.clone(),
+                    manifest_hash: hash.clone(),
+                    reuse_brief: frozen,
+                };
+                let _lock = project.lock()?;
+                let mut current = load(&project, round)?;
+                if manifest_hash(&current) != hash {
+                    bail!(
+                        "review_stale: `{round}` changed before its output intent; retry round review"
+                    );
+                }
+                current.phase = RoundPhase::PreparingReview;
+                current.review_intent = Some(intent.clone());
+                save(&project, &current)?;
+                intent
+            }
+        };
+        if intent.manifest_hash != hash || intent.brief != brief {
+            bail!(
+                "round_git_mismatch: `{round}` inputs differ from its pending review output; restore the recorded inputs before retrying round review"
+            );
+        }
+        let repair = intent.reuse_brief.is_some();
+        let b = match &intent.reuse_brief {
+            Some(b) if head == intent.head => b.clone(),
+            None if head == intent.head => commit_files_on_branch(
                 &git,
                 &record.branch,
-                &[(brief_path.as_str(), brief.as_str())],
+                &[(brief_path.as_str(), intent.brief.as_str())],
                 &format!(
                     "review({round}): brief for revision {}",
                     record.manifest.revision
                 ),
-                &head,
+                &intent.head,
                 &project.state_dir().join("tmp"),
             )?,
+            None if git.parents(&head)? == [intent.head.clone()]
+                && git.diff_names(&intent.head, &head)? == [brief_path.clone()]
+                && git.show_file(&head, &brief_path)?.as_deref() == Some(intent.brief.as_str()) =>
+            {
+                eprintln!(
+                    "round_output_recovered: `{round}` brief matches the recorded intent at {head}"
+                );
+                head.clone()
+            }
+            _ => bail!(
+                "round_git_mismatch: `{round}` expected integration head {}; found {head}; restore the recorded head before retrying round review",
+                intent.head
+            ),
         };
-        let base = if repair { head } else { b.clone() };
-        let mut review_branch = format!("review/{round}");
-        let mut n = 2;
-        while git.branch_head(&review_branch)?.is_some() {
-            review_branch = format!("review/{round}-{n}");
-            n += 1;
-        }
-        let dir_name = review_branch.replace('/', "-");
+        let base = if repair { intent.head } else { b.clone() };
+        let review_branch = intent.branch;
         let worktree = PathBuf::from(&record.repo)
             .join(".worktrees")
-            .join(dir_name);
-        git.run(&[
-            "worktree",
-            "add",
-            "-q",
-            &worktree.to_string_lossy(),
-            "-b",
-            &review_branch,
-            &base,
-        ])?;
+            .join(review_branch.replace('/', "-"));
+        match git.branch_head(&review_branch)? {
+            None => {
+                git.run(&[
+                    "worktree",
+                    "add",
+                    "-q",
+                    &worktree.to_string_lossy(),
+                    "-b",
+                    &review_branch,
+                    &base,
+                ])?;
+            }
+            Some(actual)
+                if actual == base
+                    && git.checkout_of(&review_branch)?.as_ref() == Some(&worktree) =>
+            {
+                eprintln!(
+                    "round_output_recovered: `{round}` review branch matches its recorded intent"
+                );
+            }
+            Some(actual) => bail!(
+                "round_git_mismatch: `{review_branch}` is at {actual}, expected {base} in {}; restore that output before retrying round review",
+                worktree.display()
+            ),
+        }
         (b, review_branch, worktree, repair)
     };
     // A repair re-review keeps the earlier candidate and verdict for the
@@ -1512,6 +1808,9 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                 "review_stale: the manifest changed while the brief was written; run `round review {round}` again"
             );
         }
+        current.phase = RoundPhase::UnderReview;
+        current.review_intent = None;
+        current.verdict = None;
         current.expected_head = Some(b.clone());
         current.frozen_revision = Some(current.manifest.revision);
         current.manifest_hash = Some(hash.clone());
@@ -1686,20 +1985,40 @@ fn parse_verdict(text: &str) -> Result<Verdict> {
 }
 
 /// The reviewer's sealed `done` sha for its current attempt: `V`.
-fn verdict_commit(project: &Project, record: &RoundRecord) -> Result<String> {
+fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<String> {
+    if let Some(pin) = &record.verdict {
+        return Ok(pin.sha.clone());
+    }
+    if let Some(intent) = &record.merge {
+        return Ok(intent.verdict.clone());
+    }
     let reviewer = record
         .reviewer
         .as_deref()
         .context("reviewer_unbound: no reviewer thread is recorded; run `round reviewer`")?;
     let attempt = thread_attempt(project, reviewer)?;
     let events = sealed_events(project)?;
-    events
-        .iter()
-        .filter(|e| e.thread == reviewer && e.attempt == attempt)
-        .filter_map(|e| e.payload.done.as_ref().map(|d| (e, d)))
-        .max_by(|a, b| (&a.0.created, &a.0.id).cmp(&(&b.0.created, &b.0.id)))
-        .map(|(_, d)| d.sha.clone())
-        .context("verdict_missing: the reviewer has no sealed done event for its current attempt")
+    let pin = done_pin(&events, &record.round, reviewer, attempt)
+        .context("verdict_missing: the reviewer has no sealed done event for this round and attempt; finish the review and run done with its verdict commit")?;
+    validate_verdict_inner(git, record, &pin.sha, false)?;
+    let _lock = project.lock()?;
+    let mut current = load(project, &record.round)?;
+    if current.reviewer != record.reviewer
+        || current.manifest_hash != record.manifest_hash
+        || manifest_hash(&current) != manifest_hash(record)
+        || current.review_intent.is_some()
+        || current.merge.is_some()
+        || current.phase.closed()
+    {
+        bail!("review_stale: the review changed while accepting its verdict; retry round advance");
+    }
+    if let Some(accepted) = current.verdict {
+        return Ok(accepted.sha);
+    }
+    current.verdict = Some(pin.clone());
+    current.phase = RoundPhase::VerdictIn;
+    save(project, &current)?;
+    Ok(pin.sha)
 }
 
 /// The structurally valid C and V of the completed review currently bound to
@@ -1710,7 +2029,7 @@ fn completed_review(
     record: &RoundRecord,
     git: &Git,
 ) -> Option<(String, String)> {
-    let v = verdict_commit(project, record).ok()?;
+    let v = verdict_commit(project, record, git).ok()?;
     let parents = git.parents(&v).ok()?;
     let [c] = parents.as_slice() else {
         return None;
@@ -1730,6 +2049,15 @@ fn completed_review(
 
 /// Every check `ha round merge` makes before the intent (D6). Returns `C`.
 pub fn validate_verdict(git: &Git, record: &RoundRecord, v: &str) -> Result<String> {
+    validate_verdict_inner(git, record, v, true)
+}
+
+fn validate_verdict_inner(
+    git: &Git,
+    record: &RoundRecord,
+    v: &str,
+    require_merge: bool,
+) -> Result<String> {
     let r = &record.round;
     let b = record.expected_head.as_deref().context("review_missing")?;
     let parents = git.parents(v)?;
@@ -1764,9 +2092,9 @@ pub fn validate_verdict(git: &Git, record: &RoundRecord, v: &str) -> Result<Stri
             verdict.round
         );
     }
-    if verdict.verdict != "MERGE" {
+    if require_merge && verdict.verdict != "MERGE" {
         bail!(
-            "verdict_not_merge: the verdict is `{}`; only MERGE merges (MERGE-AFTER-DECISION waits for Rolf)",
+            "verdict_not_merge: the verdict is `{}` at {v}; obtain a new review with an exact MERGE verdict using `round review {r}` then `round advance`",
             verdict.verdict
         );
     }
@@ -1779,6 +2107,9 @@ pub fn validate_verdict(git: &Git, record: &RoundRecord, v: &str) -> Result<Stri
     }
     if !git.is_ancestor(b, &c)? {
         bail!("base_not_ancestor: the brief commit B {b} is not an ancestor of C {c}");
+    }
+    if !require_merge && verdict.verdict != "MERGE" {
+        return Ok(c);
     }
     for m in &record.manifest.members {
         let pin = m.pin.as_ref().context("round_not_complete")?;
@@ -1796,12 +2127,15 @@ pub fn validate_verdict(git: &Git, record: &RoundRecord, v: &str) -> Result<Stri
 /// The verdict recorded by the reviewer's sealed `done` sha, when it parses.
 /// Read-only: it never merges and never fails a round.
 pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Option<String> {
-    let v = verdict_commit(project, record).ok()?;
+    if record.manifest_hash.as_deref() != Some(manifest_hash(record).as_str()) {
+        return None;
+    }
+    let v = verdict_commit(project, record, git).ok()?;
     let text = git.show_file(&v, &verdict_path(&record.round)).ok()??;
     parse_verdict(&text).ok().map(|v| v.verdict)
 }
 
-/// `ha round merge` (D6, item 34). Resumes from `merge.toml` when present.
+/// `ha round merge` resumes the transaction in the owning round record.
 pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<MergeOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
@@ -1822,16 +2156,9 @@ fn merge_inner(
     round: &str,
     stop: Option<Stop>,
 ) -> Result<MergeOutcome> {
+    // Serialize all explicit round changes, then read the owning record.
+    let _operation = operation_lock(&project, round)?;
     let record = load(&project, round)?;
-    // One merge per round at a time: a second run waits, then reads the
-    // first one's record and resumes from it (item 34).
-    std::fs::create_dir_all(merge_dir(&project, round))?;
-    let single = std::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(merge_dir(&project, round).join("merge.lock"))?;
-    single.lock()?;
     let git = Git::new(ctx.runner, &record.repo);
     let outcome = match read_merge(&project, round)? {
         Some(intent) => resume(ctx, &project, &record, &git, intent, stop),
@@ -1878,6 +2205,7 @@ fn fresh_merge(
     let record = {
         let _lock = project.lock()?;
         let mut record = load(project, &round)?;
+        require_editable(&record)?;
         let events = sealed_events(project)?;
         if refresh_pins(project, &mut record, &events)? {
             save(project, &record)?;
@@ -1897,7 +2225,7 @@ fn fresh_merge(
             record.frozen_revision.unwrap_or(0)
         );
     }
-    let v = verdict_commit(project, &record)?;
+    let v = verdict_commit(project, &record, git)?;
     let c = validate_verdict(git, &record, &v)?;
     // B is the brief commit, but the integration branch may have moved on: a
     // later round's brief or a `thread start` task commit lands there. The
@@ -1954,7 +2282,13 @@ fn effect_merge(
             // The branch already holds exactly the ref result (a crash after
             // the update, or an old-format record from before `merged`
             // existed): record it and merge nothing again.
-            None if is_unrecorded_merge_result(git, &intent, &head)? => head.clone(),
+            None if is_unrecorded_merge_result(git, &intent, &head)? => {
+                eprintln!(
+                    "round_output_recovered: `{}` git merge matches the recorded intent at {head}",
+                    record.round
+                );
+                head.clone()
+            }
             None => {
                 let b = record
                     .expected_head
@@ -2058,6 +2392,7 @@ fn checkpoint_phase(
     mut intent: MergeIntent,
     stop: Option<Stop>,
 ) -> Result<MergeOutcome> {
+    std::fs::create_dir_all(merge_dir(project, &record.round))?;
     let (md_path, json_path) = staged_payload_paths(project, &record.round);
     let (md, json) = match &intent.checkpoint {
         None => {
@@ -2112,6 +2447,10 @@ fn checkpoint_phase(
                 &project.state_dir().join("tmp"),
             )?
         } else if is_recorded_checkpoint(git, &head, &cp)? {
+            eprintln!(
+                "round_output_recovered: `{}` checkpoint matches its recorded intent at {head}",
+                record.round
+            );
             head
         } else {
             drop(_repo);
@@ -2154,10 +2493,35 @@ fn resume(
     stop: Option<Stop>,
 ) -> Result<MergeOutcome> {
     let head = git.branch_head(&record.branch)?.context("branch_missing")?;
+    // Resuming is not a bypass of the verdict gate. The record chooses V;
+    // neither a newer event nor a moved review ref can substitute for it.
+    validate_verdict(git, record, &intent.verdict)?;
+    if record
+        .verdict
+        .as_ref()
+        .is_some_and(|pin| pin.sha != intent.verdict)
+    {
+        bail!(
+            "round_git_mismatch: `{}` merge intent differs from its accepted verdict; restore the round record before retrying",
+            record.round
+        );
+    }
     match intent.phase {
-        MergePhase::Checkpointed => Ok(MergeOutcome::NoOp {
-            head: intent.head.clone().unwrap_or_default(),
-        }),
+        MergePhase::Checkpointed => {
+            let expected = intent
+                .head
+                .as_deref()
+                .context("round_git_mismatch: merged round has no checkpoint head")?;
+            if !git.is_ancestor(expected, &head)? {
+                bail!(
+                    "round_git_mismatch: `{}` no longer contains recorded checkpoint {expected}; restore the integration branch before retrying",
+                    record.branch
+                );
+            }
+            Ok(MergeOutcome::NoOp {
+                head: expected.to_string(),
+            })
+        }
         MergePhase::MergeDiverged => bail!(
             "merge_diverged: `{}` diverged from the recorded merge; see the inbox",
             record.round
@@ -2316,6 +2680,7 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
             .map(|f| format!(" (frozen at {f})"))
             .unwrap_or_default()
     );
+    out.push_str(&format!("phase: {:?}\n", record.phase));
     for m in &record.manifest.members {
         match &m.pin {
             Some(p) => out.push_str(&format!(
@@ -2751,6 +3116,226 @@ mod tests {
     }
 
     #[test]
+    fn old_shaped_round_on_disk_migrates_in_place() {
+        let fx = fixture();
+        std::fs::create_dir_all(rounds_dir(&fx.project)).unwrap();
+        let path = round_path(&fx.project, "r1");
+        std::fs::write(&path, include_str!("../tests/fixtures/rounds/r1.toml")).unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.phase, RoundPhase::UnderReview);
+        assert_eq!(
+            record.manifest.members[0].pin.as_ref().unwrap().sha,
+            "76da26869bf4fe58790dc12397c9239adfcc2a22"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("phase = \"under_review\"")
+        );
+        assert_eq!(record, load(&fx.project, "r1").unwrap());
+    }
+
+    #[test]
+    fn migration_absorbs_merge_sidecar_once() {
+        let fx = fixture();
+        std::fs::create_dir_all(merge_dir(&fx.project, "r1")).unwrap();
+        std::fs::write(
+            round_path(&fx.project, "r1"),
+            include_str!("../tests/fixtures/rounds/r1.toml"),
+        )
+        .unwrap();
+        let legacy = include_str!("../tests/fixtures/rounds/r1-merge.toml");
+        let intent: MergeIntent = toml::from_str(legacy).unwrap();
+        std::fs::write(merge_path(&fx.project, "r1"), legacy).unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.phase, RoundPhase::Merged);
+        assert_eq!(record.merge, Some(intent.clone()));
+        assert!(!merge_path(&fx.project, "r1").exists());
+        assert_eq!(read_merge(&fx.project, "r1").unwrap(), Some(intent));
+    }
+
+    #[test]
+    fn explicit_phase_never_reads_an_obsolete_merge_sidecar() {
+        let fx = fixture();
+        open_r1(&fx);
+        std::fs::create_dir_all(merge_dir(&fx.project, "r1")).unwrap();
+        std::fs::write(merge_path(&fx.project, "r1"), "corrupt obsolete output").unwrap();
+        assert!(read_merge(&fx.project, "r1").unwrap().is_none());
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().phase,
+            RoundPhase::Admitting
+        );
+    }
+
+    #[test]
+    fn phase_and_transaction_disagreement_is_reported() {
+        let fx = fixture();
+        open_r1(&fx);
+        let path = round_path(&fx.project, "r1");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("phase = \"admitting\"", "phase = \"merged\"");
+        std::fs::write(path, text).unwrap();
+        assert!(err(load(&fx.project, "r1")).starts_with("round_state_mismatch"));
+    }
+
+    #[test]
+    fn review_retries_only_the_outputs_in_its_saved_intent() {
+        let fx = fixture();
+        let (_, b) = reviewed(&fx);
+        let ctx = fx.world.ctx();
+        let git = Git::new(ctx.runner, &fx.repo);
+        let mut record = load(&fx.project, "r1").unwrap();
+        let intent = ReviewIntent {
+            head: git.parents(&b).unwrap()[0].clone(),
+            branch: record.review_branch.take().unwrap(),
+            brief: git
+                .show_file(&b, &review_brief_path("r1"))
+                .unwrap()
+                .unwrap(),
+            manifest_hash: record.manifest_hash.take().unwrap(),
+            reuse_brief: None,
+        };
+        record.phase = RoundPhase::PreparingReview;
+        record.expected_head = None;
+        record.frozen_revision = None;
+        record.review_intent = Some(intent);
+        save(&fx.project, &record).unwrap();
+        let result = review(&ctx, "demo", "r1").unwrap();
+        assert_eq!(result.brief_commit, b);
+        assert_eq!(result.review_branch, "review/r1");
+        assert_eq!(main_head(&fx), b);
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().phase,
+            RoundPhase::UnderReview
+        );
+    }
+
+    #[test]
+    fn open_refuses_to_move_another_rounds_target() {
+        let fx = fixture();
+        let (_, b) = reviewed(&fx);
+        let e = err(open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        ));
+        assert!(
+            e.starts_with("round_head_reserved") && e.contains("r1") && e.contains("merge"),
+            "{e}"
+        );
+        assert_eq!(main_head(&fx), b);
+        assert!(!round_path(&fx.project, "r2").exists());
+        // Independent integration branches remain independent.
+        git(&fx.repo, &["branch", "other"]);
+        open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "other".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reservation_covers_other_projects_and_worktree_aliases() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let other = fx.world.project("other", "b.sock");
+        let alias = thread::load(&fx.project, &lanes[0].0)
+            .unwrap()
+            .worktree_path;
+        fx.world.add_repo(&other, &alias);
+        let e = err(open(
+            &fx.world.ctx(),
+            "other",
+            OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: Some(alias),
+            },
+        ));
+        assert!(
+            e.starts_with("round_head_reserved") && e.contains("demo/r1"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn advance_refuses_an_empty_round_without_outputs() {
+        let fx = fixture();
+        open_r1(&fx);
+        let before = main_head(&fx);
+        let e = err(advance(&fx.world.ctx(), "demo"));
+        assert!(
+            e.starts_with("round_empty") && e.contains("round admit r1"),
+            "{e}"
+        );
+        assert_eq!(main_head(&fx), before);
+        assert!(load(&fx.project, "r1").unwrap().review_branch.is_none());
+    }
+
+    #[test]
+    fn accepted_verdict_is_not_replaced_by_a_later_done_or_reviewer() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let git = Git::new(fx.world.ctx().runner, &fx.repo);
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            read_verdict(&fx.project, &record, &git).as_deref(),
+            Some("MERGE")
+        );
+        let accepted = load(&fx.project, "r1").unwrap();
+        assert_eq!(accepted.phase, RoundPhase::VerdictIn);
+        assert_eq!(accepted.verdict.as_ref().unwrap().sha, v);
+        let reviewer = accepted.reviewer.as_ref().unwrap();
+        fx.seal_done(reviewer, 1, 2, &lanes[0].1, "a later unrelated completion");
+        let replacement = fx.thread("Replacement reviewer");
+        let e = err(bind_reviewer(&fx.world.ctx(), "demo", "r1", &replacement));
+        assert!(e.starts_with("verdict_already_accepted"), "{e}");
+        merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        let merged = load(&fx.project, "r1").unwrap();
+        assert_eq!(merged.phase, RoundPhase::Merged);
+        assert_eq!(merged.merge.unwrap().verdict, v);
+        assert!(!merge_path(&fx.project, "r1").exists());
+    }
+
+    #[test]
+    fn completed_round_reports_git_drift_instead_of_reopening() {
+        let fx = fixture();
+        let (lanes, b) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        git(&fx.repo, &["reset", "--hard", &b]);
+        let e = err(merge(&fx.world.ctx(), "demo", "r1", None));
+        assert!(e.starts_with("round_git_mismatch"), "{e}");
+        assert_eq!(load(&fx.project, "r1").unwrap().phase, RoundPhase::Merged);
+    }
+
+    #[test]
+    fn pending_merge_holds_members_and_refuses_admission() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&fx.world.ctx(), "demo", "r1", Some(Stop::Ref)).unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.phase, RoundPhase::Merging);
+        assert!(require_resolvable(&fx.project, &lanes[0].0).is_err());
+        assert!(err(admit(&fx.world.ctx(), "demo", "r1", &lanes[0].0)).starts_with("round_closed"));
+    }
+
+    #[test]
     fn open_refuses_without_plain_and_with_a_registry_name() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -2782,6 +3367,9 @@ mod tests {
             args("r0", Some("The round lands config.toml.")),
         )
         .unwrap();
+        let mut old = load(&fx.project, "r0").unwrap();
+        old.phase = RoundPhase::Abandoned;
+        save(&fx.project, &old).unwrap();
         open(&ctx, "demo", args("r1", Some(PLAIN))).unwrap();
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(record.plain, PLAIN);
@@ -2851,7 +3439,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_attempt_unpins_and_bumps_the_revision() {
+    fn a_later_attempt_keeps_frozen_pins_until_explicit_review() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         open_r1(&fx);
@@ -2864,6 +3452,10 @@ mod tests {
         assert_eq!(r.manifest.members[0].pin.as_ref().unwrap().sha, sha);
         fx.set_attempt(&a, 2);
         tick(&ctx, &fx.project).unwrap();
+        let r = load(&fx.project, "r1").unwrap();
+        assert_eq!(r.manifest.revision, 1);
+        assert_eq!(r.manifest.members[0].pin.as_ref().unwrap().sha, sha);
+        assert!(err(review(&ctx, "demo", "r1")).starts_with("round_not_complete"));
         let r = load(&fx.project, "r1").unwrap();
         assert_eq!(r.manifest.revision, 2);
         assert!(r.manifest.members[0].pin.is_none());
@@ -2942,13 +3534,16 @@ mod tests {
     }
 
     #[test]
-    fn item33_member_added_after_b_makes_merge_stale() {
+    fn item33_member_added_after_b_supersedes_the_active_review() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let (lanes, _) = reviewed(&fx);
         verdict(&fx, &lanes, front("MERGE", "r1"));
         let (late, _) = fx.lane(3);
-        admit(&ctx, "demo", "r1", &late).unwrap();
+        let changed = admit(&ctx, "demo", "r1", &late).unwrap();
+        assert_eq!(changed.phase, RoundPhase::Admitting);
+        assert!(changed.reviewer.is_none());
+        assert!(changed.verdict.is_none());
         let e = err(merge(&ctx, "demo", "r1", None));
         assert!(e.starts_with("review_stale"), "{e}");
         assert!(read_merge(&fx.project, "r1").unwrap().is_none());
@@ -3794,14 +4389,14 @@ mod tests {
         let first_branch = load(&fx.project, "r1").unwrap().review_branch.unwrap();
 
         fx.set_attempt(&lanes[0].0, 2);
-        advance(&ctx, "demo").unwrap();
+        assert!(err(advance(&ctx, "demo")).starts_with("review_stale"));
         let waiting = load(&fx.project, "r1").unwrap();
         assert!(waiting.reviewer.is_none());
         assert_eq!(
             waiting.review_branch.as_deref(),
             Some(first_branch.as_str())
         );
-        assert!(waiting.manifest.members[0].pin.is_none());
+        assert!(waiting.manifest.members[0].pin.is_some());
         assert_eq!(
             thread::list(&fx.project)
                 .into_iter()
@@ -3814,6 +4409,7 @@ mod tests {
         let wt = fx.repo.join(".worktrees/lane-1");
         let repaired = commit_file(&wt, "src/lane1.rs", "// attempt 2\n", "retry lane 1");
         fx.seal_done(&lanes[0].0, 2, 1, &repaired, "# retry report\n");
+        review(&ctx, "demo", "r1").unwrap();
         advance(&ctx, "demo").unwrap();
 
         let retried = load(&fx.project, "r1").unwrap();
@@ -3954,8 +4550,7 @@ mod tests {
         );
     }
 
-    /// A lane pinned in an open round, and the round's reviewer, are closed
-    /// after the merge; `--force` overrides and says so once.
+    /// A lane stays held through the merge intent and checkpoint, with no override.
     #[test]
     fn resolve_refuses_a_lane_pinned_in_an_open_round() {
         let fx = fixture();
@@ -3992,28 +4587,16 @@ mod tests {
             },
         ));
         assert!(e.starts_with("round_unmerged") && e.contains("r1"), "{e}");
-        crate::threads::resolve(
-            &ctx,
-            "demo",
-            id,
-            &crate::threads::ResolveArgs {
-                skip_copy: true,
-                keep_pane: true,
-                force: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let says = crate::talk::read(&fx.project)
-            .lines
-            .iter()
-            .filter(|line| matches!(&line.entry, crate::talk::Entry::Say { .. }))
-            .count();
-        assert_eq!(says, 1, "one say line on the override");
-        assert_eq!(
-            thread::load(&fx.project, id).unwrap().status,
-            thread::Status::Resolved
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&ctx, "demo", "r1", Some(Stop::Merged)).unwrap();
+        assert!(
+            require_resolvable(&fx.project, id)
+                .unwrap_err()
+                .to_string()
+                .starts_with("round_unmerged")
         );
+        merge(&ctx, "demo", "r1", None).unwrap();
+        require_resolvable(&fx.project, id).unwrap();
     }
 
     /// A done lane keeps its pane but holds no slot; a resolved lane holds
