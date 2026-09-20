@@ -2,9 +2,7 @@
 //! (SPEC-pi v2 §7; SPEC-ADE §1.3).
 //!
 //! Every command is scripted through `pi::sh::fake`; no herdr, no pi process,
-//! no network. The guard is TypeScript and runs only inside pi, so its test
-//! is `src/pi/testdata/guard-check.sh` (T7): the shipping extension against
-//! the isolated pi with a mock provider that answers 429, 401 and 400.
+//! no network.
 
 use std::path::Path;
 
