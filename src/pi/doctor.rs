@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, roles, sh};
+use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, recipes, sh};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -71,7 +71,7 @@ pub fn healthy(rows: &[Row]) -> bool {
 pub fn doctor_rows() -> Result<(Vec<Row>, bool)> {
     let env = Env::from_process()?;
     let layout = Layout::from_env(&env)?;
-    let providers = roles::enabled_providers();
+    let providers = recipes::enabled_providers();
     let rows = doctor_rows_with(&env, &layout, &sh::RealRunner, &providers);
     let ok = healthy(&rows);
     Ok((rows, ok))

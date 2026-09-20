@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "note": "Initial task-score policy from t-0083 research. Not calibrated: tune it only against real labelled cases. The three task scores are independent of the model roster; saved responses can be rerouted without inference.",
+  "model": "jev-latest",
+  "questions": {
+    "difficulty": {
+      "type": "score",
+      "instructions": "Assess the technical reasoning difficulty of completing the full task brief correctly, not its length or title. Consider coupled invariants, unfamiliar abstractions, and the reasoning needed to design and verify the change.",
+      "criteria": ["Mechanical, local change with an obvious solution", "Bounded implementation using familiar patterns", "Multi-file reasoning with interacting constraints", "Novel architecture or subtle invariants requiring deep reasoning"]
+    },
+    "ambiguity": {
+      "type": "score",
+      "instructions": "Assess how much uncertainty the worker must resolve to complete this brief: unclear requirements, missing context, competing interpretations and open design decisions. Do not mistake a long precise brief for an ambiguous one.",
+      "criteria": ["Explicit requirements and clear acceptance tests", "Minor gaps resolved by reading nearby code", "Several plausible designs or substantial missing context", "Conflicting requirements or fundamental open questions"]
+    },
+    "blast_radius": {
+      "type": "score",
+      "instructions": "Assess the consequences and scope of a wrong change in this brief. Consider persistent state, security, installation, shared infrastructure and cross-machine effects. Reading web documentation alone does not increase this score or make the product research.",
+      "criteria": ["Isolated text or test-only change", "Local feature with easy rollback", "Shared behavior, multiple consumers or build/install path", "Durable state, security boundary or cross-system failure risk"]
+    }
+  },
+  "weights": {"difficulty": 0.5, "ambiguity": 0.3, "blast_radius": 0.2},
+  "models": {
+    "pi_opencode_deepseek": {"tier": 1, "description": "DeepSeek V4.1 Flash high: fast inexpensive bounded coding."},
+    "pi_kimi_k3": {"tier": 2, "description": "Kimi K3 high: long-context reading and multi-file implementation."},
+    "pi_codex_sol_high": {"tier": 3, "description": "GPT Sol high: expensive strong reasoning for complex code and demanding reviews."}
+  },
+  "routes": [
+    {"up_to": 0.35, "recipe": "pi_opencode_deepseek"},
+    {"up_to": 0.65, "recipe": "pi_kimi_k3"},
+    {"up_to": 1.0, "recipe": "pi_codex_sol_high"}
+  ],
+  "confidence_floor": 0.65,
+  "borderline_margin": 0.05,
+  "pins": {}
+}

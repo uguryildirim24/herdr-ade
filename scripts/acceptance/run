@@ -278,31 +278,17 @@ echo "ADE acceptance (SPEC-ADE §4.3)"
 # Live parts run in subshells; what they share lives in files under ACC_DIR.
 REPO_LIVE="$ACC_DIR/repo-live"
 
-# Every Claude pane this script starts runs Haiku with the permission flag:
-# the throwaway roles table pins it for every Claude role.
+# Throwaway executable recipes for the fixed Claude exclusions. No live
+# classifier call is needed for the Claude-only lane smoke test.
 mkdir -p "$XDG_CONFIG_HOME/herdr-ade"
+cp "$checkout/config/routing.json" "$XDG_CONFIG_HOME/herdr-ade/routing.json"
 cat >"$XDG_CONFIG_HOME/herdr-ade/config.toml" <<'TOML'
-[roles.coordinator]
+[recipes.claude_coordinator_opus]
 kind = "claude"
 args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
 plain = "the quick helper"
 
-[roles.lane]
-kind = "claude"
-args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
-plain = "the quick helper"
-
-[roles.reviewer]
-kind = "claude"
-args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
-plain = "the quick helper"
-
-[roles.critic]
-kind = "claude"
-args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
-plain = "the quick helper"
-
-[roles.drafter]
+[recipes.claude_fable_xhigh]
 kind = "claude"
 args = ["--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
 plain = "the quick helper"
@@ -322,14 +308,14 @@ live_new_open() {
 }
 
 live_round_lanes() {
-  need_verb "thread start" "--role" A1 || return
+  need_verb "thread start" "--task-file" A1 || return
   [ -f "$HERDR_ADE_ROOT/acc/PROJECT.md" ] || { echo "NOT-RUN: row 1 did not create the project"; return; }
   ha round open acc r1 --branch main --plain "The first round of the test." --repo "$REPO_LIVE" >/dev/null || { echo "round open failed"; return; }
   # Two Claude lanes; no Cursor pane in a throwaway (row 9 says why).
   for n in one two; do
-    printf 'Write the file notes/%s.txt with one line and commit it, then finish as your brief says.\n' "$n" |
-      ha thread start acc --title "note $n" --repo "$REPO_LIVE" --role lane --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$n.txt" 2>&1 ||
-      { echo "thread start --role lane failed: $(tail -1 "$ACC_DIR/start-$n.txt")"; return; }
+    printf '+++\nrequires_claude = true\n+++\nWrite the file notes/%s.txt with one line and commit it, then finish as your brief says.\n' "$n" |
+      ha thread start acc --title "note $n" --repo "$REPO_LIVE" --plain "A small lane that writes one note." --task-file - >"$ACC_DIR/start-$n.txt" 2>&1 ||
+      { echo "thread start failed: $(tail -1 "$ACC_DIR/start-$n.txt")"; return; }
     id=$(grep -o 't-[0-9]*' "$ACC_DIR/start-$n.txt" | head -1)
     answer_trust "$(grep -o '"pane_id":"[^"]*"' "$ACC_DIR/start-$n.txt" | cut -d'"' -f4)"
     ha round admit acc r1 "$id" >/dev/null || { echo "round admit $id failed"; return; }
@@ -366,7 +352,7 @@ live_review() {
   b=$(git -C "$REPO_LIVE" rev-parse main)
   git -C "$REPO_LIVE" rev-parse --verify -q review/r1 >/dev/null || { echo "no review/r1 branch"; return; }
   [ "$(git -C "$REPO_LIVE" merge-base main review/r1)" = "$b" ] || { echo "review/r1 does not start at B"; return; }
-  echo "NOT-RUN: the reviewer thread (A1 thread start --role reviewer) must produce C and V; B and review/r1 checked"
+  echo "NOT-RUN: round advance must score and start the review, which produces C and V; B and review/r1 checked"
 }
 
 live_pro() {
@@ -376,7 +362,7 @@ live_pro() {
 }
 
 live_kind_claude() {
-  need_verb "thread start" "--role" A1 || return
+  need_verb "thread start" "--task-file" A1 || return
   [ -s "$ACC_DIR/lanes.txt" ] || { echo "NOT-RUN: row 2 did not start lanes"; return; }
   for id in $(cat "$ACC_DIR/lanes.txt"); do
     t="$HERDR_ADE_ROOT/acc/threads/$id.toml"
@@ -611,7 +597,7 @@ row_end pi-T11 "missing login: the start is refused, never a lane waiting for it
 
 row_begin
 cli "--provider cursor is refused" fail "pi_cursor_forbidden" -- "$HP" check cursor
-mod "no Cursor route in pi" A5 "pi::doctor::tests::(check_refuses_cursor|a_cursor_package)|pi::launch::tests::forbidden_flags_and_cursor|pi::roles::tests::there_is_no_cursor"
+mod "no Cursor route in pi" A5 "pi::doctor::tests::(check_refuses_cursor|a_cursor_package)|pi::launch::tests::forbidden_flags_and_cursor|pi::recipes::tests::there_is_no_cursor"
 row_end pi-T13 "no Cursor route: --provider cursor refused"
 
 for r in "pi-T4 one live lane per enabled provider" "pi-T5 ha done from a pi lane" \

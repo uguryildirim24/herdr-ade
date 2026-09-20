@@ -19,12 +19,12 @@ Always `--no-skills`. Never `--approve` or `-a`. Never `--session`, `-c`,
 
 ## Rows this round
 
-| Role | Provider | Model | Thinking |
+| Recipe | Provider | Model | Thinking |
 |---|---|---|---|
 | DeepSeek through OpenCode Go | `opencode-go` | `deepseek-v4.1-flash` | `high` |
 | OpenCode Muse | `opencode-go` | `muse-spark-1.3-contributor` | `high` |
 | Kimi k3 | `kimi-coding` | `k3` | `high` |
-| ChatGPT Sol (escalate only) | `openai-codex` | `gpt-5.6-sol` | `high` |
+| ChatGPT Sol | `openai-codex` | `gpt-5.6-sol` | `high` |
 | ChatGPT Astra (disabled) | `openai-codex` | `gpt-6-astra` | `xhigh` |
 
 Your context is compacted near 372k tokens on DeepSeek; nothing is lost, the

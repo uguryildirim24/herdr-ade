@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::sh::fake::{FakeRunner, ok};
-use super::{Env, Layout, doctor, folder, install, launch, roles, sh};
+use super::{Env, Layout, doctor, folder, install, launch, recipes, sh};
 
 /// A throwaway plugin root with the pinned files in place and the wrapper on
 /// the login PATH (a real symlink under the fixture HOME).
@@ -36,7 +36,7 @@ fn world(dir: &Path) -> (Env, Layout) {
 fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
     let dir = tempfile::tempdir().unwrap();
     let (_env, _layout) = world(dir.path());
-    let row = roles::pi_recipes()
+    let row = recipes::pi_recipes()
         .into_iter()
         .find(|r| r.id == "pi_kimi_k3")
         .unwrap();
@@ -64,7 +64,7 @@ fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
 fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
     let dir = tempfile::tempdir().unwrap();
     let (_env, _layout) = world(dir.path());
-    let row = roles::pi_recipes()
+    let row = recipes::pi_recipes()
         .into_iter()
         .find(|r| r.id == "pi_kimi_k3")
         .unwrap();

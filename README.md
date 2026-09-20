@@ -97,7 +97,7 @@ No. It never deletes a branch, merges or pushes on its own. An ADE lane is `git 
 
 ### What is `--plain`?
 
-A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the plugin's plain-language check (one sentence, known words). `--role` selects a row from the roles table (default `lane`). `--passive` on adopt sets the parent token and sends no primer.
+A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the plugin's plain-language check (one sentence, known words). Model choice comes from the full task brief through Jev and the editable `routing.json` policy; `thread start` rejects model, recipe and role flags. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing) for setup and offline evaluation.
 
 ### Where does my project live?
 
