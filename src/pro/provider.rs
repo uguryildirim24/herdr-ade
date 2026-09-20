@@ -16,9 +16,9 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 /// The provider id pi resolves `--provider pro` to.
-pub const PROVIDER_ID: &str = "pro";
+pub(crate) const PROVIDER_ID: &str = "pro";
 /// The single model the relay serves.
-pub const MODEL_ID: &str = "pro";
+pub(crate) const MODEL_ID: &str = "pro";
 
 /// The provider table. An answer-only worker: no reasoning effort, text only.
 fn provider_config(base_url: &str, token: &str) -> Value {
@@ -42,13 +42,13 @@ fn provider_config(base_url: &str, token: &str) -> Value {
 }
 
 /// The exact `baseUrl` the relay serves.
-pub fn base_url(port: u16) -> String {
+pub(crate) fn base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
 /// Merge the `pro` provider into `models.json`, keeping every other provider.
 /// A missing or unreadable file starts from the empty table.
-pub fn write_merged(path: &Path, base_url: &str, token: &str) -> Result<()> {
+pub(crate) fn write_merged(path: &Path, base_url: &str, token: &str) -> Result<()> {
     let mut root: Value = match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
             .with_context(|| format!("{} does not parse", path.display()))?,
