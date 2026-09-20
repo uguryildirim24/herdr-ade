@@ -421,7 +421,15 @@ impl Overview {
                 "undo" => ("undo", Tone::Peach),
                 _ => ("routine", Tone::Dim),
             };
-            out.sections[5].push(tagged(project, prefix, &d.line, tone, DECISION_INVALID));
+            let prefix = if d.overturned.is_some() {
+                "overturned"
+            } else {
+                prefix
+            };
+            let mut row = tagged(project, prefix, &d.line, tone, DECISION_INVALID);
+            // The id is an action target, not user-authored prose.
+            row.prefix = format!("{} {}", d.id, row.prefix);
+            out.sections[5].push(row);
         }
         if choices_failed {
             out.sections[5].push(Row::text(DECISIONS_ERROR));
@@ -664,16 +672,29 @@ mod tests {
         assert!(
             o.sections[5]
                 .iter()
-                .any(|r| r.full_text() == "routine I kept the words short.")
+                .any(|r| r.full_text() == "d-0001 routine I kept the words short.")
         );
         for r in o.sections.iter().flatten() {
             assert!(
-                glossary::gate_row(&fx.project, &r.full_text()).is_ok(),
+                glossary::gate_row(
+                    &fx.project,
+                    r.full_text()
+                        .strip_prefix("d-0001 ")
+                        .unwrap_or(&r.full_text())
+                )
+                .is_ok(),
                 "{}",
                 r.full_text()
             );
         }
         assert_eq!(before, std::fs::read(plan::plan_path(&fx.project)).unwrap());
         assert_eq!(o.sections[4][0].text, EMPTY[4]);
+        decide::overturn(&ctx, "demo", "d-0001", "I want more detail.", "rolf").unwrap();
+        let o = Overview::load(&fx.project, &j, &c, &Live::default());
+        assert!(
+            o.sections[5]
+                .iter()
+                .any(|r| r.full_text() == "d-0001 overturned I kept the words short.")
+        );
     }
 }

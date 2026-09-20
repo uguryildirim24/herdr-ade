@@ -404,6 +404,17 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
         }
     }
 
+    let _ = writeln!(
+        out,
+        "\n## Overturned decisions — act on these; do not repeat them"
+    );
+    for decision in crate::decide::current(project)
+        .iter()
+        .filter(|d| d.overturned.is_some())
+    {
+        let _ = writeln!(out, "{}", crate::decide::status_line(decision));
+    }
+
     let _ = writeln!(out, "\n## Memory index (MEMORY.md)");
     let memory = crate::thread::memory_use(project);
     let _ = writeln!(out, "{}", memory.index.trim());
