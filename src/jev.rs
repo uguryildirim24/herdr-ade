@@ -31,6 +31,25 @@ pub struct Assessment {
     pub response: Value,
 }
 
+/// Only explicit endpoint size refusals permit an unscored, conservative pick.
+#[derive(Debug)]
+pub struct OversizedRequest(pub String);
+impl std::fmt::Display for OversizedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for OversizedRequest {}
+
+fn token_limit_code(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s == "max_tokens_exceeded",
+        Value::Object(o) => o.values().any(token_limit_code),
+        Value::Array(a) => a.iter().any(token_limit_code),
+        _ => false,
+    }
+}
+
 pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Result<Assessment> {
     let key = ctx
         .env
@@ -91,10 +110,17 @@ pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Res
         .parse()
         .context("jev_transport: curl returned an invalid HTTP status")?;
     if !(200..300).contains(&status) {
-        bail!(
+        let message = format!(
             "jev_server_refused: HTTP {status}: {}",
             safe_error_text(response, key)
         );
+        if status == 413
+            || (matches!(status, 400 | 422)
+                && serde_json::from_str(response).is_ok_and(|v| token_limit_code(&v)))
+        {
+            return Err(OversizedRequest(message).into());
+        }
+        bail!(message);
     }
     parse(response, questions)
 }

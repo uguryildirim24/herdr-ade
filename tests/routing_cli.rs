@@ -27,6 +27,21 @@ fn coordinator_cannot_select_a_role_recipe_or_model() {
 }
 
 #[test]
+fn workflow_help_describes_policy_floor() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-ade"))
+        .args(["thread", "start", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("routing policy may set a model floor"),
+        "{help}"
+    );
+    assert!(!help.contains("never selects its model"));
+}
+
+#[test]
 fn shipped_cases_run_offline_and_report_both_error_directions() {
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join("config/herdr-ade");
