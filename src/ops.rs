@@ -159,10 +159,14 @@ pub fn check_published_ref(
     }
     let found = out.stdout.split_whitespace().next().unwrap_or("");
     if found.is_empty() {
-        bail!("lane_ref_not_published: `{branch}` is not on {publish_url}");
+        return Err(crate::refusal::error(format!(
+            "lane_ref_not_published: `{branch}` is not on {publish_url}"
+        )));
     }
     if found != sha {
-        bail!("published_ref_mismatch: `{branch}` is {found} on {publish_url}, not {sha}");
+        return Err(crate::refusal::error(format!(
+            "published_ref_mismatch: `{branch}` is {found} on {publish_url}, not {sha}"
+        )));
     }
     Ok(())
 }
@@ -191,7 +195,9 @@ pub fn stage_done(project: &Project, id: &str, worktree: &Path, runner: &dyn Run
         bail!("git_status_failed: {}", status.error_text());
     }
     if !status.stdout.trim().is_empty() {
-        bail!("worktree_dirty: ha done requires an empty git status");
+        return Err(crate::refusal::error(
+            "worktree_dirty: ha done requires an empty git status",
+        ));
     }
     let head = runner.run(
         &Cmd::new("git", std::time::Duration::from_secs(20))
@@ -202,10 +208,10 @@ pub fn stage_done(project: &Project, id: &str, worktree: &Path, runner: &dyn Run
         bail!("git_head_failed: {}", head.error_text());
     }
     if head.stdout.trim() != sha {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "sha_mismatch: requested {sha}, HEAD is {}",
             head.stdout.trim()
-        );
+        )));
     }
     let second = stable_read(&report)?;
     if first != second {
@@ -440,17 +446,35 @@ fn pid_alive(runner: &dyn Runner, pid: u32) -> bool {
 }
 
 fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
-    let relative = Path::new(requested);
-    if relative.is_absolute()
-        || relative
+    let requested = Path::new(requested);
+    if !requested.is_absolute()
+        && requested
             .components()
             .any(|part| matches!(part, std::path::Component::ParentDir))
     {
-        bail!("report_path_invalid: report must be relative and stay in the worktree");
+        return Err(crate::refusal::error(
+            "report_path_invalid: report must stay in the worktree",
+        ));
     }
-    let path = worktree.join(relative);
+    let path = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        worktree.join(requested)
+    };
     if !path.is_file() {
-        bail!("report_missing: {}", path.display());
+        return Err(crate::refusal::error(format!(
+            "report_missing: {}",
+            path.display()
+        )));
+    }
+    let worktree = std::fs::canonicalize(worktree)
+        .with_context(|| format!("could not resolve worktree {}", worktree.display()))?;
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("could not resolve report {}", path.display()))?;
+    if !path.starts_with(&worktree) {
+        return Err(crate::refusal::error(
+            "report_path_invalid: report must stay in the worktree",
+        ));
     }
     Ok(path)
 }
@@ -653,6 +677,28 @@ mod tests {
     }
 
     #[test]
+    fn done_accepts_an_absolute_report_inside_the_worktree_but_not_outside() {
+        let worktree = tempfile::tempdir().unwrap();
+        let report = worktree.path().join(".herdr-project/demo/report.md");
+        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+        std::fs::write(&report, b"result\n").unwrap();
+
+        assert_eq!(
+            resolve_report(worktree.path(), report.to_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&report).unwrap()
+        );
+        assert_eq!(
+            resolve_report(worktree.path(), ".herdr-project/demo/report.md").unwrap(),
+            std::fs::canonicalize(&report).unwrap()
+        );
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let error = resolve_report(worktree.path(), outside.path().to_str().unwrap()).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert!(error.to_string().contains("report_path_invalid"));
+    }
+
+    #[test]
     fn done_refuses_dirty_tree_and_wrong_sha() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -679,12 +725,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            stage_done(&project, &op.op, root.path(), &runner)
-                .unwrap_err()
-                .to_string()
-                .contains("worktree_dirty")
-        );
+        let error = stage_done(&project, &op.op, root.path(), &runner).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert!(error.to_string().contains("worktree_dirty"));
 
         let root2 = tempfile::tempdir().unwrap();
         let project2 = project::create(root2.path(), "demo", "", vec![]).unwrap();
@@ -709,12 +752,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            stage_done(&project2, &op2.op, root2.path(), &runner2)
-                .unwrap_err()
-                .to_string()
-                .contains("sha_mismatch")
-        );
+        let error = stage_done(&project2, &op2.op, root2.path(), &runner2).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert!(error.to_string().contains("sha_mismatch"));
     }
 
     #[test]
