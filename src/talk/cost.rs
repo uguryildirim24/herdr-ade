@@ -70,14 +70,14 @@ pub fn load(ctx: &Ctx, project: &Project) -> Cost {
         // The old Pro packet path records a lane name but no tokens or money.
         // Attribute only names belonging to this project; never charge every
         // project for a shared usage file.
-        for name in [&t.id, &t.agent_name] {
-            if let Some((all_runs, day_runs)) = pro.get(name) {
-                all.runs += all_runs;
-                day.runs += day_runs;
-                all.unknown = true;
-                if day_runs > &0 {
-                    day.unknown = true;
-                }
+        // Only the full agent name carries the project slug. A bare `t-0001`
+        // can exist in every project and is therefore not safe to attribute.
+        if let Some((all_runs, day_runs)) = pro.get(&t.agent_name) {
+            all.runs += all_runs;
+            day.runs += day_runs;
+            all.unknown = true;
+            if day_runs > &0 {
+                day.unknown = true;
             }
         }
 
