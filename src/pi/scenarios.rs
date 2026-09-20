@@ -98,14 +98,23 @@ fn scenario_setup_then_check_for_kimi() {
     let dir = tempfile::tempdir().unwrap();
     let (env, layout) = world(dir.path());
     let runner = FakeRunner::new();
-    runner.on("zsh -lic node --version", ok("v22.19.0\n"));
-    runner.on("zsh -lic command -v npm", ok("/opt/homebrew/bin/npm\n"));
+    let shell = super::sh::shell();
+    let probe = match Path::new(&shell).file_name().and_then(|name| name.to_str()) {
+        Some("bash") => "type -a pi",
+        Some("zsh") => "whence -va pi",
+        _ => "command -v pi",
+    };
+    runner.on(&format!("{shell} -lic node --version"), ok("v22.19.0\n"));
     runner.on(
-        "zsh -lic npm root -g",
+        &format!("{shell} -lic command -v npm"),
+        ok("/opt/homebrew/bin/npm\n"),
+    );
+    runner.on(
+        &format!("{shell} -lic npm root -g"),
         ok("/opt/homebrew/lib/node_modules\n"),
     );
     runner.on(
-        "zsh -lic whence -va pi",
+        &format!("{shell} -lic {probe}"),
         ok(&format!(
             "pi is {}\n",
             env.home.join(".local/bin/pi").display()
