@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-20T00:19:00-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-20T00:30:50-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 3 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
 
@@ -38,11 +38,11 @@ Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (workin
 
 ### Git
 
-Repo `/home/agent/projects/herdr-ade`, integration branch `main` (9 ahead, 0 behind origin/main).
+Repo `/home/agent/projects/herdr-ade`, integration branch `main` (5 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/home/agent/projects/herdr-ade` | `main` | dac5255 | 0 | Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821' |
+| `/home/agent/projects/herdr-ade` | `main` | f6dbb79 | 0 | docs(review): round r47 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -79,6 +79,7 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (9 ahead, 0 beh
 | `/home/agent/projects/herdr-ade/.worktrees/review-r44` | `review/r44` | 121aa10 | 0 | review(r44): brief for revision 1 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r45` | `review/r45` | ee6a42f | 0 | docs(tasks): t-0100 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r46` | `review/r46` | 43beada | 0 | docs(tasks): t-0101 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r47` | `review/r47` | ca5d598 | 0 | docs(tasks): t-0103 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r5` | `review/r5` | 008f9ac | 0 | docs(tasks): t-0012 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r6` | `review/r6` | 910649d | 0 | docs(tasks): t-0014 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r7` | `review/r7` | 7cb564e | 0 | docs(tasks): t-0015 |
@@ -151,19 +152,19 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (9 ahead, 0 beh
 Last commits on the integration branch:
 
 ```
+f6dbb79 docs(review): round r47 verdict
+6570054 Merge commit '30397a49ac993dade0eaf1942c91eb6093d3ffe7' into hp/adeherdr/t-0103-review-r47-this-round-checks-the-list-of
+ca5d598 docs(tasks): t-0103
+e73d648 review(r47): brief for revision 1
+fa12133 checkpoint(r46): HANDOFF after merging the round
 dac5255 Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821'
-fe08483 docs(review): round r46 verdict
-77927e3 review(round): cover abandonment refusal guards
-5076598 review(dispatch): classify curl timeouts and enforce error byte cap
-56da536 Merge commit '40c93cd78bcd636b12ad2a2f2945b57b4213c288' into hp/adeherdr/t-0101-review-r46-this-round-checks-that-the-pi
-017ee9c docs(tasks): t-0102
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0101.md`, `tasks/t-0102.md`, `tasks/review-r46.md`, `tasks/t-0100.md`, `tasks/review-r45.md`, `tasks/t-0099.md`, `tasks/review-r44.md`, `tasks/t-0098.md`, `tasks/t-0096.md`, `tasks/t-0097.md`, `tasks/t-0095.md`, `tasks/review-r43.md`
-- verdicts: `tasks/reviews/code-r46.md`, `tasks/reviews/code-r45.md`, `tasks/reviews/code-r43.md`, `tasks/reviews/code-r42.md`, `tasks/reviews/code-r41.md`, `tasks/reviews/code-r38.md`, `tasks/reviews/code-r39.md`, `tasks/reviews/code-r35.md`, `tasks/reviews/code-r37.md`, `tasks/reviews/code-r36.md`, `tasks/reviews/code-r34.md`, `tasks/reviews/code-r32.md`
+- briefs: `tasks/t-0103.md`, `tasks/review-r47.md`, `tasks/t-0101.md`, `tasks/t-0102.md`, `tasks/review-r46.md`, `tasks/t-0100.md`, `tasks/review-r45.md`, `tasks/t-0099.md`, `tasks/review-r44.md`, `tasks/t-0098.md`, `tasks/t-0096.md`, `tasks/t-0097.md`
+- verdicts: `tasks/reviews/code-r47.md`, `tasks/reviews/code-r46.md`, `tasks/reviews/code-r45.md`, `tasks/reviews/code-r43.md`, `tasks/reviews/code-r42.md`, `tasks/reviews/code-r41.md`, `tasks/reviews/code-r38.md`, `tasks/reviews/code-r39.md`, `tasks/reviews/code-r35.md`, `tasks/reviews/code-r37.md`, `tasks/reviews/code-r36.md`, `tasks/reviews/code-r34.md`
 
 ### Pickup
 
@@ -175,5 +176,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /home/agent/.herdr-ade/adeherdr && claude --resume 936438b4-6acf-4417-9513-2bb938fe60e0
 ```
 
-Round `r46` was merged into `main` at verdict commit `fe08483b9ef737d7ae677fe3e5dc67751e8d3821`; this checkpoint is its child.
+Round `r47` was merged into `main` at verdict commit `f6dbb79ac4cf623f395a86d1b7f890dcd7e1c7a0`; this checkpoint is its child.
 

@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0103.md",
+      "tasks/review-r47.md",
       "tasks/t-0101.md",
       "tasks/t-0102.md",
       "tasks/review-r46.md",
@@ -20,15 +22,14 @@
       "tasks/review-r44.md",
       "tasks/t-0098.md",
       "tasks/t-0096.md",
-      "tasks/t-0097.md",
-      "tasks/t-0095.md",
-      "tasks/review-r43.md"
+      "tasks/t-0097.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r47.md",
       "tasks/reviews/code-r46.md",
       "tasks/reviews/code-r45.md",
       "tasks/reviews/code-r43.md",
@@ -39,16 +40,17 @@
       "tasks/reviews/code-r35.md",
       "tasks/reviews/code-r37.md",
       "tasks/reviews/code-r36.md",
-      "tasks/reviews/code-r34.md",
-      "tasks/reviews/code-r32.md"
+      "tasks/reviews/code-r34.md"
     ]
   },
-  "generated": "2026-09-20T00:19:00-04:00",
+  "generated": "2026-09-20T00:30:50-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0103-review-r47-this-round-checks-the-list-of",
       "main",
-      "hp/adeherdr/t-0101-review-r46-this-round-checks-that-the-pi",
       "hp/adeherdr/t-0102-e5-the-rundown-shows-only-what-needs-a-d",
+      "review/r47",
+      "hp/adeherdr/t-0101-review-r46-this-round-checks-that-the-pi",
       "review/r46",
       "hp/adeherdr/t-0099-d7-bound-what-dispatch-sends-and-say-wha",
       "hp/adeherdr/t-0100-review-r45-this-round-checks-that-the-me",
@@ -174,22 +176,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "dac5255 Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821'",
-      "fe08483 docs(review): round r46 verdict",
-      "77927e3 review(round): cover abandonment refusal guards",
-      "5076598 review(dispatch): classify curl timeouts and enforce error byte cap",
-      "56da536 Merge commit '40c93cd78bcd636b12ad2a2f2945b57b4213c288' into hp/adeherdr/t-0101-review-r46-this-round-checks-that-the-pi",
-      "017ee9c docs(tasks): t-0102"
+      "f6dbb79 docs(review): round r47 verdict",
+      "6570054 Merge commit '30397a49ac993dade0eaf1942c91eb6093d3ffe7' into hp/adeherdr/t-0103-review-r47-this-round-checks-the-list-of",
+      "ca5d598 docs(tasks): t-0103",
+      "e73d648 review(r47): brief for revision 1",
+      "fa12133 checkpoint(r46): HANDOFF after merging the round",
+      "dac5255 Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821'"
     ],
-    "remote": "9 ahead, 0 behind origin/main",
+    "remote": "5 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "dac5255",
+        "head": "f6dbb79",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'fe08483b9ef737d7ae677fe3e5dc67751e8d3821'"
+        "subject": "docs(review): round r47 verdict"
       },
       {
         "branch": "review/r1",
@@ -442,6 +444,13 @@
         "head": "43beada",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r46",
         "subject": "docs(tasks): t-0101"
+      },
+      {
+        "branch": "review/r47",
+        "dirty": 0,
+        "head": "ca5d598",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r47",
+        "subject": "docs(tasks): t-0103"
       },
       {
         "branch": "review/r5",
@@ -942,8 +951,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r46",
-    "verdict": "fe08483b9ef737d7ae677fe3e5dc67751e8d3821"
+    "round": "r47",
+    "verdict": "f6dbb79ac4cf623f395a86d1b7f890dcd7e1c7a0"
   },
   "session": "default",
   "unlinked_agents": [],
