@@ -154,14 +154,23 @@ pub fn open_lane_count(project: &Project) -> usize {
 /// Creates the worktree or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::start)
+    start_with_ticker(ctx, slug, args, ticker::start, None)
 }
 
 /// Starts a thread while `round advance` holds its lock. This must not wait for
 /// a ticker replacement: the running ticker may itself be waiting for that
 /// lock. Ordinary starts still replace a stale ticker through [`start`].
 pub(crate) fn start_during_advance(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::ensure)
+    start_with_ticker(ctx, slug, args, ticker::ensure, None)
+}
+
+pub(crate) fn start_during_advance_bounded(
+    ctx: &Ctx,
+    slug: &str,
+    args: StartArgs,
+    source_truncation: serde_json::Value,
+) -> Result<Thread> {
+    start_with_ticker(ctx, slug, args, ticker::ensure, Some(source_truncation))
 }
 
 fn start_with_ticker(
@@ -169,6 +178,7 @@ fn start_with_ticker(
     slug: &str,
     args: StartArgs,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
+    source_truncation: Option<serde_json::Value>,
 ) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let status = project.status();
@@ -243,6 +253,7 @@ fn start_with_ticker(
                 args.repo.as_deref(),
                 args.base.as_deref(),
             )?,
+            source_truncation: source_truncation.as_ref(),
             ..Default::default()
         },
     )?;

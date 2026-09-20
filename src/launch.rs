@@ -187,6 +187,9 @@ pub struct ResolveInput<'a> {
     pub workflow: &'a str,
     pub previous: Option<&'a Launch>,
     pub failure: Option<&'a str>,
+    /// Evidence omitted by an upstream task builder, already disclosed in the
+    /// brief; copied into scorer state and the dispatch ledger.
+    pub source_truncation: Option<&'a Value>,
 }
 
 pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
@@ -195,7 +198,8 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
         ledger(
             project,
             json!({"kind":"dispatch-refused", "brief_hash":crate::thread::sha256_hex(input.task.as_bytes()),
-            "failure":input.failure, "error":format!("{error:#}")}),
+            "failure":input.failure, "source_truncation":input.source_truncation,
+            "error":format!("{error:#}")}),
         )?;
     }
     result
@@ -238,7 +242,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         p.strength
             .max(policy.models.get(&p.recipe_id).map_or(0, |m| m.tier))
     });
-    let (id, assessment, decision, rule) = if let Some(id) = excluded {
+    let (id, assessment, decision, rule, input_truncation) = if let Some(id) = excluded {
         (
             id.to_string(),
             None,
@@ -248,6 +252,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
             } else {
                 "exclusion"
             },
+            None,
         )
     } else {
         if previous_tier.is_some_and(|tier| {
@@ -260,16 +265,28 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         }
         let state = crate::routing::scrub(
             json!({"brief": input.task, "repository": input.state,
-            "failure": input.failure}),
+            "failure": input.failure, "source_truncation": input.source_truncation}),
             &config.recipes,
         );
-        let assessment = crate::jev::call(ctx, &policy.request(state), &policy.questions)?;
+        let (request, truncation) = bounded_request(&policy, state)?;
+        if truncation.is_some() || input.source_truncation.is_some() {
+            // This row is written before the call so a refusal by the endpoint
+            // cannot erase the fact that dispatch used incomplete evidence.
+            ledger(
+                project,
+                json!({"kind":"dispatch-input-truncated", "brief_hash":hash,
+                "source_truncation":input.source_truncation,
+                "input_truncation":truncation}),
+            )?;
+        }
+        let assessment = crate::jev::call(ctx, &request, &policy.questions)?;
         let decision = policy.select(&assessment, previous_tier)?;
         (
             decision.recipe.clone(),
             Some(assessment),
             Some(decision),
             "jev-scores",
+            truncation,
         )
     };
     let recipe = config.recipes.get(&id).context("recipe_unknown")?;
@@ -288,6 +305,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         "low_confidence": decision.as_ref().is_some_and(|d| d.confidence < policy.confidence_floor),
         "previous": input.previous.map(|p| json!({"recipe":p.recipe_id,"tier":p.strength,"attempt":p.attempt})),
         "failure": input.failure, "escalations": escalations,
+        "source_truncation": input.source_truncation,
+        "input_truncation": input_truncation,
         "policy_hash": config.policy_hash, "routing_hash": crate::thread::sha256_hex(&policy_bytes)}),
     )?;
     Ok(Launch {
@@ -306,9 +325,110 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
             usual_reason(input.workflow, &recipe.plain)
         },
         compact_reason: compact_reason(input.workflow, &recipe.plain),
+        source_truncation: input.source_truncation.cloned(),
         machine: config.dispatch.machine,
         ..Launch::default()
     })
+}
+
+/// Build the exact wire request while preserving the brief and shedding
+/// repository evidence in a deterministic, visible order.
+fn bounded_request(
+    policy: &crate::routing::Policy,
+    mut state: Value,
+) -> Result<(Value, Option<Value>)> {
+    let request_len = |state: &Value| policy.request(state.clone()).to_string().len();
+    let mut fixed_only = state.clone();
+    fixed_only["brief"] = json!("");
+    fixed_only["repository"] = Value::Null;
+    fixed_only["failure"] = Value::Null;
+    let fixed_bytes = request_len(&fixed_only);
+    if fixed_bytes > crate::jev::REQUEST_BYTE_CAP {
+        bail!(
+            "dispatch_fixed_input_too_large: routing policy needs {fixed_bytes} bytes; request cap is {}",
+            crate::jev::REQUEST_BYTE_CAP
+        );
+    }
+    let mut brief_only = state.clone();
+    brief_only["repository"] = Value::Null;
+    brief_only["failure"] = Value::Null;
+    let brief_bytes = request_len(&brief_only);
+    if brief_bytes > crate::jev::REQUEST_BYTE_CAP {
+        bail!(
+            "dispatch_brief_too_large: the complete brief needs {brief_bytes} request bytes; cap is {}",
+            crate::jev::REQUEST_BYTE_CAP
+        );
+    }
+
+    let original_bytes = request_len(&state);
+    if original_bytes <= crate::jev::REQUEST_BYTE_CAP {
+        return Ok((policy.request(state), None));
+    }
+
+    let mut omitted = Vec::<String>::new();
+    let build = |state: &mut Value, omitted: &[String]| -> (Value, Value) {
+        let mut details = json!({
+            "cut": true,
+            "request_byte_cap": crate::jev::REQUEST_BYTE_CAP,
+            "original_request_bytes": original_bytes,
+            "sent_request_bytes": 0,
+            "omitted_fields": omitted,
+            "note": "Repository or failure evidence was omitted; the brief is complete."
+        });
+        state["input_truncation"] = details.clone();
+        // The byte count is part of the request. Iterate until its digit width
+        // is stable, then return the exact serialized request.
+        let mut request = policy.request(state.clone());
+        for _ in 0..3 {
+            let sent = request.to_string().len();
+            details["sent_request_bytes"] = json!(sent);
+            details["omitted_bytes"] = json!(original_bytes.saturating_sub(sent));
+            state["input_truncation"] = details.clone();
+            let next = policy.request(state.clone());
+            if next.to_string().len() == sent {
+                request = next;
+                break;
+            }
+            request = next;
+        }
+        (request, details)
+    };
+
+    // A file inventory and recent stat log are weaker than the actual task;
+    // the review diff follows. Small identity facts survive whenever possible.
+    for field in ["files", "recent_changes", "changes_under_review", "diff"] {
+        let removed = state["repository"]
+            .as_object_mut()
+            .and_then(|repository| repository.remove(field));
+        if removed.is_some() {
+            omitted.push(format!("repository.{field}"));
+            let (request, details) = build(&mut state, &omitted);
+            if request.to_string().len() <= crate::jev::REQUEST_BYTE_CAP {
+                return Ok((request, Some(details)));
+            }
+        }
+    }
+
+    if !state["repository"].is_null() {
+        state["repository"] = Value::Null;
+        omitted.push("repository (remaining evidence)".into());
+        let (request, details) = build(&mut state, &omitted);
+        if request.to_string().len() <= crate::jev::REQUEST_BYTE_CAP {
+            return Ok((request, Some(details)));
+        }
+    }
+    if !state["failure"].is_null() {
+        state["failure"] = Value::Null;
+        omitted.push("failure".into());
+        let (request, details) = build(&mut state, &omitted);
+        if request.to_string().len() <= crate::jev::REQUEST_BYTE_CAP {
+            return Ok((request, Some(details)));
+        }
+    }
+    bail!(
+        "dispatch_brief_too_large: the complete brief leaves no room for the required truncation notice under the {} byte request cap",
+        crate::jev::REQUEST_BYTE_CAP
+    )
 }
 
 /// Append-only dispatch ledger. No network call is made while holding its lock.

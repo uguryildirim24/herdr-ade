@@ -172,6 +172,10 @@ pub struct Launch {
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
     /// never rereads live config.
     pub compact_reason: String,
+    /// Evidence intentionally left out before dispatch (for example a review
+    /// diff that the agent reads from its checkout). Escalations retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_truncation: Option<serde_json::Value>,
     /// Default machine from `[dispatch]`; empty keeps the launch local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine: String,
@@ -477,6 +481,9 @@ pub struct RoundRecord {
     /// bounded by `round::MAX_REVIEWER_START_FAILURES` (E3/D1).
     #[serde(default)]
     pub reviewer_start_failures: u32,
+    /// Human-supplied reason for deliberately ending an unmergeable round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_reason: Option<String>,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
@@ -909,6 +916,7 @@ mod tests {
             escalations: 0,
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
+            source_truncation: None,
             machine: "oci".into(),
         });
     }
