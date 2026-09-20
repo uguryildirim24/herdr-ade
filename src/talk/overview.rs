@@ -144,7 +144,7 @@ fn checked(project: &Project, text: &str) -> bool {
     !text.trim().is_empty()
         && !text.chars().any(char::is_control)
         && glossary::name_in(project, text).is_none()
-        && glossary::gate(project, text).is_ok()
+        && glossary::gate_row(project, text).is_ok()
 }
 fn safe(project: &Project, text: &str, fallback: &str) -> String {
     if checked(project, text) {
@@ -472,6 +472,27 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_long_sentence_renders_cut_instead_of_the_invalid_fallback() {
+        let fx = fixture();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.goal = format!("{}.", vec!["the"; 26].join(" "));
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        assert_ne!(o.sections[0][0].text, GOAL_INVALID);
+        assert_eq!(o.sections[0][0].text, settings.goal);
+    }
+
+    #[test]
     fn handed_in_closed_work_stays_until_real_merge_and_only_landings_finish() {
         use crate::round::testkit::{commit_file, git};
         let fx = fixture();
@@ -623,7 +644,7 @@ mod tests {
         );
         for r in o.sections.iter().flatten() {
             assert!(
-                glossary::gate(&fx.project, &r.full_text()).is_ok(),
+                glossary::gate_row(&fx.project, &r.full_text()).is_ok(),
                 "{}",
                 r.full_text()
             );

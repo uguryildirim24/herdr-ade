@@ -2556,6 +2556,25 @@ mod tests {
     }
 
     #[test]
+    fn open_refuses_a_round_sentence_over_the_word_cap() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let sentence = |n: usize| format!("{}.", vec!["the"; n].join(" "));
+        let args = |plain: String, round: &str| OpenArgs {
+            round: round.into(),
+            branch: "main".into(),
+            plain: Some(plain),
+            repo: Some(fx.repo.to_string_lossy().into_owned()),
+        };
+        let e = err(open(&ctx, "demo", args(sentence(26), "r1")));
+        assert!(
+            e.contains("plain_long_sentence") && e.contains("26-word"),
+            "{e}"
+        );
+        open(&ctx, "demo", args(sentence(25), "r1")).unwrap();
+    }
+
+    #[test]
     fn item33_manifest_removed_review_fails_closed() {
         let fx = fixture();
         let ctx = fx.world.ctx();
