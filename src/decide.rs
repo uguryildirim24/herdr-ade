@@ -78,19 +78,67 @@ fn replaced_ids(log: &Log) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// The current choices, oldest first: valid records not replaced by a later
-/// valid record. The screen reads this rather than re-folding the log.
+/// The latest state of each unreplaced choice, oldest change first, including
+/// overturned choices. The screen reads this rather than re-folding the log.
 pub fn current(project: &Project) -> Vec<Decision> {
     fold_current(&read(project))
 }
 
 fn fold_current(log: &Log) -> Vec<Decision> {
     let replaced = replaced_ids(log);
-    log.records
+    let mut latest = std::collections::BTreeMap::new();
+    for d in &log.records {
+        if !replaced.contains(&d.id) {
+            latest.insert(d.id.clone(), d.clone());
+        }
+    }
+    let mut records: Vec<_> = latest.into_values().collect();
+    records.sort_by_key(|d| d.seq);
+    records
+}
+
+/// Keep the original record and append its overturned state under the same id.
+pub fn overturn(ctx: &Ctx, slug: &str, id: &str, reason: &str, by: &str) -> Result<Decision> {
+    let project = Project::load(&ctx.root, slug)?;
+    if reason.trim().is_empty() || by.trim().is_empty() {
+        bail!("decision_overturn: a reason and actor are required");
+    }
+    let _lock = decisions_lock(&project)?;
+    let log = read(&project);
+    if log.broken_tail {
+        bail!("decision_log_broken: repair the incomplete tail before writing");
+    }
+    let mut record = log
+        .records
         .iter()
-        .filter(|d| !replaced.contains(&d.id))
+        .rev()
+        .find(|d| d.id == id)
         .cloned()
-        .collect()
+        .with_context(|| format!("decision_unknown: `{id}` is not in this log"))?;
+    if record.overturned.is_some() {
+        bail!("decision_overturned: `{id}` is already overturned");
+    }
+    if !log_current(&log, id) {
+        bail!("decision_replaced: `{id}` already has a replacement");
+    }
+    record.seq = log.records.iter().map(|d| d.seq).max().unwrap_or(0) + 1;
+    record.overturned = Some(crate::contracts::DecisionOverturn {
+        by: by.to_string(),
+        at: project::now(),
+        reason: reason.trim().to_string(),
+    });
+    append(&project, &record)?;
+    Ok(record)
+}
+
+pub fn status_line(record: &Decision) -> String {
+    match &record.overturned {
+        Some(change) => format!(
+            "{}  {}  overturned by {} at {}: {}",
+            record.id, record.line, change.by, change.at, change.reason
+        ),
+        None => format!("{}  {}  {}", record.id, record.class, record.line),
+    }
 }
 
 pub struct NewDecision<'a> {
@@ -175,7 +223,11 @@ pub fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
         );
     }
     if let Some(key) = new.key
-        && let Some(existing) = log.records.iter().find(|d| d.key.as_deref() == Some(key))
+        && let Some(existing) = log
+            .records
+            .iter()
+            .rev()
+            .find(|d| d.key.as_deref() == Some(key))
     {
         let same = existing.line == line
             && existing.class == new.class
@@ -220,8 +272,14 @@ pub fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
         basis,
         replaces: new.replaces.map(str::to_string),
         request: request.map(str::to_string),
+        overturned: None,
     };
-    let text = serde_json::to_string(&record)?;
+    append(&project, &record)?;
+    Ok(record)
+}
+
+fn append(project: &Project, record: &Decision) -> Result<()> {
+    let text = serde_json::to_string(record)?;
     if text.len() > talk::MAX_ENTRY_BYTES {
         bail!(
             "decision_too_large: {} bytes, at most {}",
@@ -232,17 +290,22 @@ pub fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
     let mut file = File::options()
         .create(true)
         .append(true)
-        .open(decisions_path(&project))?;
+        .open(decisions_path(project))?;
     file.write_all(text.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    Ok(record)
+    Ok(())
 }
 
 /// Current according to an already-read log, not a fresh read (the lock holds).
 fn log_current(log: &Log, id: &str) -> bool {
     let replaced = replaced_ids(log);
-    log.records.iter().any(|d| d.id == id) && !replaced.contains(id)
+    log.records
+        .iter()
+        .rev()
+        .find(|d| d.id == id)
+        .is_some_and(|d| d.overturned.is_none())
+        && !replaced.contains(id)
 }
 
 /// `ha decide list [--json]`: current choices, newest first.
@@ -264,10 +327,7 @@ pub fn list(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
         out.push_str("no choices have been recorded yet\n");
     }
     for record in records {
-        out.push_str(&format!(
-            "{}  {:<12}  {}\n",
-            record.id, record.class, record.line
-        ));
+        out.push_str(&format!("{}\n", status_line(&record)));
     }
     Ok(out)
 }
@@ -279,6 +339,7 @@ pub fn show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<String> {
     let record = log
         .records
         .iter()
+        .rev()
         .find(|d| d.id == id)
         .with_context(|| format!("decision_unknown: `{id}` is not in this log"))?;
     if json {
@@ -287,11 +348,9 @@ pub fn show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<String> {
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
     }
     Ok(format!(
-        "{}  {}  {}{}\n",
-        record.id,
-        record.class,
-        record.line,
-        if log_current(&log, id) {
+        "{}{}\n",
+        status_line(record),
+        if log_current(&log, id) || record.overturned.is_some() {
             ""
         } else {
             "  (replaced)"
@@ -322,6 +381,57 @@ mod tests {
 
     fn current(fx: &Fx) -> Vec<Decision> {
         fold_current(&read(&fx.project))
+    }
+
+    #[test]
+    fn overturn_preserves_history_and_is_shown_in_views_and_context() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let original = decide_routine(&fx, "I kept the words short.");
+        let changed = overturn(&ctx, "demo", &original.id, "I want more detail.", "rolf").unwrap();
+        let log = read(&fx.project);
+        assert_eq!(log.records, vec![original.clone(), changed.clone()]);
+        let change = changed.overturned.as_ref().unwrap();
+        assert_eq!(change.by, "rolf");
+        assert_eq!(change.reason, "I want more detail.");
+        assert!(!change.at.is_empty());
+        assert_eq!(current(&fx), vec![changed]);
+        assert!(
+            list(&ctx, "demo", false)
+                .unwrap()
+                .contains("overturned by rolf")
+        );
+        let shown: serde_json::Value =
+            serde_json::from_str(&show(&ctx, "demo", &original.id, true).unwrap()).unwrap();
+        assert_eq!(shown["current"], false);
+        assert_eq!(shown["overturned"]["by"], "rolf");
+        assert!(
+            show(&ctx, "demo", &original.id, false)
+                .unwrap()
+                .contains("I want more detail.")
+        );
+        let (digest, _) = crate::coordinator::digest(&ctx, &fx.project, "ha").unwrap();
+        assert!(digest.contains("overturned by rolf"));
+        assert!(digest.contains("do not repeat them"));
+        assert!(
+            overturn(&ctx, "demo", &original.id, "Again.", "rolf")
+                .unwrap_err()
+                .to_string()
+                .starts_with("decision_overturned")
+        );
+        assert_eq!(read(&fx.project).records.len(), 2);
+    }
+
+    #[test]
+    fn overturn_unknown_is_refused_without_writing() {
+        let fx = fixture();
+        assert!(
+            overturn(&fx.world.ctx(), "demo", "d-9999", "No thanks.", "rolf")
+                .unwrap_err()
+                .to_string()
+                .starts_with("decision_unknown")
+        );
+        assert!(read(&fx.project).records.is_empty());
     }
 
     #[test]

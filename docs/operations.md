@@ -54,6 +54,9 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
 | `plan show [--json]`, `plan set`, `plan step add\|edit\|link\|unlink\|remove\|move`, `plan sync` | The plan card: goal, end result and up to seven steps. A step is `done` only when all its bound work has landed in a merged round. |
 | `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list [--json]`, `decide show <id>` | The log of choices the coordinator made without asking. |
+| `decide overturn <id> "<reason>"` | Overturn a choice by id, keeping the original and recording who (`USER`), when and why. The screen and context show it as overturned. |
+| `ask "<question>?" --choice "<sentence>" --choice "<sentence>"` | Record a question; return one line with its id first. A normalized duplicate of another open question is refused with the existing id. |
+| `ask withdraw <id> "<reason>"` | Remove an open question from the board, retaining its record and withdrawal reason, actor (`USER`) and time. Answered questions cannot be withdrawn. |
 | `say --what S [--means S] [--landed-round R]` | One checked line on the board and in talk. `--landed-round` marks it as landing evidence for a merged round. |
 | `talk <project> [--replay]` | The project screen, or a conversation-only text replay for copying. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
