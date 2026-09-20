@@ -14,6 +14,10 @@ use crate::runner::{Cmd, Runner};
 pub const STARTING_TIMEOUT_SECS: i64 = 300;
 pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 pub const NOT_READY_SECS: i64 = 60;
+/// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`
+/// past this, and `ha doctor` / `ha context` warn at it: the warning fires at
+/// the point where a brief starts dropping files, and 32k is a small enough
+/// share of a lane's context to prune before it costs real tokens.
 pub const MEMORY_CAP_CHARS: usize = 32_000;
 pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
@@ -269,6 +273,81 @@ pub fn with_lane_skill(prefix: &str, brief: &str) -> String {
     )
 }
 
+/// The memory a brief would inline: `MEMORY.md` plus every regular
+/// `memory/*.md` file, sorted by name. `total_chars` counts the whole memory,
+/// including a file the cap would drop, so the warning describes the budget
+/// itself rather than only what fits.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryUse {
+    pub index: String,
+    pub files: Vec<(String, String)>,
+    pub total_chars: usize,
+}
+
+impl MemoryUse {
+    pub fn over_budget(&self) -> bool {
+        self.total_chars > MEMORY_CAP_CHARS
+    }
+
+    /// The `ha doctor` / `ha context` warning, or `None` when the memory fits.
+    /// Names the file and its size and points at `memory/archive/`.
+    pub fn warning(&self) -> Option<String> {
+        if !self.over_budget() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !self.index.trim().is_empty() {
+            parts.push(format!("MEMORY.md {}", self.index.chars().count()));
+        }
+        for (name, text) in &self.files {
+            parts.push(format!("memory/{name} {}", text.chars().count()));
+        }
+        Some(format!(
+            "memory over budget: {} of {} characters ({}); move old entries to memory/archive/",
+            self.total_chars,
+            MEMORY_CAP_CHARS,
+            parts.join(", ")
+        ))
+    }
+}
+
+/// Reads the memory exactly as `brief_for` inlines it. Regular files only: a
+/// symbolic link in `memory/` is never followed.
+pub fn memory_use(project: &Project) -> MemoryUse {
+    let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
+    let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".md") && !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let files: Vec<(String, String)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let path = project.dir().join("memory").join(&name);
+            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+            regular
+                .then(|| std::fs::read_to_string(&path).ok())
+                .flatten()
+                .map(|text| (name, text))
+        })
+        .collect();
+    let total_chars = index.chars().count()
+        + files
+            .iter()
+            .map(|(_, text)| text.chars().count())
+            .sum::<usize>();
+    MemoryUse {
+        index,
+        files,
+        total_chars,
+    }
+}
+
 pub struct BriefInput<'a> {
     pub instructions: &'a str,
     pub memory_index: &'a str,
@@ -323,33 +402,11 @@ pub fn compose_brief(input: &BriefInput) -> String {
 /// Reads the project's instructions and memory and composes the brief.
 pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) -> Result<String> {
     let (_, instructions) = project.read_project_md()?;
-    let memory_index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
-    let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.ends_with(".md") && !n.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    let memory_files: Vec<(String, String)> = names
-        .into_iter()
-        .filter_map(|name| {
-            let path = project.dir().join("memory").join(&name);
-            // Regular files only: a symbolic link in memory/ is never followed.
-            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-            regular
-                .then(|| std::fs::read_to_string(&path).ok())
-                .flatten()
-                .map(|text| (name, text))
-        })
-        .collect();
+    let memory = memory_use(project);
     Ok(compose_brief(&BriefInput {
         instructions: &instructions,
-        memory_index: &memory_index,
-        memory_files: &memory_files,
+        memory_index: &memory.index,
+        memory_files: &memory.files,
         task,
         restart,
         report_path: &thread.report_path(),
@@ -1210,6 +1267,50 @@ mod tests {
             library_path: "l",
         });
         assert!(!fresh.contains("previous attempt"));
+    }
+
+    #[test]
+    fn the_lane_skill_carries_the_push_rule_in_its_standing_rules() {
+        let lane = include_str!("../skill/LANE.md");
+        let rules_end = lane.find("## Pictures").expect("the pictures heading");
+        let standing = &lane[..rules_end];
+        assert!(
+            standing.contains("The coordinator pushes the integration branch"),
+            "{standing}"
+        );
+        assert!(standing.contains("a lane never pushes them"), "{standing}");
+        let box_section = lane.find("## On the cloud box").expect("the box heading");
+        assert!(
+            lane[box_section..].contains("push the lane branch to the URL-matched remote"),
+            "{}",
+            &lane[box_section..]
+        );
+    }
+
+    #[test]
+    fn memory_over_budget_warns_with_the_file_and_size() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir_all(project.dir().join("memory")).unwrap();
+        std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n- state\n").unwrap();
+        std::fs::write(
+            project.dir().join("memory/state.md"),
+            "x".repeat(MEMORY_CAP_CHARS + 1),
+        )
+        .unwrap();
+
+        let use_ = memory_use(&project);
+        assert!(use_.over_budget());
+        let warning = use_.warning().unwrap();
+        assert!(warning.contains("memory/state.md"), "{warning}");
+        assert!(
+            warning.contains(&(MEMORY_CAP_CHARS + 1).to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("memory/archive/"), "{warning}");
+
+        std::fs::write(project.dir().join("memory/state.md"), "short").unwrap();
+        assert!(memory_use(&project).warning().is_none());
     }
 
     fn local_thread(project: &Project, dir: &Path) -> Thread {
