@@ -17,7 +17,7 @@ use crate::coordinator::{self, MAX_LAUNCH_ATTEMPTS};
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
-use crate::steps::{self, Memory, Transition};
+use crate::steps::{self, Memory};
 use crate::{inbox, thread, threads};
 
 pub const TICK: Duration = Duration::from_secs(15);
@@ -439,8 +439,6 @@ pub struct Seen {
     socket: String,
     agents: Vec<Agent>,
     panes: Vec<Pane>,
-    /// Group changes of this tick, turned into inbox items after the copies.
-    transitions: Vec<Transition>,
     /// The session answered, the project has at least two recorded local
     /// panes, and every one of them is missing: herdr was restarted.
     session_lost: bool,
@@ -476,7 +474,6 @@ pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> R
 /// State, pending prompts, group and tokens for a set of threads that live in
 /// one herdr server (the local session, or one remote machine).
 struct Pass {
-    transitions: Vec<Transition>,
     recorded_panes: usize,
     missing_panes: usize,
     error: Option<anyhow::Error>,
@@ -494,7 +491,6 @@ fn thread_pass(
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass {
-        transitions: Vec::new(),
         recorded_panes: 0,
         missing_panes: 0,
         error: None,
@@ -561,20 +557,6 @@ fn thread_pass(
         } else {
             thread::group(&after, &live, now)
         };
-        if !t.last_group.is_empty() && group.token() != t.last_group {
-            let note = if !live.pane_exists {
-                "pane closed".to_string()
-            } else if state.is_empty() {
-                "no agent".to_string()
-            } else {
-                state.clone()
-            };
-            pass.transitions.push(Transition {
-                id: t.id.clone(),
-                to: group,
-                note,
-            });
-        }
         if delivered || state != t.last_state || group.token() != t.last_group {
             thread::update(project, &t.id, |t| {
                 if delivered {
@@ -806,7 +788,6 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
             socket: record.socket,
             agents,
             panes,
-            transitions: pass.transitions,
             session_lost: recorded_panes >= 2 && missing_panes == recorded_panes,
         })),
     }
@@ -822,9 +803,8 @@ fn remote_pass(
     machine: &str,
     view: &steps::CourierOutcome,
     may_start: &mut bool,
-    _copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>,
     errors: &mut Vec<anyhow::Error>,
-) -> Result<Vec<Transition>, String> {
+) -> Result<(), String> {
     let ctx = pass.ctx;
     let project = pass.project;
     let herdr = pass.herdr;
@@ -834,7 +814,7 @@ fn remote_pass(
         (Some(agents), Some(panes)) => (agents.clone(), panes.clone()),
         // The box server did not answer: the sealed events were still imported,
         // but no lane state changes and no GONE is invented (SPEC-remote §4.3).
-        _ => return Ok(Vec::new()),
+        _ => return Ok(()),
     };
 
     let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
@@ -866,7 +846,7 @@ fn remote_pass(
             now: jiff::Timestamp::now(),
         },
     ));
-    Ok(pass.transitions)
+    Ok(())
 }
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
@@ -875,11 +855,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
     errors.extend(crate::escalation::tick(ctx, project).err());
-    let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
     let mut may_start = true;
-    let mut transitions = seen.transitions.clone();
 
     errors.extend(
         crate::steps::config_changed(project, &crate::project::policy_hash(&ctx.config_dir))
@@ -933,10 +911,12 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
                     errors.push(anyhow::anyhow!("{}: copy failed: {error}", t.id))
                 }
                 outcome => {
-                    if let thread::CopyOutcome::Partial(notes) = outcome {
-                        copy_notes.insert(t.id.clone(), notes);
-                    }
+                    let notes = match outcome {
+                        thread::CopyOutcome::Partial(notes) => notes,
+                        _ => Vec::new(),
+                    };
                     let updated = thread::update(project, &t.id, |t| {
+                        t.copy_notes = notes;
                         t.report_hash = hash.clone();
                         t.last_report_change = project::now();
                     });
@@ -997,24 +977,14 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             &machine,
             view,
             &mut may_start,
-            &mut copy_notes,
             &mut errors,
         ) {
-            Ok(found) => transitions.extend(found),
+            Ok(()) => {}
             Err(error) => errors.push(anyhow::anyhow!("{machine}: {error}")),
         }
     }
 
-    errors.extend(
-        steps::write_thread_items(
-            project,
-            &mut state,
-            &transitions,
-            seen.session_lost,
-            &copy_notes,
-        )
-        .err(),
-    );
+    errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {
