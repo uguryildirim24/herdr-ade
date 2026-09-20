@@ -24,6 +24,7 @@ pub struct SessionView<'a> {
 
 /// `None` when the project was never opened or its session is unreachable.
 pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'a>> {
+    let _scope = crate::ledger::Scope::new(&[project]);
     let record = project.coordinator()?;
     if record.socket.is_empty() || !Path::new(&record.socket).exists() {
         return None;
@@ -1731,6 +1732,7 @@ pub struct Row {
 }
 
 pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
+    let _scope = crate::ledger::Scope::new(&[project]);
     let view = session_view(ctx, project);
     let now = jiff::Timestamp::now();
     thread::list(project)

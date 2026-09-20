@@ -654,6 +654,24 @@ fn parse_box_list<T: serde::de::DeserializeOwned>(json: &str, field: &str) -> Re
 /// advances, and only after the import is durable. Returns the box's live
 /// facts, so the caller can key lane state and push GONE after a reboot.
 pub fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
+    let _scope = crate::ledger::Scope::new(projects);
+    for project in projects {
+        crate::ledger::retry_after_failure(project, "courier-failed", machine);
+    }
+    let result = courier_inner(ctx, projects, machine);
+    if let Err(error) = &result {
+        for project in projects {
+            crate::ledger::observe(project, "courier-failed", machine, &format!("{error:#}"));
+        }
+    } else {
+        for project in projects {
+            crate::ledger::recovered(project, "courier-failed", machine);
+        }
+    }
+    result
+}
+
+fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
     let profile =
         crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
     if profile.is_local() {
@@ -919,6 +937,7 @@ pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> V
 /// Types one line into the coordinator through the same serialized writer D5
 /// uses (SPEC-remote §4.3). Returns whether it was typed.
 pub fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool> {
+    let _scope = crate::ledger::Scope::new(&[project]);
     let Some(record) = project.coordinator() else {
         return Ok(false);
     };
@@ -1953,6 +1972,11 @@ mod tests {
         let ctx = courier_ctx(root.path(), &env, &runner);
         let error = courier(&ctx, &[&alpha], "box").unwrap_err().to_string();
         assert!(error.contains("receipt_mismatch"), "{error}");
+        let failures = crate::ledger::list(&alpha).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "courier-failed");
+        assert_eq!(failures[0].subject, "box");
+        assert!(failures[0].detail.contains("receipt_mismatch"));
         assert!(events::list(&alpha).is_empty());
         assert!(
             events::remote_state(&alpha, "1").taken.is_empty(),

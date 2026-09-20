@@ -519,6 +519,7 @@ fn overview_doc(o: &Overview, width: usize, narrow: bool, t: Theme, full: bool) 
     section("overview-4", overview::HEADINGS[4], &o.sections[4], None);
     section("tasks", overview::TASKS_HEADING, &o.tasks, None);
     section("overview-5", overview::HEADINGS[5], &o.sections[5], None);
+    section("overview-6", overview::HEADINGS[6], &o.sections[6], None);
     d
 }
 
@@ -1572,6 +1573,12 @@ mod tests {
             marker: "box last seen".into(),
             tone: Tone::Yellow,
         });
+        o.sections[6].push(overview::Row {
+            text: "The work check could not start (2 times).".into(),
+            prefix: String::new(),
+            marker: "f-0001".into(),
+            tone: Tone::Yellow,
+        });
         o.progress = Some((2, 5));
         let lines = |d: &Document| -> Vec<String> {
             d.lines
@@ -1594,6 +1601,8 @@ mod tests {
             .unwrap();
         assert!(row.ends_with('…'), "{row:?}");
         assert!(row.width() <= 40, "{row:?}");
+        assert!(compact.iter().any(|line| line.contains("Failures")));
+        assert!(compact.iter().any(|line| line.ends_with("f-0001")));
         let marked = compact
             .iter()
             .find(|line| line.contains("checking"))
