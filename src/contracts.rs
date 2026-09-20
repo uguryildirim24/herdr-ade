@@ -394,9 +394,51 @@ pub struct AdmissionManifest {
     pub members: Vec<ManifestMember>,
 }
 
-/// `.state/rounds/r<n>.toml` (SPEC-ADE D6, item 33).
+/// Lifecycle owned by the round record, not by events or git refs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundPhase {
+    #[default]
+    Admitting,
+    PreparingReview,
+    UnderReview,
+    VerdictIn,
+    Merging,
+    Checkpointing,
+    Merged,
+    Abandoned,
+    Diverged,
+}
+
+impl RoundPhase {
+    pub fn closed(self) -> bool {
+        matches!(self, Self::Merged | Self::Abandoned)
+    }
+}
+
+/// Planned review outputs, saved before any branch or brief commit is written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewIntent {
+    pub head: String,
+    pub branch: String,
+    pub brief: String,
+    pub manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_brief: Option<String>,
+}
+
+/// `.state/rounds/r<n>.toml` owns the entire round transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RoundRecord {
+    #[serde(default)]
+    pub phase: RoundPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_intent: Option<ReviewIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeIntent>,
+    /// Accepted reviewer completion; later events cannot replace this pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<CompletionPin>,
     pub round: String,
     pub branch: String,
     pub plain: String,
@@ -453,7 +495,7 @@ pub enum MergePhase {
     MergeDiverged,
 }
 
-/// `.state/rounds/r<n>/merge.toml` (SPEC-ADE D6, item 34).
+/// Merge/checkpoint transaction embedded in the owning round record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergeIntent {
     pub op: String,
@@ -893,6 +935,7 @@ mod tests {
             reviewer: Some("t-0003".into()),
             announced: Some("verdict:MERGE".into()),
             reviewer_start_failures: 0,
+            ..Default::default()
         });
         both(&MergeIntent {
             op: "merge-r1".into(),

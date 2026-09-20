@@ -1315,8 +1315,6 @@ pub struct ResolveArgs {
     pub discard_uncopied: bool,
     /// Leave the lane's pane and tab open (the idle agent still runs).
     pub keep_pane: bool,
-    /// Close a lane or reviewer that an open, unmerged round still holds.
-    pub force: bool,
 }
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()> {
@@ -1345,21 +1343,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
             record.kind
         );
     }
-    // A lane pinned in a round, or a round's reviewer, is closed after the
-    // round merges, never before. `--force` overrides and says so once.
-    if let Some(round) = crate::round::open_round_pinning(&project, id)? {
-        if !args.force {
-            bail!(
-                "round_unmerged: `{id}` is pinned in round `{round}`, which has no merge record; run `round merge {round}` first, or pass --force"
-            );
-        }
-        crate::ask::say(
-            ctx,
-            slug,
-            "the round has not merged, so this lane was closed anyway",
-            None,
-        )?;
-    }
+    crate::round::require_resolvable(&project, id)?;
 
     // Every path that resolves a thread performs a final copy first.
     if !args.skip_copy {

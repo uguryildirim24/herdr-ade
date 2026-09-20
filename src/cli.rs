@@ -1246,9 +1246,6 @@ enum ThreadCommand {
         /// Leave the lane's pane and tab open instead of closing them
         #[arg(long)]
         keep_pane: bool,
-        /// Close a lane or reviewer that an open, unmerged round still holds
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -1625,7 +1622,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 skip_copy,
                 discard_uncopied,
                 keep_pane,
-                force,
             } => threads::resolve(
                 &ctx,
                 &slug,
@@ -1636,7 +1632,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     skip_copy,
                     discard_uncopied,
                     keep_pane,
-                    force,
                 },
             ),
         },
