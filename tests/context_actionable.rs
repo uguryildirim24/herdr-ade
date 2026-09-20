@@ -116,6 +116,41 @@ fn superseded_abandonment_and_obsolete_preparation_never_reach_digest() {
 }
 
 #[test]
+fn terminal_preparation_does_not_hide_the_current_failure_or_change_records() {
+    let p = Project::new();
+    let thread = "id = \"t-0001\"\nstatus = \"failed\"\nattempt = 1\nerror = \"Report could not be sealed\"\n";
+    p.write("threads/t-0001.toml", thread);
+    // No successor operation: the terminal operation is still history, but
+    // its unresolved thread must continue to tell the coordinator to act.
+    p.op("t-0001-1-1", 1, "abandoned");
+    let op_path = p.dir.join("ops/t-0001-1-1.toml");
+    let before = std::fs::read(&op_path).unwrap();
+    let text = p.context(true);
+    assert!(text.contains("## Open threads (1)"), "{text}");
+    assert!(text.contains("- t-0001 ["), "{text}");
+    assert!(text.contains("error: Report could not be sealed"), "{text}");
+    assert!(!text.contains("Completion preparation"), "{text}");
+    assert!(!text.contains("t-0001-1-1"), "{text}");
+    assert_eq!(std::fs::read(&op_path).unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(p.dir.join("threads/t-0001.toml")).unwrap(),
+        thread
+    );
+}
+
+#[test]
+fn unreadable_tasks_are_not_reported_as_an_empty_queue() {
+    let p = Project::new();
+    p.write("TASKS.md", [0xff]);
+    let text = p.context(true);
+    assert!(
+        text.contains("## Tasks (TASKS.md)\nconfig-error: TASKS.md is unreadable"),
+        "{text}"
+    );
+    assert!(!text.contains("## Tasks (TASKS.md)\n(none)"), "{text}");
+}
+
+#[test]
 fn unfinished_tasks_are_bounded_across_lists_and_finished_tasks_are_absent() {
     let p = Project::new();
     let mut tasks = String::from("# Tasks\n## Archive\n- [x] Dead work (me)\n## First\n");
