@@ -20,7 +20,8 @@ ha ledger task f-0001 | ha thread start demo \
 
 The project resolves from the current workspace or lane launch binding. The
 ledger never creates a lane or closes a failure on its own. A designed refusal
-(a safety or authority check that intentionally rejects the requested action)
+(a safety or authority check that intentionally rejects the requested action,
+or a completed doctor report that refuses to declare the system healthy)
 still exits unsuccessfully, but its structural refusal marker keeps it out of
 the failure ledger. Errors are never classified by matching message text.
 
@@ -47,6 +48,9 @@ Malformed or torn journal rows produce an error; they are never silently dropped
   refusals and predicate commands whose nonzero status is a valid negative
   answer are not failures. A caller declares that contract with
   `ExitMeaning::Answer`; ambiguous probes retain `ExitMeaning::Required`.
+  Git ancestry uses the narrower `ExitMeaning::Boolean`: 0 is yes, 1 with
+  empty stderr is no, and anything else is an error. Its typed helper returns
+  `Result<bool>` using the same decoder as the ledger.
   Missing tools, signals, and timeouts are failures under either contract.
   Optional Git branches/files use successful presence queries, not a blanket
   nonzero exemption. See the [subprocess audit](subprocess-audit.md) for counts

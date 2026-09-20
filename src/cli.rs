@@ -1762,7 +1762,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         },
         Command::Doctor { session } => {
             if !doctor::run(&ctx, &session.into())? {
-                bail!("some checks failed");
+                return Err(crate::refusal::error("some checks failed"));
             }
             Ok(())
         }
@@ -1793,6 +1793,47 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unhealthy_doctor_reports_without_recording_itself() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let _scope = crate::ledger::Scope::new(&[&project]);
+        // Probe failures remain observable; only the completed doctor's own
+        // nonzero report is exempt, not its children or arbitrary errors.
+        let runner = crate::ledger::RecordingRunner(&world.runner);
+        let mut ctx = world.ctx();
+        ctx.runner = &runner;
+        let result = dispatch(
+            ctx,
+            Command::Doctor {
+                session: SessionArgs::default(),
+            },
+            Some(&project),
+        );
+        let error = result.as_ref().unwrap_err();
+        assert_eq!(error.to_string(), "some checks failed");
+        assert!(crate::refusal::is(error));
+        let before = crate::ledger::list(&project).unwrap();
+        assert!(!before.is_empty());
+        for _ in 0..2 {
+            record_command_outcome(Some(&project), "ha doctor", &result);
+        }
+        let after = crate::ledger::list(&project).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert!(after.iter().all(|entry| entry.subject != "ha doctor"));
+
+        // Neither the command name nor the message text suppresses real faults.
+        let failure = Err(anyhow::anyhow!("some checks failed"));
+        record_command_outcome(Some(&project), "ha doctor", &failure);
+        let rows = crate::ledger::list(&project).unwrap();
+        assert!(
+            rows.iter()
+                .any(|entry| { entry.kind == "command-failed" && entry.subject == "ha doctor" })
+        );
+        record_command_outcome(Some(&project), "ha doctor", &result);
+        assert_eq!(rows.len(), crate::ledger::list(&project).unwrap().len());
+    }
 
     #[test]
     fn abandoning_a_closed_round_does_not_record_a_failure() {
