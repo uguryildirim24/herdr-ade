@@ -44,6 +44,7 @@ pub fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()> {
             workflow: &record.role,
             previous: Some(&record.launch),
             failure: Some(&failure.text),
+            source_truncation: record.launch.source_truncation.as_ref(),
         },
     );
     match selected {
