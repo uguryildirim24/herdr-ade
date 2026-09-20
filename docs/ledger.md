@@ -45,7 +45,12 @@ Malformed or torn journal rows produce an error; they are never silently dropped
 - Unexpected CLI failures and nonzero, timed-out, or unspawnable child commands
   through the ADE runner, preserving their original outcomes. Designed CLI
   refusals and predicate commands whose nonzero status is a valid negative
-  answer are not failures. Child evidence
+  answer are not failures. A caller declares that contract with
+  `ExitMeaning::Answer`; ambiguous probes retain `ExitMeaning::Required`.
+  Missing tools, signals, and timeouts are failures under either contract.
+  Optional Git branches/files use successful presence queries, not a blanket
+  nonzero exemption. See the [subprocess audit](subprocess-audit.md) for counts
+  and the mixed probes deliberately left eligible for recording. Child evidence
   includes argv, exit status, stdout and stderr, but not environment or stdin.
 - Failed reviewer starts in `round advance`, even when advance returns success.
 - Unexpected merge failures, including subprocess errors and conflicts. A

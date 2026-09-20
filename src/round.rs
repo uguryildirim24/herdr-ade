@@ -75,11 +75,6 @@ pub mod repo {
             self.runner.run(&self.cmd_in(dir, args))
         }
 
-        /// Run a predicate/probe whose nonzero exit is a valid negative result.
-        fn probe_in(&self, dir: &Path, args: &[&str]) -> Result<Output> {
-            self.runner.run(&self.cmd_in(dir, args).nonzero_is_data())
-        }
-
         /// Trimmed stdout of a successful git call in `dir`.
         pub fn run_in(&self, dir: &Path, args: &[&str]) -> Result<String> {
             let out = self.output_in(dir, args)?;
@@ -104,23 +99,13 @@ pub mod repo {
 
         /// The commit a branch points at, or `None` when it does not exist.
         pub fn branch_head(&self, branch: &str) -> Result<Option<String>> {
-            let out = self.probe_in(
-                &self.repo,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "-q",
-                    &format!("refs/heads/{branch}^{{commit}}"),
-                ],
-            )?;
-            Ok(out
-                .success()
-                .then(|| out.stdout.trim().to_string())
-                .filter(|s| !s.is_empty()))
+            crate::git::branch_head(self.runner, &self.repo.to_string_lossy(), branch)
         }
 
         pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
-            let out = self.probe_in(
+            // A negative ancestry answer and a broken object database both
+            // exit nonzero. Keep this ambiguous probe eligible for recording.
+            let out = self.output_in(
                 &self.repo,
                 &["merge-base", "--is-ancestor", ancestor, descendant],
             )?;
@@ -156,8 +141,17 @@ pub mod repo {
 
         /// A file's bytes at a revision, `None` when the path is absent there.
         pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<String>> {
-            let out = self.probe_in(&self.repo, &["show", &format!("{rev}:{path}")])?;
-            Ok(out.success().then_some(out.stdout))
+            // Query presence first: `show` alone cannot distinguish an absent
+            // path from a bad revision or unreadable object database.
+            let names = self.run(&["ls-tree", "-z", "--name-only", rev, "--", path])?;
+            if !names.split('\0').any(|name| name == path) {
+                return Ok(None);
+            }
+            let out = self.output_in(&self.repo, &["show", &format!("{rev}:{path}")])?;
+            if !out.success() {
+                bail!("`git show {rev}:{path}` failed: {}", out.error_text());
+            }
+            Ok(Some(out.stdout))
         }
 
         /// The worktree that has `branch` checked out, if any.
@@ -464,11 +458,10 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
 
 fn require_mutable(record: &RoundRecord) -> Result<()> {
     if record.phase.closed() || record.merge.is_some() {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "round_closed: `{}` is {:?}; use a new round for new work",
-            record.round,
-            record.phase
-        );
+            record.round, record.phase
+        )));
     }
     Ok(())
 }
@@ -476,11 +469,10 @@ fn require_mutable(record: &RoundRecord) -> Result<()> {
 fn require_editable(record: &RoundRecord) -> Result<()> {
     require_mutable(record)?;
     if record.phase == RoundPhase::PreparingReview {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "round_output_pending: `{}` has a recorded review output intent; finish it with `round review {}` before changing the round",
-            record.round,
-            record.round
-        );
+            record.round, record.round
+        )));
     }
     Ok(())
 }
@@ -987,7 +979,9 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
 pub fn abandon(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<RoundRecord> {
     let reason = reason.trim();
     if reason.is_empty() {
-        bail!("round_abandon_reason_missing: say why `{round}` cannot proceed");
+        return Err(crate::refusal::error(format!(
+            "round_abandon_reason_missing: say why `{round}` cannot proceed"
+        )));
     }
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
@@ -995,15 +989,15 @@ pub fn abandon(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Round
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         if record.phase.closed() {
-            bail!(
+            return Err(crate::refusal::error(format!(
                 "round_closed: `{round}` is {:?}; its ending cannot be changed",
                 record.phase
-            );
+            )));
         }
         if record.merge.is_some() {
-            bail!(
+            return Err(crate::refusal::error(format!(
                 "round_abandon_refused: `{round}` has begun its merge transaction; finish or repair that transaction"
-            );
+            )));
         }
         record.phase = RoundPhase::Abandoned;
         record.review_intent = None;
@@ -3324,6 +3318,27 @@ mod tests {
             load(&fx.project, "r1").unwrap().phase,
             RoundPhase::UnderReview
         );
+    }
+
+    #[test]
+    fn optional_git_answers_do_not_hide_repository_errors() {
+        let fx = fixture();
+        let _scope = crate::ledger::Scope::new(&[&fx.project]);
+        let runner = crate::ledger::RecordingRunner(&crate::runner::RealRunner);
+        let repo = Git::new(&runner, &fx.repo);
+        assert!(repo.branch_head("box-only").unwrap().is_none());
+        assert!(repo.show_file("HEAD", "missing.md").unwrap().is_none());
+        assert_eq!(
+            repo.show_file("HEAD", "README.md").unwrap().as_deref(),
+            Some("hello\n")
+        );
+        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
+        assert!(repo.show_file("not-a-revision", "README.md").is_err());
+        assert_eq!(crate::ledger::list(&fx.project).unwrap().len(), 1);
+        // Unlike an absent file, an ancestry status can also mean invalid
+        // input or a broken database. It must not get a blanket exemption.
+        assert!(repo.is_ancestor("not-a-revision", "HEAD").is_err());
+        assert_eq!(crate::ledger::list(&fx.project).unwrap().len(), 2);
     }
 
     #[test]

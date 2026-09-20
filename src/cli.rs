@@ -1795,6 +1795,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn abandoning_a_closed_round_does_not_record_a_failure() {
+        let fx = crate::round::testkit::fixture();
+        let ctx = fx.world.ctx();
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("This round checks the work.".into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+        crate::round::abandon(&ctx, "demo", "r1", "no longer needed").unwrap();
+        let result = crate::round::abandon(&ctx, "demo", "r1", "again").map(|_| ());
+        assert!(crate::refusal::is(result.as_ref().unwrap_err()));
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .starts_with("round_closed:")
+        );
+        record_command_outcome(Some(&fx.project), "ha round abandon", &result);
+        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
+    }
+
+    #[test]
     fn designed_refusals_are_not_failures_but_real_command_errors_are() {
         let root = tempfile::tempdir().unwrap();
         let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();

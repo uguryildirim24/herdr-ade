@@ -372,7 +372,9 @@ impl Runner for RecordingRunner<'_> {
         match &result {
             Ok(out)
                 if out.success()
-                    || (cmd.nonzero_is_data && out.code.is_some() && !out.timed_out) =>
+                    || (cmd.exit_meaning == crate::runner::ExitMeaning::Answer
+                        && out.code.is_some()
+                        && !out.timed_out) =>
             {
                 PROJECTS.with(|projects| {
                     for project in projects.borrow().iter() {
@@ -544,6 +546,65 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_answer_leaves_no_failure_or_retry() {
+        let (_root, p) = fixture();
+        let _scope = Scope::new(&[&p]);
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        // The shell builtin tests a fixed value: all normal statuses answer
+        // this question. This is not a wrapper around a possibly broken tool.
+        let cmd = Cmd::new("/bin/sh", Duration::from_secs(5))
+            .args(["-c", "test x = y"])
+            .exit_meaning(crate::runner::ExitMeaning::Answer);
+        for _ in 0..2 {
+            assert!(!runner.run(&cmd).unwrap().success());
+        }
+        assert!(list(&p).unwrap().is_empty());
+        assert!(!p.dir().join("ledger.jsonl").exists());
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_still_records() {
+        let (_root, p) = fixture();
+        let _scope = Scope::new(&[&p]);
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        let cmd = Cmd::new("/no-such-directory/herdr-ade-probe", Duration::from_secs(1))
+            .exit_meaning(crate::runner::ExitMeaning::Answer);
+        assert!(runner.run(&cmd).is_err());
+        let rows = list(&p).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "command-failed");
+    }
+
+    #[test]
+    fn a_probe_timeout_or_signal_is_not_an_answer() {
+        use crate::runner::fake::FakeRunner;
+        for output in [
+            Output {
+                code: Some(1),
+                timed_out: true,
+                ..Default::default()
+            },
+            Output {
+                code: None,
+                ..Default::default()
+            },
+        ] {
+            let (_root, p) = fixture();
+            let _scope = Scope::new(&[&p]);
+            let fake = FakeRunner::new();
+            fake.on("probe", output);
+            let runner = RecordingRunner(&fake);
+            runner
+                .run(
+                    &Cmd::new("probe", Duration::from_secs(1))
+                        .exit_meaning(crate::runner::ExitMeaning::Answer),
+                )
+                .unwrap();
+            assert_eq!(list(&p).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn a_real_nonzero_command_is_recorded_without_changing_its_result() {
         let (_root, p) = fixture();
         let _scope = Scope::new(&[&p]);
@@ -566,7 +627,7 @@ mod tests {
             .run(
                 &Cmd::new("sh", Duration::from_secs(5))
                     .args(["-c", "exit 1"])
-                    .nonzero_is_data(),
+                    .exit_meaning(crate::runner::ExitMeaning::Answer),
             )
             .unwrap();
         assert_eq!(probe.code, Some(1));

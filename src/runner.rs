@@ -7,6 +7,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+/// The caller's contract, not an exit-code or diagnostic allowlist. Use
+/// `Answer` only when *every normal exit* answers the question. Mixed probes
+/// (for example git ancestry or SSH checks) must keep `Required`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitMeaning {
+    Required,
+    Answer,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cmd {
     pub program: String,
@@ -16,8 +25,7 @@ pub struct Cmd {
     pub cwd: Option<PathBuf>,
     pub stdin: Option<String>,
     pub timeout: Duration,
-    /// A nonzero exit is data for a predicate/probe, not a failed command.
-    pub nonzero_is_data: bool,
+    pub exit_meaning: ExitMeaning,
     /// Spawn in its own process group and kill the whole group on timeout.
     pub own_group: bool,
 }
@@ -32,7 +40,7 @@ impl Cmd {
             cwd: None,
             stdin: None,
             timeout,
-            nonzero_is_data: false,
+            exit_meaning: ExitMeaning::Required,
             own_group: false,
         }
     }
@@ -71,8 +79,8 @@ impl Cmd {
         self
     }
 
-    pub fn nonzero_is_data(mut self) -> Self {
-        self.nonzero_is_data = true;
+    pub fn exit_meaning(mut self, meaning: ExitMeaning) -> Self {
+        self.exit_meaning = meaning;
         self
     }
 
