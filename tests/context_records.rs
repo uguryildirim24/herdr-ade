@@ -49,7 +49,7 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
         r#"{"pane_id":"w1:p1","generation":3,"bootstrap":"acknowledged","launch":{"attempt":1,"brief_hash":"fixture"}}"#,
     )
     .unwrap();
-    for id in ["t-0001", "t-0002"] {
+    for id in ["t-0001", "t-0002", "t-0003"] {
         std::fs::write(
             project.join(format!("threads/{id}.toml")),
             format!("id = \"{id}\"\nstatus = \"open\"\nattempt = 2\nlast_group = \"idle\"\nreport_hash = \"report\"\n"),
@@ -67,15 +67,33 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
             "id = \"{id}\"\nop = \"{id}\"\nthread = \"{thread}\"\nattempt = {attempt}\ncreated = \"2026-09-20T00:00:00Z\"\n[recipient]\npane = \"w1:p1\"\ncoordinator_attempt = {generation}\n[payload.waiting]\ntext = \"{text}\"\n"
         )).unwrap();
     }
+    std::fs::write(
+        project.join("events/t-0003-2-1.toml"),
+        "id = \"t-0003-2-1\"\nop = \"t-0003-2-1\"\nthread = \"t-0003\"\nattempt = 2\ncreated = \"2026-09-20T00:00:00Z\"\n[recipient]\npane = \"w1:p1\"\ncoordinator_attempt = 3\n[payload.failed]\ntext = \"compiler failure\"\n",
+    )
+    .unwrap();
     let text = context(home.path(), "w1:p1", true);
+    assert!(
+        text.contains("failed: compiler failure event=t-0003-2-1"),
+        "{text}"
+    );
+    assert!(text.contains("report: threads/t-0003.md"));
     assert!(text.contains("current wait"));
     assert!(text.contains("report: threads/t-0001.md"));
     assert!(!text.contains("superseded"));
     let receipt = project.join("deliveries/t-0001-2-2.jsonl");
+    let failed_receipt = project.join("deliveries/t-0003-2-1.jsonl");
     assert!(!receipt.exists(), "peek never acknowledges");
+    assert!(!failed_receipt.exists());
     context(home.path(), "w9:p9", false);
     assert!(!receipt.exists(), "another pane never acknowledges");
+    assert!(!failed_receipt.exists());
     context(home.path(), "w1:p1", false);
+    assert!(
+        std::fs::read_to_string(&failed_receipt)
+            .unwrap()
+            .contains("acknowledged")
+    );
     assert!(
         std::fs::read_to_string(&receipt)
             .unwrap()
