@@ -14,6 +14,7 @@ use crate::runner::{Cmd, Runner};
 use crate::thread;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const BOX_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
@@ -86,19 +87,13 @@ pub fn scan(ctx: &Ctx, project: &Project) -> Stale {
 
     // 5 and 6. A skill file that moved on since the agent was primed.
     if let Some(repo) = plugin_repo(ctx) {
-        if let Some(coordinator) = project.coordinator() {
-            if coordinator.launch.skill_hash.is_empty() {
-                stale.items.push(Item {
-                    what: "The coordinator's loaded skill version was not recorded.".into(),
-                    remedy: "Restart the coordinator pane so its instructions can be checked."
-                        .into(),
-                });
-            } else if skill_behind(&repo, "coordinator", &coordinator.launch.skill_hash) {
-                stale.items.push(Item {
-                    what: "The coordinator is running older skill instructions.".into(),
-                    remedy: "Restart the coordinator pane so it reads the new instructions.".into(),
-                });
-            }
+        if let Some(coordinator) = project.coordinator()
+            && skill_behind(&repo, "coordinator", &coordinator.launch.skill_hash)
+        {
+            stale.items.push(Item {
+                what: "The coordinator is running older skill instructions.".into(),
+                remedy: "Restart the coordinator pane so it reads the new instructions.".into(),
+            });
         }
         for lane in thread::list(project) {
             if lane.status == thread::Status::Resolved {
@@ -109,15 +104,7 @@ pub fn scan(ctx: &Ctx, project: &Project) -> Stale {
             } else {
                 lane.role.as_str()
             };
-            if lane.launch.skill_hash.is_empty() {
-                stale.items.push(Item {
-                    what: format!("Lane {}'s loaded skill version was not recorded.", lane.id),
-                    remedy: format!(
-                        "Restart lane {} so its instructions can be checked.",
-                        lane.id
-                    ),
-                });
-            } else if skill_behind(&repo, role, &lane.launch.skill_hash) {
+            if skill_behind(&repo, role, &lane.launch.skill_hash) {
                 stale.items.push(Item {
                     what: format!("Lane {} is running older skill instructions.", lane.id),
                     remedy: format!("Restart lane {} so it reads the new instructions.", lane.id),
@@ -232,7 +219,7 @@ fn server_stale(runner: &dyn Runner, bin: &str, target: Option<&str>) -> bool {
             target,
             &format!("{bin} status server --json"),
             None,
-            CHECK_TIMEOUT,
+            BOX_CHECK_TIMEOUT,
         )
         .ok(),
         None => runner
@@ -279,8 +266,11 @@ fn plugin_repo(ctx: &Ctx) -> Option<PathBuf> {
 }
 
 /// True when the skill file on disk no longer matches what the agent was
-/// primed with. An unreadable skill is never called stale.
+/// primed with. An unrecorded or unreadable skill is never called stale.
 fn skill_behind(repo: &Path, role: &str, recorded: &str) -> bool {
+    if recorded.is_empty() {
+        return false;
+    }
     let Ok(text) = std::fs::read_to_string(repo.join("skill").join(crate::lane::skill_file(role)))
     else {
         return false;
