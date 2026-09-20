@@ -11,6 +11,7 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0090.md",
       "tasks/t-0091.md",
       "tasks/review-r39.md",
       "tasks/review-r38.md",
@@ -21,14 +22,14 @@
       "tasks/review-r37.md",
       "tasks/review-r36.md",
       "tasks/t-0086.md",
-      "tasks/review-r35.md",
-      "tasks/t-0083.md"
+      "tasks/review-r35.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r38.md",
       "tasks/reviews/code-r39.md",
       "tasks/reviews/code-r35.md",
       "tasks/reviews/code-r37.md",
@@ -39,21 +40,20 @@
       "tasks/reviews/code-r30.md",
       "tasks/reviews/code-r29.md",
       "tasks/reviews/code-r28.md",
-      "tasks/reviews/code-r25.md",
-      "tasks/reviews/code-r26.md"
+      "tasks/reviews/code-r25.md"
     ]
   },
-  "generated": "2026-09-19T22:44:28-04:00",
+  "generated": "2026-09-19T22:50:25-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0091-review-r39-this-round-checks-the-box-rea",
       "main",
       "hp/adeherdr/t-0090-review-r38-this-round-checks-the-record",
+      "hp/adeherdr/t-0089-u2-u3-overturn-a-decision-and-withdraw-a",
+      "hp/adeherdr/t-0091-review-r39-this-round-checks-the-box-rea",
       "review/r39",
       "review/r38",
       "hp/adeherdr/t-0084-review-r35-this-round-checks-the-cost-th",
       "hp/adeherdr/t-0086-d4-d5-the-box-url-test-and-the-installer",
-      "hp/adeherdr/t-0089-u2-u3-overturn-a-decision-and-withdraw-a",
       "hp/adeherdr/t-0088-review-r37-this-round-checks-four-small",
       "hp/adeherdr/t-0081-a3-the-harness-records-its-own-failures",
       "hp/adeherdr/t-0087-review-r36-this-round-checks-that-a-chec",
@@ -158,22 +158,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
+      "cc32674 Merge commit '6bff3311f8cfe96407db289d9a716edde33f7d23'",
+      "6bff331 docs(review): round r38 verdict",
+      "6dfa7f9 review(ledger): keep failure records accurate and visible",
+      "28477a1 checkpoint(r39): HANDOFF after merging the round",
       "51b756a docs(review): round r39 verdict",
-      "7bf9881 review(harness): require the running image fingerprint",
-      "3cc0beb review(remote): quote mismatch URLs as data",
-      "d9ee69c Merge commit '8294435cd6288517e5f62900682e93a35a1f5d9b' into hp/adeherdr/t-0091-review-r39-this-round-checks-the-box-rea",
-      "1f8d2f9 docs(tasks): t-0091",
-      "02c3759 review(r39): brief for revision 1"
+      "7bf9881 review(harness): require the running image fingerprint"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "6 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "51b756a",
+        "head": "cc32674",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r39 verdict"
+        "subject": "Merge commit '6bff3311f8cfe96407db289d9a716edde33f7d23'"
       },
       {
         "branch": "review/r1",
@@ -821,10 +821,10 @@
       },
       {
         "branch": "hp/adeherdr/t-0090-review-r38-this-round-checks-the-record",
-        "dirty": 4,
-        "head": "971af5a",
+        "dirty": 0,
+        "head": "6bff331",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0090",
-        "subject": "Merge commit 'be9f28ae17f7af58c148cff3d2e318d849c063ca' into hp/adeherdr/t-0090-review-r38-this-round-checks-the-record"
+        "subject": "docs(review): round r38 verdict"
       },
       {
         "branch": "hp/adeherdr/t-0091-review-r39-this-round-checks-the-box-rea",
@@ -856,8 +856,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r39",
-    "verdict": "51b756ae1fd8b95a138a5090fa515471640f2e6d"
+    "round": "r38",
+    "verdict": "6bff3311f8cfe96407db289d9a716edde33f7d23"
   },
   "session": "default",
   "unlinked_agents": [],
@@ -870,11 +870,13 @@
       "pane_label": null,
       "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0090--/2026-09-20T02-38-59-619Z_01a0bcae-6022-7458-a988-f8937acb35d2.jsonl",
       "start_args": [],
-      "status": "working",
+      "status": "done",
       "tab_id": "w1G:t2R",
       "tab_label": "t-0090",
       "title": "π - t-0090",
       "tokens": {
+        "done": "1",
+        "lane": "t-0090",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
@@ -883,25 +885,23 @@
       }
     },
     {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0091",
+      "cwd": "/Users/rolfie/projects/herdr/.worktrees/t-0092",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0091",
-      "pane_id": "w1G:p2X",
+      "name": "hp-adeherdr-t-0092",
+      "pane_id": "w1G:p2Y",
       "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0091--/2026-09-20T02-39-21-741Z_01a0bcae-b68d-7335-8f4c-56bc95016f6f.jsonl",
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-.worktrees-t-0092--/2026-09-20T02-45-07-095Z_01a0bcb3-fb97-741b-9f9b-e2aceff66196.jsonl",
       "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:t2S",
-      "tab_label": "t-0091",
-      "title": "π - t-0091",
+      "status": "working",
+      "tab_id": "w1G:t2T",
+      "tab_label": "t-0092",
+      "title": "π - t-0092",
       "tokens": {
-        "done": "1",
-        "lane": "t-0091",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
         "review": "working",
-        "thread": "t-0091"
+        "thread": "t-0092"
       }
     }
   ],
