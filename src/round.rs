@@ -3354,6 +3354,10 @@ mod tests {
     fn abandon_records_a_reason_and_releases_the_integration_branch() {
         let fx = fixture();
         reviewed(&fx);
+        assert!(
+            err(abandon(&fx.world.ctx(), "demo", "r1", " \n "))
+                .starts_with("round_abandon_reason_missing")
+        );
         let record = abandon(
             &fx.world.ctx(),
             "demo",
@@ -3362,6 +3366,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(record.phase, RoundPhase::Abandoned);
+        assert!(
+            err(abandon(&fx.world.ctx(), "demo", "r1", "replace the reason"))
+                .starts_with("round_closed")
+        );
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().abandoned_reason,
+            record.abandoned_reason
+        );
         assert_eq!(
             record.abandoned_reason.as_deref(),
             Some("the reviewer could not be dispatched")
@@ -3469,6 +3481,19 @@ mod tests {
         merge(&fx.world.ctx(), "demo", "r1", Some(Stop::Ref)).unwrap();
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(record.phase, RoundPhase::Merging);
+        assert!(
+            err(abandon(
+                &fx.world.ctx(),
+                "demo",
+                "r1",
+                "cancel the pending merge"
+            ))
+            .starts_with("round_abandon_refused")
+        );
+        let after = load(&fx.project, "r1").unwrap();
+        assert_eq!(after.phase, RoundPhase::Merging);
+        assert!(after.abandoned_reason.is_none());
+        assert!(after.merge.is_some());
         assert!(require_resolvable(&fx.project, &lanes[0].0).is_err());
         assert!(err(admit(&fx.world.ctx(), "demo", "r1", &lanes[0].0)).starts_with("round_closed"));
     }
