@@ -340,6 +340,26 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
     )
 }
 
+/// The open round (no merge record yet) that pins this thread as a lane or
+/// binds it as the reviewer, if any. A resolved or merged round is finished
+/// and holds nothing back.
+pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<String>> {
+    for record in list(project) {
+        if read_merge(project, &record.round)?.is_some() {
+            continue;
+        }
+        let pinned = record
+            .manifest
+            .members
+            .iter()
+            .any(|m| m.thread == thread && m.pin.is_some());
+        if pinned || record.reviewer.as_deref() == Some(thread) {
+            return Ok(Some(record.round));
+        }
+    }
+    Ok(None)
+}
+
 // ------------------------------------------------------------- thread reads
 
 /// A thread's current attempt from its record. An unreadable record fails
@@ -694,7 +714,11 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
         if reviewer == thread_id {
             return Ok(record);
         }
-        bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
+        // A resolved or gone reviewer blocks nothing: bind the new one. A
+        // live bound reviewer is still refused.
+        if !reviewer_gone(ctx, &project, reviewer) {
+            bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
+        }
     }
     record.reviewer = Some(thread_id.to_string());
     save(&project, &record)?;
@@ -922,11 +946,23 @@ fn reviewer_task(
     for gate in &record.gates {
         out.push_str(&format!("- `{gate}`\n"));
     }
-    if let Some((verdict, path, branch)) = earlier_review(git, record)? {
-        out.push_str(&format!(
-            "\nThis is a re-review of `{}`; the earlier verdict was {verdict}. Read the earlier review file `{path}` at `{branch}` for the previous findings.\n",
-            record.round
-        ));
+    if let Some(earlier) = earlier_review(project, git, record)? {
+        if Some(earlier.manifest_hash.as_str()) == record.manifest_hash.as_deref() {
+            // The manifest did not move: this is a repair of a merge conflict.
+            // The earlier candidate already carries the earlier reviewer's
+            // fixes, so merge it over the new base instead of the raw shas.
+            out.push_str(&format!(
+                "\n## Repair review\n\nThe integration branch moved after the earlier review. Merge the earlier candidate `{}` into your branch instead of the pinned lane shas; it already carries the earlier reviewer's fixes. The earlier verdict commit is `{}`, its review file is `{}` (branch `{}`).\n",
+                earlier.candidate, earlier.verdict, earlier.verdict_file, earlier.branch
+            ));
+        } else {
+            // A new brief: the lanes moved, so merge the pinned shas but read
+            // the earlier findings first.
+            out.push_str(&format!(
+                "\nThis is a re-review of `{}`; the earlier candidate is `{}` at verdict commit `{}`, with review file `{}` (branch `{}`). Read the earlier review for the previous findings.\n",
+                record.round, earlier.candidate, earlier.verdict, earlier.verdict_file, earlier.branch
+            ));
+        }
     }
     Ok(out)
 }
@@ -950,23 +986,69 @@ fn previous_review_branch(round: &str, branch: &str) -> Option<String> {
     })
 }
 
-/// The verdict and review file of the revision this round's current review
-/// branch supersedes, when there is one. Read-only.
-fn earlier_review(git: &Git, record: &RoundRecord) -> Result<Option<(String, String, String)>> {
+/// The earlier revision of a round: the candidate C the earlier reviewer
+/// produced, the verdict commit V that named it, the review file at V and
+/// the manifest hash that revision reviewed. Read-only.
+struct EarlierReview {
+    candidate: String,
+    verdict: String,
+    verdict_file: String,
+    branch: String,
+    manifest_hash: String,
+}
+
+fn earlier_review(
+    project: &Project,
+    git: &Git,
+    record: &RoundRecord,
+) -> Result<Option<EarlierReview>> {
     let Some(branch) = record.review_branch.as_deref() else {
         return Ok(None);
     };
     let Some(previous) = previous_review_branch(&record.round, branch) else {
         return Ok(None);
     };
+    let Some(head) = git.branch_head(&previous)? else {
+        return Ok(None);
+    };
     let path = verdict_path(&record.round);
-    let Some(text) = git.show_file(&previous, &path)? else {
+    // The verdict V is the previous reviewer's sealed `done` sha, which is the
+    // head of the reviewer's own branch. The review branch itself holds only
+    // the reviewer task commit (`docs(tasks): <id>`), so read that commit to
+    // find the reviewer. A fixture may commit the verdict on the review branch
+    // directly, so accept it there first.
+    let v = if git.show_file(&head, &path)?.is_some() {
+        head
+    } else {
+        let message = git.run(&["log", "-1", "--format=%s", &head])?;
+        let Some(id) = message.trim().strip_prefix("docs(tasks): ") else {
+            return Ok(None);
+        };
+        let Ok(reviewer) = thread::load(project, id.trim()) else {
+            return Ok(None);
+        };
+        let Some(v) = git.branch_head(&reviewer.branch)? else {
+            return Ok(None);
+        };
+        v
+    };
+    let parents = git.parents(&v)?;
+    let [c] = parents.as_slice() else {
+        return Ok(None);
+    };
+    let Some(text) = git.show_file(&v, &path)? else {
         return Ok(None);
     };
     let Ok(verdict) = parse_verdict(&text) else {
         return Ok(None);
     };
-    Ok(Some((verdict.verdict, path, previous)))
+    Ok(Some(EarlierReview {
+        candidate: c.clone(),
+        verdict: v,
+        verdict_file: path,
+        branch: previous,
+        manifest_hash: verdict.manifest_hash,
+    }))
 }
 
 fn verdict_summary(round: &str, verdict: &str) -> String {
@@ -1062,6 +1144,10 @@ pub struct ReviewOutcome {
     pub worktree: PathBuf,
     pub manifest_hash: String,
     pub revision: u64,
+    /// The earlier candidate C and verdict commit V a repair supersedes, for
+    /// the by-hand start line. `None` on a first review.
+    pub earlier_candidate: Option<String>,
+    pub earlier_verdict: Option<String>,
 }
 
 /// Composes the review brief from pinned artifacts, commits it as `B`,
@@ -1121,22 +1207,36 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let brief_path = review_brief_path(round);
 
     let git = Git::new(ctx.runner, &record.repo);
-    let (b, review_branch, worktree) = {
+    let (b, review_branch, worktree, repair) = {
         let _repo = repo_lock(&git)?;
         let head = git
             .branch_head(&record.branch)?
             .with_context(|| format!("branch_missing: `{}`", record.branch))?;
-        let b = commit_files_on_branch(
-            &git,
-            &record.branch,
-            &[(brief_path.as_str(), brief.as_str())],
-            &format!(
-                "review({round}): brief for revision {}",
-                record.manifest.revision
-            ),
-            &head,
-            &project.state_dir().join("tmp"),
-        )?;
+        // A frozen round whose brief is unchanged (the manifest did not move)
+        // is a repair revision: the earlier brief commit B stays, and the next
+        // review branch starts from the current integration head so the
+        // earlier candidate can be merged over it.
+        let frozen = record.expected_head.clone().filter(|b| {
+            record.frozen_revision == Some(record.manifest.revision)
+                && record.manifest_hash.as_deref() == Some(hash.as_str())
+                && git.is_ancestor(b, &head).unwrap_or(false)
+        });
+        let repair = frozen.is_some();
+        let b = match frozen {
+            Some(b) => b,
+            None => commit_files_on_branch(
+                &git,
+                &record.branch,
+                &[(brief_path.as_str(), brief.as_str())],
+                &format!(
+                    "review({round}): brief for revision {}",
+                    record.manifest.revision
+                ),
+                &head,
+                &project.state_dir().join("tmp"),
+            )?,
+        };
+        let base = if repair { head } else { b.clone() };
         let mut review_branch = format!("review/{round}");
         let mut n = 2;
         while git.branch_head(&review_branch)?.is_some() {
@@ -1154,9 +1254,20 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
             &worktree.to_string_lossy(),
             "-b",
             &review_branch,
-            &b,
+            &base,
         ])?;
-        (b, review_branch, worktree)
+        (b, review_branch, worktree, repair)
+    };
+    // A repair re-review keeps the earlier candidate and verdict for the
+    // by-hand start line; the bound reviewer is still on the record here.
+    let earlier = if repair {
+        verdict_commit(&project, &record).ok().and_then(|v| {
+            git.parents(&v)
+                .ok()
+                .and_then(|parents| parents.into_iter().next().map(|c| (c, v)))
+        })
+    } else {
+        None
     };
     {
         let _lock = project.lock()?;
@@ -1185,6 +1296,8 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         worktree,
         manifest_hash: hash,
         revision: record.manifest.revision,
+        earlier_candidate: earlier.as_ref().map(|(c, _)| c.clone()),
+        earlier_verdict: earlier.map(|(_, v)| v),
     })
 }
 
@@ -1522,8 +1635,10 @@ fn fresh_merge(
             record.branch
         );
     }
-    if !git.is_ancestor(&head, &v)? {
-        git.merge_tree(&head, &v)?;
+    if !git.is_ancestor(&head, &v)?
+        && let Err(error) = git.merge_tree(&head, &v)
+    {
+        bail!("{error}; run `round review {round}`, then `round advance`");
     }
     let intent = MergeIntent {
         op: format!("merge-{round}"),
@@ -2826,6 +2941,10 @@ mod tests {
         );
         let e = err(merge(&ctx, "demo", "r1", None));
         assert!(e.starts_with("merge_conflict"), "{e}");
+        assert!(
+            e.ends_with("run `round review r1`, then `round advance`"),
+            "{e}"
+        );
         assert_eq!(main_head(&fx), late, "nothing moved on a conflict");
         assert!(read_merge(&fx.project, "r1").unwrap().is_none());
 
@@ -3216,5 +3335,178 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A frozen round whose brief is unchanged is repaired: `round review`
+    /// reuses B and opens the next review branch from the moved integration
+    /// head; the reviewer task names the earlier candidate C and verdict V.
+    #[test]
+    fn repair_review_reuses_b_and_names_the_earlier_candidate() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let lanes = vec![fx.lane(1), fx.lane(2)];
+        for (id, sha) in &lanes {
+            admit(&ctx, "demo", "r1", id).unwrap();
+            fx.seal_done(id, 1, 1, sha, &format!("# report {id}\n"));
+        }
+        // The harness starts the reviewer on its own thread branch.
+        advance(&ctx, "demo").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        let b = record.expected_head.clone().unwrap();
+        let reviewer = record.reviewer.clone().unwrap();
+        let started = thread::load(&fx.project, &reviewer).unwrap();
+        // The reviewer merges the lanes, fixes and seals the verdict.
+        let wt = PathBuf::from(&started.worktree_path);
+        let mut args = vec!["merge", "-q", "--no-edit"];
+        args.extend(lanes.iter().map(|(_, s)| s.as_str()));
+        git(&wt, &args);
+        let c = git(&wt, &["rev-parse", "HEAD"]);
+        let v = commit_file(
+            &wt,
+            &verdict_path("r1"),
+            &front("MERGE", "r1")(&c, &record),
+            "verdict r1",
+        );
+        fx.seal_done(&reviewer, 1, 1, &v, "# verdict report\n");
+
+        // Another round lands first, moving the integration head.
+        let late = commit_file(&fx.repo, "late.txt", "x\n", "later round");
+        assert_ne!(late, b);
+
+        let outcome = review(&ctx, "demo", "r1").unwrap();
+        assert_eq!(outcome.brief_commit, b, "B stays the existing brief commit");
+        assert_eq!(outcome.review_branch, "review/r1-2");
+        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
+        let wt = fx.repo.join(".worktrees/review-r1-2");
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), late);
+
+        // `advance` starts a reviewer for the branch already on the record.
+        advance(&ctx, "demo").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        let repair = record
+            .reviewer
+            .clone()
+            .expect("the repair reviewer is bound");
+        let task = std::fs::read_to_string(thread::task_path(&fx.project, &repair)).unwrap();
+        assert!(task.contains("Repair review"), "{task}");
+        assert!(task.contains(&c), "{task}");
+        assert!(task.contains(&v), "{task}");
+        assert!(task.contains("tasks/reviews/code-r1.md"), "{task}");
+    }
+
+    /// A resolved or gone reviewer is replaced; a live bound reviewer keeps
+    /// the same refusal.
+    #[test]
+    fn bind_reviewer_replaces_a_gone_reviewer_but_not_a_live_one() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        let old = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let new = fx.thread("Second reviewer");
+        // No session: the bound reviewer is not reported gone.
+        std::fs::remove_file(fx.world.home.path().join("a.sock")).unwrap();
+        let e = err(bind_reviewer(&ctx, "demo", "r1", &new));
+        assert!(e.starts_with("reviewer_already_bound"), "{e}");
+        // Resolved: the new reviewer binds.
+        thread::update(&fx.project, &old, |t| t.status = thread::Status::Resolved).unwrap();
+        bind_reviewer(&ctx, "demo", "r1", &new).unwrap();
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(new.as_str())
+        );
+    }
+
+    /// A lane pinned in an open round, and the round's reviewer, are closed
+    /// after the merge; `--force` overrides and says so once.
+    #[test]
+    fn resolve_refuses_a_lane_pinned_in_an_open_round() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        let (id, _) = &lanes[0];
+        let e = err(crate::threads::resolve(
+            &ctx,
+            "demo",
+            id,
+            &crate::threads::ResolveArgs {
+                skip_copy: true,
+                keep_pane: true,
+                ..Default::default()
+            },
+        ));
+        assert!(e.starts_with("round_unmerged") && e.contains("r1"), "{e}");
+        crate::threads::resolve(
+            &ctx,
+            "demo",
+            id,
+            &crate::threads::ResolveArgs {
+                skip_copy: true,
+                keep_pane: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let says = crate::talk::read(&fx.project)
+            .lines
+            .iter()
+            .filter(|line| matches!(&line.entry, crate::talk::Entry::Say { .. }))
+            .count();
+        assert_eq!(says, 1, "one say line on the override");
+        assert_eq!(
+            thread::load(&fx.project, id).unwrap().status,
+            thread::Status::Resolved
+        );
+    }
+
+    /// A done lane keeps its pane but holds no slot; a resolved lane holds
+    /// none either.
+    #[test]
+    fn open_lane_count_skips_a_done_lane() {
+        let fx = fixture();
+        let lanes = [fx.lane(1), fx.lane(2)];
+        assert_eq!(crate::threads::open_lane_count(&fx.project), 2);
+        thread::update(&fx.project, &lanes[0].0, |t| t.last_state = "done".into()).unwrap();
+        assert_eq!(crate::threads::open_lane_count(&fx.project), 1);
+        thread::update(&fx.project, &lanes[1].0, |t| {
+            t.status = thread::Status::Resolved
+        })
+        .unwrap();
+        assert_eq!(crate::threads::open_lane_count(&fx.project), 0);
+    }
+
+    /// A pi lane reports `blocked` for its own error; a prompt reaches it and
+    /// clears the recorded error. A gone pane is still refused.
+    #[test]
+    fn prompt_reaches_a_blocked_pi_lane_and_clears_its_error() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (id, _) = fx.lane(1);
+        thread::update(&fx.project, &id, |t| {
+            t.agent = "pi".into();
+            t.workspace_id = "w1".into();
+            t.tab_id = "w1:t2".into();
+            t.cwd = "/wt".into();
+            t.error = "the model errored".into();
+        })
+        .unwrap();
+        let pane = thread::load(&fx.project, &id).unwrap().pane_id;
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json("w1", "w1:t2", &pane, "/wt", "", "blocked")
+        );
+        fx.world
+            .runner
+            .on("agent prompt", crate::runner::fake::ok(r#"{"result":{}}"#));
+        let state = crate::threads::prompt(&ctx, "demo", &id, "carry on").unwrap();
+        assert_eq!(state, "blocked");
+        assert!(thread::load(&fx.project, &id).unwrap().error.is_empty());
+        // A gone pane is still refused.
+        *fx.world.agents.borrow_mut() = "[]".into();
+        *fx.world.panes.borrow_mut() = "[]".into();
+        assert!(crate::threads::prompt(&ctx, "demo", &id, "again").is_err());
     }
 }

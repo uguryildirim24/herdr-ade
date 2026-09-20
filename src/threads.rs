@@ -144,6 +144,17 @@ pub fn check_birth_plain(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The open lanes that hold a slot: open or starting, and not finished. A
+/// lane whose last agent state is `done` keeps its pane but holds no slot.
+pub fn open_lane_count(project: &Project) -> usize {
+    thread::list(project)
+        .iter()
+        .filter(|t| {
+            (t.status == Status::Open || t.status == Status::Starting) && t.last_state != "done"
+        })
+        .count()
+}
+
 /// Creates the worktree or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
@@ -235,10 +246,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         listed,
     )?;
     let machine = placement.machine.clone();
-    let open_count = thread::list(&project)
-        .iter()
-        .filter(|t| t.status == Status::Open || t.status == Status::Starting)
-        .count();
+    let open_count = open_lane_count(&project);
     if open_count as u32 >= settings.max_parallel_threads {
         eprintln!(
             "warning: {open_count} threads are already open; max_parallel_threads is {}",
@@ -1219,6 +1227,11 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
         .on_machine(record.machine_route())
         .agent_prompt(&record.pane_id, text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // A pi lane reports `blocked` for its own error; a prompt resumes it, so
+    // the recorded error is cleared.
+    if record.agent == "pi" && state == "blocked" {
+        thread::update(&project, id, |t| t.error.clear())?;
+    }
     Ok(state)
 }
 
@@ -1229,7 +1242,7 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread restart`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" => bail!(
+        "blocked" if record.agent != "pi" => bail!(
             "agent_blocked: {} is waiting on the user in its pane ({})",
             record.id,
             record.pane_id
@@ -1260,6 +1273,8 @@ pub struct ResolveArgs {
     pub discard_uncopied: bool,
     /// Leave the lane's pane and tab open (the idle agent still runs).
     pub keep_pane: bool,
+    /// Close a lane or reviewer that an open, unmerged round still holds.
+    pub force: bool,
 }
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()> {
@@ -1286,6 +1301,21 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         bail!(
             "--remove-worktree is only for worktree threads; {id} is a {:?} thread",
             record.kind
+        );
+    }
+    // A lane pinned in a round, or a round's reviewer, is closed after the
+    // round merges, never before. `--force` overrides and says so once.
+    if let Some(round) = crate::round::open_round_pinning(&project, id)? {
+        if !args.force {
+            bail!(
+                "round_unmerged: `{id}` is pinned in round `{round}`, which has no merge record; run `round merge {round}` first, or pass --force"
+            );
+        }
+        let _ = crate::ask::say(
+            ctx,
+            slug,
+            "the round has not merged, so this lane was closed anyway",
+            None,
         );
     }
 
