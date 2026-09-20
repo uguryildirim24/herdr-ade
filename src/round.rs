@@ -24,6 +24,17 @@ use crate::thread::{self, sha256_hex};
 
 pub use repo::Git;
 
+/// How many reviewer starts `advance` tries and fails for one round before it
+/// stops and leaves the failure for a human. A refused start and a reviewer
+/// whose agent never came up both count (E3/D1).
+pub const MAX_REVIEWER_START_FAILURES: u32 = 3;
+
+/// A bound reviewer with no launch attempt is a failed start once this many
+/// seconds have passed since its record was written. The ticker starts at
+/// most one thread per project per 15s pass, so a reviewer may wait behind a
+/// few lanes; this covers that without mistaking a slow start for a dead one.
+const REVIEWER_LAUNCH_GRACE_SECS: i64 = 120;
+
 /// Git reads for rounds, dialogue and checkpoint. Every lock and ref write
 /// goes through A1's `crate::git`: one repository lock, one D9 commit.
 pub mod repo {
@@ -784,6 +795,7 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
 }
 
 /// Records which thread reviews the round; its sealed `done` sha is `V`.
+/// Manual repair only: `advance` is the path that starts and binds a reviewer.
 pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
     thread::load(&project, thread_id)?;
@@ -829,6 +841,11 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 /// `say` line) but never merged; any other verdict gets one inbox item. A
 /// reviewer thread that is gone becomes one inbox item. This is what the
 /// `pane.agent_status_changed` hook and the ticker call.
+///
+/// A start that does not take is loud and is retried: `advance` says so on
+/// standard error with the reason, un-binds the dead reviewer and tries again
+/// on the next pass, up to `MAX_REVIEWER_START_FAILURES`. A round is never
+/// left with a bound reviewer whose agent never came up (E3/D1).
 pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     // One advance at a time, across processes (the hook and the ticker).
@@ -849,79 +866,82 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             }
         }
         let record = load(&project, &round)?;
-        let Some(reviewer) = record.reviewer.clone() else {
-            // The review branch for the current revision: one `round review`
-            // just made, or the one an earlier pass left behind. A round
-            // whose members are all pinned and that has no current review
-            // branch runs `round review` first; a frozen round whose current
-            // review revision already has its branch starts the reviewer
-            // here, exactly like a fresh round. This covers the state `round
-            // review` leaves after a REJECT and the state a failed start
-            // leaves, whatever `announced` says. Never start from a branch
-            // made stale by a changed or missing pin.
-            let ready = !record.manifest.members.is_empty()
-                && record.manifest.members.iter().all(|m| m.pin.is_some());
-            if !ready {
+        if let Some(reviewer) = record.reviewer.clone() {
+            // One herdr read for this reviewer's state. A verdict wins over a
+            // dead reviewer: a reviewer that sealed its verdict did its job.
+            let state = reviewer_state(ctx, &project, &reviewer);
+            let git = Git::new(ctx.runner, &record.repo);
+            if let Some(verdict) = read_verdict(&project, &record, &git) {
+                announce_once(
+                    ctx,
+                    &project,
+                    &round,
+                    &format!("verdict:{verdict}"),
+                    &verdict_summary(&round, &verdict),
+                    (verdict == "MERGE").then(|| verdict_say(&record)),
+                )?;
                 continue;
             }
-            // Every pin already landed: there is nothing new to review, so
-            // never start a reviewer for this round (t-0070).
-            if members_all_landed(ctx, &record)? {
-                continue;
-            }
-            let current_hash = manifest_hash(&record);
-            let review_is_current = record.frozen_revision == Some(record.manifest.revision)
-                && record.manifest_hash.as_deref() == Some(current_hash.as_str());
-            let review_branch = match (record.review_branch.clone(), review_is_current) {
-                (Some(branch), true) => branch,
-                _ => review(ctx, slug, &round)?.review_branch,
-            };
-            match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
-                Ok(thread) => {
-                    bind_reviewer(ctx, slug, &round, &thread.id)?;
+            match state {
+                // A bound reviewer whose agent never came up is a failed
+                // start, not a pending one: report it, drop the dead binding
+                // and let the next pass start a fresh reviewer.
+                ReviewerState::Unstarted(reason) => {
+                    reviewer_start_failed(ctx, &project, &round, &reason, Some(&reviewer))?;
                 }
-                Err(error) => {
-                    // A full thread cap or a machine that is not ready is
-                    // not final: the next pass retries. The announcement is
-                    // written once per state.
+                ReviewerState::Gone => {
+                    let base = record.review_branch.as_deref().unwrap_or("review/<round>");
                     announce_once(
                         ctx,
                         &project,
                         &round,
-                        "reviewer-start-failed",
+                        &format!("reviewer-gone:{reviewer}"),
                         &format!(
-                            "Round {round}: the reviewer thread did not start ({error:#}); it is retried on the next pass, or start it by hand from `{review_branch}`"
+                            "Round {round}: the reviewer thread {reviewer} is gone; start a new reviewer by hand with `{prefix} thread start {slug} --role reviewer --base {base}`, then `{prefix} round reviewer {slug} {round} <thread>`"
                         ),
                         None,
                     )?;
                 }
+                ReviewerState::Alive => {}
             }
             continue;
-        };
-        let git = Git::new(ctx.runner, &record.repo);
-        if let Some(verdict) = read_verdict(&project, &record, &git) {
-            announce_once(
-                ctx,
-                &project,
-                &round,
-                &format!("verdict:{verdict}"),
-                &verdict_summary(&round, &verdict),
-                (verdict == "MERGE").then(|| verdict_say(&record)),
-            )?;
+        }
+        // No reviewer is bound. This is the one path that starts a review;
+        // `round review` and `round reviewer` are manual repair only. A round
+        // whose members are all pinned and that has no current review branch
+        // runs `round review` first; a frozen round whose current review
+        // revision already has its branch starts the reviewer here, exactly
+        // like a fresh round. This covers the state `round review` leaves
+        // after a REJECT and the state a failed start leaves. Never start
+        // from a branch made stale by a changed or missing pin.
+        if record.reviewer_start_failures >= MAX_REVIEWER_START_FAILURES {
+            reviewer_start_exhausted(ctx, &project, &round, "the previous starts failed")?;
             continue;
         }
-        if reviewer_gone(ctx, &project, &reviewer) {
-            let base = record.review_branch.as_deref().unwrap_or("review/<round>");
-            announce_once(
-                ctx,
-                &project,
-                &round,
-                &format!("reviewer-gone:{reviewer}"),
-                &format!(
-                    "Round {round}: the reviewer thread {reviewer} is gone; start a new reviewer by hand with `{prefix} thread start {slug} --role reviewer --base {base}`, then `{prefix} round reviewer {slug} {round} <thread>`"
-                ),
-                None,
-            )?;
+        let ready = !record.manifest.members.is_empty()
+            && record.manifest.members.iter().all(|m| m.pin.is_some());
+        if !ready {
+            continue;
+        }
+        // Every pin already landed: there is nothing new to review, so never
+        // start a reviewer for this round (t-0070).
+        if members_all_landed(ctx, &record)? {
+            continue;
+        }
+        let current_hash = manifest_hash(&record);
+        let review_is_current = record.frozen_revision == Some(record.manifest.revision)
+            && record.manifest_hash.as_deref() == Some(current_hash.as_str());
+        let review_branch = match (record.review_branch.clone(), review_is_current) {
+            (Some(branch), true) => branch,
+            _ => review(ctx, slug, &round)?.review_branch,
+        };
+        match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
+            Ok(thread) => {
+                bind_reviewer(ctx, slug, &round, &thread.id)?;
+            }
+            Err(error) => {
+                reviewer_start_failed(ctx, &project, &round, &format!("{error:#}"), None)?;
+            }
         }
     }
     Ok(())
@@ -1174,17 +1194,119 @@ fn verdict_say(record: &RoundRecord) -> String {
     )
 }
 
-/// True when the reviewer thread is gone: its record is missing, it is
-/// resolved, or its pane closed after it was launched.
-fn reviewer_gone(ctx: &Ctx, project: &Project, reviewer: &str) -> bool {
+/// How a bound reviewer looks right now: alive, gone, or a start that never
+/// took (E3/D1).
+enum ReviewerState {
+    Alive,
+    Gone,
+    /// The record is there but no agent ever launched for it, or its last
+    /// launch failed. The reason is said on standard error.
+    Unstarted(String),
+}
+
+fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState {
     let rows = crate::threads::rows(ctx, project);
-    match rows.iter().find(|row| row.thread.id == reviewer) {
-        None => true,
-        Some(row) => {
-            row.group == thread::Group::Resolved
-                || (!row.thread.prompt_pending && row.note == "pane closed")
-        }
+    let Some(row) = rows.iter().find(|row| row.thread.id == reviewer) else {
+        return ReviewerState::Gone;
+    };
+    if row.group == thread::Group::Resolved
+        || (!row.thread.prompt_pending && row.note == "pane closed")
+    {
+        return ReviewerState::Gone;
     }
+    let record = &row.thread;
+    if record.status == thread::Status::Failed {
+        return ReviewerState::Unstarted(if record.error.is_empty() {
+            "the reviewer thread failed before its agent started".to_string()
+        } else {
+            record.error.clone()
+        });
+    }
+    // The ticker launches a new thread on its next pass, so a fresh reviewer
+    // may legitimately have `launch_attempts == 0` for a few seconds. Zero
+    // attempts after the grace means the start did not take.
+    if record.prompt_pending
+        && record.launch_attempts == 0
+        && thread::seconds_since(&record.created, jiff::Timestamp::now())
+            >= REVIEWER_LAUNCH_GRACE_SECS
+    {
+        return ReviewerState::Unstarted("no agent appeared in the reviewer's pane".to_string());
+    }
+    ReviewerState::Alive
+}
+
+/// The one place a reviewer start that did not take is recorded (E3/D1):
+/// `advance` tried to start the reviewer and got an error, or found a bound
+/// reviewer whose agent never came up. It says so on standard error with the
+/// reason, un-binds and fails the dead thread so the next pass can start a
+/// fresh reviewer, and counts the failure against the retry bound.
+fn reviewer_start_failed(
+    ctx: &Ctx,
+    project: &Project,
+    round: &str,
+    reason: &str,
+    dead_reviewer: Option<&str>,
+) -> Result<u32> {
+    let failures = {
+        let _lock = project.lock()?;
+        let mut record = load(project, round)?;
+        record.reviewer_start_failures += 1;
+        if let Some(dead) = dead_reviewer
+            && record.reviewer.as_deref() == Some(dead)
+        {
+            record.reviewer = None;
+        }
+        save(project, &record)?;
+        record.reviewer_start_failures
+    };
+    if let Some(dead) = dead_reviewer {
+        let _ = thread::update(project, dead, |t| {
+            t.status = thread::Status::Failed;
+            t.prompt_pending = false;
+            t.error = reason.to_string();
+        });
+    }
+    // ---- A3 failure ledger seam -----------------------------------------
+    // This is the single place the harness notices a review that did not
+    // start. Record it here when `src/ledger.rs` lands:
+    //     crate::ledger::record(project, "reviewer-start", round, reason);
+    // Until then the report is the announcement below and this `eprintln`.
+    // ---------------------------------------------------------------------
+    eprintln!("round {round}: the reviewer did not start ({reason})");
+    announce_once(
+        ctx,
+        project,
+        round,
+        "reviewer-start-failed",
+        &format!(
+            "Round {round}: the reviewer did not start ({reason}); it is retried on the next pass, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
+        ),
+        None,
+    )?;
+    Ok(failures)
+}
+
+/// The retry bound was reached: say so once and leave the round for a human.
+fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &str) -> Result<()> {
+    eprintln!(
+        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand"
+    );
+    announce_once(
+        ctx,
+        project,
+        round,
+        "reviewer-start-exhausted",
+        &format!(
+            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer`, or `thread restart`"
+        ),
+        None,
+    )
+}
+
+/// True when the bound reviewer blocks nothing: its record is missing, it is
+/// resolved, its pane closed after it launched, or its start never took.
+fn reviewer_gone(ctx: &Ctx, project: &Project, reviewer: &str) -> bool {
+    !matches!(reviewer_state(ctx, project, reviewer), ReviewerState::Alive)
 }
 
 /// Writes the one inbox item (and, for a merge verdict, the one `say` line)
@@ -1257,7 +1379,8 @@ pub struct ReviewOutcome {
 }
 
 /// Composes the review brief from pinned artifacts, commits it as `B`,
-/// freezes the manifest and creates `review/r<n>` from `B` (D6).
+/// freezes the manifest and creates `review/r<n>` from `B` (D6). Manual repair
+/// only: `advance` runs this on its own when a round is ready for review.
 pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = {
@@ -3466,6 +3589,133 @@ mod tests {
 
         let record = load(&fx.project, "r1").unwrap();
         assert!(record.reviewer.is_some(), "the start is retried");
+    }
+
+    /// A refused start is loud, counted, and retried on the next pass. The
+    /// round is never left with a bound reviewer that never came up.
+    #[test]
+    fn advance_reports_and_retries_a_refused_start() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (_, _) = reviewed(&fx);
+        // A paused project refuses `threads::start`, the easiest refused start.
+        fx.project
+            .set_status(crate::project::Status::Paused)
+            .unwrap();
+
+        advance(&ctx, "demo").unwrap();
+        let refused = load(&fx.project, "r1").unwrap();
+        assert_eq!(refused.reviewer_start_failures, 1, "the refusal is counted");
+        assert!(refused.reviewer.is_none(), "no reviewer is bound");
+        let reports = crate::inbox::unhandled(&fx.project)
+            .into_iter()
+            .filter(|item| item.kind == "round-advance" && item.summary.contains("did not start"))
+            .count();
+        assert_eq!(reports, 1, "the refused start is said once");
+
+        // The next pass tries again, and a live project starts the reviewer.
+        fx.project
+            .set_status(crate::project::Status::Active)
+            .unwrap();
+        advance(&ctx, "demo").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert!(record.reviewer.is_some(), "the start is retried");
+        assert_eq!(
+            record.reviewer_start_failures, 1,
+            "a retry is not a failure"
+        );
+    }
+
+    /// A bound reviewer the ticker never launched is a failed start: it is
+    /// reported, un-bound and failed, and the next pass starts a fresh one.
+    #[test]
+    fn advance_reports_and_retries_a_reviewer_that_never_launched() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (_, _) = reviewed(&fx);
+        advance(&ctx, "demo").unwrap();
+        let first = load(&fx.project, "r1").unwrap().reviewer.clone().unwrap();
+
+        // The ticker never even tried to launch it, and the record is past
+        // the grace.
+        thread::update(&fx.project, &first, |t| {
+            t.launch_attempts = 0;
+            t.prompt_pending = true;
+            t.created = "2026-09-18T00:00:00Z".into();
+        })
+        .unwrap();
+
+        advance(&ctx, "demo").unwrap();
+        let dead = load(&fx.project, "r1").unwrap();
+        assert_eq!(dead.reviewer_start_failures, 1, "the dead start is counted");
+        assert!(dead.reviewer.is_none(), "the dead reviewer is un-bound");
+        let record = thread::load(&fx.project, &first).unwrap();
+        assert_eq!(
+            record.status,
+            thread::Status::Failed,
+            "the dead thread is failed"
+        );
+        let reports = crate::inbox::unhandled(&fx.project)
+            .into_iter()
+            .filter(|item| item.kind == "round-advance" && item.summary.contains("did not start"))
+            .count();
+        assert_eq!(reports, 1, "the dead start is said once");
+
+        // The next pass starts a different, fresh reviewer.
+        advance(&ctx, "demo").unwrap();
+        let retried = load(&fx.project, "r1").unwrap();
+        let second = retried.reviewer.clone().expect("a fresh reviewer is bound");
+        assert_ne!(second, first, "a new reviewer replaces the dead one");
+    }
+
+    /// Once the retry bound is reached, `advance` stops starting reviewers and
+    /// says the round is left for a human.
+    #[test]
+    fn advance_stops_at_the_reviewer_retry_bound() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (_, _) = reviewed(&fx);
+        advance(&ctx, "demo").unwrap();
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.clone().unwrap();
+        {
+            let mut record = load(&fx.project, "r1").unwrap();
+            record.reviewer_start_failures = MAX_REVIEWER_START_FAILURES - 1;
+            save(&fx.project, &record).unwrap();
+        }
+        thread::update(&fx.project, &reviewer, |t| {
+            t.launch_attempts = 0;
+            t.prompt_pending = true;
+            t.created = "2026-09-18T00:00:00Z".into();
+        })
+        .unwrap();
+
+        // The last allowed failure is recorded and the dead reviewer is gone.
+        advance(&ctx, "demo").unwrap();
+        let at_bound = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            at_bound.reviewer_start_failures, MAX_REVIEWER_START_FAILURES,
+            "the failure reaches the bound"
+        );
+        assert!(at_bound.reviewer.is_none());
+        let reviewers = thread::list(&fx.project)
+            .into_iter()
+            .filter(|t| t.role == "reviewer")
+            .count();
+
+        // No pass starts another reviewer; the round is left for a human.
+        advance(&ctx, "demo").unwrap();
+        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
+        assert_eq!(
+            thread::list(&fx.project)
+                .into_iter()
+                .filter(|t| t.role == "reviewer")
+                .count(),
+            reviewers,
+            "no reviewer is started past the bound"
+        );
     }
 
     /// A failed start must not let a reviewer begin from the old branch if a

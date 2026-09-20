@@ -170,8 +170,9 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         bail!("the task is empty");
     }
     let (settings, _) = project.read_project_md()?;
-    // Without a running ticker nothing launches.
-    ticker::start(ctx)?;
+    // Without a running ticker nothing launches. `ensure` never waits for a
+    // running ticker, so a start cannot deadlock against `advance`'s lock.
+    ticker::ensure(ctx)?;
     let view = require_session(ctx, &project)?;
 
     let listed = args
