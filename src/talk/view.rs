@@ -189,6 +189,17 @@ impl Conversation {
                         });
                         continue;
                     };
+                    if let Some(withdrawal) = ask::withdrawal_of(project, id, *revision) {
+                        result.items.push(Item {
+                            at: withdrawal.at,
+                            body: Body::Notice(format!(
+                                "{id} withdrawn: {} — {}",
+                                a.question, withdrawal.reason
+                            )),
+                            delivery: None,
+                        });
+                        continue;
+                    }
                     let state = if latest.get(id).is_some_and(|r| r > revision) {
                         CardState::AskedAgain
                     } else if let Some(answer) = ask::answer_of(project, id, *revision) {
@@ -374,7 +385,10 @@ mod tests {
             &fx.world.ctx(),
             "demo",
             ask::NewAsk {
-                question: "May I spend five dollars on this check?".into(),
+                question: format!(
+                    "May I spend {} dollars on this check?",
+                    ask::open_asks(&fx.project).len() + 5
+                ),
                 choices: vec![
                     "Keep it running.".into(),
                     "Stop it now.".into(),

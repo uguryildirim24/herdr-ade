@@ -15,6 +15,125 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("USER", "rolf")
+            .args(["--root", root.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["new", "demo"]).status.success());
+    assert!(
+        run(&[
+            "decide",
+            "I kept the words short.",
+            "--class",
+            "routine",
+            "--project",
+            "demo"
+        ])
+        .status
+        .success()
+    );
+    let overturned = run(&[
+        "decide",
+        "overturn",
+        "d-0001",
+        "I want more detail.",
+        "--project",
+        "demo",
+    ]);
+    assert!(
+        overturned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overturned.stderr)
+    );
+    assert!(String::from_utf8_lossy(&overturned.stdout).contains("overturned by rolf"));
+    assert!(
+        !run(&[
+            "decide",
+            "overturn",
+            "d-9999",
+            "No thanks.",
+            "--project",
+            "demo"
+        ])
+        .status
+        .success()
+    );
+    let ask_args = [
+        "ask",
+        "May I spend\n five dollars on this check?",
+        "--choice",
+        "Keep it running.",
+        "--choice",
+        "Stop it now.",
+        "--project",
+        "demo",
+    ];
+    let asked = run(&ask_args);
+    assert!(
+        asked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    let text = String::from_utf8(asked.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.starts_with("a-1 revision 1:"));
+    assert!(text.contains("1. Keep it running."));
+    let duplicate = run(&ask_args);
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("ask_duplicate: `a-1`"));
+    let withdrawn = run(&[
+        "ask",
+        "withdraw",
+        "a-1",
+        "No longer needed.",
+        "--project",
+        "demo",
+    ]);
+    assert!(
+        withdrawn.status.success(),
+        "{}",
+        String::from_utf8_lossy(&withdrawn.stderr)
+    );
+    assert!(root.join("demo/asks/a-1/r1.toml").is_file());
+    let record = std::fs::read_to_string(root.join("demo/asks/a-1/r1.withdrawn.toml")).unwrap();
+    assert!(record.contains("by = \"rolf\""));
+    assert!(run(&ask_args).status.success());
+    assert!(
+        run(&[
+            "ask",
+            "answer",
+            "a-2",
+            "--revision",
+            "1",
+            "1",
+            "--project",
+            "demo"
+        ])
+        .status
+        .success()
+    );
+    let refused = run(&[
+        "ask",
+        "withdraw",
+        "a-2",
+        "No longer needed.",
+        "--project",
+        "demo",
+    ]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("answered ask cannot be withdrawn"));
+}
+
+#[test]
 fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("my root");
