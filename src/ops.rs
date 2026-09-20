@@ -158,14 +158,20 @@ pub fn check_published_ref(
         bail!("published_ref_check_failed: {}", out.error_text());
     }
     let found = out.stdout.split_whitespace().next().unwrap_or("");
+    let publish = format!(
+        "git -C {} push {} {}",
+        crate::remote::quote(&worktree.to_string_lossy()),
+        crate::remote::quote(publish_url),
+        crate::remote::quote(&format!("{sha}:refs/heads/{branch}")),
+    );
     if found.is_empty() {
         return Err(crate::refusal::error(format!(
-            "lane_ref_not_published: `{branch}` is not on {publish_url}"
+            "lane_ref_not_published: `{branch}` is not on {publish_url}; run `{publish}`, then retry `ha done`"
         )));
     }
     if found != sha {
         return Err(crate::refusal::error(format!(
-            "published_ref_mismatch: `{branch}` is {found} on {publish_url}, not {sha}"
+            "published_ref_mismatch: `{branch}` is {found} on {publish_url}, not {sha}; run `{publish}`, then retry `ha done`"
         )));
     }
     Ok(())
@@ -542,6 +548,49 @@ mod tests {
             coordinator_attempt: 1,
         };
         (root, project, runner, recipient)
+    }
+
+    #[test]
+    fn unpublished_ref_refusals_name_the_exact_safe_repair_command() {
+        let worktree = Path::new("/box/reviewer's worktree");
+        let branch = "hp/demo/reviewer";
+        let url = "/remotes/publish repo.git";
+        let repair = "git -C '/box/reviewer'\\''s worktree' push '/remotes/publish repo.git' new:refs/heads/hp/demo/reviewer";
+        for (remote_output, reason) in [
+            (
+                "",
+                "lane_ref_not_published: `hp/demo/reviewer` is not on /remotes/publish repo.git",
+            ),
+            (
+                "old\trefs/heads/hp/demo/reviewer\n",
+                "published_ref_mismatch: `hp/demo/reviewer` is old on /remotes/publish repo.git, not new",
+            ),
+        ] {
+            let runner = FakeRunner::new();
+            runner.on("ls-remote", ok(remote_output));
+            let error = check_published_ref(&runner, worktree, branch, url, "new")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("{reason}; run `{repair}`, then retry `ha done`")
+            );
+            let calls = runner.calls.borrow();
+            assert_eq!(calls.len(), 1, "a refusal must never push implicitly");
+            assert_eq!(
+                calls[0].args,
+                [
+                    "-C",
+                    "/box/reviewer's worktree",
+                    "ls-remote",
+                    url,
+                    "refs/heads/hp/demo/reviewer"
+                ]
+            );
+        }
+        let runner = FakeRunner::new();
+        runner.on("ls-remote", ok("new\trefs/heads/hp/demo/reviewer\n"));
+        check_published_ref(&runner, worktree, branch, url, "new").unwrap();
     }
 
     #[test]

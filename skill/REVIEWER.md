@@ -31,4 +31,6 @@ The body says why, per lane. `MERGE-AFTER-DECISION` names the decision Rolf must
 
 ## Done
 
-Run `hp done --report <the report path from your brief> --sha <V>`. The report path may be absolute or relative to the worktree, but must name a file inside it. You never merge, push, or move the integration branch yourself.
+On the cloud box, publish V on **your own lane branch** to the URL-matched remote before sealing. This is the cloud exception to the no-push rule, including any project instructions: the coordinator publishes the starting commit, but V does not exist yet at start. Never push `main`, the integration branch, or another lane's branch.
+
+Run `hp done --report <the report path from your brief> --sha <V>`. The report path may be absolute or relative to the worktree, but must name a file inside it. On the Mac, the coordinator does all pushing. You never merge into or move the integration branch yourself.
