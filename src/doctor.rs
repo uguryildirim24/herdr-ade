@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::herdr::{self, Herdr};
 use crate::paths::{self, Ctx, Env, SessionFlags};
@@ -12,6 +12,119 @@ use crate::project;
 use crate::runner::{Cmd, Runner};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One agent runtime's existing doctor probe. Recipes identify the runtime by
+/// `kind`; placement never carries a separate allowlist of recipe ids.
+#[derive(Debug, Clone, Copy)]
+struct NativeProbe {
+    kind: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+const NATIVE_PROBES: &[NativeProbe] = &[
+    NativeProbe {
+        kind: "claude",
+        program: "claude",
+        args: &["auth", "status"],
+    },
+    NativeProbe {
+        kind: "codex",
+        program: "codex",
+        args: &["login", "status"],
+    },
+    NativeProbe {
+        kind: "agy",
+        program: "agy",
+        args: &["models"],
+    },
+];
+
+fn native_probe(kind: &str) -> Option<NativeProbe> {
+    NATIVE_PROBES
+        .iter()
+        .copied()
+        .find(|probe| probe.kind == kind)
+}
+
+fn probe_error(kind: &str, output: &crate::runner::Output) -> String {
+    let detail = output.error_text();
+    if detail.is_empty() {
+        format!("{kind} readiness check exited {:?}", output.code)
+    } else {
+        format!("{kind} readiness check failed: {detail}")
+    }
+}
+
+/// Whether the chosen recipe can run on this Mac. This is the same provider
+/// or login probe the doctor owns, not a placement-specific capability table.
+pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
+    if launch.kind == "pi" {
+        return crate::threads::pi_ready(ctx, launch);
+    }
+    let probe = native_probe(&launch.kind).with_context(|| {
+        format!(
+            "no doctor readiness probe exists for agent kind `{}`",
+            launch.kind
+        )
+    })?;
+    let output = ctx
+        .runner
+        .run(
+            &Cmd::new(
+                probe.program,
+                Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
+            )
+            .args(probe.args.iter().copied()),
+        )
+        .with_context(|| format!("{} is not installed", probe.program))?;
+    if !output.success() {
+        anyhow::bail!(probe_error(probe.kind, &output));
+    }
+    Ok(())
+}
+
+/// Whether the chosen recipe can run on a saved box. SSH injects the exact
+/// lane PATH, so `command -v` and the login command measure the environment a
+/// fresh lane receives. Pi keeps using `herdr-pi check`, as the doctor does.
+pub(crate) fn recipe_ready_on_box(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
+    if launch.kind == "pi" {
+        let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+            .context("pi_args_forbidden: a pi launch names no --provider")?;
+        return crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
+            .with_context(|| format!("provider {provider}"));
+    }
+    let probe = native_probe(&launch.kind).with_context(|| {
+        format!(
+            "no doctor readiness probe exists for agent kind `{}`",
+            launch.kind
+        )
+    })?;
+    let command = std::iter::once(probe.program)
+        .chain(probe.args.iter().copied())
+        .map(crate::remote::quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "command -v {program} >/dev/null 2>&1 || {{ printf '%s\\n' '{program} is missing from the lane PATH' >&2; exit 127; }}\n{command}",
+        program = crate::remote::quote(probe.program),
+    );
+    let output = crate::remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
+    )?;
+    if !output.success() {
+        anyhow::bail!(probe_error(probe.kind, &output));
+    }
+    Ok(())
+}
 
 /// Prints the report and returns whether every required check passed.
 pub fn run(ctx: &Ctx, session: &SessionFlags) -> Result<bool> {
@@ -438,10 +551,20 @@ fn box_rows(
          printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
          printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
          printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
-         \"$HOME/.local/bin/claude\" auth status >/dev/null 2>&1 && printf 'login_claude\\tok\\n' || printf 'login_claude\\tmissing\\n'\n\
-         \"$HOME/.local/bin/codex\" login status >/dev/null 2>&1 && printf 'login_codex\\tok\\n' || printf 'login_codex\\tmissing\\n'\n\
-         \"$HOME/.local/bin/agy\" models >/dev/null 2>&1 && printf 'login_agy\\tok\\n' || printf 'login_agy\\tmissing\\n'\n",
+",
     );
+    for probe in NATIVE_PROBES {
+        let command = std::iter::once(probe.program)
+            .chain(probe.args.iter().copied())
+            .map(crate::remote::quote)
+            .collect::<Vec<_>>()
+            .join(" ");
+        script.push_str(&format!(
+            "command -v {program} >/dev/null 2>&1 && {command} >/dev/null 2>&1 && printf 'login_{kind}\\tok\\n' || printf 'login_{kind}\\tmissing\\n'\n",
+            program = crate::remote::quote(probe.program),
+            kind = probe.kind,
+        ));
+    }
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
     for provider in crate::pi::recipes::enabled_providers() {
@@ -537,7 +660,8 @@ fn box_rows(
         format!("box {label} gh"),
         format!("gh auth status: {}", fact("gh")),
     ));
-    for kind in ["claude", "codex", "agy"] {
+    for probe in NATIVE_PROBES {
+        let kind = probe.kind;
         let value = fact(&format!("login_{kind}"));
         rows.push((
             env_bool(&value, &["ok"]),
@@ -1017,14 +1141,17 @@ mod tests {
             "{script}"
         );
         assert!(
-            ssh.contains("\"$HOME/.local/bin/claude\" auth status"),
+            ssh.contains("command -v claude") && ssh.contains("claude auth status"),
             "{ssh}"
         );
         assert!(
-            ssh.contains("\"$HOME/.local/bin/codex\" login status"),
+            ssh.contains("command -v codex") && ssh.contains("codex login status"),
             "{ssh}"
         );
-        assert!(ssh.contains("\"$HOME/.local/bin/agy\" models"), "{ssh}");
+        assert!(
+            ssh.contains("command -v agy") && ssh.contains("agy models"),
+            "{ssh}"
+        );
         drop(calls);
 
         let runner = FakeRunner::new();
