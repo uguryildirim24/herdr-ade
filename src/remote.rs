@@ -133,16 +133,32 @@ pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<Stri
     bail!("no_url_remote: {repo} has no remote whose URL is {url}")
 }
 
-#[allow(dead_code)]
-fn same_url(a: &str, b: &str) -> bool {
-    fn norm(url: &str) -> String {
-        url.trim()
-            .trim_end_matches('/')
-            .trim_end_matches(".git")
-            .to_string()
-    }
-    norm(a) == norm(b)
+/// A remote URL reduced to the repository it names: surrounding whitespace,
+/// every trailing `/` and every trailing `.git` removed. `https://…/repo` and
+/// `https://…/repo.git` are the same remote, however it was written down.
+pub fn normalize_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string()
 }
+
+fn same_url(a: &str, b: &str) -> bool {
+    normalize_url(a) == normalize_url(b)
+}
+
+/// The box-side twin of [`normalize_url`], as a shell function the provision
+/// script calls on both the wanted URL and every remote it finds. A test runs
+/// this exact snippet against the Rust function, so the two cannot drift.
+const NORM_URL_SH: &str = "\
+norm() {\n\
+u=$1\n\
+while [ \"${u#[[:space:]]}\" != \"$u\" ]; do u=${u#[[:space:]]}; done\n\
+while [ \"${u%[[:space:]]}\" != \"$u\" ]; do u=${u%[[:space:]]}; done\n\
+while [ \"${u%/}\" != \"$u\" ]; do u=${u%/}; done\n\
+while [ \"${u%.git}\" != \"$u\" ]; do u=${u%.git}; done\n\
+printf '%s' \"$u\"\n\
+}\n";
 
 fn check_target(target: &str) -> Result<()> {
     // A target is `user@host` or a host alias; it must never look like an option.
@@ -193,11 +209,16 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
         "set -e\n\
          cd {repo} || exit 3\n\
          git rev-parse --show-toplevel >/dev/null || exit 3\n\
+         {norm}\
+         wanted=$(norm {url})\n\
          matched=\n\
+         found=\n\
          for name in $(git remote); do\n\
-           test \"$(git remote get-url \"$name\")\" = {url} && matched=1\n\
+           actual=$(git remote get-url \"$name\")\n\
+           found=\"$found $actual\"\n\
+           if [ \"$(norm \"$actual\")\" = \"$wanted\" ]; then matched=1; fi\n\
          done\n\
-         test -n \"$matched\" || {{ echo box_clone_url_mismatch >&2; exit 4; }}\n\
+         test -n \"$matched\" || {{ echo \"box_clone_url_mismatch: wanted {url}; box has:$found\" >&2; exit 4; }}\n\
          git fetch --quiet {url} {branch} || exit 4\n\
          test \"$(git rev-parse FETCH_HEAD)\" = {base} || {{ echo fetch_head_mismatch >&2; exit 5; }}\n\
          if [ -e {wt} ]; then\n\
@@ -210,6 +231,7 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
          fi\n\
          test \"$(git -C {wt} rev-parse HEAD)\" = {base} || {{ echo worktree_head_mismatch >&2; exit 7; }}\n\
          git -C {wt} rev-parse HEAD\n",
+        norm = NORM_URL_SH,
         repo = quote(req.box_repo),
         wt = quote(req.worktree),
         branch = quote(req.branch),
@@ -573,6 +595,144 @@ mod tests {
         assert!(script.contains("FETCH_HEAD"));
         assert!(script.contains("git worktree add"));
         drop(calls);
+    }
+
+    #[test]
+    fn the_box_shell_url_normalization_matches_the_mac_rule() {
+        let urls = [
+            "https://github.com/user/repo",
+            "https://github.com/user/repo.git",
+            "https://github.com/user/repo/",
+            "https://github.com/user/repo.git/",
+            "https://github.com/user/repo.git.git",
+            "  https://github.com/user/repo.git  ",
+            "git@github.com:user/repo.git",
+            "a/b/.git",
+        ];
+        for url in urls {
+            let script = format!("{}\nprintf '%s\\n' \"$(norm {})\"", NORM_URL_SH, quote(url));
+            let out = RealRunner
+                .run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c".to_string(), script]))
+                .unwrap();
+            assert_eq!(
+                out.stdout.trim_end_matches('\n'),
+                normalize_url(url),
+                "for {url}"
+            );
+        }
+    }
+
+    /// A box fake for the provision script: run it with the local `sh` instead
+    /// of over ssh, so a real git clone on disk exercises the real script.
+    fn run_ssh_locally(runner: &FakeRunner) {
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |cmd| {
+                RealRunner.run(&Cmd {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), cmd.args.last().unwrap().clone()],
+                    ..cmd.clone()
+                })
+            },
+        );
+    }
+
+    #[test]
+    fn provision_accepts_a_git_suffix_difference_and_names_both_urls_on_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = RealRunner
+                .run(
+                    &Cmd::new("git", Duration::from_secs(10))
+                        .args(args.iter().map(|arg| arg.to_string()))
+                        .cwd(cwd),
+                )
+                .unwrap();
+            assert!(out.success(), "git {args:?}: {}", out.error_text());
+            out.stdout
+        };
+        let origin = root.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&["init", "-q", "--bare"], &origin);
+        let work = root.path().join("work");
+        git(
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+            root.path(),
+        );
+        git(&["config", "user.email", "lane@example.invalid"], &work);
+        git(&["config", "user.name", "lane"], &work);
+        std::fs::write(work.join("file"), "content").unwrap();
+        git(&["add", "file"], &work);
+        git(&["commit", "-qm", "init"], &work);
+        git(&["branch", "-M", "lane"], &work);
+        git(&["push", "-q", "origin", "lane"], &work);
+        let base = git(&["rev-parse", "HEAD"], &work).trim().to_string();
+
+        // A URL without `.git` reaches the same bare repository.
+        let short = root.path().join("origin");
+        std::os::unix::fs::symlink("origin.git", &short).unwrap();
+
+        // The box clone's remote keeps the `.git` spelling.
+        let box_clone = root.path().join("box");
+        git(
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                box_clone.to_str().unwrap(),
+            ],
+            root.path(),
+        );
+        git(
+            &["remote", "set-url", "origin", origin.to_str().unwrap()],
+            &box_clone,
+        );
+
+        let worktree = box_clone.join(".worktrees/t-0001");
+        let runner = FakeRunner::new();
+        run_ssh_locally(&runner);
+        provision(
+            &runner,
+            "box",
+            &Provision {
+                box_repo: box_clone.to_str().unwrap(),
+                worktree: worktree.to_str().unwrap(),
+                branch: "lane",
+                base: &base,
+                publish_url: short.to_str().unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("file")).unwrap(),
+            "content"
+        );
+
+        // A different URL fails, naming the wanted URL and the one the box has.
+        let runner = FakeRunner::new();
+        run_ssh_locally(&runner);
+        let wanted = root.path().join("wanted.git");
+        let error = provision(
+            &runner,
+            "box",
+            &Provision {
+                box_repo: box_clone.to_str().unwrap(),
+                worktree: worktree.to_str().unwrap(),
+                branch: "lane",
+                base: &base,
+                publish_url: wanted.to_str().unwrap(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("box_clone_url_mismatch"), "{error}");
+        assert!(error.contains(wanted.to_str().unwrap()), "{error}");
+        assert!(error.contains(origin.to_str().unwrap()), "{error}");
     }
 
     #[test]

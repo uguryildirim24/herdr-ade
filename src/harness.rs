@@ -298,6 +298,47 @@ pub fn lock(config_dir: &Path) -> Result<InstallLock> {
     }
 }
 
+/// This process's own binary, fingerprinted before any install starts. Once
+/// `local_install` replaces that file, the running image is still the old one;
+/// this snapshot is the only way to see that the file changed underneath us.
+struct Running {
+    /// The canonical path of the running executable.
+    path: PathBuf,
+    /// The SHA-256 of its bytes as this process started.
+    hash: String,
+}
+
+impl Running {
+    fn capture() -> Option<Running> {
+        let path = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        Some(Running {
+            path,
+            hash: crate::thread::sha256_hex(&bytes),
+        })
+    }
+}
+
+/// `ha harness install` builds and installs the plugin, then keeps running the
+/// image it started as. When the file just installed is this process's own
+/// executable and its bytes changed, the rest of this run would still use the
+/// old installer logic: stop and name the command that picks up the new binary.
+fn notice_stale_self(installed: &Path, running: &Running) -> Result<()> {
+    let same = std::fs::canonicalize(installed).is_ok_and(|path| path == running.path);
+    if !same {
+        return Ok(());
+    }
+    let bytes = std::fs::read(installed)
+        .with_context(|| format!("could not read {}", installed.display()))?;
+    if crate::thread::sha256_hex(&bytes) == running.hash {
+        return Ok(());
+    }
+    bail!(
+        "harness_install_stale_self: this run installed a newer {} but is still the old process; run `ha harness install` again",
+        installed.display()
+    )
+}
+
 /// `ha harness install`: build every harness repository after a merge and
 /// install it into `~/.local/bin`, then the same on the saved box.
 pub fn install(ctx: &Ctx) -> Result<()> {
@@ -309,6 +350,7 @@ pub fn install(ctx: &Ctx) -> Result<()> {
         );
     }
     let _lock = lock(&ctx.config_dir)?;
+    let running = Running::capture();
     let box_target = remote::optional_machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
@@ -323,6 +365,9 @@ pub fn install(ctx: &Ctx) -> Result<()> {
         local_build(ctx, &repo.path, kind)?;
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin)?;
+            if let Some(running) = &running {
+                notice_stale_self(&ctx.env.home.join(".local/bin").join(bin), running)?;
+            }
         }
         for bin in kind.binaries() {
             print_version(ctx, bin)?;
@@ -468,5 +513,31 @@ mod tests {
             !script.contains("ZIG=/home/ubuntu/projects/herdr/.target"),
             "{script}"
         );
+    }
+
+    #[test]
+    fn the_installer_notices_it_replaced_its_own_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("herdr-ade");
+        std::fs::write(&exe, b"old image").unwrap();
+        let running = Running {
+            path: std::fs::canonicalize(&exe).unwrap(),
+            hash: crate::thread::sha256_hex(b"old image"),
+        };
+
+        // The installed bytes are unchanged: nothing to report.
+        notice_stale_self(&exe, &running).unwrap();
+
+        // The install replaced this process's own file: refuse to continue on
+        // the old image and name the command that runs the new one.
+        std::fs::write(&exe, b"new image").unwrap();
+        let error = notice_stale_self(&exe, &running).unwrap_err().to_string();
+        assert!(error.contains("harness_install_stale_self"), "{error}");
+        assert!(error.contains("ha harness install"), "{error}");
+
+        // A sibling binary is not this process.
+        let sibling = dir.path().join("herdr-pi");
+        std::fs::write(&sibling, b"new image").unwrap();
+        notice_stale_self(&sibling, &running).unwrap();
     }
 }
