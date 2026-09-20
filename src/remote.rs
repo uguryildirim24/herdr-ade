@@ -218,7 +218,7 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
            found=\"$found $actual\"\n\
            if [ \"$(norm \"$actual\")\" = \"$wanted\" ]; then matched=1; fi\n\
          done\n\
-         test -n \"$matched\" || {{ echo \"box_clone_url_mismatch: wanted {url}; box has:$found\" >&2; exit 4; }}\n\
+         test -n \"$matched\" || {{ printf 'box_clone_url_mismatch: wanted %s; box has:%s\\n' {url} \"$found\" >&2; exit 4; }}\n\
          git fetch --quiet {url} {branch} || exit 4\n\
          test \"$(git rev-parse FETCH_HEAD)\" = {base} || {{ echo fetch_head_mismatch >&2; exit 5; }}\n\
          if [ -e {wt} ]; then\n\
@@ -716,7 +716,9 @@ mod tests {
         // A different URL fails, naming the wanted URL and the one the box has.
         let runner = FakeRunner::new();
         run_ssh_locally(&runner);
-        let wanted = root.path().join("wanted.git");
+        // Keep the wanted URL hostile enough to prove that printing the
+        // diagnostic does not evaluate URL contents as shell syntax.
+        let wanted = root.path().join("wanted $(printf PWNED >&2).git");
         let error = provision(
             &runner,
             "box",
