@@ -827,6 +827,9 @@ mod tests {
             },
         )
         .unwrap();
+        // Already-landed work is refused: rework needs a newer attempt, so
+        // restart the lane before admitting it to the carrying round.
+        fx.set_attempt(&lane, 2);
         crate::round::admit(&ctx, "demo", "r2", &lane).unwrap();
         let _ = sync(&ctx, "demo").unwrap();
         assert_eq!(state(&fx), StepState::Running);
