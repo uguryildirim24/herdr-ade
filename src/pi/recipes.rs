@@ -14,33 +14,33 @@ use super::launch;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PiRecipe {
     /// Recipe id.
-    pub id: &'static str,
+    pub(crate) id: &'static str,
     /// D2 kind; always `pi`.
-    pub kind: &'static str,
+    pub(crate) kind: &'static str,
     /// The `provider` column; must equal `--provider` in `args`.
-    pub provider: &'static str,
+    pub(crate) provider: &'static str,
     /// The pair filter compares this, not a CLI-shaped model string.
-    pub model_family: &'static str,
+    pub(crate) model_family: &'static str,
     /// The argv after `--`.
-    pub args: Vec<String>,
+    pub(crate) args: Vec<String>,
     /// Always empty for pi: the wrapper supplies the folder, no secret.
-    pub env: Vec<String>,
-    pub ready_timeout_ms: u64,
+    pub(crate) env: Vec<String>,
+    pub(crate) ready_timeout_ms: u64,
     /// The recipe switch; disabled rows wait for Rolf.
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// The D17 `plain` phrase: a noun phrase A4's reason templates slot in
     /// ("<job> runs on <plain>"), so no product name and no full sentence.
     /// A row that replaces a native twin keeps the twin's phrase.
-    pub plain: &'static str,
+    pub(crate) plain: &'static str,
 }
 
 impl PiRecipe {
-    pub fn thinking(&self) -> String {
+    pub(crate) fn thinking(&self) -> String {
         launch::flag_value(&self.args, "--thinking").unwrap_or_default()
     }
 
     /// `--provider`, `--model`, `--thinking`, `--no-skills` and nothing else.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         launch::validate_args(&self.args)?;
         launch::validate_provider_column(self.provider, &self.args)?;
         let model = launch::flag_value(&self.args, "--model")
@@ -75,7 +75,7 @@ fn recipe(
 }
 
 /// The rows this round ships (SPEC-pi v2 §3.5, §6.2).
-pub fn pi_recipes() -> Vec<PiRecipe> {
+pub(crate) fn pi_recipes() -> Vec<PiRecipe> {
     vec![
         recipe(
             "pi_opencode_deepseek",
@@ -129,7 +129,7 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
 }
 
 /// Every provider an enabled recipe uses, in row order, for doctor.
-pub fn enabled_providers() -> Vec<&'static str> {
+pub(crate) fn enabled_providers() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for row in pi_recipes().iter().filter(|r| r.enabled) {
         if !out.contains(&row.provider) {

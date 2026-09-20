@@ -38,7 +38,7 @@ fn npm_install_args(layout: &Layout) -> Vec<String> {
 }
 
 /// What the installed `package.json` says, when anything is installed.
-pub fn installed_version(layout: &Layout) -> Option<String> {
+pub(crate) fn installed_version(layout: &Layout) -> Option<String> {
     let text = std::fs::read_to_string(layout.package_json()).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value
@@ -48,7 +48,7 @@ pub fn installed_version(layout: &Layout) -> Option<String> {
 }
 
 /// True when the prefix holds exactly the pinned version.
-pub fn is_installed_exactly(layout: &Layout) -> bool {
+pub(crate) fn is_installed_exactly(layout: &Layout) -> bool {
     installed_version(layout).as_deref() == Some(PI_VERSION)
 }
 
@@ -59,13 +59,13 @@ fn cli_js_exists(layout: &Layout) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InstallReport {
-    pub version: String,
-    pub npm_line: String,
+    pub(crate) version: String,
+    pub(crate) npm_line: String,
 }
 
 /// Install the pin with npm and check it landed. Never global; a failure is
 /// an error, not a warning.
-pub fn install(runner: &dyn sh::Runner, layout: &Layout) -> Result<InstallReport> {
+pub(crate) fn install(runner: &dyn sh::Runner, layout: &Layout) -> Result<InstallReport> {
     std::fs::create_dir_all(layout.npm())
         .with_context(|| format!("could not create {}", layout.npm().display()))?;
     let args = npm_install_args(layout);
@@ -92,7 +92,7 @@ pub fn install(runner: &dyn sh::Runner, layout: &Layout) -> Result<InstallReport
 }
 
 /// Write the plugin-owned guard extension and return its path.
-pub fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
+pub(crate) fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(layout.extensions())
         .with_context(|| format!("could not create {}", layout.extensions().display()))?;
     std::fs::write(layout.guard(), GUARD_TS)
@@ -101,7 +101,7 @@ pub fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
 }
 
 /// True when the guard is present with the plugin's marker (SPEC-pi v2 §3.9).
-pub fn guard_ok(layout: &Layout) -> bool {
+pub(crate) fn guard_ok(layout: &Layout) -> bool {
     std::fs::read_to_string(layout.guard())
         .map(|text| text.contains(GUARD_MARKER))
         .unwrap_or(false)
@@ -109,7 +109,7 @@ pub fn guard_ok(layout: &Layout) -> bool {
 
 /// The one line Rolf types after setup (SPEC-pi v2 §3.2). The wrapper itself
 /// is written by setup; the symlink is his to make.
-pub fn link_line(layout: &Layout, home: &std::path::Path) -> String {
+pub(crate) fn link_line(layout: &Layout, home: &std::path::Path) -> String {
     format!(
         "ln -s {} {}",
         layout.wrapper().display(),
@@ -119,10 +119,10 @@ pub fn link_line(layout: &Layout, home: &std::path::Path) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SetupReport {
-    pub steps: Vec<String>,
-    pub pi_folder: std::path::PathBuf,
-    pub npm_prefix: std::path::PathBuf,
-    pub link_line: String,
+    pub(crate) steps: Vec<String>,
+    pub(crate) pi_folder: std::path::PathBuf,
+    pub(crate) npm_prefix: std::path::PathBuf,
+    pub(crate) link_line: String,
 }
 
 /// Write the `pro` provider into `models.json` when the relay has written its
@@ -165,7 +165,11 @@ fn write_deepseek(layout: &Layout) -> Result<()> {
 
 /// Setup: pinned install, shared folder, guard, the running herdr's state
 /// hook, then print the one line Rolf types. Never a login.
-pub fn setup(runner: &dyn sh::Runner, env: &super::Env, layout: &Layout) -> Result<SetupReport> {
+pub(crate) fn setup(
+    runner: &dyn sh::Runner,
+    env: &super::Env,
+    layout: &Layout,
+) -> Result<SetupReport> {
     let install = install(runner, layout)?;
     let folder = super::folder::ensure(layout)?;
     let wrapper = super::launch::write_wrapper(layout)?;

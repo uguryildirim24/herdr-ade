@@ -14,24 +14,24 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 /// The default timeout for a short read-only command (node, pi, herdr).
-pub const SHORT: Duration = Duration::from_secs(10);
+pub(crate) const SHORT: Duration = Duration::from_secs(10);
 /// npm and `herdr integration install` can take a while; setup uses this.
-pub const SETUP: Duration = Duration::from_secs(600);
+pub(crate) const SETUP: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Cmd {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-    pub env_remove: Vec<String>,
-    pub cwd: Option<PathBuf>,
+pub(crate) struct Cmd {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) env_remove: Vec<String>,
+    pub(crate) cwd: Option<PathBuf>,
     /// `None` closes stdin (`</dev/null` for every doctor and check run).
-    pub stdin: Option<String>,
-    pub timeout: Duration,
+    pub(crate) stdin: Option<String>,
+    pub(crate) timeout: Duration,
 }
 
 impl Cmd {
-    pub fn new(program: impl Into<String>, timeout: Duration) -> Self {
+    pub(crate) fn new(program: impl Into<String>, timeout: Duration) -> Self {
         Cmd {
             program: program.into(),
             args: Vec::new(),
@@ -43,12 +43,12 @@ impl Cmd {
         }
     }
 
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+    pub(crate) fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
-    pub fn args<I, S>(mut self, args: I) -> Self
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -57,23 +57,23 @@ impl Cmd {
         self
     }
 
-    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub(crate) fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
     }
 
-    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+    pub(crate) fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 
-    pub fn stdin(mut self, text: impl Into<String>) -> Self {
+    pub(crate) fn stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
         self
     }
 
     /// The command as one line; the scripted fake matches on it.
-    pub fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         let mut line = self.program.clone();
         for arg in &self.args {
             line.push(' ');
@@ -84,21 +84,21 @@ impl Cmd {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Output {
+pub(crate) struct Output {
     /// `None` when the process was killed (timeout or signal).
-    pub code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    pub timed_out: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
 }
 
 impl Output {
-    pub fn success(&self) -> bool {
+    pub(crate) fn success(&self) -> bool {
         self.code == Some(0) && !self.timed_out
     }
 
     /// stderr when it has text, else stdout, trimmed; for error messages.
-    pub fn error_text(&self) -> String {
+    pub(crate) fn error_text(&self) -> String {
         if self.timed_out {
             return "timed out".to_string();
         }
@@ -111,13 +111,13 @@ impl Output {
     }
 }
 
-pub trait Runner {
+pub(crate) trait Runner {
     /// `Err` means the command could not be spawned at all (for example the
     /// program is missing). A non-zero exit or a timeout is an `Ok(Output)`.
     fn run(&self, cmd: &Cmd) -> Result<Output>;
 }
 
-pub struct RealRunner;
+pub(crate) struct RealRunner;
 
 impl Runner for RealRunner {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
@@ -229,7 +229,7 @@ fn join_text(thread: std::thread::JoinHandle<Vec<u8>>) -> String {
 /// The interactive login shell a pane starts in `auto` mode: `$SHELL`, with
 /// zsh as the fallback. SPEC-remote §3.3 replaces the hard-coded `zsh -lic`
 /// probe with the machine's own shell (zsh is absent on the box).
-pub fn shell() -> String {
+pub(crate) fn shell() -> String {
     std::env::var("SHELL")
         .ok()
         .map(|value| value.trim().to_string())
@@ -239,12 +239,12 @@ pub fn shell() -> String {
 
 /// Run one command through the login shell, the way the user's terminal would
 /// see it (`$SHELL -lic`). Doctor and check use this, never a bare `sh -c`.
-pub fn login_shell(runner: &dyn Runner, script: &str) -> Result<Output> {
+pub(crate) fn login_shell(runner: &dyn Runner, script: &str) -> Result<Output> {
     runner.run(&Cmd::new(shell(), SHORT).args(["-lic", script]))
 }
 
 /// A `$SHELL -lic` command's first output line, trimmed.
-pub fn first_line(output: &Output) -> String {
+pub(crate) fn first_line(output: &Output) -> String {
     let text = if output.stdout.trim().is_empty() {
         &output.stderr
     } else {
@@ -254,7 +254,7 @@ pub fn first_line(output: &Output) -> String {
 }
 
 /// Expand a leading `~` against `home`; everything else is left alone.
-pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         return home.to_path_buf();
     }
@@ -265,7 +265,7 @@ pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-pub mod fake {
+pub(crate) mod fake {
     use super::*;
     use std::cell::RefCell;
 
@@ -275,18 +275,18 @@ pub mod fake {
     /// answers it. Every command is recorded, matched or not.
     #[derive(Default)]
     #[allow(clippy::type_complexity)]
-    pub struct FakeRunner {
+    pub(crate) struct FakeRunner {
         rules: RefCell<Vec<(Matcher, Box<dyn Fn(&Cmd) -> Result<Output>>)>>,
-        pub calls: RefCell<Vec<Cmd>>,
+        pub(crate) calls: RefCell<Vec<Cmd>>,
     }
 
     impl FakeRunner {
-        pub fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::default()
         }
 
         /// Answer commands whose display line contains `needle`.
-        pub fn on(&self, needle: &str, output: Output) -> &Self {
+        pub(crate) fn on(&self, needle: &str, output: Output) -> &Self {
             let needle = needle.to_string();
             self.rules.borrow_mut().push((
                 Box::new(move |cmd| cmd.display().contains(&needle)),
@@ -295,7 +295,7 @@ pub mod fake {
             self
         }
 
-        pub fn on_fn(
+        pub(crate) fn on_fn(
             &self,
             matcher: impl Fn(&Cmd) -> bool + 'static,
             answer: impl Fn(&Cmd) -> Result<Output> + 'static,
@@ -306,7 +306,7 @@ pub mod fake {
             self
         }
 
-        pub fn count(&self, needle: &str) -> usize {
+        pub(crate) fn count(&self, needle: &str) -> usize {
             self.calls
                 .borrow()
                 .iter()
@@ -315,7 +315,7 @@ pub mod fake {
         }
     }
 
-    pub fn ok(stdout: &str) -> Output {
+    pub(crate) fn ok(stdout: &str) -> Output {
         Output {
             code: Some(0),
             stdout: stdout.to_string(),
@@ -323,7 +323,7 @@ pub mod fake {
         }
     }
 
-    pub fn fail(code: i32, stderr: &str) -> Output {
+    pub(crate) fn fail(code: i32, stderr: &str) -> Output {
         Output {
             code: Some(code),
             stderr: stderr.to_string(),
@@ -331,7 +331,7 @@ pub mod fake {
         }
     }
 
-    pub fn timeout() -> Output {
+    pub(crate) fn timeout() -> Output {
         Output {
             timed_out: true,
             ..Output::default()
