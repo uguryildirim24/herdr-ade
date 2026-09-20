@@ -23,7 +23,7 @@ use crate::threads;
 /// At most seven active steps (SPEC-talk §6.5).
 const MAX_STEPS: usize = 7;
 
-pub fn plan_path(project: &Project) -> PathBuf {
+pub(crate) fn plan_path(project: &Project) -> PathBuf {
     project.dir().join("plan.toml")
 }
 
@@ -49,7 +49,7 @@ fn plan_lock(project: &Project) -> Result<PlanLock> {
     Ok(PlanLock { _file: file })
 }
 
-pub fn load(project: &Project) -> Result<Option<Plan>> {
+pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
     let path = plan_path(project);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -195,7 +195,7 @@ fn project_goal(project: &Project) -> String {
 
 /// `ha plan set --kind <kind> --does "<sentence>" --expect <revision>`.
 /// Preserves the steps and refreshes the goal from `PROJECT.md`.
-pub fn set(ctx: &Ctx, slug: &str, kind: &str, does: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn set(ctx: &Ctx, slug: &str, kind: &str, does: &str, expect: u64) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let sentence = plan_kind_sentence(kind)
         .with_context(|| format!("plan_kind: `{kind}` is not one of the seven kinds"))?;
@@ -211,7 +211,7 @@ pub fn set(ctx: &Ctx, slug: &str, kind: &str, does: &str, expect: u64) -> Result
     Ok(plan)
 }
 
-pub fn step_add(
+pub(crate) fn step_add(
     ctx: &Ctx,
     slug: &str,
     text: &str,
@@ -247,7 +247,7 @@ pub fn step_add(
     Ok(plan)
 }
 
-pub fn step_edit(ctx: &Ctx, slug: &str, id: &str, text: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn step_edit(ctx: &Ctx, slug: &str, id: &str, text: &str, expect: u64) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let text = glossary::check_sentence(&project, "step", text)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -258,7 +258,7 @@ pub fn step_edit(ctx: &Ctx, slug: &str, id: &str, text: &str, expect: u64) -> Re
     Ok(plan)
 }
 
-pub fn step_link(
+pub(crate) fn step_link(
     ctx: &Ctx,
     slug: &str,
     id: &str,
@@ -288,7 +288,7 @@ pub fn step_link(
     Ok(plan)
 }
 
-pub fn step_unlink(
+pub(crate) fn step_unlink(
     ctx: &Ctx,
     slug: &str,
     id: &str,
@@ -311,7 +311,7 @@ pub fn step_unlink(
     Ok(plan)
 }
 
-pub fn step_remove(ctx: &Ctx, slug: &str, id: &str, why: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn step_remove(ctx: &Ctx, slug: &str, id: &str, why: &str, expect: u64) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     glossary::check_sentence(&project, "why", why)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -327,7 +327,13 @@ pub fn step_remove(ctx: &Ctx, slug: &str, id: &str, why: &str, expect: u64) -> R
 
 /// `move` changes display order only. `before` names the step it goes in
 /// front of; an empty `before` sends it to the end.
-pub fn step_move(ctx: &Ctx, slug: &str, id: &str, before: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn step_move(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    before: &str,
+    expect: u64,
+) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let from = plan
@@ -361,7 +367,7 @@ fn find_step<'a>(plan: &'a mut Plan, id: &str) -> Result<&'a mut PlanStep> {
 
 /// `ha plan show [--json]`. Missing returns revision zero and `present:
 /// false`; a normal call reports a goal that drifted from `PROJECT.md`.
-pub fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
+pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let plan = load(&project)?;
     if json {
@@ -426,7 +432,7 @@ pub fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncOutcome {
+pub(crate) enum SyncOutcome {
     Missing,
     Unchanged { revision: u64 },
     Changed { revision: u64 },
@@ -434,7 +440,7 @@ pub enum SyncOutcome {
 
 /// `ha plan sync`: derive states from the bound work records and write only
 /// on change.
-pub fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
+pub(crate) fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _lock = plan_lock(&project)?;
     let Some(mut plan) = load(&project)? else {
@@ -455,7 +461,7 @@ pub fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
 /// The shared projection refresh (SPEC-talk §6.5). Reads the current card and
 /// work records and writes only on change; a missing card is a no-op. Callers
 /// treat a failure as a separate refresh failure, never a merge failure.
-pub fn refresh(_ctx: &Ctx, project: &Project) -> Result<bool> {
+pub(crate) fn refresh(_ctx: &Ctx, project: &Project) -> Result<bool> {
     let _lock = plan_lock(project)?;
     let Some(mut plan) = load(project)? else {
         return Ok(false);

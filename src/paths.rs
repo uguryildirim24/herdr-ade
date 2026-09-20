@@ -13,13 +13,13 @@ use crate::herdr;
 use crate::runner::Runner;
 
 #[derive(Debug, Clone)]
-pub struct Env {
+pub(crate) struct Env {
     vars: BTreeMap<String, String>,
-    pub home: PathBuf,
+    pub(crate) home: PathBuf,
 }
 
 impl Env {
-    pub fn from_process() -> Result<Self> {
+    pub(crate) fn from_process() -> Result<Self> {
         let vars: BTreeMap<String, String> = std::env::vars().collect();
         let home = vars
             .get("HOME")
@@ -30,7 +30,7 @@ impl Env {
     }
 
     #[cfg(test)]
-    pub fn for_test(home: &Path, vars: &[(&str, &str)]) -> Self {
+    pub(crate) fn for_test(home: &Path, vars: &[(&str, &str)]) -> Self {
         Env {
             vars: vars
                 .iter()
@@ -41,7 +41,7 @@ impl Env {
     }
 
     /// A variable's value; an empty value counts as unset.
-    pub fn var(&self, key: &str) -> Option<&str> {
+    pub(crate) fn var(&self, key: &str) -> Option<&str> {
         self.vars
             .get(key)
             .map(String::as_str)
@@ -50,7 +50,7 @@ impl Env {
 
     /// Config directory: `$XDG_CONFIG_HOME/herdr-ade` when that variable is set
     /// (SPEC-ADE item 39), else `~/.config/herdr-ade`.
-    pub fn config_dir(&self) -> PathBuf {
+    pub(crate) fn config_dir(&self) -> PathBuf {
         match self.var("XDG_CONFIG_HOME") {
             Some(xdg) => self.expand_tilde(xdg).join("herdr-ade"),
             None => self.home.join(".config").join("herdr-ade"),
@@ -58,7 +58,7 @@ impl Env {
     }
 
     /// `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
-    pub fn herdr_bin(&self) -> String {
+    pub(crate) fn herdr_bin(&self) -> String {
         self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
     }
 
@@ -73,13 +73,13 @@ impl Env {
 
 /// What every subcommand works from: the environment, the resolved root and
 /// config directory, and the runner all external commands go through.
-pub struct Ctx<'a> {
-    pub env: &'a Env,
-    pub root: PathBuf,
-    pub config_dir: PathBuf,
-    pub runner: &'a dyn Runner,
+pub(crate) struct Ctx<'a> {
+    pub(crate) env: &'a Env,
+    pub(crate) root: PathBuf,
+    pub(crate) config_dir: PathBuf,
+    pub(crate) runner: &'a dyn Runner,
     /// False in tests, so commands that ensure a ticker never spawn a process.
-    pub detached_ticker: bool,
+    pub(crate) detached_ticker: bool,
 }
 
 /// The part of `config.toml` that resolution needs. Safety tables are read by
@@ -91,7 +91,7 @@ struct RootConfig {
 
 /// Projects root: `--root`, then `HERDR_ADE_ROOT`, then `root` in
 /// `<config_dir>/config.toml`, then `~/.herdr-ade`.
-pub fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result<PathBuf> {
     if let Some(flag) = flag {
         return absolute(flag);
     }
@@ -115,22 +115,26 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 
 /// Which herdr session a command should talk to, as given on the command line.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SessionFlags {
-    pub session: Option<String>,
-    pub socket: Option<PathBuf>,
+pub(crate) struct SessionFlags {
+    pub(crate) session: Option<String>,
+    pub(crate) socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Session {
-    pub socket: PathBuf,
+pub(crate) struct Session {
+    pub(crate) socket: PathBuf,
     /// Known only when the session was chosen by name.
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
 /// `--session`, then `--socket`, then `HERDR_SOCKET_PATH`, then `HERDR_SESSION`,
 /// then herdr's default socket. A name is turned into a socket path by asking
 /// herdr (`session list --json`), never by guessing herdr's directory layout.
-pub fn resolve_session(flags: &SessionFlags, env: &Env, runner: &dyn Runner) -> Result<Session> {
+pub(crate) fn resolve_session(
+    flags: &SessionFlags,
+    env: &Env,
+    runner: &dyn Runner,
+) -> Result<Session> {
     if flags.session.is_some() && flags.socket.is_some() {
         bail!("pass --session or --socket, not both");
     }

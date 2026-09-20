@@ -34,7 +34,7 @@ impl Binding {
     }
 }
 
-pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
+pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     // The path goes verbatim into the typed DONE line (D10).
     if report.is_empty() || report.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(crate::refusal::error(
@@ -83,11 +83,11 @@ pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
+pub(crate) fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
     seal_message(ctx, text, false)
 }
 
-pub fn failed(ctx: &Ctx, text: &str) -> Result<()> {
+pub(crate) fn failed(ctx: &Ctx, text: &str) -> Result<()> {
     seal_message(ctx, text, true)
 }
 
@@ -341,7 +341,7 @@ struct BootstrapReceipt {
 
 /// The skill text a role is primed with. One source for the printed skill, the
 /// start-time receipt and the staleness check, so they can never disagree.
-pub fn skill_text(role: &str) -> &'static str {
+pub(crate) fn skill_text(role: &str) -> &'static str {
     match role {
         "coordinator" => include_str!("../skill/COORDINATOR.md"),
         "reviewer" => include_str!("../skill/REVIEWER.md"),
@@ -353,7 +353,7 @@ pub fn skill_text(role: &str) -> &'static str {
 }
 
 /// The repository file that carries a role's skill text.
-pub fn skill_file(role: &str) -> &'static str {
+pub(crate) fn skill_file(role: &str) -> &'static str {
     match role {
         "coordinator" => "COORDINATOR.md",
         "reviewer" => "REVIEWER.md",
@@ -367,7 +367,7 @@ pub fn skill_file(role: &str) -> &'static str {
 /// Prints the selected role skill and runtime-only rules. A lane call also
 /// records the bootstrap receipt from `HERDR_ADE_LAUNCH` when its binding
 /// matches. A box lane prints the fixed box prefix, never the Mac's path.
-pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
+pub(crate) fn skill(ctx: &Ctx, role: &str) -> Result<()> {
     match role {
         "coordinator" => print!("{}", skill_text(role)),
         "lane" | "reviewer" | "critic" | "drafter" | "research" | "planner" => {

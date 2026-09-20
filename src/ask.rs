@@ -20,7 +20,7 @@ use crate::plain;
 use crate::project::{self, Project, write_atomic};
 
 /// The standing extra choice every ask carries (D17 item 4).
-pub const NOT_UNDERSTOOD: &str = "I did not understand the question";
+pub(crate) const NOT_UNDERSTOOD: &str = "I did not understand the question";
 
 /// Fixed notices: the only text a `Notice` can publish. Every text passes the
 /// checker with an empty registry (tested).
@@ -76,20 +76,20 @@ const NOTICES: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn notice_text(id: &str) -> Option<&'static str> {
+pub(crate) fn notice_text(id: &str) -> Option<&'static str> {
     NOTICES.iter().find(|(k, _)| *k == id).map(|(_, v)| *v)
 }
 
 /// An answer, stored next to the revision it answers; create-if-absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Answer {
-    pub id: String,
-    pub revision: u32,
-    pub choice: u32,
-    pub text: String,
-    pub not_understood: bool,
-    pub answered: String,
-    pub by: String,
+pub(crate) struct Answer {
+    pub(crate) id: String,
+    pub(crate) revision: u32,
+    pub(crate) choice: u32,
+    pub(crate) text: String,
+    pub(crate) not_understood: bool,
+    pub(crate) answered: String,
+    pub(crate) by: String,
 }
 
 fn asks_dir(project: &Project) -> PathBuf {
@@ -164,7 +164,7 @@ fn validate_ask_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load_revision(project: &Project, id: &str, revision: u32) -> Result<Option<Ask>> {
+pub(crate) fn load_revision(project: &Project, id: &str, revision: u32) -> Result<Option<Ask>> {
     validate_ask_id(id)?;
     let path = rev_path(project, id, revision);
     match std::fs::read_to_string(&path) {
@@ -176,7 +176,7 @@ pub fn load_revision(project: &Project, id: &str, revision: u32) -> Result<Optio
     }
 }
 
-pub fn latest_revision(project: &Project, id: &str) -> u32 {
+pub(crate) fn latest_revision(project: &Project, id: &str) -> u32 {
     let Ok(entries) = std::fs::read_dir(ask_dir(project, id)) else {
         return 0;
     };
@@ -193,32 +193,32 @@ pub fn latest_revision(project: &Project, id: &str) -> u32 {
         .unwrap_or(0)
 }
 
-pub fn latest(project: &Project, id: &str) -> Result<Option<Ask>> {
+pub(crate) fn latest(project: &Project, id: &str) -> Result<Option<Ask>> {
     match latest_revision(project, id) {
         0 => Ok(None),
         r => load_revision(project, id, r),
     }
 }
 
-pub fn answer_of(project: &Project, id: &str, revision: u32) -> Option<Answer> {
+pub(crate) fn answer_of(project: &Project, id: &str, revision: u32) -> Option<Answer> {
     let text = std::fs::read_to_string(answer_path(project, id, revision)).ok()?;
     toml::from_str(&text).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Withdrawal {
-    pub id: String,
-    pub revision: u32,
-    pub reason: String,
-    pub by: String,
-    pub at: String,
+    pub(crate) id: String,
+    pub(crate) revision: u32,
+    pub(crate) reason: String,
+    pub(crate) by: String,
+    pub(crate) at: String,
 }
 
 fn withdrawal_path(project: &Project, id: &str, revision: u32) -> PathBuf {
     ask_dir(project, id).join(format!("r{revision}.withdrawn.toml"))
 }
 
-pub fn withdrawal_of(project: &Project, id: &str, revision: u32) -> Option<Withdrawal> {
+pub(crate) fn withdrawal_of(project: &Project, id: &str, revision: u32) -> Option<Withdrawal> {
     let text = std::fs::read_to_string(withdrawal_path(project, id, revision)).ok()?;
     toml::from_str(&text).ok()
 }
@@ -227,7 +227,13 @@ fn is_withdrawn(project: &Project, id: &str, revision: u32) -> bool {
     withdrawal_path(project, id, revision).exists()
 }
 
-pub fn withdraw(ctx: &Ctx, slug: &str, id: &str, reason: &str, by: &str) -> Result<Withdrawal> {
+pub(crate) fn withdraw(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+    by: &str,
+) -> Result<Withdrawal> {
     validate_ask_id(id)?;
     if reason.trim().is_empty() || by.trim().is_empty() {
         bail!("ask_withdraw: a reason and actor are required");
@@ -262,7 +268,7 @@ pub fn withdraw(ctx: &Ctx, slug: &str, id: &str, reason: &str, by: &str) -> Resu
 }
 
 /// Latest revisions without an answer or withdrawal, oldest first.
-pub fn open_asks(project: &Project) -> Vec<Ask> {
+pub(crate) fn open_asks(project: &Project) -> Vec<Ask> {
     let Ok(entries) = std::fs::read_dir(asks_dir(project)) else {
         return Vec::new();
     };
@@ -278,13 +284,13 @@ pub fn open_asks(project: &Project) -> Vec<Ask> {
     asks
 }
 
-pub fn newest_open(project: &Project) -> Option<Ask> {
+pub(crate) fn newest_open(project: &Project) -> Option<Ask> {
     open_asks(project).pop()
 }
 
 /// The board's compact line: the leading clause of the question at a word
 /// boundary plus ` (<n> choices)`, at most 60 characters, never the choices.
-pub fn compact_line(ask: &Ask) -> String {
+pub(crate) fn compact_line(ask: &Ask) -> String {
     let suffix = format!(" ({} choices)", ask.choices.len());
     let budget = 60usize.saturating_sub(suffix.len() + 1);
     let question = ask.question.trim().trim_end_matches('?');
@@ -312,7 +318,7 @@ pub fn compact_line(ask: &Ask) -> String {
 }
 
 /// The full question with numbered choices and the standing `0`.
-pub fn numbered(ask: &Ask) -> String {
+pub(crate) fn numbered(ask: &Ask) -> String {
     let mut out = format!("{}\n", ask.question.trim());
     for (i, c) in ask.choices.iter().enumerate() {
         out.push_str(&format!("  {}. {}\n", i + 1, c));
@@ -321,14 +327,14 @@ pub fn numbered(ask: &Ask) -> String {
     out
 }
 
-pub struct NewAsk {
-    pub question: String,
-    pub choices: Vec<String>,
-    pub what: Option<String>,
-    pub means: Option<String>,
-    pub round: Option<String>,
+pub(crate) struct NewAsk {
+    pub(crate) question: String,
+    pub(crate) choices: Vec<String>,
+    pub(crate) what: Option<String>,
+    pub(crate) means: Option<String>,
+    pub(crate) round: Option<String>,
     /// Re-ask an existing id as revision `r+1`.
-    pub reask: Option<String>,
+    pub(crate) reask: Option<String>,
 }
 
 fn check_structured(project: &Project, new: &NewAsk) -> Result<()> {
@@ -391,7 +397,7 @@ fn say_problems(field: &str, value: &str, g: &plain::Glossary) -> Vec<String> {
 }
 
 /// `ha ask`: validate, write the immutable record, only then publish.
-pub fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
+pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let project = Project::load(&ctx.root, slug)?;
     check_structured(&project, &new)?;
     // The board line is checked before anything is recorded: a record whose
@@ -472,7 +478,7 @@ pub fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
 }
 
 /// `ha ask answer <id> --revision <r> <n>`.
-pub fn answer(
+pub(crate) fn answer(
     ctx: &Ctx,
     slug: &str,
     id: &str,
@@ -549,12 +555,12 @@ pub fn answer(
 
 /// How many `0 = I did not understand` answers the project has seen; a
 /// signal for Rolf, never a gate.
-pub fn not_understood_count(project: &Project) -> u64 {
+pub(crate) fn not_understood_count(project: &Project) -> u64 {
     project::read_json::<u64>(&project.state_dir().join("not-understood.json")).unwrap_or(0)
 }
 
 /// `ha say --what ... [--means ...]`.
-pub fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<()> {
+pub(crate) fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     publish(
         ctx,
@@ -571,7 +577,7 @@ pub fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<()>
 /// The landing line for a merged round (SPEC-talk §6.1). It publishes under
 /// `landed:<round>` so a repeated merge publishes once, and it validates that
 /// the round actually merged and checkpointed.
-pub fn say_landed(
+pub(crate) fn say_landed(
     ctx: &Ctx,
     slug: &str,
     what: &str,
@@ -615,14 +621,14 @@ fn board_line(text: &str, max: usize) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Published {
     /// `None` when the journal already had this message (a duplicate).
-    pub seq: Option<u64>,
-    pub board: bool,
-    pub notified: bool,
+    pub(crate) seq: Option<u64>,
+    pub(crate) board: bool,
+    pub(crate) notified: bool,
 }
 
 /// The stored ask an `ade-ask` envelope names: known, latest, unanswered
 /// and still passing the check. The hook corrects on the same refusal.
-pub fn open_revision(
+pub(crate) fn open_revision(
     project: &Project,
     id: &str,
     revision: u32,
@@ -647,13 +653,13 @@ pub fn open_revision(
     Ok(record)
 }
 
-pub fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
+pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
     publish_keyed(ctx, project, msg, None)
 }
 
 /// The one publisher. `key` makes a publication idempotent (a duplicate hook
 /// run of the same reply appends once).
-pub fn publish_keyed(
+pub(crate) fn publish_keyed(
     ctx: &Ctx,
     project: &Project,
     msg: &HumanMessage,
@@ -795,7 +801,7 @@ fn notify(ctx: &Ctx, project: &Project, title: &str, body: &str) -> bool {
 
 /// Resumes publication of every open latest revision that has no
 /// `published` marker (a crash between record and publication).
-pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     for a in open_asks(project) {
         if published_marker(project, &a.id, a.revision).exists() {
             continue;

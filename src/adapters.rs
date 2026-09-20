@@ -9,16 +9,16 @@ pub(crate) enum CorrectionAdapter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Adapter {
-    pub kind: &'static str,
-    pub receipt: &'static str,
-    pub positive_resend_evidence: &'static str,
-    pub required: &'static str,
-    pub correction: CorrectionAdapter,
+pub(crate) struct Adapter {
+    pub(crate) kind: &'static str,
+    pub(crate) receipt: &'static str,
+    pub(crate) positive_resend_evidence: &'static str,
+    pub(crate) required: &'static str,
+    pub(crate) correction: CorrectionAdapter,
     /// What happens to the coordinator's native chat (the `talk` header).
-    pub chat: &'static str,
+    pub(crate) chat: &'static str,
     /// The `talk` header's surface clause for a non-Claude coordinator.
-    pub surface: &'static str,
+    pub(crate) surface: &'static str,
 }
 
 const ADAPTERS: [Adapter; 8] = [
@@ -96,14 +96,14 @@ const ADAPTERS: [Adapter; 8] = [
     },
 ];
 
-pub fn get(kind: &str) -> Option<&'static Adapter> {
+pub(crate) fn get(kind: &str) -> Option<&'static Adapter> {
     ADAPTERS.iter().find(|adapter| adapter.kind == kind)
 }
 
 /// Capability labels are evidence-based. Installation alone never promotes a
 /// row; acceptance writes the project-local qualification marker after its
 /// installed-CLI test passes.
-pub fn capability_label(project: &crate::project::Project, kind: &str) -> &'static str {
+pub(crate) fn capability_label(project: &crate::project::Project, kind: &str) -> &'static str {
     let _adapter = get(kind);
     let qualified = project
         .state_dir()

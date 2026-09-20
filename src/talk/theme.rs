@@ -3,17 +3,17 @@ use crate::paths::Env;
 use ratatui::style::Color;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Theme {
-    pub accent: Color,
-    pub text: Color,
-    pub subtext0: Color,
-    pub overlay0: Color,
-    pub surface1: Color,
-    pub panel_bg: Color,
-    pub green: Color,
-    pub yellow: Color,
-    pub red: Color,
-    pub peach: Color,
+pub(crate) struct Theme {
+    pub(crate) accent: Color,
+    pub(crate) text: Color,
+    pub(crate) subtext0: Color,
+    pub(crate) overlay0: Color,
+    pub(crate) surface1: Color,
+    pub(crate) panel_bg: Color,
+    pub(crate) green: Color,
+    pub(crate) yellow: Color,
+    pub(crate) red: Color,
+    pub(crate) peach: Color,
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -32,7 +32,7 @@ impl Default for Theme {
     }
 }
 impl Theme {
-    pub fn load(env: &Env) -> Self {
+    pub(crate) fn load(env: &Env) -> Self {
         let base = env
             .var("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)

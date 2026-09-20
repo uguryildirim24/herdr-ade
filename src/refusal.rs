@@ -21,14 +21,14 @@ impl fmt::Display for DesignedRefusal {
 
 impl std::error::Error for DesignedRefusal {}
 
-pub fn error(message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(DesignedRefusal {
         message: message.into(),
     })
 }
 
 /// Context may wrap a refusal on its way to the CLI, so inspect the full chain.
-pub fn is(error: &anyhow::Error) -> bool {
+pub(crate) fn is(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<DesignedRefusal>().is_some())

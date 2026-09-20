@@ -1385,7 +1385,7 @@ fn guarded<T>(cleanup: impl FnMut(), run: impl FnOnce() -> Result<T>) -> Result<
     run()
 }
 
-pub fn run(ctx: &Ctx, slug: &str) -> Result<()> {
+pub(crate) fn run(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     guarded(restore, || {
         enable_raw_mode()?;
