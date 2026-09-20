@@ -105,7 +105,7 @@ When the user asks for scheduled or watched work, create or edit a file in `rout
 
 ## Talking to Rolf: say, ask and the talk tab
 
-Rolf reads you in the `talk` tab when the project has it on (`hp context` prints the label). The talk tab shows only checked messages, never your prose. Every text that reaches Rolf's board, notifications or talk tab goes through one check: known words, short sentences, names only in the form `<recorded sentence> (<name>)`. The check proves the words are known, not that Rolf understands them.
+Rolf reads you in the `talk` tab when the project has it on (`hp context` prints the label). The talk tab shows only checked messages, never your prose. The text that reaches Rolf's board, notifications or talk tab as prose — `hp say`, `hp ask` and its choices — goes through one check: known words, short sentences, names only in the form `<recorded sentence> (<name>)`. The check proves the words are known, not that Rolf understands them. A `hp decide` line and a round or thread sentence keep the length limit, because they are rows on a screen, but they are the internal record of what happened and may name a file or other internal detail; plan sentences and `hp term add` sentences still take the full check.
 
 - `hp say --what "<one sentence: what happened>" [--means "<one sentence: what it means for you>"]` puts one line on the board and in talk.
 - `hp ask "<question>?" --choice "<a sentence Rolf can picture>" --choice "<another>"` (two to four choices, never a single word or a name). It prints `<id>@<revision>`. Every ask also carries `0 = I did not understand the question`; when Rolf answers 0, ask again with `hp ask --reask <id> ...` in other words. A number Rolf types in your pane answers nothing; only `hp ask answer <id> --revision <r> <n>` or the talk tab does.
@@ -132,7 +132,7 @@ Rolf reads you in the `talk` tab when the project has it on (`hp context` prints
 
 ### Plans and choices
 
-The project screen reads two records you keep. The plan card (`hp plan`) is the goal, the one end result and up to seven outcome steps; a step becomes `done` only when every work item bound to it has landed in a merged round, never because you set a status. The decision log (`hp decide`) is one plain line per choice you made without asking.
+The project screen reads two records you keep. The plan card (`hp plan`) is the goal, the one end result and up to seven outcome steps; a step becomes `done` only when every work item bound to it has landed in a merged round, never because you set a status. The decision log (`hp decide`) is one short line per choice you made without asking; it may name a file.
 
 - `hp plan set --kind <kind> --does "<sentence>" --expect <revision>`; `hp plan step add|edit|link|unlink|remove|move`; `hp plan show`; `hp plan sync`. The plugin refreshes step states on its own at checkpoints, merges, and thread or round changes; `sync` is the manual form.
 - `hp decide "<one plain line>" --class routine` for everything ordinary. Only a choice that changes what Rolf gets (`what-you-get`), costs money (`money`) or is hard to undo (`undo`) needs `--basis` naming the permission it rests on, and those are the ones to ask about first.
