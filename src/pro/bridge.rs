@@ -17,17 +17,17 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Health {
-    pub version: String,
-    pub major: u64,
-    pub accepting: bool,
-    pub pid: Option<u32>,
-    pub mode: Option<String>,
-    pub raw: Value,
+    pub(crate) version: String,
+    pub(crate) major: u64,
+    pub(crate) accepting: bool,
+    pub(crate) pid: Option<u32>,
+    pub(crate) mode: Option<String>,
+    pub(crate) raw: Value,
 }
 
 impl Health {
     /// An unseen major is refused (spec Design, check 6).
-    pub fn major_seen(&self) -> bool {
+    pub(crate) fn major_seen(&self) -> bool {
         SEEN_BRIDGE_MAJORS.contains(&self.major)
     }
 }
@@ -37,7 +37,7 @@ fn url(port: u16, path: &str) -> String {
 }
 
 /// `GET /healthz`, one short local call.
-pub fn health(runner: &dyn Runner, port: u16) -> Result<Health> {
+pub(crate) fn health(runner: &dyn Runner, port: u16) -> Result<Health> {
     let output = runner.run(&Cmd::new("curl", HTTP_TIMEOUT).args([
         "-sS",
         "--fail-with-body",
@@ -81,7 +81,7 @@ pub fn health(runner: &dyn Runner, port: u16) -> Result<Health> {
 
 /// The first port that answers: the launcher's 17841, then the terminal
 /// fallback's 17941.
-pub fn health_any(runner: &dyn Runner) -> Result<(u16, Health)> {
+pub(crate) fn health_any(runner: &dyn Runner) -> Result<(u16, Health)> {
     let primary = super::BRIDGE_PORT;
     let fallback = super::FALLBACK_PORT;
     if let Ok(health) = health(runner, primary) {
@@ -110,7 +110,7 @@ fn control_token(env: &Env) -> Option<String> {
 }
 
 /// The bridge's configured mode when its config is readable.
-pub fn config_mode(env: &Env) -> Option<String> {
+pub(crate) fn config_mode(env: &Env) -> Option<String> {
     bridge_config(env)?
         .get("mode")
         .and_then(Value::as_str)
@@ -118,12 +118,12 @@ pub fn config_mode(env: &Env) -> Option<String> {
 }
 
 /// `POST /admin/drain` with the control token.
-pub fn drain(runner: &dyn Runner, env: &Env, port: u16) -> Result<String> {
+pub(crate) fn drain(runner: &dyn Runner, env: &Env, port: u16) -> Result<String> {
     admin(runner, env, port, "/admin/drain")
 }
 
 /// `POST /admin/resume`; Rolf's clear of the breaker.
-pub fn resume(runner: &dyn Runner, env: &Env, port: u16) -> Result<String> {
+pub(crate) fn resume(runner: &dyn Runner, env: &Env, port: u16) -> Result<String> {
     admin(runner, env, port, "/admin/resume")
 }
 

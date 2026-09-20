@@ -30,17 +30,17 @@ const MAX_WITH: usize = 4;
 
 /// A picture request: `herdr-pro image`.
 #[derive(Debug, Clone)]
-pub struct ImageOptions {
-    pub prompt_file: PathBuf,
-    pub size: String,
-    pub out: PathBuf,
+pub(crate) struct ImageOptions {
+    pub(crate) prompt_file: PathBuf,
+    pub(crate) size: String,
+    pub(crate) out: PathBuf,
     /// Reference pictures Codex sees before it draws.
-    pub with: Vec<PathBuf>,
-    pub keep: bool,
+    pub(crate) with: Vec<PathBuf>,
+    pub(crate) keep: bool,
 }
 
 /// `herdr-pro image`: one lane, one request, one PNG.
-pub fn run(
+pub(crate) fn run(
     env: &Env,
     layout: &Layout,
     runner: &dyn Runner,
