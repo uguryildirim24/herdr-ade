@@ -108,6 +108,24 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
         .context("machine_list_invalid: herdr returned invalid JSON")
 }
 
+/// Names of every enabled saved machine. An explicit `--machine` may place
+/// work on any one of these, even when no current thread uses it.
+pub fn registered_machine_names(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<String>> {
+    saved_machines(runner, herdr_bin)?
+        .into_iter()
+        .filter(|machine| machine.enabled)
+        .map(|machine| {
+            if !machine.label.is_empty() {
+                Ok(machine.label)
+            } else if !machine.id.is_empty() {
+                Ok(machine.id)
+            } else {
+                bail!("machine_profile_invalid: an enabled saved machine has no id or label")
+            }
+        })
+        .collect()
+}
+
 /// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box
 /// path is never derived from the Mac path.
 pub fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {

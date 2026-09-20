@@ -318,51 +318,92 @@ fn report(
         Err(error) => check(&mut out, Some(false), "recipes", format!("{error:#}")),
     }
 
-    // Machines that projects use need an SSH target for report and library copies.
+    // Check every machine placement can choose, not only machines with a live
+    // thread. This includes configured defaults, repository rows and every
+    // enabled saved profile (an explicit `--machine` can choose any of them).
+    match machines_to_check(root, config_dir, runner, &bin) {
+        Ok(machines) => {
+            for machine in machines {
+                match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
+                    Ok(profile) if profile.is_local() => check(
+                        &mut out,
+                        Some(true),
+                        &format!("machine {machine}"),
+                        "on this Mac".into(),
+                    ),
+                    Ok(profile) => {
+                        check(
+                            &mut out,
+                            Some(true),
+                            &format!("machine {machine}"),
+                            format!("ssh target {}", profile.target),
+                        );
+                        for (ok, label, detail) in box_rows(runner, &bin, &profile) {
+                            check(&mut out, ok, &label, detail);
+                        }
+                    }
+                    Err(error) => check(
+                        &mut out,
+                        Some(false),
+                        &format!("machine {machine}"),
+                        format!("{error:#}"),
+                    ),
+                }
+            }
+        }
+        Err(error) => check(&mut out, Some(false), "machines", format!("{error:#}")),
+    }
+
+    (out, healthy)
+}
+
+fn machines_to_check(
+    root: &Path,
+    config_dir: &Path,
+    runner: &dyn Runner,
+    herdr_bin: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let dispatch = crate::launch::parse_launch_config(config_dir)?
+        .dispatch
+        .machine;
     let mut machines = std::collections::BTreeSet::new();
+    if !dispatch.is_empty() {
+        machines.insert(dispatch.clone());
+    }
+    machines.extend(crate::remote::registered_machine_names(runner, herdr_bin)?);
+
+    let add_repos = |machines: &mut std::collections::BTreeSet<String>,
+                     repos: Vec<crate::project::Repo>| {
+        for repo in repos {
+            if let Some(machine) = repo.machine.filter(|machine| !machine.is_empty()) {
+                machines.insert(machine);
+            }
+            // A box_path is what makes the dispatch default eligible for this
+            // repository. Keep that relationship explicit even though the
+            // dispatch row itself is also checked when no project is open.
+            if repo.box_path.is_some() && !dispatch.is_empty() {
+                machines.insert(dispatch.clone());
+            }
+        }
+    };
+    add_repos(&mut machines, crate::harness::repos(config_dir)?);
     for slug in project::list_slugs(root) {
         let Ok(project) = project::Project::load(root, &slug) else {
             continue;
         };
         if let Ok((settings, _)) = project.read_project_md() {
-            machines.extend(settings.repos.into_iter().filter_map(|r| r.machine));
+            add_repos(&mut machines, settings.repos);
         }
         machines.extend(
             crate::thread::list(&project)
                 .into_iter()
-                .filter(|t| t.is_remote() && t.status != crate::thread::Status::Resolved)
-                .map(|t| t.machine),
+                .filter(|thread| {
+                    thread.is_remote() && thread.status != crate::thread::Status::Resolved
+                })
+                .map(|thread| thread.machine),
         );
     }
-    for machine in machines {
-        match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
-            Ok(profile) if profile.is_local() => check(
-                &mut out,
-                Some(true),
-                &format!("machine {machine}"),
-                "on this Mac".into(),
-            ),
-            Ok(profile) => {
-                check(
-                    &mut out,
-                    Some(true),
-                    &format!("machine {machine}"),
-                    format!("ssh target {}", profile.target),
-                );
-                for (ok, label, detail) in box_rows(runner, &bin, &profile) {
-                    check(&mut out, ok, &label, detail);
-                }
-            }
-            Err(error) => check(
-                &mut out,
-                Some(false),
-                &format!("machine {machine}"),
-                format!("{error:#}"),
-            ),
-        }
-    }
-
-    (out, healthy)
+    Ok(machines)
 }
 
 /// One saved machine's box rows (SPEC-remote §§2–3, R11): boot service,
@@ -425,14 +466,14 @@ fn box_rows(
         Ok(out) if out.success() => parse_facts(&out.stdout),
         Ok(out) => {
             return vec![(
-                None,
+                Some(false),
                 format!("box {label}"),
                 format!("unreachable: {}", out.error_text()),
             )];
         }
         Err(error) => {
             return vec![(
-                None,
+                Some(false),
                 format!("box {label}"),
                 format!("unreachable: {error:#}"),
             )];
@@ -523,7 +564,10 @@ fn box_rows(
                     format!("`type -a -P pi` first hit: {pi}")
                 },
             ));
-            let missing: Vec<&str> = ["cargo", "just", "claude", "codex", "agy", "node"]
+            // Pi's openai-codex provider runs inside pi's Node process; it
+            // does not launch the standalone `codex` binary. Native Claude
+            // and agy recipes do need their executables in a lane pane.
+            let missing: Vec<&str> = ["cargo", "just", "claude", "agy", "node"]
                 .into_iter()
                 .filter(|tool| {
                     !tools
@@ -676,7 +720,7 @@ mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
 
-    fn runner_with_herdr(version: &str) -> FakeRunner {
+    fn runner_with_machine_list(version: &str, machines: &str) -> FakeRunner {
         let runner = FakeRunner::new();
         runner.on("herdr --version", ok(version));
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
@@ -684,8 +728,16 @@ mod tests {
         runner.on("ssh -V", ok(""));
         runner.on("rsync --version", ok("rsync 3\n"));
         runner.on("gh --version", ok("gh version 2\n"));
-        runner.on("gh auth status", fail(1, "not logged in"));
+        runner.on_fn(
+            |cmd| cmd.program == "gh" && cmd.args == ["auth", "status"],
+            |_| Ok(fail(1, "not logged in")),
+        );
+        runner.on("machine list --json", ok(machines));
         runner
+    }
+
+    fn runner_with_herdr(version: &str) -> FakeRunner {
+        runner_with_machine_list(version, "[]")
     }
 
     #[test]
@@ -773,6 +825,103 @@ mod tests {
         assert!(text.contains("[warn] project demo memory"), "{text}");
         assert!(text.contains("memory/state.md"), "{text}");
         assert!(text.contains("memory/archive/"), "{text}");
+    }
+
+    #[test]
+    fn a_registered_machine_without_live_threads_is_checked() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
+        let machines = r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#;
+        let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("ssh", ok(&box_facts()));
+        probe_fakes(&runner);
+
+        let (text, _) = report(
+            &env,
+            &home.path().join("root-with-no-projects"),
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(
+            text.contains("[ok  ] machine oci: ssh target me@box"),
+            "{text}"
+        );
+        assert!(text.contains("[ok  ] box oci capacity"), "{text}");
+    }
+
+    #[test]
+    fn a_repo_row_with_a_box_path_brings_its_machine_in() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[dispatch]\nmachine = \"dispatch-box\"\n",
+        )
+        .unwrap();
+        let project = project::create(
+            &root,
+            "demo",
+            "",
+            vec![crate::project::Repo {
+                path: "/repo/on/box".into(),
+                machine: Some("repo-box".into()),
+                box_path: Some("/box/repo".into()),
+                publish_url: None,
+            }],
+        )
+        .unwrap();
+        assert!(crate::thread::list(&project).is_empty());
+        let runner = FakeRunner::new();
+        runner.on("machine list --json", ok("[]"));
+
+        let machines = machines_to_check(&root, &config, &runner, "herdr").unwrap();
+        assert!(machines.contains("repo-box"), "{machines:?}");
+        assert!(machines.contains("dispatch-box"), "{machines:?}");
+    }
+
+    #[test]
+    fn an_unreachable_registered_machine_fails_instead_of_disappearing() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
+        let machines = r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#;
+        let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("ssh", fail(255, "ssh: connect timed out"));
+
+        let (text, healthy) = report(
+            &env,
+            &home.path().join("root-with-no-projects"),
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy, "{text}");
+        assert!(
+            text.contains("[FAIL] box oci: unreachable: ssh: connect timed out"),
+            "{text}"
+        );
     }
 
     fn box_facts() -> String {
@@ -890,8 +1039,38 @@ mod tests {
         runner.on("ssh", fail(255, "ssh: connect timed out"));
         let rows = box_rows(&runner, "herdr", &box_profile());
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, None);
+        assert_eq!(rows[0].0, Some(false));
         assert!(rows[0].2.contains("unreachable"));
+    }
+
+    #[test]
+    fn box_rows_keep_the_real_lane_readiness_failures() {
+        let runner = FakeRunner::new();
+        let facts = box_facts()
+            .replace("login_agy\tok", "login_agy\tmissing")
+            .replace("pi_pro\tok", "pi_pro\tfail");
+        runner.on("ssh", ok(&facts));
+        runner.on(
+            "workspace create",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+        );
+        runner.on("pane run", ok(r#"{"result":{}}"#));
+        runner.on(
+            "pane read",
+            ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
+        );
+        runner.on("workspace close", ok(r#"{"result":{}}"#));
+        let rows = box_rows(&runner, "herdr", &box_profile());
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(_, name, _)| name == label)
+                .unwrap_or_else(|| panic!("no row {label}"))
+        };
+        assert_eq!(find("box oci login agy").0, Some(false));
+        assert_eq!(find("box oci tools").0, Some(false));
+        assert!(find("box oci tools").2.contains("claude agy"));
+        assert!(!find("box oci tools").2.contains("codex"));
+        assert_eq!(find("box oci pi pro").0, Some(false));
     }
 
     #[test]
