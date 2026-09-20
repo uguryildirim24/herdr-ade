@@ -399,29 +399,33 @@ fn server_refusal_includes_status_and_body_but_never_the_key() {
 #[test]
 fn timeout_is_reported_as_a_timeout_not_a_server_or_transport_failure() {
     let (world, project) = setup();
-    let runner = FakeRunner::new();
-    runner.on(
-        "agent start --help",
-        ok("[possible values: pi, claude, agy]"),
-    );
-    runner.on("/usr/bin/curl", timeout());
-    let ctx = Ctx {
-        runner: &runner,
-        ..world.ctx()
-    };
-    let error = launch::resolve_launch(
-        &ctx,
-        &project,
-        &ResolveInput {
-            task: "Implement the parser.",
-            ..Default::default()
-        },
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("jev_timeout"), "{error}");
-    assert!(!error.contains("jev_server_refused"), "{error}");
-    assert!(!error.contains("jev_transport"), "{error}");
+    // curl's 30-second deadline normally fires before the runner's 35-second
+    // watchdog. Both paths must have the same classification.
+    for output in [timeout(), fail(28, "curl: (28) Operation timed out")] {
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("/usr/bin/curl", output);
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let error = launch::resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                task: "Implement the parser.",
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("jev_timeout"), "{error}");
+        assert!(!error.contains("jev_server_refused"), "{error}");
+        assert!(!error.contains("jev_transport"), "{error}");
+    }
 }
 
 #[test]

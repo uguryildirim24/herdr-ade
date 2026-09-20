@@ -72,7 +72,7 @@ pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Res
                 .stdin(config),
         )
         .context("jev_transport: could not execute curl")?;
-    if output.timed_out {
+    if output.timed_out || output.code == Some(28) {
         bail!("jev_timeout: request timed out after 30 seconds");
     }
     if !output.success() {
@@ -112,7 +112,7 @@ fn safe_error_text(text: &str, key: &str) -> String {
         })
         .collect();
     if safe.len() > ERROR_TEXT_CAP {
-        let mut end = ERROR_TEXT_CAP;
+        let mut end = ERROR_TEXT_CAP - '…'.len_utf8();
         while !safe.is_char_boundary(end) {
             end -= 1;
         }
@@ -171,4 +171,21 @@ pub fn parse(text: &str, questions: &BTreeMap<String, Value>) -> Result<Assessme
         usage: value["usage"].clone(),
         response: value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_text_is_redacted_control_cleaned_and_byte_bounded() {
+        let text = format!("fake-key\u{1b}[31m{}", "界".repeat(ERROR_TEXT_CAP));
+        let safe = safe_error_text(&text, "fake-key");
+        assert!(safe.starts_with("[redacted] [31m"));
+        assert!(!safe.contains("fake-key"));
+        assert!(!safe.contains('\u{1b}'));
+        assert!(safe.ends_with('…'));
+        assert!(safe.len() <= ERROR_TEXT_CAP);
+        assert_eq!(safe_error_text("\0 ", "fake-key"), "(empty response)");
+    }
 }
