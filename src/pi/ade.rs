@@ -101,7 +101,7 @@ pub fn doctor_rows_with(
     root: &Path,
 ) -> Result<(Vec<doctor::Row>, bool)> {
     let env = Env::from_process()?;
-    let providers = crate::pi::roles::enabled_providers();
+    let providers = crate::pi::recipes::enabled_providers();
     let rows = doctor::doctor_rows_with(&env, &layout(root), &Adapter(runner), &providers);
     let ok = doctor::healthy(&rows);
     Ok((rows, ok))

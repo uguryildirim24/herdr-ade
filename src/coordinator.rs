@@ -86,9 +86,25 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             crate::project::BODY_WARN_CHARS
         );
     }
-    // The coordinator runs on the `coordinator` role (SPEC-ADE D2), resolved
-    // and validated before any tab exists.
-    let spec = project::resolve_role(&ctx.config_dir, &settings, "coordinator")?;
+    // Coordinator is a fixed exclusion in the editable policy, never a Jev choice.
+    let selected = crate::launch::resolve_launch(
+        ctx,
+        &project,
+        &crate::launch::ResolveInput {
+            task: &std::fs::read_to_string(project.dir().join("PROJECT.md"))?,
+            workflow: "coordinator",
+            ..Default::default()
+        },
+    )?;
+    if selected.kind != "claude" {
+        bail!("coordinator_kind: coordinator must use the Claude binary");
+    }
+    let spec = crate::contracts::RoleSpec {
+        kind: selected.kind,
+        args: selected.args,
+        env: selected.env,
+        ready_timeout_ms: selected.ready_timeout_ms,
+    };
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
 

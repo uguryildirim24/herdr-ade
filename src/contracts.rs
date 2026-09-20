@@ -2,9 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One `[recipes.<id>]` row: the full D2 row plus `provider` (reserved for the
-/// pi move, question 25), `enabled` and `plain`. Machine placement belongs to
-/// the role row, not to a model recipe.
+/// One executable `[recipes.<id>]` row. Capability descriptions and routing
+/// thresholds live in routing.json. Placement belongs to `[dispatch]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Recipe {
@@ -161,13 +160,14 @@ pub struct Launch {
     pub attempt: u32,
     pub brief_hash: String,
     pub recipe_id: String,
+    pub strength: u32,
+    pub escalations: u32,
     pub reason: String,
     /// The compact `<job> runs on <plain>` sentence for the board's
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
     /// never rereads live config.
     pub compact_reason: String,
-    /// The machine the role row chose; empty keeps the launch local
-    /// (SPEC-remote D2/D4, §4.1).
+    /// Default machine from `[dispatch]`; empty keeps the launch local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine: String,
 }
@@ -198,8 +198,7 @@ pub struct IdentityBinding {
     pub agent_session: Option<String>,
 }
 
-/// A role's resolved row (SPEC-ADE D2): the `default` recipe of
-/// `[roles.<name>]`, then the PROJECT.md override.
+/// The executable portion of a resolved launch, passed to process creation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RoleSpec {
     pub kind: String,
@@ -217,6 +216,7 @@ pub struct RoleSpec {
 pub enum OpKind {
     Done,
     Waiting,
+    Failed,
 }
 
 /// Complete requested payload stored at reserve so a later seal needs no
@@ -226,6 +226,7 @@ pub enum OpKind {
 pub enum Requested {
     Done { sha: String, report_path: String },
     Waiting { text: String },
+    Failed { failure: String },
 }
 
 /// Coordinator pane and attempt that must receive the sealed event
@@ -289,6 +290,8 @@ pub struct EventPayload {
     pub done: Option<DonePayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<WaitingPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<WaitingPayload>,
 }
 
 /// Immutable sealed event `events/<event id>.toml` (SPEC-ADE D5).
@@ -678,6 +681,7 @@ mod tests {
                     artifact: "deadbeef".into(),
                 }),
                 waiting: None,
+                failed: None,
             },
         });
         both(&Event {
@@ -696,6 +700,7 @@ mod tests {
                 waiting: Some(WaitingPayload {
                     text: "need a look".into(),
                 }),
+                failed: None,
             },
         });
     }
@@ -837,6 +842,8 @@ mod tests {
             attempt: 1,
             brief_hash: String::new(),
             recipe_id: "agy_gemini_flash".into(),
+            strength: 0,
+            escalations: 0,
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
             machine: "oci".into(),

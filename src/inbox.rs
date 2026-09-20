@@ -430,6 +430,7 @@ mod tests {
                 waiting: Some(crate::contracts::WaitingPayload {
                     text: "wait".into(),
                 }),
+                failed: None,
             },
         };
         crate::events::seal_create_if_absent(&project, &event).unwrap();
@@ -517,6 +518,7 @@ mod tests {
                 waiting: Some(crate::contracts::WaitingPayload {
                     text: "wait".into(),
                 }),
+                failed: None,
             },
         };
         crate::events::seal_create_if_absent(&project, &event).unwrap();

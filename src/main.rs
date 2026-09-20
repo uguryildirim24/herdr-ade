@@ -10,6 +10,7 @@ mod coordinator;
 mod decide;
 mod dialogue;
 mod doctor;
+mod escalation;
 mod events;
 mod git;
 mod glossary;
@@ -17,12 +18,16 @@ mod harness;
 mod herdr;
 mod hook;
 mod inbox;
+mod jev;
 mod lane;
 mod launch;
 mod lifecycle;
 mod ops;
 mod overview;
 mod paths;
+mod routing;
+#[cfg(test)]
+mod routing_tests;
 // Shared with the `herdr-pi` binary: setup, install and login run only there.
 #[allow(dead_code)]
 mod pi;

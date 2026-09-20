@@ -48,6 +48,9 @@ pub struct Thread {
     pub error: String,
     pub prompt_pending: bool,
     pub launch_attempts: u32,
+    pub failure_event: String,
+    pub last_failure: String,
+    pub escalation_pending: bool,
     pub kind: Kind,
     pub repo: String,
     pub origin: String,
@@ -172,9 +175,21 @@ fn write_record(project: &Project, thread: &Thread) -> Result<()> {
 /// Read-modify-write under the project lock: re-reads the record, lets `change`
 /// touch only the fields its step owns, writes.
 pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
+    update_checked(project, id, |thread| {
+        change(thread);
+        Ok(())
+    })
+}
+
+/// Compare-and-change for transitions which awaited external work.
+pub fn update_checked(
+    project: &Project,
+    id: &str,
+    change: impl FnOnce(&mut Thread) -> Result<()>,
+) -> Result<Thread> {
     let _lock = project.lock()?;
     let mut thread = load(project, id)?;
-    change(&mut thread);
+    change(&mut thread)?;
     thread.updated = project::now();
     write_record(project, &thread)?;
     Ok(thread)
@@ -232,16 +247,24 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     let id = &t.id;
     let role = if t.role.is_empty() { "lane" } else { &t.role };
+    let continuation = if t.last_failure.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Continue the preserved worktree; do not reset or discard changes. The previous attempt reported this failure: {}.",
+            serde_json::to_string(&t.last_failure).unwrap_or_default()
+        )
+    };
     if t.is_remote() {
         // The box lane runs the plugin on the box, so the birth line carries
         // the fixed box prefix, never the Mac's `current_exe` (D12/D14).
         return format!(
-            "Run {} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.",
+            "Run {} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
             crate::contracts::box_prefix(),
             t.machine
         );
     }
-    match t.kind {
+    let prompt = match t.kind {
         Kind::Worktree if !t.is_remote() => {
             format!("Run {prefix} skill {role}, then read tasks/{id}.md and do what it says.")
         }
@@ -249,7 +272,8 @@ pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
             "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
         ),
         _ => format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says."),
-    }
+    };
+    format!("{prompt}{continuation}")
 }
 
 // ---------------------------------------------------------------- briefs
