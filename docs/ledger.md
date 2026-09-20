@@ -19,7 +19,10 @@ ha ledger task f-0001 | ha thread start demo \
 ```
 
 The project resolves from the current workspace or lane launch binding. The
-ledger never creates a lane or closes a failure on its own.
+ledger never creates a lane or closes a failure on its own. A designed refusal
+(a safety or authority check that intentionally rejects the requested action)
+still exits unsuccessfully, but its structural refusal marker keeps it out of
+the failure ledger. Errors are never classified by matching message text.
 
 ## One durable record, derived views
 
@@ -39,12 +42,14 @@ Malformed or torn journal rows produce an error; they are never silently dropped
 
 ## Observation sites
 
-- CLI failures and nonzero, timed-out, or unspawnable child commands through the
-  ADE runner, preserving their original outcomes. Predicate commands whose
-  nonzero status is a valid negative answer are not failures. Child evidence
+- Unexpected CLI failures and nonzero, timed-out, or unspawnable child commands
+  through the ADE runner, preserving their original outcomes. Designed CLI
+  refusals and predicate commands whose nonzero status is a valid negative
+  answer are not failures. Child evidence
   includes argv, exit status, stdout and stderr, but not environment or stdin.
 - Failed reviewer starts in `round advance`, even when advance returns success.
-- Merge refusals, including head changes, conflicts and wrong verdicts.
+- Unexpected merge failures, including subprocess errors and conflicts. A
+  structurally marked verdict or safety refusal is an outcome, not a failure.
 - Thread error/blocked transitions and failed launches with zero attempts.
   Polling an unchanged state does not increase its count.
 - Failed courier passes, attributed to each project carried by that pass, plus

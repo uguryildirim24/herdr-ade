@@ -31,4 +31,4 @@ The body says why, per lane. `MERGE-AFTER-DECISION` names the decision Rolf must
 
 ## Done
 
-Run `hp done --report <your report path> --sha <V>`. You never merge, push, or move the integration branch yourself.
+Run `hp done --report <the report path from your brief> --sha <V>`. The report path may be absolute or relative to the worktree, but must name a file inside it. You never merge, push, or move the integration branch yourself.

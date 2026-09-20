@@ -336,10 +336,10 @@ fn notice_stale_self(installed: &Path, running: &Running) -> Result<()> {
     if crate::thread::sha256_hex(&bytes) == running.hash {
         return Ok(());
     }
-    bail!(
+    Err(crate::refusal::error(format!(
         "harness_install_stale_self: this run installed a newer {} but is still the old process; run `ha harness install` again",
         installed.display()
-    )
+    )))
 }
 
 /// `ha harness install`: build every harness repository after a merge and
@@ -532,9 +532,11 @@ mod tests {
         // The install replaced this process's own file: refuse to continue on
         // the old image and name the command that runs the new one.
         std::fs::write(&exe, b"new image").unwrap();
-        let error = notice_stale_self(&exe, &running).unwrap_err().to_string();
-        assert!(error.contains("harness_install_stale_self"), "{error}");
-        assert!(error.contains("ha harness install"), "{error}");
+        let error = notice_stale_self(&exe, &running).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        let message = error.to_string();
+        assert!(message.contains("harness_install_stale_self"), "{message}");
+        assert!(message.contains("ha harness install"), "{message}");
 
         // A sibling binary is not this process.
         let sibling = dir.path().join("herdr-pi");
