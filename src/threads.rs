@@ -779,7 +779,7 @@ fn integration_branch(runner: &dyn Runner, record: &Thread) -> Result<String> {
 /// Creates the lane branch at `sha`, tolerating a retry that left it at the
 /// same commit. Never moves an existing ref (D9).
 fn ensure_branch(runner: &dyn Runner, repo: &str, branch: &str, sha: &str) -> Result<()> {
-    if let Ok(existing) = crate::git::rev_parse(runner, repo, &format!("refs/heads/{branch}")) {
+    if let Some(existing) = crate::git::branch_head(runner, repo, branch)? {
         if existing == sha {
             return Ok(());
         }
@@ -850,20 +850,10 @@ fn place_ade_worktree(
     } else {
         record.base.clone()
     };
-    if git(
-        runner,
-        &record.repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "-q",
-            &format!("refs/heads/{integration}"),
-        ],
-        GIT_TIMEOUT,
-    )
-    .is_err()
-    {
-        bail!("integration_branch_required: `{integration}` is not a local branch");
+    if crate::git::branch_head(runner, &record.repo, &integration)?.is_none() {
+        return Err(crate::refusal::error(format!(
+            "integration_branch_required: `{integration}` is not a local branch"
+        )));
     }
     let branch = thread::branch_name(&project.slug, &record.id, &record.title);
     let task = std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
@@ -1270,18 +1260,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     }
     let branch_exists = record.kind == Kind::Worktree && record.worktree_path.is_empty() && {
         let branch = thread::branch_name(slug, id, &record.title);
-        git(
-            ctx.runner,
-            &record.repo,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-            GIT_TIMEOUT,
-        )
-        .is_ok()
+        crate::git::branch_head(ctx.runner, &record.repo, &branch)?.is_some()
     };
 
     let plan = restart_plan(&record, &live, branch_exists, now)?;
