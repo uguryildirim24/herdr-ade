@@ -360,9 +360,11 @@ enum RoundCommand {
         round: String,
         thread: String,
     },
-    /// Commit the review brief B, freeze the manifest, create the review branch
+    /// Manual repair only: commit the review brief B, freeze the manifest,
+    /// create the review branch. `round advance` does this on its own.
     Review { slug: String, round: String },
-    /// Record the reviewer thread whose sealed done sha is the verdict commit V
+    /// Manual repair only: record the reviewer thread whose sealed done sha is
+    /// the verdict commit V. `round advance` starts and binds the reviewer.
     Reviewer {
         slug: String,
         round: String,
@@ -647,7 +649,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     o.revision, o.manifest_hash
                 );
                 println!(
-                    "next: start the reviewer thread in that worktree with role reviewer, then `round reviewer {slug} {id} <thread>`"
+                    "next: `round advance {slug}` starts and binds the reviewer; `round reviewer` is only a manual repair"
                 );
                 if let (Some(c), Some(v)) = (&o.earlier_candidate, &o.earlier_verdict) {
                     println!(
@@ -662,7 +664,9 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 thread,
             } => {
                 round::bind_reviewer(ctx, &slug, &id, &thread)?;
-                println!("{thread} reviews {id}");
+                println!(
+                    "{thread} reviews {id} (manual repair; `round advance` binds reviewers on its own)"
+                );
                 Ok(())
             }
             RoundCommand::Merge {

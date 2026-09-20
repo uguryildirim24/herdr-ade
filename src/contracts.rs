@@ -422,6 +422,11 @@ pub struct RoundRecord {
     /// gone reviewer), so each state is announced once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced: Option<String>,
+    /// How many reviewer starts `advance` has tried and failed for this round
+    /// (a refused start or a reviewer whose agent never came up). The retry is
+    /// bounded by `round::MAX_REVIEWER_START_FAILURES` (E3/D1).
+    #[serde(default)]
+    pub reviewer_start_failures: u32,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
@@ -871,6 +876,7 @@ mod tests {
             review_branch: Some("review/r1".into()),
             reviewer: Some("t-0003".into()),
             announced: Some("verdict:MERGE".into()),
+            reviewer_start_failures: 0,
         });
         both(&MergeIntent {
             op: "merge-r1".into(),
