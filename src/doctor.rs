@@ -1,5 +1,6 @@
 //! `doctor`: what is installed, where things resolve, and whether it fits.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -22,29 +23,18 @@ struct NativeProbe {
     args: &'static [&'static str],
 }
 
-const NATIVE_PROBES: &[NativeProbe] = &[
-    NativeProbe {
-        kind: "claude",
-        program: "claude",
-        args: &["auth", "status"],
-    },
-    NativeProbe {
-        kind: "codex",
-        program: "codex",
-        args: &["login", "status"],
-    },
-    NativeProbe {
-        kind: "agy",
-        program: "agy",
-        args: &["models"],
-    },
-];
-
 fn native_probe(kind: &str) -> Option<NativeProbe> {
-    NATIVE_PROBES
-        .iter()
-        .copied()
-        .find(|probe| probe.kind == kind)
+    let (program, args): (_, &[_]) = match kind {
+        "claude" => ("claude", &["auth", "status"]),
+        "codex" => ("codex", &["login", "status"]),
+        "agy" => ("agy", &["models"]),
+        _ => return None,
+    };
+    Some(NativeProbe {
+        kind: program,
+        program,
+        args,
+    })
 }
 
 fn probe_error(kind: &str, output: &crate::runner::Output) -> String {
@@ -434,8 +424,10 @@ fn report(
     // Check every machine placement can choose, not only machines with a live
     // thread. This includes configured defaults, repository rows and every
     // enabled saved profile (an explicit `--machine` can choose any of them).
-    match machines_to_check(root, config_dir, runner, &bin) {
-        Ok(machines) => {
+    match machines_to_check(root, config_dir, runner, &bin)
+        .and_then(|machines| Ok((machines, crate::launch::parse_launch_config(config_dir)?)))
+    {
+        Ok((machines, config)) => {
             for machine in machines {
                 match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
                     Ok(profile) if profile.is_local() => check(
@@ -451,7 +443,8 @@ fn report(
                             &format!("machine {machine}"),
                             format!("ssh target {}", profile.target),
                         );
-                        for (ok, label, detail) in box_rows(runner, &bin, &profile) {
+                        for (ok, label, detail) in box_rows(runner, &bin, &profile, &config.recipes)
+                        {
                             check(&mut out, ok, &label, detail);
                         }
                     }
@@ -521,12 +514,13 @@ fn machines_to_check(
 
 /// One saved machine's box rows (SPEC-remote §§2–3, R11): boot service,
 /// server, host, listeners, repository mapping, Git identity and GitHub
-/// reach, per-kind logins, and live CPU/RAM/disk capacity with the 12 GB
+/// reach, enabled recipes' readiness, and live CPU/RAM/disk capacity with the 12 GB
 /// gate. One read-only SSH call.
 fn box_rows(
     runner: &dyn Runner,
     herdr_bin: &str,
     profile: &crate::contracts::MachineProfile,
+    recipes: &BTreeMap<String, crate::contracts::Recipe>,
 ) -> Vec<(Option<bool>, String, String)> {
     let label = &profile.label;
     if profile.target.is_empty() {
@@ -535,6 +529,36 @@ fn box_rows(
             format!("box {label}"),
             "has no SSH target".into(),
         )];
+    }
+    // The executable recipes own which checks exist. Native probe definitions
+    // only describe how to check a runtime; they never select one to require.
+    let mut natives = BTreeMap::new();
+    let mut providers = BTreeSet::new();
+    let mut rows = Vec::new();
+    for (id, recipe) in recipes.iter().filter(|(_, recipe)| recipe.enabled) {
+        if recipe.kind == "pi" {
+            match crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args) {
+                Ok(()) => {
+                    providers.insert(recipe.provider.as_str());
+                }
+                Err(error) => rows.push((
+                    Some(false),
+                    format!("box {label} recipe {id}"),
+                    format!("{error:#}"),
+                )),
+            }
+        } else if let Some(probe) = native_probe(&recipe.kind) {
+            natives.insert(probe.kind, probe);
+        } else {
+            rows.push((
+                Some(false),
+                format!("box {label} recipe {id}"),
+                format!(
+                    "no doctor readiness probe exists for agent kind `{}`",
+                    recipe.kind
+                ),
+            ));
+        }
     }
     let repos: Vec<&crate::contracts::BoxRepoMap> = crate::contracts::BOX_REPOS.iter().collect();
     let mut script = String::from(
@@ -553,7 +577,7 @@ fn box_rows(
          printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
 ",
     );
-    for probe in NATIVE_PROBES {
+    for probe in natives.values() {
         let command = std::iter::once(probe.program)
             .chain(probe.args.iter().copied())
             .map(crate::remote::quote)
@@ -567,7 +591,7 @@ fn box_rows(
     }
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
-    for provider in crate::pi::recipes::enabled_providers() {
+    for provider in &providers {
         let provider = crate::remote::quote(provider);
         script.push_str(&format!(
             "HERDR_ADE_ROOT=\"$HOME/.herdr-ade\" \"$HOME/.local/bin/herdr-pi\" check {provider} >/dev/null 2>&1 && printf 'pi_%s\\tok\\n' {provider} || printf 'pi_%s\\tfail\\n' {provider}\n"
@@ -603,7 +627,6 @@ fn box_rows(
         }
     };
     let fact = |key: &str| facts.get(key).cloned().unwrap_or_default();
-    let mut rows = Vec::new();
     rows.push((
         env_bool(&fact("boot"), &["enabled"]),
         format!("box {label} boot"),
@@ -660,7 +683,7 @@ fn box_rows(
         format!("box {label} gh"),
         format!("gh auth status: {}", fact("gh")),
     ));
-    for probe in NATIVE_PROBES {
+    for probe in natives.values() {
         let kind = probe.kind;
         let value = fact(&format!("login_{kind}"));
         rows.push((
@@ -671,7 +694,11 @@ fn box_rows(
     }
     // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
     // answers `type -a -P pi` and `command -v` in its own shell.
-    match box_pane_probe(runner, herdr_bin, profile) {
+    let required_tools: Vec<&str> = ["cargo", "just", "node"]
+        .into_iter()
+        .chain(natives.values().map(|probe| probe.program))
+        .collect();
+    match box_pane_probe(runner, herdr_bin, profile, &required_tools) {
         Ok(answer) => {
             let (pi, tools) = parse_box_probe(&answer);
             let wrapper = "/home/ubuntu/.local/bin/pi";
@@ -688,11 +715,10 @@ fn box_rows(
                     format!("`type -a -P pi` first hit: {pi}")
                 },
             ));
-            // Pi's openai-codex provider runs inside pi's Node process; it
-            // does not launch the standalone `codex` binary. Native Claude
-            // and agy recipes do need their executables in a lane pane.
-            let missing: Vec<&str> = ["cargo", "just", "claude", "agy", "node"]
-                .into_iter()
+            // Only native recipes require their standalone executables.
+            let missing: Vec<&str> = required_tools
+                .iter()
+                .copied()
                 .filter(|tool| {
                     !tools
                         .iter()
@@ -719,7 +745,7 @@ fn box_rows(
             format!("the box pane probe failed: {error:#}"),
         )),
     }
-    for provider in crate::pi::recipes::enabled_providers() {
+    for provider in providers {
         let value = fact(&format!("pi_{provider}"));
         rows.push((
             env_bool(&value, &["ok"]),
@@ -768,19 +794,25 @@ fn parse_facts(text: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// The probe a fresh box pane runs in its own Bash shell (SPEC-remote §3.3).
-const BOX_PROBE: &str = "printf '@@pi '; type -a -P pi 2>/dev/null | head -n1; \
-                         printf '@@cmd\\n'; command -v cargo just claude codex agy node 2>/dev/null; \
-                         printf '@@done\\n'";
-
-/// Creates a fresh box pane with the lane PATH, runs [`BOX_PROBE`] in that
+/// Creates a fresh box pane with the lane PATH, runs the tool probe in that
 /// pane's own shell, reads the answer and closes the workspace. This is the
 /// §3.3 probe: never a bare `ssh` command string, never `bash -lic`.
 fn box_pane_probe(
     runner: &dyn Runner,
     herdr_bin: &str,
     profile: &crate::contracts::MachineProfile,
+    tools: &[&str],
 ) -> Result<String> {
+    let tools = tools
+        .iter()
+        .map(|tool| crate::remote::quote(tool))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let probe = format!(
+        "printf '@@pi '; type -a -P pi 2>/dev/null | head -n1; \
+         printf '@@cmd\\n'; command -v {tools} 2>/dev/null; \
+         printf '@@done\\n'"
+    );
     let herdr = Herdr::new(herdr_bin, "", runner).on_machine(&profile.id);
     let env = vec![format!("PATH={}", crate::contracts::BOX_PATH)];
     let created = herdr
@@ -794,7 +826,7 @@ fn box_pane_probe(
     let pane = created.pane_id.clone();
     let answer = (|| -> Result<String> {
         herdr
-            .pane_run(&pane, BOX_PROBE)
+            .pane_run(&pane, &probe)
             .map_err(|error| anyhow::anyhow!("box probe run: {error}"))?;
         for _ in 0..50 {
             let text = herdr
@@ -985,6 +1017,56 @@ mod tests {
     }
 
     #[test]
+    fn report_uses_configured_recipe_overrides_for_box_logins() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
+        let mut recipes = default_recipes();
+        // Retiring native Claude rows and moving agy to pi must retire their
+        // login checks too, regardless of the unchanged recipe names.
+        for recipe in recipes
+            .values_mut()
+            .filter(|recipe| recipe.kind == "claude")
+        {
+            recipe.enabled = false;
+        }
+        recipes.insert(
+            "agy_gemini_flash".into(),
+            recipes["pi_codex_sol_high"].clone(),
+        );
+        std::fs::write(
+            config.join("config.toml"),
+            toml::to_string(&BTreeMap::from([("recipes", recipes)])).unwrap(),
+        )
+        .unwrap();
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        let runner = runner_with_machine_list(
+            "herdr 0.9.1\n",
+            r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#,
+        );
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("ssh", ok(&box_facts()));
+        probe_fakes(&runner);
+        let (text, _) = report(
+            &env,
+            &home.path().join("root"),
+            &config,
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(text.contains("[ok  ] box oci pi openai-codex"), "{text}");
+        assert!(!text.contains("box oci login"), "{text}");
+    }
+
+    #[test]
     fn a_repo_row_with_a_box_path_brings_its_machine_in() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
@@ -1048,6 +1130,160 @@ mod tests {
         );
     }
 
+    fn default_recipes() -> BTreeMap<String, crate::contracts::Recipe> {
+        let dir = tempfile::tempdir().unwrap();
+        crate::launch::parse_launch_config(dir.path())
+            .unwrap()
+            .recipes
+    }
+
+    #[test]
+    fn pi_only_codex_access_is_ready_without_a_codex_binary_or_login() {
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok(&box_facts().replace("login_codex\tok", "login_codex\tmissing")),
+        );
+        runner.on("pane read", ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
+        probe_fakes(&runner);
+        let mut recipes = default_recipes();
+        recipes.retain(|_, recipe| recipe.kind == "pi" && recipe.provider == "openai-codex");
+        // Multiple enabled models share one provider readiness check.
+        for recipe in recipes.values_mut() {
+            recipe.enabled = true;
+        }
+        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+        assert!(rows.iter().all(|row| row.0 == Some(true)), "{rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.1 == "box oci pi openai-codex")
+                .count(),
+            1
+        );
+        assert!(!rows.iter().any(|row| row.1.contains(" login ")));
+        let calls = runner.calls.borrow();
+        let ssh = calls
+            .iter()
+            .find(|call| call.program == "ssh")
+            .unwrap()
+            .display();
+        assert_eq!(ssh.matches("check openai-codex").count(), 1, "{ssh}");
+        assert!(!ssh.contains("codex login status"), "{ssh}");
+        assert!(!ssh.contains("command -v codex"), "{ssh}");
+    }
+
+    #[test]
+    fn each_native_recipe_requires_its_binary_and_login() {
+        for kind in ["claude", "codex", "agy"] {
+            let runner = FakeRunner::new();
+            runner.on(
+                "ssh",
+                ok(&box_facts().replace(
+                    &format!("login_{kind}\tok"),
+                    &format!("login_{kind}\tmissing"),
+                )),
+            );
+            runner.on("pane read", ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
+            probe_fakes(&runner);
+            let recipes = BTreeMap::from([(
+                "not_a_runtime_name".into(),
+                crate::contracts::Recipe {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            )]);
+            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+            let login = rows
+                .iter()
+                .find(|row| row.1 == format!("box oci login {kind}"))
+                .unwrap();
+            assert_eq!(login.0, Some(false), "{rows:?}");
+            let tools = rows.iter().find(|row| row.1 == "box oci tools").unwrap();
+            assert_eq!(tools.0, Some(false));
+            assert!(tools.2.contains(kind));
+            let calls = runner.calls.borrow();
+            let ssh = calls
+                .iter()
+                .find(|call| call.program == "ssh")
+                .unwrap()
+                .display();
+            let probe = native_probe(kind).unwrap();
+            assert!(ssh.contains(&format!("command -v {kind}")), "{ssh}");
+            assert!(
+                ssh.contains(&format!("{kind} {}", probe.args.join(" "))),
+                "{ssh}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_login_row_outlives_its_enabled_recipe() {
+        let mut recipes = default_recipes();
+        for recipe in recipes.values_mut() {
+            recipe.enabled = false;
+        }
+        for recipes in [recipes, BTreeMap::new()] {
+            let runner = FakeRunner::new();
+            runner.on("ssh", ok(&box_facts()));
+            probe_fakes(&runner);
+            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row.1.contains(" login ") || row.1.contains(" pi ")),
+                "{rows:?}"
+            );
+            let calls = runner.calls.borrow();
+            let ssh = calls
+                .iter()
+                .find(|call| call.program == "ssh")
+                .unwrap()
+                .display();
+            assert!(!ssh.contains("login_"), "{ssh}");
+            assert!(!ssh.contains("herdr-pi"), "{ssh}");
+        }
+    }
+
+    #[test]
+    fn box_readiness_fails_closed_for_unknown_kinds_and_mismatched_providers() {
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&box_facts()));
+        probe_fakes(&runner);
+        let recipes = BTreeMap::from([
+            (
+                "unknown".into(),
+                crate::contracts::Recipe {
+                    kind: "unknown".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mismatch".into(),
+                crate::contracts::Recipe {
+                    kind: "pi".into(),
+                    provider: "openai-codex".into(),
+                    args: vec!["--provider".into(), "opencode-go".into()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+        for id in ["unknown", "mismatch"] {
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.1 == format!("box oci recipe {id}"))
+                    .unwrap()
+                    .0,
+                Some(false)
+            );
+        }
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.1.contains(" login ") || row.1.contains(" pi "))
+        );
+    }
+
     fn box_facts() -> String {
         let mut lines: Vec<String> = [
             "host\toci-pi",
@@ -1104,7 +1340,7 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
         probe_fakes(&runner);
-        let rows = box_rows(&runner, "herdr", &box_profile());
+        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes());
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -1145,7 +1381,7 @@ mod tests {
             "{ssh}"
         );
         assert!(
-            ssh.contains("command -v codex") && ssh.contains("codex login status"),
+            !ssh.contains("command -v codex") && !ssh.contains("codex login status"),
             "{ssh}"
         );
         assert!(
@@ -1164,7 +1400,7 @@ mod tests {
 
         let runner = FakeRunner::new();
         runner.on("ssh", fail(255, "ssh: connect timed out"));
-        let rows = box_rows(&runner, "herdr", &box_profile());
+        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, Some(false));
         assert!(rows[0].2.contains("unreachable"));
@@ -1187,7 +1423,7 @@ mod tests {
             ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
         );
         runner.on("workspace close", ok(r#"{"result":{}}"#));
-        let rows = box_rows(&runner, "herdr", &box_profile());
+        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes());
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -1195,7 +1431,7 @@ mod tests {
         };
         assert_eq!(find("box oci login agy").0, Some(false));
         assert_eq!(find("box oci tools").0, Some(false));
-        assert!(find("box oci tools").2.contains("claude agy"));
+        assert!(find("box oci tools").2.contains("agy claude"));
         assert!(!find("box oci tools").2.contains("codex"));
         assert_eq!(find("box oci pi pro").0, Some(false));
     }
@@ -1217,7 +1453,7 @@ mod tests {
     }
 
     fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
-        box_rows(runner, "herdr", &box_profile())
+        box_rows(runner, "herdr", &box_profile(), &default_recipes())
             .into_iter()
             .find(|(_, name, _)| name == label)
             .unwrap_or_else(|| panic!("no row {label}"))
