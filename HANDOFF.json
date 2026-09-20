@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0111.md",
+      "tasks/t-0112.md",
+      "tasks/review-r51.md",
+      "tasks/t-0110.md",
       "tasks/t-0109.md",
       "tasks/review-r50.md",
       "tasks/t-0108.md",
@@ -18,17 +22,14 @@
       "tasks/review-r49.md",
       "tasks/t-0106.md",
       "tasks/t-0105.md",
-      "tasks/t-0104.md",
-      "tasks/review-r48.md",
-      "tasks/t-0103.md",
-      "tasks/review-r47.md",
-      "tasks/t-0101.md"
+      "tasks/t-0104.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r51.md",
       "tasks/reviews/code-r50.md",
       "tasks/reviews/code-r49.md",
       "tasks/reviews/code-r48.md",
@@ -39,15 +40,18 @@
       "tasks/reviews/code-r42.md",
       "tasks/reviews/code-r41.md",
       "tasks/reviews/code-r38.md",
-      "tasks/reviews/code-r39.md",
-      "tasks/reviews/code-r35.md"
+      "tasks/reviews/code-r39.md"
     ]
   },
-  "generated": "2026-09-20T04:51:42-04:00",
+  "generated": "2026-09-20T06:56:25-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0109-review-r50-this-round-checks-that-a-ques",
       "main",
+      "hp/adeherdr/t-0112-d12-a-lane-goes-to-a-machine-that-can-ac",
+      "hp/adeherdr/t-0111-review-r51-this-round-checks-that-the-he",
+      "review/r51",
+      "hp/adeherdr/t-0110-d11-the-health-check-looks-at-every-mach",
+      "hp/adeherdr/t-0109-review-r50-this-round-checks-that-a-ques",
       "review/r50",
       "hp/adeherdr/t-0108-e7-a-question-answered-is-not-a-failure",
       "hp/adeherdr/t-0107-review-r49-this-round-checks-that-a-refu",
@@ -185,22 +189,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "e94ca28 docs(review): round r50 verdict",
-      "41af076 review(git): keep optional branch queries in the local namespace",
-      "7e40f42 Merge commit '47002d8f9234d828db85fcb8b1ed30bb8cd04ad6' into hp/adeherdr/t-0109-review-r50-this-round-checks-that-a-ques",
-      "a00f467 docs(tasks): t-0109",
-      "5375a97 review(r50): brief for revision 1",
-      "47002d8 fix(ledger): separate probe answers from command failures"
+      "3c0afaf Merge commit '837f62a4d9b15360eaa77192a86a50188a8d6669'",
+      "837f62a docs(review): round r51 verdict",
+      "ba29a02 Merge commit '7b5974dfeb5a50dff674f6c3f6bdcb35f0f4b4cc' into hp/adeherdr/t-0111-review-r51-this-round-checks-that-the-he",
+      "7507186 docs(tasks): t-0112",
+      "7a5d5f6 docs(tasks): t-0111",
+      "bc79893 review(r51): brief for revision 1"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "e94ca28",
+        "head": "3c0afaf",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r50 verdict"
+        "subject": "Merge commit '837f62a4d9b15360eaa77192a86a50188a8d6669'"
       },
       {
         "branch": "review/r1",
@@ -488,6 +492,13 @@
         "head": "a00f467",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r50",
         "subject": "docs(tasks): t-0109"
+      },
+      {
+        "branch": "review/r51",
+        "dirty": 0,
+        "head": "7a5d5f6",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r51",
+        "subject": "docs(tasks): t-0111"
       },
       {
         "branch": "review/r6",
@@ -957,6 +968,13 @@
         "head": "69cc1b0",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0098",
         "subject": "checkpoint(r47): HANDOFF after merging the round"
+      },
+      {
+        "branch": "hp/adeherdr/t-0112-d12-a-lane-goes-to-a-machine-that-can-ac",
+        "dirty": 0,
+        "head": "657256f",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0112",
+        "subject": "fix(dispatch): place picks only on ready machines"
       }
     ]
   },
@@ -981,15 +999,38 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r50",
-    "verdict": "e94ca287f249f0a08dbb56727dd2de45f24353fd"
+    "round": "r51",
+    "verdict": "837f62a4d9b15360eaa77192a86a50188a8d6669"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [],
+  "workers": [
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0112",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0112",
+      "pane_id": "w1G:p33",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0112--/2026-09-20T09-55-52-745Z_01a0be3e-5b29-7553-a5d8-d06e03120283.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t2Z",
+      "tab_label": "t-0112",
+      "title": "π - t-0112",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0112",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0112"
+      }
+    }
+  ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 2
+    "tabs": 3
   }
 }
