@@ -619,7 +619,13 @@ pub fn policy_hash(config_dir: &Path) -> String {
 }
 
 /// Launch recipe stored on the thread, never rebuilt from mutable settings.
-pub fn launch_recipe(spec: &RoleSpec, attempt: u32, brief_hash: String, policy: String) -> Launch {
+pub fn launch_recipe(
+    spec: &RoleSpec,
+    attempt: u32,
+    brief_hash: String,
+    policy: String,
+    role: &str,
+) -> Launch {
     Launch {
         kind: spec.kind.clone(),
         args: spec.args.clone(),
@@ -632,6 +638,7 @@ pub fn launch_recipe(spec: &RoleSpec, attempt: u32, brief_hash: String, policy: 
         policy_hash: policy,
         attempt,
         brief_hash,
+        skill_hash: crate::thread::sha256_hex(crate::lane::skill_text(role).as_bytes()),
         ..Launch::default()
     }
 }
@@ -1163,7 +1170,7 @@ mod tests {
             kind: "dsh".into(),
             ..RoleSpec::default()
         };
-        let recipe = launch_recipe(&spec, 1, "bh".into(), "ph".into());
+        let recipe = launch_recipe(&spec, 1, "bh".into(), "ph".into(), "lane");
         assert_eq!(recipe.ready_timeout_ms, 20_000);
         let env = tab_env("demo", "t-0001", 1, "abcd", "", &spec);
         assert!(

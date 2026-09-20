@@ -160,6 +160,11 @@ pub struct Launch {
     pub policy_hash: String,
     pub attempt: u32,
     pub brief_hash: String,
+    /// The SHA-256 of the role's skill text at the moment this lane (or the
+    /// coordinator) was primed. Staleness compares it with the skill file now
+    /// on disk, so a running agent stuck on an old copy is visible (LEAN U4).
+    #[serde(default)]
+    pub skill_hash: String,
     pub recipe_id: String,
     pub reason: String,
     /// The compact `<job> runs on <plain>` sentence for the board's
@@ -841,6 +846,7 @@ mod tests {
             policy_hash: "cc".into(),
             attempt: 1,
             brief_hash: String::new(),
+            skill_hash: "aa".into(),
             recipe_id: "agy_gemini_flash".into(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
