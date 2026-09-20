@@ -43,19 +43,6 @@ impl FileLock {
     }
 }
 
-/// Lane states. Only `ready` accepts a turn.
-pub const LANE_STATES: &[&str] = &[
-    "starting",
-    "ready",
-    "in_turn",
-    "answered",
-    "failed",
-    "sign_in_required",
-    "bridge_down",
-    "cooldown",
-    "gone",
-];
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lane {
     pub name: String,
@@ -100,7 +87,7 @@ impl Lane {
         write_atomic(&layout.lane(&self.name), &self.to_toml()?)
     }
 
-    pub fn to_toml(&self) -> Result<String> {
+    fn to_toml(&self) -> Result<String> {
         toml::to_string(self).context("could not serialize the lane record")
     }
 
@@ -160,7 +147,7 @@ impl Turn {
         self.write_to(&layout.turn(&self.tag))
     }
 
-    pub fn write_to(&self, path: &Path) -> Result<()> {
+    fn write_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string(self).context("could not serialize the turn record")?;
         write_atomic(path, &text)
     }
@@ -301,7 +288,7 @@ impl Inflight {
 
 /// A lock with no write for this long belongs to a turn that can no longer be
 /// running (two-hour turn timeout plus slack).
-pub const LOCK_STALE: Duration = Duration::from_secs(125 * 60);
+const LOCK_STALE: Duration = Duration::from_secs(125 * 60);
 
 /// The number of in-flight turns, with locks older than [`LOCK_STALE`] removed
 /// first.

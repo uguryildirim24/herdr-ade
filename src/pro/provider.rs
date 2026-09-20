@@ -21,7 +21,7 @@ pub const PROVIDER_ID: &str = "pro";
 pub const MODEL_ID: &str = "pro";
 
 /// The provider table. An answer-only worker: no reasoning effort, text only.
-pub fn provider_config(base_url: &str, token: &str) -> Value {
+fn provider_config(base_url: &str, token: &str) -> Value {
     json!({
         "name": "Pro",
         "baseUrl": base_url,
