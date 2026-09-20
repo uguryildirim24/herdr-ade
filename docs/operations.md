@@ -100,7 +100,7 @@ When Rolf asks in chat to change a recorded choice, the coordinator treats it li
 
 ## Rounds
 
-`hp round advance <slug>` starts the reviewer on its own, and after a REJECT, once `hp round review` has made the next revision, the next `advance` starts and binds the new reviewer for that revision.
+A round is a set of lanes that are reviewed and merged together. `hp round advance <slug>` starts the reviewer on its own, including after a REJECT once `hp round review <slug> <round>` makes the next revision. When `hp round merge <slug> <round>` refuses with `merge_conflict` because another round landed first, run `hp round review <slug> <round>`: it keeps the brief commit B, opens the next `review/<round>-<n>` branch from the current integration head and clears the reviewer. The next `hp round advance <slug>` starts a reviewer whose task names the earlier candidate C and verdict commit V, so the reviewer merges C, including the earlier reviewer's fixes, over the new base instead of merging the raw lane shas. A round never gets a second reviewer while one is bound; `hp round reviewer` can replace one that is resolved or gone.
 
 ## Safety settings
 

@@ -61,6 +61,10 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
     for event in crate::events::list(project) {
+        // A resolved lane is finished: its delivery journal is never replayed.
+        if thread::load(project, &event.thread).is_ok_and(|lane| lane.status == Status::Resolved) {
+            continue;
+        }
         let states = match crate::events::states(project, &event.id) {
             Ok(states) => states,
             Err(error) => {
@@ -1506,6 +1510,38 @@ mod tests {
         // Once repaired, the wake-up is never typed a second time.
         deliver_events(&ctx, &project).unwrap();
         assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    /// A resolved lane is finished: its delivery journal is never replayed,
+    /// even when the event was read before its wake-up line was typed.
+    #[test]
+    fn a_resolved_lane_event_is_never_replayed() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.title = "Lane".into();
+            t.status = Status::Resolved;
+            t.resolved_reason = "manual".into();
+        })
+        .unwrap();
+        let event = sealed_done(&project, &lane.id);
+        crate::events::append_delivery(
+            &project,
+            &event.id,
+            crate::contracts::DeliveryState::Acknowledged,
+        )
+        .unwrap();
+
+        let ctx = world.ctx();
+        deliver_events(&ctx, &project).unwrap();
+
+        assert!(
+            typed_lines(&world).is_empty(),
+            "no replay for a resolved lane"
+        );
+        assert_eq!(
+            crate::events::states(&project, &event.id).unwrap(),
+            vec![crate::contracts::DeliveryState::Acknowledged]
+        );
     }
 
     #[test]
