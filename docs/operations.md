@@ -1,6 +1,6 @@
 # Operations and development
 
-How Herdr Projects works, what it writes where, what its safety settings do and don't stop, and how to run threads on other machines.
+How Herdr ADE works, what it writes where, what its safety settings do and don't stop, and how to run threads on other machines.
 
 ## How it works
 
@@ -9,7 +9,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 - **Files are the record, prompts are nudges.** Thread and round records own their state; `context` renders it directly at the start of every turn. The inbox holds only messages such as courier deliveries, machine notices and routine runs. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pull requests (every two minutes), routines, auto-resolve. Remote machines are polled once a minute.
 - **Tools are found even under a bare `PATH`.** A Herdr server started outside a login shell gives its plugins a minimal `PATH`; the binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own, so the ticker finds `gh`, `rsync` and friends. `ticker status` and `doctor` show what resolved.
-- **Nothing destructive is automatic.** The binary never removes a worktree, deletes a branch, merges or pushes on its own. Text from reports, pull requests and command output is never placed in a prompt.
+- **Destructive work is explicit.** The binary never deletes a branch and only removes a worktree or merges in response to the matching command. Text from reports, pull requests and command output is never placed in a prompt.
 
 ## Where things live
 
@@ -35,7 +35,7 @@ Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>
 
 `PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`), `talk` (default: on for a `claude` coordinator), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. `[roles.*]` is gone from both files and is refused. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). At dispatch, the full task and repository facts are scored by Jev; `routing.json` maps the scores to a recipe. Workflow labels such as reviewer still select skill text, never a model table.
 
-The birth sentence is required: `thread start` and `thread adopt` take `--plain`. The checker refuses an empty sentence, more than one sentence, or an identifier-shaped token; a thread or round sentence drops the known-word rule, because it is a row on a screen and may name a file. Default role is `lane`. `--passive` on adopt sets the parent token and sends no primer.
+The birth sentence is required: `thread start` and `thread adopt` take `--plain`. The checker refuses an empty sentence, more than one sentence, or an identifier-shaped token; a thread or round sentence drops the known-word rule, because it is a row on a screen and may name a file. The default workflow is `lane`. `--passive` on adopt sets the parent token and sends no primer.
 
 `config.toml` also carries the harness repositories under `[harness] repos` (rows with `path` and `box_path`, the same shape a project's `repos` rows have). Every project may start a lane or open a round on a harness repository, listed in `PROJECT.md` or not; a repository that is neither listed nor a harness repository is refused. `harness install` builds each harness repository after a merge and installs it into `~/.local/bin`, then the same on a saved box.
 
@@ -196,7 +196,6 @@ For other agents the principle is the same: allow reading and steering, keep any
 - **A thread can impersonate you.** Any thread agent can prompt the coordinator's pane through Herdr, and that message carries no ticker marker. The skill's rule that a go-ahead must name the threads lowers the risk; it does not remove it.
 - **An approved routine command covers the command text only.** `./check.sh` keeps its hash while the script changes.
 - **Prompt injection is reduced, not removed.** The coordinator reads reports and may choose to fetch pull request comments itself. Memory is a carrier: whatever it writes there is inlined into every later brief.
-- **Agent variety.** The skill and briefs are agent-neutral, but only Claude Code has been exercised.
 - **Cost.** Every thread is a full agent session, and each nudge and each `context` spends coordinator tokens.
 
 ## Nudges and notifications
@@ -234,10 +233,7 @@ No plugin code is involved: install Herdr and this plugin on an always-on machin
 ## Development
 
 ```bash
-cargo test                       # unit tests and scenarios against a scripted fake runner
-scripts/dev-server               # a throwaway `hp-dev` Herdr session with a scratch root
-scripts/dev-hp <subcommand>      # the binary against <repo>/.dev-root; pass --session hp-dev to open/doctor
-scripts/dev-herdr <args>         # herdr against that session
+cargo test
 ```
 
 Never develop against your default session or `~/.herdr-ade`. Use `HERDR_ADE_ROOT` and `XDG_CONFIG_HOME` under `/var/tmp`.
