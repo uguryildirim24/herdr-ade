@@ -1183,6 +1183,12 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     let (agents, panes) = lists_for(&view, &record)?;
     let now = jiff::Timestamp::now();
     let live = thread::live_state(&record, &agents, &panes, now);
+    let role = if record.role.is_empty() {
+        "lane"
+    } else {
+        record.role.as_str()
+    };
+    let skill_hash = thread::sha256_hex(crate::lane::skill_text(role).as_bytes());
     if record.is_remote() {
         // A box lane restarts from its brief: the same refusals, then the
         // exact start line again (SPEC-remote §6). The new attempt gets its
@@ -1191,6 +1197,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
         thread::update(&project, id, |t| {
             t.attempt = t.attempt.max(1).saturating_add(1);
             t.launch.attempt = t.attempt;
+            t.launch.skill_hash = skill_hash.clone();
         })?;
         if !record.tab_id.is_empty() {
             let _ = view
@@ -1220,6 +1227,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     thread::update(&project, id, |t| {
         t.attempt = t.attempt.max(1).saturating_add(1);
         t.launch.attempt = t.attempt;
+        t.launch.skill_hash = skill_hash.clone();
     })?;
     match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
