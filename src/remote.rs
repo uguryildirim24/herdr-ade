@@ -13,7 +13,6 @@ use crate::runner::{Cmd, Output, Runner};
 
 const SSH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
-#[allow(dead_code)]
 const COPY_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_OPTIONS: [&str; 4] = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"];
 
@@ -389,7 +388,6 @@ fn fetch_file(
 /// §4.3): every plain path in one call. A path scp cannot carry safely is
 /// refused here and fetched with [`fetch_file`]. The second lane's courier
 /// calls this; the start side never does.
-#[allow(dead_code)]
 pub(crate) fn fetch_batch(
     runner: &dyn Runner,
     target: &str,
