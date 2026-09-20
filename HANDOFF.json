@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0100.md",
+      "tasks/review-r45.md",
+      "tasks/t-0099.md",
+      "tasks/review-r44.md",
       "tasks/t-0098.md",
       "tasks/t-0096.md",
       "tasks/t-0097.md",
@@ -18,17 +22,14 @@
       "tasks/review-r43.md",
       "tasks/review-r42.md",
       "tasks/t-0093.md",
-      "tasks/t-0094.md",
-      "tasks/review-r41.md",
-      "tasks/t-0090.md",
-      "tasks/t-0091.md",
-      "tasks/review-r39.md"
+      "tasks/t-0094.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r45.md",
       "tasks/reviews/code-r43.md",
       "tasks/reviews/code-r42.md",
       "tasks/reviews/code-r41.md",
@@ -39,17 +40,20 @@
       "tasks/reviews/code-r36.md",
       "tasks/reviews/code-r34.md",
       "tasks/reviews/code-r32.md",
-      "tasks/reviews/code-r33.md",
-      "tasks/reviews/code-r30.md"
+      "tasks/reviews/code-r33.md"
     ]
   },
-  "generated": "2026-09-19T23:44:35-04:00",
+  "generated": "2026-09-20T00:07:17-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0098-calibrate-the-picker-on-this-project-s-o",
+      "hp/adeherdr/t-0099-d7-bound-what-dispatch-sends-and-say-wha",
+      "hp/adeherdr/t-0100-review-r45-this-round-checks-that-the-me",
       "main",
-      "hp/adeherdr/t-0096-review-r43-this-round-checks-that-the-ta",
+      "review/r45",
       "hp/adeherdr/t-0097-e1-the-message-list-stops-repeating-the",
+      "review/r44",
+      "hp/adeherdr/t-0098-calibrate-the-picker-on-this-project-s-o",
+      "hp/adeherdr/t-0096-review-r43-this-round-checks-that-the-ta",
       "hp/adeherdr/t-0095-review-r42-this-round-checks-that-one-re",
       "review/r43",
       "review/r42",
@@ -167,22 +171,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "f9ee3a5 docs(tasks): t-0098",
-      "3c5d75a checkpoint(r43): HANDOFF after merging the round",
-      "c6e8d56 Merge commit '0b5a0f74b959f829de573d84212e1f2ac53082eb'",
-      "0b5a0f7 docs(review): round r43 verdict",
-      "cf4895b review(round): restart a gone reviewer without removed flags",
-      "04fdd1e docs(tasks): t-0097"
+      "2e521c3 docs(review): round r45 verdict",
+      "c36e12c review(context): show r43 failure evidence before acknowledging it",
+      "73f6bfc review(context): retain report updates beyond sealed evidence",
+      "839a273 review(inbox): merge pinned t-0097 preserving escalation tick",
+      "ee6a42f docs(tasks): t-0100",
+      "1421976 review(r45): brief for revision 1"
     ],
-    "remote": "1 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "f9ee3a5",
+        "head": "2e521c3",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(tasks): t-0098"
+        "subject": "docs(review): round r45 verdict"
       },
       {
         "branch": "review/r1",
@@ -414,6 +418,20 @@
         "head": "24aff4a",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r43",
         "subject": "docs(tasks): t-0096"
+      },
+      {
+        "branch": "review/r44",
+        "dirty": 0,
+        "head": "121aa10",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r44",
+        "subject": "review(r44): brief for revision 1"
+      },
+      {
+        "branch": "review/r45",
+        "dirty": 0,
+        "head": "ee6a42f",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r45",
+        "subject": "docs(tasks): t-0100"
       },
       {
         "branch": "review/r5",
@@ -914,8 +932,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r1",
-    "verdict": "356c0fa90c6146dfac7b3c10fba5a5a6e58599b4"
+    "round": "r45",
+    "verdict": "2e521c36baf5d23f39c93473d533a531644e5035"
   },
   "session": "default",
   "unlinked_agents": [],
