@@ -226,6 +226,9 @@ fn report(
             continue;
         };
         let label = format!("project {slug}");
+        if let Some(warning) = crate::thread::memory_use(&project).warning() {
+            check(&mut out, None, &format!("{label} memory"), warning);
+        }
         if let Ok(text) = std::fs::read_to_string(project.project_md())
             && let Ok(front) = project::project_md_front(&text)
         {
@@ -723,6 +726,33 @@ mod tests {
         assert!(text.contains("plugin:     herdr-ade"), "{text}");
         assert!(text.contains("crate:      herdr-ade"), "{text}");
         assert!(text.contains("prefix:"), "{text}");
+    }
+
+    #[test]
+    fn a_project_over_its_memory_budget_warns_and_does_not_fail() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        std::fs::create_dir_all(project.dir().join("memory")).unwrap();
+        std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n- state\n").unwrap();
+        std::fs::write(
+            project.dir().join("memory/state.md"),
+            "x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
+        )
+        .unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(healthy, "{text}");
+        assert!(text.contains("[warn] project demo memory"), "{text}");
+        assert!(text.contains("memory/state.md"), "{text}");
+        assert!(text.contains("memory/archive/"), "{text}");
     }
 
     fn box_facts() -> String {
