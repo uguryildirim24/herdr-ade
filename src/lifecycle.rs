@@ -46,7 +46,7 @@ fn alive_panes(project: &Project, view: &SessionView) -> Vec<(String, String, St
     alive
 }
 
-pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
+pub(crate) fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let current = project.status();
     match (current, status) {
@@ -94,7 +94,7 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
 
 /// Moves the project folder to `<root>/.trash/<slug>-<timestamp>/`. Touches no
 /// worktree, branch or pull request.
-pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
+pub(crate) fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if !force && let Some(view) = threads::session_view(ctx, &project) {
         let alive = alive_panes(&project, &view);

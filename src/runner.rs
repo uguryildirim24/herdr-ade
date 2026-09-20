@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 /// `Answer` only when *every normal exit* answers the question. Ambiguous probes
 /// (for example SSH checks) must keep `Required`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitMeaning {
+pub(crate) enum ExitMeaning {
     Required,
     Answer,
     /// Zero means yes; one with empty stderr means no. Every other outcome
@@ -20,7 +20,7 @@ pub enum ExitMeaning {
 }
 
 impl ExitMeaning {
-    pub fn answered(self, out: &Output) -> bool {
+    pub(crate) fn answered(self, out: &Output) -> bool {
         out.success()
             || (self == Self::Answer && out.code.is_some() && !out.timed_out)
             || (self == Self::Boolean && out.boolean_answer().is_some())
@@ -28,21 +28,21 @@ impl ExitMeaning {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Cmd {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-    pub env_remove: Vec<String>,
-    pub cwd: Option<PathBuf>,
-    pub stdin: Option<String>,
-    pub timeout: Duration,
-    pub exit_meaning: ExitMeaning,
+pub(crate) struct Cmd {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) env_remove: Vec<String>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) stdin: Option<String>,
+    pub(crate) timeout: Duration,
+    pub(crate) exit_meaning: ExitMeaning,
     /// Spawn in its own process group and kill the whole group on timeout.
-    pub own_group: bool,
+    pub(crate) own_group: bool,
 }
 
 impl Cmd {
-    pub fn new(program: impl Into<String>, timeout: Duration) -> Self {
+    pub(crate) fn new(program: impl Into<String>, timeout: Duration) -> Self {
         Cmd {
             program: program.into(),
             args: Vec::new(),
@@ -56,12 +56,12 @@ impl Cmd {
         }
     }
 
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+    pub(crate) fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
-    pub fn args<I, S>(mut self, args: I) -> Self
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -70,39 +70,39 @@ impl Cmd {
         self
     }
 
-    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub(crate) fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
     }
 
-    pub fn env_remove(mut self, key: impl Into<String>) -> Self {
+    pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.env_remove.push(key.into());
         self
     }
 
-    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+    pub(crate) fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 
-    pub fn stdin(mut self, text: impl Into<String>) -> Self {
+    pub(crate) fn stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
         self
     }
 
-    pub fn exit_meaning(mut self, meaning: ExitMeaning) -> Self {
+    pub(crate) fn exit_meaning(mut self, meaning: ExitMeaning) -> Self {
         self.exit_meaning = meaning;
         self
     }
 
-    pub fn own_group(mut self) -> Self {
+    pub(crate) fn own_group(mut self) -> Self {
         self.own_group = true;
         self
     }
 
     /// The command as one line; the scripted fake matches on it.
     #[cfg(test)]
-    pub fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         let mut line = self.program.clone();
         for arg in &self.args {
             line.push(' ');
@@ -113,22 +113,22 @@ impl Cmd {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Output {
+pub(crate) struct Output {
     /// `None` when the process was killed (timeout or signal).
-    pub code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    pub timed_out: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
 }
 
 impl Output {
-    pub fn success(&self) -> bool {
+    pub(crate) fn success(&self) -> bool {
         self.code == Some(0) && !self.timed_out
     }
 
     /// Decode the `ExitMeaning::Boolean` contract. `None` is a failed probe,
     /// including timeouts/signals, not a negative answer.
-    pub fn boolean_answer(&self) -> Option<bool> {
+    pub(crate) fn boolean_answer(&self) -> Option<bool> {
         if self.timed_out {
             return None;
         }
@@ -140,7 +140,7 @@ impl Output {
     }
 
     /// stderr when it has text, else stdout, trimmed; for error messages.
-    pub fn error_text(&self) -> String {
+    pub(crate) fn error_text(&self) -> String {
         if self.timed_out {
             return "timed out".to_string();
         }
@@ -153,7 +153,7 @@ impl Output {
     }
 }
 
-pub trait Runner {
+pub(crate) trait Runner {
     /// `Err` means the command could not be spawned at all (for example the
     /// program is missing). A non-zero exit or a timeout is an `Ok(Output)`.
     fn run(&self, cmd: &Cmd) -> Result<Output>;
@@ -164,7 +164,7 @@ pub trait Runner {
     fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String>;
 }
 
-pub struct RealRunner;
+pub(crate) struct RealRunner;
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -298,7 +298,7 @@ fn kill(child: &mut std::process::Child, own_group: bool) {
 }
 
 #[cfg(test)]
-pub mod fake {
+pub(crate) mod fake {
     use super::*;
     use std::cell::RefCell;
 
@@ -308,20 +308,20 @@ pub mod fake {
     /// A scripted runner: the first rule whose matcher accepts the command
     /// answers it. Every command is recorded, matched or not.
     #[derive(Default)]
-    pub struct FakeRunner {
+    pub(crate) struct FakeRunner {
         rules: RefCell<Vec<(Matcher, Answer)>>,
-        pub calls: RefCell<Vec<Cmd>>,
+        pub(crate) calls: RefCell<Vec<Cmd>>,
         /// (socket, request line) of every socket request.
-        pub socket_requests: RefCell<Vec<(PathBuf, String)>>,
+        pub(crate) socket_requests: RefCell<Vec<(PathBuf, String)>>,
     }
 
     impl FakeRunner {
-        pub fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::default()
         }
 
         /// Answer commands whose display line contains `needle`.
-        pub fn on(&self, needle: &str, output: Output) -> &Self {
+        pub(crate) fn on(&self, needle: &str, output: Output) -> &Self {
             let needle = needle.to_string();
             self.rules.borrow_mut().push((
                 Box::new(move |cmd| cmd.display().contains(&needle)),
@@ -330,7 +330,7 @@ pub mod fake {
             self
         }
 
-        pub fn on_fn(
+        pub(crate) fn on_fn(
             &self,
             matcher: impl Fn(&Cmd) -> bool + 'static,
             answer: impl Fn(&Cmd) -> Result<Output> + 'static,
@@ -341,7 +341,7 @@ pub mod fake {
             self
         }
 
-        pub fn count(&self, needle: &str) -> usize {
+        pub(crate) fn count(&self, needle: &str) -> usize {
             self.calls
                 .borrow()
                 .iter()
@@ -351,7 +351,7 @@ pub mod fake {
 
         /// Canned herdr replies for the ADE verbs named in SPEC-ADE §1.3.
         /// No plugin behaviour is implemented yet; later lanes match on these needles.
-        pub fn on_ade_new_verbs(&self) -> &Self {
+        pub(crate) fn on_ade_new_verbs(&self) -> &Self {
             for (needle, stdout) in ADE_NEW_VERB_REPLIES {
                 self.on(needle, ok(stdout));
             }
@@ -360,7 +360,7 @@ pub mod fake {
     }
 
     /// Scenario names in SPEC-ADE §1.3 for the new verbs.
-    pub const ADE_NEW_VERB_SCENARIOS: [&str; 9] = [
+    pub(crate) const ADE_NEW_VERB_SCENARIOS: [&str; 9] = [
         "thread_start_parent",
         "ha_done",
         "ha_waiting",
@@ -407,7 +407,7 @@ pub mod fake {
         ),
     ];
 
-    pub fn ok(stdout: &str) -> Output {
+    pub(crate) fn ok(stdout: &str) -> Output {
         Output {
             code: Some(0),
             stdout: stdout.to_string(),
@@ -415,7 +415,7 @@ pub mod fake {
         }
     }
 
-    pub fn fail(code: i32, stderr: &str) -> Output {
+    pub(crate) fn fail(code: i32, stderr: &str) -> Output {
         Output {
             code: Some(code),
             stderr: stderr.to_string(),
@@ -423,7 +423,7 @@ pub mod fake {
         }
     }
 
-    pub fn timeout() -> Output {
+    pub(crate) fn timeout() -> Output {
         Output {
             timed_out: true,
             ..Output::default()

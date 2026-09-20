@@ -12,14 +12,14 @@ use crate::contracts::{BOX_REPOS, BoxRepoMap, MACHINE_LOCAL, MachineProfile};
 use crate::runner::{Cmd, Output, Runner};
 
 const SSH_TIMEOUT: Duration = Duration::from_secs(10);
-pub const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
+pub(crate) const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
 #[allow(dead_code)]
 const COPY_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_OPTIONS: [&str; 4] = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"];
 
 /// Single-quote escaping: safe for any value in an `sh` command string. Plain
 /// words are left bare so printed commands stay readable and stable.
-pub fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     if is_plain(value) {
         value.to_string()
     } else {
@@ -53,7 +53,7 @@ struct SavedMachine {
 
 /// The stable profile of one saved machine (SPEC-remote §4.1). `local` is a
 /// real profile with no SSH target.
-pub fn machine_profile(
+pub(crate) fn machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
     config_dir: &Path,
@@ -65,7 +65,7 @@ pub fn machine_profile(
 
 /// The saved profile when it exists. A missing profile is distinct from a
 /// failed or malformed machine list so callers never silently skip box work.
-pub fn optional_machine_profile(
+pub(crate) fn optional_machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
     _config_dir: &Path,
@@ -110,7 +110,10 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
 
 /// Names of every enabled saved machine. An explicit `--machine` may place
 /// work on any one of these, even when no current thread uses it.
-pub fn registered_machine_names(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<String>> {
+pub(crate) fn registered_machine_names(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+) -> Result<Vec<String>> {
     saved_machines(runner, herdr_bin)?
         .into_iter()
         .filter(|machine| machine.enabled)
@@ -128,14 +131,14 @@ pub fn registered_machine_names(runner: &dyn Runner, herdr_bin: &str) -> Result<
 
 /// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box
 /// path is never derived from the Mac path.
-pub fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
+pub(crate) fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
     BOX_REPOS.iter().find(|row| row.mac == mac_path)
 }
 
 /// The URL-matched remote name in `repo`, never by remote name alone. The
 /// second lane's courier calls this to fetch the lane commit (SPEC-remote
 /// §4.3); the start side pushes by URL directly.
-pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
+pub(crate) fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
     let out = runner.run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote"]))?;
     if !out.success() {
         bail!("git remote in {repo}: {}", out.error_text());
@@ -191,7 +194,7 @@ fn check_target(target: &str) -> Result<()> {
 
 /// Runs `script` on the machine with `sh -c`. The script is one argument; every
 /// value inside it must already have gone through `quote`.
-pub fn ssh(
+pub(crate) fn ssh(
     runner: &dyn Runner,
     target: &str,
     script: &str,
@@ -214,15 +217,15 @@ pub fn ssh(
 /// One box start's git effect (SPEC-remote §4.2 step 3): the box fetches the
 /// lane branch, verifies `FETCH_HEAD = B`, and creates the worktree from it
 /// under the box clone. One SSH call; nothing is copied.
-pub struct Provision<'a> {
-    pub box_repo: &'a str,
-    pub worktree: &'a str,
-    pub branch: &'a str,
-    pub base: &'a str,
-    pub publish_url: &'a str,
+pub(crate) struct Provision<'a> {
+    pub(crate) box_repo: &'a str,
+    pub(crate) worktree: &'a str,
+    pub(crate) branch: &'a str,
+    pub(crate) base: &'a str,
+    pub(crate) publish_url: &'a str,
 }
 
-pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Result<()> {
+pub(crate) fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Result<()> {
     let script = format!(
         "set -e\n\
          cd {repo} || exit 3\n\
@@ -274,7 +277,7 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
 /// The box's lane card: created after the pane id exists (SPEC-remote §4.2
 /// step 5). One SSH call, card bytes on stdin. A minimal `PROJECT.md` is
 /// written when the box has none, so the box's own `ha` can resolve it.
-pub fn provision_card(
+pub(crate) fn provision_card(
     runner: &dyn Runner,
     target: &str,
     slug: &str,
@@ -312,7 +315,7 @@ pub fn provision_card(
 /// The courier's helper call over its multiplexed connection (SPEC-remote
 /// §4.3): the box-local helper runs `sh -c <script>` and the following
 /// `scp` reuses the same control socket.
-pub fn ssh_courier(
+pub(crate) fn ssh_courier(
     runner: &dyn Runner,
     target: &str,
     control_dir: &Path,
@@ -387,7 +390,7 @@ fn fetch_file(
 /// refused here and fetched with [`fetch_file`]. The second lane's courier
 /// calls this; the start side never does.
 #[allow(dead_code)]
-pub fn fetch_batch(
+pub(crate) fn fetch_batch(
     runner: &dyn Runner,
     target: &str,
     control_dir: &Path,

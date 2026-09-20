@@ -12,8 +12,8 @@ use crate::project::{self, Coordinator, Project, Status};
 use crate::remote::quote;
 use crate::{inbox, ticker};
 
-pub const TOKEN_TTL: Duration = Duration::from_secs(300);
-pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
+pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(300);
+pub(crate) const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
 /// The digest is a work queue, not an archive. Full records remain at the
 /// source named by each overflow notice. Apply this to nested lists too.
@@ -31,7 +31,7 @@ fn overflow(out: &mut String, total: usize, source: &str) {
 
 /// `<binary> --root <root>`: the fixed shape every printed command starts
 /// with, so allow-list patterns can match on it. Values with spaces are quoted.
-pub fn command_prefix(binary: &Path, root: &Path) -> String {
+pub(crate) fn command_prefix(binary: &Path, root: &Path) -> String {
     format!(
         "{} --root {}",
         quote(&binary.to_string_lossy()),
@@ -39,18 +39,18 @@ pub fn command_prefix(binary: &Path, root: &Path) -> String {
     )
 }
 
-pub fn current_prefix(root: &Path) -> Result<String> {
+pub(crate) fn current_prefix(root: &Path) -> Result<String> {
     let binary = std::env::current_exe().context("could not find this binary's own path")?;
     Ok(command_prefix(&binary, root))
 }
 
-pub fn agent_name(slug: &str) -> String {
+pub(crate) fn agent_name(slug: &str) -> String {
     format!("hp-{slug}-coordinator")
 }
 
 /// One line, carrying the full prefix, so the coordinator reads no file outside
 /// its working directory to start.
-pub fn priming_prompt(prefix: &str, slug: &str) -> String {
+pub(crate) fn priming_prompt(prefix: &str, slug: &str) -> String {
     format!(
         "You are the coordinator of the herdr project `{slug}`. Run `{prefix} skill coordinator` and follow what it prints, then run `{prefix} context {slug}`."
     )
@@ -59,14 +59,14 @@ pub fn priming_prompt(prefix: &str, slug: &str) -> String {
 /// True when `pane` is the pane the record describes: same workspace, tab and
 /// working directory. Ids are only unique within one server, so callers only
 /// ever compare panes listed through the project's recorded socket.
-pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
+pub(crate) fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
     pane.pane_id == record.pane_id
         && pane.workspace_id == record.workspace_id
         && pane.tab_id == record.tab_id
         && pane.cwd == record.cwd
 }
 
-pub fn agent_matches(record: &Coordinator, agent: &Agent) -> bool {
+pub(crate) fn agent_matches(record: &Coordinator, agent: &Agent) -> bool {
     agent.pane_id == record.pane_id
         && agent.workspace_id == record.workspace_id
         && agent.tab_id == record.tab_id
@@ -74,7 +74,7 @@ pub fn agent_matches(record: &Coordinator, agent: &Agent) -> bool {
         && agent.name == record.agent_name
 }
 
-pub fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
+pub(crate) fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
     let _ = herdr.pane_report_tokens(
         pane_id,
         &[("project", slug), ("thread", "coordinator"), ("rank", "0")],
@@ -82,13 +82,13 @@ pub fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
     );
 }
 
-pub struct OpenOptions {
-    pub session: SessionFlags,
-    pub reprime: bool,
-    pub rebind: bool,
+pub(crate) struct OpenOptions {
+    pub(crate) session: SessionFlags,
+    pub(crate) reprime: bool,
+    pub(crate) rebind: bool,
 }
 
-pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
+pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() == Status::Archived {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
@@ -342,7 +342,7 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
     Ok(())
 }
 
-pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
+pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     // A peek reads; it is not the coordinator's receipt (D14).
     if !peek {
@@ -378,7 +378,7 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
 
 /// Test view of the digest and the inbox ids it showed.
 #[cfg(test)]
-pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
+pub(crate) fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
     let (text, items, _) = digest_snapshot(ctx, project, prefix)?;
     Ok((text, items))
 }
@@ -779,7 +779,7 @@ fn digest_snapshot(
 }
 
 /// Retires the coordinator binding and removes only this plugin's hook entry.
-pub fn close(ctx: &Ctx, slug: &str) -> Result<()> {
+pub(crate) fn close(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     crate::hook::remove(&project)?;
     project.update_coordinator(|record| *record = Coordinator::default())?;

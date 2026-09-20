@@ -15,32 +15,32 @@ use crate::thread::{self, CopyOutcome, Group, Status, Thread};
 use crate::threads;
 use crate::{events, inbox, pr, routine};
 
-pub const NUDGE_TEXT: &str =
+pub(crate) const NUDGE_TEXT: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
 const PR_INTERVAL_SECS: i64 = 120;
-pub const DONE_RETENTION_DAYS: u64 = 30;
+pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
 
 /// `.state/ticker.json`: what the ticker compared against last time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct State {
-    pub last_pr_check: String,
-    pub routines: routine::States,
+pub(crate) struct State {
+    pub(crate) last_pr_check: String,
+    pub(crate) routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
-    pub config_errors: BTreeSet<String>,
+    pub(crate) config_errors: BTreeSet<String>,
     /// Hash of the set of unseen item ids that was last nudged.
-    pub nudged: String,
-    pub session_item_written: bool,
+    pub(crate) nudged: String,
+    pub(crate) session_item_written: bool,
 }
 
-pub fn load_state(project: &Project) -> State {
+pub(crate) fn load_state(project: &Project) -> State {
     project::read_json(&project.state_dir().join("ticker.json")).unwrap_or_default()
 }
 
 /// Only the ticker writes this file, so its own read-modify-write is safe; the
 /// write still happens under the project lock, like every `.state/` write.
-pub fn save_state(project: &Project, state: &State) -> Result<()> {
+pub(crate) fn save_state(project: &Project, state: &State) -> Result<()> {
     let _lock = project.lock()?;
     project::write_json(&project.state_dir().join("ticker.json"), state)
 }
@@ -53,7 +53,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 /// no `submitted`) is still typed once, so the wake-up always happens. An
 /// event for a superseded lane attempt is left as it is, sealed and
 /// undelivered.
-pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
+pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
     for event in crate::events::list(project) {
         if event.payload.failed.is_some() {
@@ -109,7 +109,11 @@ pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     first.map_or(Ok(()), Err)
 }
 
-pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Event) -> Result<()> {
+pub(crate) fn deliver_event(
+    ctx: &Ctx,
+    project: &Project,
+    event: &crate::contracts::Event,
+) -> Result<()> {
     let coordinator = project
         .coordinator()
         .ok_or_else(|| anyhow::anyhow!("recipient_unavailable: project has no coordinator"))?;
@@ -237,7 +241,7 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
 /// D11: records the digest of `config.toml` and `RULES.md`; when it moved
 /// since the last tick, one `config-changed` item. Best-effort, not tamper
 /// evidence.
-pub fn config_changed(project: &Project, digest: &str) -> Result<()> {
+pub(crate) fn config_changed(project: &Project, digest: &str) -> Result<()> {
     let path = project.state_dir().join("policy_hash");
     let recorded = std::fs::read_to_string(&path).ok();
     if recorded.as_deref().map(str::trim) == Some(digest) {
@@ -261,17 +265,17 @@ pub fn config_changed(project: &Project, digest: &str) -> Result<()> {
 pub(crate) struct Outage {
     failing_since: Option<jiff::Timestamp>,
     reported: bool,
-    pub last_error: String,
+    pub(crate) last_error: String,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum OutageEvent {
+pub(crate) enum OutageEvent {
     Down,
     Recovered,
 }
 
 impl Outage {
-    pub fn record(
+    pub(crate) fn record(
         &mut self,
         ok: bool,
         error: &str,
@@ -298,29 +302,29 @@ const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MachineMemory {
-    pub outage: Outage,
+    pub(crate) outage: Outage,
     /// Not polled again before this tick: one sleeping machine must not slow
     /// the other projects' ticks.
-    pub skip_until_tick: u64,
-    pub last_poll_tick: u64,
+    pub(crate) skip_until_tick: u64,
+    pub(crate) last_poll_tick: u64,
 }
 
 /// What the ticker process remembers between ticks (not persisted).
-pub struct Memory {
-    pub started: jiff::Timestamp,
-    pub gh: Outage,
-    pub outage_secs: i64,
-    pub tick: u64,
-    pub machines: BTreeMap<String, MachineMemory>,
+pub(crate) struct Memory {
+    pub(crate) started: jiff::Timestamp,
+    pub(crate) gh: Outage,
+    pub(crate) outage_secs: i64,
+    pub(crate) tick: u64,
+    pub(crate) machines: BTreeMap<String, MachineMemory>,
     /// This tick's one courier pass per due machine (SPEC-remote §4.3). The
     /// pass is machine-level, not project-level, so a later project on the same
     /// machine reuses it instead of moving the cadence. An `Err` is this
     /// tick's unreachable reason.
-    pub machine_views: BTreeMap<String, Result<CourierOutcome, String>>,
+    pub(crate) machine_views: BTreeMap<String, Result<CourierOutcome, String>>,
 }
 
 impl Memory {
-    pub fn new(ctx: &Ctx) -> Memory {
+    pub(crate) fn new(ctx: &Ctx) -> Memory {
         Memory {
             started: jiff::Timestamp::now(),
             gh: Outage::default(),
@@ -338,7 +342,7 @@ impl Memory {
 
     /// Remote machines are polled every fourth tick (about a minute), and not
     /// at all for eight ticks after a failure.
-    pub fn machine_is_due(&mut self, machine: &str) -> bool {
+    pub(crate) fn machine_is_due(&mut self, machine: &str) -> bool {
         let tick = self.tick;
         let entry = self.machines.entry(machine.to_string()).or_default();
         let due = tick >= entry.skip_until_tick
@@ -349,7 +353,7 @@ impl Memory {
         due
     }
 
-    pub fn record_machine(
+    pub(crate) fn record_machine(
         &mut self,
         machine: &str,
         error: Option<&str>,
@@ -368,7 +372,7 @@ impl Memory {
 
 /// One `outage` item when a machine has been unreachable for the threshold,
 /// one more when it is back. Short outages write nothing.
-pub fn write_machine_outage(
+pub(crate) fn write_machine_outage(
     project: &Project,
     machine: &str,
     event: Option<OutageEvent>,
@@ -407,13 +411,13 @@ const COURIER_TIMEOUT: Duration = Duration::from_secs(30);
 /// One envelope the box helper reported (SPEC-remote §4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoxEnvelope {
-    pub slug: String,
-    pub event: String,
-    pub event_path: String,
-    pub event_hash: String,
+    pub(crate) slug: String,
+    pub(crate) event: String,
+    pub(crate) event_path: String,
+    pub(crate) event_hash: String,
     /// Empty for a `waiting` envelope.
-    pub artifact_path: String,
-    pub artifact_hash: String,
+    pub(crate) artifact_path: String,
+    pub(crate) artifact_hash: String,
 }
 
 /// One completion receipt the box wrote at seal (D5): the event bytes and
@@ -421,48 +425,48 @@ pub(crate) struct BoxEnvelope {
 /// before the taken cursor advances.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompletionReceipt {
-    pub slug: String,
-    pub event: String,
-    pub event_hash: String,
+    pub(crate) slug: String,
+    pub(crate) event: String,
+    pub(crate) event_hash: String,
     /// Empty for a `waiting` receipt.
-    pub artifact_hash: String,
+    pub(crate) artifact_hash: String,
 }
 
 /// One bootstrap receipt the box wrote when its lane ran `skill lane` (D14).
 /// The courier carries it to the Mac, which marks the thread's receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootstrapReceipt {
-    pub slug: String,
-    pub thread: String,
-    pub brief_hash: String,
-    pub pane: String,
+pub(crate) struct BootstrapReceipt {
+    pub(crate) slug: String,
+    pub(crate) thread: String,
+    pub(crate) brief_hash: String,
+    pub(crate) pane: String,
 }
 
 /// What one box helper call returned, after the taken cursor it was asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CourierManifest {
-    pub boot_id: String,
-    pub free_bytes: u64,
+    pub(crate) boot_id: String,
+    pub(crate) free_bytes: u64,
     /// Box-local `herdr agent list` JSON; `None` when the box server did not
     /// answer this pass.
-    pub agents: Option<String>,
+    pub(crate) agents: Option<String>,
     /// Box-local `herdr pane list` JSON; `None` when it did not answer.
-    pub panes: Option<String>,
-    pub envelopes: Vec<BoxEnvelope>,
-    pub receipts: Vec<CompletionReceipt>,
-    pub bootstraps: Vec<BootstrapReceipt>,
+    pub(crate) panes: Option<String>,
+    pub(crate) envelopes: Vec<BoxEnvelope>,
+    pub(crate) receipts: Vec<CompletionReceipt>,
+    pub(crate) bootstraps: Vec<BootstrapReceipt>,
 }
 
 /// The stable identity a courier pass resolved and the live facts it read, so
 /// the caller can key lane state, detect a reboot and needs no second bridge.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CourierOutcome {
-    pub machine_id: String,
-    pub boot_id: String,
+pub(crate) struct CourierOutcome {
+    pub(crate) machine_id: String,
+    pub(crate) boot_id: String,
     /// `None` when the box's own server did not answer: the pass still imports
     /// sealed events, but changes no lane state.
-    pub agents: Option<Vec<Agent>>,
-    pub panes: Option<Vec<Pane>>,
+    pub(crate) agents: Option<Vec<Agent>>,
+    pub(crate) panes: Option<Vec<Pane>>,
 }
 
 /// The box-local helper: it recovers an interrupted box D5 operation, reads
@@ -628,7 +632,7 @@ fn parse_box_list<T: serde::de::DeserializeOwned>(json: &str, field: &str) -> Re
 /// Mac's canonical ledger. The box keeps its copies; only the taken cursor
 /// advances, and only after the import is durable. Returns the box's live
 /// facts, so the caller can key lane state and push GONE after a reboot.
-pub fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
+pub(crate) fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
     let _scope = crate::ledger::Scope::new(projects);
     for project in projects {
         crate::ledger::retry_after_failure(project, "courier-failed", machine);
@@ -829,20 +833,24 @@ fn apply_bootstraps(projects: &[&Project], receipts: &[BootstrapReceipt]) {
 }
 
 /// One successful pass's live facts for a machine's box lanes.
-pub struct RemoteView<'a> {
-    pub machine_id: &'a str,
-    pub threads: &'a [Thread],
-    pub agents: &'a [Agent],
-    pub panes: &'a [Pane],
-    pub boot_id: &'a str,
-    pub now: jiff::Timestamp,
+pub(crate) struct RemoteView<'a> {
+    pub(crate) machine_id: &'a str,
+    pub(crate) threads: &'a [Thread],
+    pub(crate) agents: &'a [Agent],
+    pub(crate) panes: &'a [Pane],
+    pub(crate) boot_id: &'a str,
+    pub(crate) now: jiff::Timestamp,
 }
 
 /// The D8 amendment for box lanes: the fork has no push across machines, so
 /// the plugin's one serialized writer types `BLOCKED` and `GONE` exactly once
 /// per transition. A boot-id change types GONE for every open box lane; a pane
 /// or agent absent on two consecutive successful passes does the same.
-pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> Vec<anyhow::Error> {
+pub(crate) fn remote_attention(
+    ctx: &Ctx,
+    project: &Project,
+    view: RemoteView<'_>,
+) -> Vec<anyhow::Error> {
     let RemoteView {
         machine_id,
         threads,
@@ -921,7 +929,7 @@ pub fn remote_attention(ctx: &Ctx, project: &Project, view: RemoteView<'_>) -> V
 
 /// Types one line into the coordinator through the same serialized writer D5
 /// uses (SPEC-remote §4.3). Returns whether it was typed.
-pub fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool> {
+pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool> {
     let _scope = crate::ledger::Scope::new(&[project]);
     let Some(record) = project.coordinator() else {
         return Ok(false);
@@ -945,7 +953,11 @@ pub fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool
 }
 
 /// A server restart is a machine event, not an individual thread change.
-pub fn session_notice(project: &Project, state: &mut State, session_lost: bool) -> Result<()> {
+pub(crate) fn session_notice(
+    project: &Project,
+    state: &mut State,
+    session_lost: bool,
+) -> Result<()> {
     if session_lost {
         if !state.session_item_written {
             let open = thread::list(project)
@@ -983,7 +995,7 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
 /// Step 6. A given set of unseen items is announced once; there is no timed
 /// re-nudge. With `nudge = false` (the default) the user gets a herdr
 /// notification instead of a prompt in the coordinator.
-pub fn nudge(
+pub(crate) fn nudge(
     project: &Project,
     state: &mut State,
     settings: &Settings,
@@ -1026,7 +1038,7 @@ pub fn nudge(
 }
 
 /// Step 2, every two minutes.
-pub fn pull_requests(
+pub(crate) fn pull_requests(
     ctx: &Ctx,
     project: &Project,
     state: &mut State,
@@ -1162,7 +1174,7 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
 /// Step 4. Measured from the later of the last state change, the last report
 /// change and the time this ticker process started, so a ticker that was down
 /// for a week does not resolve everything at once.
-pub fn auto_resolve(
+pub(crate) fn auto_resolve(
     ctx: &Ctx,
     project: &Project,
     settings: &Settings,
@@ -1208,7 +1220,7 @@ pub fn auto_resolve(
 }
 
 /// Step 3, plus `config-error` items for files that do not parse.
-pub fn routines(
+pub(crate) fn routines(
     ctx: &Ctx,
     project: &Project,
     state: &mut State,

@@ -45,10 +45,10 @@ fn plugin_vocabulary() -> &'static BTreeSet<String> {
 
 /// Registry names, glossary terms and the sentence-length cap (SPEC-ADE D17).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Glossary {
-    pub names: BTreeMap<String, String>,
-    pub terms: BTreeMap<String, String>,
-    pub max_sentence_words: usize,
+pub(crate) struct Glossary {
+    pub(crate) names: BTreeMap<String, String>,
+    pub(crate) terms: BTreeMap<String, String>,
+    pub(crate) max_sentence_words: usize,
 }
 
 impl Default for Glossary {
@@ -84,7 +84,7 @@ impl Glossary {
 
 /// D17 rule ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rule {
+pub(crate) enum Rule {
     BareName,
     InventedDefinition,
     Identifier,
@@ -95,7 +95,7 @@ pub enum Rule {
 }
 
 impl Rule {
-    pub fn code(self) -> &'static str {
+    pub(crate) fn code(self) -> &'static str {
         match self {
             Self::BareName => "plain_bare_name",
             Self::InventedDefinition => "plain_invented_definition",
@@ -110,33 +110,33 @@ impl Rule {
 
 /// Byte span in the checked text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
+pub(crate) struct Span {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// One failing span, its rule, and the fixed fix text (SPEC-ADE D17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Violation {
-    pub rule: Rule,
-    pub span: Span,
-    pub fix: String,
+    pub(crate) rule: Rule,
+    pub(crate) span: Span,
+    pub(crate) fix: String,
 }
 
 /// Pass when `violations` is empty.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CheckResult {
-    pub violations: Vec<Violation>,
+pub(crate) struct CheckResult {
+    pub(crate) violations: Vec<Violation>,
 }
 
 impl CheckResult {
-    pub fn passed(&self) -> bool {
+    pub(crate) fn passed(&self) -> bool {
         self.violations.is_empty()
     }
 }
 
 /// Check free text against R1 to R5. R6 and R7 apply only to structured fields.
-pub fn check(text: &str, glossary: &Glossary) -> CheckResult {
+pub(crate) fn check(text: &str, glossary: &Glossary) -> CheckResult {
     CheckResult {
         violations: check_text(text, glossary),
     }
@@ -147,7 +147,7 @@ pub fn check(text: &str, glossary: &Glossary) -> CheckResult {
 /// whole line. The record is a row on a screen and records what happened, in
 /// whatever words are accurate, so it may name a file. Everything Rolf reads
 /// as prose (`say`, `ask` and their choices) uses [`check`].
-pub fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
+pub(crate) fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
     let mut violations = Vec::new();
     violations.extend(check_r1_r2(text, glossary));
     violations.extend(check_r3(text, glossary));
@@ -175,7 +175,7 @@ pub fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
 /// two letters or digits (`config.toml`, `1.2`) does not end a sentence; other
 /// terminators and newlines do. [`check_r5`] keeps its own split because
 /// Rolf's prose has no file names.
-pub fn sentence_count(text: &str) -> usize {
+pub(crate) fn sentence_count(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut count = 0;
     let mut start = 0;
@@ -208,7 +208,7 @@ pub fn sentence_count(text: &str) -> usize {
 }
 
 /// Check an `ha ask` question and its choices (R1 to R6).
-pub fn check_ask(question: &str, choices: &[String], glossary: &Glossary) -> CheckResult {
+pub(crate) fn check_ask(question: &str, choices: &[String], glossary: &Glossary) -> CheckResult {
     let mut violations = check_text(question, glossary);
     for choice in choices {
         violations.extend(check_text(choice, glossary));
@@ -218,7 +218,7 @@ pub fn check_ask(question: &str, choices: &[String], glossary: &Glossary) -> Che
 }
 
 /// Check a typed envelope (R7) and any prose fields it carries (R1 to R5).
-pub fn check_message(message: &HumanMessage, glossary: &Glossary) -> CheckResult {
+pub(crate) fn check_message(message: &HumanMessage, glossary: &Glossary) -> CheckResult {
     let mut violations = Vec::new();
     match message {
         HumanMessage::Say { what, means, .. } => {
@@ -552,7 +552,7 @@ struct Token<'a> {
 
 /// The checker's word normalization: whitespace tokens, edge punctuation
 /// stripped, ASCII case folded. Keep order and interior punctuation.
-pub fn normalized_words(text: &str) -> Vec<String> {
+pub(crate) fn normalized_words(text: &str) -> Vec<String> {
     tokens(text)
         .into_iter()
         .map(|t| t.raw.to_ascii_lowercase())

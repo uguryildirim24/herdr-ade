@@ -17,9 +17,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Held while worktree add/remove, `info/exclude` edits, and plugin ref writes
 /// run. Keyed by `git rev-parse --git-common-dir`.
-pub struct RepoLock {
+pub(crate) struct RepoLock {
     _file: File,
-    pub common_dir: PathBuf,
+    pub(crate) common_dir: PathBuf,
 }
 
 fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
@@ -37,7 +37,7 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
 }
 
 /// Absolute `git-common-dir` for `repo`.
-pub fn common_dir(runner: &dyn Runner, repo: &str) -> Result<PathBuf> {
+pub(crate) fn common_dir(runner: &dyn Runner, repo: &str) -> Result<PathBuf> {
     let raw = git(
         runner,
         repo,
@@ -53,7 +53,7 @@ pub fn common_dir(runner: &dyn Runner, repo: &str) -> Result<PathBuf> {
 }
 
 /// Exclusive lock for one repository. The lock file lives in the common dir.
-pub fn lock(runner: &dyn Runner, repo: &str) -> Result<RepoLock> {
+pub(crate) fn lock(runner: &dyn Runner, repo: &str) -> Result<RepoLock> {
     let common = common_dir(runner, repo)?;
     std::fs::create_dir_all(&common)
         .with_context(|| format!("could not create {}", common.display()))?;
@@ -72,7 +72,7 @@ pub fn lock(runner: &dyn Runner, repo: &str) -> Result<RepoLock> {
 }
 
 /// `git worktree add <repo>/.worktrees/<id> -b <branch> <base>` (SPEC-ADE D4).
-pub fn worktree_add(
+pub(crate) fn worktree_add(
     runner: &dyn Runner,
     repo: &str,
     id: &str,
@@ -91,20 +91,20 @@ pub fn worktree_add(
 }
 
 /// `git worktree remove` without `--force`. A dirty tree refuses.
-pub fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
+pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
     git(runner, repo, &["worktree", "remove", path], GIT_TIMEOUT)?;
     Ok(())
 }
 
 /// SHA of `refs/heads/<branch>`, or of any ref name passed in.
-pub fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
+pub(crate) fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
     git(runner, repo, &["rev-parse", rev], Duration::from_secs(5))
 }
 
 /// A typed ancestry answer: 0 is yes, 1 with empty stderr is no; other exits,
 /// diagnostics on a negative result, signals, timeouts and spawn errors fail.
 /// The runner uses the same contract so a normal no never enters the ledger.
-pub fn is_ancestor(
+pub(crate) fn is_ancestor(
     runner: &dyn Runner,
     repo: &str,
     ancestor: &str,
@@ -134,7 +134,7 @@ pub fn is_ancestor(
 /// Query an optional local branch without conflating an absent ref with a git
 /// error. `for-each-ref` answers absence with empty output; every nonzero exit
 /// still means the query failed. Match the full name (git also lists prefixes).
-pub fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<String>> {
+pub(crate) fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<String>> {
     // Keep the local-branch namespace even when the supplied name starts
     // with `refs/`: round and worktree callers use short branch names.
     let want = format!("refs/heads/{branch}");
@@ -151,13 +151,7 @@ pub fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Opti
 }
 
 /// `git update-ref <ref> <new> <old>`: refuses when the old value does not match.
-fn update_ref(
-    runner: &dyn Runner,
-    repo: &str,
-    git_ref: &str,
-    new: &str,
-    old: &str,
-) -> Result<()> {
+fn update_ref(runner: &dyn Runner, repo: &str, git_ref: &str, new: &str, old: &str) -> Result<()> {
     git(
         runner,
         repo,
@@ -229,7 +223,7 @@ fn branch_checkout(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Opti
 /// - Branch checked out dirty: `integration_checkout_dirty`.
 /// - Branch not checked out: a temporary index in `tmp_dir` plus
 ///   `update-ref <branch> <new> <expected_old>`.
-pub fn commit_files_locked(
+pub(crate) fn commit_files_locked(
     runner: &dyn Runner,
     repo: &Path,
     branch: &str,
@@ -349,7 +343,7 @@ pub fn commit_files_locked(
 
 /// Adds `.herdr-project/` and `.worktrees/` to `info/exclude` when missing;
 /// the caller holds the repository lock (D4).
-pub fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Result<()> {
+pub(crate) fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Result<()> {
     let exclude = git(
         runner,
         repo,

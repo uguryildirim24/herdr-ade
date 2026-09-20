@@ -18,16 +18,16 @@ use crate::project::Project;
 use crate::runner::{Cmd, Output, Runner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Entry {
-    pub id: String,
-    pub at: String,
-    pub last_at: String,
-    pub kind: String,
-    pub subject: String,
+pub(crate) struct Entry {
+    pub(crate) id: String,
+    pub(crate) at: String,
+    pub(crate) last_at: String,
+    pub(crate) kind: String,
+    pub(crate) subject: String,
     /// Original, unnormalized evidence. Every revision keeps its latest evidence.
-    pub detail: String,
-    pub count: u64,
-    pub closed: bool,
+    pub(crate) detail: String,
+    pub(crate) count: u64,
+    pub(crate) closed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,7 +135,7 @@ fn normalize(text: &str) -> String {
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn record(project: &Project, kind: &str, subject: &str, detail: &str) -> Result<Entry> {
+pub(crate) fn record(project: &Project, kind: &str, subject: &str, detail: &str) -> Result<Entry> {
     let _lock = lock(project)?;
     let state = load(project)?;
     let now = jiff::Timestamp::now().to_string();
@@ -174,7 +174,7 @@ pub fn record(project: &Project, kind: &str, subject: &str, detail: &str) -> Res
 
 /// Observation must not change a failed command into success, nor replace its
 /// original error with a logging error. A broken ledger is always visible.
-pub fn observe(project: &Project, kind: &str, subject: &str, detail: &str) {
+pub(crate) fn observe(project: &Project, kind: &str, subject: &str, detail: &str) {
     if let Err(error) = record(project, kind, subject, detail) {
         eprintln!(
             "warning: could not record failure for {}: {error:#}",
@@ -198,7 +198,7 @@ fn worst_first(entries: &mut [Entry]) {
     });
 }
 
-pub fn list(project: &Project) -> Result<Vec<Entry>> {
+pub(crate) fn list(project: &Project) -> Result<Vec<Entry>> {
     let _lock = lock(project)?;
     let mut entries: Vec<_> = load(project)?
         .entries
@@ -209,7 +209,7 @@ pub fn list(project: &Project) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-pub fn show(project: &Project, id: &str) -> Result<Entry> {
+pub(crate) fn show(project: &Project, id: &str) -> Result<Entry> {
     let _lock = lock(project)?;
     load(project)?
         .entries
@@ -217,7 +217,7 @@ pub fn show(project: &Project, id: &str) -> Result<Entry> {
         .with_context(|| format!("no failure `{id}`"))
 }
 
-pub fn done(project: &Project, id: &str) -> Result<()> {
+pub(crate) fn done(project: &Project, id: &str) -> Result<()> {
     let _lock = lock(project)?;
     let mut entry = load(project)?
         .entries
@@ -230,7 +230,7 @@ pub fn done(project: &Project, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn task(entry: &Entry) -> String {
+pub(crate) fn task(entry: &Entry) -> String {
     let evidence = entry
         .detail
         .lines()
@@ -242,7 +242,7 @@ pub fn task(entry: &Entry) -> String {
     )
 }
 
-pub fn summary(entry: &Entry) -> String {
+pub(crate) fn summary(entry: &Entry) -> String {
     let text = normalize(&format!(
         "{} ({} times) {} — {}: {}",
         entry.id, entry.count, entry.kind, entry.subject, entry.detail
@@ -254,7 +254,7 @@ pub fn summary(entry: &Entry) -> String {
     }
 }
 
-pub fn recent(project: &Project) -> Result<Vec<Entry>> {
+pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
     let _lock = lock(project)?;
     let state = load(project)?;
     let mut entries: Vec<_> = state
@@ -267,7 +267,7 @@ pub fn recent(project: &Project) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-pub fn section(project: &Project) -> Result<String> {
+pub(crate) fn section(project: &Project) -> Result<String> {
     let rows = recent(project)?;
     let mut text = String::from("\n## Failures\n");
     if rows.is_empty() {
@@ -279,13 +279,13 @@ pub fn section(project: &Project) -> Result<String> {
     Ok(text)
 }
 
-pub fn context_read(project: &Project, at: &str) -> Result<()> {
+pub(crate) fn context_read(project: &Project, at: &str) -> Result<()> {
     let _lock = lock(project)?;
     append(project, &Line::ContextRead { at: at.into() })
 }
 
 /// Retry only at an operation's actual re-entry, not every poll of its state.
-pub fn retry_after_failure(project: &Project, kind: &str, subject: &str) {
+pub(crate) fn retry_after_failure(project: &Project, kind: &str, subject: &str) {
     let pending = (|| -> Result<bool> {
         let _lock = lock(project)?;
         Ok(load(project)?
@@ -301,7 +301,7 @@ pub fn retry_after_failure(project: &Project, kind: &str, subject: &str) {
 
 /// A successful retry is not a checked fix: the failure stays open, but future
 /// healthy polls must not be counted as more retries.
-pub fn recovered(project: &Project, kind: &str, subject: &str) {
+pub(crate) fn recovered(project: &Project, kind: &str, subject: &str) {
     let result = (|| -> Result<()> {
         let _lock = lock(project)?;
         if load(project)?
@@ -327,9 +327,9 @@ pub fn recovered(project: &Project, kind: &str, subject: &str) {
 // dispatch and at each ticker/courier pass, never inferred from a subprocess's
 // cwd. RAII restores nested scopes; thread-local storage isolates test workers.
 thread_local! { static PROJECTS: RefCell<Vec<Project>> = const { RefCell::new(Vec::new()) }; }
-pub struct Scope(Vec<Project>);
+pub(crate) struct Scope(Vec<Project>);
 impl Scope {
-    pub fn new(projects: &[&Project]) -> Self {
+    pub(crate) fn new(projects: &[&Project]) -> Self {
         Self(PROJECTS.with(|p| p.replace(projects.iter().map(|p| (*p).clone()).collect())))
     }
 }
@@ -349,7 +349,7 @@ fn observe_current(kind: &str, subject: &str, detail: &str) {
     });
 }
 
-pub struct RecordingRunner<'a>(pub &'a dyn Runner);
+pub(crate) struct RecordingRunner<'a>(pub &'a dyn Runner);
 impl Runner for RecordingRunner<'_> {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         // Never collect environment or stdin (credentials and prompts). Args

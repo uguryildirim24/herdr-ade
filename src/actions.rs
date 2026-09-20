@@ -22,13 +22,13 @@ const PLUGIN_ID: &str = "herdr-ade";
 #[serde(default)]
 pub(crate) struct Handoff {
     /// The subcommand the `pick` pane should run: `open`, `pause` or `resume`.
-    pub command: String,
-    pub slug: String,
+    pub(crate) command: String,
+    pub(crate) slug: String,
     /// Captured by the action, before any popup opens.
-    pub pane_id: String,
-    pub workspace_label: String,
-    pub workspace_cwd: String,
-    pub socket: String,
+    pub(crate) pane_id: String,
+    pub(crate) workspace_label: String,
+    pub(crate) workspace_cwd: String,
+    pub(crate) socket: String,
 }
 
 /// The originating pane and workspace, from the action's own environment or
@@ -107,7 +107,7 @@ fn current_slug(ctx: &Ctx) -> Option<String> {
     )
 }
 
-pub fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
+pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
     let context = action_context(ctx);
     let base = Handoff {
         socket: socket(ctx).unwrap_or_default(),
@@ -222,7 +222,7 @@ fn hold_open() {
 
 /// A popup's body. Errors are printed and the popup is held open, so the user
 /// can read them before it closes.
-pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
+pub(crate) fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
     let handoff = read_handoff(ctx);
     let result = match id {
         "overview" => {

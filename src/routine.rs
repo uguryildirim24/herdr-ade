@@ -62,7 +62,7 @@ fn parse_schedule(text: &str) -> Result<Schedule> {
 /// Whether a routine is due, comparing with its stored last run. The time zone
 /// is read on each use, so `daily HH:MM` stays right across a daylight-saving
 /// change in a long-running ticker.
-pub fn is_due(schedule: &Schedule, last_run: jiff::Timestamp, now: &jiff::Zoned) -> bool {
+pub(crate) fn is_due(schedule: &Schedule, last_run: jiff::Timestamp, now: &jiff::Zoned) -> bool {
     match schedule {
         Schedule::Every(seconds) => now.timestamp().as_second() - last_run.as_second() >= *seconds,
         Schedule::Daily(hour, minute) => {
@@ -109,18 +109,18 @@ impl Default for Front {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Routine {
-    pub name: String,
-    pub schedule: Schedule,
-    pub schedule_text: String,
+pub(crate) struct Routine {
+    pub(crate) name: String,
+    pub(crate) schedule: Schedule,
+    pub(crate) schedule_text: String,
     /// Empty for a prompt-only routine.
-    pub command: String,
-    pub enabled: bool,
-    pub prompt: String,
+    pub(crate) command: String,
+    pub(crate) enabled: bool,
+    pub(crate) prompt: String,
 }
 
 impl Routine {
-    pub fn command_hash(&self) -> String {
+    pub(crate) fn command_hash(&self) -> String {
         sha256_hex(self.command.as_bytes())
     }
 }
@@ -129,12 +129,12 @@ impl Routine {
 /// unfixed file is reported once.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Broken {
-    pub file: String,
-    pub hash: String,
-    pub error: String,
+    pub(crate) file: String,
+    pub(crate) hash: String,
+    pub(crate) error: String,
 }
 
-pub fn parse(name: &str, text: &str) -> Result<Routine> {
+pub(crate) fn parse(name: &str, text: &str) -> Result<Routine> {
     project::validate_slug(name).context("a routine's file name must follow the slug rule")?;
     let rest = text
         .strip_prefix("+++\n")
@@ -154,7 +154,7 @@ pub fn parse(name: &str, text: &str) -> Result<Routine> {
     })
 }
 
-pub fn load_all(project: &Project) -> (Vec<Routine>, Vec<Broken>) {
+pub(crate) fn load_all(project: &Project) -> (Vec<Routine>, Vec<Broken>) {
     let mut routines = Vec::new();
     let mut broken = Vec::new();
     let Ok(entries) = std::fs::read_dir(project.dir().join("routines")) else {
@@ -189,24 +189,24 @@ pub fn load_all(project: &Project) -> (Vec<Routine>, Vec<Broken>) {
 // ---------------------------------------------------------------- approvals
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Approval {
-    pub project: String,
-    pub routine: String,
-    pub command_sha256: String,
-    pub approved: String,
+pub(crate) struct Approval {
+    pub(crate) project: String,
+    pub(crate) routine: String,
+    pub(crate) command_sha256: String,
+    pub(crate) approved: String,
 }
 
 fn approvals_path(config_dir: &Path) -> std::path::PathBuf {
     config_dir.join("approved-routines.json")
 }
 
-pub fn approvals(config_dir: &Path) -> Vec<Approval> {
+pub(crate) fn approvals(config_dir: &Path) -> Vec<Approval> {
     project::read_json(&approvals_path(config_dir)).unwrap_or_default()
 }
 
 /// Approved means: an entry for this canonical project path, this routine name
 /// and the command's *current* SHA-256. An edited command is not approved.
-pub fn is_approved(config_dir: &Path, project: &Project, routine: &Routine) -> bool {
+pub(crate) fn is_approved(config_dir: &Path, project: &Project, routine: &Routine) -> bool {
     let path = project.canonical_dir().to_string_lossy().into_owned();
     let hash = routine.command_hash();
     approvals(config_dir)
@@ -231,7 +231,7 @@ fn store_approval(config_dir: &Path, project: &Project, routine: &Routine) -> Re
 /// `routine approve`: refuses unless a person is at a terminal, and asks them
 /// to type the routine's name. It does not rely on an agent's permission
 /// prompt, because users allow-list this binary for their coordinator.
-pub fn approve(config_dir: &Path, project: &Project, name: &str) -> Result<()> {
+pub(crate) fn approve(config_dir: &Path, project: &Project, name: &str) -> Result<()> {
     project::validate_slug(name)?;
     if !std::io::stdin().is_terminal() {
         bail!(
@@ -275,7 +275,7 @@ pub fn approve(config_dir: &Path, project: &Project, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn print_list(config_dir: &Path, project: &Project, routine_commands: bool) {
+pub(crate) fn print_list(config_dir: &Path, project: &Project, routine_commands: bool) {
     let (routines, broken) = load_all(project);
     if routines.is_empty() && broken.is_empty() {
         println!("no routines");
@@ -306,7 +306,7 @@ pub fn print_list(config_dir: &Path, project: &Project, routine_commands: bool) 
 
 /// A fence one backtick longer than the longest run of backticks in `text`
 /// (and at least three), so the text cannot close it early.
-pub fn fence_for(text: &str) -> String {
+pub(crate) fn fence_for(text: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
     for c in text.chars() {
@@ -317,15 +317,19 @@ pub fn fence_for(text: &str) -> String {
 }
 
 pub(crate) struct Ran {
-    pub output_hash: String,
+    pub(crate) output_hash: String,
     /// The fenced, capped, labelled block for the inbox item body.
-    pub block: String,
-    pub exit: String,
+    pub(crate) block: String,
+    pub(crate) exit: String,
 }
 
 /// Runs an approved command with `sh -c` in the project folder, in its own
 /// process group with a 60 second timeout.
-pub fn run_command(runner: &dyn Runner, project: &Project, routine: &Routine) -> Result<Ran> {
+pub(crate) fn run_command(
+    runner: &dyn Runner,
+    project: &Project,
+    routine: &Routine,
+) -> Result<Ran> {
     let out = runner.run(
         &Cmd::new("sh", COMMAND_TIMEOUT)
             .args(["-c", &routine.command])
@@ -361,14 +365,14 @@ pub fn run_command(runner: &dyn Runner, project: &Project, routine: &Routine) ->
 /// Per-routine ticker state, stored in `.state/ticker.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct State {
-    pub last_run: String,
-    pub output_hash: String,
+pub(crate) struct State {
+    pub(crate) last_run: String,
+    pub(crate) output_hash: String,
     /// Command hash the last "needs approval" item was written for.
-    pub approval_item_for: String,
+    pub(crate) approval_item_for: String,
 }
 
-pub type States = BTreeMap<String, State>;
+pub(crate) type States = BTreeMap<String, State>;
 
 #[cfg(test)]
 mod tests {
