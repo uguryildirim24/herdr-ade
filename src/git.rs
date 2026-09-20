@@ -25,6 +25,8 @@ pub struct RepoLock {
 fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
     let out = runner.run(
         &Cmd::new("git", timeout)
+            // These calls return answers in stdout, never in failure status.
+            .exit_meaning(crate::runner::ExitMeaning::Required)
             .args(["-C", repo])
             .args(args.iter().copied()),
     )?;
@@ -97,6 +99,23 @@ pub fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()
 /// SHA of `refs/heads/<branch>`, or of any ref name passed in.
 pub fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
     git(runner, repo, &["rev-parse", rev], Duration::from_secs(5))
+}
+
+/// Query an optional local branch without conflating an absent ref with a git
+/// error. `for-each-ref` answers absence with empty output; every nonzero exit
+/// still means the query failed. Match the full name (git also lists prefixes).
+pub fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<String>> {
+    let want = branch_ref(branch);
+    let rows = git(
+        runner,
+        repo,
+        &["for-each-ref", "--format=%(refname) %(objectname)", &want],
+        Duration::from_secs(5),
+    )?;
+    Ok(rows.lines().find_map(|row| {
+        let (name, sha) = row.split_once(' ')?;
+        (name == want).then(|| sha.to_string())
+    }))
 }
 
 /// `git update-ref <ref> <new> <old>`: refuses when the old value does not match.
@@ -334,6 +353,38 @@ mod tests {
     use super::*;
     use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail, ok};
+
+    #[test]
+    fn absent_branch_is_an_answer_but_a_broken_repository_is_not() {
+        let (_dir, repo) = repo_with_commit();
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
+        let _scope = crate::ledger::Scope::new(&[&project]);
+        let runner = crate::ledger::RecordingRunner(&RealRunner);
+        let repo_s = repo.to_string_lossy();
+        assert!(
+            branch_head(&runner, &repo_s, "cloud-only")
+                .unwrap()
+                .is_none()
+        );
+        assert!(branch_head(&runner, &repo_s, "main").unwrap().is_some());
+        // A prefix match is not the requested branch.
+        git(
+            &runner,
+            &repo_s,
+            &["branch", "cloud-only/child"],
+            GIT_TIMEOUT,
+        )
+        .unwrap();
+        assert!(
+            branch_head(&runner, &repo_s, "cloud-only")
+                .unwrap()
+                .is_none()
+        );
+        assert!(crate::ledger::list(&project).unwrap().is_empty());
+        assert!(branch_head(&runner, &root.path().to_string_lossy(), "main").is_err());
+        assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
+    }
 
     fn repo_with_commit() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
