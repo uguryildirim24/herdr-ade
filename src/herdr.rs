@@ -21,7 +21,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Parses `herdr 0.9.1` and `herdr 0.9.2-preview.3`; a pre-release suffix is ignored.
-pub fn parse_version(text: &str) -> Option<Version> {
+fn parse_version(text: &str) -> Option<Version> {
     let token = text
         .split_whitespace()
         .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
@@ -45,7 +45,7 @@ pub fn version(bin: &str, runner: &dyn Runner) -> Result<Version> {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct SessionInfo {
+pub(crate) struct SessionInfo {
     pub name: String,
     #[serde(default)]
     pub default: bool,
@@ -251,7 +251,7 @@ pub fn ready_state(state: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Created {
+pub(crate) struct Created {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,

@@ -31,10 +31,10 @@ pub const KEYS: [&str; 5] = [
 ];
 
 /// The fork cuts token values at 80 characters; the board never relies on it.
-pub const MAX_VALUE_CHARS: usize = 80;
+const MAX_VALUE_CHARS: usize = 80;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct BoardState {
+pub(crate) struct BoardState {
     /// The last value published per key.
     #[serde(default)]
     pub values: BTreeMap<String, String>,

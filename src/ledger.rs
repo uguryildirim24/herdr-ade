@@ -341,7 +341,7 @@ impl Drop for Scope {
     }
 }
 
-pub fn observe_current(kind: &str, subject: &str, detail: &str) {
+fn observe_current(kind: &str, subject: &str, detail: &str) {
     PROJECTS.with(|projects| {
         for project in projects.borrow().iter() {
             observe(project, kind, subject, detail);

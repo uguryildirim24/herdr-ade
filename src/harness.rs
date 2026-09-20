@@ -17,7 +17,7 @@ use crate::remote;
 use crate::runner::Cmd;
 
 /// The saved machine whose box gets the same build and install.
-pub const BOX_MACHINE: &str = "oci";
+const BOX_MACHINE: &str = "oci";
 /// The plugin build's tool path, exactly as the coordinator uses it by hand.
 pub const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -274,7 +274,7 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
 }
 
 /// The machine-wide install lock: two projects never install at once.
-pub struct InstallLock {
+pub(crate) struct InstallLock {
     _file: std::fs::File,
 }
 

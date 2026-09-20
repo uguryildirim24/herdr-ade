@@ -670,7 +670,7 @@ pub fn render(st: &Value, prefix: &str) -> String {
 
 /// Replaces the `## Herdr` section of a handoff (through the next `## `
 /// heading) or appends it.
-pub fn splice_herdr(document: &str, section: &str) -> String {
+fn splice_herdr(document: &str, section: &str) -> String {
     let mut out = String::new();
     let mut skipping = false;
     let mut replaced = false;
@@ -707,7 +707,7 @@ pub fn splice_herdr(document: &str, section: &str) -> String {
 
 /// `state.py check`, over a document and the collected live state. Returns
 /// the problem classes; empty means the document checks out.
-pub fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, BTreeSet<String>> {
+fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut problems: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut add = |class: &str, item: String| {
         problems.entry(class.to_string()).or_default().insert(item);

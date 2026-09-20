@@ -16,7 +16,7 @@ use crate::thread;
 
 /// Tokens, money in micro-dollars, whole minutes and send count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Totals {
+pub(crate) struct Totals {
     pub tokens: u64,
     pub micros: u64,
     pub minutes: u64,
@@ -342,7 +342,7 @@ fn current_round(project: &Project) -> Option<(String, Vec<String>)> {
 }
 
 /// `1234567` -> `1.2m`; a small number stays whole.
-pub fn format_tokens(tokens: u64) -> String {
+fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
@@ -352,7 +352,7 @@ pub fn format_tokens(tokens: u64) -> String {
     }
 }
 
-pub fn format_money(micros: u64) -> String {
+fn format_money(micros: u64) -> String {
     format!("${:.2}", micros as f64 / 1_000_000.0)
 }
 

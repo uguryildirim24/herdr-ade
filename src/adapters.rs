@@ -1,7 +1,7 @@
 //! Per-kind launch, receipt, trap, and correction capability facts.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CorrectionAdapter {
+pub(crate) enum CorrectionAdapter {
     ClaudeStop,
     CursorFollowup,
     CodexStop,
@@ -21,7 +21,7 @@ pub struct Adapter {
     pub surface: &'static str,
 }
 
-pub const ADAPTERS: [Adapter; 8] = [
+const ADAPTERS: [Adapter; 8] = [
     Adapter {
         kind: "claude",
         receipt: "ha skill or ha context",

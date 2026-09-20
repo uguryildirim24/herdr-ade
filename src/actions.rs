@@ -20,7 +20,7 @@ const PLUGIN_ID: &str = "herdr-ade";
 /// What an action hands to the popup it opens.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct Handoff {
+pub(crate) struct Handoff {
     /// The subcommand the `pick` pane should run: `open`, `pause` or `resume`.
     pub command: String,
     pub slug: String,

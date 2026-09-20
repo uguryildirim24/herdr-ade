@@ -23,7 +23,7 @@ fn artifacts_dir(project: &Project) -> PathBuf {
     project.dir().join("artifacts")
 }
 
-pub fn op_path(project: &Project, id: &str) -> Result<PathBuf> {
+fn op_path(project: &Project, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
     Ok(ops_dir(project).join(format!("{id}.toml")))
 }

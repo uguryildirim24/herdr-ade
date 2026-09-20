@@ -17,7 +17,7 @@ use crate::{events, inbox, pr, routine};
 
 pub const NUDGE_TEXT: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
-pub const PR_INTERVAL_SECS: i64 = 120;
+const PR_INTERVAL_SECS: i64 = 120;
 pub const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
 
@@ -258,7 +258,7 @@ pub fn config_changed(project: &Project, digest: &str) -> Result<()> {
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
 /// failed for the threshold, one more when it recovers, nothing for blips.
 #[derive(Debug, Clone, Default)]
-pub struct Outage {
+pub(crate) struct Outage {
     failing_since: Option<jiff::Timestamp>,
     reported: bool,
     pub last_error: String,
@@ -293,11 +293,11 @@ impl Outage {
     }
 }
 
-pub const REMOTE_EVERY_TICKS: u64 = 4;
-pub const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
+const REMOTE_EVERY_TICKS: u64 = 4;
+const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
 
 #[derive(Debug, Clone, Default)]
-pub struct MachineMemory {
+pub(crate) struct MachineMemory {
     pub outage: Outage,
     /// Not polled again before this tick: one sleeping machine must not slow
     /// the other projects' ticks.
@@ -402,11 +402,11 @@ pub fn write_machine_outage(
 // ---------------------------------------------------------------- courier
 
 /// The courier's helper timeout (SPEC-remote §4.3): one short-lived call.
-pub const COURIER_TIMEOUT: Duration = Duration::from_secs(30);
+const COURIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One envelope the box helper reported (SPEC-remote §4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoxEnvelope {
+pub(crate) struct BoxEnvelope {
     pub slug: String,
     pub event: String,
     pub event_path: String,
@@ -420,7 +420,7 @@ pub struct BoxEnvelope {
 /// report bytes the box itself hashed. The Mac compares both with its own
 /// before the taken cursor advances.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletionReceipt {
+pub(crate) struct CompletionReceipt {
     pub slug: String,
     pub event: String,
     pub event_hash: String,
@@ -440,7 +440,7 @@ pub struct BootstrapReceipt {
 
 /// What one box helper call returned, after the taken cursor it was asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CourierManifest {
+pub(crate) struct CourierManifest {
     pub boot_id: String,
     pub free_bytes: u64,
     /// Box-local `herdr agent list` JSON; `None` when the box server did not
@@ -524,7 +524,7 @@ for f in "$root"/*/.state/bootstrap/*.json; do
 done
 "#;
 
-pub fn courier_helper(box_root: &str, session: &str) -> String {
+fn courier_helper(box_root: &str, session: &str) -> String {
     COURIER_HELPER
         .replace("__ROOT__", &crate::remote::quote(box_root))
         .replace("__SESSION__", &crate::remote::quote(session))
@@ -532,7 +532,7 @@ pub fn courier_helper(box_root: &str, session: &str) -> String {
 
 /// Parses the helper's tab-separated output. An unknown record is refused so a
 /// helper version mismatch is loud, not silently empty.
-pub fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
+fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
     let mut manifest = CourierManifest::default();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let fields: Vec<&str> = line.split('\t').collect();

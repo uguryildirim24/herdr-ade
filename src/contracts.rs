@@ -44,7 +44,7 @@ pub const BOX_PATH: &str =
 /// The box user's home, the cwd for a doctor probe pane (SPEC-remote §3.3).
 pub const BOX_HOME: &str = "/home/ubuntu";
 /// The plugin binary and ADE root on the box (SPEC-remote §4.2 step 6).
-pub const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
+const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
 /// The pi binary on the box: `setup`, `login`, `doctor` and `check` are
 /// `herdr-pi` verbs, so a pi readiness probe never runs through [`BOX_BIN`]
 /// (SPEC-remote §4.2 step 6).
@@ -395,7 +395,7 @@ pub struct ManifestMember {
 /// Authoritative admitted set. Membership is never inferred from completions
 /// (SPEC-ADE D6, item 33).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct AdmissionManifest {
+pub(crate) struct AdmissionManifest {
     pub revision: u64,
     #[serde(default)]
     pub members: Vec<ManifestMember>,

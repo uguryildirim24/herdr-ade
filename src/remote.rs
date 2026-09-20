@@ -11,10 +11,10 @@ use serde::Deserialize;
 use crate::contracts::{BOX_REPOS, BoxRepoMap, MACHINE_LOCAL, MachineProfile};
 use crate::runner::{Cmd, Output, Runner};
 
-pub const SSH_TIMEOUT: Duration = Duration::from_secs(10);
+const SSH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
 #[allow(dead_code)]
-pub const COPY_TIMEOUT: Duration = Duration::from_secs(60);
+const COPY_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_OPTIONS: [&str; 4] = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"];
 
 /// Single-quote escaping: safe for any value in an `sh` command string. Plain
@@ -29,7 +29,7 @@ pub fn quote(value: &str) -> String {
 
 /// Only characters that no shell, and neither scp nor rsync in any of their
 /// remote-path modes, treat specially.
-pub fn is_plain(value: &str) -> bool {
+fn is_plain(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
         && value.chars().all(|c| {
@@ -154,7 +154,7 @@ pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<Stri
 /// A remote URL reduced to the repository it names: surrounding whitespace,
 /// every trailing `/` and every trailing `.git` removed. `https://…/repo` and
 /// `https://…/repo.git` are the same remote, however it was written down.
-pub fn normalize_url(url: &str) -> String {
+fn normalize_url(url: &str) -> String {
     url.trim()
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -332,7 +332,7 @@ pub fn ssh_courier(
 
 /// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per
 /// pass. The courier passes these on its helper and `scp` calls.
-pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
+fn multiplex_options(control_dir: &Path) -> Vec<String> {
     let dir = control_dir.join("ssh");
     let _ = std::fs::create_dir_all(&dir);
     vec![
@@ -349,7 +349,7 @@ pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
 /// unchanged in every mode (spaces, quotes, globs) is fetched with `ssh cat`
 /// through the quoting helper instead. The second lane's ingress calls this.
 #[allow(dead_code)]
-pub fn fetch_file(
+fn fetch_file(
     runner: &dyn Runner,
     target: &str,
     remote_path: &str,

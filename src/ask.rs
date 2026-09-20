@@ -24,7 +24,7 @@ pub const NOT_UNDERSTOOD: &str = "I did not understand the question";
 
 /// Fixed notices: the only text a `Notice` can publish. Every text passes the
 /// checker with an empty registry (tested).
-pub const NOTICES: &[(&str, &str)] = &[
+const NOTICES: &[(&str, &str)] = &[
     (
         "plain_exhausted",
         "The coordinator could not say this in plain words. Open its pane to read it.",
@@ -102,7 +102,7 @@ fn ask_dir(project: &Project, id: &str) -> PathBuf {
 
 /// At most three open asks, including one whose publication is still pending
 /// (SPEC-talk §6.7).
-pub const MAX_OPEN_ASKS: usize = 3;
+const MAX_OPEN_ASKS: usize = 3;
 
 /// The shared ask-set lock, `<project>/asks/.open.lock`. Creation, re-asking
 /// and answering take it inside the project lock so concurrent writers cannot
@@ -206,7 +206,7 @@ pub fn answer_of(project: &Project, id: &str, revision: u32) -> Option<Answer> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Withdrawal {
+pub(crate) struct Withdrawal {
     pub id: String,
     pub revision: u32,
     pub reason: String,
@@ -592,7 +592,7 @@ pub fn say_landed(
 }
 
 /// The last line of `what` that fits a board token: cut at a word boundary.
-pub fn board_line(text: &str, max: usize) -> String {
+fn board_line(text: &str, max: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max {
         return text.to_string();
@@ -613,7 +613,7 @@ pub fn board_line(text: &str, max: usize) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Published {
+pub(crate) struct Published {
     /// `None` when the journal already had this message (a duplicate).
     pub seq: Option<u64>,
     pub board: bool,

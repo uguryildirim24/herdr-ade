@@ -55,7 +55,7 @@ fn removed_kind(kind: &str) -> bool {
 }
 
 /// File-name-safe form of a subject (a thread id, routine name, machine label).
-pub fn safe_subject(subject: &str) -> String {
+fn safe_subject(subject: &str) -> String {
     let cleaned: String = subject
         .chars()
         .map(|c| {
