@@ -341,13 +341,6 @@ fn tick_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
         // X1: the helper is dead, or the lane's attempt was superseded.
         OpState::Reserved if superseded || !pid_alive(ctx.runner, op.helper_pid) => {
             abandon(project, &op.op)?;
-            crate::inbox::write(
-                project,
-                "preparation-abandoned",
-                &op.thread,
-                "completion preparation was abandoned",
-                "",
-            )?;
         }
         // X2: seal from the op's own payload when the bindings still match.
         OpState::Staged => {
@@ -400,13 +393,6 @@ fn recover_box_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
             let superseded = card.as_ref().is_some_and(|card| card.attempt != op.attempt);
             if superseded || !pid_alive(ctx.runner, op.helper_pid) {
                 abandon(project, &op.op)?;
-                crate::inbox::write(
-                    project,
-                    "preparation-abandoned",
-                    &op.thread,
-                    "completion preparation was abandoned",
-                    "",
-                )?;
             }
         }
         OpState::Staged => {

@@ -27,7 +27,7 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 3 | `--remove-worktree` refused for a tab thread and for a dirty worktree; with the ticker stopped, a late report survives `resolve --remove-worktree`; a tab thread starts in `threads/<id>/` | Builder, unit |
 | 4 | Two tab threads in one workspace show different `thread` tokens | Builder (`api snapshot`) |
 | 4 | `overview` run without a terminal returns at once; a finished thread stays under Ready for review until `thread ack` | Builder |
-| 5 | A finishing thread gives one inbox item and one nudge, none after until a new item | Builder (with `nudge = true`), unit |
+| 5 | A finishing thread appears in `context` without an inbox item; a courier delivery still writes one message | Builder, unit |
 | 5 | A second session with the plugin linked produces no "pane gone" items | Builder (`hp-dev2`) |
 | 5 | A command routine does not run until `routine_commands = true` and `routine approve` in a terminal; an edited command stops; approve without a terminal refuses | Builder (approved inside a herdr pane), unit |
 | 5 | Fake `gh`: a merged pull request resolves its thread; a comment gives an item with no body; two events in one tick give two items | Unit. A run against a real pull request was not done (needs a push) |

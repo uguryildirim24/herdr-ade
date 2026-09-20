@@ -1,6 +1,6 @@
-//! The ticker's per-project steps beyond thread state: inbox items, the nudge,
-//! pull requests, routines, auto-resolve. Each is "compare with last time,
-//! write an inbox item when it changed".
+//! The ticker's per-project steps: delivery, messages, pull requests, routines
+//! and auto-resolve. Thread facts update their owning records; only messages
+//! without a thread or round home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -26,11 +26,6 @@ const DEFAULT_OUTAGE_SECS: i64 = 600;
 #[serde(default)]
 pub struct State {
     pub last_pr_check: String,
-    pub prs: BTreeMap<String, pr::Summary>,
-    /// thread id -> the pull request URL an "ignored" item was written for.
-    pub pr_ignored: BTreeMap<String, String>,
-    /// thread id -> report hash a "bad PR: line" note was written for.
-    pub pr_line_noted: BTreeMap<String, String>,
     pub routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
     pub config_errors: BTreeSet<String>,
@@ -142,28 +137,6 @@ pub fn deliver_event(ctx: &Ctx, project: &Project, event: &crate::contracts::Eve
     {
         verify_published_sha(ctx, project, &lane, &done.sha)?;
     }
-    let kind = if event.payload.done.is_some() {
-        "done"
-    } else {
-        "waiting"
-    };
-    // A box lane's summary names its machine (SPEC-remote §5).
-    let place = if lane.is_remote() {
-        format!(" on machine `{}`", lane.machine)
-    } else {
-        String::new()
-    };
-    let summary = match (&event.payload.done, &event.payload.waiting) {
-        (Some(done), None) => format!(
-            "{}{} completed with report {} at {}",
-            event.thread, place, done.report_path, done.sha
-        ),
-        (None, Some(waiting)) => {
-            format!("{}{} is waiting: {}", event.thread, place, waiting.text)
-        }
-        _ => bail!("event_payload_invalid: {}", event.id),
-    };
-    inbox::write_event(project, event, kind, &summary)?;
 
     // A box lane's tokens were set by the box's own `ha done`; the Mac has no
     // socket into that server, so delivery never projects them again
@@ -797,6 +770,16 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
                     Some(bytes)
                 };
                 events::import_box_event(project, &profile.id, &bytes, artifact.as_deref())?;
+                let imported = events::load(project, &env.event)?;
+                inbox::write_event(
+                    project,
+                    &imported,
+                    "courier-delivery",
+                    &format!(
+                        "received sealed event {} from machine `{machine}`",
+                        imported.id
+                    ),
+                )?;
                 state
                     .taken
                     .insert(env.event.clone(), env.event_hash.clone());
@@ -959,32 +942,8 @@ pub fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool
     Ok(true)
 }
 
-/// A group change seen in the cheap pass.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Transition {
-    pub id: String,
-    pub to: Group,
-    pub note: String,
-}
-
-fn thread_label(t: &Thread) -> String {
-    let label = format!("{} \"{}\"", t.id, t.title);
-    if t.is_remote() {
-        format!("{label} on machine `{}`", t.machine)
-    } else {
-        label
-    }
-}
-
-/// Step 1's inbox items, written after the copies so a Ready for review item
-/// always points at a home copy that exists.
-pub fn write_thread_items(
-    project: &Project,
-    state: &mut State,
-    transitions: &[Transition],
-    session_lost: bool,
-    copy_notes: &BTreeMap<String, Vec<String>>,
-) -> Result<()> {
+/// A server restart is a machine event, not an individual thread change.
+pub fn session_notice(project: &Project, state: &mut State, session_lost: bool) -> Result<()> {
     if session_lost {
         if !state.session_item_written {
             let open = thread::list(project)
@@ -1006,58 +965,6 @@ pub fn write_thread_items(
     }
     state.session_item_written = false;
 
-    for change in transitions {
-        if !matches!(
-            change.to,
-            Group::WaitingOnYou | Group::Landing | Group::Idle
-        ) {
-            continue;
-        }
-        let Ok(t) = thread::load(project, &change.id) else {
-            continue;
-        };
-        let mut summary = format!(
-            "{} is now {} ({})",
-            thread_label(&t),
-            change.to.label(),
-            change.note
-        );
-        if change.to == Group::WaitingOnYou && !t.pane_id.is_empty() {
-            summary.push_str(&format!("; it needs the user in pane {}", t.pane_id));
-            if t.is_remote() {
-                summary.push_str(" (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)");
-            }
-        }
-        inbox::write(project, "thread-state", &t.id, &summary, "")?;
-    }
-
-    // Ready for review: once per report hash, so an agent that goes back and
-    // forth between working and idle on an unchanged report produces nothing.
-    for t in thread::list(project) {
-        if t.status != Status::Open
-            || t.report_hash.is_empty()
-            || t.report_hash == t.last_review_item_hash
-        {
-            continue;
-        }
-        if t.last_group != Group::ReadyForReview.token() && t.last_group != Group::Landing.token() {
-            continue;
-        }
-        let mut summary = format!(
-            "{} has a new report: threads/{}.md; report bytes are not a completion",
-            thread_label(&t),
-            t.id
-        );
-        if let Some(notes) = copy_notes.get(&t.id) {
-            summary.push_str(&format!(
-                "; not everything was copied: {}",
-                notes.join("; ")
-            ));
-        }
-        inbox::write(project, "report-available", &t.id, &summary, "")?;
-        let hash = t.report_hash.clone();
-        thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
-    }
     Ok(())
 }
 
@@ -1139,30 +1046,21 @@ pub fn pull_requests(
         // The `PR:` line of the home copy of the report.
         let report =
             std::fs::read_to_string(thread::home_report_path(project, &t.id)).unwrap_or_default();
-        let url = match pr::pr_line(&report) {
-            Ok(url) => url.unwrap_or_default(),
-            Err(note) => {
-                if state.pr_line_noted.get(&t.id) != Some(&t.report_hash) {
-                    state
-                        .pr_line_noted
-                        .insert(t.id.clone(), t.report_hash.clone());
-                    errors.extend(
-                        inbox::write(
-                            project,
-                            "pr",
-                            &t.id,
-                            &format!("{}: {note}", thread_label(&t)),
-                            "",
-                        )
-                        .err(),
-                    );
-                }
-                String::new()
-            }
+        let (url, note) = match pr::pr_line(&report) {
+            Ok(url) => (url.unwrap_or_default(), String::new()),
+            Err(note) => (String::new(), note),
         };
-        if url != t.pr {
-            let new_url = url.clone();
-            errors.extend(thread::update(project, &t.id, |t| t.pr = new_url).err());
+        if url != t.pr || (url.is_empty() && note != t.pr_note) {
+            errors.extend(
+                thread::update(project, &t.id, |t| {
+                    t.pr = url.clone();
+                    t.pr_note = note;
+                    t.pr_summary = None;
+                    t.pr_state.clear();
+                    t.pr_review.clear();
+                })
+                .err(),
+            );
         }
         if url.is_empty() {
             continue;
@@ -1203,50 +1101,33 @@ pub fn pull_requests(
         match pr::reduce(&json, &t.branch, &t.origin) {
             Err(error) => errors.push(error.context(format!("{}: gh output", t.id))),
             Ok(pr::Checked::Ignored(reason)) => {
-                if state.pr_ignored.get(&t.id) != Some(&url) {
-                    state.pr_ignored.insert(t.id.clone(), url.clone());
-                    errors.extend(
-                        inbox::write(
-                            project,
-                            "pr",
-                            &t.id,
-                            &format!(
-                                "{}: the pull request in its report is ignored: {reason}",
-                                thread_label(&t)
-                            ),
-                            "",
-                        )
-                        .err(),
-                    );
-                }
+                errors.extend(
+                    thread::update(project, &t.id, |t| {
+                        t.pr_note = format!("pull request ignored: {reason}");
+                        t.pr_summary = None;
+                        t.pr_state.clear();
+                        t.pr_review.clear();
+                    })
+                    .err(),
+                );
             }
             Ok(pr::Checked::Summary(summary)) => {
-                let old = state.prs.get(&t.id).cloned();
-                if old.as_ref() == Some(&summary) {
+                let old = t.pr_summary.clone();
+                if t.pr == url && t.pr_note.is_empty() && old.as_ref() == Some(&summary) {
                     continue;
                 }
                 let (pr_state, pr_review) =
                     (summary.state.clone(), summary.review_decision.clone());
                 errors.extend(
                     thread::update(project, &t.id, |t| {
+                        t.pr_note.clear();
                         t.pr_state = pr_state;
                         t.pr_review = pr_review;
+                        t.pr_summary = Some(summary.clone());
                     })
                     .err(),
                 );
-                let change = pr::describe_change(old.as_ref(), &summary);
                 let merged = summary.state == "MERGED";
-                state.prs.insert(t.id.clone(), summary);
-                errors.extend(
-                    inbox::write(
-                        project,
-                        "pr",
-                        &t.id,
-                        &format!("{}: pull request {change}", thread_label(&t)),
-                        "",
-                    )
-                    .err(),
-                );
                 if merged {
                     errors.extend(resolve_after_copy(ctx, project, &t, "merged").err());
                 }
@@ -1317,7 +1198,7 @@ pub fn auto_resolve(
             continue;
         }
         match resolve_after_copy(ctx, project, &t, "auto") {
-            Ok(_) => errors.extend(inbox::write(project, "thread-state", &t.id, &format!("{} was idle for {} days and was resolved automatically; `thread resolve --reopen` undoes it", thread_label(&t), settings.auto_resolve_days), "").err()),
+            Ok(_) => {}
             Err(error) => errors.push(error),
         }
     }
@@ -1504,7 +1385,7 @@ mod tests {
         })
         .unwrap();
         let event = sealed_done(&project, "t-0001");
-        // The coordinator read the inbox item in the same window as the seal,
+        // The coordinator read the completion in the same window as the seal,
         // before the ticker had typed the wake-up line.
         crate::events::append_delivery(
             &project,
@@ -1584,21 +1465,13 @@ mod tests {
 
         deliver_events(&ctx, &project).unwrap();
         assert_eq!(typed_lines(&world).len(), 1);
-    }
-
-    #[test]
-    fn every_box_lane_message_label_names_its_machine() {
-        let lane = Thread {
-            id: "t-0001".into(),
-            title: "cloud work".into(),
-            machine: "oci".into(),
-            machine_id: "profile-1".into(),
-            ..Thread::default()
-        };
-        assert_eq!(
-            thread_label(&lane),
-            "t-0001 \"cloud work\" on machine `oci`"
+        assert!(inbox::unhandled(&project).is_empty());
+        let digest = crate::coordinator::digest(&ctx, &project, "ha").unwrap().0;
+        assert!(
+            digest.contains("done: abc report=.reports/lane.md"),
+            "{digest}"
         );
+        assert!(!project.state_dir().join("inbox-counter.json").exists());
     }
 
     #[test]
@@ -1924,6 +1797,18 @@ mod tests {
         let before = runner.count("scp");
         courier(&ctx, &[&alpha, &beta, &gamma], "box").unwrap();
         assert_eq!(runner.count("scp"), before);
+        for project in [&alpha, &beta] {
+            let items = inbox::unhandled(project);
+            assert_eq!(
+                items.len(),
+                1,
+                "one courier delivery, including after retry"
+            );
+            assert_eq!(items[0].kind, "courier-delivery");
+            assert_eq!(items[0].event, "t-0001-1-1");
+            assert!(items[0].summary.contains("machine `box`"));
+        }
+        assert!(inbox::unhandled(&gamma).is_empty());
     }
 
     #[test]

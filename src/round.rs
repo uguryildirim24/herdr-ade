@@ -455,6 +455,7 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
     let mut record = load(project, round)?;
     record.phase = phase_for_merge(intent);
     record.merge = Some(intent.clone());
+    record.attention.clear();
     save(project, &record)
 }
 
@@ -489,11 +490,12 @@ fn return_to_admitting(record: &mut RoundRecord) {
     record.reviewer = None;
     record.verdict = None;
     record.announced = None;
+    record.attention.clear();
     record.reviewer_start_failures = 0;
 }
 
 /// Safety callers must not use the display list, which skips broken records.
-fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
+pub fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
     if !rounds_dir(project).exists() {
         return Ok(Vec::new());
     }
@@ -1041,6 +1043,8 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
     record.verdict = None;
     record.phase = RoundPhase::UnderReview;
     record.reviewer = Some(thread_id.to_string());
+    record.announced = None;
+    record.attention.clear();
     save(&project, &record)?;
     Ok(record)
 }
@@ -1055,9 +1059,9 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 /// whose current review revision already has its review branch but no bound
 /// reviewer (after a REJECT was repaired with `round review`, or after an
 /// earlier start failed), writing the review task for that revision. A round
-/// never gets a second reviewer. A MERGE verdict is announced (inbox plus a
-/// `say` line) but never merged; any other verdict gets one inbox item. A
-/// reviewer thread that is gone becomes one inbox item. This is what the
+/// never gets a second reviewer. A MERGE verdict gets a `say` line but is
+/// never merged. Verdicts and reviewer problems live on the round record
+/// and are rendered by context. This is what the
 /// `pane.agent_status_changed` hook and the ticker call.
 ///
 /// A start that does not take is loud and is retried: `advance` says so on
@@ -1417,7 +1421,7 @@ fn verdict_summary(round: &str, verdict: &str) -> String {
 }
 
 /// A `say` line that passes the plain check: the round is a born name, so it
-/// is written in its gloss form and the command stays in the inbox item.
+/// is written in its gloss form and the command stays in the round record.
 fn verdict_say(record: &RoundRecord) -> String {
     format!(
         "{} ({}) It has a merge verdict.",
@@ -1536,8 +1540,8 @@ fn reviewer_gone(ctx: &Ctx, project: &Project, reviewer: &str) -> bool {
     !matches!(reviewer_state(ctx, project, reviewer), ReviewerState::Alive)
 }
 
-/// Writes the one inbox item (and, for a merge verdict, the one `say` line)
-/// for a state. The state is recorded first, so a crash cannot announce twice.
+/// Records the current action and emits at most one `say` line for a merge
+/// verdict. Context reads this record directly, including after a crash.
 fn announce_once(
     ctx: &Ctx,
     project: &Project,
@@ -1549,13 +1553,14 @@ fn announce_once(
     {
         let _lock = project.lock()?;
         let mut record = load(project, round)?;
-        if record.announced.as_deref() == Some(token) {
+        let already = record.announced.as_deref() == Some(token);
+        record.announced = Some(token.to_string());
+        record.attention = summary.to_string();
+        save(project, &record)?;
+        if already {
             return Ok(());
         }
-        record.announced = Some(token.to_string());
-        save(project, &record)?;
     }
-    crate::inbox::write(project, "round-advance", round, summary, "")?;
     if let Some(what) = say_what {
         let _ = crate::ask::say(ctx, &project.slug, &what, None);
     }
@@ -2523,7 +2528,7 @@ fn resume(
             })
         }
         MergePhase::MergeDiverged => bail!(
-            "merge_diverged: `{}` diverged from the recorded merge; see the inbox",
+            "merge_diverged: `{}` diverged from the recorded merge; see context and the round record",
             record.round
         ),
         MergePhase::Intent if intent.at_or_past_merge(&head) => {
@@ -2553,17 +2558,18 @@ fn diverged(
     head: &str,
 ) -> Result<MergeOutcome> {
     intent.phase = MergePhase::MergeDiverged;
-    write_merge(project, &record.round, &intent)?;
-    let _ = crate::inbox::write(
-        project,
-        "merge-diverged",
-        &record.round,
-        &format!(
+    {
+        let _lock = project.lock()?;
+        let mut current = load(project, &record.round)?;
+        current.phase = RoundPhase::Diverged;
+        current.merge = Some(intent.clone());
+        current.attention = format!(
             "{}: `{}` is at {head}, which is neither the recorded merge start, merge result nor checkpoint; nothing was merged again",
             record.round, record.branch
-        ),
-        "",
-    );
+        );
+        save(project, &current)?;
+    }
+
     bail!(
         "merge_diverged: `{}` is at {head}; expected merge start {}, merge result {} or the recorded checkpoint",
         record.branch,
@@ -2756,22 +2762,7 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
                     }
                 }
             }
-            Ok(Some(m)) if matches!(m.phase, MergePhase::Intent | MergePhase::Merged) => {
-                let marker = merge_dir(project, &round).join("pending-reported");
-                if !marker.exists() {
-                    let _ = crate::inbox::write(
-                        project,
-                        "merge-pending",
-                        &round,
-                        &format!(
-                            "{round}: a merge stopped at phase {:?}; run `round merge {round}` to finish it",
-                            m.phase
-                        ),
-                        "",
-                    );
-                    let _ = std::fs::write(&marker, "");
-                }
-            }
+
             _ => {}
         }
     }
@@ -3773,11 +3764,12 @@ mod tests {
         let e = err(merge(&ctx, "demo", "r1", None));
         assert!(e.starts_with("merge_diverged"), "{e}");
         assert_eq!(phase(&fx), MergePhase::MergeDiverged);
-        assert!(
-            crate::inbox::unhandled(&fx.project)
-                .iter()
-                .any(|i| i.kind == "merge-diverged")
-        );
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("[Diverged]"), "{digest}");
+        assert!(digest.contains("round merge r1"));
         assert!(err(merge(&ctx, "demo", "r1", None)).starts_with("merge_diverged"));
     }
 
@@ -4109,7 +4101,7 @@ mod tests {
         assert_eq!(reviewers, 0, "no reviewer for landed work");
     }
 
-    /// A MERGE verdict is announced once: one inbox item and one `say` line.
+    /// A MERGE verdict lives on its round and emits one `say` line.
     #[test]
     fn advance_announces_a_merge_verdict_once() {
         let fx = fixture();
@@ -4118,13 +4110,14 @@ mod tests {
         verdict(&fx, &lanes, front("MERGE", "r1"));
 
         advance(&ctx, "demo").unwrap();
-        let announcements = |project: &Project| {
-            crate::inbox::unhandled(project)
-                .into_iter()
-                .filter(|item| item.kind == "round-advance")
-                .count()
-        };
-        assert_eq!(announcements(&fx.project), 1);
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(
+            digest.contains("merge verdict; run `round merge r1`"),
+            "{digest}"
+        );
         let says = crate::talk::read(&fx.project)
             .lines
             .iter()
@@ -4136,7 +4129,13 @@ mod tests {
 
         // The same verdict is never announced twice.
         advance(&ctx, "demo").unwrap();
-        assert_eq!(announcements(&fx.project), 1);
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        assert_eq!(
+            crate::coordinator::digest(&ctx, &fx.project, "ha")
+                .unwrap()
+                .0,
+            digest
+        );
     }
 
     /// Automation may consume a verdict and announce it, but only a command
@@ -4259,11 +4258,12 @@ mod tests {
             "each refusal is counted"
         );
         assert!(refused.reviewer.is_none(), "no reviewer is bound");
-        let reports = crate::inbox::unhandled(&fx.project)
-            .into_iter()
-            .filter(|item| item.kind == "round-advance" && item.summary.contains("did not start"))
-            .count();
-        assert_eq!(reports, 1, "the refused start is said once");
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("did not start"));
+        assert!(digest.contains("2 of 3 failures"), "{digest}");
         let failures = crate::ledger::list(&fx.project).unwrap();
         let start = failures
             .iter()
@@ -4316,11 +4316,11 @@ mod tests {
             thread::Status::Failed,
             "the dead thread is failed"
         );
-        let reports = crate::inbox::unhandled(&fx.project)
-            .into_iter()
-            .filter(|item| item.kind == "round-advance" && item.summary.contains("did not start"))
-            .count();
-        assert_eq!(reports, 1, "the dead start is said once");
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("no agent appeared"), "{digest}");
 
         // The next pass starts a different, fresh reviewer.
         advance(&ctx, "demo").unwrap();
@@ -4436,24 +4436,20 @@ mod tests {
 
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(record.reviewer, Some(reviewer.clone()));
-        let announcements = crate::inbox::unhandled(&fx.project)
-            .into_iter()
-            .filter(|item| item.kind == "round-advance")
-            .collect::<Vec<_>>();
-        assert_eq!(announcements.len(), 1, "one gone report");
-        assert!(
-            announcements[0].summary.contains("is gone"),
-            "{announcements:?}"
-        );
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("is gone"), "{digest}");
 
         // The same gone state is announced once.
         advance(&ctx, "demo").unwrap();
+        assert!(crate::inbox::unhandled(&fx.project).is_empty());
         assert_eq!(
-            crate::inbox::unhandled(&fx.project)
-                .into_iter()
-                .filter(|item| item.kind == "round-advance")
-                .count(),
-            1
+            crate::coordinator::digest(&ctx, &fx.project, "ha")
+                .unwrap()
+                .0,
+            digest
         );
     }
 

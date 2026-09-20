@@ -6,7 +6,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 
 - **The coordinator is an ordinary agent** in a Herdr pane that follows a skill (`herdr-ade skill` prints it). Plugin code does not route messages, plan work or decide anything.
 - **The binary does mechanics.** Starting or restarting a thread, copying reports, marking inbox items handled: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The one exception is `focus`/`unfocus`: Herdr 0.9.1 has no CLI command for `agent.view.set`, so those two send one JSON line to the project's socket.
-- **Files are the record, prompts are nudges.** Threads write a report file, the ticker writes events to an inbox folder, and the coordinator re-reads state with `context` at the start of every turn. A missed prompt loses nothing.
+- **Files are the record, prompts are nudges.** Thread and round records own their state; `context` renders it directly at the start of every turn. The inbox holds only messages such as courier deliveries, machine notices and routine runs. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pull requests (every two minutes), routines, auto-resolve. Remote machines are polled once a minute.
 - **Tools are found even under a bare `PATH`.** A Herdr server started outside a login shell gives its plugins a minimal `PATH`; the binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own, so the ticker finds `gh`, `rsync` and friends. `ticker status` and `doctor` show what resolved.
 - **Nothing destructive is automatic.** The binary never removes a worktree, deletes a branch, merges or pushes on its own. Text from reports, pull requests and command output is never placed in a prompt.
@@ -22,7 +22,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   scratch/                the coordinator's temporary files
   threads/<id>.toml       thread record          threads/<id>.md   home copy of its report
   threads/<id>.task.md    the task as given      threads/<id>/     working folder of a tab thread
-  inbox/, inbox/done/     events for the coordinator
+  inbox/, inbox/done/     messages with no thread or round home
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator pane, ticker state, lock
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
@@ -167,7 +167,7 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 ## Lane completion deliveries
 
-A lane's `DONE`/`WAITING` line is the wake-up: the ticker types it once into the coordinator's ready pane, so the coordinator is roused even when it already handled the result. The inbox item is the record the coordinator re-reads with `context`; only a command the coordinator runs (`context`, `inbox done`) acknowledges a delivery, and automation never does.
+A lane's `DONE`/`WAITING` line is the wake-up: the ticker types it once into the coordinator's ready pane, so the coordinator is roused even when it already handled the result. `context` reads the current attempt's sealed completion evidence directly, alongside thread and round records. Local completions write no inbox item. A courier import leaves one `courier-delivery` message; a changed recipient leaves a `recipient-changed` message. Only a command the bound coordinator runs (`context`, or `inbox done` for messages) acknowledges a delivery; `--peek` and automation never do. Old thread/round inbox projections are ignored on read, not migrated.
 
 ## Routines
 
@@ -181,12 +181,12 @@ A `lane` or `reviewer` runs on the box by default when its repository has a `box
 
 When you close your Mac session and start a new one, a box lane keeps running on the box but loses the link to its coordinator. `ha pickup` reads each machine once through the courier, re-links the living box lanes under the new coordinator pane, and prints a `herdr --machine <label>` start line for each gone one. `ha pickup --all --start` does that for every active project and restarts the gone lanes, but only where `start_threads = "auto"`.
 
-- The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
+- The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the thread's copy notes say so).
 - The box holds two plugin binaries: `/home/ubuntu/.local/bin/herdr-ade` (lane start and `ha`) and `/home/ubuntu/.local/bin/herdr-pi` (pi `setup`, `login`, `doctor` and `check`); no pi verb runs through `herdr-ade`.
 - Every command the home machine runs on a box goes over SSH with the fixed box `PATH` `/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin` in front, so a fresh box needs no login-shell `PATH` edits for the plugin.
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and it is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back.
 - A blocked remote thread needs you in its pane on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
-- `focus` does not cover remote threads: their sidebar tokens are set on the remote Herdr server. They appear in `overview`, `thread list` and inbox items.
+- `focus` does not cover remote threads: their sidebar tokens are set on the remote Herdr server. They appear in `overview`, `thread list` and `context`.
 - Tasks with no repository always run locally, as tabs.
 
 ## Laptop-closed operation

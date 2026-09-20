@@ -44,7 +44,7 @@ Say what you want once. The coordinator proposes threads and waits for your go-a
 
 ### 💬 Know when a thread needs an answer
 
-A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. A background ticker follows pull requests, runs your scheduled routines, and leaves each change in the coordinator's inbox.
+A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. A background ticker follows pull requests and runs your scheduled routines. The coordinator reads thread and round facts directly; its inbox holds messages such as routine runs and courier deliveries, not copies of those facts.
 
 ## Open your first project in three steps
 

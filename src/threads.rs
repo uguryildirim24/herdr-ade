@@ -1652,32 +1652,18 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
             continue;
         };
         // An unverified pane is never reparented (D3).
-        let Some(stored) = &record.identity.process else {
+        let Some(_) = &record.identity.process else {
             continue;
         };
         let live = herdr
             .pane_process_info(&record.pane_id)
             .map(|info| info.identities())
             .unwrap_or_default();
-        if !thread::identity_verifies(&record, agent, &live) {
-            // Said once per thread attempt and stored process, not per tick.
-            let marker = project.state_dir().join("lineage").join(format!(
-                "{}-{}-{}",
-                record.id,
-                record.attempt.max(1),
-                stored.pid
-            ));
-            if !marker.exists() {
-                let _ = crate::inbox::write(
-                    project,
-                    "lineage-mismatch",
-                    &record.id,
-                    "the live process does not match the stored identity; parent was not repaired",
-                    "",
-                );
-                let _ = std::fs::create_dir_all(project.state_dir().join("lineage"));
-                let _ = std::fs::write(&marker, "");
-            }
+        let mismatch = !thread::identity_verifies(&record, agent, &live);
+        if mismatch != record.lineage_mismatch {
+            thread::update(project, &record.id, |t| t.lineage_mismatch = mismatch)?;
+        }
+        if mismatch {
             continue;
         }
         if agent.parent() != Some(coordinator.pane_id.as_str()) {
@@ -2423,7 +2409,12 @@ mod tests {
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().contains("lineage-mismatch"))
             .count();
-        assert_eq!(inbox, 1);
+        assert_eq!(inbox, 0);
+        assert!(thread::load(&project, "t-0001").unwrap().lineage_mismatch);
+        let digest = crate::coordinator::digest(&world.ctx(), &project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("lineage-mismatch"), "{digest}");
         let repaired = world.runner.calls.borrow().iter().any(|c| {
             let line = c.display();
             line.contains("report-metadata")

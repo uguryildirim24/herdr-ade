@@ -77,11 +77,16 @@ pub struct Thread {
     pub last_group: String,
     pub report_hash: String,
     pub last_report_change: String,
-    pub last_review_item_hash: String,
+    /// Incomplete report/library copy, kept with the report it describes.
+    pub copy_notes: Vec<String>,
+    /// Current pull request validation problem (not a second inbox record).
+    pub pr_note: String,
+    pub lineage_mismatch: bool,
     pub acked_report_hash: String,
     pub pr: String,
     pub pr_state: String,
     pub pr_review: String,
+    pub pr_summary: Option<crate::pr::Summary>,
     pub resolved_reason: String,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub role: String,

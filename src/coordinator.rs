@@ -321,7 +321,7 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let prefix = current_prefix(&ctx.root)?;
     // Capture before the read so a concurrent failure is not marked as seen.
     let read_at = jiff::Timestamp::now().to_string();
-    let (text, shown) = digest(ctx, &project, &prefix)?;
+    let (text, shown, events) = digest_snapshot(ctx, &project, &prefix)?;
     print!("{text}");
     if !peek {
         crate::ledger::context_read(&project, &read_at)?;
@@ -330,13 +330,34 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
             && std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
         {
             inbox::acknowledge_events(&project, &shown, &record.pane_id, record.attempt())?;
+            for event in events {
+                if event.recipient.pane == record.pane_id
+                    && event.recipient.coordinator_attempt == record.attempt()
+                {
+                    crate::events::append_delivery(
+                        &project,
+                        &event.id,
+                        crate::contracts::DeliveryState::Acknowledged,
+                    )?;
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// The digest and the ids of the inbox items it showed.
+/// Test view of the digest and the inbox ids it showed.
+#[cfg(test)]
 pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
+    let (text, items, _) = digest_snapshot(ctx, project, prefix)?;
+    Ok((text, items))
+}
+
+fn digest_snapshot(
+    ctx: &Ctx,
+    project: &Project,
+    prefix: &str,
+) -> Result<(String, Vec<String>, Vec<crate::contracts::Event>)> {
     let mut out = String::new();
     let slug = &project.slug;
     let _ = writeln!(out, "Commands: {prefix}");
@@ -440,6 +461,8 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
 
     out.push_str(&crate::ledger::section(project)?);
 
+    let events = crate::events::list(project);
+    let mut shown_events = Vec::new();
     let rows = crate::threads::rows(ctx, project);
     let open: Vec<_> = rows
         .iter()
@@ -462,6 +485,125 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
             t.title,
             place
         );
+        if !t.machine.is_empty() || !t.pane_id.is_empty() {
+            let _ = writeln!(out, "  pane={} machine={}", t.pane_id, t.machine);
+        }
+        if !t.error.is_empty() {
+            let _ = writeln!(out, "  error: {}", t.error);
+        }
+        let completion = crate::round::latest_event(&events, &t.id, t.attempt.max(1));
+        if let Some(event) = completion {
+            if let Some(done) = &event.payload.done {
+                let _ = writeln!(
+                    out,
+                    "  done: {} report={} event={}",
+                    done.sha, done.report_path, event.id
+                );
+            } else if let Some(waiting) = &event.payload.waiting {
+                let _ = writeln!(out, "  waiting: {} event={}", waiting.text, event.id);
+            }
+            shown_events.push(event.clone());
+        }
+        if !t.report_hash.is_empty() && !completion.is_some_and(|e| e.payload.done.is_some()) {
+            let _ = writeln!(
+                out,
+                "  report: threads/{}.md (report bytes are not a completion)",
+                t.id
+            );
+        }
+        for note in &t.copy_notes {
+            let _ = writeln!(out, "  copy incomplete: {note}");
+        }
+        if t.lineage_mismatch {
+            let _ = writeln!(
+                out,
+                "  lineage-mismatch: live process identity differs; parent not repaired"
+            );
+        }
+        if !t.pr_note.is_empty() {
+            let _ = writeln!(out, "  PR: {}", t.pr_note);
+        }
+        if let Some(summary) = &t.pr_summary {
+            let _ = writeln!(
+                out,
+                "  PR {}: {}",
+                t.pr,
+                crate::pr::describe_change(None, summary)
+            );
+        }
+    }
+    // Auto-resolution used to be a thread-state item. Keep its durable reason
+    // visible without retaining every historical thread transition.
+    for row in rows.iter().filter(|r| {
+        r.group == crate::thread::Group::Resolved
+            && matches!(r.thread.resolved_reason.as_str(), "auto" | "merged")
+    }) {
+        let t = &row.thread;
+        let _ = writeln!(
+            out,
+            "- {} [Resolved: {}] {} (thread resolve --reopen undoes it)",
+            t.id, t.resolved_reason, t.title
+        );
+    }
+
+    let rounds = crate::round::checked_list(project)?;
+    let _ = writeln!(out, "\n## Rounds ({})", rounds.len());
+    for round in rounds {
+        let _ = writeln!(
+            out,
+            "- {} [{:?}] {} — {}",
+            round.round, round.phase, round.branch, round.plain
+        );
+        if round.phase.closed() {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  members: {}",
+            round
+                .manifest
+                .members
+                .iter()
+                .map(|m| {
+                    match &m.pin {
+                        Some(pin) => format!("{}@{}", m.thread, pin.sha),
+                        None => format!("{} (pending)", m.thread),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Some(reviewer) = &round.reviewer {
+            let _ = writeln!(out, "  reviewer: {reviewer}");
+        }
+        if let Some(merge) = &round.merge {
+            if !round.attention.is_empty() {
+                let _ = writeln!(out, "  {}", round.attention);
+            }
+            let _ = writeln!(
+                out,
+                "  merge {:?}: start={} candidate={} merged={} checkpoint={}; run `round merge {}` to finish or diagnose",
+                merge.phase,
+                merge.expected_old,
+                merge.candidate,
+                merge.merged.as_deref().unwrap_or("none"),
+                merge.head.as_deref().unwrap_or("none"),
+                round.round
+            );
+        } else {
+            if !round.attention.is_empty() {
+                let _ = writeln!(out, "  {}", round.attention);
+            } else if let Some(announced) = &round.announced {
+                let _ = writeln!(out, "  {announced}");
+            }
+            if round.reviewer_start_failures > 0 {
+                let _ = writeln!(
+                    out,
+                    "  reviewer start failures: {}",
+                    round.reviewer_start_failures
+                );
+            }
+        }
     }
 
     let preparing: Vec<_> = crate::ops::list(project)
@@ -549,7 +691,7 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
         let _ = writeln!(out, "- config-error: {}: {}", b.file, b.error);
     }
     let shown = items.into_iter().map(|i| i.id).collect();
-    Ok((out, shown))
+    Ok((out, shown, shown_events))
 }
 
 /// Retires the coordinator binding and removes only this plugin's hook entry.
