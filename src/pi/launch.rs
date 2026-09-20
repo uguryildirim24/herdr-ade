@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 /// recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
 /// `opencode-go` is the OpenCode Go plan (the DeepSeek and Muse rows, SPEC-ADE
 /// §6 items 65, 80). `pro` is the local relay from `herdr-pro serve`.
-pub const PROVIDERS: [&str; 4] = ["openai-codex", "opencode-go", "kimi-coding", "pro"];
+pub(crate) const PROVIDERS: [&str; 4] = ["openai-codex", "opencode-go", "kimi-coding", "pro"];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
 /// `pi_args_forbidden`. `-na` is `--no-approve`'s short form (§1) and
@@ -141,13 +141,13 @@ fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
-pub fn min_node_string() -> String {
+pub(crate) fn min_node_string() -> String {
     let (a, b, c) = super::MIN_NODE;
     format!("{a}.{b}.{c}")
 }
 
 /// Write the wrapper and make it executable.
-pub fn write_wrapper(layout: &super::Layout) -> Result<PathBuf> {
+pub(crate) fn write_wrapper(layout: &super::Layout) -> Result<PathBuf> {
     let path = layout.wrapper();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -162,7 +162,7 @@ pub fn write_wrapper(layout: &super::Layout) -> Result<PathBuf> {
 }
 
 /// The args after `--` on the start line (SPEC-pi v2 §3.4).
-pub fn start_args(provider: &str, model: &str, thinking: &str) -> Vec<String> {
+pub(crate) fn start_args(provider: &str, model: &str, thinking: &str) -> Vec<String> {
     vec![
         "--provider".into(),
         provider.into(),
@@ -176,7 +176,7 @@ pub fn start_args(provider: &str, model: &str, thinking: &str) -> Vec<String> {
 
 /// The full `herdr agent start` argv for kind `pi`. `session` is ADE's
 /// `launch.resume_session` (a thread restart), never a recipe value.
-pub fn agent_start_args(
+pub(crate) fn agent_start_args(
     name: &str,
     pane: &str,
     parent: &str,
@@ -208,7 +208,7 @@ pub fn agent_start_args(
 
 /// A `kind = "pi"` recipe is refused when it carries a session or trust flag
 /// (SPEC-pi v2 §3.5). The code is part of the message, so callers can name it.
-pub fn validate_args(args: &[String]) -> Result<()> {
+pub(crate) fn validate_args(args: &[String]) -> Result<()> {
     for arg in args {
         let flag = arg.split('=').next().unwrap_or(arg);
         if FORBIDDEN_ARGS.contains(&flag) {
@@ -251,7 +251,7 @@ fn validate_env(env: &[(String, String)]) -> Result<()> {
 }
 
 /// `provider` equals the `--provider` the args carry (SPEC-pi v2 §3.5).
-pub fn validate_provider_column(provider: &str, args: &[String]) -> Result<()> {
+pub(crate) fn validate_provider_column(provider: &str, args: &[String]) -> Result<()> {
     let in_args = flag_value(args, "--provider")
         .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `--provider` is required"))?;
     if provider != in_args {
@@ -261,7 +261,7 @@ pub fn validate_provider_column(provider: &str, args: &[String]) -> Result<()> {
 }
 
 /// The value of `--flag value` or `--flag=value`.
-pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
+pub(crate) fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == flag {
@@ -289,7 +289,7 @@ fn thinking_supported(provider: &str, model: &str, level: &str) -> Option<bool> 
 }
 
 /// Refuse an unknown level or a level the model clamps.
-pub fn validate_thinking(provider: &str, model: &str, level: &str) -> Result<()> {
+pub(crate) fn validate_thinking(provider: &str, model: &str, level: &str) -> Result<()> {
     if !THINKING_LEVELS.contains(&level) {
         bail!("pi_args_forbidden: `{level}` is not one of the seven thinking levels");
     }

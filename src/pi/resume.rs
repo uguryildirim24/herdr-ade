@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 /// The argv ADE appends for a new attempt on the same session.
-pub fn append_resume_session(session: &Path, recipe_args: &[String]) -> Result<Vec<String>> {
+pub(crate) fn append_resume_session(session: &Path, recipe_args: &[String]) -> Result<Vec<String>> {
     for arg in recipe_args {
         let flag = arg.split('=').next().unwrap_or(arg);
         if SESSION_PICKING.contains(&flag) {
@@ -63,7 +63,7 @@ const R2_STRIP_RULES: [(&str, bool); 7] = [
 /// The session path the herdr extension reported, from a `pane get` answer
 /// (`result.pane.agent_session.value`); `None` means the pane has not
 /// reported one yet.
-pub fn session_from_pane_get(json: &str) -> Result<Option<String>> {
+pub(crate) fn session_from_pane_get(json: &str) -> Result<Option<String>> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     Ok(value
         .pointer("/result/pane/agent_session/value")
