@@ -1,6 +1,6 @@
 {
   "coordinator": {
-    "agent_name": null,
+    "agent_name": "hp-adeherdr-coordinator",
     "cwd": "/Users/rolfie/.herdr-ade/adeherdr",
     "kind": "claude",
     "pane_id": "w1G:p1",
@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0074.md",
+      "tasks/review-r33.md",
+      "tasks/review-r32.md",
+      "tasks/t-0071.md",
+      "tasks/t-0070.md",
+      "tasks/t-0069.md",
       "tasks/t-0068.md",
       "tasks/review-r30.md",
       "tasks/t-0067.md",
       "tasks/t-0066.md",
       "tasks/t-0060.md",
-      "tasks/review-r29.md",
-      "tasks/review-r28.md",
-      "tasks/t-0061.md",
-      "tasks/t-0065.md",
-      "tasks/review-r26.md",
-      "tasks/t-0059.md",
-      "tasks/review-r25.md"
+      "tasks/review-r29.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r33.md",
       "tasks/reviews/code-r30.md",
       "tasks/reviews/code-r29.md",
       "tasks/reviews/code-r28.md",
@@ -39,15 +40,21 @@
       "tasks/reviews/code-r22.md",
       "tasks/reviews/code-r20.md",
       "tasks/reviews/code-r19.md",
-      "tasks/reviews/code-r18.md",
-      "tasks/reviews/code-r15.md"
+      "tasks/reviews/code-r18.md"
     ]
   },
-  "generated": "2026-09-19T20:37:58-04:00",
+  "generated": "2026-09-19T21:35:14-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0068-review-r30-this-round-checks-the-way-a-f",
+      "hp/adeherdr/t-0073-review-r32-this-round-checks-that-every",
+      "hp/adeherdr/t-0074-review-r33-this-round-checks-that-the-cl",
       "main",
+      "hp/adeherdr/t-0070-a-round-refuses-work-that-already-landed",
+      "review/r33",
+      "review/r32",
+      "hp/adeherdr/t-0071-the-cloud-box-builds-the-terminal-progra",
+      "hp/adeherdr/t-0069-the-overview-keeps-one-line-per-row",
+      "hp/adeherdr/t-0068-review-r30-this-round-checks-the-way-a-f",
       "review/r30",
       "hp/adeherdr/t-0057-project-screen-lane-2-the-overview-above",
       "hp/adeherdr/t-0054-every-coordinator-may-evolve-the-harness",
@@ -129,22 +136,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "751bdd9 docs(review): round r30 verdict",
-      "536f195 review(threads): prompt only errored pi lanes",
-      "f600f85 review(threads): fail closed before resolving round work",
-      "d5a0d52 review(round): preserve completed review context",
-      "898b0f3 Merge lane t-0065 for round r30",
-      "b63449f docs(tasks): t-0068"
+      "00883cb docs(review): round r33 verdict",
+      "c727f66 Merge commit '66e4119a5a9c14814c5933b324be32646dc52d76' into hp/adeherdr/t-0074-review-r33-this-round-checks-that-the-cl",
+      "fa0436a docs(tasks): t-0074",
+      "e6ebfaf review(r33): brief for revision 1",
+      "413b65e review(r32): brief for revision 1",
+      "66e4119 fix(harness): resolve zig on the box for the fork build"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "751bdd9",
+        "head": "00883cb",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r30 verdict"
+        "subject": "docs(review): round r33 verdict"
       },
       {
         "branch": "review/r1",
@@ -292,6 +299,20 @@
         "head": "b63449f",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r30",
         "subject": "docs(tasks): t-0068"
+      },
+      {
+        "branch": "review/r32",
+        "dirty": 0,
+        "head": "a215f16",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r32",
+        "subject": "docs(tasks): t-0073"
+      },
+      {
+        "branch": "review/r33",
+        "dirty": 0,
+        "head": "fa0436a",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r33",
+        "subject": "docs(tasks): t-0074"
       },
       {
         "branch": "review/r4",
@@ -684,6 +705,20 @@
         "head": "751bdd9",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0068",
         "subject": "docs(review): round r30 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0073-review-r32-this-round-checks-that-every",
+        "dirty": 0,
+        "head": "beb349e",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0073",
+        "subject": "review(talk): preserve compact row markers"
+      },
+      {
+        "branch": "hp/adeherdr/t-0074-review-r33-this-round-checks-that-the-cl",
+        "dirty": 0,
+        "head": "00883cb",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0074",
+        "subject": "docs(review): round r33 verdict"
       }
     ]
   },
@@ -691,7 +726,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "working",
+      "status": "done",
       "workspace_id": "w1H"
     },
     {
@@ -708,38 +743,80 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r30",
-    "verdict": "751bdd943616b2daa84166bb5b8ecc2fd1fcc7e6"
+    "round": "r33",
+    "verdict": "00883cb262e94280d167a12976fcf56b9a271bf6"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
     {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0068",
+      "cwd": "/Users/rolfie/projects/herdr/.worktrees/t-0072",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0068",
-      "pane_id": "w1G:p2K",
+      "name": "hp-adeherdr-t-0072",
+      "pane_id": "w1G:p2M",
       "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0068--/2026-09-19T23-57-41-124Z_01a0bc1a-b184-72d7-b62a-252811a1c4a0.jsonl",
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-.worktrees-t-0072--/2026-09-20T01-20-20-863Z_01a0bc66-5f7e-70a8-a16b-b9a25d063909.jsonl",
       "start_args": [],
       "status": "done",
-      "tab_id": "w1G:t2F",
-      "tab_label": "t-0068",
-      "title": "π - t-0068",
+      "tab_id": "w1G:t2G",
+      "tab_label": "t-0072",
+      "title": "π - t-0072",
       "tokens": {
         "done": "1",
-        "lane": "t-0068",
+        "lane": "t-0072",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "1",
         "review": "ready-for-review",
-        "thread": "t-0068"
+        "thread": "t-0072"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0073",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0073",
+      "pane_id": "w1G:p2N",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0073--/2026-09-20T01-27-49-494Z_01a0bc6d-37f6-7416-8117-d2c55fc3c681.jsonl",
+      "start_args": [],
+      "status": "working",
+      "tab_id": "w1G:t2H",
+      "tab_label": "t-0073",
+      "title": "π - t-0073",
+      "tokens": {
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "3",
+        "review": "working",
+        "thread": "t-0073"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0074",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0074",
+      "pane_id": "w1G:p2P",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0074--/2026-09-20T01-28-45-474Z_01a0bc6e-12a2-7365-aa4b-fd0e68d2a105.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t2J",
+      "tab_label": "t-0074",
+      "title": "π - t-0074",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0074",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0074"
       }
     }
   ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 3
+    "tabs": 5
   }
 }
