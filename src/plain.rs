@@ -171,11 +171,10 @@ pub fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
     CheckResult { violations }
 }
 
-/// The number of non-empty sentences in `text`, for a record. A `.` inside a
-/// token (`config.toml`) does not end a sentence: a terminator counts when it
-/// is at the end of the text or followed by whitespace, and a newline always
-/// ends one. [`check_r5`] keeps its own split because Rolf's prose has no file
-/// names.
+/// The number of non-empty sentences in `text`, for a record. A `.` between
+/// two letters or digits (`config.toml`, `1.2`) does not end a sentence; other
+/// terminators and newlines do. [`check_r5`] keeps its own split because
+/// Rolf's prose has no file names.
 pub fn sentence_count(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut count = 0;
@@ -183,8 +182,15 @@ pub fn sentence_count(text: &str) -> usize {
     let mut i = 0;
     while i < bytes.len() {
         let ends = match bytes[i] {
-            b'\n' => true,
-            b'.' | b'!' | b'?' => bytes.get(i + 1).is_none_or(|c| c.is_ascii_whitespace()),
+            b'\n' | b'!' | b'?' => true,
+            b'.' => {
+                let inside_token = i
+                    .checked_sub(1)
+                    .and_then(|before| bytes.get(before))
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                    && bytes.get(i + 1).is_some_and(u8::is_ascii_alphanumeric);
+                !inside_token
+            }
             _ => false,
         };
         if ends {
@@ -797,6 +803,7 @@ mod tests {
         assert_eq!(codes(&check_record(&long, &g)), ["plain_long_sentence"]);
         assert_eq!(sentence_count("The round lands config.toml."), 1);
         assert_eq!(sentence_count("One. Two."), 2);
+        assert_eq!(sentence_count("One.\" Two."), 2);
         assert_eq!(sentence_count("No terminator here"), 1);
     }
 
