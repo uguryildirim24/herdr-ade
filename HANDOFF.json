@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0107.md",
+      "tasks/review-r49.md",
+      "tasks/t-0106.md",
+      "tasks/t-0105.md",
       "tasks/t-0104.md",
       "tasks/review-r48.md",
       "tasks/t-0103.md",
@@ -18,17 +22,14 @@
       "tasks/t-0101.md",
       "tasks/t-0102.md",
       "tasks/review-r46.md",
-      "tasks/t-0100.md",
-      "tasks/review-r45.md",
-      "tasks/t-0099.md",
-      "tasks/review-r44.md",
-      "tasks/t-0098.md"
+      "tasks/t-0100.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r49.md",
       "tasks/reviews/code-r48.md",
       "tasks/reviews/code-r47.md",
       "tasks/reviews/code-r46.md",
@@ -39,15 +40,18 @@
       "tasks/reviews/code-r38.md",
       "tasks/reviews/code-r39.md",
       "tasks/reviews/code-r35.md",
-      "tasks/reviews/code-r37.md",
-      "tasks/reviews/code-r36.md"
+      "tasks/reviews/code-r37.md"
     ]
   },
-  "generated": "2026-09-20T01:34:25-04:00",
+  "generated": "2026-09-20T02:47:47-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0104-review-r48-this-round-checks-that-the-ru",
+      "hp/adeherdr/t-0107-review-r49-this-round-checks-that-a-refu",
       "main",
+      "review/r49",
+      "hp/adeherdr/t-0105-e6-d10-designed-refusals-are-not-failure",
+      "hp/adeherdr/t-0106-d9-a-reviewer-on-the-box-can-seal-its-ow",
+      "hp/adeherdr/t-0104-review-r48-this-round-checks-that-the-ru",
       "review/r48",
       "hp/adeherdr/t-0098-calibrate-the-picker-on-this-project-s-o",
       "hp/adeherdr/t-0103-review-r47-this-round-checks-the-list-of",
@@ -178,22 +182,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "1aba858 docs(review): round r48 verdict",
-      "436ec1d review(context): cover terminal preparation and unreadable tasks",
-      "00a59a8 review(context): merge pinned t-0102",
-      "e681ae4 docs(tasks): t-0104",
-      "397d11b review(r48): brief for revision 1",
-      "69cc1b0 checkpoint(r47): HANDOFF after merging the round"
+      "a8a46b4 review(ade): record r49 MERGE verdict",
+      "fd38b90 review(ade): cover publication refusal markers and report symlinks",
+      "49ff01d review(ade): merge pinned cloud reviewer publication changes",
+      "15f14da Merge commit '566bcfbc8e073aaa7ea159bf1407946a8f8da4e4' into hp/adeherdr/t-0107-review-r49-this-round-checks-that-a-refu",
+      "5796465 docs(tasks): t-0107",
+      "b7d87d6 review(r49): brief for revision 2"
     ],
-    "remote": "6 ahead, 0 behind origin/main",
+    "remote": "10 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "1aba858",
+        "head": "a8a46b4",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r48 verdict"
+        "subject": "review(ade): record r49 MERGE verdict"
       },
       {
         "branch": "review/r1",
@@ -460,6 +464,13 @@
         "head": "e681ae4",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r48",
         "subject": "docs(tasks): t-0104"
+      },
+      {
+        "branch": "review/r49",
+        "dirty": 0,
+        "head": "5796465",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r49",
+        "subject": "docs(tasks): t-0107"
       },
       {
         "branch": "review/r5",
@@ -960,8 +971,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r48",
-    "verdict": "1aba85866308107a92754ffec7027dfe091d4769"
+    "round": "r49",
+    "verdict": "a8a46b439b7aa55869f8a80121538214abd18e08"
   },
   "session": "default",
   "unlinked_agents": [],
