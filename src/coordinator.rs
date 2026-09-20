@@ -520,7 +520,12 @@ fn digest_snapshot(
             }
             shown_events.push(event.clone());
         }
-        if !t.report_hash.is_empty() && !completion.is_some_and(|e| e.payload.done.is_some()) {
+        // Only suppress a copied report when the sealed evidence covers those
+        // exact bytes. A later report edit is not a new sealed completion.
+        let sealed_report = completion
+            .and_then(|e| e.payload.done.as_ref())
+            .is_some_and(|done| done.artifact == t.report_hash);
+        if !t.report_hash.is_empty() && !sealed_report {
             let _ = writeln!(
                 out,
                 "  report: threads/{}.md (report bytes are not a completion)",

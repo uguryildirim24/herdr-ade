@@ -30,7 +30,7 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 5 | A finishing thread appears in `context` without an inbox item; a courier delivery still writes one message | Builder, unit |
 | 5 | A second session with the plugin linked produces no "pane gone" items | Builder (`hp-dev2`) |
 | 5 | A command routine does not run until `routine_commands = true` and `routine approve` in a terminal; an edited command stops; approve without a terminal refuses | Builder (approved inside a herdr pane), unit |
-| 5 | Fake `gh`: a merged pull request resolves its thread; a comment gives an item with no body; two events in one tick give two items | Unit. A run against a real pull request was not done (needs a push) |
+| 5 | Fake `gh`: a merged pull request resolves its thread; commenter metadata appears in context without comment bodies or inbox items | Unit. A run against a real pull request was not done (needs a push) |
 | 6 | `thread start --machine` creates a worktree and agent on the second machine; the report and a library file come home within two minutes; Ready for review | Builder (about 70 s) |
 | 6 | A short failed connection: no item, no group change, local ticks not slowed; a long one with a one-minute threshold: exactly one `outage` item and one recovery item | Builder (ssh shim on the ticker's `PATH`), unit |
 | 6 | A title with quotes, spaces and `$(...)` reaches the remote `--label` unchanged and runs nothing | Builder |
