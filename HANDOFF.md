@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T21:39:11-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-19T21:42:01-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 4 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
 
@@ -25,7 +25,7 @@ Coordinator session id `6c22d8cf-cae6-47e2-a930-fd9207175aea`.
 | name | kind | status | pane | tab (label) | cwd | tokens | last title |
 |---|---|---|---|---|---|---|---|
 | hp-adeherdr-t-0073 | pi | done | `w1G:p2N` | `w1G:t2H` (t-0073) | `/home/agent/projects/herdr-ade/.worktrees/t-0073` | done=1 lane=t-0073 project=adeherdr rank=1 review=ready-for-review thread=t-0073 | π - t-0073 |
-| hp-adeherdr-t-0075 | pi | working | `w1G:p2Q` | `w1G:t2K` (t-0075) | `/home/agent/projects/herdr-ade/.worktrees/t-0075` | project=adeherdr rank=3 review=working thread=t-0075 | π - t-0075 |
+| hp-adeherdr-t-0075 | pi | done | `w1G:p2Q` | `w1G:t2K` (t-0075) | `/home/agent/projects/herdr-ade/.worktrees/t-0075` | done=1 lane=t-0075 project=adeherdr rank=3 review=working thread=t-0075 | π - t-0075 |
 
 Start lines as they run now (from `pane process-info`), for restarting a worker that is gone:
 
@@ -34,15 +34,15 @@ herdr agent start hp-adeherdr-t-0073 --kind pi --pane <new pane> --parent "$HERD
 herdr agent start hp-adeherdr-t-0075 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
 ```
 
-Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done), `w1J` Venator (idle), `w1K` Elicio (idle)
+Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done), `w1J` Venator (idle), `w1K` Elicio (done)
 
 ### Git
 
-Repo `/home/agent/projects/herdr-ade`, integration branch `main` (7 ahead, 0 behind origin/main).
+Repo `/home/agent/projects/herdr-ade`, integration branch `main` (6 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/home/agent/projects/herdr-ade` | `main` | cf34b16 | 0 | Merge commit 'd775cd4a5ca727b77d6445147d39f5c993120678' |
+| `/home/agent/projects/herdr-ade` | `main` | 6420617 | 0 | Merge commit 'ded43484fd4e98be9d0a2400845fe8b9ba7c659a' |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -125,24 +125,24 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (7 ahead, 0 beh
 | `/home/agent/projects/herdr-ade/.worktrees/t-0068` | `hp/adeherdr/t-0068-review-r30-this-round-checks-the-way-a-f` | 751bdd9 | 0 | docs(review): round r30 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0073` | `hp/adeherdr/t-0073-review-r32-this-round-checks-that-every` | d775cd4 | 0 | docs(review): round r32 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0074` | `hp/adeherdr/t-0074-review-r33-this-round-checks-that-the-cl` | 00883cb | 0 | docs(review): round r33 verdict |
-| `/home/agent/projects/herdr-ade/.worktrees/t-0075` | `hp/adeherdr/t-0075-review-r34-this-round-checks-that-a-roun` | cfee43f | 0 | docs(tasks): t-0075 |
+| `/home/agent/projects/herdr-ade/.worktrees/t-0075` | `hp/adeherdr/t-0075-review-r34-this-round-checks-that-a-roun` | ded4348 | 0 | docs(review): round r34 verdict |
 
 Last commits on the integration branch:
 
 ```
+6420617 Merge commit 'ded43484fd4e98be9d0a2400845fe8b9ba7c659a'
+ded4348 docs(review): round r34 verdict
+8849074 Merge commit '1cb0ded43922b184d3e17b3fbfc041821fdda757' into hp/adeherdr/t-0075-review-r34-this-round-checks-that-a-roun
+dbe3fad checkpoint(r32): HANDOFF after merging the round
 cf34b16 Merge commit 'd775cd4a5ca727b77d6445147d39f5c993120678'
-1bf4919 review(r34): brief for revision 1
-d775cd4 docs(review): round r32 verdict
-58699ce checkpoint(r33): HANDOFF after merging the round
-beb349e review(talk): preserve compact row markers
-00883cb docs(review): round r33 verdict
+cfee43f docs(tasks): t-0075
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0073.md`, `tasks/review-r34.md`, `tasks/t-0074.md`, `tasks/review-r33.md`, `tasks/review-r32.md`, `tasks/t-0071.md`, `tasks/t-0070.md`, `tasks/t-0069.md`, `tasks/t-0068.md`, `tasks/review-r30.md`, `tasks/t-0067.md`, `tasks/t-0066.md`
-- verdicts: `tasks/reviews/code-r32.md`, `tasks/reviews/code-r33.md`, `tasks/reviews/code-r30.md`, `tasks/reviews/code-r29.md`, `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`, `tasks/reviews/code-r23.md`, `tasks/reviews/code-r22.md`, `tasks/reviews/code-r20.md`, `tasks/reviews/code-r19.md`
+- briefs: `tasks/t-0075.md`, `tasks/t-0073.md`, `tasks/review-r34.md`, `tasks/t-0074.md`, `tasks/review-r33.md`, `tasks/review-r32.md`, `tasks/t-0071.md`, `tasks/t-0070.md`, `tasks/t-0069.md`, `tasks/t-0068.md`, `tasks/review-r30.md`, `tasks/t-0067.md`
+- verdicts: `tasks/reviews/code-r34.md`, `tasks/reviews/code-r32.md`, `tasks/reviews/code-r33.md`, `tasks/reviews/code-r30.md`, `tasks/reviews/code-r29.md`, `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`, `tasks/reviews/code-r23.md`, `tasks/reviews/code-r22.md`, `tasks/reviews/code-r20.md`
 
 ### Pickup
 
@@ -154,5 +154,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /home/agent/.herdr-ade/adeherdr && claude --resume 6c22d8cf-cae6-47e2-a930-fd9207175aea
 ```
 
-Round `r32` was merged into `main` at verdict commit `d775cd4a5ca727b77d6445147d39f5c993120678`; this checkpoint is its child.
+Round `r34` was merged into `main` at verdict commit `ded43484fd4e98be9d0a2400845fe8b9ba7c659a`; this checkpoint is its child.
 

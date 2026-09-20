@@ -11,6 +11,7 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0075.md",
       "tasks/t-0073.md",
       "tasks/review-r34.md",
       "tasks/t-0074.md",
@@ -21,14 +22,14 @@
       "tasks/t-0069.md",
       "tasks/t-0068.md",
       "tasks/review-r30.md",
-      "tasks/t-0067.md",
-      "tasks/t-0066.md"
+      "tasks/t-0067.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r34.md",
       "tasks/reviews/code-r32.md",
       "tasks/reviews/code-r33.md",
       "tasks/reviews/code-r30.md",
@@ -39,11 +40,10 @@
       "tasks/reviews/code-r24.md",
       "tasks/reviews/code-r23.md",
       "tasks/reviews/code-r22.md",
-      "tasks/reviews/code-r20.md",
-      "tasks/reviews/code-r19.md"
+      "tasks/reviews/code-r20.md"
     ]
   },
-  "generated": "2026-09-19T21:39:11-04:00",
+  "generated": "2026-09-19T21:42:01-04:00",
   "git": {
     "branches": [
       "main",
@@ -138,22 +138,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
+      "6420617 Merge commit 'ded43484fd4e98be9d0a2400845fe8b9ba7c659a'",
+      "ded4348 docs(review): round r34 verdict",
+      "8849074 Merge commit '1cb0ded43922b184d3e17b3fbfc041821fdda757' into hp/adeherdr/t-0075-review-r34-this-round-checks-that-a-roun",
+      "dbe3fad checkpoint(r32): HANDOFF after merging the round",
       "cf34b16 Merge commit 'd775cd4a5ca727b77d6445147d39f5c993120678'",
-      "1bf4919 review(r34): brief for revision 1",
-      "d775cd4 docs(review): round r32 verdict",
-      "58699ce checkpoint(r33): HANDOFF after merging the round",
-      "beb349e review(talk): preserve compact row markers",
-      "00883cb docs(review): round r33 verdict"
+      "cfee43f docs(tasks): t-0075"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "6 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "cf34b16",
+        "head": "6420617",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'd775cd4a5ca727b77d6445147d39f5c993120678'"
+        "subject": "Merge commit 'ded43484fd4e98be9d0a2400845fe8b9ba7c659a'"
       },
       {
         "branch": "review/r1",
@@ -732,9 +732,9 @@
       {
         "branch": "hp/adeherdr/t-0075-review-r34-this-round-checks-that-a-roun",
         "dirty": 0,
-        "head": "cfee43f",
+        "head": "ded4348",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0075",
-        "subject": "docs(tasks): t-0075"
+        "subject": "docs(review): round r34 verdict"
       }
     ]
   },
@@ -752,15 +752,15 @@
     },
     {
       "label": "Elicio",
-      "status": "idle",
+      "status": "done",
       "workspace_id": "w1K"
     }
   ],
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r32",
-    "verdict": "d775cd4a5ca727b77d6445147d39f5c993120678"
+    "round": "r34",
+    "verdict": "ded43484fd4e98be9d0a2400845fe8b9ba7c659a"
   },
   "session": "default",
   "unlinked_agents": [],
@@ -795,11 +795,13 @@
       "pane_label": null,
       "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0075--/2026-09-20T01-38-33-908Z_01a0bc77-0d33-7715-b96b-288d3b2a0834.jsonl",
       "start_args": [],
-      "status": "working",
+      "status": "done",
       "tab_id": "w1G:t2K",
       "tab_label": "t-0075",
       "title": "π - t-0075",
       "tokens": {
+        "done": "1",
+        "lane": "t-0075",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
