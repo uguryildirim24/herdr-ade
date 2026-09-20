@@ -158,6 +158,22 @@ pub fn open_lane_count(project: &Project) -> usize {
 /// Creates the worktree or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
+    start_with_ticker(ctx, slug, args, ticker::start)
+}
+
+/// Starts a thread while `round advance` holds its lock. This must not wait for
+/// a ticker replacement: the running ticker may itself be waiting for that
+/// lock. Ordinary starts still replace a stale ticker through [`start`].
+pub(crate) fn start_during_advance(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
+    start_with_ticker(ctx, slug, args, ticker::ensure)
+}
+
+fn start_with_ticker(
+    ctx: &Ctx,
+    slug: &str,
+    args: StartArgs,
+    ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
+) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let status = project.status();
     if status != project::Status::Active {
@@ -170,8 +186,9 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         bail!("the task is empty");
     }
     let (settings, _) = project.read_project_md()?;
-    // Without a running ticker nothing launches.
-    ticker::start(ctx)?;
+    // Without a running ticker nothing launches. The advance path uses the
+    // non-blocking ensure; every ordinary start replaces a stale ticker.
+    ensure_ticker(ctx)?;
     let view = require_session(ctx, &project)?;
 
     let listed = args

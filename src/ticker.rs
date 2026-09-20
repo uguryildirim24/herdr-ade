@@ -92,6 +92,23 @@ pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) 
     }
 }
 
+/// Ensures a ticker is running without waiting for a running one to stop.
+/// `round advance` must not block while replacing a ticker: the ticker's own
+/// pass calls `advance`, so waiting here would deadlock against the ticker
+/// waiting on `advance`'s lock. Ordinary thread starts and explicit `ticker
+/// start` calls still replace a stale-version ticker.
+pub fn ensure(ctx: &Ctx) -> Result<()> {
+    let root = &ctx.root;
+    if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
+        return Ok(());
+    }
+    if lock_state(root) == LockState::Free {
+        let _ = std::fs::remove_file(stop_path(root));
+        spawn(root)?;
+    }
+    Ok(())
+}
+
 /// Spawns the detached loop unless there is nothing to watch. It creates
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
@@ -1066,6 +1083,37 @@ mod tests {
             decide_start(&held("v1"), "v1", true),
             StartAction::StopThenSpawn
         );
+    }
+
+    /// `ensure` never writes the stop file, so `round advance` cannot deadlock
+    /// waiting for a running ticker whose own pass waits on its lock.
+    #[test]
+    fn ensure_leaves_a_running_ticker_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: true,
+        };
+        // A running ticker of another version: `start` would stop it, `ensure`
+        // must not.
+        let mut file = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path(&root))
+            .unwrap();
+        file.lock().unwrap();
+        file.write_all(br#"{"version":"old","pid":1}"#).unwrap();
+        ensure(&ctx).unwrap();
+        assert!(!stop_path(&root).exists(), "ensure writes no stop file");
+        drop(file);
     }
 
     #[test]
