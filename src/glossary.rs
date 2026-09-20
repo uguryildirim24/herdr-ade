@@ -156,9 +156,8 @@ pub fn format_check(text: &str, result: &CheckResult) -> String {
 }
 
 /// One checked plain sentence for a coordinator-written field (plan step,
-/// result sentence, decision line). Uses the project registry so a born name
-/// may appear in gloss form, and requires exactly one sentence. Returns the
-/// trimmed text.
+/// result sentence). Uses the project registry so a born name may appear in
+/// gloss form, and requires exactly one sentence. Returns the trimmed text.
 pub fn check_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -174,6 +173,22 @@ pub fn check_sentence(project: &Project, field: &str, text: &str) -> Result<Stri
         .count();
     if sentences != 1 {
         bail!("plain_refused: {field}: write one sentence of at most 25 words");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One checked sentence for a coordinator record (`ha decide`). Keeps every
+/// rule [`check_sentence`] keeps except the known-word rule, so the line may
+/// name a file; the length limit still holds because the line is a row on a
+/// screen.
+pub fn check_record_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("plain_envelope: required field {field} is missing or empty");
+    }
+    let result = plain::check_record(trimmed, &registry(project));
+    if !result.passed() {
+        bail!("plain_refused: {field}: {}", format_check(trimmed, &result));
     }
     Ok(trimmed.to_string())
 }
@@ -239,18 +254,28 @@ fn is_name_char(b: u8) -> bool {
 /// The birth check (D17 item 6): one sentence, at most the word cap, every
 /// word admitted by R4, no registry name and no identifier-shaped token.
 pub fn check_birth(project: &Project, sentence: &str) -> Result<()> {
+    check_birth_with(project, sentence, plain::check)
+}
+
+/// The birth check for a coordinator record (`round open`): the same rules as
+/// [`check_birth`] except the known-word rule. The round sentence is a row on a
+/// screen and may name a file.
+pub fn check_record_birth(project: &Project, sentence: &str) -> Result<()> {
+    check_birth_with(project, sentence, plain::check_record)
+}
+
+fn check_birth_with(
+    project: &Project,
+    sentence: &str,
+    check: fn(&str, &Glossary) -> CheckResult,
+) -> Result<()> {
     let sentence = sentence.trim();
     if sentence.is_empty() {
         bail!("plain_missing: a name needs --plain \"<one sentence>\"");
     }
     let glossary = registry(project);
     let mut problems = Vec::new();
-    let enders = sentence
-        .trim_end_matches(['.', '!', '?'])
-        .chars()
-        .filter(|c| matches!(c, '.' | '!' | '?' | '\n'))
-        .count();
-    if enders > 0 {
+    if plain::sentence_count(sentence) != 1 {
         problems.push("plain_birth: write exactly one sentence".to_string());
     }
     for name in glossary.names.keys().chain(glossary.terms.keys()) {
@@ -260,7 +285,7 @@ pub fn check_birth(project: &Project, sentence: &str) -> Result<()> {
             ));
         }
     }
-    let result = plain::check(sentence, &glossary);
+    let result = check(sentence, &glossary);
     if !result.passed() {
         problems.push(format_check(sentence, &result));
     }

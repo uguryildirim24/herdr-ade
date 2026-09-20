@@ -405,8 +405,11 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     }
 
     let _ = writeln!(out, "\n## Memory index (MEMORY.md)");
-    let memory = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
-    let _ = writeln!(out, "{}", memory.trim());
+    let memory = crate::thread::memory_use(project);
+    let _ = writeln!(out, "{}", memory.index.trim());
+    if let Some(warning) = memory.warning() {
+        let _ = writeln!(out, "{warning}");
+    }
 
     let _ = writeln!(out, "\n## Tasks (TASKS.md)");
     let tasks = std::fs::read_to_string(project.dir().join("TASKS.md")).unwrap_or_default();

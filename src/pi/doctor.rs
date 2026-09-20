@@ -658,8 +658,9 @@ fn wrapper_path_row_with(runner: &dyn sh::Runner, env: &Env, layout: &Layout, sh
     }
 }
 
-/// The login shell's own "where is this word" builtin.
-fn path_probe(shell: &str) -> &'static str {
+/// The login shell's own "where is this word" builtin. Visible to the
+/// fake-runner scenarios so their scripts use the same shell as the probe.
+pub(super) fn path_probe(shell: &str) -> &'static str {
     match Path::new(shell).file_name().and_then(|name| name.to_str()) {
         Some("bash") => "type -a pi",
         Some("zsh") => "whence -va pi",

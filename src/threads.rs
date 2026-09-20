@@ -117,14 +117,16 @@ pub struct StartArgs {
     pub recipe: Option<String>,
 }
 
-/// Birth sentence: required, one sentence, R1–R5 (SPEC-ADE D17 item 6).
+/// Birth sentence: required, one sentence, R1–R5 except the known-word rule
+/// (SPEC-ADE D17 item 6). The sentence is a row on a screen, so it may name a
+/// file; `say`, `ask` and their choices keep the known-word rule.
 pub fn check_birth_plain(text: &str) -> Result<()> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         bail!("plain_missing");
     }
     let glossary = crate::plain::Glossary::default();
-    let result = crate::plain::check(trimmed, &glossary);
+    let result = crate::plain::check_record(trimmed, &glossary);
     if !result.passed() {
         let detail: Vec<String> = result
             .violations
@@ -133,12 +135,7 @@ pub fn check_birth_plain(text: &str) -> Result<()> {
             .collect();
         bail!("{}", detail.join("; "));
     }
-    let sentences: Vec<&str> = trimmed
-        .split(['.', '?', '!', '\n'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if sentences.len() != 1 {
+    if crate::plain::sentence_count(trimmed) != 1 {
         bail!("write one sentence of at most 25 words");
     }
     Ok(())
@@ -2017,7 +2014,11 @@ mod tests {
     fn birth_sentence_is_required_and_checked() {
         let err = check_birth_plain("").unwrap_err().to_string();
         assert!(err.contains("plain_missing"), "{err}");
-        assert!(check_birth_plain("bisimulation quotient").is_err());
+        // An identifier-shaped token is still refused; only the known-word
+        // rule is relaxed for a thread sentence.
+        assert!(check_birth_plain("It touches src/plain.rs there.").is_err());
+        // A file name the record needs is allowed.
+        check_birth_plain("It changes config.toml today.").unwrap();
         check_birth_plain("The lane does the work.").unwrap();
     }
 

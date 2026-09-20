@@ -142,6 +142,65 @@ pub fn check(text: &str, glossary: &Glossary) -> CheckResult {
     }
 }
 
+/// Check a coordinator record (`ha decide`, a round or thread sentence): every
+/// rule except the known-word one (R4), with the length cap counted over the
+/// whole line. The record is a row on a screen and records what happened, in
+/// whatever words are accurate, so it may name a file. Everything Rolf reads
+/// as prose (`say`, `ask` and their choices) uses [`check`].
+pub fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
+    let mut violations = Vec::new();
+    violations.extend(check_r1_r2(text, glossary));
+    violations.extend(check_r3(text, glossary));
+    // R5 splits on every dot; a file name like `config.toml` would hide a long
+    // line behind two short pieces. The record's length is the whole line.
+    let cap = glossary.max_words();
+    let n = tokens(text)
+        .into_iter()
+        .filter(|t| t.raw.chars().any(|c| c.is_ascii_alphanumeric()))
+        .count();
+    if n > cap {
+        violations.push(Violation {
+            rule: Rule::LongSentence,
+            span: Span {
+                start: 0,
+                end: text.len(),
+            },
+            fix: format!("split this {n}-word sentence"),
+        });
+    }
+    CheckResult { violations }
+}
+
+/// The number of non-empty sentences in `text`, for a record. A `.` inside a
+/// token (`config.toml`) does not end a sentence: a terminator counts when it
+/// is at the end of the text or followed by whitespace, and a newline always
+/// ends one. [`check_r5`] keeps its own split because Rolf's prose has no file
+/// names.
+pub fn sentence_count(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut count = 0;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ends = match bytes[i] {
+            b'\n' => true,
+            b'.' | b'!' | b'?' => bytes.get(i + 1).is_none_or(|c| c.is_ascii_whitespace()),
+            _ => false,
+        };
+        if ends {
+            if !text[start..i].trim().is_empty() {
+                count += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if !text[start..].trim().is_empty() {
+        count += 1;
+    }
+    count
+}
+
 /// Check an `ha ask` question and its choices (R1 to R6).
 pub fn check_ask(question: &str, choices: &[String], glossary: &Glossary) -> CheckResult {
     let mut violations = check_text(question, glossary);
@@ -721,6 +780,24 @@ mod tests {
 
     fn codes(result: &CheckResult) -> Vec<&'static str> {
         result.violations.iter().map(|v| v.rule.code()).collect()
+    }
+
+    /// E4: a record line may name a file. The known-word rule is off, the cap
+    /// counts the whole line, and a dot inside a token does not end a sentence.
+    #[test]
+    fn a_record_line_may_name_a_file_but_keeps_the_length_cap() {
+        let g = Glossary::default();
+        assert!(check_record("I changed config.toml today.", &g).passed());
+        // Rolf's prose keeps the known-word rule.
+        assert_eq!(
+            codes(&check("I changed config.toml today.", &g)),
+            ["plain_unknown_word"]
+        );
+        let long = format!("I changed {}.", vec!["config.toml"; 26].join(" "));
+        assert_eq!(codes(&check_record(&long, &g)), ["plain_long_sentence"]);
+        assert_eq!(sentence_count("The round lands config.toml."), 1);
+        assert_eq!(sentence_count("One. Two."), 2);
+        assert_eq!(sentence_count("No terminator here"), 1);
     }
 
     fn list_is_clean(text: &str) {
