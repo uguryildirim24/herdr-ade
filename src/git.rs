@@ -101,6 +101,36 @@ pub fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
     git(runner, repo, &["rev-parse", rev], Duration::from_secs(5))
 }
 
+/// A typed ancestry answer: 0 is yes, 1 with empty stderr is no; other exits,
+/// diagnostics on a negative result, signals, timeouts and spawn errors fail.
+/// The runner uses the same contract so a normal no never enters the ledger.
+pub fn is_ancestor(
+    runner: &dyn Runner,
+    repo: &str,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool> {
+    let out = runner.run(
+        &Cmd::new("git", GIT_TIMEOUT)
+            .args([
+                "-C",
+                repo,
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ])
+            .exit_meaning(crate::runner::ExitMeaning::Boolean),
+    )?;
+    out.boolean_answer().with_context(|| {
+        format!(
+            "`git merge-base --is-ancestor {ancestor} {descendant}` failed: exit={:?}, {}",
+            out.code,
+            out.error_text()
+        )
+    })
+}
+
 /// Query an optional local branch without conflating an absent ref with a git
 /// error. `for-each-ref` answers absence with empty output; every nonzero exit
 /// still means the query failed. Match the full name (git also lists prefixes).
@@ -355,6 +385,45 @@ mod tests {
     use super::*;
     use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail, ok};
+
+    #[test]
+    fn ancestry_errors_are_not_negative_answers() {
+        use crate::runner::Output;
+        for output in [
+            fail(1, "object database error"),
+            fail(2, ""),
+            Output {
+                code: Some(1),
+                timed_out: true,
+                ..Default::default()
+            },
+            Output {
+                code: Some(0),
+                timed_out: true,
+                ..Default::default()
+            },
+            Output::default(), // signal
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
+            let _scope = crate::ledger::Scope::new(&[&project]);
+            let fake = FakeRunner::new();
+            fake.on("merge-base --is-ancestor", output);
+            let runner = crate::ledger::RecordingRunner(&fake);
+            assert!(is_ancestor(&runner, "/repo", "a", "b").is_err());
+            let rows = crate::ledger::list(&project).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].kind, "command-failed");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
+        let _scope = crate::ledger::Scope::new(&[&project]);
+        let fake = FakeRunner::new();
+        fake.on_fn(|_| true, |_| Err(anyhow::anyhow!("could not spawn git")));
+        assert!(is_ancestor(&crate::ledger::RecordingRunner(&fake), "/repo", "a", "b").is_err());
+        assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
+    }
 
     #[test]
     fn absent_branch_is_an_answer_but_a_broken_repository_is_not() {

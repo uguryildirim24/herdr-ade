@@ -1,5 +1,14 @@
 # E7 subprocess audit
 
+E8 correction: Git `merge-base --is-ancestor` has distinguishable outcomes.
+Rounds and publication verification now share `git::is_ancestor`, returning
+`Result<bool>` under `ExitMeaning::Boolean`: 0 means yes, 1 with empty stderr
+means no, and every other outcome remains a failure. This adds one shared
+construction site to the inventory below; it does not exempt ambiguous probes.
+The counts below are the original E7 audit, not a new census. The completed
+`ha doctor` nonzero report now carries E6's structural refusal marker; failures
+of its child probes remain eligible for recording.
+
 Count unit: a production command-construction site (`Cmd::new` or
 `Command::new`), not each invocation, loop iteration, or argument combination.
 Tests are excluded. Shared command constructors are counted once; their callers
@@ -79,9 +88,8 @@ Line numbers are deliberately omitted; function names survive formatting.
 
 ## Mixed probes: still eligible for recording
 
-- Git `merge-base --is-ancestor` in rounds and publication verification: false
-  ancestry, invalid refs, and object-database failures all exit unsuccessfully.
-  `merge-tree` likewise mixes conflicts with repository/tool failures.
+- Git `merge-tree` mixes conflicts with repository/tool failures. Ancestry
+  is no longer in this category (see the E8 correction above).
 - Git repository detection, optional origin URL, detached-HEAD detection, and
   checkpoint discovery: absence/non-repository/detachment and unreadable paths,
   configuration, or repository damage overlap. The shared constructors are not

@@ -7,13 +7,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-/// The caller's contract, not an exit-code or diagnostic allowlist. Use
-/// `Answer` only when *every normal exit* answers the question. Mixed probes
-/// (for example git ancestry or SSH checks) must keep `Required`.
+/// The caller's contract, not a command-name or diagnostic allowlist. Use
+/// `Answer` only when *every normal exit* answers the question. Ambiguous probes
+/// (for example SSH checks) must keep `Required`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitMeaning {
     Required,
     Answer,
+    /// Zero means yes; one with empty stderr means no. Every other outcome
+    /// is an error. Only for commands with this precise contract (git ancestry).
+    Boolean,
+}
+
+impl ExitMeaning {
+    pub fn answered(self, out: &Output) -> bool {
+        out.success()
+            || (self == Self::Answer && out.code.is_some() && !out.timed_out)
+            || (self == Self::Boolean && out.boolean_answer().is_some())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +124,19 @@ pub struct Output {
 impl Output {
     pub fn success(&self) -> bool {
         self.code == Some(0) && !self.timed_out
+    }
+
+    /// Decode the `ExitMeaning::Boolean` contract. `None` is a failed probe,
+    /// including timeouts/signals, not a negative answer.
+    pub fn boolean_answer(&self) -> Option<bool> {
+        if self.timed_out {
+            return None;
+        }
+        match self.code {
+            Some(0) => Some(true),
+            Some(1) if self.stderr.is_empty() => Some(false),
+            _ => None,
+        }
     }
 
     /// stderr when it has text, else stdout, trimmed; for error messages.
