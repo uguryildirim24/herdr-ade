@@ -1,7 +1,7 @@
 //! Keyboard-first alternate screen. Drawing is pure over local snapshots;
 //! only explicit input uses the existing request and answer operations.
 use super::{
-    overview::{self, Live, Overview, Tone},
+    overview::{self, Live, Overview, Row, Tone},
     theme::Theme,
     view::{self, Body, CardState, Conversation, JournalReader, Selection, Target},
 };
@@ -500,68 +500,93 @@ fn composer_layout(input: &Composer, width: usize) -> (Vec<Line<'static>>, usize
 
 fn overview_doc(o: &Overview, width: usize, narrow: bool, t: Theme, full: bool) -> Document {
     let mut d = Document::default();
-    for (section, rows) in o.sections.iter().enumerate() {
-        let key = format!("overview-{section}");
+    let mut section = |key: &str, heading: &str, rows: &[Row], progress| {
+        overview_section(&mut d, key, heading, rows, progress, width, narrow, t, full)
+    };
+    if !o.stale.is_empty() {
+        section("stale", overview::STALE_HEADING, &o.stale, None);
+    }
+    section("overview-0", overview::HEADINGS[0], &o.sections[0], None);
+    section("overview-1", overview::HEADINGS[1], &o.sections[1], None);
+    section(
+        "overview-2",
+        overview::HEADINGS[2],
+        &o.sections[2],
+        o.progress,
+    );
+    section("cost", overview::COST_HEADING, &o.cost, None);
+    section("overview-3", overview::HEADINGS[3], &o.sections[3], None);
+    section("overview-4", overview::HEADINGS[4], &o.sections[4], None);
+    section("tasks", overview::TASKS_HEADING, &o.tasks, None);
+    section("overview-5", overview::HEADINGS[5], &o.sections[5], None);
+    d
+}
+
+#[allow(clippy::too_many_arguments)]
+fn overview_section(
+    d: &mut Document,
+    key: &str,
+    heading: &str,
+    rows: &[Row],
+    progress: Option<(usize, usize)>,
+    width: usize,
+    narrow: bool,
+    t: Theme,
+    full: bool,
+) {
+    if full {
+        d.prose(
+            key,
+            vec![bold(heading, t.accent)],
+            width.saturating_sub(1),
+            1,
+        );
+    } else {
+        d.push(key, one_line("", heading, "", Tone::Heading, width, t));
+    }
+    if let Some((done, total)) = progress {
+        let cells = if narrow { 10 } else { 20 };
         if full {
-            d.prose(
-                &key,
-                vec![bold(overview::HEADINGS[section], t.accent)],
-                width.saturating_sub(1),
-                1,
-            );
+            let mut spans = vec![
+                span(format!("{done} of {total} done"), t.green),
+                Span::raw("  "),
+            ];
+            spans.extend(progress_spans(done, total, cells, t));
+            d.prose("progress", spans, width.saturating_sub(1), 1);
         } else {
-            d.push(
-                &key,
-                one_line("", overview::HEADINGS[section], "", Tone::Heading, width, t),
-            );
-        }
-        if section == 2
-            && let Some((done, total)) = o.progress
-        {
-            let cells = if narrow { 10 } else { 20 };
-            if full {
-                let mut spans = vec![
-                    span(format!("{done} of {total} done"), t.green),
-                    Span::raw("  "),
-                ];
-                spans.extend(progress_spans(done, total, cells, t));
-                d.prose("progress", spans, width.saturating_sub(1), 1);
-            } else {
-                let label = format!("{done} of {total} done");
-                let available_cells = width.saturating_sub(1 + label.width() + 2).min(cells);
-                let mut spans = vec![Span::raw(" "), span(label, t.green)];
-                if available_cells > 0 {
-                    spans.push(Span::raw("  "));
-                    spans.extend(progress_spans(done, total, available_cells, t));
-                }
-                d.push("progress", Line::from(spans));
+            let label = format!("{done} of {total} done");
+            let available_cells = width.saturating_sub(1 + label.width() + 2).min(cells);
+            let mut spans = vec![Span::raw(" "), span(label, t.green)];
+            if available_cells > 0 {
+                spans.push(Span::raw("  "));
+                spans.extend(progress_spans(done, total, available_cells, t));
             }
-        }
-        for (i, row) in rows.iter().enumerate() {
-            if full {
-                let spans = if row.tone == Tone::Heading {
-                    vec![bold(row.full_text(), t.accent)]
-                } else {
-                    let mut spans = Vec::new();
-                    if !row.prefix.is_empty() {
-                        spans.push(span(format!("{} ", row.prefix), tone(t, row.tone)));
-                    }
-                    spans.push(span(row.text.clone(), t.text));
-                    if !row.marker.is_empty() {
-                        spans.push(span(format!(" {}", row.marker), t.overlay0));
-                    }
-                    spans
-                };
-                d.prose(&format!("{key}-{i}"), spans, width.saturating_sub(1), 1);
-            } else {
-                d.push(
-                    &format!("{key}-{i}"),
-                    one_line(&row.prefix, &row.text, &row.marker, row.tone, width, t),
-                );
-            }
+            d.push("progress", Line::from(spans));
         }
     }
-    d
+    for (i, row) in rows.iter().enumerate() {
+        if full {
+            let spans = if row.tone == Tone::Heading {
+                vec![bold(row.full_text(), t.accent)]
+            } else {
+                let mut spans = Vec::new();
+                if !row.prefix.is_empty() {
+                    spans.push(span(format!("{} ", row.prefix), tone(t, row.tone)));
+                }
+                spans.push(span(row.text.clone(), t.text));
+                if !row.marker.is_empty() {
+                    spans.push(span(format!(" {}", row.marker), t.overlay0));
+                }
+                spans
+            };
+            d.prose(&format!("{key}-{i}"), spans, width.saturating_sub(1), 1);
+        } else {
+            d.push(
+                &format!("{key}-{i}"),
+                one_line(&row.prefix, &row.text, &row.marker, row.tone, width, t),
+            );
+        }
+    }
 }
 
 fn progress_spans(done: usize, total: usize, cells: usize, t: Theme) -> Vec<Span<'static>> {
@@ -1376,6 +1401,7 @@ pub fn run(ctx: &Ctx, slug: &str) -> Result<()> {
         let mut journal = JournalReader::default();
         let mut live = Live::default();
         let mut poll = Instant::now() - Duration::from_secs(3);
+        let mut slow = Instant::now() - Duration::from_secs(30);
         let capability =
             crate::adapters::capability_label(&project, &super::coordinator_kind(&project));
         let capability = if capability.starts_with("capability: unqualified") {
@@ -1387,6 +1413,10 @@ pub fn run(ctx: &Ctx, slug: &str) -> Result<()> {
             if poll.elapsed() >= Duration::from_secs(3) {
                 live.poll(ctx, &project);
                 poll = Instant::now();
+            }
+            if slow.elapsed() >= Duration::from_secs(30) {
+                live.refresh_slow(ctx, &project);
+                slow = Instant::now();
             }
             journal.refresh(&project)?;
             let mut conversation = Conversation::load(&project, &journal.journal);
@@ -1822,6 +1852,13 @@ mod tests {
             overview::NO_DECISIONS,
             overview::CHANGE,
             overview::ASK_WARNING,
+            overview::STALE_HEADING,
+            overview::COST_HEADING,
+            overview::TASKS_HEADING,
+            overview::NO_COST,
+            overview::COST_ERROR,
+            overview::NO_TASKS,
+            overview::TASKS_ERROR,
         ]);
         let wide = hints(false);
         let narrow = hints(true);
