@@ -370,18 +370,11 @@ impl Runner for RecordingRunner<'_> {
         });
         let result = self.0.run(cmd);
         match &result {
-            Ok(out)
-                if out.success()
-                    || (cmd.exit_meaning == crate::runner::ExitMeaning::Answer
-                        && out.code.is_some()
-                        && !out.timed_out) =>
-            {
-                PROJECTS.with(|projects| {
-                    for project in projects.borrow().iter() {
-                        recovered(project, "command-failed", &subject);
-                    }
-                })
-            }
+            Ok(out) if cmd.exit_meaning.answered(out) => PROJECTS.with(|projects| {
+                for project in projects.borrow().iter() {
+                    recovered(project, "command-failed", &subject);
+                }
+            }),
             Ok(out) => observe_current(
                 "command-failed",
                 &subject,
