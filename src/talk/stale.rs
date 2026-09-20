@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::herdr;
 use crate::paths::Ctx;
 use crate::project::Project;
 use crate::runner::{Cmd, Runner};
@@ -47,24 +46,24 @@ pub fn scan(ctx: &Ctx, project: &Project) -> Stale {
         });
     }
 
-    // 2. The client window against the installed herdr binary.
+    // 2. `status client` describes the short-lived CLI that runs the command,
+    // not the already-open window. Find that long-running `herdr` process and
+    // compare its start with the installed binary's modification time. Fork
+    // builds keep the same 0.9.1 version, so a version comparison cannot see
+    // this stale window.
     let herdr_bin = ctx.env.herdr_bin();
     if let Some(client) = json(
         ctx.runner,
         &Cmd::new(herdr_bin.clone(), CHECK_TIMEOUT).args(["status", "client", "--json"]),
-    ) {
-        let running = client
-            .get("version")
-            .and_then(Value::as_str)
-            .and_then(herdr::parse_version);
-        if let Some(installed) = herdr_version(ctx.runner, &herdr_bin)
-            && running.is_some_and(|version| version != installed)
-        {
-            stale.items.push(Item {
-                what: "The client window is older than the installed program.".into(),
-                remedy: "Reopen the client window so it runs the installed program.".into(),
-            });
-        }
+    ) && client
+        .get("binary")
+        .and_then(Value::as_str)
+        .is_some_and(|binary| client_started_before_install(ctx.runner, Path::new(binary)))
+    {
+        stale.items.push(Item {
+            what: "The client window is older than the installed program.".into(),
+            remedy: "Reopen the client window so it runs the installed program.".into(),
+        });
     }
 
     // 3. The local herdr server image.
@@ -87,13 +86,19 @@ pub fn scan(ctx: &Ctx, project: &Project) -> Stale {
 
     // 5 and 6. A skill file that moved on since the agent was primed.
     if let Some(repo) = plugin_repo(ctx) {
-        if let Some(coordinator) = project.coordinator()
-            && skill_behind(&repo, "coordinator", &coordinator.launch.skill_hash)
-        {
-            stale.items.push(Item {
-                what: "The coordinator is running older skill instructions.".into(),
-                remedy: "Restart the coordinator pane so it reads the new instructions.".into(),
-            });
+        if let Some(coordinator) = project.coordinator() {
+            if coordinator.launch.skill_hash.is_empty() {
+                stale.items.push(Item {
+                    what: "The coordinator's loaded skill version was not recorded.".into(),
+                    remedy: "Restart the coordinator pane so its instructions can be checked."
+                        .into(),
+                });
+            } else if skill_behind(&repo, "coordinator", &coordinator.launch.skill_hash) {
+                stale.items.push(Item {
+                    what: "The coordinator is running older skill instructions.".into(),
+                    remedy: "Restart the coordinator pane so it reads the new instructions.".into(),
+                });
+            }
         }
         for lane in thread::list(project) {
             if lane.status == thread::Status::Resolved {
@@ -104,10 +109,24 @@ pub fn scan(ctx: &Ctx, project: &Project) -> Stale {
             } else {
                 lane.role.as_str()
             };
-            if skill_behind(&repo, role, &lane.launch.skill_hash) {
+            if lane.launch.skill_hash.is_empty() {
+                stale.items.push(Item {
+                    what: format!("Lane {}'s loaded skill version was not recorded.", lane.id),
+                    remedy: format!(
+                        "Restart lane {} so its instructions can be checked.",
+                        lane.id
+                    ),
+                });
+            } else if skill_behind(&repo, role, &lane.launch.skill_hash) {
                 stale.items.push(Item {
                     what: format!("Lane {} is running older skill instructions.", lane.id),
                     remedy: format!("Restart lane {} so it reads the new instructions.", lane.id),
+                });
+            }
+            if brief_behind(&lane) {
+                stale.items.push(Item {
+                    what: format!("Lane {} is running an older brief.", lane.id),
+                    remedy: format!("Restart lane {} so it reads the current brief.", lane.id),
                 });
             }
         }
@@ -138,14 +157,63 @@ fn plugin_version(runner: &dyn Runner, path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn herdr_version(runner: &dyn Runner, bin: &str) -> Option<herdr::Version> {
+fn client_started_before_install(runner: &dyn Runner, binary: &Path) -> bool {
+    let installed = std::fs::metadata(binary)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let Some(installed) = installed else {
+        return false;
+    };
     let output = runner
-        .run(&Cmd::new(bin, CHECK_TIMEOUT).arg("--version"))
-        .ok()?;
-    if !output.success() {
-        return None;
+        .run(&Cmd::new("/bin/ps", CHECK_TIMEOUT).args(["-axo", "pid=,comm=,args="]))
+        .ok();
+    let Some(output) = output.filter(|output| output.success()) else {
+        return false;
+    };
+    for line in output.stdout.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 3
+            || Path::new(fields[2])
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("herdr")
+        {
+            continue;
+        }
+        let elapsed = runner
+            .run(&Cmd::new("/bin/ps", CHECK_TIMEOUT).args(["-p", fields[0], "-o", "etime="]))
+            .ok()
+            .filter(|output| output.success())
+            .and_then(|output| parse_elapsed(output.stdout.trim()));
+        if let Some(elapsed) = elapsed
+            && std::time::SystemTime::now()
+                .checked_sub(elapsed)
+                .is_some_and(|started| started < installed)
+        {
+            return true;
+        }
     }
-    herdr::parse_version(&output.stdout)
+    false
+}
+
+fn parse_elapsed(text: &str) -> Option<Duration> {
+    let (days, clock) = match text.rsplit_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let fields: Vec<_> = clock.split(':').collect();
+    let (hours, minutes, seconds): (u64, u64, u64) = match fields.as_slice() {
+        [minutes, seconds] => (0, minutes.parse().ok()?, seconds.parse().ok()?),
+        [hours, minutes, seconds] => (
+            hours.parse().ok()?,
+            minutes.parse().ok()?,
+            seconds.parse().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(Duration::from_secs(
+        days * 86_400 + hours * 3_600 + minutes * 60 + seconds,
+    ))
 }
 
 fn json(runner: &dyn Runner, cmd: &Cmd) -> Option<Value> {
@@ -211,16 +279,34 @@ fn plugin_repo(ctx: &Ctx) -> Option<PathBuf> {
 }
 
 /// True when the skill file on disk no longer matches what the agent was
-/// primed with. An unrecorded or unreadable skill is never called stale.
+/// primed with. An unreadable skill is never called stale.
 fn skill_behind(repo: &Path, role: &str, recorded: &str) -> bool {
-    if recorded.is_empty() {
-        return false;
-    }
     let Ok(text) = std::fs::read_to_string(repo.join("skill").join(crate::lane::skill_file(role)))
     else {
         return false;
     };
     thread::sha256_hex(text.as_bytes()) != recorded
+}
+
+/// A worktree reads `tasks/<id>.md`; a tab reads its fixed `brief.md`. Remote
+/// worktree paths are on the box, so their committed copy is read in the Mac
+/// checkout that created the brief.
+fn brief_behind(lane: &thread::Thread) -> bool {
+    if lane.launch.brief_hash.is_empty() {
+        return false;
+    }
+    let path = match lane.kind {
+        thread::Kind::Tab => PathBuf::from(&lane.thread_dir).join("brief.md"),
+        _ if lane.is_remote() => PathBuf::from(&lane.repo)
+            .join("tasks")
+            .join(format!("{}.md", lane.id)),
+        _ => PathBuf::from(&lane.worktree_path)
+            .join("tasks")
+            .join(format!("{}.md", lane.id)),
+    };
+    std::fs::read(&path)
+        .ok()
+        .is_some_and(|text| thread::sha256_hex(&text) != lane.launch.brief_hash)
 }
 
 /// pi's `pro` provider URL against the relay's `serve.json` port.
@@ -331,5 +417,37 @@ mod tests {
             .find(|item| item.what.contains("old port"))
             .expect("a stale port row");
         assert!(row.remedy.contains("herdr-pi setup"), "{}", row.remedy);
+    }
+
+    #[test]
+    fn a_client_started_before_the_installed_binary_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("herdr");
+        std::fs::write(&binary, b"new binary").unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on("-axo", ok("42 herdr herdr\n"));
+        runner.on("-p 42", ok("01:00:00\n"));
+        assert!(client_started_before_install(&runner, &binary));
+        assert_eq!(
+            parse_elapsed("2-03:04:05"),
+            Some(Duration::from_secs(183_845))
+        );
+    }
+
+    #[test]
+    fn a_changed_lane_brief_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tasks")).unwrap();
+        std::fs::write(dir.path().join("tasks/t-0001.md"), "new").unwrap();
+        let lane = thread::Thread {
+            id: "t-0001".into(),
+            worktree_path: dir.path().to_string_lossy().into_owned(),
+            launch: crate::contracts::Launch {
+                brief_hash: thread::sha256_hex(b"old"),
+                ..crate::contracts::Launch::default()
+            },
+            ..thread::Thread::default()
+        };
+        assert!(brief_behind(&lane));
     }
 }
