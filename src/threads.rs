@@ -260,15 +260,34 @@ fn start_with_ticker(
     // The machine is resolved before any tab or worktree exists (SPEC-remote
     // §4.1, d-0005). `--machine` wins and never falls back; a default box
     // start whose box cannot be used falls back to this Mac.
-    let placement = resolve_placement(
+    let explicit_machine = args.machine.as_deref().filter(|m| !m.is_empty());
+    let placement = match resolve_placement(
         ctx,
-        slug,
-        args.machine.as_deref().filter(|m| !m.is_empty()),
+        explicit_machine,
         role,
         &launch,
         args.repo.as_deref(),
         listed,
+    ) {
+        Ok(placement) => placement,
+        Err(error) => {
+            crate::launch::ledger(
+                &project,
+                serde_json::json!({"kind":"placement-refused", "recipe":launch.recipe_id,
+                    "explicit":explicit_machine, "error":format!("{error:#}")}),
+            )?;
+            return Err(error);
+        }
+    };
+    crate::launch::ledger(
+        &project,
+        serde_json::json!({"kind":"placement", "recipe":launch.recipe_id,
+            "machine":placement.ledger_machine(), "reason":placement.reason,
+            "tried":placement.tried}),
     )?;
+    if placement.fell_back {
+        fallback_say(ctx, slug)?;
+    }
     let machine = placement.machine.clone();
     let open_count = open_lane_count(&project);
     if open_count as u32 >= settings.max_parallel_threads {
@@ -278,12 +297,8 @@ fn start_with_ticker(
         );
     }
 
-    // A box lane's readiness ran during placement (SPEC-remote §4.1): the
-    // Mac's login is irrelevant to it. A local pi lane is checked here.
-    if machine.is_empty() && launch.kind == "pi" {
-        pi_ready(ctx, &launch)?;
-    }
-    // A box start resolves its box repository row before a thread record
+    // Recipe readiness ran on the selected machine during placement. A box
+    // start resolves its box repository row before a thread record
     // exists, so a missing piece refuses early and leaves no record behind
     // (t-0070).
     if !machine.is_empty() && !repo.is_empty() {
@@ -332,11 +347,25 @@ fn start_with_ticker(
     }
 }
 
-/// The resolved machine of a new thread: empty for a local thread.
+/// The resolved machine of a new thread: empty for a local thread. The tried
+/// rows are durable dispatch evidence, not presentation text inferred later.
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Placement {
     machine: String,
     machine_id: String,
+    reason: String,
+    tried: Vec<serde_json::Value>,
+    fell_back: bool,
+}
+
+impl Placement {
+    fn ledger_machine(&self) -> &str {
+        if self.machine.is_empty() {
+            crate::contracts::MACHINE_LOCAL
+        } else {
+            &self.machine
+        }
+    }
 }
 
 /// The default machine of a start without `--machine` (SPEC-remote §4.1,
@@ -358,63 +387,108 @@ fn default_machine(
     has_box.then(|| role_machine.to_string())
 }
 
-/// Resolves a start's machine before any tab or worktree exists (SPEC-remote
-/// §4.1, d-0005). `--machine` wins and never falls back. A default box start
-/// whose box cannot be used (an unknown or disabled profile, a held box, or a
-/// box readiness refusal) falls back to this Mac with one plain line.
+/// Resolves a start's machine before any tab or worktree exists. Placement is
+/// evaluated after the pick: the default box is tried first, then this Mac.
+/// An explicit machine is the only candidate and is never silently changed.
 fn resolve_placement(
     ctx: &Ctx,
-    slug: &str,
     explicit: Option<&str>,
     role: &str,
     launch: &crate::contracts::Launch,
     repo: Option<&str>,
     listed: Option<&crate::project::Repo>,
 ) -> Result<Placement> {
-    let (chosen, fallback) = match explicit {
-        Some(machine) => (machine.to_string(), false),
+    let candidates: Vec<String> = match explicit {
+        Some(machine) => vec![machine.to_string()],
         None => match default_machine(role, &launch.machine, repo, listed) {
-            Some(machine) => (machine, true),
-            None => return Ok(Placement::default()),
+            Some(machine) if machine == crate::contracts::MACHINE_LOCAL => vec![machine],
+            Some(machine) => vec![machine, crate::contracts::MACHINE_LOCAL.to_string()],
+            None => vec![crate::contracts::MACHINE_LOCAL.to_string()],
         },
     };
-    if chosen == crate::contracts::MACHINE_LOCAL {
-        return Ok(Placement::default());
-    }
-    let profile =
-        match remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &chosen) {
-            Ok(profile) => profile,
-            Err(_) if fallback => {
-                fallback_say(ctx, slug)?;
-                return Ok(Placement::default());
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        let checked = if candidate == crate::contracts::MACHINE_LOCAL {
+            crate::doctor::recipe_ready_local(ctx, launch)
+                .map(|_| None)
+                .map_err(|error| format!("{error:#}"))
+        } else {
+            match remote::machine_profile(
+                ctx.runner,
+                &ctx.env.herdr_bin(),
+                &ctx.config_dir,
+                &candidate,
+            ) {
+                Err(error) => Err(format!("{error:#}")),
+                Ok(profile) if profile.is_local() => crate::doctor::recipe_ready_local(ctx, launch)
+                    .map(|_| None)
+                    .map_err(|error| format!("{error:#}")),
+                Ok(profile) if project::machine_held(&ctx.root, &profile.id) => Err(format!(
+                    "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
+                    profile.label, profile.label
+                )),
+                Ok(profile) => crate::doctor::recipe_ready_on_box(ctx, &profile, launch)
+                    .map(|_| Some(profile))
+                    .map_err(|error| format!("{error:#}")),
             }
-            Err(error) => return Err(error),
         };
-    if profile.is_local() {
-        return Ok(Placement::default());
-    }
-    if project::machine_held(&ctx.root, &profile.id) {
-        if fallback {
-            fallback_say(ctx, slug)?;
-            return Ok(Placement::default());
+        match checked {
+            Ok(profile) => {
+                let chosen = profile
+                    .as_ref()
+                    .map(|profile| profile.label.as_str())
+                    .unwrap_or(crate::contracts::MACHINE_LOCAL);
+                tried.push(serde_json::json!({"machine":chosen, "ready":true}));
+                let reason = if tried.len() == 1 {
+                    format!("recipe `{}` is ready on `{chosen}`", launch.recipe_id)
+                } else {
+                    let earlier = tried[..tried.len() - 1]
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{}: {}",
+                                row["machine"].as_str().unwrap_or("unknown"),
+                                row["missing"].as_str().unwrap_or("not ready")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!(
+                        "recipe `{}` runs on `{chosen}` because {earlier}",
+                        launch.recipe_id
+                    )
+                };
+                return Ok(Placement {
+                    machine: profile
+                        .as_ref()
+                        .map(|p| p.label.clone())
+                        .unwrap_or_default(),
+                    machine_id: profile.map(|p| p.id).unwrap_or_default(),
+                    reason,
+                    fell_back: explicit.is_none() && tried.len() > 1,
+                    tried,
+                });
+            }
+            Err(missing) => tried.push(serde_json::json!({
+                "machine":candidate, "ready":false, "missing":missing
+            })),
         }
-        bail!(
-            "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
-            profile.label,
-            profile.label
-        );
     }
-    if let Err(error) = box_launch_ready(ctx, &profile, launch) {
-        if !fallback {
-            return Err(error);
-        }
-        fallback_say(ctx, slug)?;
-        return Ok(Placement::default());
-    }
-    Ok(Placement {
-        machine: profile.label,
-        machine_id: profile.id,
-    })
+    let details = tried
+        .iter()
+        .map(|row| {
+            format!(
+                "{}: {}",
+                row["machine"].as_str().unwrap_or("unknown"),
+                row["missing"].as_str().unwrap_or("not ready")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "recipe_unavailable: recipe `{}` cannot run; tried {details}",
+        launch.recipe_id
+    )
 }
 
 /// The one plain line when a default box start falls back to this Mac
@@ -438,34 +512,14 @@ pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
         .with_context(|| format!("pi_not_ready: provider {provider}"))
 }
 
-/// Box readiness: pi launches run their provider check on the box; every
-/// other kind still proves SSH reachability before placement can choose it.
+/// Recipe readiness on a box is owned by the doctor probes.
 fn box_launch_ready(
     ctx: &Ctx,
     profile: &crate::contracts::MachineProfile,
     launch: &crate::contracts::Launch,
 ) -> Result<()> {
-    if launch.kind == "pi" {
-        let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-            .context("pi_args_forbidden: a pi launch names no --provider")?;
-        return crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
-            .with_context(|| format!("pi_not_ready: provider {provider} on `{}`", profile.label));
-    }
-    let out = remote::ssh(
-        ctx.runner,
-        &profile.target,
-        "true",
-        None,
-        remote::SSH_TIMEOUT,
-    )?;
-    if !out.success() {
-        bail!(
-            "machine_unreachable: `{}` did not answer: {}",
-            profile.label,
-            out.error_text()
-        );
-    }
-    Ok(())
+    crate::doctor::recipe_ready_on_box(ctx, profile, launch)
+        .with_context(|| format!("recipe `{}` on `{}`", launch.recipe_id, profile.label))
 }
 
 /// Box pi readiness: the check runs on the box, never against the Mac login
@@ -2609,6 +2663,163 @@ mod tests {
     }
 
     #[test]
+    fn a_research_pick_uses_the_mac_when_the_box_has_no_agy_and_records_why() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        fx.world.runner.on_fn(
+            |cmd| {
+                cmd.program == "ssh"
+                    && cmd
+                        .args
+                        .last()
+                        .is_some_and(|script| script.contains("command -v agy"))
+            },
+            |_| {
+                Ok(crate::runner::fake::fail(
+                    127,
+                    "agy is missing from the lane PATH",
+                ))
+            },
+        );
+        stub_box(&fx);
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.task = "+++\nproduct = \"web-research\"\n+++\nCompare the published results.".into();
+        let started = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(started.launch.recipe_id, "agy_gemini_flash");
+        assert!(
+            started.machine.is_empty(),
+            "research must stay off this box"
+        );
+        let ledger =
+            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
+        let placement = ledger
+            .lines()
+            .rfind(|line| line.contains("\"kind\":\"placement\""))
+            .unwrap();
+        assert!(placement.contains("\"machine\":\"local\""), "{placement}");
+        assert!(
+            placement.contains("agy is missing from the lane PATH"),
+            "{placement}"
+        );
+        assert!(placement.contains("agy_gemini_flash"), "{placement}");
+    }
+
+    #[test]
+    fn a_pi_pick_still_uses_a_ready_box() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        let task = "Run the bounded coding task.";
+        let policy_path = fx.world.home.path().join("cfg/routing.json");
+        let mut policy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&policy_path).unwrap()).unwrap();
+        policy["pins"][crate::thread::sha256_hex(task.as_bytes())] =
+            serde_json::json!("pi_opencode_deepseek");
+        std::fs::write(&policy_path, policy.to_string()).unwrap();
+        stub_box(&fx);
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.task = task.into();
+        let started = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
+        assert_eq!(started.machine, "oci");
+        assert_eq!(started.machine_id, "oci-id");
+    }
+
+    #[test]
+    fn an_explicit_machine_that_cannot_run_the_pick_is_refused() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, LANE_CONFIG);
+        fx.world.runner.on_fn(
+            |cmd| {
+                cmd.program == "ssh"
+                    && cmd
+                        .args
+                        .last()
+                        .is_some_and(|script| script.contains("command -v agy"))
+            },
+            |_| {
+                Ok(crate::runner::fake::fail(
+                    127,
+                    "agy is missing from the lane PATH",
+                ))
+            },
+        );
+        stub_box(&fx);
+        let mut args = start_args(
+            Some(fx.repo.to_string_lossy().into_owned()),
+            Some("oci".into()),
+        );
+        args.task = "+++\nproduct = \"web-research\"\n+++\nCompare the published results.".into();
+        let error = start(&fx.world.ctx(), "demo", args)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recipe_unavailable"), "{error}");
+        assert!(error.contains("agy_gemini_flash"), "{error}");
+        assert!(error.contains("oci"), "{error}");
+        assert!(
+            error.contains("agy is missing from the lane PATH"),
+            "{error}"
+        );
+        assert!(thread::list(&fx.project).is_empty());
+        let ledger =
+            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
+        assert!(ledger.contains("placement-refused"), "{ledger}");
+    }
+
+    #[test]
+    fn no_ready_machine_names_the_recipe_and_every_machine_tried() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on(
+            "machine list --json",
+            crate::runner::fake::ok(
+                r#"[{"id":"oci-id","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#,
+            ),
+        );
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |_| {
+                Ok(crate::runner::fake::fail(
+                    127,
+                    "agy is missing from the lane PATH",
+                ))
+            },
+        );
+        runner.on_fn(
+            |cmd| cmd.program == "agy",
+            |_| Ok(crate::runner::fake::fail(1, "agy is not signed in here")),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let launch = crate::contracts::Launch {
+            kind: "agy".into(),
+            recipe_id: "agy_gemini_flash".into(),
+            machine: "oci".into(),
+            ready_timeout_ms: 30_000,
+            ..Default::default()
+        };
+        let row = crate::project::Repo {
+            path: "/repo".into(),
+            box_path: Some("/box/repo".into()),
+            ..Default::default()
+        };
+        let error = resolve_placement(&ctx, None, "lane", &launch, Some("/repo"), Some(&row))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agy_gemini_flash"), "{error}");
+        assert!(error.contains("oci") && error.contains("local"), "{error}");
+        assert!(
+            error.contains("lane PATH") && error.contains("not signed in"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn box_repo_row_names_each_missing_piece() {
         let mut settings = crate::project::Settings {
             repos: vec![crate::project::Repo {
@@ -2734,7 +2945,7 @@ mod tests {
                     && cmd
                         .args
                         .last()
-                        .is_some_and(|script| script.ends_with("\ntrue'"))
+                        .is_some_and(|script| script.contains("command -v claude"))
             },
             |_| Ok(crate::runner::fake::fail(255, "connection refused")),
         );
