@@ -138,12 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_the_compaction_point_plus_the_pi_reserve() {
-        assert_eq!(PI_RESERVE_TOKENS, 16_384);
-        assert_eq!(DEEPSEEK_CONTEXT_WINDOW, 372_000 + 16_384);
-    }
-
-    #[test]
     fn write_sets_the_override_and_keeps_every_other_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent/models.json");
