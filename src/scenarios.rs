@@ -50,6 +50,14 @@ impl World {
             "agent start --help",
             ok("[possible values: pi, claude, cursor, agy]"),
         );
+        world.runner.on_fn(
+            |cmd| cmd.program == "claude" && cmd.args == ["auth", "status"],
+            |_| Ok(ok("logged in\n")),
+        );
+        world.runner.on_fn(
+            |cmd| cmd.program == "agy" && cmd.args == ["models"],
+            |_| Ok(ok("gemini-3.8-flash-high\n")),
+        );
         let mut answers = serde_json::Map::new();
         for id in ["difficulty", "ambiguity", "blast_radius"] {
             answers.insert(
