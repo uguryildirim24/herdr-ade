@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::sh::fake::{FakeRunner, ok};
-use super::{Env, Layout, doctor, folder, install, launch, roles};
+use super::{Env, Layout, doctor, folder, install, launch, roles, sh};
 
 /// A throwaway plugin root with the pinned files in place and the wrapper on
 /// the login PATH (a real symlink under the fixture HOME).
@@ -93,24 +93,39 @@ fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
     row.validate().unwrap();
 }
 
+/// Script the login shell's own probes, the same shell `doctor` runs. The
+/// Mac's shell is zsh and the box's is bash, so a scenario that hard-coded
+/// zsh would fail on the box; the probe and the script must agree with the
+/// shell actually in use.
+fn script_login_shell(runner: &FakeRunner, env: &Env) {
+    let shell = sh::shell();
+    let probe = doctor::path_probe(&shell);
+    let link = env.home.join(".local/bin/pi");
+    runner.on(&format!("{shell} -lic node --version"), ok("v22.19.0\n"));
+    runner.on(
+        &format!("{shell} -lic command -v npm"),
+        ok("/opt/homebrew/bin/npm\n"),
+    );
+    runner.on(
+        &format!("{shell} -lic npm root -g"),
+        ok("/opt/homebrew/lib/node_modules\n"),
+    );
+    // `type -a` and `whence -va` answer `pi is <path>`; POSIX `command -v`
+    // prints the bare path.
+    let resolution = if probe == "command -v pi" {
+        format!("{}\n", link.display())
+    } else {
+        format!("pi is {}\n", link.display())
+    };
+    runner.on(&format!("{shell} -lic {probe}"), ok(&resolution));
+}
+
 #[test]
 fn scenario_setup_then_check_for_kimi() {
     let dir = tempfile::tempdir().unwrap();
     let (env, layout) = world(dir.path());
     let runner = FakeRunner::new();
-    runner.on("zsh -lic node --version", ok("v22.19.0\n"));
-    runner.on("zsh -lic command -v npm", ok("/opt/homebrew/bin/npm\n"));
-    runner.on(
-        "zsh -lic npm root -g",
-        ok("/opt/homebrew/lib/node_modules\n"),
-    );
-    runner.on(
-        "zsh -lic whence -va pi",
-        ok(&format!(
-            "pi is {}\n",
-            env.home.join(".local/bin/pi").display()
-        )),
-    );
+    script_login_shell(&runner, &env);
     runner.on("herdr integration status", ok("pi: current\n"));
     runner.on("--version", ok("0.85.1\n"));
     runner.on(
@@ -136,13 +151,7 @@ fn scenario_check_refuses_a_missing_login_before_any_start() {
     let dir = tempfile::tempdir().unwrap();
     let (env, layout) = world(dir.path());
     let runner = FakeRunner::new();
-    runner.on(
-        "zsh -lic whence -va pi",
-        ok(&format!(
-            "pi is {}\n",
-            env.home.join(".local/bin/pi").display()
-        )),
-    );
+    script_login_shell(&runner, &env);
     runner.on("herdr integration status", ok("pi: current\n"));
     runner.on(
         "auth check --provider kimi-coding",
