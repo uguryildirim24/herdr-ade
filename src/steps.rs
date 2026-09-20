@@ -228,8 +228,7 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
     if !out.success() {
         bail!("published_fetch_failed: {url}: {}", out.error_text());
     }
-    let out = git(&["merge-base", "--is-ancestor", sha, "FETCH_HEAD"])?;
-    if !out.success() {
+    if !crate::git::is_ancestor(ctx.runner, &lane.repo, sha, "FETCH_HEAD")? {
         bail!("published_sha_missing: {sha} is not reachable on {url}");
     }
     Ok(())
@@ -1924,12 +1923,15 @@ mod tests {
         sha_absent.on("git -C /repo fetch", crate::runner::fake::ok(""));
         sha_absent.on(
             "git -C /repo merge-base --is-ancestor",
-            crate::runner::fake::fail(1, "not an ancestor"),
+            crate::runner::fake::fail(1, ""),
         );
-        let ctx = courier_ctx(root.path(), &env, &sha_absent);
+        let _scope = crate::ledger::Scope::new(&[&project]);
+        let runner = crate::ledger::RecordingRunner(&sha_absent);
+        let ctx = courier_ctx(root.path(), &env, &runner);
         let error = verify_published_sha(&ctx, &project, &lane, "abc")
             .unwrap_err()
             .to_string();
         assert!(error.contains("published_sha_missing"), "{error}");
+        assert!(crate::ledger::list(&project).unwrap().is_empty());
     }
 }
