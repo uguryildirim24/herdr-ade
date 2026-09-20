@@ -86,3 +86,40 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     }
     assert!(!project.join(".state/inbox-counter.json").exists());
 }
+
+#[test]
+fn a_sealed_done_does_not_hide_a_different_report() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    assert!(
+        Command::new(BIN)
+            .env_clear()
+            .env("HOME", home.path())
+            .args(["--root", root.to_str().unwrap(), "new", "demo"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let project = root.join("demo");
+    std::fs::create_dir_all(project.join("events")).unwrap();
+    std::fs::write(
+        project.join("events/t-0001-1-1.toml"),
+        "id = \"t-0001-1-1\"\nop = \"t-0001-1-1\"\nthread = \"t-0001\"\nattempt = 1\ncreated = \"2026-09-20T00:00:00Z\"\n[recipient]\npane = \"w1:p1\"\ncoordinator_attempt = 1\n[payload.done]\nsha = \"sealed-sha\"\nreport_path = \"artifacts/sealed-report\"\nartifact = \"sealed-report\"\n",
+    )
+    .unwrap();
+    for (hash, separate_report) in [("sealed-report", false), ("updated-report", true)] {
+        std::fs::write(
+            project.join("threads/t-0001.toml"),
+            format!("id = \"t-0001\"\nstatus = \"open\"\nattempt = 1\nreport_hash = \"{hash}\"\n"),
+        )
+        .unwrap();
+        let text = context(home.path(), "w1:p1", true);
+        assert!(text.contains("done: sealed-sha report=artifacts/sealed-report"));
+        assert_eq!(
+            text.contains("report: threads/t-0001.md (report bytes are not a completion)"),
+            separate_report,
+            "{text}"
+        );
+    }
+}
