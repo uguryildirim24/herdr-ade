@@ -1,0 +1,25 @@
+round = "r1"
+branch = "main"
+plain = "The first round lands the shared types."
+gates = ["cargo test"]
+policy_hash = "old-policy"
+opened = "2026-09-18T00:00:00Z"
+repo = "/old/repo"
+expected_head = "old-brief"
+frozen_revision = 1
+manifest_hash = "old-manifest"
+review_branch = "review/r1"
+reviewer = "t-0002"
+announced = "verdict:MERGE"
+
+[manifest]
+revision = 1
+
+[[manifest.members]]
+thread = "t-0001"
+
+[manifest.members.pin]
+event = "t-0001-1-1"
+attempt = 1
+sha = "old-lane"
+artifact = "old-report"
