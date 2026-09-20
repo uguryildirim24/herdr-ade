@@ -205,7 +205,63 @@ pub fn answer_of(project: &Project, id: &str, revision: u32) -> Option<Answer> {
     toml::from_str(&text).ok()
 }
 
-/// Latest revisions without an answer, oldest first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Withdrawal {
+    pub id: String,
+    pub revision: u32,
+    pub reason: String,
+    pub by: String,
+    pub at: String,
+}
+
+fn withdrawal_path(project: &Project, id: &str, revision: u32) -> PathBuf {
+    ask_dir(project, id).join(format!("r{revision}.withdrawn.toml"))
+}
+
+pub fn withdrawal_of(project: &Project, id: &str, revision: u32) -> Option<Withdrawal> {
+    let text = std::fs::read_to_string(withdrawal_path(project, id, revision)).ok()?;
+    toml::from_str(&text).ok()
+}
+
+fn is_withdrawn(project: &Project, id: &str, revision: u32) -> bool {
+    withdrawal_path(project, id, revision).exists()
+}
+
+pub fn withdraw(ctx: &Ctx, slug: &str, id: &str, reason: &str, by: &str) -> Result<Withdrawal> {
+    validate_ask_id(id)?;
+    if reason.trim().is_empty() || by.trim().is_empty() {
+        bail!("ask_withdraw: a reason and actor are required");
+    }
+    let project = Project::load(&ctx.root, slug)?;
+    let record = {
+        let _lock = project.lock()?;
+        let _set = ask_set_lock(&project)?;
+        let ask = latest(&project, id)?
+            .with_context(|| format!("ask_unknown: `{id}` has never been asked"))?;
+        if answer_of(&project, id, ask.revision).is_some() {
+            bail!("ask_closed: `{id}` is already answered; an answered ask cannot be withdrawn");
+        }
+        if is_withdrawn(&project, id, ask.revision) {
+            bail!("ask_withdrawn: `{id}` is already withdrawn");
+        }
+        let record = Withdrawal {
+            id: id.to_string(),
+            revision: ask.revision,
+            reason: reason.trim().to_string(),
+            by: by.to_string(),
+            at: project::now(),
+        };
+        write_atomic(
+            &withdrawal_path(&project, id, ask.revision),
+            toml::to_string(&record)?.as_bytes(),
+        )?;
+        record
+    };
+    let _ = crate::board::refresh(ctx, &project);
+    Ok(record)
+}
+
+/// Latest revisions without an answer or withdrawal, oldest first.
 pub fn open_asks(project: &Project) -> Vec<Ask> {
     let Ok(entries) = std::fs::read_dir(asks_dir(project)) else {
         return Vec::new();
@@ -216,6 +272,7 @@ pub fn open_asks(project: &Project) -> Vec<Ask> {
         .filter(|id| validate_ask_id(id).is_ok())
         .filter_map(|id| latest(project, &id).ok().flatten())
         .filter(|a| answer_of(project, &a.id, a.revision).is_none())
+        .filter(|a| !is_withdrawn(project, &a.id, a.revision))
         .collect();
     asks.sort_by(|a, b| (&a.asked, &a.id).cmp(&(&b.asked, &b.id)));
     asks
@@ -349,12 +406,25 @@ pub fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let record = {
         let _lock = project.lock()?;
         let _set = ask_set_lock(&project)?;
+        if let Some(existing) = open_asks(&project).iter().find(|a| {
+            Some(a.id.as_str()) != new.reask.as_deref()
+                && plain::normalized_words(&a.question) == plain::normalized_words(&new.question)
+        }) {
+            bail!(
+                "ask_duplicate: `{}` already asks this question",
+                existing.id
+            );
+        }
         enforce_ask_cap(&project, new.reask.as_deref())?;
         let (id, revision) = match &new.reask {
             Some(id) => {
+                validate_ask_id(id)?;
                 let r = latest_revision(&project, id);
                 if r == 0 {
                     bail!("ask_unknown: `{id}` has never been asked");
+                }
+                if is_withdrawn(&project, id, r) {
+                    bail!("ask_withdrawn: `{id}` is withdrawn; it cannot be asked again");
                 }
                 if answer_of(&project, id, r).is_some() {
                     bail!("ask_closed: `{id}` revision {r} is already answered");
@@ -414,7 +484,11 @@ pub fn answer(
     let answer = {
         let _lock = project.lock()?;
         let _set = ask_set_lock(&project)?;
+        validate_ask_id(id)?;
         let latest = latest_revision(&project, id);
+        if is_withdrawn(&project, id, latest) {
+            bail!("ask_withdrawn: `{id}` is withdrawn; it cannot be answered");
+        }
         if latest == 0 {
             bail!("ask_unknown: `{id}` has never been asked");
         }
@@ -559,6 +633,9 @@ pub fn open_revision(
         .with_context(|| format!("ask_unknown: `{id}` revision {revision} does not exist"))?;
     if revision != latest {
         bail!("ask_revision_stale: `{id}` is at revision {latest}");
+    }
+    if is_withdrawn(project, id, revision) {
+        bail!("ask_withdrawn: `{id}` revision {revision} is withdrawn");
     }
     if answer_of(project, id, revision).is_some() {
         bail!("ask_closed: `{id}` revision {revision} is answered");
@@ -1180,8 +1257,127 @@ mod tests {
         assert!(glossary::gate(&fx.project, "The quotient is a thing.").is_err());
     }
 
+    fn distinct_ask(n: usize) -> NewAsk {
+        NewAsk {
+            question: format!("May I spend {n} dollars on this check?"),
+            ..keep_or_stop()
+        }
+    }
+
     fn ask_again(fx: &Fx) -> Result<Ask> {
-        ask(&fx.world.ctx(), "demo", keep_or_stop())
+        let n = project::read_json::<u64>(&fx.project.state_dir().join("ask-counter.json"))
+            .unwrap_or(0)
+            + 1;
+        ask(&fx.world.ctx(), "demo", distinct_ask(n as usize))
+    }
+
+    #[test]
+    fn withdraw_removes_an_older_ask_from_the_board_and_keeps_its_record() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let a = ask_again(&fx).unwrap();
+        let b = ask_again(&fx).unwrap();
+        let withdrawn = withdraw(&ctx, "demo", &a.id, "This is no longer needed.", "rolf").unwrap();
+        assert_eq!(
+            withdrawal_of(&fx.project, &a.id, 1),
+            Some(withdrawn.clone())
+        );
+        assert_eq!(withdrawn.by, "rolf");
+        assert!(!withdrawn.at.is_empty());
+        assert_eq!(latest(&fx.project, &a.id).unwrap(), Some(a.clone()));
+        assert_eq!(open_asks(&fx.project), vec![b.clone()]);
+        assert!(
+            crate::board::compute(&ctx, &fx.project)
+                .contains(&("ade_needs_you".into(), compact_line(&b)))
+        );
+        withdraw(&ctx, "demo", &b.id, "No longer needed.", "rolf").unwrap();
+        assert!(
+            crate::board::compute(&ctx, &fx.project)
+                .contains(&("ade_needs_you".into(), "nothing waits for you".into()))
+        );
+        assert!(
+            answer(&ctx, "demo", &a.id, 1, 1, "test")
+                .unwrap_err()
+                .to_string()
+                .starts_with("ask_withdrawn")
+        );
+        assert!(
+            ask(
+                &ctx,
+                "demo",
+                NewAsk {
+                    reask: Some(a.id.clone()),
+                    ..keep_or_stop()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .starts_with("ask_withdrawn")
+        );
+        assert!(open_revision(&fx.project, &a.id, 1, &glossary::registry(&fx.project)).is_err());
+        let view =
+            crate::talk::view::Conversation::load(&fx.project, &crate::talk::read(&fx.project));
+        assert!(view.items.iter().any(|item| matches!(&item.body, crate::talk::view::Body::Notice(text) if text.contains("a-1 withdrawn"))));
+        assert!(withdraw(&ctx, "demo", &a.id, "Again.", "rolf").is_err());
+        // A withdrawn question does not prevent a genuinely new card.
+        ask(&ctx, "demo", distinct_ask(1)).unwrap();
+    }
+
+    #[test]
+    fn an_answered_or_unknown_ask_cannot_be_withdrawn() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let a = ask_again(&fx).unwrap();
+        answer(&ctx, "demo", &a.id, 1, 1, "rolf").unwrap();
+        let error = withdraw(&ctx, "demo", &a.id, "No longer needed.", "rolf")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("ask_closed") && error.contains("answered"));
+        assert!(withdrawal_of(&fx.project, &a.id, 1).is_none());
+        assert!(
+            withdraw(&ctx, "demo", "a-999", "No thanks.", "rolf")
+                .unwrap_err()
+                .to_string()
+                .starts_with("ask_unknown")
+        );
+    }
+
+    #[test]
+    fn a_normalized_duplicate_names_the_existing_id_without_writing() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let a = ask(&ctx, "demo", keep_or_stop()).unwrap();
+        let before = journal_kinds(&fx.project);
+        let duplicate = NewAsk {
+            question: "  Keep  the experiment running another hour or stop now?  ".into(),
+            ..keep_or_stop()
+        };
+        let error = ask(&ctx, "demo", duplicate).unwrap_err().to_string();
+        assert_eq!(error, "ask_duplicate: `a-1` already asks this question");
+        assert_eq!(open_asks(&fx.project), vec![a]);
+        assert_eq!(journal_kinds(&fx.project), before);
+        assert!(!ask_dir(&fx.project, "a-2").exists());
+        assert_eq!(
+            project::read_json::<u64>(&fx.project.state_dir().join("ask-counter.json")).unwrap(),
+            1
+        );
+        // Re-asking oneself is allowed, but copying another open ask is not.
+        let b = ask(&ctx, "demo", distinct_ask(2)).unwrap();
+        assert!(
+            ask(
+                &ctx,
+                "demo",
+                NewAsk {
+                    reask: Some(b.id),
+                    ..keep_or_stop()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .starts_with("ask_duplicate")
+        );
+        answer(&ctx, "demo", "a-1", 1, 1, "rolf").unwrap();
+        ask(&ctx, "demo", keep_or_stop()).unwrap();
     }
 
     #[test]
@@ -1213,8 +1409,8 @@ mod tests {
         let world = World::new();
         let project = world.project("demo", "a.sock");
         // No board or notification rule: each ask is recorded but unpublished.
-        for _ in 0..3 {
-            ask(&world.ctx(), "demo", keep_or_stop()).unwrap();
+        for n in 1..=3 {
+            ask(&world.ctx(), "demo", distinct_ask(n)).unwrap();
         }
         assert_eq!(open_asks(&project).len(), 3);
         assert!(!published_marker(&project, "a-1", 1).exists());

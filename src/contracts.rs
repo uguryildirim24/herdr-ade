@@ -577,6 +577,15 @@ pub struct Decision {
     pub basis: Option<String>,
     pub replaces: Option<String>,
     pub request: Option<String>,
+    pub overturned: Option<DecisionOverturn>,
+}
+
+/// An append-only change to a decision; the original line remains in the log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DecisionOverturn {
+    pub by: String,
+    pub at: String,
+    pub reason: String,
 }
 
 /// A `--basis` reference: an existing human message (`request:<id>`) or a
@@ -801,6 +810,7 @@ mod tests {
             basis: None,
             replaces: Some("d-0001".into()),
             request: Some("q-example".into()),
+            overturned: None,
         };
         json_roundtrip(&decision);
         let text = serde_json::to_string(&decision).unwrap();
