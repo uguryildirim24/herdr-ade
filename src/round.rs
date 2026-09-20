@@ -3585,6 +3585,9 @@ mod tests {
         let state = crate::threads::prompt(&ctx, "demo", &id, "carry on").unwrap();
         assert_eq!(state, "blocked");
         assert!(thread::load(&fx.project, &id).unwrap().error.is_empty());
+        // A blocked pi lane without its own recorded error is waiting on the
+        // person at the pane and is not prompted through that question.
+        assert!(crate::threads::prompt(&ctx, "demo", &id, "again").is_err());
         // A gone pane is still refused.
         *fx.world.agents.borrow_mut() = "[]".into();
         *fx.world.panes.borrow_mut() = "[]".into();
