@@ -168,6 +168,10 @@ enum Command {
     },
     /// Seal and deliver why this lane must wait
     Waiting { what: String },
+    /// Record a failed lane attempt and request automatic stronger-model dispatch
+    Failed { what: String },
+    /// Evaluate the editable routing policy against labelled full-brief cases
+    RoutingEval { cases: std::path::PathBuf },
     /// Print a role skill and the runtime-only standing rules
     Skill {
         #[arg(default_value = "coordinator")]
@@ -647,7 +651,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     o.revision, o.manifest_hash
                 );
                 println!(
-                    "next: start the reviewer thread in that worktree with role reviewer, then `round reviewer {slug} {id} <thread>`"
+                    "next: `round advance {slug}` starts the review from its full brief and pinned changes"
                 );
                 if let (Some(c), Some(v)) = (&o.earlier_candidate, &o.earlier_verdict) {
                     println!(
@@ -721,9 +725,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         repo,
                         integration: branch,
                     },
-                    &crate::launch::DialoguePair(crate::launch::parse_launch_config(
-                        &ctx.config_dir,
-                    )?),
+                    &crate::launch::DialoguePair,
                 )?;
                 println!("dialogue {} recorded on {}", d.topic, d.branch);
                 print!("{next}");
@@ -1113,12 +1115,6 @@ enum ThreadCommand {
         /// Birth sentence (SPEC-ADE D17 item 6)
         #[arg(long)]
         plain: Option<String>,
-        /// Role from the roles table (default: lane)
-        #[arg(long, value_name = "ROLE")]
-        role: Option<String>,
-        /// Pin this recipe from the role's allowed list
-        #[arg(long, value_name = "ID")]
-        recipe: Option<String>,
     },
     /// Bring back a thread whose pane is gone or whose start failed
     Restart { slug: String, id: String },
@@ -1387,8 +1383,6 @@ pub fn run() -> Result<()> {
                 base,
                 task_file,
                 plain,
-                role,
-                recipe,
             } => {
                 let task = read_text(&task_file)?;
                 let thread = threads::start(
@@ -1401,8 +1395,7 @@ pub fn run() -> Result<()> {
                         base,
                         task,
                         plain: plain.unwrap_or_default(),
-                        role,
-                        recipe,
+                        workflow: None,
                     },
                 )?;
                 println!(
@@ -1545,6 +1538,14 @@ pub fn run() -> Result<()> {
         },
         Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
         Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
+        Command::Failed { what } => crate::lane::failed(&ctx, &what),
+        Command::RoutingEval { cases } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::routing::evaluate(&ctx, &cases)?)?
+            );
+            Ok(())
+        }
         Command::Skill { role } => crate::lane::skill(&ctx, &role),
         Command::Close { slug } => crate::coordinator::close(&ctx, &slug),
         Command::Plain { command } => match command {

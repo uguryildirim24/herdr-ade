@@ -76,14 +76,12 @@ pub fn adopt(
     if title.trim().is_empty() {
         bail!("--title may not be empty");
     }
-    let (settings, _) = project.read_project_md()?;
     crate::threads::check_birth_plain(&ade.plain)?;
     let role = ade
         .role
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("lane");
-    let spec = project::resolve_role(&ctx.config_dir, &settings, role)?;
     let passive = ade.passive;
     let record = project
         .coordinator()
@@ -91,6 +89,11 @@ pub fn adopt(
     ticker::start(ctx)?;
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let agent = adoptable_agent(ctx, &herdr, &record.socket, pane)?;
+    // Adoption records the process already running; it never selects a model.
+    let spec = crate::contracts::RoleSpec {
+        kind: agent.agent.clone(),
+        ..Default::default()
+    };
 
     // The pane's repository and branch, when it is in one.
     let git = |args: &[&str]| -> Option<String> {

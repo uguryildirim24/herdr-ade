@@ -82,6 +82,14 @@ pub fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
 }
 
 pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
+    seal_message(ctx, text, false)
+}
+
+pub fn failed(ctx: &Ctx, text: &str) -> Result<()> {
+    seal_message(ctx, text, true)
+}
+
+fn seal_message(ctx: &Ctx, text: &str, failed: bool) -> Result<()> {
     let binding = current_lane(ctx)?;
     let text = bounded_waiting(text)?;
     let recipient = binding.recipient()?;
@@ -91,10 +99,18 @@ pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
         ops::Reservation {
             thread: &binding.thread.id,
             attempt,
-            kind: OpKind::Waiting,
+            kind: if failed {
+                OpKind::Failed
+            } else {
+                OpKind::Waiting
+            },
             recipient,
             round: None,
-            requested: Requested::Waiting { text },
+            requested: if failed {
+                Requested::Failed { failure: text }
+            } else {
+                Requested::Waiting { text }
+            },
             helper_pid: std::process::id(),
         },
     )?;
@@ -103,7 +119,11 @@ pub fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
         validate_current(&binding, candidate.attempt, candidate)
     })?;
     if binding.card.is_none() {
-        steps::deliver_event(ctx, &binding.project, &event)?;
+        // Failure is consumed by the next ticker pass, never synchronously:
+        // the sealing lane gets to finish before its old tab is closed.
+        if !failed {
+            steps::deliver_event(ctx, &binding.project, &event)?;
+        }
         ticker::start(ctx)?;
     }
     println!("sealed {}", event.id);

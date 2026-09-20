@@ -154,21 +154,7 @@ pub struct Settings {
     /// (`talk::enabled`). Never written by `new`, so the default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub talk: Option<bool>,
-    /// Per-role `kind`/`args` overrides (SPEC-ADE D2). Arrays replace.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub roles: std::collections::BTreeMap<String, RoleOverride>,
     pub repos: Vec<Repo>,
-}
-
-/// Project override of one role. Only `kind` and `args` (SPEC-ADE D2): a
-/// misspelt key is refused, not dropped.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct RoleOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<Vec<String>>,
 }
 
 impl Default for Settings {
@@ -183,7 +169,6 @@ impl Default for Settings {
             // `false` the ticker shows a herdr notification instead.
             nudge: false,
             talk: None,
-            roles: std::collections::BTreeMap::new(),
             repos: Vec::new(),
         }
     }
@@ -205,9 +190,11 @@ pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
         toml::from_str(front).context("PROJECT.md front matter does not parse")?;
     if value
         .as_table()
-        .is_some_and(|table| table.contains_key("jev"))
+        .is_some_and(|table| table.contains_key("jev") || table.contains_key("roles"))
     {
-        bail!("picker_removed: PROJECT.md jev is gone; the lane picker was removed");
+        bail!(
+            "roles_removed: remove roles and jev from PROJECT.md; routing.json owns dispatch policy"
+        );
     }
     let settings: Settings = value
         .try_into()
@@ -531,85 +518,11 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
     Ok(safety)
 }
 
-/// Plugin default for a day-one role when the safety file has no row.
-pub fn default_role_spec(name: &str) -> RoleSpec {
-    match name {
-        "pro" => RoleSpec {
-            kind: "chatgpt".into(),
-            ..RoleSpec::default()
-        },
-        // The coordinator runs on Claude Opus at xhigh (Rolf, 2026-09-19).
-        "coordinator" => RoleSpec {
-            kind: "claude".into(),
-            args: vec![
-                "--model".into(),
-                "claude-opus-5".into(),
-                "--effort".into(),
-                "xhigh".into(),
-            ],
-            ..RoleSpec::default()
-        },
-        _ => RoleSpec {
-            kind: "claude".into(),
-            ..RoleSpec::default()
-        },
-    }
-}
-
-fn apply_override(base: RoleSpec, over: &RoleOverride) -> Result<RoleSpec> {
-    let mut out = base;
-    if let Some(kind) = &over.kind {
-        if kind != &out.kind {
-            let Some(args) = &over.args else {
-                bail!("role_args_missing");
-            };
-            out.kind = kind.clone();
-            out.args = args.clone();
-        } else if let Some(args) = &over.args {
-            out.args = args.clone();
-        }
-    } else if let Some(args) = &over.args {
-        out.args = args.clone();
-    }
-    Ok(out)
-}
-
-/// A role's row for a launch the roles table never starts (the coordinator,
-/// an adopted pane): the `default` recipe of `[roles.<name>]` in the one
-/// roles table, else the plugin default, then the PROJECT.md override.
-/// Arrays replace, never merge (SPEC-ADE D2).
-pub fn resolve_role(config_dir: &Path, settings: &Settings, role: &str) -> Result<RoleSpec> {
-    if role.is_empty() {
-        bail!("a role name is required");
-    }
-    let config = crate::launch::parse_launch_config(config_dir)?;
-    let mut spec = match config.roles.get(role) {
-        Some(row) => {
-            let recipe = config.recipes.get(&row.default).with_context(|| {
-                format!("recipe_unknown: [roles.{role}] default `{}`", row.default)
-            })?;
-            RoleSpec {
-                kind: recipe.kind.clone(),
-                args: recipe.args.clone(),
-                env: recipe.env.clone(),
-                ready_timeout_ms: recipe.ready_timeout_ms,
-            }
-        }
-        None => default_role_spec(role),
-    };
-    if let Some(over) = settings.roles.get(role) {
-        spec = apply_override(spec, over)?;
-    }
-    if spec.ready_timeout_ms == 0 {
-        spec.ready_timeout_ms = 20_000;
-    }
-    Ok(spec)
-}
-
-/// SHA-256 of `config.toml` and `RULES.md` (SPEC-ADE D11).
+/// SHA-256 of executable settings, routing policy and standing rules.
 pub fn policy_hash(config_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(std::fs::read(config_dir.join("config.toml")).unwrap_or_default());
+    hasher.update(std::fs::read(config_dir.join("routing.json")).unwrap_or_default());
     hasher.update(std::fs::read(config_dir.join("RULES.md")).unwrap_or_default());
     hasher
         .finalize()
@@ -1079,82 +992,15 @@ mod tests {
     }
 
     #[test]
-    fn roles_replace_never_merge_and_kind_change_needs_args() {
-        let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[roles.lane]\nkind = \"claude\"\nargs = [\"--a\", \"--b\"]\nready_timeout_ms = 15000\n",
-        )
-        .unwrap();
-        let mut settings = Settings::default();
-        let spec = resolve_role(config.path(), &settings, "lane").unwrap();
-        assert_eq!(spec.kind, "claude");
-        assert_eq!(spec.args, ["--a", "--b"]);
-        assert_eq!(spec.ready_timeout_ms, 15_000);
-
-        settings.roles.insert(
-            "lane".into(),
-            RoleOverride {
-                kind: None,
-                args: Some(vec!["--x".into()]),
-            },
-        );
-        let spec = resolve_role(config.path(), &settings, "lane").unwrap();
-        assert_eq!(spec.args, ["--x"]);
-        assert_eq!(spec.kind, "claude");
-
-        settings.roles.insert(
-            "lane".into(),
-            RoleOverride {
-                kind: Some("cursor".into()),
-                args: None,
-            },
-        );
-        let err = resolve_role(config.path(), &settings, "lane")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("role_args_missing"), "{err}");
-        // A1 review M6: a misspelt override key was dropped silently.
-        let bad = toml::from_str::<RoleOverride>("agrs = [\"--x\"]").unwrap_err();
-        assert!(bad.to_string().contains("unknown field"), "{bad}");
-
-        settings.roles.insert(
-            "lane".into(),
-            RoleOverride {
-                kind: Some("cursor".into()),
-                args: Some(vec!["--force".into()]),
-            },
-        );
-        let spec = resolve_role(config.path(), &settings, "lane").unwrap();
-        assert_eq!(spec.kind, "cursor");
-        assert_eq!(spec.args, ["--force"]);
-    }
-
-    #[test]
-    fn unknown_role_field_is_refused_and_picker_keys_are_gone() {
-        let config = tempfile::tempdir().unwrap();
-        let settings = Settings::default();
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[roles.lane]\nkind = \"claude\"\nbootstrap = true\n",
-        )
-        .unwrap();
-        let err = format!(
-            "{:#}",
-            resolve_role(config.path(), &settings, "lane").unwrap_err()
-        );
-        assert!(err.contains("bootstrap"), "{err}");
-
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[roles]\nresolver = \"off\"\n\n[roles.lane]\nkind = \"claude\"\n",
-        )
-        .unwrap();
-        let err = format!(
-            "{:#}",
-            resolve_role(config.path(), &settings, "lane").unwrap_err()
-        );
-        assert!(err.contains("picker_removed"), "{err}");
+    fn project_model_overrides_are_refused() {
+        for front in ["[roles.lane]\nkind = \"claude\"", "jev = true"] {
+            assert!(
+                parse_project_md(&format!("+++\n{front}\n+++\n"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("roles_removed")
+            );
+        }
     }
 
     #[test]

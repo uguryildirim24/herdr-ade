@@ -220,8 +220,11 @@ pub fn stage_waiting(project: &Project, id: &str) -> Result<Op> {
     if op.state == OpState::Staged || op.state == OpState::Sealed {
         return Ok(op);
     }
-    if op.state != OpState::Reserved || op.revision != 1 || op.kind != OpKind::Waiting {
-        bail!("op_state_changed: {id} is not a reserved waiting operation");
+    if op.state != OpState::Reserved
+        || op.revision != 1
+        || !matches!(op.kind, OpKind::Waiting | OpKind::Failed)
+    {
+        bail!("op_state_changed: {id} is not a reserved waiting/failure operation");
     }
     advance_staged(project, id, None)
 }
@@ -284,10 +287,18 @@ fn event_from_op(op: &Op) -> Result<Event> {
                     .context("op_payload_invalid: staged done has no artifact")?,
             }),
             waiting: None,
+            failed: None,
         },
         (Requested::Waiting { text }, OpKind::Waiting) => EventPayload {
             done: None,
             waiting: Some(WaitingPayload { text: text.clone() }),
+            failed: None,
+        },
+        (Requested::Failed { failure }, OpKind::Failed) => EventPayload {
+            failed: Some(WaitingPayload {
+                text: failure.clone(),
+            }),
+            ..Default::default()
         },
         _ => bail!("op_payload_invalid: kind and requested payload disagree"),
     };

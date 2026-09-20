@@ -29,7 +29,15 @@ impl World {
     pub fn new() -> World {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let env = Env::for_test(home.path(), &[]);
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(home.path().join("cfg/config.toml"), "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n").unwrap();
+        let mut policy: serde_json::Value =
+            serde_json::from_str(include_str!("../config/routing.json")).unwrap();
+        policy["models"] =
+            serde_json::json!({"test_claude": {"tier": 1, "description": "Fixture coding model"}});
+        policy["routes"] = serde_json::json!([{"up_to": 1.0, "recipe": "test_claude"}]);
+        std::fs::write(home.path().join("cfg/routing.json"), policy.to_string()).unwrap();
         let world = World {
             env,
             root,
@@ -38,6 +46,24 @@ impl World {
             panes: Rc::new(RefCell::new("[]".into())),
             home,
         };
+        world.runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, cursor, agy]"),
+        );
+        let mut answers = serde_json::Map::new();
+        for id in ["difficulty", "ambiguity", "blast_radius"] {
+            answers.insert(
+                id.into(),
+                serde_json::json!({"type":"score", "score":0.0, "confidence":0.98,
+                "probabilities":{"0":1.0,"1":0.0,"2":0.0,"3":0.0}}),
+            );
+        }
+        world.runner.on(
+            "/usr/bin/curl",
+            ok(&serde_json::json!({"model":"jev-test", "answers":answers,
+            "usage":{"input_tokens":100,"output_tokens":20}})
+            .to_string()),
+        );
         let agents = world.agents.clone();
         world.runner.on_fn(
             |cmd| {
@@ -553,8 +579,7 @@ fn thread_start_is_refused_when_paused() {
         base: None,
         task: "t".into(),
         plain: "The lane does the work.".into(),
-        role: None,
-        recipe: None,
+        workflow: None,
     };
     let error = threads::start(&world.ctx(), "demo", args)
         .unwrap_err()
@@ -1410,8 +1435,7 @@ fn a_remote_thread_without_a_repo_is_refused() {
         base: None,
         task: "t".into(),
         plain: "The lane does the work.".into(),
-        role: None,
-        recipe: None,
+        workflow: None,
     };
     assert!(
         threads::start(&world.ctx(), "demo", args)
