@@ -951,7 +951,11 @@ fn a_merged_pull_request_resolves_its_thread_after_the_final_copy() {
     );
     assert!(items_of(&project, "pr").is_empty());
     let digest = coordinator::digest(&world.ctx(), &project, "ha").unwrap().0;
-    assert!(digest.contains("Resolved: merged"), "{digest}");
+    assert!(
+        digest.contains("1 resolved threads (not listed)"),
+        "{digest}"
+    );
+    assert!(!digest.contains("t-0001"), "{digest}");
 }
 
 #[test]
@@ -1227,12 +1231,12 @@ fn auto_resolve_waits_for_the_later_of_state_report_and_ticker_start() {
         (Status::Resolved, "auto")
     );
     assert!(items_of(&project, "thread-state").is_empty());
+    let digest = coordinator::digest(&ctx, &project, "ha").unwrap().0;
     assert!(
-        coordinator::digest(&ctx, &project, "ha")
-            .unwrap()
-            .0
-            .contains("Resolved: auto")
+        digest.contains("1 resolved threads (not listed)"),
+        "{digest}"
     );
+    assert!(!digest.contains("t-0001"), "{digest}");
 }
 
 #[test]

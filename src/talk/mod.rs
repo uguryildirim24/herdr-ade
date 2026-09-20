@@ -31,7 +31,7 @@ mod cost;
 mod overview;
 pub mod screen;
 mod stale;
-mod tasks;
+pub(crate) mod tasks;
 mod theme;
 pub mod view;
 
