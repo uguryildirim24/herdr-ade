@@ -103,20 +103,12 @@ pub mod repo {
         }
 
         pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
-            // A negative ancestry answer and a broken object database both
-            // exit nonzero. Keep this ambiguous probe eligible for recording.
-            let out = self.output_in(
-                &self.repo,
-                &["merge-base", "--is-ancestor", ancestor, descendant],
-            )?;
-            match out.code {
-                Some(0) => Ok(true),
-                Some(1) => Ok(false),
-                _ => bail!(
-                    "`git merge-base --is-ancestor {ancestor} {descendant}` failed: {}",
-                    out.error_text()
-                ),
-            }
+            crate::git::is_ancestor(
+                self.runner,
+                &self.repo.to_string_lossy(),
+                ancestor,
+                descendant,
+            )
         }
 
         pub fn parents(&self, commit: &str) -> Result<Vec<String>> {
@@ -3326,6 +3318,13 @@ mod tests {
         let _scope = crate::ledger::Scope::new(&[&fx.project]);
         let runner = crate::ledger::RecordingRunner(&crate::runner::RealRunner);
         let repo = Git::new(&runner, &fx.repo);
+        let (_, lane_sha) = fx.lane(1);
+        for _ in 0..2 {
+            assert!(!repo.is_ancestor(&lane_sha, "main").unwrap());
+            assert!(repo.is_ancestor("main", &lane_sha).unwrap());
+        }
+        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
+        assert!(!fx.project.dir().join("ledger.jsonl").exists());
         assert!(repo.branch_head("box-only").unwrap().is_none());
         assert!(repo.show_file("HEAD", "missing.md").unwrap().is_none());
         assert_eq!(
@@ -3335,8 +3334,8 @@ mod tests {
         assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
         assert!(repo.show_file("not-a-revision", "README.md").is_err());
         assert_eq!(crate::ledger::list(&fx.project).unwrap().len(), 1);
-        // Unlike an absent file, an ancestry status can also mean invalid
-        // input or a broken database. It must not get a blanket exemption.
+        // Ancestry errors still record; only its precise yes/no statuses
+        // are answers, not a blanket exemption for every normal exit.
         assert!(repo.is_ancestor("not-a-revision", "HEAD").is_err());
         assert_eq!(crate::ledger::list(&fx.project).unwrap().len(), 2);
     }
