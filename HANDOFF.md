@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T23:44:35-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-20T00:07:17-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 3 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
@@ -38,11 +38,11 @@ Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (workin
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (1 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (9 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | f9ee3a5 | 0 | docs(tasks): t-0098 |
+| `/Users/rolfie/projects/herdr-ade` | `main` | 2e521c3 | 0 | docs(review): round r45 verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -76,6 +76,8 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (1 ahead, 0 b
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r41` | `review/r41` | 4e12822 | 0 | docs(tasks): t-0093 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r42` | `review/r42` | f20dd08 | 0 | docs(tasks): t-0095 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r43` | `review/r43` | 24aff4a | 0 | docs(tasks): t-0096 |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r44` | `review/r44` | 121aa10 | 0 | review(r44): brief for revision 1 |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r45` | `review/r45` | ee6a42f | 0 | docs(tasks): t-0100 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r5` | `review/r5` | 008f9ac | 0 | docs(tasks): t-0012 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r6` | `review/r6` | 910649d | 0 | docs(tasks): t-0014 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r7` | `review/r7` | 7cb564e | 0 | docs(tasks): t-0015 |
@@ -148,19 +150,19 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (1 ahead, 0 b
 Last commits on the integration branch:
 
 ```
-f9ee3a5 docs(tasks): t-0098
-3c5d75a checkpoint(r43): HANDOFF after merging the round
-c6e8d56 Merge commit '0b5a0f74b959f829de573d84212e1f2ac53082eb'
-0b5a0f7 docs(review): round r43 verdict
-cf4895b review(round): restart a gone reviewer without removed flags
-04fdd1e docs(tasks): t-0097
+2e521c3 docs(review): round r45 verdict
+c36e12c review(context): show r43 failure evidence before acknowledging it
+73f6bfc review(context): retain report updates beyond sealed evidence
+839a273 review(inbox): merge pinned t-0097 preserving escalation tick
+ee6a42f docs(tasks): t-0100
+1421976 review(r45): brief for revision 1
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0098.md`, `tasks/t-0096.md`, `tasks/t-0097.md`, `tasks/t-0095.md`, `tasks/review-r43.md`, `tasks/review-r42.md`, `tasks/t-0093.md`, `tasks/t-0094.md`, `tasks/review-r41.md`, `tasks/t-0090.md`, `tasks/t-0091.md`, `tasks/review-r39.md`
-- verdicts: `tasks/reviews/code-r43.md`, `tasks/reviews/code-r42.md`, `tasks/reviews/code-r41.md`, `tasks/reviews/code-r38.md`, `tasks/reviews/code-r39.md`, `tasks/reviews/code-r35.md`, `tasks/reviews/code-r37.md`, `tasks/reviews/code-r36.md`, `tasks/reviews/code-r34.md`, `tasks/reviews/code-r32.md`, `tasks/reviews/code-r33.md`, `tasks/reviews/code-r30.md`
+- briefs: `tasks/t-0100.md`, `tasks/review-r45.md`, `tasks/t-0099.md`, `tasks/review-r44.md`, `tasks/t-0098.md`, `tasks/t-0096.md`, `tasks/t-0097.md`, `tasks/t-0095.md`, `tasks/review-r43.md`, `tasks/review-r42.md`, `tasks/t-0093.md`, `tasks/t-0094.md`
+- verdicts: `tasks/reviews/code-r45.md`, `tasks/reviews/code-r43.md`, `tasks/reviews/code-r42.md`, `tasks/reviews/code-r41.md`, `tasks/reviews/code-r38.md`, `tasks/reviews/code-r39.md`, `tasks/reviews/code-r35.md`, `tasks/reviews/code-r37.md`, `tasks/reviews/code-r36.md`, `tasks/reviews/code-r34.md`, `tasks/reviews/code-r32.md`, `tasks/reviews/code-r33.md`
 
 ### Pickup
 
@@ -172,4 +174,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 936438b4-6acf-4417-9513-2bb938fe60e0
 ```
 
-Round `r1` was merged into `main` at verdict commit `356c0fa90c6146dfac7b3c10fba5a5a6e58599b4`; this checkpoint is its child.
+Round `r45` was merged into `main` at verdict commit `2e521c36baf5d23f39c93473d533a531644e5035`; this checkpoint is its child.
+
