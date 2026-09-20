@@ -11,6 +11,11 @@ use crate::paths::Ctx;
 use crate::runner::Cmd;
 
 pub const URL: &str = "https://api.typesafe.ai/v1/systemone";
+/// The authenticated endpoint accepted ordinary requests but refused the
+/// measured 750 KiB review request. Keep a wide margin below that boundary.
+pub const REQUEST_BYTE_CAP: usize = 256 * 1024;
+const STATUS_MARKER: &str = "\nHERDR_HTTP_STATUS:";
+const ERROR_TEXT_CAP: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Score {
@@ -36,11 +41,19 @@ pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Res
         bail!("jev_key_invalid: TYPESAFE_API_KEY contains a control character");
     }
     let quote = |s: &str| serde_json::to_string(s).expect("string serialization");
+    let body = body.to_string();
+    if body.len() > REQUEST_BYTE_CAP {
+        bail!(
+            "jev_request_too_large: serialized request is {} bytes; cap is {REQUEST_BYTE_CAP}",
+            body.len()
+        );
+    }
     let config = format!(
-        "url = {}\nrequest = \"POST\"\nheader = {}\nheader = \"Content-Type: application/json\"\ndata = {}\n",
+        "url = {}\nrequest = \"POST\"\nheader = {}\nheader = \"Content-Type: application/json\"\ndata = {}\nwrite-out = {}\n",
         quote(URL),
         quote(&format!("Authorization: Bearer {key}")),
-        quote(&body.to_string())
+        quote(&body),
+        quote(&format!("{STATUS_MARKER}%{{http_code}}"))
     );
     let output = ctx
         .runner
@@ -50,7 +63,6 @@ pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Res
                     "--disable",
                     "--silent",
                     "--show-error",
-                    "--fail",
                     "--max-time",
                     "30",
                     "--config",
@@ -60,14 +72,64 @@ pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Res
                 .stdin(config),
         )
         .context("jev_transport: could not execute curl")?;
+    if output.timed_out {
+        bail!("jev_timeout: request timed out after 30 seconds");
+    }
     if !output.success() {
         bail!(
-            "jev_transport: request failed (exit {:?}, timeout {})",
+            "jev_transport: curl failed (exit {:?}): {}",
             output.code,
-            output.timed_out
+            safe_error_text(&output.error_text(), key)
         );
     }
-    parse(&output.stdout, questions)
+    let (response, status) = output
+        .stdout
+        .rsplit_once(STATUS_MARKER)
+        .context("jev_transport: curl response did not include an HTTP status")?;
+    let status: u16 = status
+        .trim()
+        .parse()
+        .context("jev_transport: curl returned an invalid HTTP status")?;
+    if !(200..300).contains(&status) {
+        bail!(
+            "jev_server_refused: HTTP {status}: {}",
+            safe_error_text(response, key)
+        );
+    }
+    parse(response, questions)
+}
+
+fn safe_error_text(text: &str, key: &str) -> String {
+    let redacted = text.replace(key, "[redacted]");
+    let mut safe: String = redacted
+        .chars()
+        .map(|c| {
+            if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if safe.len() > ERROR_TEXT_CAP {
+        let mut end = ERROR_TEXT_CAP;
+        while !safe.is_char_boundary(end) {
+            end -= 1;
+        }
+        safe.truncate(end);
+        safe.push('…');
+    }
+    let safe = safe.trim();
+    if safe.is_empty() {
+        "(empty response)".to_string()
+    } else {
+        safe.to_string()
+    }
+}
+
+#[cfg(test)]
+pub fn http_response(body: &str, status: u16) -> String {
+    format!("{body}{STATUS_MARKER}{status}")
 }
 
 fn probability(v: f64) -> bool {
