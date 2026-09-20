@@ -1012,7 +1012,7 @@ fn start_reviewer(
     let record = load(project, round)?;
     let git = Git::new(ctx.runner, &record.repo);
     let task = reviewer_task(project, &record, prefix, &git)?;
-    crate::threads::start(
+    crate::threads::start_during_advance(
         ctx,
         &project.slug,
         crate::threads::StartArgs {
@@ -1514,6 +1514,9 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         current.manifest_hash = Some(hash.clone());
         current.review_branch = Some(review_branch.clone());
         current.reviewer = None;
+        // A new review revision is a fresh automatic-start cycle. Failures
+        // from the superseded review must not consume this one's retry bound.
+        current.reviewer_start_failures = 0;
         save(&project, &current)?;
     }
     let _ = crate::board::refresh(ctx, &project);
@@ -3543,9 +3546,19 @@ mod tests {
         let wt = fx.repo.join(".worktrees/lane-1");
         let repaired = commit_file(&wt, "src/lane1.rs", "// repaired\n", "repair lane 1");
         fx.seal_done(&lanes[0].0, 1, 2, &repaired, "# repaired report\n");
+        {
+            let mut record = load(&fx.project, "r1").unwrap();
+            record.reviewer_start_failures = MAX_REVIEWER_START_FAILURES;
+            save(&fx.project, &record).unwrap();
+        }
         let outcome = review(&ctx, "demo", "r1").unwrap();
         assert_eq!(outcome.review_branch, "review/r1-2");
-        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
+        let reviewed = load(&fx.project, "r1").unwrap();
+        assert!(reviewed.reviewer.is_none());
+        assert_eq!(
+            reviewed.reviewer_start_failures, 0,
+            "the new review gets a fresh start bound"
+        );
 
         advance(&ctx, "demo").unwrap();
 
