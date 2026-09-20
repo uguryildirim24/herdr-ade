@@ -1,6 +1,7 @@
 //! Structural marker for a designed command refusal.
 //!
-//! A refusal is an expected safety or authority outcome chosen by the harness.
+//! A refusal is an expected outcome chosen by the harness: a safety/authority
+//! guard, or a completed health report refusing to declare the system healthy.
 //! It still exits unsuccessfully and keeps its message, but it is not evidence
 //! that the harness failed. Unexpected I/O, subprocess and invariant errors use
 //! ordinary `anyhow::Error` values and remain eligible for the failure ledger.
