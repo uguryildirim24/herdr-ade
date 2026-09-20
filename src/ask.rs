@@ -720,6 +720,10 @@ pub fn publish_keyed(
             })
         }
         HumanMessage::Ask { id, revision } => {
+            // Keep publication atomic with answer and withdrawal. Without the
+            // ask-set lock, a publisher that passed open_revision just before
+            // a withdrawal could put the closed card back on the board.
+            let _set = ask_set_lock(project)?;
             let record = open_revision(project, id, *revision, &g)?;
             let compact = compact_line(&record);
             glossary::gate(project, &compact)?;
