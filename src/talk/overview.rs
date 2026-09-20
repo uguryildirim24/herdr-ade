@@ -58,6 +58,7 @@ pub enum Tone {
 pub struct Row {
     pub text: String,
     pub prefix: String,
+    pub marker: String,
     pub tone: Tone,
 }
 impl Row {
@@ -65,15 +66,17 @@ impl Row {
         Self {
             text: text.into(),
             prefix: String::new(),
+            marker: String::new(),
             tone: Tone::Text,
         }
     }
     pub fn full_text(&self) -> String {
-        if self.prefix.is_empty() {
-            self.text.clone()
-        } else {
-            format!("{} {}", self.prefix, self.text)
-        }
+        [&self.prefix, &self.text, &self.marker]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 #[derive(Default)]
@@ -144,7 +147,7 @@ fn checked(project: &Project, text: &str) -> bool {
     !text.trim().is_empty()
         && !text.chars().any(char::is_control)
         && glossary::name_in(project, text).is_none()
-        && glossary::gate(project, text).is_ok()
+        && glossary::gate_row(project, text).is_ok()
 }
 fn safe(project: &Project, text: &str, fallback: &str) -> String {
     if checked(project, text) {
@@ -154,7 +157,22 @@ fn safe(project: &Project, text: &str, fallback: &str) -> String {
     }
 }
 fn tagged(project: &Project, prefix: &str, text: &str, tone: Tone, fallback: &str) -> Row {
-    let composed = format!("{prefix} {text}");
+    tagged_with_marker(project, prefix, text, "", tone, fallback)
+}
+
+fn tagged_with_marker(
+    project: &Project,
+    prefix: &str,
+    text: &str,
+    marker: &str,
+    tone: Tone,
+    fallback: &str,
+) -> Row {
+    let composed = [prefix, text, marker]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     Row {
         prefix: prefix.into(),
         text: if checked(project, &composed) {
@@ -162,6 +180,7 @@ fn tagged(project: &Project, prefix: &str, text: &str, tone: Tone, fallback: &st
         } else {
             fallback.into()
         },
+        marker: marker.into(),
         tone,
     }
 }
@@ -302,16 +321,20 @@ impl Overview {
                 Group::ReadyForReview | Group::Landing => ("checking", Tone::Yellow),
                 _ => ("working", Tone::Yellow),
             };
-            let mut suffix = String::new();
-            if t.is_remote() {
-                suffix.push_str(" box");
-            }
-            if t.is_remote() || !live.reachable {
-                suffix.push_str(" last seen");
-            }
-            let text = format!("{}{suffix}", safe(project, &t.plain, TASK_INVALID));
-            let fallback = format!("{TASK_INVALID}{suffix}");
-            out.sections[3].push(tagged(project, state, &text, tone, &fallback));
+            let marker = match (t.is_remote(), live.reachable) {
+                (true, _) => "box last seen",
+                (false, false) => "last seen",
+                (false, true) => "",
+            };
+            let text = safe(project, &t.plain, TASK_INVALID);
+            out.sections[3].push(tagged_with_marker(
+                project,
+                state,
+                &text,
+                marker,
+                tone,
+                TASK_INVALID,
+            ));
             // Error strings may contain internal detail; only a checked plain
             // explanation can accompany the retained work row.
             if !t.error.is_empty() && checked(project, &t.error) {
@@ -374,6 +397,7 @@ impl Overview {
         out.sections[5].push(Row {
             text: "Decided for you".into(),
             prefix: String::new(),
+            marker: String::new(),
             tone: Tone::Heading,
         });
         let choices = decide::current(project);
@@ -469,6 +493,27 @@ mod tests {
             &Live::default(),
         );
         assert_eq!(overview.name, "Adeherdr");
+    }
+
+    #[test]
+    fn an_existing_long_sentence_renders_cut_instead_of_the_invalid_fallback() {
+        let fx = fixture();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.goal = format!("{}.", vec!["the"; 26].join(" "));
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        assert_ne!(o.sections[0][0].text, GOAL_INVALID);
+        assert_eq!(o.sections[0][0].text, settings.goal);
     }
 
     #[test]
@@ -623,7 +668,7 @@ mod tests {
         );
         for r in o.sections.iter().flatten() {
             assert!(
-                glossary::gate(&fx.project, &r.full_text()).is_ok(),
+                glossary::gate_row(&fx.project, &r.full_text()).is_ok(),
                 "{}",
                 r.full_text()
             );

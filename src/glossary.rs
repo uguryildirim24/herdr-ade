@@ -188,6 +188,22 @@ pub fn gate(project: &Project, text: &str) -> Result<()> {
     }
 }
 
+/// The check a rendered overview row must pass: every plain rule except the
+/// sentence cap. The compact overview cuts a long sentence to one line and
+/// the full overview wraps it, so length alone never hides a record; jargon,
+/// names and identifiers still do.
+pub fn gate_row(project: &Project, text: &str) -> Result<()> {
+    let mut result = plain::check(text, &registry(project));
+    result
+        .violations
+        .retain(|v| v.rule != plain::Rule::LongSentence);
+    if result.passed() {
+        Ok(())
+    } else {
+        bail!("plain_refused:\n{}", format_check(text, &result))
+    }
+}
+
 /// The first born name or term `text` carries, even in gloss form. Board
 /// values carry none (item 14).
 pub fn name_in(project: &Project, text: &str) -> Option<String> {
