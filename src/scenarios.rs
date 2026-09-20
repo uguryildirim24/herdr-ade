@@ -60,9 +60,12 @@ impl World {
         }
         world.runner.on(
             "/usr/bin/curl",
-            ok(&serde_json::json!({"model":"jev-test", "answers":answers,
-            "usage":{"input_tokens":100,"output_tokens":20}})
-            .to_string()),
+            ok(&crate::jev::http_response(
+                &serde_json::json!({"model":"jev-test", "answers":answers,
+                "usage":{"input_tokens":100,"output_tokens":20}})
+                .to_string(),
+                200,
+            )),
         );
         let agents = world.agents.clone();
         world.runner.on_fn(

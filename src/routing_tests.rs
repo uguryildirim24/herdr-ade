@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::contracts::{Event, EventPayload, Launch, WaitingPayload};
 use crate::launch::{self, ResolveInput};
 use crate::paths::Ctx;
-use crate::runner::fake::{FakeRunner, fail, ok};
+use crate::runner::fake::{FakeRunner, fail, ok, timeout};
 use crate::scenarios::World;
 use crate::{escalation, events, jev, routing, thread};
 
@@ -47,7 +47,10 @@ fn runner(level: f64, confidence: f64) -> FakeRunner {
     );
     runner.on(
         "/usr/bin/curl",
-        ok(&response(level, confidence).to_string()),
+        ok(&jev::http_response(
+            &response(level, confidence).to_string(),
+            200,
+        )),
     );
     runner
 }
@@ -297,6 +300,132 @@ fn evaluator_counts_both_costly_mistakes_and_preserves_scores() {
     );
     assert!(result.cases[0]["assessment"]["scores"].is_object());
     assert_eq!(world.runner.count("/usr/bin/curl"), 0);
+}
+
+#[test]
+fn oversized_repository_state_is_cut_disclosed_and_logged() {
+    let (world, project) = setup();
+    let runner = runner(0.0, 1.0);
+    let ctx = Ctx {
+        runner: &runner,
+        ..world.ctx()
+    };
+    let brief = "Classify this complete bounded task brief.";
+    launch::resolve_launch(
+        &ctx,
+        &project,
+        &ResolveInput {
+            task: brief,
+            state: json!({"head":"abc", "files":"generated.json\n".repeat(30_000),
+                "recent_changes":"small useful summary"}),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let body = request(&runner);
+    assert!(body.to_string().len() <= jev::REQUEST_BYTE_CAP);
+    assert_eq!(body["state"]["brief"], brief);
+    assert_eq!(body["state"]["repository"]["head"], "abc");
+    assert_eq!(body["state"]["input_truncation"]["cut"], true);
+    assert!(
+        body["state"]["input_truncation"]["omitted_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "repository.files")
+    );
+    let ledger = std::fs::read_to_string(project.state_dir().join("dispatch.jsonl")).unwrap();
+    assert!(ledger.contains("dispatch-input-truncated"));
+    assert!(ledger.contains("input_truncation"));
+}
+
+#[test]
+fn brief_that_cannot_fit_is_refused_without_a_call() {
+    let (world, project) = setup();
+    let runner = runner(0.0, 1.0);
+    let ctx = Ctx {
+        runner: &runner,
+        ..world.ctx()
+    };
+    let brief = "b".repeat(jev::REQUEST_BYTE_CAP + 1);
+    let error = launch::resolve_launch(
+        &ctx,
+        &project,
+        &ResolveInput {
+            task: &brief,
+            state: json!({"files":"cheap evidence"}),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("dispatch_brief_too_large"));
+    assert_eq!(runner.count("/usr/bin/curl"), 0);
+}
+
+#[test]
+fn server_refusal_includes_status_and_body_but_never_the_key() {
+    let (world, project) = setup();
+    let runner = FakeRunner::new();
+    runner.on(
+        "agent start --help",
+        ok("[possible values: pi, claude, agy]"),
+    );
+    runner.on(
+        "/usr/bin/curl",
+        ok(&jev::http_response(
+            r#"{"detail":"request is too large; fake-key must not leak"}"#,
+            400,
+        )),
+    );
+    let ctx = Ctx {
+        runner: &runner,
+        ..world.ctx()
+    };
+    let error = launch::resolve_launch(
+        &ctx,
+        &project,
+        &ResolveInput {
+            task: "Implement the parser.",
+            ..Default::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("jev_server_refused: HTTP 400"), "{error}");
+    assert!(error.contains("request is too large"), "{error}");
+    assert!(!error.contains("fake-key"), "{error}");
+}
+
+#[test]
+fn timeout_is_reported_as_a_timeout_not_a_server_or_transport_failure() {
+    let (world, project) = setup();
+    // curl's 30-second deadline normally fires before the runner's 35-second
+    // watchdog. Both paths must have the same classification.
+    for output in [timeout(), fail(28, "curl: (28) Operation timed out")] {
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("/usr/bin/curl", output);
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let error = launch::resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                task: "Implement the parser.",
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("jev_timeout"), "{error}");
+        assert!(!error.contains("jev_server_refused"), "{error}");
+        assert!(!error.contains("jev_transport"), "{error}");
+    }
 }
 
 #[test]
