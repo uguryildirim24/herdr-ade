@@ -20,7 +20,7 @@ pub const PROVIDERS: [&str; 4] = ["openai-codex", "opencode-go", "kimi-coding", 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
 /// `pi_args_forbidden`. `-na` is `--no-approve`'s short form (§1) and
 /// `--no-session` is a session flag the r2 strip list also drops (§3.8).
-pub const FORBIDDEN_ARGS: [&str; 15] = [
+const FORBIDDEN_ARGS: [&str; 15] = [
     "--approve",
     "-a",
     "--no-approve",
@@ -47,7 +47,7 @@ pub const FORBIDDEN_ARGS: [&str; 15] = [
 /// so the wrapper expands `~`, makes the path absolute, squeezes `//`,
 /// refuses `.` and `..` parts, and compares both the path and its physical
 /// form (symlinks resolved on the nearest existing folder) against `~/.pi`.
-pub fn wrapper_script(agent_dir: &Path, cli_js: &Path) -> String {
+fn wrapper_script(agent_dir: &Path, cli_js: &Path) -> String {
     format!(
         r#"#!/bin/sh
 # herdr-ade pi wrapper — pinned {package}@{version}
@@ -137,7 +137,7 @@ exec node {cli} "$@"
 
 /// One single-quoted `sh` word, so a baked path with a quote, `$` or a
 /// backtick stays a path.
-pub fn sh_quote(text: &str) -> String {
+fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
@@ -206,24 +206,6 @@ pub fn agent_start_args(
     Ok(args)
 }
 
-/// One line, for reports and the coordinator skill.
-pub fn agent_start_line(
-    herdr_bin: &str,
-    name: &str,
-    pane: &str,
-    parent: &str,
-    timeout_ms: u64,
-    recipe_args: &[String],
-) -> Result<String> {
-    let args = agent_start_args(name, pane, parent, timeout_ms, recipe_args, None)?;
-    let mut line = herdr_bin.to_string();
-    for arg in &args {
-        line.push(' ');
-        line.push_str(arg);
-    }
-    Ok(line)
-}
-
 /// A `kind = "pi"` recipe is refused when it carries a session or trust flag
 /// (SPEC-pi v2 §3.5). The code is part of the message, so callers can name it.
 pub fn validate_args(args: &[String]) -> Result<()> {
@@ -259,7 +241,7 @@ pub fn validate_args(args: &[String]) -> Result<()> {
 
 /// `env` on a pi row must not set `PI_CODING_AGENT_DIR`
 /// (SPEC-pi v2 §3.5: the wrapper supplies it).
-pub fn validate_env(env: &[(String, String)]) -> Result<()> {
+fn validate_env(env: &[(String, String)]) -> Result<()> {
     for (key, _) in env {
         if key == "PI_CODING_AGENT_DIR" {
             bail!("pi_env_forbidden: the wrapper supplies PI_CODING_AGENT_DIR");
@@ -294,11 +276,11 @@ pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 /// Seven levels; the chosen rows are all valid, but the table clamps some
 /// (SPEC-pi v2 §1, §3.4).
-pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Models that clamp a level; a custom model with no thinking map clamps
 /// `xhigh` to off silently, so the recipe table is a check, not a hope.
-pub fn thinking_supported(provider: &str, model: &str, level: &str) -> Option<bool> {
+fn thinking_supported(provider: &str, model: &str, level: &str) -> Option<bool> {
     let _ = provider;
     match (model, level) {
         ("k3", "xhigh") => Some(false),

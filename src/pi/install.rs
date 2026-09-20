@@ -21,11 +21,11 @@ use super::provider as deepseek;
 
 /// The guard extension, plugin-owned, beside the herdr state hook
 /// (SPEC-pi v2 §3.3, §3.7). Doctor checks the marker.
-pub const GUARD_TS: &str = include_str!("../../extensions/herdr-pi-guard.ts");
+const GUARD_TS: &str = include_str!("../../extensions/herdr-pi-guard.ts");
 
 /// The exact `npm install` argv (SPEC-pi v2 §3.2). `--save-exact` is the pin;
 /// a caret range is refused by doctor.
-pub fn npm_install_args(layout: &Layout) -> Vec<String> {
+fn npm_install_args(layout: &Layout) -> Vec<String> {
     vec![
         "install".to_string(),
         "--prefix".to_string(),
@@ -53,12 +53,12 @@ pub fn is_installed_exactly(layout: &Layout) -> bool {
 }
 
 /// The bin the package declares, and the file it must point at.
-pub fn cli_js_exists(layout: &Layout) -> bool {
+fn cli_js_exists(layout: &Layout) -> bool {
     layout.cli_js().is_file()
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct InstallReport {
+pub(crate) struct InstallReport {
     pub version: String,
     pub npm_line: String,
 }
@@ -118,7 +118,7 @@ pub fn link_line(layout: &Layout, home: &std::path::Path) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetupReport {
+pub(crate) struct SetupReport {
     pub steps: Vec<String>,
     pub pi_folder: std::path::PathBuf,
     pub npm_prefix: std::path::PathBuf,

@@ -12,7 +12,7 @@ use super::launch;
 /// One ready-made recipe row. Fields line up with `Recipe` plus
 /// `model_family` and the D17 `plain` phrase.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PiRecipe {
+pub(crate) struct PiRecipe {
     /// Recipe id.
     pub id: &'static str,
     /// D2 kind; always `pi`.
@@ -126,11 +126,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "the strongest paid chat model, used as a worker",
         ),
     ]
-}
-
-/// Providers a pi row may name. Never `cursor` (SPEC-pi v2 §3.5).
-pub fn is_pi_provider(provider: &str) -> bool {
-    launch::PROVIDERS.contains(&provider)
 }
 
 /// Every provider an enabled recipe uses, in row order, for doctor.
