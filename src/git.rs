@@ -105,7 +105,9 @@ pub fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
 /// error. `for-each-ref` answers absence with empty output; every nonzero exit
 /// still means the query failed. Match the full name (git also lists prefixes).
 pub fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<String>> {
-    let want = branch_ref(branch);
+    // Keep the local-branch namespace even when the supplied name starts
+    // with `refs/`: round and worktree callers use short branch names.
+    let want = format!("refs/heads/{branch}");
     let rows = git(
         runner,
         repo,
@@ -368,6 +370,12 @@ mod tests {
                 .is_none()
         );
         assert!(branch_head(&runner, &repo_s, "main").unwrap().is_some());
+        // Callers supply a local branch name, not an arbitrary ref. In
+        // particular a tag must not pass integration-branch validation.
+        git(&runner, &repo_s, &["tag", "release"], GIT_TIMEOUT).unwrap();
+        for name in ["refs/tags/release", "refs/heads/main"] {
+            assert!(branch_head(&runner, &repo_s, name).unwrap().is_none());
+        }
         // A prefix match is not the requested branch.
         git(
             &runner,
