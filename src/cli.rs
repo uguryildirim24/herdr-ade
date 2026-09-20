@@ -1389,16 +1389,29 @@ pub fn run() -> Result<()> {
         .and_then(|s| Project::load(&ctx.root, s).ok());
     let _scope = crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>());
     let subject = format!("ha {command_name}");
-    if let Some(project) = &observed_project {
-        crate::ledger::retry_after_failure(project, "command-failed", &subject);
-    }
     let result = dispatch(ctx, cli.command, observed_project.as_ref());
-    if let Err(error) = &result {
-        crate::ledger::observe_current("command-failed", &subject, &format!("{error:#}"));
-    } else if let Some(project) = &observed_project {
-        crate::ledger::recovered(project, "command-failed", &subject);
-    }
+    record_command_outcome(observed_project.as_ref(), &subject, &result);
     result
+}
+
+/// Only unexpected command errors belong in the failure ledger. A designed
+/// refusal still returns its error to the caller, but its structural marker
+/// keeps the safety/authority outcome out of defect counts.
+fn record_command_outcome(project: Option<&Project>, subject: &str, result: &Result<()>) {
+    let Some(project) = project else {
+        return;
+    };
+    match result {
+        Err(error) if crate::refusal::is(error) => {}
+        Err(error) => {
+            crate::ledger::retry_after_failure(project, "command-failed", subject);
+            crate::ledger::observe(project, "command-failed", subject, &format!("{error:#}"));
+        }
+        Ok(()) => {
+            crate::ledger::retry_after_failure(project, "command-failed", subject);
+            crate::ledger::recovered(project, "command-failed", subject);
+        }
+    }
 }
 
 fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) -> Result<()> {
@@ -1774,5 +1787,41 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn designed_refusals_are_not_failures_but_real_command_errors_are() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
+        let refusal: Result<()> = Err(crate::refusal::error(
+            "harness_install_stale_self: run the command again",
+        ));
+        record_command_outcome(Some(&project), "ha harness install", &refusal);
+        assert!(crate::ledger::list(&project).unwrap().is_empty());
+
+        let failure: Result<()> = Err(anyhow::anyhow!("compiler process crashed"));
+        record_command_outcome(Some(&project), "ha harness install", &failure);
+        let entries = crate::ledger::list(&project).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "command-failed");
+        assert_eq!(entries[0].subject, "ha harness install");
+        assert!(entries[0].detail.contains("compiler process crashed"));
+
+        // A later guard refusal is neither a retry nor proof that the real
+        // failure recovered. Only an actual successful re-entry does both.
+        record_command_outcome(Some(&project), "ha harness install", &refusal);
+        assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
+        record_command_outcome(Some(&project), "ha harness install", &Ok(()));
+        let entries = crate::ledger::list(&project).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.kind == "retry"));
+        assert!(entries.iter().any(|entry| {
+            entry.kind == "command-failed" && entry.detail.contains("compiler process crashed")
+        }));
     }
 }

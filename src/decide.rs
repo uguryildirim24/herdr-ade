@@ -205,10 +205,10 @@ pub fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
     check_class(new.class)?;
     let line = glossary::check_record_sentence(&project, "line", new.line)?;
     if new.class != "routine" && new.basis.is_none() {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "decision_authority: a `{}` choice needs --basis with the permission it rests on",
             new.class
-        );
+        )));
     }
     let basis = match new.basis {
         Some(basis) => Some(validate_basis(&project, basis)?),
@@ -545,22 +545,21 @@ mod tests {
     fn a_consequential_choice_needs_a_basis_and_a_no_answer_authorizes_nothing() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        let e = format!(
-            "{:#}",
-            decide(
-                &ctx,
-                "demo",
-                NewDecision {
-                    line: "I will spend five dollars on the check.",
-                    class: "money",
-                    key: None,
-                    basis: None,
-                    replaces: None,
-                    request: None,
-                }
-            )
-            .unwrap_err()
-        );
+        let error = decide(
+            &ctx,
+            "demo",
+            NewDecision {
+                line: "I will spend five dollars on the check.",
+                class: "money",
+                key: None,
+                basis: None,
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap_err();
+        assert!(crate::refusal::is(&error));
+        let e = format!("{error:#}");
         assert!(e.starts_with("decision_authority"), "{e}");
         let (id, revision) = answered_ask(&fx);
         let e = format!(

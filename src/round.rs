@@ -2170,66 +2170,74 @@ fn validate_verdict_inner(
     require_merge: bool,
 ) -> Result<String> {
     let r = &record.round;
-    let b = record.expected_head.as_deref().context("review_missing")?;
+    let b = record
+        .expected_head
+        .as_deref()
+        .ok_or_else(|| crate::refusal::error("review_missing"))?;
     let parents = git.parents(v)?;
     let [c] = parents.as_slice() else {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "verdict_parent: V {v} must have exactly one parent, it has {}",
             parents.len()
-        );
+        )));
     };
     let c = c.clone();
     let path = verdict_path(r);
     let names = git.diff_names(&c, v)?;
     if names != [path.clone()] {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "verdict_scope: C..V must touch exactly {path}, it touches {}",
             names.join(", ")
-        );
+        )));
     }
-    let text = git
-        .show_file(v, &path)?
-        .context("verdict_unreadable: the verdict file is absent at V")?;
-    let verdict = parse_verdict(&text)?;
+    let text = git.show_file(v, &path)?.ok_or_else(|| {
+        crate::refusal::error("verdict_unreadable: the verdict file is absent at V")
+    })?;
+    let verdict =
+        parse_verdict(&text).map_err(|error| crate::refusal::error(format!("{error:#}")))?;
     if verdict.candidate != c {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "verdict_candidate: the verdict names {} but V's parent is {c}",
             verdict.candidate
-        );
+        )));
     }
     if verdict.round != *r {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "verdict_wrong_round: the verdict is for `{}`, not `{r}`",
             verdict.round
-        );
+        )));
     }
     if require_merge && verdict.verdict != "MERGE" {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "verdict_not_merge: the verdict is `{}` at {v}; obtain a new review with an exact MERGE verdict using `round review {r}` then `round advance`",
             verdict.verdict
-        );
+        )));
     }
     if Some(verdict.manifest_hash.as_str()) != record.manifest_hash.as_deref()
         || verdict.policy_hash != record.policy_hash
     {
-        bail!(
-            "verdict_manifest_mismatch: the verdict's manifest or policy hash is not this round's"
-        );
+        return Err(crate::refusal::error(
+            "verdict_manifest_mismatch: the verdict's manifest or policy hash is not this round's",
+        ));
     }
     if !git.is_ancestor(b, &c)? {
-        bail!("base_not_ancestor: the brief commit B {b} is not an ancestor of C {c}");
+        return Err(crate::refusal::error(format!(
+            "base_not_ancestor: the brief commit B {b} is not an ancestor of C {c}"
+        )));
     }
     if !require_merge && verdict.verdict != "MERGE" {
         return Ok(c);
     }
     for m in &record.manifest.members {
-        let pin = m.pin.as_ref().context("round_not_complete")?;
+        let pin = m
+            .pin
+            .as_ref()
+            .ok_or_else(|| crate::refusal::error("round_not_complete"))?;
         if !git.is_ancestor(&pin.sha, &c)? {
-            bail!(
+            return Err(crate::refusal::error(format!(
                 "lane_not_in_candidate: {} sha {} is not an ancestor of C {c}",
-                m.thread,
-                pin.sha
-            );
+                m.thread, pin.sha
+            )));
         }
     }
     Ok(c)
@@ -2250,12 +2258,17 @@ pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Optio
 pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<MergeOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
-    crate::ledger::retry_after_failure(&project, "merge-refused", round);
     let result = merge_inner(ctx, project.clone(), slug, round, stop);
-    if let Err(error) = &result {
-        crate::ledger::observe(&project, "merge-refused", round, &format!("{error:#}"));
-    } else {
-        crate::ledger::recovered(&project, "merge-refused", round);
+    match &result {
+        Err(error) if crate::refusal::is(error) => {}
+        Err(error) => {
+            crate::ledger::retry_after_failure(&project, "merge-refused", round);
+            crate::ledger::observe(&project, "merge-refused", round, &format!("{error:#}"));
+        }
+        Ok(_) => {
+            crate::ledger::retry_after_failure(&project, "merge-refused", round);
+            crate::ledger::recovered(&project, "merge-refused", round);
+        }
     }
     result
 }
@@ -3965,15 +3978,9 @@ mod tests {
         verdict(&fx, &lanes, front("MERGE-AFTER-DECISION", "r1"));
         assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("verdict_not_merge"));
         assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("verdict_not_merge"));
-        let failures = crate::ledger::list(&fx.project).unwrap();
-        let refusal = failures
-            .iter()
-            .find(|entry| entry.kind == "merge-refused")
-            .unwrap();
-        assert_eq!(refusal.subject, "r1");
-        assert_eq!(refusal.count, 2);
-        assert!(refusal.detail.contains("verdict_not_merge"));
-        assert!(failures.iter().any(|entry| entry.kind == "retry"));
+        // The exact-MERGE gate worked as designed. Repeating it does not turn
+        // the refusal or the re-entry into a coordinator-visible failure.
+        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
 
         // An earlier round's verdict.
         let fx = fixture();

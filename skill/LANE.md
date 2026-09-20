@@ -30,10 +30,12 @@ This seals a failure event. The harness scores the full brief again with that fa
 
 ## Finish
 
-Commit the finished work, write the report named by your brief, then run:
+Commit the finished work and write the report at the path named by your brief.
+Pass that same path to `done`: an absolute path or a path relative to the
+worktree is accepted, but the report must be a file inside the worktree.
 
 ```text
-hp done --report <report path> --sha <commit sha>
+hp done --report <report path from the brief> --sha <commit sha>
 ```
 
 If you must stop for input, keep your work and run:

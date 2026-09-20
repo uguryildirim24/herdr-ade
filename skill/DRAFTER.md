@@ -14,4 +14,4 @@ You draft a spec in a dialogue with a critic. You work on the branch `lane/spec-
 - One idea per revision where you can, so a turn can point at it.
 - Keep a short "Changes since the last turn" section at the top of the draft.
 - Stop when the critic's latest turn has no blocking finding, or when a finding needs Rolf: then say which one with `hp waiting`.
-- Finish with `hp done --report <your report> --sha <your last commit>`.
+- Finish with `hp done --report <the report path from your brief> --sha <your last commit>`; the path may be absolute or relative, but the file must be inside the worktree.
