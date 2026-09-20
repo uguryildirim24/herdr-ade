@@ -6,8 +6,8 @@
 //! and only then advances the turn. A delayed turn-N line never completes
 //! turn N+1: the commit names `n`.
 //!
-//! The pair filter: `start` asks it whether the drafter and critic roles may
-//! work as a pair, and pins the critic's recipe off the drafter's model.
+//! The pair check keeps the two instruction sets distinct. Model selection
+//! happens later from each side's full brief.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,11 +22,9 @@ use crate::round::Git;
 use crate::round::repo::{commit_files_on_branch, repo_lock};
 use crate::thread::sha256_hex;
 
-/// The pair check (`crate::launch::DialoguePair`). `Ok(Some(id))` pins the
-/// critic's recipe so its `thread start` line cannot land on the drafter's
-/// model; `Err` carries the refusal to print.
+/// Check the two dialogue sides, without choosing or pinning their models.
 pub trait PairFilter {
-    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<Option<String>, String>;
+    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String>;
 }
 
 /// A role never pairs with itself.
@@ -146,7 +144,7 @@ pub fn start(
         );
     };
     crate::glossary::check_birth(&project, &plain)?;
-    let critic_recipe = filter
+    filter
         .check(&args.drafter, &args.critic)
         .map_err(|e| anyhow::anyhow!(e))?;
     let repo = match args.repo {
@@ -189,8 +187,8 @@ pub fn start(
         crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "herdr-ade".into());
     let coord = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
     let mut next = format!(
-        "drafter: {prefix} thread start {slug} --role {} --branch {} --plain \"{}\" --task-file <brief>\n",
-        d.drafter, d.branch, d.plain
+        "drafter: write a full brief with `product = \"spec\"` in its TOML front matter, then {prefix} thread start {slug} --title \"Draft {}\" --repo {} --workflow drafter --plain \"{}\" --task-file <brief>\n",
+        d.topic, d.repo, d.plain
     );
     if d.critic == "pro" {
         next.push_str(&format!(
@@ -199,12 +197,8 @@ pub fn start(
         ));
     } else {
         next.push_str(&format!(
-            "critic:  {prefix} thread start {slug} --role {}{} --plain \"<sentence>\" --task-file <brief>, then\n         {prefix} dialogue critic {slug} {} --pane <its pane>\n",
-            d.critic,
-            critic_recipe
-                .map(|id| format!(" --recipe {id}"))
-                .unwrap_or_default(),
-            d.topic
+            "critic:  {prefix} thread start {slug} --title \"Check {}\" --repo {} --workflow critic --plain \"<sentence>\" --task-file <full review brief>, then\n         {prefix} dialogue critic {slug} {} --pane <its pane>\n",
+            d.topic, d.repo, d.topic
         ));
     }
     Ok((d, next))
@@ -378,22 +372,18 @@ mod tests {
 
     struct AnyPair;
     impl PairFilter for AnyPair {
-        fn check(
-            &self,
-            drafter: &str,
-            critic: &str,
-        ) -> std::result::Result<Option<String>, String> {
-            same_role(drafter, critic).map(|()| None)
+        fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String> {
+            same_role(drafter, critic)
         }
     }
 
     struct NoCodexPair;
     impl PairFilter for NoCodexPair {
-        fn check(&self, drafter: &str, _: &str) -> std::result::Result<Option<String>, String> {
+        fn check(&self, drafter: &str, _: &str) -> std::result::Result<(), String> {
             if drafter == "codex" {
                 Err("dialogue_pair: not this pair".into())
             } else {
-                Ok(None)
+                Ok(())
             }
         }
     }
@@ -455,7 +445,9 @@ mod tests {
             ("lane/spec-shapes", "main")
         );
         assert!(
-            next.contains("--branch lane/spec-shapes") && next.contains("--role pro --passive"),
+            next.contains("--title \"Draft shapes\"")
+                && next.contains("--workflow drafter")
+                && next.contains("--role pro --passive"),
             "{next}"
         );
         let e = format!(

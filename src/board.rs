@@ -350,6 +350,7 @@ mod tests {
                     artifact: "def".into(),
                 }),
                 waiting: None,
+                failed: None,
             },
         };
         crate::events::seal_create_if_absent(&project, &event).unwrap();

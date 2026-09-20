@@ -19,8 +19,8 @@ pub mod folder;
 pub mod install;
 pub mod launch;
 pub mod provider;
+pub mod recipes;
 pub mod resume;
-pub mod roles;
 pub mod sh;
 
 #[cfg(test)]

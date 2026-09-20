@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::roles;
+use super::recipes;
 
 /// The provider that serves the DeepSeek rows.
 pub const PROVIDER_ID: &str = "opencode-go";
@@ -30,7 +30,7 @@ pub const DEEPSEEK_CONTEXT_WINDOW: u64 = DEEPSEEK_COMPACT_AT + PI_RESERVE_TOKENS
 /// The model id of every `opencode-go` recipe row that starts with
 /// `deepseek`, in row order. Derived from the rows, never repeated here.
 pub fn deepseek_models() -> Vec<&'static str> {
-    roles::pi_recipes()
+    recipes::pi_recipes()
         .iter()
         .filter(|row| row.provider == PROVIDER_ID && row.model_family.starts_with("deepseek"))
         .map(|row| row.model_family)

@@ -505,6 +505,7 @@ pub fn typed_line(event: &Event) -> Result<String> {
         EventPayload {
             done: Some(done),
             waiting: None,
+            failed: None,
         } => Ok(format!(
             "DONE {} {} {}",
             event.thread, done.report_path, done.sha
@@ -512,7 +513,13 @@ pub fn typed_line(event: &Event) -> Result<String> {
         EventPayload {
             done: None,
             waiting: Some(waiting),
+            failed: None,
         } => Ok(format!("WAITING {} {}", event.thread, waiting.text)),
+        EventPayload {
+            done: None,
+            waiting: None,
+            failed: Some(failure),
+        } => Ok(format!("FAILED {} {}", event.thread, failure.text)),
         _ => bail!(
             "event_payload_invalid: {} has no single tagged payload",
             event.id
@@ -553,6 +560,7 @@ mod tests {
                     artifact: "def".into(),
                 }),
                 waiting: None,
+                failed: None,
             },
         };
         (root, project, event)
@@ -592,6 +600,7 @@ mod tests {
                     artifact: artifact.into(),
                 }),
                 waiting: None,
+                failed: None,
             },
         }
     }

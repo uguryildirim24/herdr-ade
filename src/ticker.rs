@@ -874,6 +874,7 @@ fn remote_pass(
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
+    errors.extend(crate::escalation::tick(ctx, project).err());
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();

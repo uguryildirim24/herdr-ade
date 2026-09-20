@@ -403,7 +403,7 @@ fn box_rows(
     );
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
-    for provider in crate::pi::roles::enabled_providers() {
+    for provider in crate::pi::recipes::enabled_providers() {
         let provider = crate::remote::quote(provider);
         script.push_str(&format!(
             "HERDR_ADE_ROOT=\"$HOME/.herdr-ade\" \"$HOME/.local/bin/herdr-pi\" check {provider} >/dev/null 2>&1 && printf 'pi_%s\\tok\\n' {provider} || printf 'pi_%s\\tfail\\n' {provider}\n"
@@ -551,7 +551,7 @@ fn box_rows(
             format!("the box pane probe failed: {error:#}"),
         )),
     }
-    for provider in crate::pi::roles::enabled_providers() {
+    for provider in crate::pi::recipes::enabled_providers() {
         let value = fact(&format!("pi_{provider}"));
         rows.push((
             env_bool(&value, &["ok"]),
@@ -708,8 +708,18 @@ mod tests {
     #[test]
     fn new_herdr_passes_and_warnings_do_not_fail() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
         let root = home.path().join("root");
         let (text, healthy) = report(
             &env,
@@ -731,7 +741,13 @@ mod tests {
     #[test]
     fn a_project_over_its_memory_budget_warns_and_does_not_fail() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         std::fs::create_dir_all(project.dir().join("memory")).unwrap();
@@ -742,6 +758,10 @@ mod tests {
         )
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
         let (text, healthy) = report(
             &env,
             &root,
@@ -778,7 +798,7 @@ mod tests {
         .into_iter()
         .map(String::from)
         .collect();
-        for provider in crate::pi::roles::enabled_providers() {
+        for provider in crate::pi::recipes::enabled_providers() {
             lines.push(format!("pi_{provider}\tok"));
         }
         lines.join("\n") + "\n"
@@ -900,11 +920,17 @@ mod tests {
     #[test]
     fn fork_0_9_0_with_parent_is_accepted() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
         let runner = runner_with_herdr("herdr 0.9.0\n");
         runner.on(
             "agent start --help",
-            ok("usage: herdr agent start <name> --kind KIND --pane ID [--parent PANE_ID]\n"),
+            ok("usage: herdr agent start <name> --kind KIND --pane ID [--parent PANE_ID]\n[possible values: pi, claude, agy]"),
         );
         let (text, healthy) = report(
             &env,

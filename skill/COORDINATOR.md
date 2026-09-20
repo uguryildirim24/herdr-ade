@@ -45,7 +45,7 @@ hp thread start <slug> --title "<short title>" --repo <path> --task-file - <<'TA
 TASK
 ```
 
-Leave out `--repo` for a task with no repository. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (the role's `machine` row); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. The thread automatically gets the project instructions and memory, so the task only needs what is specific to it.
+Leave out `--repo` for a task with no repository. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (`[dispatch].machine`); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. The thread automatically gets the project instructions and memory, so the task only needs what is specific to it.
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
@@ -53,16 +53,17 @@ Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start fa
 
 ### Model choice
 
-You choose the role, never a model. The roles table in `~/.config/herdr-ade/config.toml` fixes each role's model and effort: a lane runs the role's `default`, and that is the whole choice. There is no picker and no per-task model decision.
+You do not choose; describe the work well, because that description is what picks the model. Write a full task file with scope, constraints and gates, not a one-line title. The harness sends that brief and repository facts to Jev in the background. Jev scores the task; the editable policy turns those scores into a model. Low confidence upgrades the model and is logged; it never asks you to choose.
 
-- Pick a role with `--role <name>` when the work is not a lane: `reviewer`, `critic`, `drafter`, `research`, `planner`.
-- `--recipe <id>` pins a row from the role's `allowed` list. Use it only when Rolf has explicitly chosen that override.
-- Rows in `escalate` are stronger options for a stalled lane. Do not move one into `allowed` or start a replacement lane on it until Rolf says so.
-- Do not name a model in the task text and do not try to change a running lane's model or effort. A restart reuses the recorded launch.
+- `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions during a spec dialogue; it does not select a model.
+- Describe hard exceptions in the task's opening `+++` TOML front matter: `product = "web-research"` when the deliverable is web research; `product = "spec"` for writing a specification; `requires_claude = true` for a Claude-only runtime requirement. A coding task that reads a web page is still coding, not web research.
+- `round advance` still starts the review. Its full brief and pinned changes go through the same picker.
+- A lane calls `ha failed "<failure and evidence>"` to ask for a stronger model. The harness keeps its worktree and replaces its attempt automatically, with no permission or settings step. A lane can climb at most three times; fixed exceptions cannot climb.
+- `thread restart` is recovery of the same model, not a model choice. Only Rolf may pin an exact task through the policy's hash-keyed `pins` map.
 
 ### Harness evolves
 
-Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, allow it for a role, change a role default, add a machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file. A flaw in the harness that you hit is fixed in the harness through a lane and a round from your own project, never written into memory as a workaround; a lane may run on a harness repository even when your `PROJECT.md` does not list it, and after the merge that lands the fix run `ha harness install` to build and install the harness.
+Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a model recipe or a machine. Routing questions, weights, cutoffs and model cards live in `~/.config/herdr-ade/routing.json`; tune them against labelled cases with `ha routing-eval <cases.json>`, never by pinning each dispatched lane. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file. A flaw in the harness that you hit is fixed in the harness through a lane and a round from your own project, never written into memory as a workaround; a lane may run on a harness repository even when your `PROJECT.md` does not list it, and after the merge that lands the fix run `ha harness install` to build and install the harness.
 
 ## Tasks
 

@@ -1,0 +1,35 @@
+[
+  {
+    "id": "bounded-shell-fix",
+    "brief": "Fix the wrapper lookup in a Linux shell probe. The only product is a portable shell command and a regression test. Read the existing probe and its test fixture, replace the zsh-only lookup with the supported shell lookup, and run the focused test. Do not redesign installation or authentication.",
+    "state": {"files": ["src/pi/doctor.rs", "src/pi/scenarios.rs"], "fixture": "Synthetic plumbing example, not a measured Jev result"},
+    "expected": "pi_opencode_deepseek",
+    "response": {"model": "offline-fixture", "answers": {
+      "difficulty": {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1, "1": 0, "2": 0, "3": 0}},
+      "ambiguity": {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1, "1": 0, "2": 0, "3": 0}},
+      "blast_radius": {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1, "1": 0, "2": 0, "3": 0}}
+    }, "usage": {"input_tokens": 0, "output_tokens": 0}}
+  },
+  {
+    "id": "over-routing-example",
+    "brief": "Correct a typo in the installation guide. The expected product is a one-word documentation change. Read the paragraph and verify that the new word is correct; do not edit code, scripts or settings. There is no design question and no runtime behavior changes.",
+    "state": {"files": ["docs/operations.md"], "fixture": "Deliberately over-scored synthetic answer to exercise the wasted-money count"},
+    "expected": "pi_opencode_deepseek",
+    "response": {"model": "offline-fixture", "answers": {
+      "difficulty": {"type": "score", "score": 3, "confidence": 1, "probabilities": {"0": 0, "1": 0, "2": 0, "3": 1}},
+      "ambiguity": {"type": "score", "score": 3, "confidence": 1, "probabilities": {"0": 0, "1": 0, "2": 0, "3": 1}},
+      "blast_radius": {"type": "score", "score": 3, "confidence": 1, "probabilities": {"0": 0, "1": 0, "2": 0, "3": 1}}
+    }, "usage": {"input_tokens": 0, "output_tokens": 0}}
+  },
+  {
+    "id": "under-routing-example",
+    "brief": "Design and implement crash-safe failure recovery across the local and remote lane lifecycle. Preserve uncommitted work and process identity, reject stale attempts, and make delivery replay-safe. Read the event store, courier, thread allocation, process launch and review flow. Add fault-injection tests for a crash at each write boundary and run the full suite. No live process may be replaced without a matching recorded failure.",
+    "state": {"files": ["src/events.rs", "src/ops.rs", "src/threads.rs", "src/steps.rs", "src/round.rs"], "fixture": "Deliberately under-scored synthetic answer to exercise the wasted-lane count"},
+    "expected": "pi_codex_sol_high",
+    "response": {"model": "offline-fixture", "answers": {
+      "difficulty": {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1, "1": 0, "2": 0, "3": 0}},
+      "ambiguity": {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1, "1": 0, "2": 0, "3": 0}},
+      "blast_radius": {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1, "1": 0, "2": 0, "3": 0}}
+    }, "usage": {"input_tokens": 0, "output_tokens": 0}}
+  }
+]

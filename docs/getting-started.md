@@ -40,7 +40,7 @@ herdr-projects open billing
 
 `new` creates `~/.herdr-projects/billing/`. `open` creates a Herdr workspace in that folder with a `coordinator` tab, starts your agent there, and sends it one priming line that tells it to print and follow the coordinator skill. The first time, your agent asks whether you trust the folder: answer it in the coordinator's pane. The ticker sends the priming line as soon as the agent is ready.
 
-Edit `PROJECT.md` in the project folder to write your standing instructions and to change the agent kind, `max_parallel_threads`, or the listed repos.
+Edit `PROJECT.md` in the project folder to write your standing instructions and to change `max_parallel_threads` or the listed repos. Task briefs pick their model through the routing policy; projects do not choose an agent kind.
 
 ## 4. Tell the coordinator what you want
 
@@ -54,7 +54,7 @@ By default it lists the threads it suggests and waits. Reply with a go-ahead tha
 
 Each code thread opens as its own workspace on a branch named `hp/<project>/<id>-<title>`; a task with no repository opens as a tab in the project's workspace. Expand Herdr's agent sidebar to see `project`, `thread` and `review` beside each one, or run **Projects: overview**.
 
-Expect one interruption per thread under the default settings: **a new worktree folder is a folder your agent hasn't trusted yet**, so each code thread starts with your agent's trust dialog and shows under Waiting on you until you press Enter in its pane. After that come your agent's ordinary first-edit and first-command prompts. Tab threads live inside the project folder you already trusted, so they skip the dialog. To reduce the prompts, give the role's `args` in the roles table (see [Operations](operations.md)).
+Expect one interruption per thread under the default settings: **a new worktree folder is a folder your agent hasn't trusted yet**, so each code thread starts with your agent's trust dialog and shows under Waiting on you until you press Enter in its pane. After that come your agent's ordinary first-edit and first-command prompts. Tab threads live inside the project folder you already trusted, so they skip the dialog. Executable model settings live in `[recipes.*]`; task routing is described in [Operations](operations.md#task-based-routing).
 
 When a thread finishes it writes a report. The report is copied to `threads/<id>.md` in the project folder and the thread moves to Ready for review. Tell the coordinator you've looked (it runs `thread ack`), or resolve the thread:
 
@@ -75,7 +75,7 @@ herdr-projects ticker status
 
 - **`open` says the session is not reachable**: run it inside Herdr, or pass `--session <name>`. A project belongs to the session it was first opened in; opening it from another one is refused.
 - **A thread stays at "no agent"**: the ticker launches agents, one per project per tick (about 15 seconds). `ticker status` shows whether it runs and which `herdr`, `git`, `gh`, `ssh` and `rsync` it resolves from its own environment, which may differ from your shell. After three failed launches the thread is marked failed with the reason; `thread restart` tries again.
-- **Herdr was restarted**: panes are gone but records, reports and branches are not. Run `open <project>` for a new coordinator and `thread restart <project> <id>` for each thread you want back. The coordinator starts with no chat history; it works from memory, thread records and the inbox. To keep your agent's own history, put `--continue` in the `coordinator` role's `args` (for Claude Code).
+- **Herdr was restarted**: panes are gone but records, reports and branches are not. Run `open <project>` for a new coordinator and `thread restart <project> <id>` for each thread you want back. The coordinator starts with no chat history; it works from memory, thread records and the inbox.
 - **The coordinator forgot how to behave** after a long conversation: `herdr-projects open <project> --reprime`.
 
 ## Optional configuration
