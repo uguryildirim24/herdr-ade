@@ -259,6 +259,12 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if machine.is_empty() && launch.kind == "pi" {
         pi_ready(ctx, &launch)?;
     }
+    // A box start resolves its box repository row before a thread record
+    // exists, so a missing piece refuses early and leaves no record behind
+    // (t-0070).
+    if !machine.is_empty() && !repo.is_empty() {
+        box_repo_row(&settings, &repo)?;
+    }
     let machine_id = placement.machine_id.clone();
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
@@ -480,6 +486,35 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
     prepare_local_dir(ctx, project, placed)
 }
 
+/// The box clone path and publish URL a box start needs for `repo`, each
+/// reported by name when it is missing. A row in `PROJECT.md` whose
+/// `box_path` is set but whose `publish_url` is not names the missing URL; a
+/// repo with neither falls back to the built-in harness map, or keeps the
+/// mapping message (t-0070).
+fn box_repo_row(settings: &crate::project::Settings, repo: &str) -> Result<(String, String)> {
+    let row = settings.repos.iter().find(|r| r.path == repo);
+    match (
+        row.and_then(|r| r.box_path.clone()),
+        row.and_then(|r| r.publish_url.clone()),
+    ) {
+        (Some(box_path), Some(publish_url)) => Ok((box_path, publish_url)),
+        (Some(_), None) => bail!(
+            "box_publish_url_missing: `{repo}` has a box_path in PROJECT.md but no `publish_url` in that row; add the URL the box fetches the lane branch from (the remote the branch is pushed to) before the first box start"
+        ),
+        (None, Some(_)) => bail!(
+            "box_path_missing: `{repo}` has a publish_url in PROJECT.md but no `box_path` in that row; add the box clone path before the first box start"
+        ),
+        (None, None) => {
+            let map = crate::remote::box_repo_for(repo).with_context(|| {
+                format!(
+                    "box_repo_unmapped: {repo} has no Mac-to-box row; add one before the first box start"
+                )
+            })?;
+            Ok((map.box_path.to_string(), map.publish_url.to_string()))
+        }
+    }
+}
+
 /// The box start side (SPEC-remote §4.2 steps 2–5): commit the brief `B` on
 /// the Mac integration branch, push only the lane branch to the URL-matched
 /// remote, one ssh call to fetch and create the box worktree, create the box
@@ -495,23 +530,7 @@ fn place_box_worktree(
     let runner = ctx.runner;
     let (settings, _) = project.read_project_md()?;
     let label = crate::project::display_name(&settings.name, &project.slug);
-    let (box_repo, publish_url) = match settings
-        .repos
-        .iter()
-        .find(|r| r.path == record.repo)
-        .and_then(|r| Some((r.box_path.clone()?, r.publish_url.clone()?)))
-    {
-        Some(pair) => pair,
-        None => {
-            let map = crate::remote::box_repo_for(&record.repo).with_context(|| {
-                format!(
-                    "box_repo_unmapped: {} has no Mac-to-box row; add one before the first box start",
-                    record.repo
-                )
-            })?;
-            (map.box_path.to_string(), map.publish_url.to_string())
-        }
-    };
+    let (box_repo, publish_url) = box_repo_row(&settings, &record.repo)?;
     // Both clones must name the configured publish URL. The push still uses
     // the URL itself; finding the matching remote only validates this clone.
     let _ = remote::remote_for_url(runner, &record.repo, &publish_url)?;
@@ -2548,6 +2567,68 @@ mod tests {
         assert!(
             say_lines(&fx.project).is_empty(),
             "a box start says nothing"
+        );
+    }
+
+    #[test]
+    fn box_repo_row_names_each_missing_piece() {
+        let mut settings = crate::project::Settings {
+            repos: vec![crate::project::Repo {
+                path: "/r".into(),
+                box_path: Some("/box/r".into()),
+                publish_url: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let e = box_repo_row(&settings, "/r").unwrap_err().to_string();
+        assert!(
+            e.contains("box_publish_url_missing") && e.contains("publish_url"),
+            "{e}"
+        );
+
+        settings.repos[0].box_path = None;
+        settings.repos[0].publish_url = Some("https://example/r.git".into());
+        let e = box_repo_row(&settings, "/r").unwrap_err().to_string();
+        assert!(
+            e.contains("box_path_missing") && e.contains("box_path"),
+            "{e}"
+        );
+
+        // A repo with neither, and not in the built-in list, keeps the
+        // mapping message; a built-in harness repo resolves from the map.
+        settings.repos[0].publish_url = None;
+        let e = box_repo_row(&settings, "/other").unwrap_err().to_string();
+        assert!(e.contains("box_repo_unmapped"), "{e}");
+        let (box_path, url) = box_repo_row(&settings, "/Users/rolfie/projects/herdr").unwrap();
+        assert_eq!(box_path, "/home/ubuntu/projects/herdr");
+        assert!(url.ends_with("herdr.git"), "{url}");
+    }
+
+    #[test]
+    fn a_box_repo_without_a_publish_url_names_it_and_leaves_no_thread() {
+        let (fx, _remote) = box_fixture();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].publish_url = None;
+        let text = format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap());
+        std::fs::write(fx.project.project_md(), text).unwrap();
+        write_config(&fx, LANE_CONFIG);
+        stub_box(&fx);
+        let error = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("box_publish_url_missing"), "{error}");
+        assert!(
+            error.contains("publish_url") && error.contains("PROJECT.md"),
+            "{error}"
+        );
+        assert!(
+            thread::list(&fx.project).is_empty(),
+            "a refused box start leaves no thread record"
         );
     }
 
