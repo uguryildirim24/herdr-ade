@@ -11,6 +11,7 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0098.md",
       "tasks/t-0096.md",
       "tasks/t-0097.md",
       "tasks/t-0095.md",
@@ -21,8 +22,7 @@
       "tasks/review-r41.md",
       "tasks/t-0090.md",
       "tasks/t-0091.md",
-      "tasks/review-r39.md",
-      "tasks/review-r38.md"
+      "tasks/review-r39.md"
     ],
     "handoff": [
       "HANDOFF.md"
@@ -43,9 +43,10 @@
       "tasks/reviews/code-r30.md"
     ]
   },
-  "generated": "2026-09-19T23:27:04-04:00",
+  "generated": "2026-09-19T23:44:35-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0098-calibrate-the-picker-on-this-project-s-o",
       "main",
       "hp/adeherdr/t-0096-review-r43-this-round-checks-that-the-ta",
       "hp/adeherdr/t-0097-e1-the-message-list-stops-repeating-the",
@@ -166,22 +167,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
+      "f9ee3a5 docs(tasks): t-0098",
+      "3c5d75a checkpoint(r43): HANDOFF after merging the round",
       "c6e8d56 Merge commit '0b5a0f74b959f829de573d84212e1f2ac53082eb'",
       "0b5a0f7 docs(review): round r43 verdict",
       "cf4895b review(round): restart a gone reviewer without removed flags",
-      "04fdd1e docs(tasks): t-0097",
-      "4adfe05 review(routing): keep workflows separate from model choice",
-      "56d371c checkpoint(r42): HANDOFF after merging the round"
+      "04fdd1e docs(tasks): t-0097"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "1 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "c6e8d56",
+        "head": "f9ee3a5",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit '0b5a0f74b959f829de573d84212e1f2ac53082eb'"
+        "subject": "docs(tasks): t-0098"
       },
       {
         "branch": "review/r1",
@@ -882,6 +883,13 @@
         "head": "0b5a0f7",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0096",
         "subject": "docs(review): round r43 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0098-calibrate-the-picker-on-this-project-s-o",
+        "dirty": 0,
+        "head": "30397a4",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0098",
+        "subject": "Label picker cases from completed project threads"
       }
     ]
   },
@@ -906,32 +914,32 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r43",
-    "verdict": "0b5a0f74b959f829de573d84212e1f2ac53082eb"
+    "round": "r1",
+    "verdict": "356c0fa90c6146dfac7b3c10fba5a5a6e58599b4"
   },
   "session": "default",
   "unlinked_agents": [],
   "workers": [
     {
-      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0096",
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0098",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0096",
-      "pane_id": "w1G:p31",
+      "name": "hp-adeherdr-t-0098",
+      "pane_id": "w1G:p32",
       "pane_label": null,
-      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0096--/2026-09-20T03-16-02-338Z_01a0bcd0-4aa2-7335-a237-b76d6748fbf3.jsonl",
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0098--/2026-09-20T03-30-04-491Z_01a0bcdd-244b-7157-8eff-8c9ea715488f.jsonl",
       "start_args": [],
       "status": "done",
-      "tab_id": "w1G:t2X",
-      "tab_label": "t-0096",
-      "title": "π - t-0096",
+      "tab_id": "w1G:t2Y",
+      "tab_label": "t-0098",
+      "title": "π - t-0098",
       "tokens": {
         "done": "1",
-        "lane": "t-0096",
+        "lane": "t-0098",
         "parent": "w1G:p1",
         "project": "adeherdr",
-        "rank": "3",
-        "review": "working",
-        "thread": "t-0096"
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0098"
       }
     }
   ],
