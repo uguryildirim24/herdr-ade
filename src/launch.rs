@@ -805,6 +805,7 @@ fn launch_from(recipe: &Recipe, policy_hash: &str, role: &str) -> Launch {
         policy_hash: policy_hash.to_string(),
         attempt: 1,
         brief_hash: String::new(),
+        skill_hash: crate::thread::sha256_hex(crate::lane::skill_text(role).as_bytes()),
         recipe_id: String::new(),
         reason: String::new(),
         compact_reason: compact_reason(role, &recipe.plain),

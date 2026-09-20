@@ -317,12 +317,37 @@ struct BootstrapReceipt {
     acknowledged: String,
 }
 
+/// The skill text a role is primed with. One source for the printed skill, the
+/// start-time receipt and the staleness check, so they can never disagree.
+pub fn skill_text(role: &str) -> &'static str {
+    match role {
+        "coordinator" => include_str!("../skill/COORDINATOR.md"),
+        "reviewer" => include_str!("../skill/REVIEWER.md"),
+        "critic" => include_str!("../skill/CRITIC.md"),
+        "drafter" => include_str!("../skill/DRAFTER.md"),
+        "pickup" => include_str!("../skill/PICKUP.md"),
+        _ => include_str!("../skill/LANE.md"),
+    }
+}
+
+/// The repository file that carries a role's skill text.
+pub fn skill_file(role: &str) -> &'static str {
+    match role {
+        "coordinator" => "COORDINATOR.md",
+        "reviewer" => "REVIEWER.md",
+        "critic" => "CRITIC.md",
+        "drafter" => "DRAFTER.md",
+        "pickup" => "PICKUP.md",
+        _ => "LANE.md",
+    }
+}
+
 /// Prints the selected role skill and runtime-only rules. A lane call also
 /// records the bootstrap receipt from `HERDR_ADE_LAUNCH` when its binding
 /// matches. A box lane prints the fixed box prefix, never the Mac's path.
 pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
     match role {
-        "coordinator" => print!("{}", include_str!("../skill/COORDINATOR.md")),
+        "coordinator" => print!("{}", skill_text(role)),
         "lane" | "reviewer" | "critic" | "drafter" | "research" | "planner" => {
             let binding = current_lane(ctx)?;
             let recorded = match binding.thread.role.as_str() {
@@ -341,17 +366,9 @@ pub fn skill(ctx: &Ctx, role: &str) -> Result<()> {
                 crate::coordinator::current_prefix(&ctx.root)?
             };
             print!("{}", crate::thread::commands_line(&prefix));
-            print!(
-                "{}",
-                match role {
-                    "reviewer" => include_str!("../skill/REVIEWER.md"),
-                    "critic" => include_str!("../skill/CRITIC.md"),
-                    "drafter" => include_str!("../skill/DRAFTER.md"),
-                    _ => include_str!("../skill/LANE.md"),
-                }
-            );
+            print!("{}", skill_text(role));
         }
-        "pickup" => print!("{}", include_str!("../skill/PICKUP.md")),
+        "pickup" => print!("{}", skill_text(role)),
         _ => bail!("unknown role `{role}`"),
     }
     print_rules(&ctx.config_dir)

@@ -27,8 +27,11 @@ use crate::herdr::Herdr;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 
+mod cost;
 mod overview;
 pub mod screen;
+mod stale;
+mod tasks;
 mod theme;
 pub mod view;
 
