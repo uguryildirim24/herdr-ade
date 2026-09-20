@@ -896,14 +896,13 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
                     reviewer_start_failed(ctx, &project, &round, &reason, Some(&reviewer))?;
                 }
                 ReviewerState::Gone => {
-                    let base = record.review_branch.as_deref().unwrap_or("review/<round>");
                     announce_once(
                         ctx,
                         &project,
                         &round,
                         &format!("reviewer-gone:{reviewer}"),
                         &format!(
-                            "Round {round}: the reviewer thread {reviewer} is gone; start a new reviewer by hand with `{prefix} thread start {slug} --role reviewer --base {base}`, then `{prefix} round reviewer {slug} {round} <thread>`"
+                            "Round {round}: the reviewer thread {reviewer} is gone; restore its recorded review workflow with `{prefix} thread restart {slug} {reviewer}` (reopen it first if resolved)"
                         ),
                         None,
                     )?;
