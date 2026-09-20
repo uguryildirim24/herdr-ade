@@ -1,16 +1,15 @@
 round = "r1"
 branch = "main"
-plain = "The first round lands the shared types."
-gates = ["cargo test"]
-policy_hash = "old-policy"
-opened = "2026-09-18T00:00:00Z"
-repo = "/old/repo"
-expected_head = "old-brief"
+plain = "This round checks the fix for the word check and then adds it to the main line."
+gates = []
+policy_hash = "acfaae9ab98bf4e0b0925f47cd4a8cc784944e12bbd9b9caae384ce29bfd3ff4"
+expected_head = "b719725f35c928bb808528efa5d49a90d4cd87c9"
+manifest_hash = "ac4e2fcefc536e1909bb85d7f143308ebdd1a61b2bec5cce0936e8875ab2bf9b"
+opened = "2026-09-19T15:33:52Z"
+repo = "/Users/rolfie/projects/herdr-ade"
 frozen_revision = 1
-manifest_hash = "old-manifest"
 review_branch = "review/r1"
-reviewer = "t-0002"
-announced = "verdict:MERGE"
+reviewer = "t-0004"
 
 [manifest]
 revision = 1
@@ -19,7 +18,7 @@ revision = 1
 thread = "t-0001"
 
 [manifest.members.pin]
-event = "t-0001-1-1"
+event = "t-0001-1-2"
 attempt = 1
-sha = "old-lane"
-artifact = "old-report"
+sha = "76da26869bf4fe58790dc12397c9239adfcc2a22"
+artifact = "7809048bc151c7eb69a62e45462bdec94664caf80f39ba44a89f280fd4e824e1"

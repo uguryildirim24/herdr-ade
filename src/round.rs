@@ -369,6 +369,23 @@ fn validate_record(record: &RoundRecord) -> Result<()> {
             record.round
         );
     }
+    let verdict_phase = matches!(
+        record.phase,
+        RoundPhase::PreparingReview
+            | RoundPhase::VerdictIn
+            | RoundPhase::Merging
+            | RoundPhase::Checkpointing
+            | RoundPhase::Merged
+            | RoundPhase::Diverged
+    );
+    if record.phase == RoundPhase::VerdictIn && record.verdict.is_none()
+        || record.verdict.is_some() && !verdict_phase
+    {
+        bail!(
+            "round_state_mismatch: `{}` phase disagrees with its accepted verdict; restore the round record before retrying",
+            record.round
+        );
+    }
     Ok(())
 }
 
@@ -462,6 +479,17 @@ fn require_editable(record: &RoundRecord) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A manifest change supersedes the active review. Keep the old review branch
+/// metadata so the next review can name its predecessor, but do not leave its
+/// reviewer or verdict bound to the new inputs.
+fn return_to_admitting(record: &mut RoundRecord) {
+    record.phase = RoundPhase::Admitting;
+    record.reviewer = None;
+    record.verdict = None;
+    record.announced = None;
+    record.reviewer_start_failures = 0;
 }
 
 /// Safety callers must not use the display list, which skips broken records.
@@ -917,6 +945,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
+        let before = record.manifest.clone();
         if !record
             .manifest
             .members
@@ -930,8 +959,14 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
             record.manifest.revision += 1;
         }
         let events = sealed_events(&project)?;
+        let previous_phase = record.phase;
         record.phase = RoundPhase::Admitting;
         refresh_pins(&project, &mut record, &events)?;
+        if record.manifest != before {
+            return_to_admitting(&mut record);
+        } else {
+            record.phase = previous_phase;
+        }
         save(&project, &record)?;
         record
     };
@@ -951,13 +986,13 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
-        record.phase = RoundPhase::Admitting;
         let before = record.manifest.members.len();
         record.manifest.members.retain(|m| m.thread != thread_id);
         if record.manifest.members.len() == before {
             bail!("not_a_member: `{thread_id}` is not admitted to `{round}`");
         }
         record.manifest.revision += 1;
+        return_to_admitting(&mut record);
         save(&project, &record)?;
         record
     };
@@ -987,6 +1022,11 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
         .any(|m| m.thread == thread_id)
     {
         bail!("reviewer_is_member: `{thread_id}` is a lane of `{round}`");
+    }
+    if record.verdict.is_some() && record.reviewer.as_deref() != Some(thread_id) {
+        bail!(
+            "verdict_already_accepted: `{round}` already pins its reviewer verdict; run `round review {round}` to start a new review"
+        );
     }
     if let Some(reviewer) = record.reviewer.as_deref() {
         if reviewer == thread_id {
@@ -3085,7 +3125,7 @@ mod tests {
         assert_eq!(record.phase, RoundPhase::UnderReview);
         assert_eq!(
             record.manifest.members[0].pin.as_ref().unwrap().sha,
-            "old-lane"
+            "76da26869bf4fe58790dc12397c9239adfcc2a22"
         );
         assert!(
             std::fs::read_to_string(&path)
@@ -3104,21 +3144,9 @@ mod tests {
             include_str!("../tests/fixtures/rounds/r1.toml"),
         )
         .unwrap();
-        let intent = MergeIntent {
-            op: "merge-r1".into(),
-            expected_old: "old-brief".into(),
-            candidate: "candidate".into(),
-            verdict: "verdict".into(),
-            phase: MergePhase::Checkpointed,
-            merged: Some("verdict".into()),
-            checkpoint: None,
-            head: Some("checkpoint".into()),
-        };
-        std::fs::write(
-            merge_path(&fx.project, "r1"),
-            toml::to_string(&intent).unwrap(),
-        )
-        .unwrap();
+        let legacy = include_str!("../tests/fixtures/rounds/r1-merge.toml");
+        let intent: MergeIntent = toml::from_str(legacy).unwrap();
+        std::fs::write(merge_path(&fx.project, "r1"), legacy).unwrap();
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(record.phase, RoundPhase::Merged);
         assert_eq!(record.merge, Some(intent.clone()));
@@ -3258,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_verdict_is_not_replaced_by_a_later_done() {
+    fn accepted_verdict_is_not_replaced_by_a_later_done_or_reviewer() {
         let fx = fixture();
         let (lanes, _) = reviewed(&fx);
         let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
@@ -3273,6 +3301,9 @@ mod tests {
         assert_eq!(accepted.verdict.as_ref().unwrap().sha, v);
         let reviewer = accepted.reviewer.as_ref().unwrap();
         fx.seal_done(reviewer, 1, 2, &lanes[0].1, "a later unrelated completion");
+        let replacement = fx.thread("Replacement reviewer");
+        let e = err(bind_reviewer(&fx.world.ctx(), "demo", "r1", &replacement));
+        assert!(e.starts_with("verdict_already_accepted"), "{e}");
         merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
         let merged = load(&fx.project, "r1").unwrap();
         assert_eq!(merged.phase, RoundPhase::Merged);
@@ -3503,13 +3534,16 @@ mod tests {
     }
 
     #[test]
-    fn item33_member_added_after_b_makes_merge_stale() {
+    fn item33_member_added_after_b_supersedes_the_active_review() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let (lanes, _) = reviewed(&fx);
         verdict(&fx, &lanes, front("MERGE", "r1"));
         let (late, _) = fx.lane(3);
-        admit(&ctx, "demo", "r1", &late).unwrap();
+        let changed = admit(&ctx, "demo", "r1", &late).unwrap();
+        assert_eq!(changed.phase, RoundPhase::Admitting);
+        assert!(changed.reviewer.is_none());
+        assert!(changed.verdict.is_none());
         let e = err(merge(&ctx, "demo", "r1", None));
         assert!(e.starts_with("review_stale"), "{e}");
         assert!(read_merge(&fx.project, "r1").unwrap().is_none());
