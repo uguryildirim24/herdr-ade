@@ -517,8 +517,15 @@ fn digest_snapshot(
                 );
             } else if let Some(waiting) = &event.payload.waiting {
                 let _ = writeln!(out, "  waiting: {} event={}", waiting.text, event.id);
+            } else if let Some(failed) = &event.payload.failed {
+                let _ = writeln!(out, "  failed: {} event={}", failed.text, event.id);
             }
-            shown_events.push(event.clone());
+            if event.payload.done.is_some()
+                || event.payload.waiting.is_some()
+                || event.payload.failed.is_some()
+            {
+                shown_events.push(event.clone());
+            }
         }
         // Only suppress a copied report when the sealed evidence covers those
         // exact bytes. A later report edit is not a new sealed completion.
