@@ -240,6 +240,6 @@ scripts/dev-hp <subcommand>      # the binary against <repo>/.dev-root; pass --s
 scripts/dev-herdr <args>         # herdr against that session
 ```
 
-Never develop against your default session or `~/.herdr-ade`. Use `HERDR_ADE_ROOT` and `XDG_CONFIG_HOME` under `/var/tmp`. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr stage by stage, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm. [`going-public.md`](going-public.md) is the checklist for the public release.
+Never develop against your default session or `~/.herdr-ade`. Use `HERDR_ADE_ROOT` and `XDG_CONFIG_HOME` under `/var/tmp`.
 
 `scripts/migration/swap-binary.sh` is the state-dependent install of `~/.local/bin/herdr`. Tests must set `HERDR_ADE_SWAP_DIR` so they never write `~/.local/bin`. Run `scripts/migration/swap-binary.test.sh` on this Mac.
