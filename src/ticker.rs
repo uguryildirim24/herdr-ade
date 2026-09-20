@@ -20,7 +20,7 @@ use crate::project::{self, Project, Status};
 use crate::steps::{self, Memory};
 use crate::{inbox, thread, threads};
 
-pub const TICK: Duration = Duration::from_secs(15);
+const TICK: Duration = Duration::from_secs(15);
 const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
@@ -41,7 +41,7 @@ fn log_path(root: &Path) -> PathBuf {
 /// `doctor`. The pid is for display only; nothing signals it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct Info {
+pub(crate) struct Info {
     pub version: String,
     pub pid: u32,
     pub root: String,
@@ -73,7 +73,7 @@ pub fn lock_state(root: &Path) -> LockState {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum StartAction {
+pub(crate) enum StartAction {
     Spawn,
     Nothing,
     StopThenSpawn,
@@ -82,7 +82,7 @@ pub enum StartAction {
 /// The `ticker start` decision. A healthy ticker of the same version is never
 /// replaced; a different version, or a stop in progress, is stopped first so
 /// `open` never ends with no ticker.
-pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> StartAction {
+fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> StartAction {
     match lock {
         LockState::Free => StartAction::Spawn,
         LockState::Held(info) if info.version == my_version && !stop_file_exists => {
@@ -435,7 +435,7 @@ pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
 }
 
 /// What the cheap pass saw, handed to the slow pass so herdr is asked once.
-pub struct Seen {
+pub(crate) struct Seen {
     socket: String,
     agents: Vec<Agent>,
     panes: Vec<Pane>,

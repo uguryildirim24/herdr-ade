@@ -13,18 +13,18 @@ use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 use crate::thread::sha256_hex;
 
-pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-pub const OUTPUT_CAP_CHARS: usize = 4_000;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const OUTPUT_CAP_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Schedule {
+pub(crate) enum Schedule {
     /// `every <N>m|h|d`, in seconds.
     Every(i64),
     /// `daily HH:MM`, local time.
     Daily(i8, i8),
 }
 
-pub fn parse_schedule(text: &str) -> Result<Schedule> {
+fn parse_schedule(text: &str) -> Result<Schedule> {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix("every ") {
         let rest = rest.trim();
@@ -128,7 +128,7 @@ impl Routine {
 /// A routine file that could not be used, keyed by its content hash so an
 /// unfixed file is reported once.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Broken {
+pub(crate) struct Broken {
     pub file: String,
     pub hash: String,
     pub error: String,
@@ -316,7 +316,7 @@ pub fn fence_for(text: &str) -> String {
     "`".repeat((longest + 1).max(3))
 }
 
-pub struct Ran {
+pub(crate) struct Ran {
     pub output_hash: String,
     /// The fenced, capped, labelled block for the inbox item body.
     pub block: String,

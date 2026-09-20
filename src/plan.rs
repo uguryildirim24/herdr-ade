@@ -21,7 +21,7 @@ use crate::thread;
 use crate::threads;
 
 /// At most seven active steps (SPEC-talk §6.5).
-pub const MAX_STEPS: usize = 7;
+const MAX_STEPS: usize = 7;
 
 pub fn plan_path(project: &Project) -> PathBuf {
     project.dir().join("plan.toml")

@@ -46,7 +46,7 @@ pub struct Turn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TurnRecord {
+pub(crate) struct TurnRecord {
     pub n: u32,
     pub path: String,
     pub hash: String,
@@ -80,7 +80,7 @@ fn path(project: &Project, topic: &str) -> PathBuf {
     dir(project).join(format!("{topic}.toml"))
 }
 
-pub fn validate_topic(topic: &str) -> Result<()> {
+fn validate_topic(topic: &str) -> Result<()> {
     if topic.is_empty()
         || topic.len() > 40
         || !topic
@@ -239,12 +239,12 @@ pub fn bind_critic(ctx: &Ctx, slug: &str, topic: &str, pane: &str) -> Result<Dia
     Ok(d)
 }
 
-pub fn turn_path(d: &Dialogue, n: u32) -> String {
+fn turn_path(d: &Dialogue, n: u32) -> String {
     format!("tasks/{}/turns/{n:02}-{}.md", d.topic, d.critic)
 }
 
 /// The one-line `TURN` prompt; its `DONE` reply is an artifact event.
-pub fn turn_line(d: &Dialogue, n: u32) -> String {
+fn turn_line(d: &Dialogue, n: u32) -> String {
     let path = turn_path(d, n);
     format!(
         "TURN {topic}-{n:02}: write your turn to {repo}/{path}, then reply DONE {topic}-{n:02} {path} -",

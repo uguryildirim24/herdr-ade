@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runner::{Cmd, Runner};
 
-pub const GH_TIMEOUT: Duration = Duration::from_secs(10);
+const GH_TIMEOUT: Duration = Duration::from_secs(10);
 const NAME_LIMIT: usize = 80;
 
 /// The `PR:` value of a report's first line, only when it is exactly
@@ -30,7 +30,7 @@ pub fn pr_line(report: &str) -> Result<Option<String>, String> {
     }
 }
 
-pub fn valid_pr_url(url: &str) -> bool {
+fn valid_pr_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://github.com/") else {
         return false;
     };
@@ -52,7 +52,7 @@ pub fn valid_pr_url(url: &str) -> bool {
 }
 
 /// `owner/repo`, lower-cased, from the three URL forms git uses for GitHub.
-pub fn normalize_origin(origin: &str) -> Option<String> {
+fn normalize_origin(origin: &str) -> Option<String> {
     let origin = origin.trim();
     let rest = origin
         .strip_prefix("https://github.com/")

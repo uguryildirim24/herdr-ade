@@ -374,7 +374,7 @@ pub mod fake {
 
     /// Needle → canned stdout for each new verb's herdr or git call (SPEC-ADE §1.3).
     /// More specific needles come first so FakeRunner's first-match rule is stable.
-    pub const ADE_NEW_VERB_REPLIES: &[(&str, &str)] = &[
+    const ADE_NEW_VERB_REPLIES: &[(&str, &str)] = &[
         (
             "--parent",
             r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#,

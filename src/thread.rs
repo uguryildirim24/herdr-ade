@@ -13,13 +13,13 @@ use crate::runner::{Cmd, Runner};
 
 pub const STARTING_TIMEOUT_SECS: i64 = 300;
 pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
-pub const NOT_READY_SECS: i64 = 60;
+const NOT_READY_SECS: i64 = 60;
 /// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`
 /// past this, and `ha doctor` / `ha context` warn at it: the warning fires at
 /// the point where a brief starts dropping files, and 32k is a small enough
 /// share of a lane's context to prune before it costs real tokens.
 pub const MEMORY_CAP_CHARS: usize = 32_000;
-pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
+const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -123,7 +123,7 @@ impl Thread {
         format!("{}/report.md", self.thread_dir)
     }
 
-    pub fn library_path(&self) -> String {
+    fn library_path(&self) -> String {
         format!("{}/library", self.thread_dir)
     }
 }
@@ -140,7 +140,7 @@ fn threads_dir(project: &Project) -> PathBuf {
     project.dir().join("threads")
 }
 
-pub fn record_path(project: &Project, id: &str) -> PathBuf {
+fn record_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.toml"))
 }
 
@@ -343,14 +343,14 @@ pub fn with_lane_skill(prefix: &str, brief: &str) -> String {
 /// including a file the cap would drop, so the warning describes the budget
 /// itself rather than only what fits.
 #[derive(Debug, Clone, Default)]
-pub struct MemoryUse {
+pub(crate) struct MemoryUse {
     pub index: String,
     pub files: Vec<(String, String)>,
     pub total_chars: usize,
 }
 
 impl MemoryUse {
-    pub fn over_budget(&self) -> bool {
+    fn over_budget(&self) -> bool {
         self.total_chars > MEMORY_CAP_CHARS
     }
 
@@ -413,7 +413,7 @@ pub fn memory_use(project: &Project) -> MemoryUse {
     }
 }
 
-pub struct BriefInput<'a> {
+pub(crate) struct BriefInput<'a> {
     pub instructions: &'a str,
     pub memory_index: &'a str,
     /// (file name, contents), in the order they should be inlined.
@@ -424,7 +424,7 @@ pub struct BriefInput<'a> {
     pub library_path: &'a str,
 }
 
-pub fn compose_brief(input: &BriefInput) -> String {
+fn compose_brief(input: &BriefInput) -> String {
     let mut brief = String::new();
     if input.restart {
         brief.push_str(

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::contracts::{Launch, RoleSpec};
 
-pub const MAX_SLUG: usize = 40;
+const MAX_SLUG: usize = 40;
 pub const BODY_WARN_CHARS: usize = 16_000;
 
 /// A slug matches `[a-z0-9][a-z0-9-]*` and is at most 40 characters. Every
@@ -64,7 +64,7 @@ pub fn slug_from_name(name: &str) -> Result<String> {
 /// Words split on `-` and `_`, each with its first letter upper-cased:
 /// `herdr-projects` becomes `Herdr Projects`. Plain title case, so `gtm-ai`
 /// becomes `Gtm Ai`; a user who wants `GTM AI` sets `name` in PROJECT.md.
-pub fn humanize(slug: &str) -> String {
+fn humanize(slug: &str) -> String {
     slug.split(['-', '_'])
         .filter(|word| !word.is_empty())
         .map(|word| {
@@ -175,7 +175,7 @@ impl Default for Settings {
 }
 
 /// Splits `+++` TOML front matter from the body.
-pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
+fn parse_project_md(text: &str) -> Result<(Settings, String)> {
     let rest = text
         .strip_prefix("+++\n")
         .context("PROJECT.md must start with a `+++` line")?;
@@ -323,14 +323,14 @@ pub struct Project {
 
 /// Held while reading and rewriting anything under `threads/`, `inbox/` or
 /// `.state/`. Never held across a herdr, git, gh, ssh or scp call.
-pub struct ProjectLock {
+pub(crate) struct ProjectLock {
     _file: File,
 }
 
 /// Held while a box start fetches and creates its worktree, keyed by the
 /// stable profile id and the box repository so starts for one box repository
 /// serialize (SPEC-remote §4.2 step 3).
-pub struct BoxLock {
+pub(crate) struct BoxLock {
     _file: File,
 }
 
@@ -492,7 +492,7 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// The effective safety settings: `[safety."<canonical project path>"]` in
 /// `<config_dir>/config.toml`, with defaults for an absent table or key.
-pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
+fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
     #[derive(Deserialize, Default)]
     struct Config {
         #[serde(default)]

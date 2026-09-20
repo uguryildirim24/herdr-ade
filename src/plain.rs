@@ -34,12 +34,12 @@ fn parse_list(text: &str) -> BTreeSet<String> {
 }
 
 /// Shipped everyday list `plain/words.txt`.
-pub fn shipped_words() -> &'static BTreeSet<String> {
+fn shipped_words() -> &'static BTreeSet<String> {
     &WORDS
 }
 
 /// Plugin nouns `plain/vocabulary.txt` (SPEC-ADE D17 R4).
-pub fn plugin_vocabulary() -> &'static BTreeSet<String> {
+fn plugin_vocabulary() -> &'static BTreeSet<String> {
     &VOCAB
 }
 
@@ -62,7 +62,7 @@ impl Default for Glossary {
 }
 
 impl Glossary {
-    pub fn max_words(&self) -> usize {
+    fn max_words(&self) -> usize {
         if self.max_sentence_words == 0 {
             25
         } else {
@@ -117,7 +117,7 @@ pub struct Span {
 
 /// One failing span, its rule, and the fixed fix text (SPEC-ADE D17).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Violation {
+pub(crate) struct Violation {
     pub rule: Rule,
     pub span: Span,
     pub fix: String,

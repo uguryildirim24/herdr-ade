@@ -453,7 +453,7 @@ fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
     Ok(())
 }
 
-pub fn print_rules(config_dir: &Path) -> Result<()> {
+fn print_rules(config_dir: &Path) -> Result<()> {
     let path = config_dir.join("RULES.md");
     let Ok(bytes) = std::fs::read(&path) else {
         return Ok(());

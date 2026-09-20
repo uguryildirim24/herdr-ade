@@ -151,7 +151,7 @@ pub fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Opti
 }
 
 /// `git update-ref <ref> <new> <old>`: refuses when the old value does not match.
-pub fn update_ref(
+fn update_ref(
     runner: &dyn Runner,
     repo: &str,
     git_ref: &str,
@@ -168,7 +168,7 @@ pub fn update_ref(
 }
 
 /// Porcelain worktree rows: `(path, branch)` where branch is `refs/heads/...` or empty.
-pub fn worktree_list(runner: &dyn Runner, repo: &str) -> Result<Vec<(PathBuf, String)>> {
+fn worktree_list(runner: &dyn Runner, repo: &str) -> Result<Vec<(PathBuf, String)>> {
     let text = git(
         runner,
         repo,
@@ -209,7 +209,7 @@ fn branch_ref(branch: &str) -> String {
 }
 
 /// Where `branch` is checked out, if anywhere.
-pub fn branch_checkout(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<PathBuf>> {
+fn branch_checkout(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<PathBuf>> {
     let want = branch_ref(branch);
     for (path, found) in worktree_list(runner, repo)? {
         if found == want {

@@ -58,7 +58,7 @@ fn validate_machine(machine: &str) -> Result<()> {
 }
 
 /// The Mac's content-addressed artifact folder (SPEC-remote §4.3).
-pub fn artifact_dir(project: &Project) -> PathBuf {
+fn artifact_dir(project: &Project) -> PathBuf {
     project.dir().join("artifacts")
 }
 
@@ -72,7 +72,7 @@ pub fn artifact_path(project: &Project, hash: &str) -> PathBuf {
 /// id and the hash of the box's own bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct ImportSource {
+pub(crate) struct ImportSource {
     /// Stable saved-profile id the envelope came from.
     pub machine: String,
     /// Box project slug (the Mac's slug).
@@ -96,29 +96,10 @@ fn import_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf>
         .join(format!("{event}.toml")))
 }
 
-pub fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSource> {
+fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSource> {
     let path = import_path(project, machine, event).ok()?;
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str(&text).ok()
-}
-
-#[allow(dead_code)]
-pub fn list_imports(project: &Project, machine: &str) -> Vec<ImportSource> {
-    if validate_machine(machine).is_err() {
-        return Vec::new();
-    }
-    let dir = imports_dir(project).join(machine);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut imports: Vec<ImportSource> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_owned))
-        .filter_map(|id| load_import(project, machine, &id))
-        .collect();
-    imports.sort_by(|a, b| a.event.cmp(&b.event));
-    imports
 }
 
 /// What an [`import_box_event`] call did.
@@ -269,7 +250,7 @@ fn write_artifact_create_only(project: &Project, hash: &str, bytes: &[u8]) -> Re
 /// and no agent; `gone` and `blocked` stop a line being typed twice.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct RemoteState {
+pub(crate) struct RemoteState {
     pub boot_id: String,
     pub last_pass: String,
     pub taken: BTreeMap<String, String>,
@@ -304,17 +285,6 @@ pub fn save_remote_state(project: &Project, machine: &str, state: &RemoteState) 
 
 fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-/// The import record's path, exposed for tests.
-#[allow(dead_code)]
-pub fn source_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf> {
-    import_path(project, machine, event)
-}
-
-#[allow(dead_code)]
-pub fn artifact_dir_path(project: &Project) -> PathBuf {
-    artifact_dir(project)
 }
 
 /// Canonical bytes used both for the create-if-absent write and the X2b
@@ -369,7 +339,7 @@ pub fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
 /// compares it with the fetched bytes before the taken cursor advances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct Receipt {
+pub(crate) struct Receipt {
     pub event: String,
     pub event_hash: String,
     /// The content-addressed artifact name; empty for `waiting`.
@@ -482,7 +452,7 @@ pub(crate) fn append_delivery_locked(
     sync_parent(&path)
 }
 
-pub fn delivery_lines(project: &Project, event: &str) -> Result<Vec<DeliveryLine>> {
+fn delivery_lines(project: &Project, event: &str) -> Result<Vec<DeliveryLine>> {
     let path = journal_path(project, event)?;
     let Ok(text) = std::fs::read_to_string(path) else {
         return Ok(Vec::new());

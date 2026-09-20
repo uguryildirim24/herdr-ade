@@ -9,7 +9,7 @@
 use std::fmt;
 
 #[derive(Debug)]
-pub struct DesignedRefusal {
+pub(crate) struct DesignedRefusal {
     message: String,
 }
 

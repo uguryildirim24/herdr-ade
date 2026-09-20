@@ -44,7 +44,7 @@ pub enum Resolved {
 
 /// An explicit slug, else the current herdr workspace, else a numbered picker
 /// when on a terminal, else every project.
-pub fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
+fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
     if let Some(slug) = slug {
         project::validate_slug(slug)?;
         return Ok(Resolved::Slug(slug.to_string()));

@@ -264,7 +264,7 @@ fn set_suspended(project: &Project, on: bool) -> Result<()> {
 
 /// The serialized writer's lock for this coordinator (D8). A2's outbox takes
 /// the same lock around its read-and-prompt.
-pub struct WriterLock {
+pub(crate) struct WriterLock {
     _lock: Locked,
 }
 
@@ -335,7 +335,7 @@ fn coordinator_state(ctx: &Ctx, project: &Project) -> Option<String> {
 
 /// Sends queued requests in order through the serialized writer. Only
 /// `queued` requests are ever sent; `uncertain` ones are never re-sent.
-pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkRequestState)>> {
+fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkRequestState)>> {
     let _writer = writer_lock(project)?;
     let mut out = Vec::new();
     if writer_suspended(project) {
@@ -407,7 +407,7 @@ pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkR
 }
 
 /// Rolf typed a line: journal the intent first, then hand it to the writer.
-pub fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
+fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
     submit_with_answer(ctx, project, text, None)
 }
 
@@ -546,7 +546,7 @@ pub fn replay(ctx: &Ctx, slug: &str) -> Result<String> {
 // ------------------------------------------------------------ tab and tick
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SurfaceTab {
+pub(crate) struct SurfaceTab {
     pub tab_id: String,
     pub pane_id: String,
     pub created: String,
