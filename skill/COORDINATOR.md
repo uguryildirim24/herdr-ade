@@ -57,7 +57,7 @@ You do not choose; describe the work well, because that description is what pick
 
 - `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions during a spec dialogue; it does not select a model.
 - Describe hard exceptions in the task's opening `+++` TOML front matter: `product = "web-research"` when the deliverable is web research; `product = "spec"` for writing a specification; `requires_claude = true` for a Claude-only runtime requirement. A coding task that reads a web page is still coding, not web research.
-- `round advance` still starts the review. Its full brief and pinned changes go through the same picker.
+- `round advance` still starts the review. The picker and reviewer get a bounded task that names the committed review brief and every pinned commit range; large sources stay in the checkout for the reviewer to read.
 - A lane calls `ha failed "<failure and evidence>"` to ask for a stronger model. The harness keeps its worktree and replaces its attempt automatically, with no permission or settings step. A lane can climb at most three times; fixed exceptions cannot climb.
 - `thread restart` is recovery of the same model, not a model choice. Only Rolf may pin an exact task through the policy's hash-keyed `pins` map.
 
@@ -149,6 +149,7 @@ A round is a set of lanes that are reviewed and merged together (`hp round show 
 - When every lane in a round is pinned, the harness starts the review on its own; the review does not wait for runs, only for pins. A herdr hook runs `hp round advance <slug>` when a lane's agent changes state, and the ticker runs the same pass as a safety net. It runs `round review` if needed, starts the reviewer thread, and binds it. You do not start reviewers by hand. To add focus to a running reviewer, use `hp thread prompt <slug> <id>`. `hp round review` and `hp round reviewer` stay as manual recovery commands; a gone reviewer is reported, and `hp round reviewer` can replace it. After a REJECT, `hp round review <slug> <round>` makes the next revision and the next `advance` starts its reviewer. After `round merge` reports `merge_conflict`, run `round review` and then `round advance`; the repair reviewer merges the earlier candidate over the new base.
 - `hp round advance <slug>` records the verdict and next action on the round; `context` prints it directly. A MERGE verdict also gets one `say` line. It never merges.
 - `hp round merge <slug> <round>` lands the round and writes the checkpoint. Run it again after a failure to resume the recorded transaction.
+- `hp round abandon <slug> <round> --reason "<why>"` deliberately ends a round that will not merge and releases its integration branch. The reason remains in the round record; a merge transaction that has begun cannot be abandoned.
 - `hp dialogue start|critic|turn|commit` runs a spec dialogue; `hp checkpoint <slug>` writes `HANDOFF.md` and `HANDOFF.json` as one commit; `hp pickup <slug>` re-links live workers and prints start lines for gone ones.
 
 ## Never without the user asking in chat

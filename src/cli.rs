@@ -369,6 +369,13 @@ enum RoundCommand {
         round: String,
         thread: String,
     },
+    /// End a round that will not be merged and release its integration branch
+    Abandon {
+        slug: String,
+        round: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Manual repair only: commit the review brief B, freeze the manifest,
     /// create the review branch. `round advance` does this on its own.
     Review { slug: String, round: String },
@@ -657,6 +664,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     "{thread} removed from {id}; manifest revision {}",
                     r.manifest.revision
                 );
+                Ok(())
+            }
+            RoundCommand::Abandon {
+                slug,
+                round: id,
+                reason,
+            } => {
+                round::abandon(ctx, &slug, &id, &reason)?;
+                println!("abandoned {id}: {reason}");
                 Ok(())
             }
             RoundCommand::Review { slug, round: id } => {
