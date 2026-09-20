@@ -463,8 +463,7 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
     let mut changed = false;
     let mut bump = false;
     for member in &mut record.manifest.members {
-        let attempt = thread_attempt(project, &member.thread)?;
-        let pin = done_pin(events, &record.round, &member.thread, attempt);
+        let pin = member_pin(project, &record.round, &member.thread, events)?;
         if member.pin != pin {
             if member.pin.is_some() {
                 bump = true;
@@ -477,6 +476,65 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
         record.manifest.revision += 1;
     }
     Ok(changed)
+}
+
+/// The completion pin the current attempt of `thread` projects into `round`,
+/// read from sealed events. The read-only twin of `refresh_pins` for one
+/// member, so a decision can see the pin before anything is written.
+fn member_pin(
+    project: &Project,
+    round: &str,
+    thread: &str,
+    events: &[Event],
+) -> Result<Option<CompletionPin>> {
+    let attempt = thread_attempt(project, thread)?;
+    Ok(done_pin(events, round, thread, attempt))
+}
+
+/// True when `sha` is already reachable from the integration branch `branch`.
+/// A branch that does not exist yet contains nothing.
+fn landed(git: &Git, branch: &str, sha: &str) -> Result<bool> {
+    if git.branch_head(branch)?.is_none() {
+        return Ok(false);
+    }
+    git.is_ancestor(sha, branch)
+}
+
+/// The refusal when the sha a lane would pin already landed on the round's
+/// integration branch. A lane that can still seal a newer done says so; a
+/// resolved lane has nothing new.
+fn already_landed_error(thread: &thread::Thread, sha: &str, branch: &str) -> anyhow::Error {
+    let id = &thread.id;
+    if thread.status == thread::Status::Resolved {
+        anyhow::anyhow!(
+            "lane_already_landed: `{id}` would pin sha `{sha}`, which is already on `{branch}`; the lane has no newer done event, so there is nothing new to admit"
+        )
+    } else {
+        anyhow::anyhow!(
+            "lane_already_landed: `{id}` would pin sha `{sha}`, which is already on `{branch}`; the lane's newer done event has not arrived yet, so admit it again after that done lands"
+        )
+    }
+}
+
+/// True when every member of `record` pins a sha that already landed on the
+/// round's integration branch: there is nothing left to review.
+fn members_all_landed(ctx: &Ctx, record: &RoundRecord) -> Result<bool> {
+    if record.manifest.members.is_empty() || record.repo.is_empty() {
+        return Ok(false);
+    }
+    let git = Git::new(ctx.runner, &record.repo);
+    if git.branch_head(&record.branch)?.is_none() {
+        return Ok(false);
+    }
+    for member in &record.manifest.members {
+        let Some(pin) = &member.pin else {
+            return Ok(false);
+        };
+        if !git.is_ancestor(&pin.sha, &record.branch)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The hash over the member set, revision, pinned events and policy that the
@@ -649,7 +707,24 @@ fn stamp_workspace(ctx: &Ctx, project: &Project, record: &RoundRecord) {
 
 pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
-    let _ = thread::load(&project, thread_id)?;
+    let lane = thread::load(&project, thread_id)?;
+    let record = load(&project, round)?;
+    if let Some(merge) = read_merge(&project, round)?
+        && merge.phase == MergePhase::Checkpointed
+    {
+        bail!("round_closed: `{round}` is merged and checkpointed");
+    }
+    // Refuse a pin that already landed before any record changes, and never
+    // run git under the project lock (D4).
+    if !record.repo.is_empty() {
+        let events = sealed_events(&project)?;
+        if let Some(pin) = member_pin(&project, round, thread_id, &events)? {
+            let git = Git::new(ctx.runner, &record.repo);
+            if landed(&git, &record.branch, &pin.sha)? {
+                return Err(already_landed_error(&lane, &pin.sha, &record.branch));
+            }
+        }
+    }
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
@@ -787,6 +862,11 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             let ready = !record.manifest.members.is_empty()
                 && record.manifest.members.iter().all(|m| m.pin.is_some());
             if !ready {
+                continue;
+            }
+            // Every pin already landed: there is nothing new to review, so
+            // never start a reviewer for this round (t-0070).
+            if members_all_landed(ctx, &record)? {
                 continue;
             }
             let current_hash = manifest_hash(&record);
@@ -2649,6 +2729,40 @@ mod tests {
     }
 
     #[test]
+    fn admit_refuses_a_pin_that_already_landed() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        // The lane's work is already on the integration branch.
+        git(&fx.repo, &["merge", "-q", "--ff-only", "lane/1"]);
+        assert_eq!(main_head(&fx), sha);
+        let e = err(admit(&ctx, "demo", "r1", &id));
+        assert!(e.starts_with("lane_already_landed"), "{e}");
+        assert!(e.contains(&sha) && e.contains("main"), "{e}");
+        assert!(e.contains("newer done event has not arrived yet"), "{e}");
+        // The refusal changed nothing.
+        assert!(load(&fx.project, "r1").unwrap().manifest.members.is_empty());
+    }
+
+    #[test]
+    fn admit_names_a_lane_that_has_nothing_new() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        thread::update(&fx.project, &id, |t| t.status = thread::Status::Resolved).unwrap();
+        git(&fx.repo, &["merge", "-q", "--ff-only", "lane/1"]);
+        let e = err(admit(&ctx, "demo", "r1", &id));
+        assert!(e.starts_with("lane_already_landed"), "{e}");
+        assert!(e.contains(&sha) && e.contains("main"), "{e}");
+        assert!(e.contains("no newer done event"), "{e}");
+        assert!(!e.contains("has not arrived yet"), "{e}");
+    }
+
+    #[test]
     fn review_commits_b_before_the_review_worktree_and_pastes_pinned_reports() {
         let fx = fixture();
         let (lanes, b) = reviewed(&fx);
@@ -3207,6 +3321,32 @@ mod tests {
             .filter(|t| t.role == "reviewer")
             .count();
         assert_eq!(reviewers, 1, "one reviewer per round, ever");
+    }
+
+    /// A round whose every pinned lane already landed never starts a
+    /// reviewer: there is nothing new to review.
+    #[test]
+    fn advance_starts_no_reviewer_when_every_pin_landed() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        git(&fx.repo, &["merge", "-q", "--ff-only", "lane/1"]);
+        assert_eq!(main_head(&fx), sha);
+
+        advance(&ctx, "demo").unwrap();
+
+        let record = load(&fx.project, "r1").unwrap();
+        assert!(record.reviewer.is_none(), "{record:?}");
+        assert!(record.review_branch.is_none(), "{record:?}");
+        let reviewers = thread::list(&fx.project)
+            .into_iter()
+            .filter(|t| t.role == "reviewer")
+            .count();
+        assert_eq!(reviewers, 0, "no reviewer for landed work");
     }
 
     /// A MERGE verdict is announced once: one inbox item and one `say` line.
