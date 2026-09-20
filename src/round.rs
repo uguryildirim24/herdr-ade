@@ -935,8 +935,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             (Some(branch), true) => branch,
             _ => review(ctx, slug, &round)?.review_branch,
         };
+        crate::ledger::retry_after_failure(&project, "reviewer-start-failed", &round);
         match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
             Ok(thread) => {
+                crate::ledger::recovered(&project, "reviewer-start-failed", &round);
                 bind_reviewer(ctx, slug, &round, &thread.id)?;
             }
             Err(error) => {
@@ -1266,12 +1268,7 @@ fn reviewer_start_failed(
             t.error = reason.to_string();
         });
     }
-    // ---- A3 failure ledger seam -----------------------------------------
-    // This is the single place the harness notices a review that did not
-    // start. Record it here when `src/ledger.rs` lands:
-    //     crate::ledger::record(project, "reviewer-start", round, reason);
-    // Until then the report is the announcement below and this `eprintln`.
-    // ---------------------------------------------------------------------
+    crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
     announce_once(
         ctx,
