@@ -542,6 +542,13 @@ enum PlanStepCommand {
 
 #[derive(Subcommand)]
 enum DecideCommand {
+    /// Overturn a decision, keeping its history
+    Overturn {
+        id: String,
+        reason: String,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
     /// List the current choices, newest first
     List {
         #[arg(long)]
@@ -561,6 +568,13 @@ enum DecideCommand {
 
 #[derive(Subcommand)]
 enum AskCommand {
+    /// Withdraw an open question, keeping its history
+    Withdraw {
+        id: String,
+        reason: String,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
     /// Answer an ask by id and revision
     Answer {
         id: String,
@@ -812,6 +826,20 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             reask,
             project,
         } => match command {
+            Some(AskCommand::Withdraw {
+                id,
+                reason,
+                project,
+            }) => {
+                let slug = slug_of(project)?;
+                let by = ctx
+                    .env
+                    .var("USER")
+                    .context("USER is required to record who withdrew the ask")?;
+                ask::withdraw(ctx, &slug, &id, &reason, by)?;
+                println!("{id} withdrawn: {reason}");
+                Ok(())
+            }
             Some(AskCommand::Answer {
                 id,
                 revision,
@@ -838,8 +866,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         reask,
                     },
                 )?;
-                println!("ask {} revision {}", a.id, a.revision);
-                print!("{}", ask::numbered(&a));
+                println!(
+                    "{} revision {}: {}",
+                    a.id,
+                    a.revision,
+                    ask::numbered(&a)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
                 Ok(())
             }
         },
@@ -957,6 +992,20 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             request,
             project,
         } => match command {
+            Some(DecideCommand::Overturn {
+                id,
+                reason,
+                project,
+            }) => {
+                let slug = slug_of(project)?;
+                let by = ctx
+                    .env
+                    .var("USER")
+                    .context("USER is required to record who overturned the decision")?;
+                let record = decide::overturn(ctx, &slug, &id, &reason, by)?;
+                println!("{}", decide::status_line(&record));
+                Ok(())
+            }
             Some(DecideCommand::List { json, project }) => {
                 let slug = slug_of(project)?;
                 print!("{}", decide::list(ctx, &slug, json)?);
