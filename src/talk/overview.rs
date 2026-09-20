@@ -1,6 +1,6 @@
 //! Read-only projection of the existing project records. Step state comes
 //! from plan::project_states, the very same projection used by plan sync.
-use super::{Entry, Journal, view::Conversation};
+use super::{Entry, Journal, cost::Cost, stale::Stale, tasks, view::Conversation};
 use crate::{
     contracts::StepState,
     decide, glossary,
@@ -41,6 +41,13 @@ pub const DECISIONS_ERROR: &str = "I could not read the choices.";
 pub const NO_DECISIONS: &str = "No choices have been recorded yet.";
 pub const CHANGE: &str = "Tell me what to change in the chat.";
 pub const ASK_WARNING: &str = "More than three questions are waiting here.";
+pub const STALE_HEADING: &str = "Stale";
+pub const COST_HEADING: &str = "Cost";
+pub const TASKS_HEADING: &str = "Tasks";
+pub const NO_COST: &str = "No cost has been recorded yet.";
+pub const COST_ERROR: &str = "I could not read the cost.";
+pub const NO_TASKS: &str = "No tasks are on the list.";
+pub const TASKS_ERROR: &str = "I could not read the task list.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tone {
@@ -86,6 +93,21 @@ pub struct Overview {
     pub active: usize,
     pub needs: usize,
     pub name: String,
+    /// LEAN U4: only items that are behind; empty when nothing is stale.
+    pub stale: Vec<Row>,
+    /// LEAN U1: today's total and the current round, already rendered.
+    pub cost: Vec<Row>,
+    /// LEAN U5: Rolf's lists, each with its heading and one line per task.
+    pub tasks: Vec<Row>,
+}
+
+/// One workflow word for a thread group, the same words Running now uses.
+fn state_word(group: Group) -> &'static str {
+    match group {
+        Group::WaitingOnYou => "needs you",
+        Group::ReadyForReview | Group::Landing => "checking",
+        _ => "working",
+    }
 }
 
 /// One shared poll for all local rows and the coordinator. Remote records
@@ -96,9 +118,19 @@ pub struct Live {
     pub panes: Vec<Pane>,
     pub reachable: bool,
     pub state: String,
+    /// LEAN U4 and U1, refreshed on a slower cadence than the live poll.
+    pub stale: Stale,
+    pub cost: Cost,
     groups: BTreeMap<String, Group>,
 }
 impl Live {
+    /// The slower scan: staleness and cost read files and, for the box server,
+    /// one SSH call. Separate from the three-second live poll.
+    pub fn refresh_slow(&mut self, ctx: &Ctx, project: &Project) {
+        self.stale = super::stale::scan(ctx, project);
+        self.cost = super::cost::load(ctx, project);
+    }
+
     pub fn poll(&mut self, ctx: &Ctx, project: &Project) {
         if let Some(view) = threads::session_view(ctx, project) {
             self.agents = view.agents;
@@ -287,6 +319,17 @@ impl Overview {
         }
         let (mut tasks, failed) = records::<thread::Thread>(&project.dir().join("threads"));
         tasks.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
+        let known: BTreeMap<String, Group> = tasks
+            .iter()
+            .map(|t| {
+                let group = if t.status == Status::Resolved {
+                    Group::ReadyForReview
+                } else {
+                    live.group(t)
+                };
+                (t.id.clone(), group)
+            })
+            .collect();
         let (rounds, rounds_failed) =
             records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));
         for t in tasks {
@@ -432,8 +475,91 @@ impl Overview {
                 rows.push(Row::text(EMPTY[i]));
             }
         }
+        out.stale = live
+            .stale
+            .items
+            .iter()
+            .map(|item| Row {
+                text: format!("{} {}", item.what, item.remedy),
+                prefix: String::new(),
+                marker: String::new(),
+                tone: Tone::Red,
+            })
+            .collect();
+        out.cost = cost_rows(&live.cost);
+        out.tasks = task_rows(project, &known);
         out
     }
+}
+
+/// One line per task, a heading per list, and the thread state for a
+/// delegated task (LEAN U5).
+fn task_rows(project: &Project, known: &BTreeMap<String, Group>) -> Vec<Row> {
+    let (lists, failed) = tasks::load(project);
+    let mut rows = Vec::new();
+    if failed {
+        rows.push(Row::text(TASKS_ERROR));
+    }
+    for list in &lists {
+        if list.tasks.is_empty() {
+            continue;
+        }
+        rows.push(Row {
+            text: list.heading.clone(),
+            prefix: String::new(),
+            marker: String::new(),
+            tone: Tone::Heading,
+        });
+        for task in &list.tasks {
+            let marker = task
+                .thread
+                .as_ref()
+                .and_then(|id| known.get(id))
+                .map(|group| state_word(*group))
+                .unwrap_or("");
+            rows.push(tagged_with_marker(
+                project,
+                &task.owner,
+                &task.title,
+                marker,
+                Tone::Text,
+                TASK_INVALID,
+            ));
+        }
+    }
+    if rows.is_empty() && !failed {
+        rows.push(Row::text(NO_TASKS));
+    }
+    rows
+}
+
+/// Today's total and the current round (LEAN U1). Numeric facts are drawn
+/// verbatim; they are not prose and carry no names.
+fn cost_rows(cost: &Cost) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if cost.failed {
+        rows.push(Row::text(COST_ERROR));
+    }
+    if !cost.today.is_empty() {
+        rows.push(Row {
+            prefix: "today".into(),
+            text: super::cost::format_totals(&cost.today),
+            marker: String::new(),
+            tone: Tone::Text,
+        });
+    }
+    if let Some((round, totals)) = &cost.round {
+        rows.push(Row {
+            prefix: format!("round {round}"),
+            text: super::cost::format_totals(totals),
+            marker: String::new(),
+            tone: Tone::Text,
+        });
+    }
+    if rows.is_empty() && !cost.failed {
+        rows.push(Row::text(NO_COST));
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -675,5 +801,82 @@ mod tests {
         }
         assert_eq!(before, std::fs::read(plan::plan_path(&fx.project)).unwrap());
         assert_eq!(o.sections[4][0].text, EMPTY[4]);
+    }
+
+    #[test]
+    fn the_task_list_shows_lists_owners_and_a_delegated_thread_state() {
+        let fx = fixture();
+        let lane = fx.thread("Work");
+        thread::update(&fx.project, &lane, |t| {
+            t.plain = "Build the screen.".into();
+            t.last_group = "ready-for-review".into();
+        })
+        .unwrap();
+        std::fs::write(
+            fx.project.dir().join("TASKS.md"),
+            format!(
+                "# Tasks\n\n## Backlog\n- [ ] Write the screen (agent → {lane})\n- [ ] Ask Rolf (me)\n"
+            ),
+        )
+        .unwrap();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        assert!(
+            o.tasks
+                .iter()
+                .any(|r| r.tone == Tone::Heading && r.text == "Backlog")
+        );
+        assert!(
+            o.tasks.iter().any(|r| {
+                r.prefix == "agent" && r.text == "Write the screen" && r.marker == "checking"
+            }),
+            "{:?}",
+            o.tasks
+        );
+        assert!(
+            o.tasks
+                .iter()
+                .any(|r| r.prefix == "me" && r.text == "Ask Rolf")
+        );
+    }
+
+    #[test]
+    fn the_cost_section_shows_todays_pi_usage() {
+        let fx = fixture();
+        let (lane, _) = fx.lane(1);
+        let ctx = fx.world.ctx();
+        let now: jiff::Timestamp = crate::project::now().parse().unwrap();
+        let record = thread::load(&fx.project, &lane).unwrap();
+        let dir = ctx
+            .root
+            .join("pi/agent/sessions")
+            .join(crate::talk::cost::session_dir_name(&record.worktree_path));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("s.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{now}\",\"message\":{{\"usage\":{{\"totalTokens\":1200,\"cost\":{{\"total\":0.75}}}}}}}}"
+            ),
+        )
+        .unwrap();
+        let mut live = Live::default();
+        live.refresh_slow(&ctx, &fx.project);
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &live,
+        );
+        let row = o
+            .cost
+            .iter()
+            .find(|r| r.prefix == "today")
+            .expect("a today row");
+        assert!(row.text.contains("1.2k tokens"), "{:?}", row.text);
+        assert!(row.text.contains("$0.75"), "{:?}", row.text);
     }
 }
