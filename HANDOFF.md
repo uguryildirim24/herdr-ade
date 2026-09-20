@@ -14,9 +14,9 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-19T22:38:18-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-19T22:44:28-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
-Workspace `w1G` (Adeherdr), 3 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
+Workspace `w1G` (Adeherdr), 4 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
 
 Coordinator session id `936438b4-6acf-4417-9513-2bb938fe60e0`.
 
@@ -26,12 +26,14 @@ The coordinator has no agent name, so workers cannot `herdr agent prompt` it. Na
 
 | name | kind | status | pane | tab (label) | cwd | tokens | last title |
 |---|---|---|---|---|---|---|---|
-| hp-adeherdr-t-0084 | pi | done | `w1G:p2S` | `w1G:t2N` (t-0084) | `/home/agent/projects/herdr-ade/.worktrees/t-0084` | done=1 lane=t-0084 project=adeherdr rank=3 review=working thread=t-0084 | π - t-0084 |
+| hp-adeherdr-t-0090 | pi | working | `w1G:p2W` | `w1G:t2R` (t-0090) | `/home/agent/projects/herdr-ade/.worktrees/t-0090` | project=adeherdr rank=3 review=working thread=t-0090 | π - t-0090 |
+| hp-adeherdr-t-0091 | pi | done | `w1G:p2X` | `w1G:t2S` (t-0091) | `/home/agent/projects/herdr-ade/.worktrees/t-0091` | done=1 lane=t-0091 project=adeherdr rank=3 review=working thread=t-0091 | π - t-0091 |
 
 Start lines as they run now (from `pane process-info`), for restarting a worker that is gone:
 
 ```bash
-herdr agent start hp-adeherdr-t-0084 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0090 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0091 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
 ```
 
 Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (working), `w1J` Venator (idle), `w1K` Elicio (idle)
@@ -42,7 +44,7 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (8 ahead, 0 beh
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/home/agent/projects/herdr-ade` | `main` | 34bc292 | 0 | Merge commit '77678782f8b6df81a9582e8402bb9d38667b25f5' |
+| `/home/agent/projects/herdr-ade` | `main` | 51b756a | 0 | docs(review): round r39 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -70,6 +72,8 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (8 ahead, 0 beh
 | `/home/agent/projects/herdr-ade/.worktrees/review-r35` | `review/r35` | 15960a3 | 0 | docs(tasks): t-0084 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r36` | `review/r36` | 41a4d7b | 0 | docs(tasks): t-0087 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r37` | `review/r37` | af39a21 | 0 | docs(tasks): t-0088 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r38` | `review/r38` | 66f96e4 | 0 | docs(tasks): t-0090 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r39` | `review/r39` | 1f8d2f9 | 0 | docs(tasks): t-0091 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r4` | `review/r4` | 689e079 | 0 | docs(tasks): t-0011 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r5` | `review/r5` | 008f9ac | 0 | docs(tasks): t-0012 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r6` | `review/r6` | 910649d | 0 | docs(tasks): t-0014 |
@@ -133,23 +137,25 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (8 ahead, 0 beh
 | `/home/agent/projects/herdr-ade/.worktrees/t-0084` | `hp/adeherdr/t-0084-review-r35-this-round-checks-the-cost-th` | 7767878 | 0 | docs(review): round r35 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0087` | `hp/adeherdr/t-0087-review-r36-this-round-checks-that-a-chec` | fdbdfdd | 0 | docs(review): round r36 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0088` | `hp/adeherdr/t-0088-review-r37-this-round-checks-four-small` | dc942f3 | 0 | docs(review): round r37 verdict |
+| `/home/agent/projects/herdr-ade/.worktrees/t-0090` | `hp/adeherdr/t-0090-review-r38-this-round-checks-the-record` | 971af5a | 4 | Merge commit 'be9f28ae17f7af58c148cff3d2e318d849c063ca' into hp/adeherdr/t-0090-review-r38-this-round-checks-the-record |
+| `/home/agent/projects/herdr-ade/.worktrees/t-0091` | `hp/adeherdr/t-0091-review-r39-this-round-checks-the-box-rea` | 51b756a | 0 | docs(review): round r39 verdict |
 
 Last commits on the integration branch:
 
 ```
-34bc292 Merge commit '77678782f8b6df81a9582e8402bb9d38667b25f5'
-7767878 docs(review): round r35 verdict
-7d32a0b review(talk): finish measured totals and probes
-8f79ee3 docs(tasks): t-0089
-b8d836a review(talk): measure missing cost and stale processes
-4b98fed checkpoint(r37): HANDOFF after merging the round
+51b756a docs(review): round r39 verdict
+7bf9881 review(harness): require the running image fingerprint
+3cc0beb review(remote): quote mismatch URLs as data
+d9ee69c Merge commit '8294435cd6288517e5f62900682e93a35a1f5d9b' into hp/adeherdr/t-0091-review-r39-this-round-checks-the-box-rea
+1f8d2f9 docs(tasks): t-0091
+02c3759 review(r39): brief for revision 1
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0084.md`, `tasks/t-0089.md`, `tasks/t-0088.md`, `tasks/t-0087.md`, `tasks/review-r37.md`, `tasks/review-r36.md`, `tasks/t-0086.md`, `tasks/review-r35.md`, `tasks/t-0083.md`, `tasks/t-0082.md`, `tasks/t-0081.md`, `tasks/t-0080.md`
-- verdicts: `tasks/reviews/code-r35.md`, `tasks/reviews/code-r37.md`, `tasks/reviews/code-r36.md`, `tasks/reviews/code-r34.md`, `tasks/reviews/code-r32.md`, `tasks/reviews/code-r33.md`, `tasks/reviews/code-r30.md`, `tasks/reviews/code-r29.md`, `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`, `tasks/reviews/code-r24.md`
+- briefs: `tasks/t-0091.md`, `tasks/review-r39.md`, `tasks/review-r38.md`, `tasks/t-0084.md`, `tasks/t-0089.md`, `tasks/t-0088.md`, `tasks/t-0087.md`, `tasks/review-r37.md`, `tasks/review-r36.md`, `tasks/t-0086.md`, `tasks/review-r35.md`, `tasks/t-0083.md`
+- verdicts: `tasks/reviews/code-r39.md`, `tasks/reviews/code-r35.md`, `tasks/reviews/code-r37.md`, `tasks/reviews/code-r36.md`, `tasks/reviews/code-r34.md`, `tasks/reviews/code-r32.md`, `tasks/reviews/code-r33.md`, `tasks/reviews/code-r30.md`, `tasks/reviews/code-r29.md`, `tasks/reviews/code-r28.md`, `tasks/reviews/code-r25.md`, `tasks/reviews/code-r26.md`
 
 ### Pickup
 
@@ -161,5 +167,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /home/agent/.herdr-ade/adeherdr && claude --resume 936438b4-6acf-4417-9513-2bb938fe60e0
 ```
 
-Round `r35` was merged into `main` at verdict commit `77678782f8b6df81a9582e8402bb9d38667b25f5`; this checkpoint is its child.
+Round `r39` was merged into `main` at verdict commit `51b756ae1fd8b95a138a5090fa515471640f2e6d`; this checkpoint is its child.
 
