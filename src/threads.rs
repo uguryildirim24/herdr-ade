@@ -1227,9 +1227,9 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
         .on_machine(record.machine_route())
         .agent_prompt(&record.pane_id, text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // A pi lane reports `blocked` for its own error; a prompt resumes it, so
-    // the recorded error is cleared.
-    if record.agent == "pi" && state == "blocked" {
+    // A pi lane reports `blocked` for its own recorded error; a prompt
+    // resumes it, so that error is cleared.
+    if record.agent == "pi" && state == "blocked" && !record.error.is_empty() {
         thread::update(&project, id, |t| t.error.clear())?;
     }
     Ok(state)
@@ -1242,7 +1242,7 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread restart`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" if record.agent != "pi" => bail!(
+        "blocked" if record.agent != "pi" || record.error.is_empty() => bail!(
             "agent_blocked: {} is waiting on the user in its pane ({})",
             record.id,
             record.pane_id
