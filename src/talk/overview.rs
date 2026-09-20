@@ -14,21 +14,23 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const HEADINGS: [&str; 6] = [
+pub const HEADINGS: [&str; 7] = [
     "Goal",
     "What you get at the end",
     "How far along",
     "Running now",
     "Finished lately",
     "Needs you",
+    "Failures",
 ];
-pub const EMPTY: [&str; 6] = [
+pub const EMPTY: [&str; 7] = [
     "Your goal is not written down yet.",
     "The end result is not written down yet.",
     "The steps are not written down yet.",
     "Nothing is running now.",
     "Nothing has landed yet.",
     "No question is waiting here.",
+    "No new or repeated failure is open.",
 ];
 pub const GOAL_INVALID: &str = "Your goal needs a plain sentence.";
 pub const TASK_INVALID: &str = "This task needs a plain description.";
@@ -88,7 +90,7 @@ impl Row {
 }
 #[derive(Default)]
 pub struct Overview {
-    pub sections: [Vec<Row>; 6],
+    pub sections: [Vec<Row>; 7],
     pub progress: Option<(usize, usize)>,
     pub active: usize,
     pub needs: usize,
@@ -470,6 +472,29 @@ impl Overview {
             out.sections[5].push(Row::text(DECISIONS_ERROR));
         }
         out.sections[5].push(Row::text(CHANGE));
+        match crate::ledger::recent(project) {
+            Ok(entries) => {
+                for entry in entries {
+                    // Keep raw error output in `ledger show`, not on Rolf's screen.
+                    let what = match entry.kind.as_str() {
+                        "reviewer-start-failed" => "The work check could not start",
+                        "launch-not-attempted" => "A helper stopped before it could start",
+                        "merge-refused" => "The checked work could not land",
+                        "thread-error" | "thread-state" => "A helper needs help",
+                        "courier-failed" => "The box could not send its work home",
+                        "retry" => "The harness had to try again",
+                        _ => "A command failed",
+                    };
+                    out.sections[6].push(Row {
+                        text: format!("{what} ({} times).", entry.count),
+                        prefix: String::new(),
+                        marker: entry.id,
+                        tone: Tone::Yellow,
+                    });
+                }
+            }
+            Err(_) => out.sections[6].push(Row::text("I could not read the failures.")),
+        }
         for (i, rows) in out.sections.iter_mut().enumerate() {
             if rows.is_empty() {
                 rows.push(Row::text(EMPTY[i]));
@@ -566,6 +591,45 @@ fn cost_rows(cost: &Cost) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::round::testkit::fixture;
+    #[test]
+    fn failures_use_the_digest_selection_and_keep_raw_errors_off_the_screen() {
+        let fx = fixture();
+        for n in 0..8 {
+            crate::ledger::record(
+                &fx.project,
+                "reviewer-start-failed",
+                &format!("r{n}"),
+                "private raw error\nsecond line",
+            )
+            .unwrap();
+        }
+        crate::ledger::record(
+            &fx.project,
+            "reviewer-start-failed",
+            "r0",
+            "private raw error\nsecond line",
+        )
+        .unwrap();
+        let overview = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        let rows = &overview.sections[6];
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].text.contains("2 times"));
+        assert_eq!(
+            rows[0].marker,
+            crate::ledger::recent(&fx.project).unwrap()[0].id
+        );
+        assert!(
+            rows.iter()
+                .all(|r| !r.text.contains('\n') && !r.text.contains("private raw"))
+        );
+        assert!(rows.iter().all(|r| checked(&fx.project, &r.text)));
+    }
+
     #[test]
     fn one_fake_poll_supplies_all_local_rows_and_outage_keeps_last_state() {
         let fx = fixture();
