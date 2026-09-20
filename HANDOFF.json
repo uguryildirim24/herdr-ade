@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0113.md",
+      "tasks/review-r52.md",
       "tasks/t-0111.md",
       "tasks/t-0112.md",
       "tasks/review-r51.md",
@@ -20,15 +22,14 @@
       "tasks/t-0108.md",
       "tasks/t-0107.md",
       "tasks/review-r49.md",
-      "tasks/t-0106.md",
-      "tasks/t-0105.md",
-      "tasks/t-0104.md"
+      "tasks/t-0106.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r52.md",
       "tasks/reviews/code-r51.md",
       "tasks/reviews/code-r50.md",
       "tasks/reviews/code-r49.md",
@@ -39,14 +40,15 @@
       "tasks/reviews/code-r43.md",
       "tasks/reviews/code-r42.md",
       "tasks/reviews/code-r41.md",
-      "tasks/reviews/code-r38.md",
-      "tasks/reviews/code-r39.md"
+      "tasks/reviews/code-r38.md"
     ]
   },
-  "generated": "2026-09-20T06:56:25-04:00",
+  "generated": "2026-09-20T07:58:01-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0113-review-r52-this-round-checks-that-work-g",
       "main",
+      "review/r52",
       "hp/adeherdr/t-0112-d12-a-lane-goes-to-a-machine-that-can-ac",
       "hp/adeherdr/t-0111-review-r51-this-round-checks-that-the-he",
       "review/r51",
@@ -189,22 +191,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "3c0afaf Merge commit '837f62a4d9b15360eaa77192a86a50188a8d6669'",
-      "837f62a docs(review): round r51 verdict",
-      "ba29a02 Merge commit '7b5974dfeb5a50dff674f6c3f6bdcb35f0f4b4cc' into hp/adeherdr/t-0111-review-r51-this-round-checks-that-the-he",
-      "7507186 docs(tasks): t-0112",
-      "7a5d5f6 docs(tasks): t-0111",
-      "bc79893 review(r51): brief for revision 1"
+      "594793f docs(review): round r52 verdict",
+      "e749017 Merge commit '657256fee7ba3931856c43ecab4f75b5fefc7c6a' into hp/adeherdr/t-0113-review-r52-this-round-checks-that-work-g",
+      "a485e93 docs(tasks): t-0113",
+      "cf632d0 review(r52): brief for revision 1",
+      "dbe088e checkpoint(r51): HANDOFF after merging the round",
+      "3c0afaf Merge commit '837f62a4d9b15360eaa77192a86a50188a8d6669'"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "5 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "3c0afaf",
+        "head": "594793f",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit '837f62a4d9b15360eaa77192a86a50188a8d6669'"
+        "subject": "docs(review): round r52 verdict"
       },
       {
         "branch": "review/r1",
@@ -499,6 +501,13 @@
         "head": "7a5d5f6",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r51",
         "subject": "docs(tasks): t-0111"
+      },
+      {
+        "branch": "review/r52",
+        "dirty": 0,
+        "head": "a485e93",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r52",
+        "subject": "docs(tasks): t-0113"
       },
       {
         "branch": "review/r6",
@@ -999,8 +1008,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r51",
-    "verdict": "837f62a4d9b15360eaa77192a86a50188a8d6669"
+    "round": "r52",
+    "verdict": "594793f95d30ad6b1e8c34572b68afaf9a9cef18"
   },
   "session": "default",
   "unlinked_agents": [],
