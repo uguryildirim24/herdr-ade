@@ -61,6 +61,9 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 pub fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
     for event in crate::events::list(project) {
+        if event.payload.failed.is_some() {
+            continue;
+        }
         // A resolved lane is finished: its delivery journal is never replayed.
         if thread::load(project, &event.thread).is_ok_and(|lane| lane.status == Status::Resolved) {
             continue;
@@ -1477,6 +1480,7 @@ mod tests {
                     artifact: "def".into(),
                 }),
                 waiting: None,
+                failed: None,
             },
         };
         crate::events::seal_create_if_absent(project, &event).unwrap();
@@ -1814,6 +1818,7 @@ mod tests {
                     artifact: artifact.into(),
                 }),
                 waiting: None,
+                failed: None,
             },
         };
         events::bytes(&event).unwrap()

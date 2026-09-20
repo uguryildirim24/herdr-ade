@@ -112,10 +112,8 @@ pub struct StartArgs {
     pub task: String,
     /// The birth sentence (SPEC-ADE D17 item 6).
     pub plain: String,
-    /// A roles-table row; `lane` when empty (SPEC-ADE D2).
-    pub role: Option<String>,
-    /// `--recipe <id>`: pins one allowed recipe.
-    pub recipe: Option<String>,
+    /// Internal flow/skill label; never a coordinator model-selection input.
+    pub workflow: Option<String>,
 }
 
 /// Birth sentence: required, one sentence, R1–R5 except the known-word rule
@@ -206,30 +204,10 @@ fn start_with_ticker(
         );
     }
     let role = args
-        .role
+        .workflow
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("lane");
-    // The roles table resolves and validates the launch before any tab or
-    // worktree exists (SPEC-ADE D2, item 48).
-    let project_pin = settings
-        .roles
-        .get(role)
-        .map(|over| crate::contracts::Recipe {
-            kind: over.kind.clone().unwrap_or_default(),
-            args: over.args.clone().unwrap_or_default(),
-            ..crate::contracts::Recipe::default()
-        });
-    let launch = crate::launch::resolve_launch(
-        ctx,
-        &crate::launch::ResolveInput {
-            role,
-            recipe: args.recipe.as_deref(),
-            project_pin,
-            sibling: None,
-        },
-    )?;
-
     // A box lane still commits and pushes from the Mac clone, so every
     // explicit repository is a local path and follows the same allowlist,
     // local and box lanes alike (SPEC-remote §4.2).
@@ -248,6 +226,20 @@ fn start_with_ticker(
             path
         }
     };
+    let launch = crate::launch::resolve_launch(
+        ctx,
+        &project,
+        &crate::launch::ResolveInput {
+            task: &args.task,
+            workflow: role,
+            state: crate::launch::repository_state(
+                ctx,
+                args.repo.as_deref(),
+                args.base.as_deref(),
+            )?,
+            ..Default::default()
+        },
+    )?;
     // The machine is resolved before any tab or worktree exists (SPEC-remote
     // §4.1, d-0005). `--machine` wins and never falls back; a default box
     // start whose box cannot be used falls back to this Mac.
@@ -331,7 +323,7 @@ struct Placement {
 }
 
 /// The default machine of a start without `--machine` (SPEC-remote §4.1,
-/// d-0005): a lane or reviewer whose role row names a machine, on a
+/// d-0005): lane/review work with a dispatch machine, on a
 /// repository that has a box clone, runs on that box. Every other start
 /// stays on this Mac.
 fn default_machine(
@@ -568,7 +560,9 @@ fn place_box_worktree(
     // commits it (D9). The brief is never rewritten.
     let reusable = restart && !record.base.is_empty() && !record.launch.brief_hash.is_empty();
     let (base, brief_hash) = if reusable {
-        push_branch(runner, &record.repo, &publish_url, &branch, &record.base)?;
+        if record.failure_event.is_empty() {
+            push_branch(runner, &record.repo, &publish_url, &branch, &record.base)?;
+        }
         (record.base.clone(), record.launch.brief_hash.clone())
     } else {
         let task =
@@ -616,17 +610,19 @@ fn place_box_worktree(
     // step 3).
     let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
 
-    remote::provision(
-        runner,
-        &target,
-        &remote::Provision {
-            box_repo: &box_repo,
-            worktree: &box_worktree,
-            branch: &branch,
-            base: &base,
-            publish_url: &publish_url,
-        },
-    )?;
+    if record.failure_event.is_empty() {
+        remote::provision(
+            runner,
+            &target,
+            &remote::Provision {
+                box_repo: &box_repo,
+                worktree: &box_worktree,
+                branch: &branch,
+                base: &base,
+                publish_url: &publish_url,
+            },
+        )?;
+    }
 
     // Step 4: route by the stable profile id. Reuse the recorded box workspace
     // when the box still lists it, else create it with the box clone as cwd.
@@ -1083,14 +1079,19 @@ pub fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
 
 /// Step 5: hand the thread to the ticker's launch step.
 fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<Thread> {
-    let thread = thread::update(project, id, |t| {
+    let thread = thread::update_checked(project, id, |t| {
+        if t.status == Status::Resolved {
+            bail!("placement_stale: thread was resolved during placement");
+        }
         t.agent_name = thread::agent_name(&project.slug, &t.id);
         t.prompt_pending = true;
         t.launch_attempts = 0;
+        t.escalation_pending = false;
         t.status = Status::Open;
         t.error.clear();
         t.last_state.clear();
         t.last_state_change = project::now();
+        Ok(())
     })?;
     report_thread_tokens(&view.herdr, &thread, &project.slug, Group::Working);
     Ok(thread)
@@ -1174,6 +1175,48 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
         herdr.agent_list().map_err(unreachable)?,
         herdr.pane_list().map_err(unreachable)?,
     ))
+}
+
+/// Resume a persisted escalation without re-picking or touching worktree files.
+pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if record.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
+        thread::update(project, &record.id, |t| {
+            t.escalation_pending = false;
+            t.error = "escalation_placement_exhausted: could not open the replacement lane".into();
+        })?;
+        bail!("escalation_placement_exhausted");
+    }
+    thread::update(project, &record.id, |t| t.launch_attempts += 1)?;
+    let view = require_session(ctx, project)?;
+    let herdr = view.herdr.on_machine(record.machine_route());
+    if !record.tab_id.is_empty() {
+        // Only this lane's failed attempt is stopped, never a coordinator.
+        let panes = herdr.pane_list()?;
+        if let Some(pane) = panes.iter().find(|p| p.pane_id == record.pane_id) {
+            if !thread::pane_matches(record, pane) {
+                bail!("escalation_identity_mismatch: old pane was reused");
+            }
+            herdr.tab_close(&record.tab_id)?;
+        }
+    }
+    if record.is_remote() {
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        box_launch_ready(ctx, &profile, &record.launch)?;
+        place_and_brief(ctx, project, &view, &record.id, true)?;
+    } else {
+        if record.launch.kind == "pi" {
+            pi_ready(ctx, &record.launch)?;
+        }
+        place_ade_tab(ctx, project, &view, record)?;
+        finish_placement(project, &view, &record.id)?;
+    }
+    thread::update(project, &record.id, |t| t.escalation_pending = false)?;
+    Ok(())
 }
 
 pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
@@ -2137,7 +2180,7 @@ mod tests {
         std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
-            "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+            "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
         )
         .unwrap();
 
@@ -2161,8 +2204,7 @@ mod tests {
                 base: None,
                 task: "Do the thing.".into(),
                 plain: "The lane does the work.".into(),
-                role: None,
-                recipe: None,
+                workflow: None,
             },
         )
         .unwrap();
@@ -2296,7 +2338,7 @@ mod tests {
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
             format!(
-                "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
+                "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
             ),
         )
         .unwrap();
@@ -2337,8 +2379,7 @@ mod tests {
             base: None,
             task: "Do the thing.".into(),
             plain: "The lane does the work.".into(),
-            role: None,
-            recipe: None,
+            workflow: None,
         };
 
         let other = world.home.path().join("other");
@@ -2379,8 +2420,7 @@ mod tests {
                 base: None,
                 task: "Do the thing.".into(),
                 plain: String::new(),
-                role: None,
-                recipe: None,
+                workflow: None,
             },
         )
         .unwrap_err()
@@ -2517,7 +2557,7 @@ mod tests {
         );
     }
 
-    const LANE_CONFIG: &str = "[roles.lane]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\nmachine = \"oci\"\n";
+    const LANE_CONFIG: &str = "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n[dispatch]\nmachine = \"oci\"\n";
 
     fn start_args(repo: Option<String>, machine: Option<String>) -> StartArgs {
         StartArgs {
@@ -2527,8 +2567,7 @@ mod tests {
             base: None,
             task: "Do the thing.".into(),
             plain: "The lane does the work.".into(),
-            role: None,
-            recipe: None,
+            workflow: None,
         }
     }
 
@@ -2575,7 +2614,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_on_a_box_repo_lands_on_the_role_row_machine() {
+    fn a_lane_on_a_box_repo_lands_on_the_dispatch_machine() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, LANE_CONFIG);
         stub_box(&fx);
@@ -2767,7 +2806,7 @@ mod tests {
         let (fx, _remote) = box_fixture();
         write_config(
             &fx,
-            "[roles.reviewer]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\nmachine = \"oci\"\n",
+            "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n",
         );
         stub_box(&fx);
         let ctx = fx.world.ctx();

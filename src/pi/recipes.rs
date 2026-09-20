@@ -1,4 +1,4 @@
-//! The `kind = "pi"` rows for the roles table (SPEC-pi v2 §3.4, §3.5).
+//! Executable `kind = "pi"` model recipes. Routing rubrics live in routing.json.
 //!
 //! One pi row replaces its native twin in exactly the list the twin was in.
 //! Cursor is not replaced: `cursor_grok_xhigh` stays native while the port
@@ -28,8 +28,6 @@ pub struct PiRecipe {
     pub ready_timeout_ms: u64,
     /// The recipe switch; disabled rows wait for Rolf.
     pub enabled: bool,
-    /// May a start-time `allowed` list carry it?
-    pub start_time_allowed: bool,
     /// The D17 `plain` phrase: a noun phrase A4's reason templates slot in
     /// ("<job> runs on <plain>"), so no product name and no full sentence.
     /// A row that replaces a native twin keeps the twin's phrase.
@@ -61,7 +59,6 @@ fn recipe(
     model: &'static str,
     thinking: &'static str,
     enabled: bool,
-    start_time_allowed: bool,
     plain: &'static str,
 ) -> PiRecipe {
     PiRecipe {
@@ -73,7 +70,6 @@ fn recipe(
         env: Vec::new(),
         ready_timeout_ms: 30_000,
         enabled,
-        start_time_allowed,
         plain,
     }
 }
@@ -87,7 +83,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "deepseek-v4.1-flash",
             "high",
             true,
-            true,
             "the cheap coding helper",
         ),
         recipe(
@@ -96,7 +91,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "gpt-5.6-sol",
             "high",
             true,
-            false,
             "the careful number helper",
         ),
         recipe(
@@ -104,7 +98,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "openai-codex",
             "gpt-6-astra",
             "xhigh",
-            false,
             false,
             "the hardest problem helper",
         ),
@@ -114,7 +107,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "muse-spark-1.3-contributor",
             "high",
             true,
-            true,
             "the second coding helper",
         ),
         recipe(
@@ -123,7 +115,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "k3",
             "high",
             true,
-            true,
             "the long task helper",
         ),
         recipe(
@@ -131,7 +122,6 @@ pub fn pi_recipes() -> Vec<PiRecipe> {
             "pro",
             "pro",
             "high",
-            true,
             true,
             "the strongest paid chat model, used as a worker",
         ),
@@ -174,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_is_disabled_and_sol_is_not_a_start_time_row() {
+    fn astra_is_disabled_and_sol_is_available_to_routing() {
         let rows = pi_recipes();
         let astra = rows
             .iter()
@@ -182,7 +172,7 @@ mod tests {
             .unwrap();
         assert!(!astra.enabled);
         let sol = rows.iter().find(|r| r.id == "pi_codex_sol_high").unwrap();
-        assert!(sol.enabled && !sol.start_time_allowed);
+        assert!(sol.enabled);
     }
 
     #[test]
@@ -214,7 +204,6 @@ mod tests {
             env: Vec::new(),
             ready_timeout_ms: 30_000,
             enabled: true,
-            start_time_allowed: false,
             plain: "x",
         };
         assert!(
