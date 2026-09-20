@@ -93,11 +93,10 @@ pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) 
 }
 
 /// Ensures a ticker is running without waiting for a running one to stop.
-/// A start (`thread start`, and through it `round advance`) must not block on
-/// replacing a ticker: the ticker's own pass calls `advance`, so a start that
-/// waited for the ticker to exit would deadlock against the ticker waiting on
-/// `advance`'s lock. A stale-version ticker is replaced by `ticker start` (the
-/// plugin's `[[startup]]` and `ha ticker start`), which may wait.
+/// `round advance` must not block while replacing a ticker: the ticker's own
+/// pass calls `advance`, so waiting here would deadlock against the ticker
+/// waiting on `advance`'s lock. Ordinary thread starts and explicit `ticker
+/// start` calls still replace a stale-version ticker.
 pub fn ensure(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
@@ -1086,8 +1085,8 @@ mod tests {
         );
     }
 
-    /// `ensure` never writes the stop file, so a start cannot deadlock waiting
-    /// for a running ticker whose own pass waits on the start.
+    /// `ensure` never writes the stop file, so `round advance` cannot deadlock
+    /// waiting for a running ticker whose own pass waits on its lock.
     #[test]
     fn ensure_leaves_a_running_ticker_alone() {
         let home = tempfile::tempdir().unwrap();
