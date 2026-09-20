@@ -98,6 +98,67 @@ fn peek_records_nothing_and_context_records_seen_items() {
 }
 
 #[test]
+fn ledger_cli_records_folds_prints_a_task_and_closes() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(
+        hp(home.path(), &["--root", root_arg, "new", "demo"])
+            .status
+            .success()
+    );
+    for _ in 0..2 {
+        assert!(
+            !hp(
+                home.path(),
+                &["--root", root_arg, "thread", "show", "demo", "t-0001"]
+            )
+            .status
+            .success()
+        );
+    }
+    let ledger = |args: &[&str]| {
+        Command::new(BIN)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("HERDR_ADE_LAUNCH", "demo/t-0001/1/brief")
+            .args(["--root", root_arg, "ledger"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = ledger(&["list", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(entries[0]["count"], 2);
+    assert_eq!(entries[0]["kind"], "command-failed");
+    let id = entries[0]["id"].as_str().unwrap();
+    let out = ledger(&["task", id]);
+    assert!(out.status.success());
+    let task = String::from_utf8(out.stdout).unwrap();
+    assert!(task.starts_with("# Fix an observed harness failure:"));
+    for text in [
+        "Count: 2",
+        "First seen:",
+        "Last seen:",
+        "no thread",
+        "regression test",
+    ] {
+        assert!(task.contains(text), "{task}");
+    }
+    assert!(ledger(&["done", id]).status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&ledger(&["show", id]).stdout).unwrap();
+    assert_eq!(shown["closed"], true);
+    let open: Vec<serde_json::Value> =
+        serde_json::from_slice(&ledger(&["list", "--json"]).stdout).unwrap();
+    assert!(open.iter().all(|entry| entry["id"] != id));
+}
+
+#[test]
 fn path_like_names_and_slugs_are_refused() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");

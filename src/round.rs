@@ -71,6 +71,11 @@ pub mod repo {
             self.runner.run(&self.cmd_in(dir, args))
         }
 
+        /// Run a predicate/probe whose nonzero exit is a valid negative result.
+        fn probe_in(&self, dir: &Path, args: &[&str]) -> Result<Output> {
+            self.runner.run(&self.cmd_in(dir, args).nonzero_is_data())
+        }
+
         /// Trimmed stdout of a successful git call in `dir`.
         pub fn run_in(&self, dir: &Path, args: &[&str]) -> Result<String> {
             let out = self.output_in(dir, args)?;
@@ -95,7 +100,7 @@ pub mod repo {
 
         /// The commit a branch points at, or `None` when it does not exist.
         pub fn branch_head(&self, branch: &str) -> Result<Option<String>> {
-            let out = self.output_in(
+            let out = self.probe_in(
                 &self.repo,
                 &[
                     "rev-parse",
@@ -111,7 +116,7 @@ pub mod repo {
         }
 
         pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
-            let out = self.output_in(
+            let out = self.probe_in(
                 &self.repo,
                 &["merge-base", "--is-ancestor", ancestor, descendant],
             )?;
@@ -147,7 +152,7 @@ pub mod repo {
 
         /// A file's bytes at a revision, `None` when the path is absent there.
         pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<String>> {
-            let out = self.output_in(&self.repo, &["show", &format!("{rev}:{path}")])?;
+            let out = self.probe_in(&self.repo, &["show", &format!("{rev}:{path}")])?;
             Ok(out.success().then_some(out.stdout))
         }
 
@@ -848,6 +853,7 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 /// left with a bound reviewer whose agent never came up (E3/D1).
 pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let _scope = crate::ledger::Scope::new(&[&project]);
     // One advance at a time, across processes (the hook and the ticker).
     let _advance = advance_lock(&project)?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
@@ -935,8 +941,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             (Some(branch), true) => branch,
             _ => review(ctx, slug, &round)?.review_branch,
         };
+        crate::ledger::retry_after_failure(&project, "reviewer-start-failed", &round);
         match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
             Ok(thread) => {
+                crate::ledger::recovered(&project, "reviewer-start-failed", &round);
                 bind_reviewer(ctx, slug, &round, &thread.id)?;
             }
             Err(error) => {
@@ -1266,12 +1274,7 @@ fn reviewer_start_failed(
             t.error = reason.to_string();
         });
     }
-    // ---- A3 failure ledger seam -----------------------------------------
-    // This is the single place the harness notices a review that did not
-    // start. Record it here when `src/ledger.rs` lands:
-    //     crate::ledger::record(project, "reviewer-start", round, reason);
-    // Until then the report is the announcement below and this `eprintln`.
-    // ---------------------------------------------------------------------
+    crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
     announce_once(
         ctx,
@@ -1801,6 +1804,24 @@ pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Optio
 /// `ha round merge` (D6, item 34). Resumes from `merge.toml` when present.
 pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<MergeOutcome> {
     let project = Project::load(&ctx.root, slug)?;
+    let _scope = crate::ledger::Scope::new(&[&project]);
+    crate::ledger::retry_after_failure(&project, "merge-refused", round);
+    let result = merge_inner(ctx, project.clone(), slug, round, stop);
+    if let Err(error) = &result {
+        crate::ledger::observe(&project, "merge-refused", round, &format!("{error:#}"));
+    } else {
+        crate::ledger::recovered(&project, "merge-refused", round);
+    }
+    result
+}
+
+fn merge_inner(
+    ctx: &Ctx,
+    project: Project,
+    slug: &str,
+    round: &str,
+    stop: Option<Stop>,
+) -> Result<MergeOutcome> {
     let record = load(&project, round)?;
     // One merge per round at a time: a second run waits, then reads the
     // first one's record and resumes from it (item 34).
@@ -3184,6 +3205,16 @@ mod tests {
         let (lanes, _) = reviewed(&fx);
         verdict(&fx, &lanes, front("MERGE-AFTER-DECISION", "r1"));
         assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("verdict_not_merge"));
+        assert!(err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("verdict_not_merge"));
+        let failures = crate::ledger::list(&fx.project).unwrap();
+        let refusal = failures
+            .iter()
+            .find(|entry| entry.kind == "merge-refused")
+            .unwrap();
+        assert_eq!(refusal.subject, "r1");
+        assert_eq!(refusal.count, 2);
+        assert!(refusal.detail.contains("verdict_not_merge"));
+        assert!(failures.iter().any(|entry| entry.kind == "retry"));
 
         // An earlier round's verdict.
         let fx = fixture();
@@ -3626,14 +3657,26 @@ mod tests {
             .unwrap();
 
         advance(&ctx, "demo").unwrap();
+        advance(&ctx, "demo").unwrap();
         let refused = load(&fx.project, "r1").unwrap();
-        assert_eq!(refused.reviewer_start_failures, 1, "the refusal is counted");
+        assert_eq!(
+            refused.reviewer_start_failures, 2,
+            "each refusal is counted"
+        );
         assert!(refused.reviewer.is_none(), "no reviewer is bound");
         let reports = crate::inbox::unhandled(&fx.project)
             .into_iter()
             .filter(|item| item.kind == "round-advance" && item.summary.contains("did not start"))
             .count();
         assert_eq!(reports, 1, "the refused start is said once");
+        let failures = crate::ledger::list(&fx.project).unwrap();
+        let start = failures
+            .iter()
+            .find(|entry| entry.kind == "reviewer-start-failed")
+            .unwrap();
+        assert_eq!(start.subject, "r1");
+        assert_eq!(start.count, 2);
+        assert!(failures.iter().any(|entry| entry.kind == "retry"));
 
         // The next pass tries again, and a live project starts the reviewer.
         fx.project
@@ -3643,7 +3686,7 @@ mod tests {
         let record = load(&fx.project, "r1").unwrap();
         assert!(record.reviewer.is_some(), "the start is retried");
         assert_eq!(
-            record.reviewer_start_failures, 1,
+            record.reviewer_start_failures, 2,
             "a retry is not a failure"
         );
     }

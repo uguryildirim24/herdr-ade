@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
 use crate::paths::{self, Ctx, Env, SessionFlags};
@@ -89,6 +89,11 @@ enum Command {
     Unfocus {
         #[command(flatten)]
         session: SessionArgs,
+    },
+    /// Observed harness failures in the current project
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommand,
     },
     /// Inbox items
     Inbox {
@@ -1086,6 +1091,21 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
 }
 
 #[derive(Subcommand)]
+enum LedgerCommand {
+    /// Open failures, worst repeat count first
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a failure and its evidence
+    Show { id: String },
+    /// Close a failure
+    Done { id: String },
+    /// Print an actionable task brief to standard output
+    Task { id: String },
+}
+
+#[derive(Subcommand)]
 enum InboxCommand {
     /// Move handled items to inbox/done/
     Done {
@@ -1251,11 +1271,36 @@ enum PlainCommand {
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    let mut leaf = &matches;
+    let mut command_path = Vec::new();
+    let mut explicit_slug = None;
+    loop {
+        if let Ok(Some(slug)) = leaf.try_get_one::<String>("slug") {
+            explicit_slug = Some(slug.clone());
+        }
+        match leaf.subcommand() {
+            Some((name, args)) => {
+                command_path.push(name);
+                leaf = args;
+            }
+            None => break,
+        }
+    }
+    let mut command_name = command_path.join(" ");
+    // Identify the object of a refusal/retry, not just its verb. Do not copy
+    // task text, prompts, flags or environment into the CLI-level subject.
+    for key in ["round", "id", "name"] {
+        if let Ok(Some(value)) = leaf.try_get_one::<String>(key) {
+            command_name.push(' ');
+            command_name.push_str(value);
+        }
+    }
     let env = Env::from_process()?;
     let config_dir = env.config_dir();
     let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
-    let runner = RealRunner;
+    let runner = crate::ledger::RecordingRunner(&RealRunner);
     let ctx = Ctx {
         env: &env,
         root,
@@ -1264,7 +1309,39 @@ pub fn run() -> Result<()> {
         detached_ticker: true,
     };
 
-    match cli.command {
+    let observed_slug = explicit_slug
+        .or_else(|| {
+            ctx.env
+                .var("HERDR_ADE_LAUNCH")
+                .and_then(project::LaunchEnv::parse)
+                .map(|l| l.project)
+        })
+        .or_else(|| {
+            overview::project_for_workspace(
+                &ctx,
+                ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or(""),
+                ctx.env.var("HERDR_SOCKET_PATH").unwrap_or(""),
+            )
+        });
+    let observed_project = observed_slug
+        .as_deref()
+        .and_then(|s| Project::load(&ctx.root, s).ok());
+    let _scope = crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>());
+    let subject = format!("ha {command_name}");
+    if let Some(project) = &observed_project {
+        crate::ledger::retry_after_failure(project, "command-failed", &subject);
+    }
+    let result = dispatch(ctx, cli.command, observed_project.as_ref());
+    if let Err(error) = &result {
+        crate::ledger::observe_current("command-failed", &subject, &format!("{error:#}"));
+    } else if let Some(project) = &observed_project {
+        crate::ledger::recovered(project, "command-failed", &subject);
+    }
+    result
+}
+
+fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) -> Result<()> {
+    match command {
         Command::New { name, goal, repos } => {
             let repos = repos
                 .iter()
@@ -1331,6 +1408,33 @@ pub fn run() -> Result<()> {
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
         Command::Focus { slug } => overview::focus(&ctx, slug.as_deref()),
         Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
+        Command::Ledger { command } => {
+            let project = observed_project
+                .as_ref()
+                .context("no project resolves from this workspace or lane")?;
+            match command {
+                LedgerCommand::List { json } => {
+                    let entries = crate::ledger::list(project)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&entries)?);
+                    } else {
+                        for entry in entries {
+                            println!("{}", crate::ledger::summary(&entry));
+                        }
+                    }
+                }
+                LedgerCommand::Show { id } => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::ledger::show(project, &id)?)?
+                ),
+                LedgerCommand::Done { id } => crate::ledger::done(project, &id)?,
+                LedgerCommand::Task { id } => print!(
+                    "{}",
+                    crate::ledger::task(&crate::ledger::show(project, &id)?)
+                ),
+            }
+            Ok(())
+        }
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
                 let project = Project::load(&ctx.root, &slug)?;

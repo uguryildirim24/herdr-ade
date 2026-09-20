@@ -178,10 +178,46 @@ fn write_record(project: &Project, thread: &Thread) -> Result<()> {
 pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
     let _lock = project.lock()?;
     let mut thread = load(project, id)?;
+    let before = thread.clone();
     change(&mut thread);
     thread.updated = project::now();
     write_record(project, &thread)?;
+    observe_transition(project, &before, &thread);
     Ok(thread)
+}
+
+/// Record transitions, not polls: an unchanged blocked/error state is one
+/// occurrence even if the ticker sees it a hundred times.
+fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
+    if (after.status == Status::Failed && before.status != Status::Failed)
+        || (!after.error.is_empty() && after.error != before.error)
+    {
+        crate::ledger::observe(project, "thread-error", &after.id, &after.error);
+        if after.launch_attempts == 0 && !after.launch.kind.is_empty() {
+            crate::ledger::observe(
+                project,
+                "launch-not-attempted",
+                &after.id,
+                &format!("launch_attempts = 0: {}", after.error),
+            );
+        }
+    }
+    if after.last_state != before.last_state
+        && matches!(after.last_state.as_str(), "error" | "blocked")
+    {
+        crate::ledger::observe(
+            project,
+            "thread-state",
+            &after.id,
+            &format!("{}: {}", after.last_state, after.error),
+        );
+    }
+    if after.attempt > before.attempt && before.attempt > 0 {
+        crate::ledger::observe(project, "retry", &after.id, "thread restart");
+    }
+    if after.launch_attempts > before.launch_attempts && before.launch_attempts > 0 {
+        crate::ledger::observe(project, "retry", &after.id, "agent launch");
+    }
 }
 
 /// Allocates the next id under the project lock and writes the first record.
@@ -1200,6 +1236,37 @@ mod tests {
         assert_eq!(ids.len(), 8);
         assert_eq!(ids[0], "t-0001");
         assert_eq!(ids[7], "t-0008");
+    }
+
+    #[test]
+    fn failure_transitions_record_once_and_launch_retries_are_counted() {
+        let root = tempfile::tempdir().unwrap();
+        let p = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = allocate(&p, |t| {
+            t.attempt = 1;
+            t.launch.kind = "pi".into();
+        })
+        .unwrap();
+        for _ in 0..3 {
+            update(&p, &t.id, |t| {
+                t.status = Status::Failed;
+                t.error = "login expired".into();
+                t.last_state = "blocked".into();
+            })
+            .unwrap();
+        }
+        let entries = crate::ledger::list(&p).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| e.count == 1));
+        assert!(entries.iter().any(|e| e.kind == "launch-not-attempted"));
+        update(&p, &t.id, |t| {
+            t.attempt += 1;
+            t.launch_attempts = 1;
+        })
+        .unwrap();
+        update(&p, &t.id, |t| t.launch_attempts += 1).unwrap();
+        let entries = crate::ledger::list(&p).unwrap();
+        assert_eq!(entries.iter().filter(|e| e.kind == "retry").count(), 2);
     }
 
     #[test]

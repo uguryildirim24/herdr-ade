@@ -16,6 +16,8 @@ pub struct Cmd {
     pub cwd: Option<PathBuf>,
     pub stdin: Option<String>,
     pub timeout: Duration,
+    /// A nonzero exit is data for a predicate/probe, not a failed command.
+    pub nonzero_is_data: bool,
     /// Spawn in its own process group and kill the whole group on timeout.
     pub own_group: bool,
 }
@@ -30,6 +32,7 @@ impl Cmd {
             cwd: None,
             stdin: None,
             timeout,
+            nonzero_is_data: false,
             own_group: false,
         }
     }
@@ -65,6 +68,11 @@ impl Cmd {
 
     pub fn stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
+        self
+    }
+
+    pub fn nonzero_is_data(mut self) -> Self {
+        self.nonzero_is_data = true;
         self
     }
 
