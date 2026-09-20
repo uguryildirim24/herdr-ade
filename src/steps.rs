@@ -1259,6 +1259,7 @@ pub fn pull_requests(
 /// Auto-resolve and resolve-on-merge: the final copy first; if it fails the
 /// thread is not resolved and the next tick tries again.
 fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) -> Result<bool> {
+    crate::round::require_resolvable(project, &t.id)?;
     let copied = threads::final_copy(ctx, project, t);
     if let CopyOutcome::Failed(error) = copied.outcome {
         anyhow::bail!(
