@@ -5725,6 +5725,23 @@ mod tests {
             err(adopt(&fx.world.ctx(), "demo", "r1", &reviewer))
                 .starts_with("verdict_manifest_mismatch")
         );
+
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = adoptable_reviewer(&fx, &lanes, front("MERGE", "r1"), None);
+        let outcome = adopt(&fx.world.ctx(), "demo", "r1", &reviewer).unwrap();
+        assert_eq!(outcome.action, "adopted_verdict");
+        advance(&fx.world.ctx(), "demo").unwrap();
+        assert_eq!(
+            thread::list(&fx.project)
+                .into_iter()
+                .filter(|thread| thread.role == "reviewer")
+                .count(),
+            1
+        );
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.reviewer.as_deref(), Some(reviewer.as_str()));
+        assert_eq!(record.phase, RoundPhase::VerdictIn);
     }
 
     /// A lane stays held through the merge intent and checkpoint, with no override.
