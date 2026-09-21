@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0146.md",
+      "tasks/t-0145.md",
+      "tasks/review-r62.md",
+      "tasks/t-0144.md",
       "tasks/t-0143.md",
       "tasks/t-0138.md",
       "tasks/review-r60.md",
@@ -18,17 +22,14 @@
       "tasks/review-r59.md",
       "tasks/t-0139.md",
       "tasks/review-r61.md",
-      "tasks/t-0136.md",
-      "tasks/review-r58.md",
-      "tasks/t-0135.md",
-      "tasks/t-0134.md",
-      "tasks/t-0133.md"
+      "tasks/t-0136.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r62.md",
       "tasks/reviews/code-r60.md",
       "tasks/reviews/code-r61.md",
       "tasks/reviews/code-r58.md",
@@ -39,15 +40,19 @@
       "tasks/reviews/code-r53.md",
       "tasks/reviews/code-r52.md",
       "tasks/reviews/code-r51.md",
-      "tasks/reviews/code-r50.md",
-      "tasks/reviews/code-r49.md"
+      "tasks/reviews/code-r50.md"
     ]
   },
-  "generated": "2026-09-21T10:45:20-04:00",
+  "generated": "2026-09-21T11:10:36-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0143-review-r60-this-round-measures-the-part",
+      "hp/adeherdr/t-0146-review-r62-this-round-stops-the-health-c",
       "main",
+      "hp/adeherdr/t-0144-rounds-side-by-side-stop-sending-each-ot",
+      "review/r62-2",
+      "hp/adeherdr/t-0145-review-r62-this-round-stops-the-health-c",
+      "review/r62",
+      "hp/adeherdr/t-0143-review-r60-this-round-measures-the-part",
       "hp/adeherdr/t-0142-the-doctor-ignores-a-machine-s-own-home",
       "review/r60-2",
       "hp/adeherdr/t-0141-review-r59-this-round-fixes-your-talk-ta",
@@ -231,22 +236,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "0c4f85d review(r60): verdict",
-      "eb0448f review(doctor): keep cached failures plain",
-      "9faa08a Merge earlier r60 candidate",
-      "5778e55 docs(tasks): t-0143",
-      "38c5d8c review(r60): brief for revision 2",
-      "5c6fd5a docs(tasks): t-0142"
+      "ae83b4d review(r62): accept home workspace exclusion",
+      "f7cde15 review(doctor): state the accepted home-label limit",
+      "51d67c9 Merge commit 'ea72eb5dca372309e7cae7d72357dbe4ddb08ae7' into hp/adeherdr/t-0146-review-r62-this-round-stops-the-health-c",
+      "e384897 docs(tasks): t-0146",
+      "e1ab251 review(r62): brief for revision 1",
+      "ea72eb5 Merge commit '74ce0d48dcbed0f524315ee2336be2d451810908' into hp/adeherdr/t-0145-review-r62-this-round-stops-the-health-c"
     ],
-    "remote": "15 ahead, 0 behind origin/main",
+    "remote": "10 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "0c4f85d",
+        "head": "ae83b4d",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r60): verdict"
+        "subject": "review(r62): accept home workspace exclusion"
       },
       {
         "branch": "review/r1",
@@ -632,6 +637,20 @@
         "head": "84e6a49",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r61",
         "subject": "docs(tasks): t-0139"
+      },
+      {
+        "branch": "review/r62",
+        "dirty": 0,
+        "head": "c3a93ca",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r62",
+        "subject": "docs(tasks): t-0145"
+      },
+      {
+        "branch": "review/r62-2",
+        "dirty": 0,
+        "head": "e384897",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r62-2",
+        "subject": "docs(tasks): t-0146"
       },
       {
         "branch": "review/r7",
@@ -1115,6 +1134,27 @@
         "head": "0c4f85d",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0143",
         "subject": "review(r60): verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0144-rounds-side-by-side-stop-sending-each-ot",
+        "dirty": 0,
+        "head": "c6bd193",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0144",
+        "subject": "fix(rounds): ignore bookkeeping base movement"
+      },
+      {
+        "branch": "hp/adeherdr/t-0145-review-r62-this-round-stops-the-health-c",
+        "dirty": 0,
+        "head": "5b97481",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0145",
+        "subject": "review(r62): reject incomplete home workspace rule"
+      },
+      {
+        "branch": "hp/adeherdr/t-0146-review-r62-this-round-stops-the-health-c",
+        "dirty": 0,
+        "head": "ae83b4d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0146",
+        "subject": "review(r62): accept home workspace exclusion"
       }
     ]
   },
@@ -1139,8 +1179,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r60",
-    "verdict": "0c4f85d56798f848235fb3311aaab139b1d0a558"
+    "round": "r62",
+    "verdict": "ae83b4dec0a07ce62c2b04c8f972186eb021a098"
   },
   "session": "default",
   "unlinked_agents": [],
@@ -1153,13 +1193,11 @@
       "pane_label": null,
       "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0142--/2026-09-21T14-36-37-984Z_01a0c465-c0df-72b9-9525-22a8eba3794b.jsonl",
       "start_args": [],
-      "status": "done",
+      "status": "idle",
       "tab_id": "w1G:t31",
       "tab_label": "t-0142",
       "title": "π - t-0142",
       "tokens": {
-        "done": "1",
-        "lane": "t-0142",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "1",
@@ -1168,31 +1206,75 @@
       }
     },
     {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0143",
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0144",
       "kind": "pi",
-      "name": "hp-adeherdr-t-0143",
-      "pane_id": "w1G:p36",
+      "name": "hp-adeherdr-t-0144",
+      "pane_id": "w1G:p37",
       "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0143--/2026-09-21T14-37-32-770Z_01a0c466-96e2-74e3-936c-0f4cc00ccb6f.jsonl",
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0144--/2026-09-21T15-01-16-697Z_01a0c47c-5119-71d2-b07d-9b938dd3782c.jsonl",
       "start_args": [],
       "status": "done",
-      "tab_id": "w1G:t32",
-      "tab_label": "t-0143",
-      "title": "π - t-0143",
+      "tab_id": "w1G:t33",
+      "tab_label": "t-0144",
+      "title": "π - t-0144",
       "tokens": {
         "done": "1",
-        "lane": "t-0143",
+        "lane": "t-0144",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0144"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0145",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0145",
+      "pane_id": "w1G:p38",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0145--/2026-09-21T15-01-50-803Z_01a0c47c-d652-76bb-aa79-642bf318c120.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t34",
+      "tab_label": "t-0145",
+      "title": "π - t-0145",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0145",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0145"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0146",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0146",
+      "pane_id": "w1G:p39",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0146--/2026-09-21T15-06-45-888Z_01a0c481-5700-7576-947e-bc94278a39fc.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t35",
+      "tab_label": "t-0146",
+      "title": "π - t-0146",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0146",
         "parent": "w1G:p1",
         "project": "adeherdr",
         "rank": "3",
         "review": "working",
-        "thread": "t-0143"
+        "thread": "t-0146"
       }
     }
   ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 4
+    "tabs": 6
   }
 }
