@@ -130,6 +130,7 @@ fn scenario_setup_then_check_for_kimi() {
         "auth check --provider kimi-coding",
         ok(r#"{"status":"ready"}"#),
     );
+    runner.on("--print Reply OK.", ok("OK\n"));
 
     let report = doctor::check_report(&env, &layout, &runner, "kimi-coding");
     assert!(report.ok, "{}", report.error_text());
