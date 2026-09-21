@@ -979,6 +979,10 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     );
     assert!(!command.contains("cd /Users/rolfie"), "{command}");
     assert!(
+        command.contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
+        "{command}"
+    );
+    assert!(
         thread::load(&project, &t.id)
             .unwrap()
             .worktree_path
@@ -1040,6 +1044,7 @@ fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
         Status::Resolved
     );
     assert_eq!(world.runner.count("git worktree remove"), 0);
+    assert_eq!(world.runner.count("rm -rf -- /home/ubuntu/build/lanes"), 0);
 }
 
 #[test]
