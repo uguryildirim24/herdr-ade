@@ -379,13 +379,9 @@ enum RoundCommand {
     /// Manual repair only: commit the review brief B, freeze the manifest,
     /// create the review branch. `round advance` does this on its own.
     Review { slug: String, round: String },
-    /// Manual repair only: record the reviewer thread whose sealed done sha is
-    /// the verdict commit V. `round advance` starts and binds the reviewer.
-    Reviewer {
-        slug: String,
-        round: String,
-        thread: String,
-    },
+    /// Manual repair only: start the reviewer for a frozen round and bind it.
+    /// `round advance` does this on its own.
+    Reviewer { slug: String, round: String },
     /// Merge on an exact MERGE verdict, then checkpoint; resumes after a crash
     Merge {
         slug: String,
@@ -688,7 +684,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     o.revision, o.manifest_hash
                 );
                 println!(
-                    "next: `round advance {slug}` starts and binds the reviewer after routing from its full brief and pinned changes; `round reviewer` is only a manual repair"
+                    "next: `round advance {slug}` starts and binds the reviewer after routing from its full brief and pinned changes; `round reviewer {slug} {id}` is the manual start"
                 );
                 if let (Some(c), Some(v)) = (&o.earlier_candidate, &o.earlier_verdict) {
                     println!(
@@ -697,14 +693,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 }
                 Ok(())
             }
-            RoundCommand::Reviewer {
-                slug,
-                round: id,
-                thread,
-            } => {
-                round::bind_reviewer(ctx, &slug, &id, &thread)?;
+            RoundCommand::Reviewer { slug, round: id } => {
+                let reviewer = round::start_reviewer_by_hand(ctx, &slug, &id)?;
                 println!(
-                    "{thread} reviews {id} (manual repair; `round advance` binds reviewers on its own)"
+                    "{} reviews {id} (manual repair; `round advance` starts reviewers on its own)",
+                    reviewer.id
                 );
                 Ok(())
             }
