@@ -1185,7 +1185,9 @@ fn a_single_missing_pane_is_shown_from_the_thread_record() {
     assert!(inbox::unhandled(&project).is_empty());
     let digest = coordinator::digest(&world.ctx(), &project, "ha").unwrap().0;
     assert!(
-        digest.contains("[Waiting on you] (process gone: pane or agent is gone without a report)"),
+        digest.contains(
+            "[Waiting on you] (process gone: the pane or agent is gone without a report)"
+        ),
         "{digest}"
     );
 }
@@ -1784,6 +1786,12 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
             .summary
             .contains("`box` has been unreachable")
     );
+    let disconnected = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(
+        disconnected.failure_class,
+        crate::contracts::FailureClass::LostConnection
+    );
+    assert_eq!(disconnected.last_group, "waiting-on-you");
 
     *down.borrow_mut() = false;
     for tick in [28, 32, 36] {
@@ -1793,6 +1801,12 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
     let outages = items_of(&project, "outage");
     assert_eq!(outages.len(), 2);
     assert!(outages[1].summary.contains("reachable again"));
+    let reconnected = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(
+        reconnected.failure_class,
+        crate::contracts::FailureClass::Unknown
+    );
+    assert!(reconnected.error.is_empty());
     // Remote tokens go through `--machine`, with the five minute TTL.
     let calls = scripted.runner.calls.borrow();
     let tokens = calls
@@ -1950,6 +1964,134 @@ fn launch_without_a_routing_table_names_the_config_fix() {
         error,
         "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
     );
+}
+
+#[test]
+fn provider_retries_do_not_consume_failed_work_retries_or_choose_a_fallback() {
+    let world = World::new();
+    let config = world.home.path().join("cfg/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace("fallback = []", "fallback = [\"backup\"]")
+            + "\n[recipes.backup]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the backup helper\"\n",
+    )
+    .unwrap();
+    let project = world.project("demo", "a.sock");
+    let input = |previous, failure| crate::launch::ResolveInput {
+        task: "Do the work.",
+        workflow: "lane",
+        previous,
+        failure,
+        source_truncation: None,
+    };
+    let first = crate::launch::resolve_launch(&world.ctx(), &project, &input(None, None)).unwrap();
+    let provider = crate::launch::resolve_failure(
+        &world.ctx(),
+        &project,
+        &input(Some(&first), Some("fetch failed")),
+        crate::contracts::FailureClass::Provider,
+    )
+    .unwrap();
+    assert_eq!(provider.recipe_id, "test_claude");
+    assert_eq!(provider.escalations, 0);
+    assert_eq!(provider.same_recipe_retries, 1);
+
+    let first_work = crate::launch::resolve_failure(
+        &world.ctx(),
+        &project,
+        &input(Some(&provider), Some("the approach failed")),
+        crate::contracts::FailureClass::WorkFailed,
+    )
+    .unwrap();
+    assert_eq!(first_work.recipe_id, "test_claude");
+    assert_eq!(first_work.escalations, 1);
+    assert_eq!(first_work.same_recipe_retries, 0);
+    let fallback = crate::launch::resolve_failure(
+        &world.ctx(),
+        &project,
+        &input(Some(&first_work), Some("the retry failed")),
+        crate::contracts::FailureClass::WorkFailed,
+    )
+    .unwrap();
+    assert_eq!(fallback.recipe_id, "backup");
+}
+
+#[test]
+fn provider_readiness_and_a_gone_process_schedule_same_recipe_restarts() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let launch = crate::launch::resolve_launch(
+        &world.ctx(),
+        &project,
+        &crate::launch::ResolveInput {
+            task: "Do the work.",
+            workflow: "lane",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let lane = world.thread(&project, world.home.path(), |thread| {
+        thread.attempt = 1;
+        thread.launch = launch;
+    });
+    std::fs::write(thread::task_path(&project, &lane.id), "Do the work.").unwrap();
+    threads::fail_start(
+        &world.ctx(),
+        &project,
+        &lane.id,
+        "the pane or agent is gone without a report",
+        crate::contracts::FailureClass::ProcessGone,
+        true,
+    )
+    .unwrap();
+    let restarted = thread::load(&project, &lane.id).unwrap();
+    assert_eq!(
+        restarted.failure_class,
+        crate::contracts::FailureClass::ProcessGone
+    );
+    assert_eq!(restarted.attempt, 2);
+    assert_eq!(restarted.launch.recipe_id, "test_claude");
+    assert_eq!(restarted.launch.escalations, 0);
+    assert_eq!(restarted.launch.same_recipe_retries, 1);
+    assert!(restarted.escalation_pending);
+
+    let provider_launch = crate::launch::resolve_launch(
+        &world.ctx(),
+        &project,
+        &crate::launch::ResolveInput {
+            task: "Check the provider.",
+            workflow: "lane",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let provider_lane = world.thread(&project, world.home.path(), |thread| {
+        thread.attempt = 1;
+        thread.launch = provider_launch;
+    });
+    std::fs::write(
+        thread::task_path(&project, &provider_lane.id),
+        "Check the provider.",
+    )
+    .unwrap();
+    threads::fail_start(
+        &world.ctx(),
+        &project,
+        &provider_lane.id,
+        "pi_not_ready: the provider probe timed out",
+        crate::contracts::FailureClass::Provider,
+        true,
+    )
+    .unwrap();
+    let provider_retry = thread::load(&project, &provider_lane.id).unwrap();
+    assert_eq!(
+        provider_retry.failure_class,
+        crate::contracts::FailureClass::Provider
+    );
+    assert_eq!(provider_retry.launch.recipe_id, "test_claude");
+    assert_eq!(provider_retry.launch.escalations, 0);
+    assert_eq!(provider_retry.launch.same_recipe_retries, 1);
 }
 
 #[test]

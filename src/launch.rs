@@ -229,7 +229,7 @@ pub fn resolve_failure(
             let config = parse_launch_config(&ctx.config_dir)?;
             validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
             let work = work_contract(input.task, input.workflow)?;
-            let recovery = previous.escalations.saturating_add(1);
+            let recovery = previous.same_recipe_retries.saturating_add(1);
             let retries = config.routing.retry_limit(&work);
             if recovery > retries {
                 bail!(
@@ -238,11 +238,11 @@ pub fn resolve_failure(
                 );
             }
             let mut same = previous.clone();
-            same.escalations = recovery;
+            same.same_recipe_retries = recovery;
             ledger(
                 project,
                 json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
-                    "recovery":recovery, "failure":input.failure,
+                    "same_recipe_retry":recovery, "failure":input.failure,
                     "policy_hash":config.policy_hash}),
             )?;
             Ok(same)

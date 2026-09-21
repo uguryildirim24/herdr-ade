@@ -378,6 +378,9 @@ fn collect_inner(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> 
         Outcome::ProviderFailed(reason) => {
             finish_failed(env, layout, runner, &mut turn, "provider", &reason, true)
         }
+        Outcome::Unknown(reason) => {
+            finish_failed(env, layout, runner, &mut turn, "unknown", &reason, false)
+        }
     }
 }
 
@@ -567,6 +570,7 @@ pub(crate) enum Outcome {
     Delivered(String),
     Cooldown(String),
     ProviderFailed(String),
+    Unknown(String),
 }
 
 fn classify(completion: &Completion) -> Outcome {
@@ -595,7 +599,7 @@ fn classify(completion: &Completion) -> Outcome {
     if !completion.answer.trim().is_empty() {
         return Outcome::Delivered(completion.answer.clone());
     }
-    Outcome::ProviderFailed("the turn completed with no answer".into())
+    Outcome::Unknown("the turn completed with no answer or failure evidence".into())
 }
 
 fn value_contains(value: &Value, needle: &str) -> bool {
@@ -883,7 +887,7 @@ mod tests {
             answer: String::new(),
             events: vec![],
         };
-        assert!(matches!(classify(&empty), Outcome::ProviderFailed(_)));
+        assert!(matches!(classify(&empty), Outcome::Unknown(_)));
 
         let stopped = Completion {
             turn_id: "t".into(),

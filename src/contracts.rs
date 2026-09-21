@@ -165,8 +165,13 @@ pub(crate) struct Launch {
     #[serde(default)]
     pub(crate) skill_hash: String,
     pub(crate) recipe_id: String,
-    /// Number of bounded recovery selections after the first launch.
+    /// Number of failed-work recovery selections after the first launch.
+    /// Infrastructure retries never advance this fallback selector.
     pub(crate) escalations: u32,
+    /// Number of bounded same-recipe retries for provider, connection, and
+    /// process failures.
+    #[serde(default)]
+    pub(crate) same_recipe_retries: u32,
     /// `pin`, `default`, or the ordered `rule[n]` that selected this recipe.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) routing_rule: String,
@@ -995,6 +1000,7 @@ mod tests {
             skill_hash: "aa".into(),
             recipe_id: "agy_gemini_flash".into(),
             escalations: 0,
+            same_recipe_retries: 0,
             routing_rule: "default".into(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
