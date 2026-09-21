@@ -516,6 +516,33 @@ fn report_with_checks(
         Err(_) => check(&mut out, None, "gh auth", "gh is not installed".into()),
     }
 
+    let doctor_config = match crate::launch::doctor_config(config_dir) {
+        Ok(config) => config,
+        Err(error) => {
+            check(
+                &mut out,
+                Some(false),
+                "doctor settings",
+                format!("{error:#}"),
+            );
+            crate::launch::DoctorConfig::default()
+        }
+    };
+    match local_free_disk_gb(runner) {
+        Ok(free) => check(
+            &mut out,
+            Some(free >= doctor_config.min_free_disk_gb),
+            "machine local disk",
+            disk_detail(free, doctor_config.min_free_disk_gb),
+        ),
+        Err(error) => check(
+            &mut out,
+            Some(false),
+            "machine local disk",
+            format!("free space unknown: {error:#}"),
+        ),
+    }
+
     if root.is_dir() {
         let count = project::list_slugs(root).len();
         check(&mut out, Some(true), "root", format!("{count} project(s)"));
@@ -723,9 +750,13 @@ fn report_with_checks(
                                 &format!("machine {machine}"),
                                 format!("ssh target {}", profile.target),
                             );
-                            for (ok, label, detail) in
-                                box_rows(runner, &bin, &profile, &config.recipes)
-                            {
+                            for (ok, label, detail) in box_rows(
+                                runner,
+                                &bin,
+                                &profile,
+                                &config.recipes,
+                                config.doctor.min_free_disk_gb,
+                            ) {
                                 check(&mut out, ok, &label, detail);
                             }
                             let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
@@ -744,8 +775,12 @@ fn report_with_checks(
                                 runner,
                                 detached_ticker: false,
                             };
-                            let (leftovers, data_kept, errors) =
+                            let (mut leftovers, data_kept, mut errors) =
                                 finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
+                            let (builds, build_errors) =
+                                finished_build_folders(&ctx, &profile.id, &profile.target);
+                            leftovers.extend(builds);
+                            errors.extend(build_errors);
                             check(
                                 &mut out,
                                 worktree_check_status(&leftovers, &errors),
@@ -801,6 +836,35 @@ fn ticker_folder_check(info: &crate::ticker::Info) -> (Option<bool>, String) {
     )
 }
 
+fn local_free_disk_gb(runner: &dyn Runner) -> Result<f64> {
+    let output = runner.run(&Cmd::new("df", TOOL_TIMEOUT).args(["-Pk", "/"]))?;
+    if !output.success() {
+        anyhow::bail!("{}", output.error_text());
+    }
+    let available_kb = output
+        .stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.split_whitespace().nth(3)?.parse::<u64>().ok())
+        .context("`df -Pk /` did not report available blocks")?;
+    Ok(available_kb as f64 * 1024.0 / 1_000_000_000.0)
+}
+
+fn display_gb(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn disk_detail(free_gb: f64, minimum_gb: f64) -> String {
+    format!(
+        "{free_gb:.1} GB free; refuses below {} GB free",
+        display_gb(minimum_gb)
+    )
+}
+
 fn worktree_check_status(leftovers: &[String], errors: &[String]) -> Option<bool> {
     if !leftovers.is_empty() {
         Some(false)
@@ -814,10 +878,13 @@ fn worktree_check_status(leftovers: &[String], errors: &[String]) -> Option<bool
 fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
     match (leftovers.is_empty(), errors.is_empty()) {
         (true, true) => "none whose work is done".into(),
-        (false, true) => format!("remove these finished worktrees: {}", leftovers.join(", ")),
+        (false, true) => format!(
+            "remove these finished worktrees or build folders: {}",
+            leftovers.join(", ")
+        ),
         (true, false) => format!("unknown; could not check: {}", errors.join("; ")),
         (false, false) => format!(
-            "remove these finished worktrees: {}; unknown for: {}",
+            "remove these finished worktrees or build folders: {}; unknown for: {}",
             leftovers.join(", "),
             errors.join("; ")
         ),
@@ -948,6 +1015,91 @@ fn finished_worktrees(
         }
     }
     (leftovers, data_kept, errors)
+}
+
+/// Rebuildable box output whose owning thread is no longer open. The folder
+/// names come from the same helper that sets `CARGO_TARGET_DIR` at launch.
+fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String>, Vec<String>) {
+    let mut active = BTreeSet::new();
+    let mut errors = Vec::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let Ok(project) = project::Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        let (threads, unreadable) = crate::thread::list_with_errors(&project);
+        errors.extend(
+            unreadable
+                .into_iter()
+                .map(|error| format!("{slug}: build ownership unknown: {error:#}")),
+        );
+        for thread in threads {
+            if thread.status != crate::thread::Status::Resolved
+                && thread.is_remote()
+                && thread.machine_route() == machine
+            {
+                active.insert(format!("{slug}-{}", thread.id));
+            }
+        }
+    }
+
+    let root = crate::contracts::BOX_BUILD;
+    let script = format!(
+        "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -exec du -sk -- {{}} +; fi; printf '__HERDR_BUILDS_DONE__\\n'",
+        root = crate::remote::quote(root),
+    );
+    let output = match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
+        Ok(output) if output.success() => output,
+        Ok(output) => {
+            errors.push(output.error_text());
+            return (Vec::new(), errors);
+        }
+        Err(error) => {
+            errors.push(format!("{error:#}"));
+            return (Vec::new(), errors);
+        }
+    };
+
+    let mut in_list = false;
+    let mut complete = false;
+    let mut leftovers = Vec::new();
+    for line in output.stdout.lines() {
+        match line.trim() {
+            "__HERDR_BUILDS__" => {
+                in_list = true;
+                continue;
+            }
+            "__HERDR_BUILDS_DONE__" => {
+                complete = true;
+                break;
+            }
+            _ if !in_list => continue,
+            _ => {}
+        }
+        let Some((kb, path)) = line.split_once(char::is_whitespace) else {
+            errors.push(format!("build folder size unreadable: {line}"));
+            continue;
+        };
+        let path = path.trim();
+        let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
+            errors.push(format!("build folder path unreadable: {path}"));
+            continue;
+        };
+        let Ok(kb) = kb.parse::<u64>() else {
+            errors.push(format!("build folder size unreadable: {line}"));
+            continue;
+        };
+        if !active.contains(name) {
+            leftovers.push(format!(
+                "{} ({})",
+                path,
+                crate::worktrees::human_size(kb.saturating_mul(1024))
+            ));
+        }
+    }
+    if !complete {
+        errors.push(format!("could not list build folders under {root}"));
+    }
+    (leftovers, errors)
 }
 
 fn check_workspace_leaks(
@@ -1196,13 +1348,14 @@ fn machines_to_check(
 
 /// One saved machine's box rows (SPEC-remote §§2–3, R11): boot service,
 /// server, host, listeners, repository mapping, Git identity and GitHub
-/// reach, enabled recipes' readiness, and live CPU/RAM/disk capacity with the 12 GB
-/// gate. One read-only SSH call.
+/// reach, enabled recipes' readiness, and live CPU/RAM/disk capacity with the
+/// configured free-space gate. One read-only SSH call.
 fn box_rows(
     runner: &dyn Runner,
     herdr_bin: &str,
     profile: &crate::contracts::MachineProfile,
     recipes: &BTreeMap<String, crate::contracts::Recipe>,
+    min_free_disk_gb: f64,
 ) -> Vec<(Option<bool>, String, String)> {
     let label = &profile.label;
     if profile.target.is_empty() {
@@ -1445,12 +1598,13 @@ fn box_rows(
     let mem_fit = (mem_gb / 4.0) as u64;
     let disk_fit = (disk_gb / 5.0) as u64;
     let fits = cpu_fit.min(mem_fit).min(disk_fit);
-    let capacity_ok = disk_gb >= 12.0;
+    let capacity_ok = disk_gb >= min_free_disk_gb;
     rows.push((
         if capacity_ok { Some(true) } else { Some(false) },
         format!("box {label} capacity"),
         format!(
-            "{nproc} OCPU, {mem_gb:.1} GB RAM free, {disk_gb:.1} GB disk free; about {fits} more lane(s) fit; refuses below 12 GB free"
+            "{nproc} OCPU, {mem_gb:.1} GB RAM free, {disk_gb:.1} GB disk free; about {fits} more lane(s) fit; refuses below {} GB free",
+            display_gb(min_free_disk_gb)
         ),
     ));
     let rules = fact("rules");
@@ -1587,6 +1741,7 @@ recipe = "claude_fable_xhigh"
         runner.on("herdr --version", ok(version));
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
+        runner.on("df -Pk /", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 200000000 1000000 199000000 1% /\n"));
         runner.on("ssh -V", ok(""));
         runner.on("rsync --version", ok("rsync 3\n"));
         runner.on("gh --version", ok("gh version 2\n"));
@@ -1612,6 +1767,7 @@ recipe = "claude_fable_xhigh"
         runner.on("herdr --version", ok(version));
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
+        runner.on("df -Pk /", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 200000000 1000000 199000000 1% /\n"));
         runner.on("ssh -V", ok(""));
         runner.on("rsync --version", ok("rsync 3\n"));
         runner.on("gh --version", ok("gh version 2\n"));
@@ -2371,6 +2527,67 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
+    fn doctor_lists_an_orphan_box_build_folder_with_its_size() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
+        let runner = runner_with_machine_list(
+            "herdr 0.9.1\n",
+            r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#,
+        );
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        let facts = box_facts().replace(
+            "__HERDR_BUILDS_DONE__",
+            "2662400\t/home/ubuntu/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__",
+        );
+        runner.on("ssh", ok(&facts));
+        probe_fakes(&runner);
+
+        let (text, healthy) = report(
+            &env,
+            &home.path().join("root"),
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+
+        assert!(!healthy, "{text}");
+        assert!(text.contains("[FAIL] finished worktrees oci"), "{text}");
+        assert!(text.contains("demo-t-0099 (2.5 GiB)"), "{text}");
+    }
+
+    #[test]
+    fn configured_free_disk_threshold_gates_the_local_machine() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("cfg");
+        write_routing_config(&config);
+        let mut text = std::fs::read_to_string(config.join("config.toml")).unwrap();
+        text.push_str("\n[doctor]\nmin_free_disk_gb = 250\n");
+        std::fs::write(config.join("config.toml"), text).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+
+        let (text, healthy) = report(
+            &env,
+            &home.path().join("root"),
+            &config,
+            &SessionFlags::default(),
+            &runner,
+        );
+
+        assert!(!healthy, "{text}");
+        assert!(text.contains("[FAIL] machine local disk"), "{text}");
+        assert!(text.contains("refuses below 250 GB free"), "{text}");
+    }
+
+    #[test]
     fn report_uses_configured_recipe_overrides_for_box_logins() {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("cfg");
@@ -2501,7 +2718,7 @@ recipe = "claude_fable_xhigh"
         for recipe in recipes.values_mut() {
             recipe.enabled = true;
         }
-        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
         assert!(rows.iter().all(|row| row.0 == Some(true)), "{rows:?}");
         assert_eq!(
             rows.iter()
@@ -2541,7 +2758,7 @@ recipe = "claude_fable_xhigh"
                     ..Default::default()
                 },
             )]);
-            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
             let login = rows
                 .iter()
                 .find(|row| row.1 == format!("box oci login {kind}"))
@@ -2573,7 +2790,7 @@ recipe = "claude_fable_xhigh"
             let runner = FakeRunner::new();
             runner.on("ssh", ok(&box_facts()));
             probe_fakes(&runner);
-            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
             assert!(
                 !rows
                     .iter()
@@ -2614,7 +2831,7 @@ recipe = "claude_fable_xhigh"
                 },
             ),
         ]);
-        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes);
+        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
         for id in ["unknown", "mismatch"] {
             assert_eq!(
                 rows.iter()
@@ -2657,6 +2874,7 @@ recipe = "claude_fable_xhigh"
         for provider in crate::pi::recipes::enabled_providers() {
             lines.push(format!("pi_{provider}\tok"));
         }
+        lines.extend(["__HERDR_BUILDS__".into(), "__HERDR_BUILDS_DONE__".into()]);
         lines.join("\n") + "\n"
     }
 
@@ -2687,7 +2905,7 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
         probe_fakes(&runner);
-        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes());
+        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 12.0);
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -2708,6 +2926,15 @@ recipe = "claude_fable_xhigh"
         );
         assert_eq!(find("box oci capacity").0, Some(true));
         assert!(find("box oci capacity").1.contains("refuses below 12 GB"));
+        let configured = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 120.0);
+        assert_eq!(
+            configured
+                .iter()
+                .find(|row| row.1 == "box oci capacity")
+                .unwrap()
+                .0,
+            Some(false)
+        );
         let calls = runner.calls.borrow();
         let ssh = calls
             .iter()
@@ -2751,7 +2978,7 @@ recipe = "claude_fable_xhigh"
 
         let runner = FakeRunner::new();
         runner.on("ssh", fail(255, "ssh: connect timed out"));
-        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes());
+        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 12.0);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, Some(false));
         assert!(rows[0].2.contains("unreachable"));
@@ -2774,7 +3001,7 @@ recipe = "claude_fable_xhigh"
             ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
         );
         runner.on("workspace close", ok(r#"{"result":{}}"#));
-        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes());
+        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 12.0);
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -2804,7 +3031,7 @@ recipe = "claude_fable_xhigh"
     }
 
     fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
-        box_rows(runner, "herdr", &box_profile(), &default_recipes())
+        box_rows(runner, "herdr", &box_profile(), &default_recipes(), 12.0)
             .into_iter()
             .find(|(_, name, _)| name == label)
             .unwrap_or_else(|| panic!("no row {label}"))

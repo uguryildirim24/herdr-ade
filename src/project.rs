@@ -648,8 +648,8 @@ pub(crate) fn tab_env(
         );
         env.push(format!("PATH={}", crate::contracts::BOX_PATH));
         env.push(format!(
-            "CARGO_TARGET_DIR={}/{slug}-{thread}",
-            crate::contracts::BOX_BUILD
+            "CARGO_TARGET_DIR={}",
+            crate::contracts::box_build_folder(slug, thread)
         ));
     } else {
         // Keep the established local-lane argv unchanged.

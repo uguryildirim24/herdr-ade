@@ -27,11 +27,26 @@ pub struct DispatchConfig {
     pub machine: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DoctorConfig {
+    pub min_free_disk_gb: f64,
+}
+
+impl Default for DoctorConfig {
+    fn default() -> Self {
+        Self {
+            min_free_disk_gb: 12.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchConfig {
     pub recipes: BTreeMap<String, Recipe>,
     pub dispatch: DispatchConfig,
     pub routing: crate::routing::Routing,
+    pub doctor: DoctorConfig,
     pub policy_hash: String,
 }
 
@@ -41,22 +56,48 @@ struct RawConfig {
     recipes: BTreeMap<String, Recipe>,
     dispatch: DispatchConfig,
     routing: crate::routing::Routing,
+    doctor: DoctorConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DoctorOnlyConfig {
+    doctor: DoctorConfig,
+}
+
+fn config_text(config_dir: &Path) -> Result<String> {
+    let file = config_dir.join("config.toml");
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", file.display())),
+    }
+}
+
+fn validate_doctor_config(config: &DoctorConfig) -> Result<()> {
+    if !config.min_free_disk_gb.is_finite() || config.min_free_disk_gb < 0.0 {
+        bail!("doctor_min_free_disk_invalid: [doctor].min_free_disk_gb must be zero or greater");
+    }
+    Ok(())
+}
+
+pub fn doctor_config(config_dir: &Path) -> Result<DoctorConfig> {
+    let raw: DoctorOnlyConfig =
+        toml::from_str(&config_text(config_dir)?).context("config.toml does not parse")?;
+    validate_doctor_config(&raw.doctor)?;
+    Ok(raw.doctor)
 }
 
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
-    let file = config_dir.join("config.toml");
-    let text = match std::fs::read_to_string(&file) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
-    };
-    let value: toml::Value = toml::from_str(&text).context("config.toml does not parse")?;
+    let value: toml::Value =
+        toml::from_str(&config_text(config_dir)?).context("config.toml does not parse")?;
     if value.get("roles").is_some() {
         bail!(
             "roles_removed: remove [roles] and every [roles.*] table from config.toml; keep model rows in [recipes.*]"
         );
     }
     let raw: RawConfig = value.try_into()?;
+    validate_doctor_config(&raw.doctor)?;
     let mut recipes = builtin_recipes();
     // A configured row is a complete recipe, not an old inline role or a partial patch.
     recipes.extend(raw.recipes);
@@ -67,6 +108,7 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
         recipes,
         dispatch: raw.dispatch,
         routing: raw.routing,
+        doctor: raw.doctor,
         policy_hash,
     };
     config.routing.validate(&config.recipes)?;

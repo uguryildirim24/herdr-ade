@@ -53,6 +53,12 @@ pub(crate) const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";
 /// The box's per-lane build folders (SPEC-remote §3.2).
 pub(crate) const BOX_BUILD: &str = "/home/ubuntu/build/lanes";
 
+/// One remote lane's rebuildable Cargo output. The project slug keeps thread
+/// ids from different ADE projects separate without introducing another path.
+pub(crate) fn box_build_folder(slug: &str, thread: &str) -> String {
+    format!("{BOX_BUILD}/{slug}-{thread}")
+}
+
 /// The fixed box command prefix `/home/ubuntu/.local/bin/herdr-ade --root
 /// /home/ubuntu/.herdr-ade` (SPEC-remote D12/D14, §4.2 step 6).
 pub(crate) fn box_prefix() -> String {
