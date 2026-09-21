@@ -1900,6 +1900,9 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
 /// reported on its own line; it never fails the lifecycle operation
 /// (SPEC-talk §6.5).
 pub fn refresh_plan(ctx: &Ctx, project: &Project) {
+    if let Err(e) = crate::task::refresh_tasks_md(project) {
+        eprintln!("note: the task list refresh failed: {e:#}");
+    }
     if let Err(e) = crate::plan::refresh(ctx, project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }

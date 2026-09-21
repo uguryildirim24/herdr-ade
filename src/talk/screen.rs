@@ -1674,7 +1674,7 @@ mod tests {
         });
         o.sections[3].push(overview::Row {
             text: long.into(),
-            prefix: "checking".into(),
+            prefix: "reviewed".into(),
             marker: "box last seen".into(),
             tone: Tone::Yellow,
         });
@@ -1710,7 +1710,7 @@ mod tests {
         assert!(compact.iter().any(|line| line.ends_with("f-0001")));
         let marked = compact
             .iter()
-            .find(|line| line.contains("checking"))
+            .find(|line| line.contains("reviewed"))
             .unwrap();
         assert!(
             marked.contains('…') && marked.ends_with("box last seen"),

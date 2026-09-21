@@ -1,6 +1,6 @@
 //! Read-only projection of the existing project records. Step state comes
 //! from plan::project_states, the very same projection used by plan sync.
-use super::{Entry, Journal, cost::Cost, stale::Stale, tasks, view::Conversation};
+use super::{Entry, Journal, cost::Cost, stale::Stale, view::Conversation};
 use crate::{
     contracts::StepState,
     decide, glossary,
@@ -102,16 +102,6 @@ pub(crate) struct Overview {
     pub(crate) cost: Vec<Row>,
     /// LEAN U5: Rolf's lists, each with its heading and one line per task.
     pub(crate) tasks: Vec<Row>,
-}
-
-/// One workflow word for a thread group, the same words Running now uses.
-fn state_word(group: Group) -> &'static str {
-    match group {
-        Group::WaitingOnYou => "needs you",
-        Group::Unknown => "unknown",
-        Group::ReadyForReview | Group::Landing => "checking",
-        _ => "working",
-    }
 }
 
 /// One shared poll for all local rows and the coordinator. Remote records
@@ -323,17 +313,6 @@ impl Overview {
         }
         let (mut tasks, failed) = records::<thread::Thread>(&project.dir().join("threads"));
         tasks.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
-        let known: BTreeMap<String, Group> = tasks
-            .iter()
-            .map(|t| {
-                let group = if t.status == Status::Resolved {
-                    Group::ReadyForReview
-                } else {
-                    live.group(t)
-                };
-                (t.id.clone(), group)
-            })
-            .collect();
         let (rounds, rounds_failed) =
             records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));
         let mut seen_work = BTreeSet::new();
@@ -370,7 +349,8 @@ impl Overview {
                 }
                 Group::WaitingOnYou => ("needs you", Tone::Red),
                 Group::Unknown => ("unknown", Tone::Peach),
-                Group::ReadyForReview | Group::Landing => ("checking", Tone::Yellow),
+                Group::ReadyForReview => ("finished", Tone::Yellow),
+                Group::Landing => ("reviewed", Tone::Yellow),
                 _ => ("working", Tone::Yellow),
             };
             let marker = match (t.is_remote(), live.reachable) {
@@ -540,54 +520,41 @@ impl Overview {
             });
         }
         out.cost = cost_rows(&live.cost);
-        let (tasks, open_tasks) = task_rows(project, &known);
+        let (tasks, open_tasks) = task_rows(project);
         out.tasks = tasks;
         out.active = open_tasks;
         out
     }
 }
 
-/// One line per task, a heading per list, and the thread state for a
-/// delegated task (LEAN U5).
-fn task_rows(project: &Project, known: &BTreeMap<String, Group>) -> (Vec<Row>, usize) {
-    let (lists, failed) = tasks::load(project);
+/// One line per stable task. The marker is the same evidence-derived word
+/// shown by TASKS.md, context and the plan projection.
+fn task_rows(project: &Project) -> (Vec<Row>, usize) {
+    let (views, errors) = crate::task::views(project);
     let mut rows = Vec::new();
-    let mut count = 0;
-    if failed {
+    if !errors.is_empty() {
         rows.push(Row::text(TASKS_ERROR));
     }
-    for list in &lists {
-        if list.tasks.is_empty() {
-            continue;
-        }
-        rows.push(Row {
-            text: list.heading.clone(),
-            prefix: String::new(),
-            marker: String::new(),
-            tone: Tone::Heading,
-        });
-        for task in &list.tasks {
-            count += 1;
-            let marker = task
-                .thread
-                .as_ref()
-                .and_then(|id| known.get(id))
-                .map(|group| state_word(*group))
-                .unwrap_or("");
-            rows.push(tagged_with_marker(
-                project,
-                &task.owner,
-                &task.title,
-                marker,
-                Tone::Text,
-                TASK_INVALID,
-            ));
-        }
+    for view in &views {
+        rows.push(tagged_with_marker(
+            project,
+            view.state.word(),
+            &view.record.title,
+            &view.record.id,
+            match view.state {
+                crate::task::State::Verified | crate::task::State::Merged => Tone::Green,
+                crate::task::State::Failed | crate::task::State::Cancelled => Tone::Red,
+                crate::task::State::Unknown => Tone::Peach,
+                _ => Tone::Yellow,
+            },
+            TASK_INVALID,
+        ));
     }
-    if rows.is_empty() && !failed {
+    if rows.is_empty() && errors.is_empty() {
         rows.push(Row::text(NO_TASKS));
     }
-    (rows, count)
+    let open = views.iter().filter(|view| !view.terminal(project)).count();
+    (rows, open)
 }
 
 /// Today's money and tokens when the ledger has them, the current round when
@@ -709,7 +676,7 @@ mod tests {
         // The header counts the task list and the open questions, while the
         // running rows keep their own state words.
         assert_eq!(o.needs, 0);
-        assert_eq!(o.active, 2);
+        assert_eq!(o.active, 0);
         assert!(o.sections[3].iter().all(|r| {
             r.full_text()
                 .contains("needs you Build the screen. last seen")
@@ -808,7 +775,7 @@ mod tests {
         assert!(
             o.sections[3]
                 .iter()
-                .any(|r| r.prefix == "checking" && r.text.contains("Build the first screen."))
+                .any(|r| r.prefix == "finished" && r.text.contains("Build the first screen."))
         );
         assert_eq!(o.sections[4][0].text, EMPTY[4]);
         git(&review.worktree, &["merge", "-q", "--no-edit", &sha]);
@@ -1024,47 +991,6 @@ mod tests {
             o.sections[5]
                 .iter()
                 .any(|r| r.full_text() == "d-0001 overturned I kept the words short.")
-        );
-    }
-
-    #[test]
-    fn the_task_list_shows_lists_owners_and_a_delegated_thread_state() {
-        let fx = fixture();
-        let lane = fx.thread("Work");
-        thread::update(&fx.project, &lane, |t| {
-            t.plain = "Build the screen.".into();
-            t.last_group = "ready-for-review".into();
-        })
-        .unwrap();
-        std::fs::write(
-            fx.project.dir().join("TASKS.md"),
-            format!(
-                "# Tasks\n\n## Backlog\n- [ ] Write the screen (agent → {lane})\n- [ ] Ask Rolf (me)\n"
-            ),
-        )
-        .unwrap();
-        let o = Overview::load(
-            &fx.project,
-            &Journal::default(),
-            &Conversation::default(),
-            &Live::default(),
-        );
-        assert!(
-            o.tasks
-                .iter()
-                .any(|r| r.tone == Tone::Heading && r.text == "Backlog")
-        );
-        assert!(
-            o.tasks.iter().any(|r| {
-                r.prefix == "agent" && r.text == "Write the screen" && r.marker == "checking"
-            }),
-            "{:?}",
-            o.tasks
-        );
-        assert!(
-            o.tasks
-                .iter()
-                .any(|r| r.prefix == "me" && r.text == "Ask Rolf")
         );
     }
 
