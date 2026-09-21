@@ -423,11 +423,7 @@ pub(crate) fn skill(ctx: &Ctx, role: &str) -> Result<()> {
                 );
             }
             acknowledge_bootstrap(&binding)?;
-            let prefix = if binding.card.is_some() {
-                crate::contracts::box_prefix()
-            } else {
-                crate::coordinator::current_prefix(&ctx.root)?
-            };
+            let prefix = crate::coordinator::current_prefix(&ctx.root)?;
             print!("{}", crate::thread::commands_line(&prefix));
             print!("{}", skill_text(role));
         }

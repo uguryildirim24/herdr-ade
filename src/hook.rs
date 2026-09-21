@@ -30,6 +30,10 @@ struct Binding {
     pane: String,
     #[serde(default)]
     session_id: String,
+    /// The declaration used at install time, so removal and capture checks do
+    /// not depend on mutable global configuration.
+    #[serde(default)]
+    adapter: crate::adapters::Adapter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,26 +62,27 @@ enum ConfigShape {
     Cursor,
 }
 
-fn settings_path(project: &Project, kind: &str) -> Option<(PathBuf, ConfigShape)> {
-    match kind {
-        "claude" => Some((
-            project.dir().join(".claude").join("settings.local.json"),
-            ConfigShape::ClaudeLike,
-        )),
-        "codex" => Some((
-            project.dir().join(".codex").join("hooks.json"),
-            ConfigShape::ClaudeLike,
-        )),
-        "cursor" => Some((
-            project.dir().join(".cursor").join("hooks.json"),
-            ConfigShape::Cursor,
-        )),
-        _ => None,
-    }
+fn settings_path(
+    project: &Project,
+    adapter: &crate::adapters::Adapter,
+) -> Option<(PathBuf, ConfigShape)> {
+    let shape = match adapter.hook.shape.as_str() {
+        "claude" => ConfigShape::ClaudeLike,
+        "cursor" => ConfigShape::Cursor,
+        _ => return None,
+    };
+    crate::adapters::settings_path(&project.dir(), adapter).map(|path| (path, shape))
 }
 
 pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<bool> {
-    let Some((path, shape)) = settings_path(project, kind) else {
+    if kind.is_empty() {
+        return Ok(false);
+    }
+    let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
+    if !adapter.coordinator || !adapter.talk {
+        return Ok(false);
+    }
+    let Some((path, shape)) = settings_path(project, &adapter) else {
         return Ok(false);
     };
     let binary = std::env::current_exe().context("could not locate herdr-ade")?;
@@ -91,7 +96,7 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     );
     let _lock = project.lock()?;
     let mut value = read_json_object(&path)?;
-    install_entry(&mut value, shape, kind, &command)?;
+    install_entry(&mut value, shape, &adapter, &command)?;
     write_json_atomic(&path, &value)?;
     let dir = project.state_dir().join("plain");
     std::fs::create_dir_all(&dir)?;
@@ -102,9 +107,10 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
             project: project.slug.clone(),
             pane: pane.to_string(),
             session_id: String::new(),
+            adapter: adapter.clone(),
         },
     )?;
-    verify_owned_entry(&path, pane, shape, kind)?;
+    verify_owned_entry(&path, pane, shape, &adapter)?;
     Ok(true)
 }
 
@@ -112,11 +118,11 @@ pub(crate) fn remove(project: &Project) -> Result<()> {
     let _lock = project.lock()?;
     let binding: Option<Binding> = project::read_json(&binding_path(project));
     if let Some(binding) = binding
-        && let Some((path, shape)) = settings_path(project, &binding.kind)
+        && let Some((path, shape)) = settings_path(project, &binding.adapter)
         && path.exists()
     {
         let mut value = read_json_object(&path)?;
-        remove_entries(&mut value, shape, &binding.kind);
+        remove_entries(&mut value, shape, &binding.adapter);
         write_json_atomic(&path, &value)?;
     }
     let _ = std::fs::remove_file(binding_path(project));
@@ -132,25 +138,18 @@ pub(crate) fn captures(project: &Project, pane: &str) -> bool {
     if binding.pane != pane {
         return false;
     }
-    settings_path(project, &binding.kind)
-        .is_some_and(|(_, shape)| owned_events(shape, &binding.kind).contains(&"UserPromptSubmit"))
+    settings_path(project, &binding.adapter).is_some_and(|_| {
+        !binding.adapter.hook.prompt_event.is_empty()
+            && binding
+                .adapter
+                .hook
+                .events
+                .contains(&binding.adapter.hook.prompt_event)
+    })
 }
 
-/// The hook events this kind installs. Only Claude Code exposes a
-/// prompt-submit event; the other kinds keep their end-of-turn checks.
-fn owned_events(shape: ConfigShape, kind: &str) -> &'static [&'static str] {
-    match shape {
-        ConfigShape::ClaudeLike if kind == "claude" => &["Stop", "UserPromptSubmit"],
-        ConfigShape::ClaudeLike => &["Stop"],
-        ConfigShape::Cursor => &["afterAgentResponse", "stop"],
-    }
-}
-
-fn event_phase(event: &str) -> Option<&'static str> {
-    match event {
-        "UserPromptSubmit" => Some("prompt"),
-        _ => None,
-    }
+fn event_phase<'a>(adapter: &'a crate::adapters::Adapter, event: &str) -> Option<&'a str> {
+    (event == adapter.hook.prompt_event).then_some("prompt")
 }
 
 fn owned_hook(value: &serde_json::Value) -> bool {
@@ -167,7 +166,7 @@ fn owned_hook(value: &serde_json::Value) -> bool {
 fn install_entry(
     value: &mut serde_json::Value,
     shape: ConfigShape,
-    kind: &str,
+    adapter: &crate::adapters::Adapter,
     command: &str,
 ) -> Result<()> {
     let object = value
@@ -183,16 +182,16 @@ fn install_entry(
         .context("hook_config_invalid: `hooks` is not an object")?;
     match shape {
         ConfigShape::ClaudeLike => {
-            for event in owned_events(shape, kind) {
+            for event in &adapter.hook.events {
                 let entries = hooks
-                    .entry(*event)
+                    .entry(event.clone())
                     .or_insert_with(|| serde_json::json!([]))
                     .as_array_mut()
                     .with_context(|| {
                         format!("hook_config_invalid: `hooks.{event}` is not an array")
                     })?;
                 entries.retain(|entry| !owned_hook(entry));
-                let command = match event_phase(event) {
+                let command = match event_phase(adapter, event) {
                     Some(phase) => format!("{command} --phase {phase}"),
                     None => command.to_string(),
                 };
@@ -203,7 +202,14 @@ fn install_entry(
             }
         }
         ConfigShape::Cursor => {
-            for (event, phase) in [("afterAgentResponse", "observe"), ("stop", "stop")] {
+            for event in &adapter.hook.events {
+                let phase = if event == &adapter.hook.prompt_event {
+                    "prompt"
+                } else if event == "stop" {
+                    "stop"
+                } else {
+                    "observe"
+                };
                 let entries = hooks
                     .entry(event)
                     .or_insert_with(|| serde_json::json!([]))
@@ -222,11 +228,15 @@ fn install_entry(
     Ok(())
 }
 
-fn remove_entries(value: &mut serde_json::Value, shape: ConfigShape, kind: &str) {
-    for name in owned_events(shape, kind) {
+fn remove_entries(
+    value: &mut serde_json::Value,
+    _shape: ConfigShape,
+    adapter: &crate::adapters::Adapter,
+) {
+    for name in &adapter.hook.events {
         if let Some(entries) = value
             .get_mut("hooks")
-            .and_then(|hooks| hooks.get_mut(*name))
+            .and_then(|hooks| hooks.get_mut(name))
             .and_then(serde_json::Value::as_array_mut)
         {
             entries.retain(|entry| !owned_hook(entry));
@@ -234,9 +244,14 @@ fn remove_entries(value: &mut serde_json::Value, shape: ConfigShape, kind: &str)
     }
 }
 
-fn verify_owned_entry(path: &Path, pane: &str, shape: ConfigShape, kind: &str) -> Result<()> {
+fn verify_owned_entry(
+    path: &Path,
+    pane: &str,
+    _shape: ConfigShape,
+    adapter: &crate::adapters::Adapter,
+) -> Result<()> {
     let value = read_json_object(path)?;
-    let names = owned_events(shape, kind);
+    let names = &adapter.hook.events;
     let found: usize = names
         .iter()
         .map(|event| {
@@ -292,10 +307,12 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     if phase != "observe" {
         crate::talk::mark_accepted(&project)?;
     }
-    if kind == "cursor" && phase == "stop" {
+    let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
+    let cursor_shape = adapter.hook.shape == "cursor";
+    if cursor_shape && phase == "stop" {
         return cursor_stop(ctx, &project, kind);
     }
-    let text = reply_text(kind, &input).unwrap_or_default();
+    let text = crate::adapters::reply_text(&adapter, &input).unwrap_or_default();
     // An oversize reply is a failed check like any other: it spends the
     // turn's budget and ends in the fixed notice, never a block loop.
     let (text, oversize) = if text.len() > INPUT_LIMIT {
@@ -303,7 +320,7 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     } else {
         (text, false)
     };
-    let turn = if kind == "cursor" {
+    let turn = if cursor_shape {
         project::read_json::<CursorPending>(&cursor_pending_path(&project))
             .map(|pending| pending.turn)
             .map_or_else(|| turn_key(&project, session, &input, text), Ok)?
@@ -323,7 +340,7 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     let messages = match parse_envelopes(text) {
         Ok(messages) => messages,
         Err(error) => {
-            if kind == "cursor" && phase == "observe" {
+            if cursor_shape && phase == "observe" {
                 return save_cursor_pending(&project, session, &turn, text, &error.to_string());
             }
             return failed_check(ctx, &project, kind, session, &turn, &error.to_string());
@@ -334,13 +351,13 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
             .err()
             .map(|error| error.to_string())
     }) {
-        if kind == "cursor" && phase == "observe" {
+        if cursor_shape && phase == "observe" {
             return save_cursor_pending(&project, session, &turn, text, &reason);
         }
         return failed_check(ctx, &project, kind, session, &turn, &reason);
     }
     publish(ctx, &project, session, &turn, &messages)?;
-    if kind == "cursor" {
+    if cursor_shape {
         let _ = std::fs::remove_file(cursor_pending_path(&project));
     }
     Ok(())
@@ -428,19 +445,6 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
     }
 }
 
-fn reply_text<'a>(kind: &str, input: &'a serde_json::Value) -> Option<&'a str> {
-    match kind {
-        "claude" => input["last_assistant_message"].as_str(),
-        "cursor" => input["text"]
-            .as_str()
-            .or_else(|| input["response"].as_str()),
-        "codex" => input["last_assistant_message"]
-            .as_str()
-            .or_else(|| input["text"].as_str()),
-        _ => None,
-    }
-}
-
 /// The human turn this stop belongs to. A native id wins. Claude sends none:
 /// its first stop of a turn has `stop_hook_active = false` and starts a new
 /// turn (a fresh budget and fresh publication keys); a continuation has it
@@ -504,7 +508,7 @@ fn failed_check(
     if !expired && budget.corrections < MAX_CORRECTIONS {
         budget.corrections += 1;
         save_budget(project, session, &budget)?;
-        return correction(kind, reason);
+        return correction(ctx, kind, reason);
     }
     publish(
         ctx,
@@ -517,14 +521,12 @@ fn failed_check(
     )
 }
 
-fn correction(kind: &str, reason: &str) -> Result<()> {
+fn correction(ctx: &Ctx, kind: &str, reason: &str) -> Result<()> {
     let reason = format!("Rewrite the reply for the plain-language check: {reason}");
-    let value = match kind {
-        "cursor" => serde_json::json!({ "followup_message": reason }),
-        "claude" | "codex" => serde_json::json!({ "decision": "block", "reason": reason }),
-        _ => return Ok(()),
-    };
-    println!("{}", serde_json::to_string(&value)?);
+    let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
+    if let Some(value) = crate::adapters::correction(&adapter, &reason) {
+        println!("{}", serde_json::to_string(&value)?);
+    }
     Ok(())
 }
 

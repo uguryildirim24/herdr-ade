@@ -611,14 +611,13 @@ pub(crate) fn tab_env(
     thread: &str,
     attempt: u32,
     brief_hash: &str,
-    machine: &str,
+    machine: Option<&crate::remote::MachineDeclaration>,
     spec: &RoleSpec,
 ) -> Vec<String> {
     let mut env = vec![format!(
         "HERDR_ADE_LAUNCH={slug}/{thread}/{attempt}/{brief_hash}"
     )];
-    let remote = !machine.is_empty() && machine != crate::contracts::MACHINE_LOCAL;
-    if remote {
+    if let Some(machine) = machine {
         // These three values are the box binding, wrapper path and isolated
         // build folder. A recipe cannot replace them with Mac-side values.
         env.extend(
@@ -631,10 +630,10 @@ pub(crate) fn tab_env(
                 })
                 .cloned(),
         );
-        env.push(format!("PATH={}", crate::contracts::BOX_PATH));
+        env.push(format!("PATH={}", machine.path));
         env.push(format!(
             "CARGO_TARGET_DIR={}/{slug}-{thread}",
-            crate::contracts::BOX_BUILD
+            machine.build
         ));
     } else {
         // Keep the established local-lane argv unchanged.
@@ -1071,7 +1070,7 @@ mod tests {
         };
         let recipe = launch_recipe(&spec, 1, "bh".into(), "ph".into(), "lane");
         assert_eq!(recipe.ready_timeout_ms, 20_000);
-        let env = tab_env("demo", "t-0001", 1, "abcd", "", &spec);
+        let env = tab_env("demo", "t-0001", 1, "abcd", None, &spec);
         assert!(
             env.iter()
                 .any(|e| e == "HERDR_ADE_LAUNCH=demo/t-0001/1/abcd")

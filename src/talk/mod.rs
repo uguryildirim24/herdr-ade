@@ -389,24 +389,24 @@ pub(crate) fn take_pending_prompt(
 
 // ------------------------------------------------------------- settings
 
-/// `talk` in `PROJECT.md` front matter, else on for a `claude` coordinator.
+/// `talk` in `PROJECT.md` front matter, otherwise on for every coordinator
+/// adapter. Coordinator admission checks the adapter's declared support.
 pub(crate) fn enabled(project: &Project) -> bool {
     if let Ok((settings, _)) = project.read_project_md()
         && let Some(on) = settings.talk
     {
         return on;
     }
-    coordinator_kind(project) == "claude"
+    true
 }
 
-/// The kind the coordinator was launched with (the `coordinator` role at
-/// `open`, SPEC-ADE D2); `claude`, the plugin default, before the first open.
+/// The kind the coordinator was launched with (the `coordinator` workflow).
 pub(crate) fn coordinator_kind(project: &Project) -> String {
     project
         .coordinator()
         .map(|c| c.launch.kind)
         .filter(|kind| !kind.is_empty())
-        .unwrap_or_else(|| "claude".into())
+        .unwrap_or_default()
 }
 
 /// Per-kind labels (D17 item 2, D18 item 5). The shipped capability table is

@@ -12,6 +12,8 @@ pub(crate) struct Recipe {
     pub(crate) env: Vec<String>,
     pub(crate) ready_timeout_ms: u64,
     pub(crate) provider: String,
+    /// Runtime features this recipe can satisfy (for example `pictures`).
+    pub(crate) capabilities: Vec<String>,
     pub(crate) enabled: bool,
     pub(crate) plain: String,
 }
@@ -24,6 +26,7 @@ impl Default for Recipe {
             env: Vec::new(),
             ready_timeout_ms: 30_000,
             provider: String::new(),
+            capabilities: Vec::new(),
             enabled: true,
             plain: String::new(),
         }
@@ -36,43 +39,6 @@ pub(crate) const MACHINE_LOCAL: &str = "local";
 /// The local machine's display label, the one herdr's sidebar shows. It is the
 /// machine part of a cross-machine `parent` token (the fork lane t-0053 form).
 pub(crate) const MACHINE_LOCAL_LABEL: &str = "Local";
-
-/// The box's PATH, passed to every box lane's `tab create --env`
-/// (SPEC-remote §3.3, check c C4).
-pub(crate) const BOX_PATH: &str =
-    "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
-/// The box user's home, the cwd for a doctor probe pane (SPEC-remote §3.3).
-pub(crate) const BOX_HOME: &str = "/home/ubuntu";
-/// The plugin binary and ADE root on the box (SPEC-remote §4.2 step 6).
-const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
-/// The pi binary on the box: `setup`, `login`, `doctor` and `check` are
-/// `herdr-pi` verbs, so a pi readiness probe never runs through [`BOX_BIN`]
-/// (SPEC-remote §4.2 step 6).
-pub(crate) const BOX_PI_BIN: &str = "/home/ubuntu/.local/bin/herdr-pi";
-pub(crate) const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";
-/// The box's per-lane build folders (SPEC-remote §3.2).
-pub(crate) const BOX_BUILD: &str = "/home/ubuntu/build/lanes";
-
-/// The fixed box command prefix `/home/ubuntu/.local/bin/herdr-ade --root
-/// /home/ubuntu/.herdr-ade` (SPEC-remote D12/D14, §4.2 step 6).
-pub(crate) fn box_prefix() -> String {
-    format!("{BOX_BIN} --root {BOX_ROOT}")
-}
-
-/// One box `sh -c` script with `PATH` set and exported before the script
-/// (SPEC-remote §3.3, t-0049). A non-login SSH shell starts with a bare
-/// `PATH`, so `node`, the `pi` wrapper and the rest of the box tools would be
-/// invisible without this. Exporting keeps the path for every command, even
-/// when the script starts with a regular builtin. Every SSH script the plugin
-/// runs on the box goes through here.
-pub(crate) fn with_box_path(script: &str) -> String {
-    format!("PATH={BOX_PATH}; export PATH\n{script}")
-}
-
-/// The box path of one lane's card (SPEC-remote §4.3).
-pub(crate) fn box_lane_card(slug: &str, thread: &str) -> String {
-    format!("{BOX_ROOT}/{slug}/lanes/{thread}.toml")
-}
 
 /// A saved machine's stable profile (SPEC-remote §4.1). `id` is the plugin's
 /// identity; `label` is renameable and is only shown.
@@ -89,30 +55,6 @@ impl MachineProfile {
         self.id == MACHINE_LOCAL || self.label == MACHINE_LOCAL
     }
 }
-
-/// One row of the Mac→box repository map (SPEC-remote §4.1). The plugin never
-/// derives a box path from a Mac path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoxRepoMap {
-    pub(crate) mac: &'static str,
-    pub(crate) box_path: &'static str,
-    pub(crate) publish_url: &'static str,
-}
-
-/// The committed default map: the two tool repositories. Other projects add
-/// their own row before first remote use.
-pub(crate) const BOX_REPOS: &[BoxRepoMap] = &[
-    BoxRepoMap {
-        mac: "/home/agent/projects/herdr",
-        box_path: "/home/ubuntu/projects/herdr",
-        publish_url: "https://github.com/uguryildirim24/herdr.git",
-    },
-    BoxRepoMap {
-        mac: "/home/agent/projects/herdr-ade",
-        box_path: "/home/ubuntu/projects/herdr-ade",
-        publish_url: "https://github.com/uguryildirim24/herdr-ade.git",
-    },
-];
 
 /// The box's copy of one lane's start record (SPEC-remote §4.2 step 5, §4.3).
 /// Written by the Mac after the box pane id exists; the box validates
@@ -985,6 +927,7 @@ mod tests {
             env: vec![],
             ready_timeout_ms: 30_000,
             provider: "cursor".into(),
+            capabilities: vec!["pictures".into()],
             enabled: true,
             plain: "the usual coding helper".into(),
         };

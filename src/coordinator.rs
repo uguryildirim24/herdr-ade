@@ -236,12 +236,21 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             "coordinator",
         ),
     };
+    if !launch.kind.is_empty() {
+        let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
+        if !adapter.coordinator || !adapter.talk {
+            bail!(
+                "coordinator_unsupported: adapter `{}` does not declare coordinator and talk support",
+                launch.kind
+            );
+        }
+    }
     let env = project::tab_env(
         slug,
         "coordinator",
         launch.attempt,
         &launch.brief_hash,
-        "",
+        None,
         &spec,
     );
     let (workspace_id, tab_id, pane_id) = if let Some(record) = reusable {
