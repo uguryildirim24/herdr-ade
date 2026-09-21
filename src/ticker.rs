@@ -735,7 +735,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         // binding clears `prime_pending` only on its `ha context` receipt, and
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
         if record.prime_pending && !record.prime_sent && agent.ready() {
-            match herdr.agent_prompt(&record.pane_id, &coordinator::priming_prompt(&prefix, slug)) {
+            let prompt = coordinator::priming_prompt(&prefix, slug);
+            crate::talk::mark_automated_prompt(project, &record.pane_id, &prompt)?;
+            match herdr.agent_prompt(&record.pane_id, &prompt) {
                 Ok(()) => {
                     project.update_coordinator(|c| c.prime_sent = true)?;
                 }

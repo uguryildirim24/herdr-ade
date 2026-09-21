@@ -18,6 +18,8 @@ pub(crate) const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 /// The digest is a work queue, not an archive. Full records remain at the
 /// source named by each overflow notice. Apply this to nested lists too.
 const DIGEST_ROWS: usize = 20;
+/// How many of Rolf's latest messages the digest prints so an id is findable.
+const REQUEST_ROWS: usize = 5;
 
 fn overflow(out: &mut String, total: usize, source: &str) {
     if total > DIGEST_ROWS {
@@ -318,14 +320,16 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// Sends the priming prompt now when the agent is ready for one; otherwise
 /// leaves `prime_pending` set so the ticker delivers it. One delivery path.
 fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &str) -> Result<()> {
-    let sent = agent.ready()
-        && match herdr.agent_prompt(&agent.pane_id, prompt) {
+    let sent = agent.ready() && {
+        crate::talk::mark_automated_prompt(project, &agent.pane_id, prompt)?;
+        match herdr.agent_prompt(&agent.pane_id, prompt) {
             Ok(()) => true,
             Err(error) => {
                 println!("the priming prompt was not accepted ({error})");
                 false
             }
-        };
+        }
+    };
     // Transport is not the bootstrap receipt: `prime_pending` clears only when
     // the matching `ha context` call records `bootstrap = acknowledged`.
     project.update_coordinator(|c| {
@@ -457,6 +461,20 @@ fn digest_snapshot(
         }
         Err(error) => {
             let _ = writeln!(out, "config-error: {error:#}");
+        }
+    }
+
+    // Rolf's own words, each under the request id `ha decide --basis` cites.
+    let requests = crate::talk::recent_requests(project, REQUEST_ROWS);
+    if !requests.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## Latest messages from Rolf — cite one with --basis request:<id>"
+        );
+        for (request, text) in &requests {
+            let first = text.lines().next().unwrap_or_default();
+            let short: String = first.chars().take(160).collect();
+            let _ = writeln!(out, "- {request}: {short}");
         }
     }
 

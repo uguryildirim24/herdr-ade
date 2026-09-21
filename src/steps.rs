@@ -182,7 +182,9 @@ pub(crate) fn deliver_event(
     let Some(_agent) = agent else {
         return Ok(());
     };
-    herdr.agent_prompt(&event.recipient.pane, &crate::events::typed_line(event)?)?;
+    let line = crate::events::typed_line(event)?;
+    crate::talk::mark_automated_prompt(project, &event.recipient.pane, &line)?;
+    herdr.agent_prompt(&event.recipient.pane, &line)?;
     crate::events::append_delivery(
         project,
         &event.id,
@@ -948,6 +950,7 @@ pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Resu
     if !ready {
         return Ok(false);
     }
+    crate::talk::mark_automated_prompt(project, &record.pane_id, text)?;
     herdr.agent_prompt(&record.pane_id, text)?;
     Ok(true)
 }
@@ -1025,6 +1028,7 @@ pub(crate) fn nudge(
         if crate::talk::writer_suspended(project) {
             return Ok(());
         }
+        crate::talk::mark_automated_prompt(project, pane, NUDGE_TEXT)?;
         herdr.agent_prompt(pane, NUDGE_TEXT)?;
     } else {
         let body = format!(
