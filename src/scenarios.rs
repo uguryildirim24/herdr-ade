@@ -617,7 +617,7 @@ fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
     });
     record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
     world.runner.on(
-        "status --porcelain --untracked-files=all",
+        "status --porcelain --ignored --untracked-files=all",
         ok("?? scratch.txt\n"),
     );
 
@@ -633,6 +633,106 @@ fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
 }
 
 #[test]
+fn resolving_ignored_data_keeps_the_worktree_but_resolves_the_thread() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let worktree = world.home.path().join("data-worktree");
+    std::fs::create_dir_all(worktree.join("camber-runs")).unwrap();
+    std::fs::write(worktree.join("camber-runs/raw.bin"), vec![0; 2048]).unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    world.runner.on(
+        "status --porcelain --ignored --untracked-files=all",
+        ok("!! camber-runs/raw.bin\n"),
+    );
+
+    let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
+
+    assert_eq!(outcome.worktree, "kept");
+    let reason = outcome.worktree_reason.unwrap();
+    assert!(reason.starts_with("ignored_data:"), "{reason}");
+    assert!(
+        reason.contains("camber-runs") && reason.contains("KiB"),
+        "{reason}"
+    );
+    let kept = thread::load(&project, &t.id).unwrap();
+    assert_eq!(kept.status, Status::Resolved);
+    assert_eq!(kept.worktree_path, worktree.to_string_lossy());
+    assert_eq!(world.runner.count("worktree remove"), 0);
+    assert!(
+        !std::fs::read_to_string(world.home.path().join("cfg/config.toml"))
+            .unwrap()
+            .contains("[worktrees]")
+    );
+}
+
+#[test]
+fn resolving_disposable_ignored_output_removes_the_worktree() {
+    let world = World::new();
+    let config = world.home.path().join("cfg/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[worktrees]\ndisposable = [\"target\"]\n");
+    std::fs::write(config, text).unwrap();
+    let project = world.project("demo", "a.sock");
+    let worktree = world.home.path().join("generated-worktree");
+    std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(worktree.join("target/debug/cache"), "generated").unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    world.runner.on(
+        "status --porcelain --ignored --untracked-files=all",
+        ok("!! target/debug/cache\n"),
+    );
+    world.runner.on("worktree remove", ok(""));
+
+    let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
+
+    assert_eq!(outcome.worktree, "removed");
+    assert_eq!(world.runner.count("worktree remove"), 1);
+}
+
+#[test]
+fn a_nested_worktree_is_kept_inside_a_disposable_folder() {
+    let world = World::new();
+    let config = world.home.path().join("cfg/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[worktrees]\ndisposable = [\"target\"]\n");
+    std::fs::write(config, text).unwrap();
+    let project = world.project("demo", "a.sock");
+    let worktree = world.home.path().join("nested-worktree");
+    std::fs::create_dir_all(worktree.join("target/child")).unwrap();
+    std::fs::write(
+        worktree.join("target/child/.git"),
+        "gitdir: /repo/.git/worktrees/child\n",
+    )
+    .unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    world.runner.on(
+        "status --porcelain --ignored --untracked-files=all",
+        ok("!! target/child/output.bin\n"),
+    );
+
+    let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
+
+    assert_eq!(outcome.worktree, "kept");
+    assert!(outcome.worktree_reason.unwrap().contains("target/child"),);
+    assert_eq!(
+        thread::load(&project, &t.id).unwrap().status,
+        Status::Resolved
+    );
+}
+
+#[test]
 fn resolving_a_clean_lane_from_an_abandoned_round_removes_its_worktree() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -645,7 +745,7 @@ fn resolving_a_clean_lane_from_an_abandoned_round_removes_its_worktree() {
     record_closed_round(&project, &t.id, "/repo", RoundPhase::Abandoned);
     world
         .runner
-        .on("status --porcelain --untracked-files=all", ok(""));
+        .on("status --porcelain --ignored --untracked-files=all", ok(""));
     world.runner.on("worktree remove", ok(""));
 
     threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
@@ -707,6 +807,62 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
             .worktree_path
             .is_empty()
     );
+}
+
+#[test]
+fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let t = world.thread(
+        &project,
+        Path::new("/home/ubuntu/projects/herdr-ade/.worktrees/t-0001"),
+        |thread| {
+            thread.repo = "/Users/rolfie/projects/herdr-ade".into();
+            thread.branch = "hp/demo/t-0001-task".into();
+            thread.machine = "oci".into();
+            thread.machine_id = "oci-id".into();
+        },
+    );
+    record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
+    world.runner.on(
+        "machine list --json",
+        ok(r#"[{"id":"oci-id","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
+    );
+    world.runner.on_fn(
+        |cmd| cmd.program == "ssh",
+        |cmd| {
+            let line = cmd.display();
+            if line.contains("status --porcelain --ignored --untracked-files=all") {
+                Ok(ok("!! runs/raw.bin\n\n__HERDR_NESTED_WORKTREES__\n"))
+            } else if line.contains("du -sk") {
+                Ok(ok(
+                    "4096\t/home/ubuntu/projects/herdr-ade/.worktrees/t-0001/runs\n",
+                ))
+            } else {
+                Ok(ok(""))
+            }
+        },
+    );
+
+    let outcome = threads::resolve(
+        &world.ctx(),
+        "demo",
+        &t.id,
+        &ResolveArgs {
+            skip_copy: true,
+            ..ResolveArgs::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(outcome.worktree, "kept");
+    let reason = outcome.worktree_reason.unwrap();
+    assert!(reason.starts_with("ignored_data:") && reason.contains("runs"));
+    assert_eq!(
+        thread::load(&project, &t.id).unwrap().status,
+        Status::Resolved
+    );
+    assert_eq!(world.runner.count("git worktree remove"), 0);
 }
 
 #[test]
