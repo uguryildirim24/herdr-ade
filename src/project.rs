@@ -137,6 +137,10 @@ pub(crate) struct Repo {
     /// The URL-matched remote the lane branch publishes to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) publish_url: Option<String>,
+    /// Rebuildable ignored paths specific to this repository. These are added
+    /// to the global worktree list and never apply to another repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) disposable: Vec<String>,
 }
 
 /// `PROJECT.md` front matter. `repos` is last so the TOML tables follow the

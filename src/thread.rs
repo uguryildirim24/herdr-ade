@@ -163,18 +163,42 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
-pub(crate) fn list(project: &Project) -> Vec<Thread> {
-    let Ok(entries) = std::fs::read_dir(threads_dir(project)) else {
-        return Vec::new();
+pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::Error>) {
+    let entries = match std::fs::read_dir(threads_dir(project)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => return (Vec::new(), vec![error.into()]),
     };
-    let mut threads: Vec<Thread> = entries
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
-        .filter_map(|id| load(project, &id).ok())
-        .collect();
+    let mut threads = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(error.into());
+                continue;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            errors.push(anyhow::anyhow!("a thread record name is not UTF-8"));
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".toml") else {
+            continue;
+        };
+        match load(project, id) {
+            Ok(thread) => threads.push(thread),
+            Err(error) => errors.push(error),
+        }
+    }
     threads.sort_by(|a, b| a.id.cmp(&b.id));
-    threads
+    (threads, errors)
+}
+
+pub(crate) fn list(project: &Project) -> Vec<Thread> {
+    list_with_errors(project).0
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {

@@ -1939,6 +1939,7 @@ mod tests {
                 machine: None,
                 box_path: Some("/box/repo".into()),
                 publish_url: Some("https://github.com/uguryildirim24/herdr-ade.git".into()),
+                ..crate::project::Repo::default()
             }],
         )
         .unwrap();

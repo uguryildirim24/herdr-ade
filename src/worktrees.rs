@@ -2,7 +2,7 @@
 //!
 //! Git does not consider ignored files when deciding whether a worktree is
 //! clean enough to remove. ADE does: only ignored paths covered by the
-//! editable `[worktrees].disposable` list may be discarded.
+//! global or repository-specific disposable lists may be discarded.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::project::Project;
 use crate::runner::Runner;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -75,19 +76,9 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn disposable(config_dir: &Path) -> Result<Vec<String>> {
-    let file = config_dir.join("config.toml");
-    let text = match std::fs::read_to_string(&file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", file.display()));
-        }
-    };
-    let config: RawConfig =
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
+fn validate_disposable(raw_paths: impl IntoIterator<Item = String>) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    for raw in config.worktrees.disposable {
+    for raw in raw_paths {
         let path = raw.trim_end_matches('/');
         if path.is_empty()
             || raw.starts_with('/')
@@ -103,6 +94,46 @@ fn disposable(config_dir: &Path) -> Result<Vec<String>> {
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+fn same_repo(left: &str, right: &str) -> bool {
+    let canonical =
+        |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// Global disposable paths plus the paths owned by this project's repository
+/// row or, for a harness repository, its config row.
+pub(crate) fn disposable(config_dir: &Path, project: &Project, repo: &str) -> Result<Vec<String>> {
+    let file = config_dir.join("config.toml");
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", file.display()));
+        }
+    };
+    let config: RawConfig = if text.trim().is_empty() {
+        RawConfig::default()
+    } else {
+        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?
+    };
+    let mut paths = config.worktrees.disposable;
+    let (settings, _) = project.read_project_md()?;
+    paths.extend(
+        settings
+            .repos
+            .iter()
+            .filter(|row| same_repo(&row.path, repo))
+            .flat_map(|row| row.disposable.iter().cloned()),
+    );
+    paths.extend(
+        crate::harness::repos(config_dir)?
+            .into_iter()
+            .filter(|row| same_repo(&row.path, repo))
+            .flat_map(|row| row.disposable),
+    );
+    validate_disposable(paths)
 }
 
 fn parse_status(text: &str) -> (Vec<String>, Vec<String>) {
@@ -130,6 +161,30 @@ fn parse_status(text: &str) -> (Vec<String>, Vec<String>) {
     (dirty, ignored)
 }
 
+fn component_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let (mut pattern_at, mut value_at) = (0, 0);
+    let (mut star_at, mut star_value_at) = (None, 0);
+    while value_at < value.len() {
+        if pattern_at < pattern.len() && pattern[pattern_at] == value[value_at] {
+            pattern_at += 1;
+            value_at += 1;
+        } else if pattern_at < pattern.len() && pattern[pattern_at] == '*' {
+            star_at = Some(pattern_at);
+            pattern_at += 1;
+            star_value_at = value_at;
+        } else if let Some(star) = star_at {
+            star_value_at += 1;
+            value_at = star_value_at;
+            pattern_at = star + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_at..].iter().all(|part| *part == '*')
+}
+
 fn disposable_path(path: &str, configured: &[String]) -> bool {
     let components: Vec<_> = Path::new(path)
         .components()
@@ -139,10 +194,17 @@ fn disposable_path(path: &str, configured: &[String]) -> bool {
         })
         .collect();
     configured.iter().any(|entry| {
-        if entry.contains('/') {
-            path == entry || path.starts_with(&format!("{entry}/"))
+        let pattern: Vec<_> = entry.split('/').collect();
+        if pattern.len() == 1 {
+            components
+                .iter()
+                .any(|value| component_matches(pattern[0], value))
         } else {
-            components.contains(&entry.as_str())
+            pattern.len() <= components.len()
+                && pattern
+                    .iter()
+                    .zip(&components)
+                    .all(|(pattern, value)| component_matches(pattern, value))
         }
     })
 }
@@ -226,13 +288,12 @@ pub(crate) fn inspect_local(
     runner: &dyn Runner,
     repo: &str,
     path: &str,
-    config_dir: &Path,
+    disposable: &[String],
 ) -> Result<Inspection> {
     let text = crate::git::worktree_status_with_ignored(runner, repo, path)?;
     let (dirty, ignored) = parse_status(&text);
     let nested = nested_worktrees(Path::new(path))?;
-    let disposable = disposable(config_dir)?;
-    let ignored_data = roots(ignored, nested, &disposable)
+    let ignored_data = roots(ignored, nested, disposable)
         .into_iter()
         .map(|relative| {
             let bytes = path_size(&Path::new(path).join(&relative))?;
@@ -252,7 +313,7 @@ pub(crate) fn inspect_remote(
     runner: &dyn Runner,
     target: &str,
     path: &str,
-    config_dir: &Path,
+    disposable: &[String],
 ) -> Result<Inspection> {
     const MARKER: &str = "__HERDR_NESTED_WORKTREES__";
     let quoted = crate::remote::quote(path);
@@ -277,9 +338,8 @@ pub(crate) fn inspect_remote(
         .filter_map(|entry| entry.strip_suffix("/.git"))
         .map(str::to_string)
         .collect();
-    let disposable = disposable(config_dir)?;
     let mut ignored_data = Vec::new();
-    for relative in roots(ignored, nested, &disposable) {
+    for relative in roots(ignored, nested, disposable) {
         let full = format!("{}/{}", path.trim_end_matches('/'), relative);
         let out = crate::remote::ssh(
             runner,
@@ -323,22 +383,65 @@ mod tests {
     }
 
     #[test]
-    fn absent_table_has_no_disposable_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[routing]\ndefault = 'x'\n").unwrap();
-        assert!(disposable(dir.path()).unwrap().is_empty());
+    fn wildcard_matches_inside_one_path_part_only() {
+        let configured = vec!["runs/pytest-*".to_string()];
+        assert!(disposable_path("runs/pytest-x/output.bin", &configured));
+        assert!(!disposable_path("runs/seed-1/output.bin", &configured));
+        assert!(component_matches("a*a", "aaa"));
+        assert!(!disposable_path(
+            "other/runs/pytest-x/output.bin",
+            &configured
+        ));
+
+        assert!(roots(vec!["runs/pytest-x/output.bin".into()], vec![], &configured).is_empty());
+        assert_eq!(
+            roots(
+                vec![
+                    "runs/pytest-x/output.bin".into(),
+                    "runs/seed-1/output.bin".into()
+                ],
+                vec![],
+                &configured
+            ),
+            BTreeSet::from(["runs".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_project_repository_list_does_not_apply_to_another_repository() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "").unwrap();
+        let project = crate::project::create(
+            &home.path().join("root"),
+            "demo",
+            "",
+            vec![
+                crate::project::Repo {
+                    path: "/one".into(),
+                    disposable: vec!["runs/pytest-*".into()],
+                    ..crate::project::Repo::default()
+                },
+                crate::project::Repo {
+                    path: "/two".into(),
+                    ..crate::project::Repo::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            disposable(&config, &project, "/one").unwrap(),
+            ["runs/pytest-*".to_string()]
+        );
+        assert!(disposable(&config, &project, "/two").unwrap().is_empty());
     }
 
     #[test]
     fn absolute_disposable_path_is_rejected_instead_of_broadened() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[worktrees]\ndisposable = ['/target']\n",
-        )
-        .unwrap();
         assert!(
-            disposable(dir.path())
+            validate_disposable(["/target".to_string()])
                 .unwrap_err()
                 .to_string()
                 .contains("must be a relative path name")
@@ -349,7 +452,6 @@ mod tests {
     fn remote_status_marker_filename_is_still_kept_as_data() {
         use crate::runner::fake::{FakeRunner, ok};
 
-        let config = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         runner.on("du -sk", ok("4\t/wt/__HERDR_NESTED_WORKTREES__\n"));
         runner.on(
@@ -357,7 +459,7 @@ mod tests {
             ok("!! __HERDR_NESTED_WORKTREES__\0\0__HERDR_NESTED_WORKTREES__\0"),
         );
 
-        let inspection = inspect_remote(&runner, "box", "/wt", config.path()).unwrap();
+        let inspection = inspect_remote(&runner, "box", "/wt", &[]).unwrap();
 
         assert_eq!(
             inspection.ignored_data,

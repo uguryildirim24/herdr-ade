@@ -486,7 +486,7 @@ fn report_with_checks(
         let (leftovers, data_kept, errors) = finished_worktrees(&ctx, None);
         check(
             &mut out,
-            Some(leftovers.is_empty() && errors.is_empty()),
+            worktree_check_status(&leftovers, &errors),
             "finished worktrees local",
             worktree_check_detail(&leftovers, &errors),
         );
@@ -712,7 +712,7 @@ fn report_with_checks(
                                 finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
                             check(
                                 &mut out,
-                                Some(leftovers.is_empty() && errors.is_empty()),
+                                worktree_check_status(&leftovers, &errors),
                                 &format!("finished worktrees {}", profile.label),
                                 worktree_check_detail(&leftovers, &errors),
                             );
@@ -741,13 +741,23 @@ fn report_with_checks(
     (out, healthy, checks)
 }
 
+fn worktree_check_status(leftovers: &[String], errors: &[String]) -> Option<bool> {
+    if !leftovers.is_empty() {
+        Some(false)
+    } else if !errors.is_empty() {
+        None
+    } else {
+        Some(true)
+    }
+}
+
 fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
     match (leftovers.is_empty(), errors.is_empty()) {
         (true, true) => "none whose work is done".into(),
         (false, true) => format!("remove these finished worktrees: {}", leftovers.join(", ")),
-        (true, false) => format!("could not check: {}", errors.join("; ")),
+        (true, false) => format!("unknown; could not check: {}", errors.join("; ")),
         (false, false) => format!(
-            "remove these finished worktrees: {}; could not check: {}",
+            "remove these finished worktrees: {}; unknown for: {}",
             leftovers.join(", "),
             errors.join("; ")
         ),
@@ -767,8 +777,17 @@ fn finished_worktrees(
         let Ok(project) = project::Project::load(&ctx.root, &slug) else {
             continue;
         };
-        for thread in crate::thread::list(&project) {
-            if thread.kind != crate::thread::Kind::Worktree || thread.worktree_path.is_empty() {
+        let (threads, unreadable) = crate::thread::list_with_errors(&project);
+        errors.extend(
+            unreadable
+                .into_iter()
+                .map(|error| format!("{slug}: thread state unknown: {error:#}")),
+        );
+        for thread in threads {
+            if thread.status != crate::thread::Status::Resolved
+                || thread.kind != crate::thread::Kind::Worktree
+                || thread.worktree_path.is_empty()
+            {
                 continue;
             }
             let on_machine = match remote {
@@ -779,7 +798,7 @@ fn finished_worktrees(
                 continue;
             }
             match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
-                Ok(None) => candidates.push(thread),
+                Ok(None) => candidates.push((project.clone(), thread)),
                 Ok(Some(_)) => {}
                 Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
             }
@@ -787,7 +806,7 @@ fn finished_worktrees(
     }
     let mut leftovers = Vec::new();
     let mut data_kept = Vec::new();
-    for thread in candidates {
+    for (project, thread) in candidates {
         let path = &thread.worktree_path;
         let exists = if let Some((_, target)) = remote {
             let script = format!("test -d {}", crate::remote::quote(path));
@@ -809,7 +828,7 @@ fn finished_worktrees(
         if !exists {
             continue;
         }
-        match crate::threads::inspect_worktree_for_removal(ctx, &thread) {
+        match crate::threads::inspect_worktree_for_removal(ctx, &project, &thread) {
             Ok(inspection) if !inspection.dirty.is_empty() => leftovers.push(path.clone()),
             Ok(inspection) if !inspection.ignored_data.is_empty() => data_kept.push(format!(
                 "{} ({})",
@@ -1788,6 +1807,75 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
+    fn an_open_working_thread_is_not_a_finished_worktree() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(crate::harness::BOX_WORKER_MARKER),
+            "lane worker\n",
+        )
+        .unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let worktree = home.path().join("live-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        crate::thread::allocate(&project, |thread| {
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.status = crate::thread::Status::Open;
+            thread.last_group = "working".into();
+            thread.worktree_path = worktree.to_string_lossy().into_owned();
+            thread.repo = "/repo".into();
+            thread.branch = "lane".into();
+        })
+        .unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+
+        let (text, healthy, checks) =
+            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+
+        assert!(healthy, "{text}");
+        assert!(
+            !text.contains(worktree.to_string_lossy().as_ref()),
+            "{text}"
+        );
+        assert!(checks.iter().any(|check| {
+            check.status == "ok"
+                && check.label == "finished worktrees local"
+                && check.detail == "none whose work is done"
+        }));
+    }
+
+    #[test]
+    fn unreadable_thread_state_makes_finished_worktrees_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(crate::harness::BOX_WORKER_MARKER),
+            "lane worker\n",
+        )
+        .unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        std::fs::write(project.dir().join("threads/t-0001.toml"), "status = [\n").unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+
+        let (text, healthy, checks) =
+            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+
+        assert!(healthy, "{text}");
+        assert!(text.contains("thread state unknown"), "{text}");
+        assert!(checks.iter().any(|check| {
+            check.status == "warning"
+                && check.label == "finished worktrees local"
+                && check.detail.contains("unknown; could not check")
+        }));
+    }
+
+    #[test]
     fn a_finished_worktree_left_on_disk_fails_the_doctor_row() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
@@ -2115,6 +2203,7 @@ recipe = "claude_fable_xhigh"
                 machine: Some("repo-box".into()),
                 box_path: Some("/box/repo".into()),
                 publish_url: None,
+                ..crate::project::Repo::default()
             }],
         )
         .unwrap();

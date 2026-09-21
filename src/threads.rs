@@ -1572,7 +1572,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             removal_refusal = finished_worktree_reason(ctx, &project, &record)?;
         }
         if removal_refusal.is_none() {
-            let inspection = inspect_worktree_for_removal(ctx, &record)?;
+            let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
             if !inspection.dirty.is_empty() {
                 return Err(crate::refusal::error(format!(
                     "worktree_dirty: uncommitted changes in {}; not removing ({})",
@@ -1875,14 +1875,16 @@ pub(crate) fn finished_worktree_reason(
 
 pub(crate) fn inspect_worktree_for_removal(
     ctx: &Ctx,
+    project: &Project,
     record: &Thread,
 ) -> Result<crate::worktrees::Inspection> {
+    let disposable = crate::worktrees::disposable(&ctx.config_dir, project, &record.repo)?;
     if !record.is_remote() {
         return crate::worktrees::inspect_local(
             ctx.runner,
             &record.repo,
             &record.worktree_path,
-            &ctx.config_dir,
+            &disposable,
         );
     }
     let profile = remote::machine_profile(
@@ -1895,7 +1897,7 @@ pub(crate) fn inspect_worktree_for_removal(
         ctx.runner,
         &profile.target,
         &record.worktree_path,
-        &ctx.config_dir,
+        &disposable,
     )
 }
 

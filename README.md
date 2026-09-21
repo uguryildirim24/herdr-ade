@@ -93,7 +93,7 @@ Project files and lane work stay on your machines. Dispatch reads the local rout
 
 ### Will it touch my branches or worktrees on its own?
 
-It never deletes a branch, merges or pushes on its own. An ADE lane is `git worktree add` into `<repo>/.worktrees/<id>` plus a tab in the coordinator workspace. `thread resolve` removes the worktree without force after its files are copied and its commits have landed or its round has closed. Uncommitted changes refuse resolution. Ignored files keep the worktree while the thread still resolves, unless their path name is listed as rebuildable under `[worktrees].disposable` in `config.toml`; a nested worktree is always kept. The result names kept data and its size. The branch is retained. Deleting a project moves its folder to a trash folder and leaves every worktree and branch alone.
+It never deletes a branch, merges or pushes on its own. An ADE lane is `git worktree add` into `<repo>/.worktrees/<id>` plus a tab in the coordinator workspace. `thread resolve` removes the worktree without force after its files are copied and its commits have landed or its round has closed. Uncommitted changes refuse resolution. Ignored files keep the worktree while the thread still resolves, unless their path is listed as rebuildable under global `[worktrees].disposable` in `config.toml` or `disposable` on that repository's `PROJECT.md` row (harness repository rows may set it too). `*` matches within one path part, so `runs/pytest-*` does not discard other `runs/` output; a nested worktree is always kept. The result names kept data and its size. The branch is retained. Deleting a project moves its folder to a trash folder and leaves every worktree and branch alone.
 
 ### What is `--plain`?
 
