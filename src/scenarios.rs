@@ -472,9 +472,11 @@ fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
     world.thread(&project, world.home.path(), |t| {
         t.status = Status::Failed;
         t.error = "no agent".into();
+        t.failure_class = crate::contracts::FailureClass::ProcessGone;
         t.launch_attempts = 3;
         t.attempt = 1;
         t.launch.kind = "claude".into();
+        t.launch.recipe_id = "test_claude".into();
         t.launch.brief_hash = "h1".into();
     });
     std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();

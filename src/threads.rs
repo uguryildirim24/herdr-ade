@@ -1283,7 +1283,8 @@ pub struct RetryOutcome {
 
 /// Start the same task as a new bounded recovery attempt. Unlike the removed
 /// `restart` command this deliberately replaces a live, blocked, or stuck
-/// process, and every invocation advances the editable routing policy.
+/// process. Its durable failure class decides whether recovery stays on the
+/// same recipe, advances failed-work fallback routing, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
     retry_with_ticker(ctx, slug, id, reason, ticker::start)
 }
@@ -1335,7 +1336,7 @@ fn retry_with_ticker(
         std::fs::read_to_string(thread::task_path(&project, id)).context("retry_brief_missing")?;
     // Select before stopping anything: an exhausted policy leaves the current
     // process untouched.
-    let mut launch = crate::launch::resolve_launch(
+    let mut launch = crate::launch::resolve_failure(
         ctx,
         &project,
         &crate::launch::ResolveInput {
@@ -1349,6 +1350,7 @@ fn retry_with_ticker(
             failure: Some(reason),
             source_truncation: record.launch.source_truncation.as_ref(),
         },
+        record.failure_class,
     )?;
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
@@ -2787,11 +2789,17 @@ mod tests {
         *world.agents.borrow_mut() = "[]".into();
 
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        thread::update(&project, &started.id, |thread| {
+            thread.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
         retry(&ctx, "demo", &started.id, "the first process disappeared").unwrap();
         let retried = thread::load(&project, &started.id).unwrap();
         assert_eq!(retried.attempt, 2);
         assert_eq!(retried.launch.kind, kind);
         assert_eq!(retried.launch.attempt, 2);
+        assert_eq!(retried.launch.escalations, 0);
+        assert_eq!(retried.launch.same_recipe_retries, 1);
         let calls = world.runner.calls.borrow();
         assert!(!calls.iter().any(|c| c.display().contains("worktree open")));
         let tabs = calls

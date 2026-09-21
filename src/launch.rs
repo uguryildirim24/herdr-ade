@@ -223,7 +223,9 @@ pub fn resolve_failure(
     use crate::contracts::FailureClass;
     let previous = input.previous.context("recovery_previous_missing")?;
     match class {
-        FailureClass::Unknown => bail!("recovery_unknown: waiting for the coordinator"),
+        FailureClass::Unknown => Err(crate::refusal::error(
+            "recovery_unknown: waiting for the coordinator",
+        )),
         FailureClass::WorkFailed => resolve_launch(ctx, project, input),
         FailureClass::Provider | FailureClass::LostConnection | FailureClass::ProcessGone => {
             let config = parse_launch_config(&ctx.config_dir)?;
@@ -232,10 +234,10 @@ pub fn resolve_failure(
             let recovery = previous.same_recipe_retries.saturating_add(1);
             let retries = config.routing.retry_limit(&work);
             if recovery > retries {
-                bail!(
+                return Err(crate::refusal::error(format!(
                     "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
                     class.plain()
-                );
+                )));
             }
             let mut same = previous.clone();
             same.same_recipe_retries = recovery;
