@@ -345,6 +345,13 @@ fn every_named_verb_returns_a_structured_refusal() {
         assert!(output.stderr.is_empty(), "{args:?}: {:?}", output.stderr);
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["outcome"], "refused", "{args:?}: {result}");
+        assert_eq!(
+            result["command"]
+                .as_str()
+                .and_then(|command| command.split_whitespace().next()),
+            args.first().copied(),
+            "{args:?}: {result}"
+        );
         assert!(
             result["reason"]
                 .as_str()
