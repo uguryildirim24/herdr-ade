@@ -775,9 +775,16 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         "machine list --json",
         ok(r#"[{"id":"oci-id","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
     );
-    world
-        .runner
-        .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+    world.runner.on_fn(
+        |cmd| cmd.program == "ssh",
+        |cmd| {
+            if cmd.display().contains("status --porcelain") {
+                Ok(ok("\0__HERDR_NESTED_WORKTREES__\0"))
+            } else {
+                Ok(ok(""))
+            }
+        },
+    );
 
     threads::resolve(
         &world.ctx(),
@@ -833,7 +840,7 @@ fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
         |cmd| {
             let line = cmd.display();
             if line.contains("status --porcelain --ignored --untracked-files=all") {
-                Ok(ok("!! runs/raw.bin\n\n__HERDR_NESTED_WORKTREES__\n"))
+                Ok(ok("!! runs/raw.bin\0\0__HERDR_NESTED_WORKTREES__\0"))
             } else if line.contains("du -sk") {
                 Ok(ok(
                     "4096\t/home/ubuntu/projects/herdr-ade/.worktrees/t-0001/runs\n",

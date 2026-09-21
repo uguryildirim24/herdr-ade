@@ -88,8 +88,9 @@ fn disposable(config_dir: &Path) -> Result<Vec<String>> {
         toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
     let mut paths = Vec::new();
     for raw in config.worktrees.disposable {
-        let path = raw.trim_matches('/');
+        let path = raw.trim_end_matches('/');
         if path.is_empty()
+            || raw.starts_with('/')
             || Path::new(path).is_absolute()
             || Path::new(path)
                 .components()
@@ -107,9 +108,20 @@ fn disposable(config_dir: &Path) -> Result<Vec<String>> {
 fn parse_status(text: &str) -> (Vec<String>, Vec<String>) {
     let mut dirty = Vec::new();
     let mut ignored = Vec::new();
-    for line in text.lines().filter(|line| line.len() > 3) {
-        let path = line[3..].trim().trim_matches('"').replace("\\\"", "\"");
-        if &line[..2] == "!!" {
+    let nul_delimited = text.contains('\0');
+    let records: Box<dyn Iterator<Item = &str>> = if nul_delimited {
+        Box::new(text.split('\0'))
+    } else {
+        // Scripted tests written before status used `-z` still use lines.
+        Box::new(text.lines())
+    };
+    for record in records.filter(|record| record.len() > 3) {
+        let path = if nul_delimited {
+            record[3..].to_string()
+        } else {
+            record[3..].trim().trim_matches('"').replace("\\\"", "\"")
+        };
+        if &record[..2] == "!!" {
             ignored.push(path);
         } else {
             dirty.push(path);
@@ -244,19 +256,25 @@ pub(crate) fn inspect_remote(
 ) -> Result<Inspection> {
     const MARKER: &str = "__HERDR_NESTED_WORKTREES__";
     let quoted = crate::remote::quote(path);
+    // NUL framing cannot collide with a status path: every porcelain record
+    // starts with its two-byte status and a space, and paths cannot contain NUL.
     let script = format!(
-        "cd {quoted} && git status --porcelain --ignored --untracked-files=all && printf '\\n{MARKER}\\n' && find . -mindepth 2 -name .git -print"
+        "cd {quoted} && git status --porcelain --ignored --untracked-files=all -z && printf '\\0{MARKER}\\0' && find . -mindepth 2 -name .git -print0"
     );
     let out = crate::remote::ssh(runner, target, &script, None, CHECK_TIMEOUT)?;
     if !out.success() {
         bail!("worktree_status_failed: {path}: {}", out.error_text());
     }
-    let (status, nested_text) = out.stdout.split_once(MARKER).unwrap_or((&out.stdout, ""));
-    let (dirty, ignored) = parse_status(status.trim_end());
+    let delimiter = format!("\0{MARKER}\0");
+    let (status, nested_text) = out
+        .stdout
+        .split_once(&delimiter)
+        .context("worktree inspection output was incomplete")?;
+    let (dirty, ignored) = parse_status(status);
     let nested = nested_text
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("./"))
-        .filter_map(|line| line.strip_suffix("/.git"))
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("./"))
+        .filter_map(|entry| entry.strip_suffix("/.git"))
         .map(str::to_string)
         .collect();
     let disposable = disposable(config_dir)?;
@@ -309,5 +327,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "[routing]\ndefault = 'x'\n").unwrap();
         assert!(disposable(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn absolute_disposable_path_is_rejected_instead_of_broadened() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[worktrees]\ndisposable = ['/target']\n",
+        )
+        .unwrap();
+        assert!(
+            disposable(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("must be a relative path name")
+        );
+    }
+
+    #[test]
+    fn remote_status_marker_filename_is_still_kept_as_data() {
+        use crate::runner::fake::{FakeRunner, ok};
+
+        let config = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        runner.on("du -sk", ok("4\t/wt/__HERDR_NESTED_WORKTREES__\n"));
+        runner.on(
+            "status --porcelain --ignored --untracked-files=all -z",
+            ok("!! __HERDR_NESTED_WORKTREES__\0\0__HERDR_NESTED_WORKTREES__\0"),
+        );
+
+        let inspection = inspect_remote(&runner, "box", "/wt", config.path()).unwrap();
+
+        assert_eq!(
+            inspection.ignored_data,
+            vec![DataPath {
+                path: "__HERDR_NESTED_WORKTREES__".into(),
+                bytes: 4096,
+            }]
+        );
     }
 }
