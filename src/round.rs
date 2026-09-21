@@ -131,6 +131,19 @@ pub mod repo {
             Ok(names)
         }
 
+        /// Commits that changed an integration branch after `from`, following
+        /// only its first-parent history. A merge is therefore judged by what
+        /// it added to the integration branch, not by the side branch's shape.
+        pub fn first_parent_commits(&self, from: &str, to: &str) -> Result<Vec<String>> {
+            let range = format!("{from}..{to}");
+            Ok(self
+                .run(&["rev-list", "--first-parent", "--reverse", &range])?
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect())
+        }
+
         /// A file's bytes at a revision, `None` when the path is absent there.
         pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<String>> {
             // Query presence first: `show` alone cannot distinguish an absent
@@ -2109,8 +2122,8 @@ pub enum MergeOutcome {
     Checkpointed { head: String, lanes: Vec<String> },
     /// A second merge after `checkpointed`: nothing was done.
     NoOp { head: String },
-    /// The reviewed base moved, so the next review revision and its reviewer
-    /// were started automatically instead of merging an unreviewed pairing.
+    /// Reviewed files changed on the integration base, so the next review
+    /// revision and its reviewer were started instead of merging that pairing.
     RepairReviewStarted {
         review_branch: String,
         reviewer: Option<String>,
@@ -2427,7 +2440,9 @@ fn fresh_merge(
                 record.branch
             );
         }
-        return Ok(FreshMergeOutcome::BaseMoved { from: b, to: head });
+        if !only_bookkeeping_since(git, &b, &head)? {
+            return Ok(FreshMergeOutcome::BaseMoved { from: b, to: head });
+        }
     }
     let intent = MergeIntent {
         op: format!("merge-{round}"),
@@ -2456,10 +2471,47 @@ fn fresh_merge(
     checkpoint_phase(ctx, project, &record, git, intent, stop, repo).map(FreshMergeOutcome::Done)
 }
 
-/// A moved base never asks the coordinator to orchestrate repair. The normal
-/// review revision is created and `advance` starts its reviewer. Even a clean
-/// tree merge needs this review: textual compatibility does not establish
-/// semantic compatibility between independently reviewed rounds.
+/// Whether every integration-branch change after B is output the harness
+/// writes only to coordinate work. These are the complete bookkeeping paths:
+/// lane tasks, round review briefs, round verdicts, and HANDOFF checkpoints.
+/// Dialogue turns and every other repository path are project work.
+fn only_bookkeeping_since(git: &Git, from: &str, to: &str) -> Result<bool> {
+    for commit in git.first_parent_commits(from, to)? {
+        let parent = git
+            .parents(&commit)?
+            .into_iter()
+            .next()
+            .context("bookkeeping commit has no first parent")?;
+        if git
+            .diff_names(&parent, &commit)?
+            .iter()
+            .any(|path| !is_bookkeeping_path(path))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn is_bookkeeping_path(path: &str) -> bool {
+    fn numbered(path: &str, prefix: &str, suffix: &str, minimum_digits: usize) -> bool {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .is_some_and(|digits| {
+                digits.len() >= minimum_digits && digits.chars().all(|c| c.is_ascii_digit())
+            })
+    }
+
+    matches!(path, "HANDOFF.md" | "HANDOFF.json")
+        || numbered(path, "tasks/t-", ".md", 4)
+        || numbered(path, "tasks/review-r", ".md", 1)
+        || numbered(path, "tasks/reviews/code-r", ".md", 1)
+}
+
+/// A substantive base move never asks the coordinator to orchestrate repair.
+/// The normal review revision is created and `advance` starts its reviewer.
+/// Even a clean tree merge needs this review: textual compatibility does not
+/// establish semantic compatibility between independently reviewed rounds.
 fn start_moved_base_repair(
     ctx: &Ctx,
     project: &Project,
@@ -4195,6 +4247,28 @@ mod tests {
     }
 
     #[test]
+    fn bookkeeping_paths_are_exactly_the_harness_coordination_outputs() {
+        for path in [
+            "HANDOFF.md",
+            "HANDOFF.json",
+            "tasks/t-0001.md",
+            "tasks/review-r1.md",
+            "tasks/reviews/code-r42.md",
+        ] {
+            assert!(is_bookkeeping_path(path), "{path}");
+        }
+        for path in [
+            "tasks/t-1.md",
+            "tasks/review-rx.md",
+            "tasks/reviews/code-r1.txt",
+            "tasks/shapes/turns/01-pro.md",
+            "src/round.rs",
+        ] {
+            assert!(!is_bookkeeping_path(path), "{path}");
+        }
+    }
+
+    #[test]
     fn two_reviewing_rounds_merge_in_turn_with_automatic_repair() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -4219,8 +4293,10 @@ mod tests {
         fx.seal_done(&lane1.0, 1, 1, &lane1.1, "# r1 report\n");
         fx.seal_done(&lane2.0, 1, 1, &lane2.1, "# r2 report\n");
 
-        // Review r2 first and r1 second. Both branches and worktrees coexist;
-        // r1 is based on the newest integration head and can merge first.
+        // Review r1 first and r2 second. r2's brief moves main after r1's B,
+        // but it is bookkeeping, so r1 still merges without another review.
+        let r1_review = review(&ctx, "demo", "r1").unwrap();
+        verdict(&fx, std::slice::from_ref(&lane1), front("MERGE", "r1"));
         let r2_review = review(&ctx, "demo", "r2").unwrap();
         let (r2_candidate, r2_verdict) = verdict_for(
             &fx,
@@ -4228,10 +4304,15 @@ mod tests {
             std::slice::from_ref(&lane2),
             front("MERGE", "r2"),
         );
-        let r1_review = review(&ctx, "demo", "r1").unwrap();
-        verdict(&fx, std::slice::from_ref(&lane1), front("MERGE", "r1"));
         assert_ne!(r1_review.review_branch, r2_review.review_branch);
         assert_ne!(r1_review.worktree, r2_review.worktree);
+        assert_eq!(
+            git(
+                &fx.repo,
+                &["rev-parse", &format!("{}^", r2_review.brief_commit)]
+            ),
+            r1_review.brief_commit
+        );
         assert_eq!(
             merge(&ctx, "demo", "r1", Some(Stop::Ref)).unwrap(),
             MergeOutcome::Stopped {
@@ -4245,9 +4326,10 @@ mod tests {
             MergeOutcome::Checkpointed { .. }
         ));
         let after_r1 = main_head(&fx);
+        assert_eq!(load(&fx.project, "r1").unwrap().phase, RoundPhase::Merged);
 
-        // r2's verdict was built on the old base. `round merge` creates the
-        // repair revision and starts its reviewer without coordinator steps.
+        // r2's verdict was built before r1's real code merge. `round merge`
+        // creates the repair revision and starts its reviewer automatically.
         let outcome = merge(&ctx, "demo", "r2", None).unwrap();
         let MergeOutcome::RepairReviewStarted {
             review_branch,
