@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::{LaneCard, OpKind, Recipient, Requested};
+use crate::contracts::{FailureClass, LaneCard, OpKind, Recipient, Requested};
 use crate::herdr::Herdr;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
@@ -84,17 +84,44 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
-    seal_message(ctx, text, false)
+pub(crate) fn waiting_class(
+    ctx: &Ctx,
+    text: &str,
+    class: FailureClass,
+    provider_kind: Option<&str>,
+) -> Result<()> {
+    seal_message(ctx, text, false, class, provider_kind)
 }
 
-pub(crate) fn failed(ctx: &Ctx, text: &str) -> Result<()> {
-    seal_message(ctx, text, true)
+pub(crate) fn failed_class(
+    ctx: &Ctx,
+    text: &str,
+    class: FailureClass,
+    provider_kind: Option<&str>,
+) -> Result<()> {
+    seal_message(ctx, text, true, class, provider_kind)
 }
 
-fn seal_message(ctx: &Ctx, text: &str, failed: bool) -> Result<()> {
+fn seal_message(
+    ctx: &Ctx,
+    text: &str,
+    failed: bool,
+    class: FailureClass,
+    provider_kind: Option<&str>,
+) -> Result<()> {
     let binding = current_lane(ctx)?;
     let text = bounded_waiting(text)?;
+    let provider_kind = provider_kind.map(str::trim).filter(|kind| !kind.is_empty());
+    if class == FailureClass::Provider && provider_kind.is_none() {
+        return Err(crate::refusal::error(
+            "provider_kind_missing: a provider failure needs --provider-kind",
+        ));
+    }
+    if class != FailureClass::Provider && provider_kind.is_some() {
+        return Err(crate::refusal::error(
+            "provider_kind_without_provider: --provider-kind requires --class provider",
+        ));
+    }
     let recipient = binding.recipient()?;
     let attempt = binding.thread.attempt.max(1);
     let op = ops::reserve(
@@ -110,9 +137,17 @@ fn seal_message(ctx: &Ctx, text: &str, failed: bool) -> Result<()> {
             recipient,
             round: None,
             requested: if failed {
-                Requested::Failed { failure: text }
+                Requested::Failed {
+                    failure: text,
+                    class,
+                    provider_kind: provider_kind.map(str::to_string),
+                }
             } else {
-                Requested::Waiting { text }
+                Requested::Waiting {
+                    text,
+                    class,
+                    provider_kind: provider_kind.map(str::to_string),
+                }
             },
             helper_pid: std::process::id(),
         },
@@ -130,6 +165,10 @@ fn seal_message(ctx: &Ctx, text: &str, failed: bool) -> Result<()> {
         ticker::start(ctx)?;
     }
     crate::output::insert("event", event.id.clone());
+    crate::output::insert("failure_class", serde_json::json!(class));
+    if let Some(kind) = provider_kind {
+        crate::output::insert("provider_kind", serde_json::json!(kind));
+    }
     println!("sealed {}", event.id);
     Ok(())
 }

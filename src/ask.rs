@@ -1181,7 +1181,7 @@ mod tests {
         );
         assert_eq!(
             get("ade_lanes"),
-            "0 working, 1 done, 1 waiting for you, 0 stuck"
+            "0 working, 1 done, 1 waiting for you, 0 stuck, 0 unknown"
         );
         assert_eq!(
             get("ade_needs_you"),

@@ -177,9 +177,21 @@ enum Command {
         sha: String,
     },
     /// Seal and deliver why this lane must wait
-    Waiting { what: String },
+    Waiting {
+        #[arg(long, value_enum, default_value = "unknown")]
+        class: crate::contracts::FailureClass,
+        #[arg(long, requires = "class")]
+        provider_kind: Option<String>,
+        what: String,
+    },
     /// Record a failed lane attempt and request bounded routing recovery
-    Failed { what: String },
+    Failed {
+        #[arg(long, value_enum, default_value = "work-failed")]
+        class: crate::contracts::FailureClass,
+        #[arg(long, requires = "class")]
+        provider_kind: Option<String>,
+        what: String,
+    },
     /// Print a role skill and the runtime-only standing rules
     Skill {
         #[arg(default_value = "coordinator")]
@@ -1641,18 +1653,27 @@ pub fn run() -> Result<()> {
 /// refusal still returns its error to the caller, but its structural marker
 /// keeps the safety/authority outcome out of defect counts.
 fn record_command_outcome(project: Option<&Project>, subject: &str, result: &Result<()>) {
-    let Some(project) = project else {
-        return;
-    };
     match result {
-        Err(error) if crate::refusal::is(error) => {}
+        Err(error) if crate::refusal::is(error) => {
+            crate::output::set_outcome("refused");
+            crate::output::set_failure_class(None);
+        }
         Err(error) => {
-            crate::ledger::retry_after_failure(project, "command-failed", subject);
-            crate::ledger::observe(project, "command-failed", subject, &format!("{error:#}"));
+            if let Some(project) = project {
+                crate::output::set_outcome("failed");
+                crate::output::set_failure_class(Some("unknown"));
+                crate::ledger::observe(project, "command-failed", subject, &format!("{error:#}"));
+            } else {
+                // With no project binding this is a rejected invocation (for
+                // example a missing project), not evidence of failed work.
+                crate::output::set_outcome("refused");
+                crate::output::set_failure_class(None);
+            }
         }
         Ok(()) => {
-            crate::ledger::retry_after_failure(project, "command-failed", subject);
-            crate::ledger::recovered(project, "command-failed", subject);
+            if let Some(project) = project {
+                crate::ledger::recovered(project, "command-failed", subject);
+            }
         }
     }
 }
@@ -2018,8 +2039,16 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             }
         },
         Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
-        Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
-        Command::Failed { what } => crate::lane::failed(&ctx, &what),
+        Command::Waiting {
+            class,
+            provider_kind,
+            what,
+        } => crate::lane::waiting_class(&ctx, &what, class, provider_kind.as_deref()),
+        Command::Failed {
+            class,
+            provider_kind,
+            what,
+        } => crate::lane::failed_class(&ctx, &what, class, provider_kind.as_deref()),
         Command::Skill { role } => crate::lane::skill(&ctx, &role),
         Command::Close { slug } => crate::coordinator::close(&ctx, &slug),
         Command::Plain { command } => match command {
@@ -2191,15 +2220,13 @@ mod tests {
         assert!(entries[0].detail.contains("compiler process crashed"));
 
         // A later guard refusal is neither a retry nor proof that the real
-        // failure recovered. Only an actual successful re-entry does both.
+        // failure recovered. A successful re-entry closes the same entry.
         record_command_outcome(Some(&project), "ha harness install", &refusal);
         assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
         record_command_outcome(Some(&project), "ha harness install", &Ok(()));
-        let entries = crate::ledger::list(&project).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.kind == "retry"));
-        assert!(entries.iter().any(|entry| {
-            entry.kind == "command-failed" && entry.detail.contains("compiler process crashed")
-        }));
+        assert!(crate::ledger::list(&project).unwrap().is_empty());
+        let closed = crate::ledger::show(&project, &entries[0].id).unwrap();
+        assert!(closed.closed_at.is_some());
+        assert_eq!(closed.count, 1);
     }
 }

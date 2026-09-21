@@ -211,6 +211,45 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
     result
 }
 
+/// Apply the recovery policy without turning infrastructure evidence into
+/// failed work. Provider and connection failures get bounded same-recipe
+/// retries; a gone process restarts; only failed work may select a fallback.
+pub fn resolve_failure(
+    ctx: &Ctx,
+    project: &Project,
+    input: &ResolveInput<'_>,
+    class: crate::contracts::FailureClass,
+) -> Result<Launch> {
+    use crate::contracts::FailureClass;
+    let previous = input.previous.context("recovery_previous_missing")?;
+    match class {
+        FailureClass::Unknown => bail!("recovery_unknown: waiting for the coordinator"),
+        FailureClass::WorkFailed => resolve_launch(ctx, project, input),
+        FailureClass::Provider | FailureClass::LostConnection | FailureClass::ProcessGone => {
+            let config = parse_launch_config(&ctx.config_dir)?;
+            validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
+            let work = work_contract(input.task, input.workflow)?;
+            let recovery = previous.escalations.saturating_add(1);
+            let retries = config.routing.retry_limit(&work);
+            if recovery > retries {
+                bail!(
+                    "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
+                    class.plain()
+                );
+            }
+            let mut same = previous.clone();
+            same.escalations = recovery;
+            ledger(
+                project,
+                json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
+                    "recovery":recovery, "failure":input.failure,
+                    "policy_hash":config.policy_hash}),
+            )?;
+            Ok(same)
+        }
+    }
+}
+
 fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
     if input.task.trim().is_empty() {
         bail!("dispatch_brief_missing: supply the full task file");

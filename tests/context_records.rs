@@ -74,7 +74,7 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     .unwrap();
     let text = context(home.path(), "w1:p1", true);
     assert!(
-        text.contains("failed: compiler failure event=t-0003-2-1"),
+        text.contains("failed — failure unknown: compiler failure event=t-0003-2-1"),
         "{text}"
     );
     assert!(text.contains("report: threads/t-0003.md"));

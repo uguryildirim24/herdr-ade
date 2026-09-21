@@ -1185,7 +1185,7 @@ fn a_single_missing_pane_is_shown_from_the_thread_record() {
     assert!(inbox::unhandled(&project).is_empty());
     let digest = coordinator::digest(&world.ctx(), &project, "ha").unwrap().0;
     assert!(
-        digest.contains("[Waiting on you] (pane closed)"),
+        digest.contains("[Waiting on you] (process gone: pane or agent is gone without a report)"),
         "{digest}"
     );
 }

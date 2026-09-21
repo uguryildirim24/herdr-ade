@@ -514,6 +514,7 @@ mod tests {
                 done: None,
                 waiting: Some(crate::contracts::WaitingPayload {
                     text: "wait".into(),
+                    ..Default::default()
                 }),
                 failed: None,
             },
@@ -608,6 +609,7 @@ mod tests {
                 done: None,
                 waiting: Some(crate::contracts::WaitingPayload {
                     text: "wait".into(),
+                    ..Default::default()
                 }),
                 failed: None,
             },
