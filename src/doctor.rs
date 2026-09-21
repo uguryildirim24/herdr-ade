@@ -508,7 +508,7 @@ fn check_workspace_leaks(
             return;
         }
     };
-    let open: BTreeSet<String> = project::list_slugs(root)
+    let open_threads: Vec<_> = project::list_slugs(root)
         .into_iter()
         .filter_map(|slug| project::Project::load(root, &slug).ok())
         .flat_map(|project| crate::thread::list(&project))
@@ -522,7 +522,10 @@ fn check_workspace_leaks(
                 thread.is_remote() && thread.machine_route() == machine
             }
         })
-        .map(|thread| thread.workspace_id)
+        .collect();
+    let open: BTreeSet<String> = open_threads
+        .iter()
+        .map(|thread| thread.workspace_id.clone())
         .filter(|workspace| !workspace.is_empty())
         .collect();
     let leaked: Vec<_> = workspaces
@@ -555,6 +558,89 @@ fn check_workspace_leaks(
                 workspaces.len()
             )
         },
+    );
+
+    if machine == "local" {
+        return;
+    }
+    let tabs = match herdr.tab_list() {
+        Ok(tabs) => tabs,
+        Err(error) => {
+            check(
+                out,
+                Some(false),
+                &format!("{display} project tabs"),
+                format!("could not list tabs: {error}"),
+            );
+            return;
+        }
+    };
+    let labels: BTreeSet<String> = project::list_slugs(root)
+        .into_iter()
+        .filter_map(|slug| project::Project::load(root, &slug).ok())
+        .filter_map(|project| {
+            project
+                .read_project_md()
+                .ok()
+                .map(|(settings, _)| project::display_name(&settings.name, &project.slug))
+        })
+        .collect();
+    let mut duplicate_labels = Vec::new();
+    let mut project_workspaces = BTreeSet::new();
+    for label in labels {
+        let matching: Vec<_> = workspaces
+            .iter()
+            .filter(|workspace| workspace.label == label)
+            .collect();
+        if matching.len() > 1 {
+            duplicate_labels.push(format!("{label} ({})", matching.len()));
+        }
+        project_workspaces.extend(
+            matching
+                .into_iter()
+                .map(|workspace| workspace.workspace_id.clone()),
+        );
+    }
+    let open_tabs: BTreeSet<_> = open_threads
+        .iter()
+        .map(|thread| thread.tab_id.clone())
+        .filter(|tab| !tab.is_empty())
+        .collect();
+    let orphan_tabs: Vec<_> = tabs
+        .iter()
+        .filter(|tab| project_workspaces.contains(&tab.workspace_id))
+        .filter(|tab| {
+            !open_tabs.contains(&tab.tab_id)
+                && !agents.iter().any(|agent| agent.tab_id == tab.tab_id)
+        })
+        .map(|tab| tab.tab_id.as_str())
+        .collect();
+    let healthy = duplicate_labels.is_empty() && orphan_tabs.is_empty();
+    let detail = if healthy {
+        format!(
+            "{} project workspaces; every tab has an agent or an open lane",
+            project_workspaces.len()
+        )
+    } else {
+        format!(
+            "duplicate labels: {}; shell tabs with no open lane: {}",
+            if duplicate_labels.is_empty() {
+                "none".to_string()
+            } else {
+                duplicate_labels.join(", ")
+            },
+            if orphan_tabs.is_empty() {
+                "none".to_string()
+            } else {
+                orphan_tabs.join(", ")
+            }
+        )
+    };
+    check(
+        out,
+        Some(healthy),
+        &format!("{display} project tabs"),
+        detail,
     );
 }
 
@@ -985,6 +1071,7 @@ mod tests {
         );
         runner.on("machine list --json", ok(machines));
         runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+        runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
         runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
         runner
     }
@@ -1014,6 +1101,7 @@ mod tests {
             "agent list",
             ok(r#"{"result":{"agents":[{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}]}}"#),
         );
+        runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
         let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
         let mut text = String::new();
         let mut healthy = true;
@@ -1027,6 +1115,39 @@ mod tests {
         assert!(!healthy);
         assert!(
             text.contains("1 of 3 hold no agent and belong to no open lane: w1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_project_workspaces_and_unowned_shell_tabs_fail_doctor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "workspace list",
+            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"Demo"},{"workspace_id":"w2","label":"Demo"}]}}"#),
+        );
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "tab list",
+            ok(r#"{"result":{"tabs":[{"workspace_id":"w1","tab_id":"w1:t1","label":"shell"}]}}"#),
+        );
+        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
+        let mut text = String::new();
+        let mut healthy = true;
+        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
+            healthy &= ok != Some(false);
+            let _ = writeln!(out, "{label}: {detail}");
+        };
+
+        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+
+        assert!(!healthy);
+        assert!(text.contains("duplicate labels: Demo (2)"), "{text}");
+        assert!(
+            text.contains("shell tabs with no open lane: w1:t1"),
             "{text}"
         );
     }

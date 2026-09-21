@@ -158,6 +158,12 @@ pub(crate) trait Runner {
     /// program is missing). A non-zero exit or a timeout is an `Ok(Output)`.
     fn run(&self, cmd: &Cmd) -> Result<Output>;
 
+    /// Independent commands. Production runs them side by side; scripted
+    /// runners keep deterministic order unless they opt into concurrency.
+    fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
+        commands.iter().map(|command| self.run(command)).collect()
+    }
+
     /// One JSON line to a herdr socket, one line back. The single exception to
     /// "talk to herdr through its CLI" (client decision during the build):
     /// herdr 0.9.1 has no CLI command for `agent.view.set` / `agent.view.clear`.
@@ -242,6 +248,23 @@ impl Runner for RealRunner {
             stdout,
             stderr,
             timed_out,
+        })
+    }
+
+    fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = commands
+                .iter()
+                .map(|command| scope.spawn(|| self.run(command)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("parallel command panicked")))
+                })
+                .collect()
         })
     }
 
@@ -466,6 +489,23 @@ mod tests {
         assert_eq!(out.stdout, "hi\n");
         assert_eq!(out.stderr, "err\n");
         assert!(!out.success());
+    }
+
+    #[test]
+    fn independent_commands_run_side_by_side() {
+        let commands = [
+            Cmd::new("sleep", Duration::from_secs(2)).arg("0.5"),
+            Cmd::new("sleep", Duration::from_secs(2)).arg("0.5"),
+            Cmd::new("sleep", Duration::from_secs(2)).arg("0.5"),
+        ];
+        let started = Instant::now();
+        let results = RealRunner.run_parallel(&commands);
+        assert!(results.into_iter().all(|result| result.unwrap().success()));
+        assert!(
+            started.elapsed() < Duration::from_millis(1100),
+            "three starts ran serially: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

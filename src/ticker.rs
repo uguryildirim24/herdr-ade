@@ -480,14 +480,16 @@ struct Pass {
 }
 
 fn thread_pass(
-    project: &Project,
+    input: &LaunchPass<'_>,
     prefix: &str,
-    herdr: &Herdr,
-    threads: &[thread::Thread],
-    agents: &[Agent],
-    panes: &[Pane],
     hashes: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Pass> {
+    let ctx = input.ctx;
+    let project = input.project;
+    let herdr = input.herdr;
+    let threads = input.threads;
+    let agents = input.agents;
+    let panes = input.panes;
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass {
@@ -498,10 +500,7 @@ fn thread_pass(
     for t in threads {
         if t.status == thread::Status::Starting {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
-                thread::update(project, &t.id, |t| {
-                    t.status = thread::Status::Failed;
-                    t.error = "still starting after five minutes".into();
-                })?;
+                threads::fail_start(ctx, project, &t.id, "still starting after five minutes")?;
             }
             continue;
         }
@@ -576,6 +575,19 @@ fn thread_pass(
     Ok(pass)
 }
 
+fn agent_start_timeout(launch: &crate::contracts::Launch) -> u64 {
+    let configured = if launch.ready_timeout_ms == 0 {
+        crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
+    } else {
+        launch.ready_timeout_ms
+    };
+    if launch.kind == "pi" {
+        configured.max(thread::PI_START_TIMEOUT_MS)
+    } else {
+        configured
+    }
+}
+
 struct LaunchPass<'a> {
     ctx: &'a Ctx<'a>,
     project: &'a Project,
@@ -585,12 +597,17 @@ struct LaunchPass<'a> {
     panes: &'a [Pane],
 }
 
-/// Launches pending threads whose pane is at a shell prompt. At most one
-/// `agent start` per project per tick (`may_start`), and never a start and a
-/// prompt for the same pane in one tick: prompts only go to agents that were
-/// already listed before any start.
-fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
+/// Launches pending threads whose pane is at a shell prompt. Local starts stay
+/// one per pass; independent box starts are submitted as one parallel batch.
+/// Prompts still go only to agents listed before this launch pass.
+fn launch_pass(
+    pass: &LaunchPass<'_>,
+    may_start: &mut bool,
+    one_at_a_time: bool,
+    errors: &mut Vec<anyhow::Error>,
+) {
     let now = jiff::Timestamp::now();
+    let mut pending = Vec::new();
     for t in pass.threads {
         if t.status != thread::Status::Open || !t.prompt_pending {
             continue;
@@ -600,21 +617,21 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             continue;
         }
         if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
-            let failed = thread::update(pass.project, &t.id, |t| {
-                t.status = thread::Status::Failed;
-                t.error = format!(
-                    "no `{}` agent appeared in the pane after {} launch attempts",
-                    t.agent,
-                    thread::MAX_LAUNCH_ATTEMPTS
-                );
-            });
-            errors.extend(failed.err());
+            let reason = format!(
+                "no `{}` agent appeared in the pane after {} launch attempts",
+                t.agent,
+                thread::MAX_LAUNCH_ATTEMPTS
+            );
+            errors.extend(
+                threads::fail_start(pass.ctx, pass.project, &t.id, &reason)
+                    .err()
+                    .map(|error| error.context(format!("{}: failed-start cleanup", t.id))),
+            );
             continue;
         }
-        if !*may_start {
+        if one_at_a_time && !*may_start {
             continue;
         }
-        *may_start = false;
         // A pi provider that stopped being ready (an expired login) fails
         // the thread at once instead of launching into it (SPEC-pi §3.4). A
         // box lane's readiness is read on the box, never from the Mac login
@@ -628,55 +645,59 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
             if let Err(error) = readiness {
                 let message = format!("{error:#}");
                 errors.extend(
-                    thread::update(pass.project, &t.id, |t| {
-                        t.status = thread::Status::Failed;
-                        t.error = message;
-                    })
-                    .err(),
+                    threads::fail_start(pass.ctx, pass.project, &t.id, &message)
+                        .err()
+                        .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
                 );
                 continue;
             }
         }
-        let launched = (|| -> Result<()> {
-            thread::update(pass.project, &t.id, |t| t.launch_attempts += 1)?;
-            // The coordinator's pane is on the project's server; a remote
-            // thread has no parent there (D13).
-            let parent = pass
-                .project
-                .coordinator()
-                .filter(|_| !t.is_remote())
-                .map(|c| c.pane_id);
-            let timeout = if t.launch.ready_timeout_ms == 0 {
-                crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
-            } else {
-                t.launch.ready_timeout_ms
-            };
-            let agent = pass.herdr.on_machine(t.machine_route()).agent_start_opts(
-                &crate::herdr::AgentStart {
-                    name: &t.agent_name,
-                    kind: &t.launch.kind,
-                    pane: &t.pane_id,
-                    agent_args: &t.launch.args,
-                    parent: parent.as_deref(),
-                    ready_timeout_ms: timeout,
-                },
-            )?;
-            let process = pass
-                .herdr
-                .on_machine(t.machine_route())
+        match thread::update(pass.project, &t.id, |t| t.launch_attempts += 1) {
+            Ok(_) => {
+                pending.push(t);
+                if one_at_a_time {
+                    *may_start = false;
+                    break;
+                }
+            }
+            Err(error) => errors.push(error.context(format!("{}: launch record", t.id))),
+        }
+    }
+    let Some(first) = pending.first() else {
+        return;
+    };
+    let parent = pass
+        .project
+        .coordinator()
+        .filter(|_| !first.is_remote())
+        .map(|coordinator| coordinator.pane_id);
+    let starts: Vec<_> = pending
+        .iter()
+        .map(|t| crate::herdr::AgentStart {
+            name: &t.agent_name,
+            kind: &t.launch.kind,
+            pane: &t.pane_id,
+            agent_args: &t.launch.args,
+            parent: parent.as_deref(),
+            ready_timeout_ms: agent_start_timeout(&t.launch),
+        })
+        .collect();
+    let herdr = pass.herdr.on_machine(first.machine_route());
+    let outcomes = herdr.agent_start_many(&starts);
+    let socket = pass
+        .project
+        .coordinator()
+        .map(|coordinator| coordinator.socket)
+        .unwrap_or_default();
+    for (t, outcome) in pending.into_iter().zip(outcomes) {
+        let launched = outcome.map_err(anyhow::Error::from).and_then(|agent| {
+            let process = herdr
                 .pane_process_info(&t.pane_id)
                 .ok()
                 .and_then(|info| info.identity(&t.launch.kind));
-            let socket = pass
-                .project
-                .coordinator()
-                .map(|c| c.socket)
-                .unwrap_or_default();
-            thread::update(pass.project, &t.id, |rec| {
-                thread::bind_identity(rec, &socket, &agent, process);
+            thread::update(pass.project, &t.id, |record| {
+                thread::bind_identity(record, &socket, &agent, process);
             })?;
-            // The board says which helper took the task; the value is
-            // plain-checked there.
             if !t.launch.compact_reason.is_empty() {
                 let _ = crate::board::publish_value(
                     pass.ctx,
@@ -686,11 +707,11 @@ fn launch_pass(pass: &LaunchPass<'_>, may_start: &mut bool, errors: &mut Vec<any
                 );
             }
             Ok(())
-        })();
+        });
         errors.extend(
             launched
                 .err()
-                .map(|e| e.context(format!("{}: launch", t.id))),
+                .map(|error| error.context(format!("{}: launch", t.id))),
         );
     }
 }
@@ -745,13 +766,17 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         coordinator::report_tokens(&herdr, slug, &record.pane_id);
     }
 
+    let local = open_threads(project, false);
     let pass = thread_pass(
-        project,
+        &LaunchPass {
+            ctx,
+            project,
+            herdr: &herdr,
+            threads: &local,
+            agents: &agents,
+            panes: &panes,
+        },
         &prefix,
-        &herdr,
-        &open_threads(project, false),
-        &agents,
-        &panes,
         None,
     )?;
     first_error = first_error.or(pass.error);
@@ -818,9 +843,16 @@ fn remote_pass(
     };
 
     let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
-    let pass = thread_pass(project, &prefix, &remote, threads, &agents, &panes, None)
-        .map_err(|e| format!("{e:#}"))?;
-    errors.extend(pass.error);
+    let state_input = LaunchPass {
+        ctx,
+        project,
+        herdr: &remote,
+        threads,
+        agents: &agents,
+        panes: &panes,
+    };
+    let state_pass = thread_pass(&state_input, &prefix, None).map_err(|e| format!("{e:#}"))?;
+    errors.extend(state_pass.error);
     launch_pass(
         &LaunchPass {
             ctx,
@@ -831,6 +863,7 @@ fn remote_pass(
             panes: &panes,
         },
         may_start,
+        false,
         errors,
     );
     // The D8 BLOCKED/GONE lines for this machine's box lanes (SPEC-remote §4.3).
@@ -935,6 +968,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             panes: &seen.panes,
         },
         &mut may_start,
+        true,
         &mut errors,
     );
 
@@ -1037,6 +1071,91 @@ mod tests {
             version: version.into(),
             ..Info::default()
         })
+    }
+
+    #[test]
+    fn pi_start_uses_the_cloud_outer_bound_without_changing_other_kinds() {
+        let pi = crate::contracts::Launch {
+            kind: "pi".into(),
+            ready_timeout_ms: 90_000,
+            ..crate::contracts::Launch::default()
+        };
+        assert_eq!(agent_start_timeout(&pi), thread::PI_START_TIMEOUT_MS);
+        let claude = crate::contracts::Launch {
+            kind: "claude".into(),
+            ready_timeout_ms: 90_000,
+            ..crate::contracts::Launch::default()
+        };
+        assert_eq!(agent_start_timeout(&claude), 90_000);
+    }
+
+    #[test]
+    fn one_remote_pass_submits_every_independent_lane_start() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
+        );
+        let mut records = Vec::new();
+        let mut panes = Vec::new();
+        for number in 1..=3 {
+            let id = format!("t-{number:04}");
+            let tab_id = format!("w2:t{number}");
+            let pane_id = format!("w2:p{number}");
+            let cwd = format!("/box/lane-{number}");
+            let record = thread::allocate(&fixture.project, |record| {
+                record.id = id.clone();
+                record.status = thread::Status::Open;
+                record.prompt_pending = true;
+                record.machine = "oci".into();
+                record.machine_id = "machine-1".into();
+                record.workspace_id = "w2".into();
+                record.tab_id = tab_id.clone();
+                record.pane_id = pane_id.clone();
+                record.cwd = cwd.clone();
+                record.agent = "claude".into();
+                record.agent_name = format!("hp-demo-{id}");
+                record.launch.kind = "claude".into();
+            })
+            .unwrap();
+            panes.push(Pane {
+                pane_id,
+                tab_id,
+                workspace_id: "w2".into(),
+                cwd,
+            });
+            records.push(record);
+        }
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let mut may_start = true;
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: &records,
+                agents: &[],
+                panes: &panes,
+            },
+            &mut may_start,
+            false,
+            &mut errors,
+        );
+
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(runner.count("agent start"), 3);
+        for record in thread::list(&fixture.project) {
+            assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
+        }
     }
 
     #[test]

@@ -334,6 +334,41 @@ pub(crate) struct BoxLock {
     _file: File,
 }
 
+/// Held while one project finds or creates its shared workspace on a machine.
+/// Repository provisioning has a different lock because one project may span
+/// repositories while still owning exactly one remote workspace.
+pub(crate) struct RemoteWorkspaceLock {
+    _file: File,
+}
+
+pub(crate) fn remote_workspace_lock(
+    root: &Path,
+    slug: &str,
+    machine_id: &str,
+) -> Result<RemoteWorkspaceLock> {
+    let dir = root.join(".locks");
+    std::fs::create_dir_all(&dir)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"workspace\n");
+    hasher.update(slug.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(machine_id.as_bytes());
+    let key: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = dir.join(format!("{key}.lock"));
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open remote workspace lock {}", path.display()))?;
+    file.lock()?;
+    Ok(RemoteWorkspaceLock { _file: file })
+}
+
 pub(crate) fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<BoxLock> {
     let dir = root.join(".locks");
     std::fs::create_dir_all(&dir)?;
