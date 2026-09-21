@@ -175,7 +175,7 @@ pub(crate) fn start_args(provider: &str, model: &str, thinking: &str) -> Vec<Str
 }
 
 /// The full `herdr agent start` argv for kind `pi`. `session` is ADE's
-/// `launch.resume_session` (a thread restart), never a recipe value.
+/// `launch.resume_session` (process recovery), never a recipe value.
 pub(crate) fn agent_start_args(
     name: &str,
     pane: &str,
