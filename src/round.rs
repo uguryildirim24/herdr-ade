@@ -1096,6 +1096,9 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thread::Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
+    // Serialize with the hook and ticker's automatic `advance`, or both paths
+    // can observe no bound reviewer and start one each.
+    let _advance = advance_lock(&project)?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
     // The pins are the input: refresh them before deciding, as `advance` does.
     let events = sealed_events(&project)?;
