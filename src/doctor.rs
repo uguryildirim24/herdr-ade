@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::herdr::{self, Herdr};
 use crate::paths::{self, Ctx, Env, SessionFlags};
@@ -13,6 +14,21 @@ use crate::project;
 use crate::runner::{Cmd, Runner};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct CheckResult {
+    pub(crate) status: String,
+    pub(crate) label: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DoctorOutcome {
+    pub(crate) healthy: bool,
+    pub(crate) checks: Vec<CheckResult>,
+    #[serde(skip)]
+    pub(crate) message: String,
+}
 
 /// One agent runtime's existing doctor probe. Recipes identify the runtime by
 /// `kind`; placement never carries a separate allowlist of recipe ids.
@@ -234,26 +250,47 @@ pub(crate) fn recipe_ready_on_box(
     Ok(())
 }
 
-/// Prints the report and returns whether every required check passed.
-pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<bool> {
-    let (mut text, mut healthy) = report(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
+/// Builds the human report and its typed check results from the same facts.
+pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
+    let (mut text, mut healthy, mut checks) =
+        report_with_checks(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
     // The pi rows read the process's own layout (SPEC-pi §3.4).
     match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root) {
         Ok((rows, pi_healthy)) => {
             healthy &= pi_healthy;
             for row in rows {
+                let status = match row.level {
+                    crate::pi::doctor::Level::Ok => "ok",
+                    crate::pi::doctor::Level::Warn => "warning",
+                    crate::pi::doctor::Level::Fail => "failed",
+                };
+                checks.push(CheckResult {
+                    status: status.into(),
+                    label: row.label.clone(),
+                    detail: row.detail.clone(),
+                });
                 let _ = writeln!(text, "{}", row.line());
             }
         }
         Err(error) => {
             healthy = false;
-            let _ = writeln!(text, "[FAIL] pi: {error:#}");
+            let detail = format!("{error:#}");
+            checks.push(CheckResult {
+                status: "failed".into(),
+                label: "pi".into(),
+                detail: detail.clone(),
+            });
+            let _ = writeln!(text, "[FAIL] pi: {detail}");
         }
     }
-    print!("{text}");
-    Ok(healthy)
+    Ok(DoctorOutcome {
+        healthy,
+        checks,
+        message: text,
+    })
 }
 
+#[cfg(test)]
 fn report(
     env: &Env,
     root: &Path,
@@ -261,17 +298,34 @@ fn report(
     session: &SessionFlags,
     runner: &dyn Runner,
 ) -> (String, bool) {
+    let (text, healthy, _) = report_with_checks(env, root, config_dir, session, runner);
+    (text, healthy)
+}
+
+fn report_with_checks(
+    env: &Env,
+    root: &Path,
+    config_dir: &Path,
+    session: &SessionFlags,
+    runner: &dyn Runner,
+) -> (String, bool, Vec<CheckResult>) {
     let mut out = String::new();
     let mut healthy = true;
+    let mut checks = Vec::new();
     let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
-        let mark = match ok {
-            Some(true) => "ok  ",
+        let (mark, status) = match ok {
+            Some(true) => ("ok  ", "ok"),
             Some(false) => {
                 healthy = false;
-                "FAIL"
+                ("FAIL", "failed")
             }
-            None => "warn",
+            None => ("warn", "warning"),
         };
+        checks.push(CheckResult {
+            status: status.into(),
+            label: label.into(),
+            detail: detail.clone(),
+        });
         let _ = writeln!(out, "[{mark}] {label}: {detail}");
     };
 
@@ -668,7 +722,7 @@ fn report(
         }
     }
 
-    (out, healthy)
+    (out, healthy, checks)
 }
 
 fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
@@ -1671,11 +1725,17 @@ mod tests {
         std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
 
-        let (text, healthy) = report(&env, &root, &config, &SessionFlags::default(), &runner);
+        let (text, healthy, checks) =
+            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
 
         assert!(!healthy, "{text}");
         assert!(text.contains("[FAIL] finished worktrees local"), "{text}");
         assert!(text.contains(worktree.to_string_lossy().as_ref()), "{text}");
+        assert!(checks.iter().any(|check| {
+            check.status == "failed"
+                && check.label == "finished worktrees local"
+                && check.detail.contains(worktree.to_string_lossy().as_ref())
+        }));
     }
 
     #[test]

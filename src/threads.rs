@@ -1545,7 +1545,10 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         match copied.outcome {
             CopyOutcome::Complete => ("complete".to_string(), Vec::new()),
             CopyOutcome::Partial(notes) => {
-                if !args.discard_uncopied {
+                if record.kind == Kind::Worktree
+                    && !record.worktree_path.is_empty()
+                    && !args.discard_uncopied
+                {
                     removal_refusal = Some(
                         "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
                             .to_string(),
@@ -2206,6 +2209,28 @@ mod tests {
             agent_state: None,
             state_secs: 0,
         }
+    }
+
+    #[test]
+    fn resolve_outcome_types_automatic_worktree_cleanup() {
+        let outcome = ResolveOutcome {
+            thread: "t-0001".into(),
+            state: "resolved".into(),
+            final_copy: "complete".into(),
+            copy_notes: Vec::new(),
+            pane: "closed".into(),
+            worktree: "kept".into(),
+            worktree_path: "/wt".into(),
+            worktree_reason: Some("work_not_done".into()),
+            branch: "lane".into(),
+        };
+        let data = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(data["worktree"], "kept");
+        assert_eq!(data["worktree_reason"], "work_not_done");
+        assert_eq!(
+            outcome.message("demo"),
+            "t-0001 resolved.\nIts pane and tab were closed.\nThe worktree /wt was kept: work_not_done.\n"
+        );
     }
 
     #[test]
