@@ -14,39 +14,37 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-21T11:10:36-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-21T11:15:28-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
-Workspace `w1G` (Adeherdr), 6 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
+Workspace `w1G` (Adeherdr), 4 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
 
-Coordinator session id `936438b4-6acf-4417-9513-2bb938fe60e0`.
+Coordinator session id `22e30006-6abc-4f92-9bcc-c002ce0ce442`.
+
+The coordinator has no agent name, so workers cannot `herdr agent prompt` it. Name it: `herdr agent rename "$HERDR_PANE_ID" coordinator`.
 
 ### Workers nested under the coordinator
 
 | name | kind | status | pane | tab (label) | cwd | tokens | last title |
 |---|---|---|---|---|---|---|---|
-| hp-adeherdr-t-0142 | pi | idle | `w1G:p35` | `w1G:t31` (t-0142) | `/home/agent/projects/herdr-ade/.worktrees/t-0142` | project=adeherdr rank=1 review=ready-for-review thread=t-0142 | π - t-0142 |
-| hp-adeherdr-t-0144 | pi | done | `w1G:p37` | `w1G:t33` (t-0144) | `/home/agent/projects/herdr-ade/.worktrees/t-0144` | done=1 lane=t-0144 project=adeherdr rank=1 review=ready-for-review thread=t-0144 | π - t-0144 |
-| hp-adeherdr-t-0145 | pi | done | `w1G:p38` | `w1G:t34` (t-0145) | `/home/agent/projects/herdr-ade/.worktrees/t-0145` | done=1 lane=t-0145 project=adeherdr rank=1 review=ready-for-review thread=t-0145 | π - t-0145 |
-| hp-adeherdr-t-0146 | pi | done | `w1G:p39` | `w1G:t35` (t-0146) | `/home/agent/projects/herdr-ade/.worktrees/t-0146` | done=1 lane=t-0146 project=adeherdr rank=3 review=working thread=t-0146 | π - t-0146 |
+| hp-adeherdr-t-0144 | pi | done | `w1G:p37` | `w1G:t33` (t-0144) | `/home/agent/projects/herdr-ade/.worktrees/t-0144` | project=adeherdr rank=1 review=ready-for-review thread=t-0144 | π - t-0144 |
+| hp-adeherdr-t-0147 | pi | done | `w1G:p3A` | `w1G:t36` (t-0147) | `/home/agent/projects/herdr-ade/.worktrees/t-0147` | done=1 lane=t-0147 project=adeherdr rank=1 review=ready-for-review thread=t-0147 | π - t-0147 |
 
 Start lines as they run now (from `pane process-info`), for restarting a worker that is gone:
 
 ```bash
-herdr agent start hp-adeherdr-t-0142 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
 herdr agent start hp-adeherdr-t-0144 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
-herdr agent start hp-adeherdr-t-0145 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
-herdr agent start hp-adeherdr-t-0146 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
+herdr agent start hp-adeherdr-t-0147 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
 ```
 
 Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (working), `w1J` Venator (idle), `w1K` Elicio (idle)
 
 ### Git
 
-Repo `/home/agent/projects/herdr-ade`, integration branch `main` (10 ahead, 0 behind origin/main).
+Repo `/home/agent/projects/herdr-ade`, integration branch `main` (5 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/home/agent/projects/herdr-ade` | `main` | ae83b4d | 0 | review(r62): accept home workspace exclusion |
+| `/home/agent/projects/herdr-ade` | `main` | 98d5543 | 0 | docs(review): round r63 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -104,6 +102,7 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (10 ahead, 0 be
 | `/home/agent/projects/herdr-ade/.worktrees/review-r61` | `review/r61` | 84e6a49 | 0 | docs(tasks): t-0139 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r62` | `review/r62` | c3a93ca | 0 | docs(tasks): t-0145 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r62-2` | `review/r62-2` | e384897 | 0 | docs(tasks): t-0146 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r63` | `review/r63` | cd6250e | 0 | docs(tasks): t-0147 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r7` | `review/r7` | 7cb564e | 0 | docs(tasks): t-0015 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r9` | `review/r9` | ef62484 | 0 | docs(tasks): t-0022 |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0001` | `hp/adeherdr/t-0001-plain-language-check-everyday-words-pass` | c482aa9 | 0 | checkpoint(r1): HANDOFF after merging the round |
@@ -171,28 +170,29 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (10 ahead, 0 be
 | `/home/agent/projects/herdr-ade/.worktrees/t-0096` | `hp/adeherdr/t-0096-review-r43-this-round-checks-that-the-ta` | 0b5a0f7 | 0 | docs(review): round r43 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0098` | `hp/adeherdr/t-0098-calibrate-the-picker-on-this-project-s-o` | 69cc1b0 | 0 | checkpoint(r47): HANDOFF after merging the round |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0112` | `hp/adeherdr/t-0112-d12-a-lane-goes-to-a-machine-that-can-ac` | 1fdbb98 | 0 | checkpoint(r52): HANDOFF after merging the round |
-| `/home/agent/projects/herdr-ade/.worktrees/t-0142` | `hp/adeherdr/t-0142-the-doctor-ignores-a-machine-s-own-home` | 74ce0d4 | 0 | fix(doctor): ignore a machine's own home workspace |
+| `/home/agent/projects/herdr-ade/.worktrees/t-0142` | `hp/adeherdr/t-0142-the-doctor-ignores-a-machine-s-own-home` | 2785dc9 | 0 | checkpoint(r62): HANDOFF after merging the round |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0143` | `hp/adeherdr/t-0143-review-r60-this-round-measures-the-part` | 0c4f85d | 0 | review(r60): verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0144` | `hp/adeherdr/t-0144-rounds-side-by-side-stop-sending-each-ot` | c6bd193 | 0 | fix(rounds): ignore bookkeeping base movement |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0145` | `hp/adeherdr/t-0145-review-r62-this-round-stops-the-health-c` | 5b97481 | 0 | review(r62): reject incomplete home workspace rule |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0146` | `hp/adeherdr/t-0146-review-r62-this-round-stops-the-health-c` | ae83b4d | 0 | review(r62): accept home workspace exclusion |
+| `/home/agent/projects/herdr-ade/.worktrees/t-0147` | `hp/adeherdr/t-0147-review-r63-this-round-stops-rounds-that` | 98d5543 | 0 | docs(review): round r63 verdict |
 
 Last commits on the integration branch:
 
 ```
+98d5543 docs(review): round r63 verdict
+c6a88c7 Merge commit 'c6bd1937fbbcc7789d3bddff19e0b3747529f0f2' into hp/adeherdr/t-0147-review-r63-this-round-stops-rounds-that
+cd6250e docs(tasks): t-0147
+c00dd46 review(r63): brief for revision 1
+2785dc9 checkpoint(r62): HANDOFF after merging the round
 ae83b4d review(r62): accept home workspace exclusion
-f7cde15 review(doctor): state the accepted home-label limit
-51d67c9 Merge commit 'ea72eb5dca372309e7cae7d72357dbe4ddb08ae7' into hp/adeherdr/t-0146-review-r62-this-round-stops-the-health-c
-e384897 docs(tasks): t-0146
-e1ab251 review(r62): brief for revision 1
-ea72eb5 Merge commit '74ce0d48dcbed0f524315ee2336be2d451810908' into hp/adeherdr/t-0145-review-r62-this-round-stops-the-health-c
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0146.md`, `tasks/t-0145.md`, `tasks/review-r62.md`, `tasks/t-0144.md`, `tasks/t-0143.md`, `tasks/t-0138.md`, `tasks/review-r60.md`, `tasks/t-0142.md`, `tasks/review-r59.md`, `tasks/t-0139.md`, `tasks/review-r61.md`, `tasks/t-0136.md`
-- verdicts: `tasks/reviews/code-r62.md`, `tasks/reviews/code-r60.md`, `tasks/reviews/code-r61.md`, `tasks/reviews/code-r58.md`, `tasks/reviews/code-r57.md`, `tasks/reviews/code-r56.md`, `tasks/reviews/code-r55.md`, `tasks/reviews/code-r54.md`, `tasks/reviews/code-r53.md`, `tasks/reviews/code-r52.md`, `tasks/reviews/code-r51.md`, `tasks/reviews/code-r50.md`
+- briefs: `tasks/t-0147.md`, `tasks/review-r63.md`, `tasks/t-0146.md`, `tasks/t-0145.md`, `tasks/review-r62.md`, `tasks/t-0144.md`, `tasks/t-0143.md`, `tasks/t-0138.md`, `tasks/review-r60.md`, `tasks/t-0142.md`, `tasks/review-r59.md`, `tasks/t-0139.md`
+- verdicts: `tasks/reviews/code-r63.md`, `tasks/reviews/code-r62.md`, `tasks/reviews/code-r60.md`, `tasks/reviews/code-r61.md`, `tasks/reviews/code-r58.md`, `tasks/reviews/code-r57.md`, `tasks/reviews/code-r56.md`, `tasks/reviews/code-r55.md`, `tasks/reviews/code-r54.md`, `tasks/reviews/code-r53.md`, `tasks/reviews/code-r52.md`, `tasks/reviews/code-r51.md`
 
 ### Pickup
 
@@ -201,8 +201,8 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 ```bash
 /home/agent/.local/bin/ha --root /home/agent/.herdr-ade pickup <slug>
 # the old coordinator conversation, if herdr did not resume it in the pane:
-# cd /home/agent/.herdr-ade/adeherdr && claude --resume 936438b4-6acf-4417-9513-2bb938fe60e0
+# cd /home/agent/.herdr-ade/adeherdr && claude --resume 22e30006-6abc-4f92-9bcc-c002ce0ce442
 ```
 
-Round `r62` was merged into `main` at verdict commit `ae83b4dec0a07ce62c2b04c8f972186eb021a098`; this checkpoint is its child.
+Round `r63` was merged into `main` at verdict commit `98d5543ba047831800c6862d0001d6be17ff78ea`; this checkpoint is its child.
 
