@@ -21,6 +21,11 @@ const PR_INTERVAL_SECS: i64 = 120;
 pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
 
+/// Ticker passes an announced inbox set may stay unread before `doctor` fails
+/// the project row. The ticker beats every 15 seconds, so this is about a
+/// minute of a coordinator that does not read what was announced.
+pub(crate) const UNREAD_NUDGE_PASSES: u32 = 3;
+
 /// `.state/ticker.json`: what the ticker compared against last time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
@@ -31,6 +36,9 @@ pub(crate) struct State {
     pub(crate) config_errors: BTreeSet<String>,
     /// Hash of the set of unseen item ids that was last nudged.
     pub(crate) nudged: String,
+    /// Ticker passes where the set in `nudged` was announced and stayed
+    /// unread. Reset when the set is read or a different set is announced.
+    pub(crate) unread_passes: u32,
     pub(crate) session_item_written: bool,
 }
 
@@ -992,9 +1000,29 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
     )
 }
 
+/// The announced set is still unseen and has gone unread for at least
+/// `UNREAD_NUDGE_PASSES` ticker passes. Returns that pass count, or `None`
+/// when the coordinator has read it, nothing is announced, or too few passes
+/// were counted. Recomputed against the live inbox, so a stale counter never
+/// fails a project whose items are now read.
+pub(crate) fn announced_unread(project: &Project) -> Option<u32> {
+    let state = load_state(project);
+    if state.nudged.is_empty() || state.unread_passes < UNREAD_NUDGE_PASSES {
+        return None;
+    }
+    let seen = inbox::seen(project);
+    let unseen: BTreeSet<String> = inbox::unhandled(project)
+        .into_iter()
+        .map(|i| i.id)
+        .filter(|id| !seen.contains(id))
+        .collect();
+    (!unseen.is_empty() && hash_ids(&unseen) == state.nudged).then_some(state.unread_passes)
+}
+
 /// Step 6. A given set of unseen items is announced once; there is no timed
-/// re-nudge. With `nudge = false` (the default) the user gets a herdr
-/// notification instead of a prompt in the coordinator.
+/// re-nudge. With `nudge = true`, the default, the coordinator is prompted;
+/// `nudge = false` gives the user a herdr notification instead. Either way,
+/// passes where the same set stays unread are counted for `doctor`.
 pub(crate) fn nudge(
     project: &Project,
     state: &mut State,
@@ -1009,10 +1037,17 @@ pub(crate) fn nudge(
         .filter(|id| !seen.contains(id))
         .collect();
     if unseen.is_empty() {
+        // Nothing is waiting: the announced set was read, or none was ever
+        // announced. Clear both so an old announcement cannot keep counting.
+        state.nudged.clear();
+        state.unread_passes = 0;
         return Ok(());
     }
     let hash = hash_ids(&unseen);
     if hash == state.nudged {
+        // The announced set is still unread on this pass. `doctor` reads this
+        // count to fail a coordinator that never woke.
+        state.unread_passes = state.unread_passes.saturating_add(1);
         return Ok(());
     }
     if settings.nudge {
@@ -1034,6 +1069,7 @@ pub(crate) fn nudge(
         let _ = herdr.notification_show(&format!("herdr-ade: {}", project.slug), &body);
     }
     state.nudged = hash;
+    state.unread_passes = 0;
     Ok(())
 }
 

@@ -549,6 +549,14 @@ impl<'a> Herdr<'a> {
             .map(|_| ())
     }
 
+    /// Puts a name back on an agent that is already running in `target`.
+    /// `agent start` drops the name when interactive readiness times out, and
+    /// a live server handoff drops it on respawn; the process keeps running.
+    pub(crate) fn agent_rename(&self, target: &str, name: &str) -> Result<(), HerdrError> {
+        self.call(&["agent", "rename", target, name], CALL_TIMEOUT)
+            .map(|_| ())
+    }
+
     pub(crate) fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
         self.call(
             &["notification", "show", title, "--body", body],
