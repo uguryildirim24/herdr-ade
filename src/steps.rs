@@ -3,6 +3,7 @@
 //! without a thread or round home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -202,14 +203,19 @@ pub(crate) fn deliver_event(
 
 /// The configured publish URL for a repository (SPEC-remote §4.1): the
 /// project's own row wins, then the committed Mac→box map.
-fn publish_url_for(project: &Project, repo: &str) -> Option<String> {
+fn publish_url_for(
+    config_dir: &Path,
+    project: &Project,
+    machine: &str,
+    repo: &str,
+) -> Option<String> {
     if let Ok((settings, _)) = project.read_project_md()
         && let Some(row) = settings.repos.iter().find(|row| row.path == repo)
         && let Some(url) = &row.publish_url
     {
         return Some(url.clone());
     }
-    crate::remote::box_repo_for(repo).map(|row| row.publish_url.to_string())
+    crate::remote::box_repo_for(config_dir, machine, repo).and_then(|row| row.publish_url)
 }
 
 /// Before a box lane's DONE is typed, the Mac fetches the lane branch from the
@@ -223,7 +229,7 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
     if lane.branch.is_empty() {
         bail!("published_branch_missing: {} has no lane branch", lane.id);
     }
-    let url = publish_url_for(project, &lane.repo)
+    let url = publish_url_for(&ctx.config_dir, project, &lane.machine, &lane.repo)
         .with_context(|| format!("box_repo_unmapped: {} has no publish URL", lane.repo))?;
     let remote = crate::remote::remote_for_url(ctx.runner, &lane.repo, &url)?;
     let git = |args: &[&str]| {
@@ -683,7 +689,8 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
         states.insert(project.slug.clone(), state);
     }
 
-    let script = courier_helper(crate::contracts::BOX_ROOT, &profile.session);
+    let machine_paths = crate::remote::machine_declaration(&ctx.config_dir, machine)?;
+    let script = courier_helper(&machine_paths.root, &profile.session);
     let out = crate::remote::ssh_courier(
         ctx.runner,
         &target,
@@ -1761,10 +1768,27 @@ mod tests {
         env: &'a crate::paths::Env,
         runner: &'a dyn crate::runner::Runner,
     ) -> Ctx<'a> {
+        let config_dir = root.join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r#"[machines.box]
+target = "me@box"
+session = "default"
+home = "/home/ubuntu"
+root = "/home/ubuntu/.herdr-ade"
+worktrees = "/home/ubuntu/projects"
+build = "/home/ubuntu/build/lanes"
+path = "/home/ubuntu/.local/bin:/usr/bin:/bin"
+ade_bin = "/home/ubuntu/.local/bin/herdr-ade"
+pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
+"#,
+        )
+        .unwrap();
         Ctx {
             env,
             root: root.to_path_buf(),
-            config_dir: root.join("cfg"),
+            config_dir,
             runner,
             detached_ticker: false,
         }

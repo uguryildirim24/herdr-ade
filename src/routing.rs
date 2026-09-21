@@ -12,7 +12,7 @@ use crate::contracts::Recipe;
 pub struct Rule {
     pub workflow: Option<String>,
     pub product: Option<String>,
-    pub requires_claude: Option<bool>,
+    pub capability: Option<String>,
     pub recipe: String,
     pub retries: Option<u32>,
     pub fallback: Option<Vec<String>>,
@@ -32,7 +32,7 @@ pub struct Routing {
 pub struct WorkContract {
     pub workflow: String,
     pub product: String,
-    pub requires_claude: bool,
+    pub capability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,20 @@ pub struct Selection {
 }
 
 impl Routing {
+    pub fn recipe_ids(&self) -> std::collections::BTreeSet<&str> {
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert(self.default.as_str());
+        ids.extend(self.fallback.iter().map(String::as_str));
+        ids.extend(self.pins.values().map(String::as_str));
+        for rule in &self.rules {
+            ids.insert(rule.recipe.as_str());
+            if let Some(fallback) = &rule.fallback {
+                ids.extend(fallback.iter().map(String::as_str));
+            }
+        }
+        ids
+    }
+
     pub fn validate(&self, recipes: &BTreeMap<String, Recipe>) -> Result<()> {
         if self.default.trim().is_empty() {
             bail!(
@@ -60,13 +74,21 @@ impl Routing {
             self.validate_recipe(recipes, recipe)?;
         }
         for (index, rule) in self.rules.iter().enumerate() {
-            if rule.workflow.is_none() && rule.product.is_none() && rule.requires_claude.is_none() {
+            if rule.workflow.is_none() && rule.product.is_none() && rule.capability.is_none() {
                 bail!("routing_rule_invalid: rule[{index}] has no matcher");
             }
             if rule.recipe.trim().is_empty() {
                 bail!("routing_rule_invalid: rule[{index}] has no recipe");
             }
             self.validate_recipe(recipes, &rule.recipe)?;
+            if let Some(capability) = &rule.capability
+                && !recipes[&rule.recipe].capabilities.contains(capability)
+            {
+                bail!(
+                    "routing_capability_missing: rule[{index}] selects `{}` which does not declare `{capability}`",
+                    rule.recipe
+                );
+            }
             if let Some(fallback) = &rule.fallback {
                 for recipe in fallback {
                     self.validate_recipe(recipes, recipe)?;
@@ -98,8 +120,9 @@ impl Routing {
                         .as_ref()
                         .is_none_or(|value| value == &work.product)
                     && rule
-                        .requires_claude
-                        .is_none_or(|value| value == work.requires_claude)
+                        .capability
+                        .as_ref()
+                        .is_none_or(|value| work.capability.as_ref() == Some(value))
             })
             .and_then(|rule| rule.retries)
             .unwrap_or(self.retries)
@@ -120,8 +143,9 @@ impl Routing {
                     .as_ref()
                     .is_none_or(|value| value == &work.product)
                 && rule
-                    .requires_claude
-                    .is_none_or(|value| value == work.requires_claude)
+                    .capability
+                    .as_ref()
+                    .is_none_or(|value| work.capability.as_ref() == Some(value))
         });
         let (base, retries, fallback, mut label) = if let Some((index, rule)) = matched {
             (
@@ -199,7 +223,7 @@ mod tests {
         WorkContract {
             workflow: workflow.into(),
             product: String::new(),
-            requires_claude: false,
+            capability: None,
         }
     }
 
@@ -250,6 +274,28 @@ mod tests {
             error,
             "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
         );
+    }
+
+    #[test]
+    fn capability_rule_selects_only_a_recipe_that_declares_it() {
+        let mut rows = recipes();
+        rows.get_mut("rule")
+            .unwrap()
+            .capabilities
+            .push("pictures".into());
+        let mut table = routing();
+        table.rules[0] = Rule {
+            capability: Some("pictures".into()),
+            recipe: "rule".into(),
+            ..Rule::default()
+        };
+        table.validate(&rows).unwrap();
+        let work = WorkContract {
+            workflow: "lane".into(),
+            product: String::new(),
+            capability: Some("pictures".into()),
+        };
+        assert_eq!(table.select("hash", &work, 0).unwrap().recipe, "rule");
     }
 
     #[test]

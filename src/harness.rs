@@ -16,8 +16,6 @@ use crate::project::{Repo, Settings};
 use crate::remote;
 use crate::runner::Cmd;
 
-/// The saved machine whose box gets the same build and install.
-const BOX_MACHINE: &str = "oci";
 /// The plugin build's tool path, exactly as the coordinator uses it by hand.
 pub(crate) const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -32,6 +30,8 @@ pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
 struct RawConfig {
     #[serde(default)]
     harness: HarnessConfig,
+    #[serde(default)]
+    dispatch: crate::launch::DispatchConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -263,11 +263,6 @@ fn installed_version(ctx: &Ctx, bin: &str) -> Result<InstalledBinary> {
     })
 }
 
-/// The box's PATH for a build, exported before the zig probe and the cargo
-/// call. The box keeps zig in `$HOME/.local/bin`, which a non-login SSH shell
-/// does not otherwise carry.
-const BOX_BUILD_PATH: &str = "/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin";
-
 /// Resolve the box's zig on the box for a fork build, as a shell snippet.
 ///
 /// The repository-local `<box_path>/.target/rebase/zig-0.16.0/zig` wins when it
@@ -296,7 +291,13 @@ fn box_zig_script(box_path: &str) -> String {
     )
 }
 
-fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> {
+fn box_build(
+    ctx: &Ctx,
+    target: &str,
+    machine_path: &str,
+    box_path: &str,
+    kind: Kind,
+) -> Result<()> {
     let zig = if kind == Kind::Fork {
         format!("\n{}", box_zig_script(box_path))
     } else {
@@ -320,7 +321,7 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
          cargo build --release --locked\n\
          mkdir -p $HOME/.local/bin{installs}",
         path = remote::quote(box_path),
-        build_path = BOX_BUILD_PATH,
+        build_path = remote::quote(machine_path),
     );
     let out = remote::ssh(ctx.runner, target, &script, None, BOX_BUILD_TIMEOUT)?;
     if !out.success() {
@@ -441,13 +442,27 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
     }
     let _lock = lock(&ctx.config_dir)?;
     let running = Running::capture()?;
-    let box_target = remote::optional_machine_profile(
-        ctx.runner,
-        &ctx.env.herdr_bin(),
-        &ctx.config_dir,
-        BOX_MACHINE,
-    )?
-    .map(|profile| profile.target);
+    let config_text =
+        std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap_or_default();
+    let dispatch = toml::from_str::<RawConfig>(&config_text)
+        .context("config.toml does not parse")?
+        .dispatch
+        .machine;
+    let box_profile = if dispatch.is_empty() || dispatch == crate::contracts::MACHINE_LOCAL {
+        None
+    } else {
+        remote::optional_machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            &dispatch,
+        )?
+    };
+    let box_target = box_profile.as_ref().map(|profile| profile.target.clone());
+    let box_paths = box_profile
+        .as_ref()
+        .map(|profile| remote::machine_declaration(&ctx.config_dir, &profile.label))
+        .transpose()?;
     let mut fork = false;
     let mut installed = Vec::new();
     let mut warnings = Vec::new();
@@ -465,7 +480,16 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         }
         let box_installed = match (&box_target, &repo.box_path) {
             (Some(target), Some(box_path)) => {
-                box_build(ctx, target, box_path, kind)?;
+                box_build(
+                    ctx,
+                    target,
+                    &box_paths
+                        .as_ref()
+                        .context("machine path declaration is missing")?
+                        .path,
+                    box_path,
+                    kind,
+                )?;
                 true
             }
             (Some(_), None) => {
@@ -612,7 +636,14 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        box_build(&ctx, "box", "/home/ubuntu/projects/herdr", Kind::Fork).unwrap();
+        box_build(
+            &ctx,
+            "box",
+            "/bin:$HOME/.local/bin",
+            "/home/ubuntu/projects/herdr",
+            Kind::Fork,
+        )
+        .unwrap();
         let calls = runner.calls.borrow();
         let script = calls.last().unwrap().args.last().unwrap();
         assert!(script.contains("herdr_repo_zig"), "{script}");

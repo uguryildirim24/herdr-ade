@@ -332,11 +332,8 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
         )
     };
     if t.is_remote() {
-        // The box lane runs the plugin on the box, so the birth line carries
-        // the fixed box prefix, never the Mac's `current_exe` (D12/D14).
         return format!(
-            "Run {} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
-            crate::contracts::box_prefix(),
+            "Run {prefix} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
             t.machine
         );
     }

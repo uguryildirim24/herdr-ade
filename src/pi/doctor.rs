@@ -511,6 +511,16 @@ pub(crate) fn check_report(
     runner: &dyn sh::Runner,
     provider: &str,
 ) -> CheckReport {
+    check_report_model(env, layout, runner, provider, None)
+}
+
+pub(crate) fn check_report_model(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn sh::Runner,
+    provider: &str,
+    model: Option<&str>,
+) -> CheckReport {
     let mut rows = Vec::new();
 
     if let Err(error) = check_provider_allowed(provider) {
@@ -587,7 +597,7 @@ pub(crate) fn check_report(
 
     if check_provider_allowed(provider).is_ok() {
         if layout.wrapper().is_file() {
-            match auth_check(runner, layout, provider) {
+            match auth_check_model(runner, layout, provider, model) {
                 Ok(()) => rows.push(Row::ok("login", format!("{provider} ready"))),
                 Err(error) if error.evidence == FailureEvidence::Provider => {
                     rows.push(Row::provider_fail("login", error.detail));
@@ -608,6 +618,34 @@ pub(crate) fn check_report(
         provider: provider.to_string(),
         rows,
     }
+}
+
+/// ADE-facing doctor rows for the exact routed provider/model pairs.
+pub(crate) fn doctor_rows_with_models(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn sh::Runner,
+    models: &[(&str, &str)],
+) -> Vec<Row> {
+    let mut rows = doctor_rows_with(env, layout, runner, &[]);
+    if !layout.wrapper().is_file() {
+        return rows;
+    }
+    for (provider_id, model) in models {
+        if *provider_id == "pro" && !provider::has_provider(&layout.models(), "pro") {
+            rows.push(Row::ok("provider pro", "not on this machine (no relay)"));
+            continue;
+        }
+        let label = format!("provider {provider_id}/{model}");
+        match auth_check_model(runner, layout, provider_id, Some(model)) {
+            Ok(()) => rows.push(Row::ok(label, "login ready")),
+            Err(error) if error.evidence == FailureEvidence::Provider => {
+                rows.push(Row::provider_fail(format!("{label} login"), error.detail));
+            }
+            Err(error) => rows.push(Row::fail(format!("{label} readiness"), error.detail)),
+        }
+    }
+    rows
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,15 +671,33 @@ fn provider_auth(detail: impl Into<String>) -> AuthFailure {
 }
 
 fn auth_check(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> AuthResult {
-    if let Some(cached) = read_cached_probe(layout, provider) {
+    auth_check_model(runner, layout, provider, None)
+}
+
+fn auth_check_model(
+    runner: &dyn sh::Runner,
+    layout: &Layout,
+    provider: &str,
+    model: Option<&str>,
+) -> AuthResult {
+    if model.is_none()
+        && let Some(cached) = read_cached_probe(layout, provider)
+    {
         return cached;
     }
-    let result = auth_check_uncached(runner, layout, provider);
-    write_cached_probe(layout, provider, &result);
+    let result = auth_check_uncached(runner, layout, provider, model);
+    if model.is_none() {
+        write_cached_probe(layout, provider, &result);
+    }
     result
 }
 
-fn auth_check_uncached(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> AuthResult {
+fn auth_check_uncached(
+    runner: &dyn sh::Runner,
+    layout: &Layout,
+    provider: &str,
+    selected_model: Option<&str>,
+) -> AuthResult {
     // Let pi refresh an expired OAuth token. This is still only a credential
     // check; the print-mode call below is what proves the provider will serve
     // a model now.
@@ -683,7 +739,9 @@ fn auth_check_uncached(runner: &dyn sh::Runner, layout: &Layout, provider: &str)
         )));
     }
 
-    let model = probe_model(provider)
+    let model = selected_model
+        .map(Ok)
+        .unwrap_or_else(|| probe_model(provider))
         .map_err(|error| unknown_auth(format!("provider readiness setup failed: {error:#}")))?;
     let live = runner
         .run(
