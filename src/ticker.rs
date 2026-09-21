@@ -747,11 +747,23 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     let prefix = coordinator::current_prefix(&ctx.root)?;
     let mut first_error = None;
 
+    // The recorded name can be gone while the agent keeps running in the
+    // bound pane: `agent start` drops it when interactive readiness times out,
+    // and a live server handoff drops it on respawn. Put it back, so the
+    // coordinator can be woken, and record the repair in its own record.
+    let agent = match coordinator::restore_agent_name(project, &herdr, &record, &agents) {
+        Ok(agent) => agent,
+        Err(error) => {
+            first_error = Some(error);
+            agents
+                .iter()
+                .find(|a| coordinator::agent_matches(&record, a))
+                .cloned()
+        }
+    };
+
     // The coordinator: deliver a pending priming prompt, refresh its tokens.
-    let agent = agents
-        .iter()
-        .find(|a| coordinator::agent_matches(&record, a));
-    if let Some(agent) = agent {
+    if let Some(agent) = &agent {
         // One priming line per binding. Transport is not the receipt: an ADE
         // binding clears `prime_pending` only on its `ha context` receipt, and
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
@@ -797,12 +809,15 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     // Nudge (or notify) about inbox items `context` has not shown yet.
     if let Ok((settings, _)) = project.read_project_md() {
         let mut state = steps::load_state(project);
-        let before = state.nudged.clone();
-        let ready_pane = agent.filter(|a| a.ready()).map(|_| record.pane_id.as_str());
+        let before = state.clone();
+        let ready_pane = agent
+            .as_ref()
+            .filter(|a| a.ready())
+            .map(|_| record.pane_id.as_str());
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
             first_error = first_error.or(Some(error.context("nudge")));
         }
-        if state.nudged != before {
+        if state != before {
             steps::save_state(project, &state)?;
         }
     }
@@ -1404,6 +1419,49 @@ mod tests {
         assert_eq!(runner.count("agent start"), 0);
         // The board (workspace tokens) still publishes; the pane is untouched.
         assert_eq!(runner.count("pane report-metadata"), 0);
+    }
+
+    #[test]
+    fn a_name_dropped_while_the_agent_runs_is_restored_on_the_bound_pane() {
+        let f = fixture(true);
+        let runner = FakeRunner::new();
+        // The agent is in the bound pane, but a startup timeout or a live
+        // handoff left it without its recorded name.
+        let unnamed =
+            with_cwd(AGENT_READY, &f).replace(r#""name":"hp-demo-coordinator","#, r#""name":"","#);
+        runner.on("agent list", ok(&unnamed));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on(
+            "agent rename",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p1"}}}"#),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on("report-metadata", ok("{}"));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        let calls = runner.calls.borrow();
+        let rename = calls
+            .iter()
+            .find(|c| c.display().contains("agent rename"))
+            .expect("the recorded name is put back");
+        assert!(rename.display().contains("w1:p1"), "{}", rename.display());
+        assert!(
+            rename.display().contains("hp-demo-coordinator"),
+            "{}",
+            rename.display()
+        );
+        assert!(rename.env.iter().any(
+            |(k, v)| k == "HERDR_SOCKET_PATH" && v == &f.project.coordinator().unwrap().socket
+        ));
+        drop(calls);
+        // The repair is durable, not just this tick's return value.
+        assert_eq!(f.project.coordinator().unwrap().name_restored, 1);
     }
 
     #[test]

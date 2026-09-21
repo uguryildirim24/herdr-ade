@@ -716,10 +716,12 @@ fn items_of(project: &Project, kind: &str) -> Vec<inbox::Item> {
 
 fn set_front_matter(project: &Project, extra: &str) {
     let text = std::fs::read_to_string(project.project_md()).unwrap();
+    // Drop the default `nudge` line first, then let `extra` set the value it
+    // wants; inserting first would make the strip remove the new line.
+    let stripped = text.replacen("nudge = true\n", "", 1);
     std::fs::write(
         project.project_md(),
-        text.replacen("+++\n", &format!("+++\n{extra}\n"), 1)
-            .replacen("nudge = false\n", "", 1),
+        stripped.replacen("+++\n", &format!("+++\n{extra}\n"), 1),
     )
     .unwrap();
 }
@@ -831,6 +833,7 @@ fn a_finishing_thread_is_in_the_digest_without_writing_an_inbox_item() {
 #[test]
 fn with_nudge_off_the_user_gets_one_notification_and_the_coordinator_no_prompt() {
     let (world, project, _) = finished_world("idle");
+    set_front_matter(&project, "nudge = false");
     settle(&project);
     inbox::write(&project, "routine", "r", "due", "Prompt").unwrap();
     let ctx = world.ctx();
@@ -871,6 +874,32 @@ fn a_blocked_nudge_is_retried_and_a_busy_coordinator_is_not_prompted() {
     ticker::tick_project(&ctx, &project).unwrap();
     assert_eq!(world.runner.count("agent prompt"), 0);
     assert!(crate::steps::load_state(&project).nudged.is_empty());
+}
+
+#[test]
+fn an_announcement_that_stays_unread_is_counted_by_ticker_pass() {
+    let (world, project, _) = finished_world("idle");
+    set_front_matter(&project, "nudge = true");
+    settle(&project);
+    inbox::write(&project, "routine", "r", "due", "Prompt").unwrap();
+    let ctx = world.ctx();
+    // The first tick announces the set; later ticks with the same set unread
+    // are the passes `doctor` reads.
+    for _ in 0..(crate::steps::UNREAD_NUDGE_PASSES + 1) {
+        ticker::tick_project(&ctx, &project).unwrap();
+    }
+    assert!(crate::steps::load_state(&project).unread_passes >= crate::steps::UNREAD_NUDGE_PASSES);
+    // A context read marks the set seen; the count resets on the next pass.
+    let ids: Vec<String> = inbox::unhandled(&project)
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    inbox::mark_seen(&project, &ids).unwrap();
+    // `doctor` recomputes against the live inbox, so a stale counter does not
+    // fail a project whose items are now read.
+    assert!(crate::steps::announced_unread(&project).is_none());
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(crate::steps::load_state(&project).unread_passes, 0);
 }
 
 #[test]

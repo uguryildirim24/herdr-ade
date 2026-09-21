@@ -164,10 +164,12 @@ impl Default for Settings {
             goal: String::new(),
             max_parallel_threads: 3,
             auto_resolve_days: 7,
-            // Off by default: on herdr 0.9.1 a prompt merges with, and submits,
-            // text the user has half-typed. With `false` the ticker shows a
-            // herdr notification instead.
-            nudge: false,
+            // On by default: a coordinator that does not read its inbox is
+            // unreachable. A project that wants the old notification-only
+            // behaviour sets `nudge = false` in PROJECT.md. On herdr 0.9.1 a
+            // prompt merges with, and submits, text the user has half-typed;
+            // the project setting is the way out.
+            nudge: true,
             talk: None,
             repos: Vec::new(),
         }
@@ -290,6 +292,10 @@ pub(crate) struct Coordinator {
     /// `open` and the ticker's relaunch each start a new incarnation, and a
     /// sealed event is bound to the one it was sealed for (D5 X5).
     pub(crate) generation: u32,
+    /// How many times `open` or the ticker put the recorded name back on the
+    /// agent running in the bound pane after herdr dropped it. A durable record
+    /// of a repair, so `doctor` can say it happened.
+    pub(crate) name_restored: u32,
 }
 
 impl Coordinator {
@@ -730,10 +736,11 @@ from the project's memory. Replace this paragraph with how you want work done:
 conventions, what to check before finishing, what never to do.
 
 The settings above, between the `+++` lines, are yours to edit. `nudge = true`
-lets the ticker prompt the coordinator when something changed; it is off by
-default because a prompt that arrives while you are typing in the coordinator
-is merged with, and submits, your half-typed text. With it off you get a herdr
-notification instead.
+lets the ticker prompt the coordinator when something changed; it is on by
+default so a coordinator that is not reading its inbox still wakes. A prompt
+that arrives while you are typing in the coordinator is merged with, and
+submits, your half-typed text; set `nudge = false` to get a herdr notification
+instead.
 ";
 
 /// Creates the folder and skeleton files. The only code path that creates a
@@ -913,7 +920,7 @@ mod tests {
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.max_parallel_threads, 3);
         assert_eq!(settings.auto_resolve_days, 7);
-        assert!(!settings.nudge);
+        assert!(settings.nudge);
         assert_eq!(
             settings.repos,
             vec![
@@ -940,6 +947,12 @@ mod tests {
             parse_project_md("+++\nname = \"X\"\nnudge = true\n+++\n\nBody\n+++\nmore\n").unwrap();
         assert_eq!(settings.name, "X");
         assert!(settings.nudge);
+        // Prompting is the default: a PROJECT.md without the key wakes the
+        // coordinator. Only an explicit `nudge = false` turns it off.
+        let (settings, _) = parse_project_md("+++\nname = \"X\"\n+++\n").unwrap();
+        assert!(settings.nudge);
+        let (settings, _) = parse_project_md("+++\nname = \"X\"\nnudge = false\n+++\n").unwrap();
+        assert!(!settings.nudge);
         assert_eq!(body, "Body\n+++\nmore\n");
         assert!(parse_project_md("no front matter").is_err());
         assert!(parse_project_md("+++\nname = \n+++\n").is_err());
