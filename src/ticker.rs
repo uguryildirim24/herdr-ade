@@ -20,12 +20,12 @@ use crate::project::{self, Project, Status};
 use crate::steps::{self, Memory};
 use crate::{inbox, thread, threads};
 
-pub const TICK: Duration = Duration::from_secs(15);
+const TICK: Duration = Duration::from_secs(15);
 const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
-pub fn lock_path(root: &Path) -> PathBuf {
+pub(crate) fn lock_path(root: &Path) -> PathBuf {
     root.join(".ticker.lock")
 }
 
@@ -41,24 +41,24 @@ fn log_path(root: &Path) -> PathBuf {
 /// `doctor`. The pid is for display only; nothing signals it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct Info {
-    pub version: String,
-    pub pid: u32,
-    pub root: String,
-    pub started: String,
+pub(crate) struct Info {
+    pub(crate) version: String,
+    pub(crate) pid: u32,
+    pub(crate) root: String,
+    pub(crate) started: String,
     /// Where the ticker resolves its tools from its own environment, which may
     /// differ from the user's shell.
-    pub tools: Vec<(String, String)>,
+    pub(crate) tools: Vec<(String, String)>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum LockState {
+pub(crate) enum LockState {
     Free,
     Held(Info),
 }
 
 /// Probes the lock without keeping it. The file is never created here.
-pub fn lock_state(root: &Path) -> LockState {
+pub(crate) fn lock_state(root: &Path) -> LockState {
     let Ok(mut file) = File::options().read(true).write(true).open(lock_path(root)) else {
         return LockState::Free;
     };
@@ -73,7 +73,7 @@ pub fn lock_state(root: &Path) -> LockState {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum StartAction {
+pub(crate) enum StartAction {
     Spawn,
     Nothing,
     StopThenSpawn,
@@ -82,7 +82,7 @@ pub enum StartAction {
 /// The `ticker start` decision. A healthy ticker of the same version is never
 /// replaced; a different version, or a stop in progress, is stopped first so
 /// `open` never ends with no ticker.
-pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> StartAction {
+fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> StartAction {
     match lock {
         LockState::Free => StartAction::Spawn,
         LockState::Held(info) if info.version == my_version && !stop_file_exists => {
@@ -97,7 +97,7 @@ pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) 
 /// pass calls `advance`, so waiting here would deadlock against the ticker
 /// waiting on `advance`'s lock. Ordinary thread starts and explicit `ticker
 /// start` calls still replace a stale-version ticker.
-pub fn ensure(ctx: &Ctx) -> Result<()> {
+pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
         return Ok(());
@@ -112,7 +112,7 @@ pub fn ensure(ctx: &Ctx) -> Result<()> {
 /// Spawns the detached loop unless there is nothing to watch. It creates
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
-pub fn start(ctx: &Ctx) -> Result<()> {
+pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
         return Ok(());
@@ -172,7 +172,7 @@ fn spawn(root: &Path) -> Result<()> {
 }
 
 /// Asks the running ticker to exit and waits for the lock to be released.
-pub fn stop(root: &Path) -> Result<()> {
+pub(crate) fn stop(root: &Path) -> Result<()> {
     if lock_state(root) == LockState::Free {
         let _ = std::fs::remove_file(stop_path(root));
         return Ok(());
@@ -193,7 +193,7 @@ pub fn stop(root: &Path) -> Result<()> {
     )
 }
 
-pub fn status(root: &Path) -> Result<()> {
+pub(crate) fn status(root: &Path) -> Result<()> {
     match lock_state(root) {
         LockState::Free => println!("ticker: not running (root {})", root.display()),
         LockState::Held(info) => {
@@ -228,12 +228,12 @@ fn which(tool: &str, path_var: &str) -> String {
         .unwrap_or_else(|| "(not found)".to_string())
 }
 
-pub struct Log {
+pub(crate) struct Log {
     path: PathBuf,
 }
 
 impl Log {
-    pub fn line(&self, text: &str) {
+    pub(crate) fn line(&self, text: &str) {
         let Ok(mut file) = File::options().create(true).append(true).open(&self.path) else {
             return;
         };
@@ -255,7 +255,7 @@ impl Log {
 
 /// The loop. Exits when another ticker holds the lock, when the stop file
 /// appears, or when no project has had a reachable session for five minutes.
-pub fn run(ctx: &Ctx) -> Result<()> {
+pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
     if project::list_slugs(root).is_empty() {
         return Ok(());
@@ -327,7 +327,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// slow project does not delay the others' sidebar. Returns whether any
 /// project's session was reachable. A failure in one project never stops the
 /// others.
-pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
+pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
     memory.machine_views.clear();
     let mut reachable = Vec::new();
@@ -429,13 +429,13 @@ fn machine_passes(
 }
 
 #[cfg(test)]
-pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
+pub(crate) fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
     let dir = std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id()));
     tick(ctx, &Log { path: dir }, memory)
 }
 
 /// What the cheap pass saw, handed to the slow pass so herdr is asked once.
-pub struct Seen {
+pub(crate) struct Seen {
     socket: String,
     agents: Vec<Agent>,
     panes: Vec<Pane>,
@@ -446,12 +446,12 @@ pub struct Seen {
 
 /// Both passes for one project; `Ok(false)` when its session is unreachable.
 #[cfg(test)]
-pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
+pub(crate) fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
     tick_project_with(ctx, project, &mut Memory::new(ctx))
 }
 
 #[cfg(test)]
-pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
+pub(crate) fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
     memory.machine_views.clear();
     match tick_cheap(ctx, project)? {
         Some(seen) => {

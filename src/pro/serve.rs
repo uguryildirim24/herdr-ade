@@ -38,30 +38,29 @@ use super::sh::Runner;
 use super::{BRIDGE_PORT, Env, FAILURE_WINDOW, Layout, TURN_TIMEOUT, lane, state};
 
 /// The model id `GET /v1/models` lists and the relay accepts.
-pub const MODEL_ID: &str = super::provider::MODEL_ID;
+pub(crate) const MODEL_ID: &str = super::provider::MODEL_ID;
 
 /// Read timeout while waiting for a request header block.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The folders the model may read even without `--read-root`.
-pub const DEFAULT_READ_ROOT: &str = "/home/agent/projects";
+const DEFAULT_READ_ROOT: &str = "/home/agent/projects";
 /// One refused path's answer line, whatever the reason.
-pub const REFUSED: &str = "refused: outside the readable folders";
+const REFUSED: &str = "refused: outside the readable folders";
 /// Request rounds served per pi request before the last answer is returned.
-pub const MAX_REQUEST_ROUNDS: usize = 8;
+const MAX_REQUEST_ROUNDS: usize = 8;
 /// One file's text cap; a larger file is cut with a note.
-pub const FILE_MAX_BYTES: usize = 200 * 1024;
+const FILE_MAX_BYTES: usize = 200 * 1024;
 /// One round's combined text cap.
-pub const ROUND_MAX_BYTES: usize = 1024 * 1024;
+const ROUND_MAX_BYTES: usize = 1024 * 1024;
 /// One `LIST`'s entry cap.
-pub const LIST_MAX_ENTRIES: usize = 500;
+const LIST_MAX_ENTRIES: usize = 500;
 /// The note the model sees when it keeps asking past the round budget.
-pub const REQUEST_BUDGET_NOTE: &str =
-    "[relay: the 8-request budget is spent; this answer is final]";
+const REQUEST_BUDGET_NOTE: &str = "[relay: the 8-request budget is spent; this answer is final]";
 /// The relay-owned preamble added to the first message of every session (the
 /// relay already builds that message; the shared Pro home's instruction file
 /// stays the packet lane's, so this text never reaches a packet turn).
-pub const RELAY_PROTOCOL: &str = "\
+const RELAY_PROTOCOL: &str = "\
 Relay access: this session can read files for you. At the very end of an
 answer you may ask for files, one request per line and nothing after them:
 READ <absolute path>
@@ -71,12 +70,12 @@ entries, each under a `=== <path> ===` header. Use absolute paths. Do not emit
 a request line when the answer is final.";
 
 /// `<state dir>/relay`: the relay's own files, so a failed request leaves a trace.
-pub fn relay_dir(layout: &Layout) -> PathBuf {
+fn relay_dir(layout: &Layout) -> PathBuf {
     layout.root.join("relay")
 }
 
 /// `<state dir>/relay/serve.log`: one line per request and per refusal.
-pub fn serve_log(layout: &Layout) -> PathBuf {
+fn serve_log(layout: &Layout) -> PathBuf {
     relay_dir(layout).join("serve.log")
 }
 
@@ -86,23 +85,23 @@ unsafe extern "C" {
 
 /// `serve.json`: how pi and the doctor find the relay.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServeState {
-    pub port: u16,
-    pub pid: u32,
-    pub started: String,
-    pub token: String,
+pub(crate) struct ServeState {
+    pub(crate) port: u16,
+    pub(crate) pid: u32,
+    pub(crate) started: String,
+    pub(crate) token: String,
     /// The folders the model may read, default root plus `--read-root`.
     #[serde(default)]
-    pub read_roots: Vec<PathBuf>,
+    pub(crate) read_roots: Vec<PathBuf>,
 }
 
 impl ServeState {
-    pub fn read(layout: &Layout) -> Option<ServeState> {
+    pub(crate) fn read(layout: &Layout) -> Option<ServeState> {
         let text = std::fs::read_to_string(layout.serve_state()).ok()?;
         serde_json::from_str(&text).ok()
     }
 
-    pub fn write(&self, layout: &Layout) -> Result<()> {
+    pub(crate) fn write(&self, layout: &Layout) -> Result<()> {
         let path = layout.serve_state();
         let text = serde_json::to_string_pretty(self).context("could not serialize serve.json")?;
         state::write_atomic(&path, &format!("{text}\n"))?;
@@ -110,13 +109,13 @@ impl ServeState {
             .with_context(|| format!("could not protect {}", path.display()))
     }
 
-    pub fn remove(layout: &Layout) {
+    pub(crate) fn remove(layout: &Layout) {
         let _ = std::fs::remove_file(layout.serve_state());
     }
 }
 
 /// True when a process with this pid exists.
-pub fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     Command::new("/bin/kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -161,7 +160,7 @@ fn relay_healthy(state: &ServeState) -> bool {
 }
 
 /// `herdr-pro serve`: start the daemon unless one is already running.
-pub fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
+pub(crate) fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
     if let Some(state) = ServeState::read(layout)
         && pid_alive(state.pid)
     {
@@ -227,7 +226,7 @@ pub fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
 /// The effective readable roots: the default plus every `--read-root`, each
 /// resolved so a symlinked root and a canonical path still match. Duplicates
 /// are dropped.
-pub fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
+fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from(DEFAULT_READ_ROOT)];
     roots.extend(extra.iter().cloned());
     let mut resolved: Vec<PathBuf> = Vec::new();
@@ -242,7 +241,7 @@ pub fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
 
 /// The readable roots recorded in `serve.json`, or the default when there is
 /// no relay state yet.
-pub fn readable_roots(layout: &Layout) -> Vec<PathBuf> {
+pub(crate) fn readable_roots(layout: &Layout) -> Vec<PathBuf> {
     match ServeState::read(layout) {
         Some(state) if !state.read_roots.is_empty() => state.read_roots,
         _ => vec![PathBuf::from(DEFAULT_READ_ROOT)],
@@ -250,7 +249,7 @@ pub fn readable_roots(layout: &Layout) -> Vec<PathBuf> {
 }
 
 /// The last non-empty `serve.log` line, for the doctor's relay row.
-pub fn last_log_line(layout: &Layout) -> Option<String> {
+pub(crate) fn last_log_line(layout: &Layout) -> Option<String> {
     let text = std::fs::read_to_string(serve_log(layout)).ok()?;
     text.lines()
         .rev()
@@ -259,7 +258,7 @@ pub fn last_log_line(layout: &Layout) -> Option<String> {
 }
 
 /// `herdr-pro serve-run`: the foreground server (started detached by `serve`).
-pub fn run(layout: &Layout, env: &Env, extra_roots: &[PathBuf]) -> Result<()> {
+pub(crate) fn run(layout: &Layout, env: &Env, extra_roots: &[PathBuf]) -> Result<()> {
     layout.ensure()?;
     let read_roots = effective_read_roots(extra_roots);
     let inflight_limit = env.inflight_limit()?;
@@ -317,7 +316,7 @@ pub fn run(layout: &Layout, env: &Env, extra_roots: &[PathBuf]) -> Result<()> {
 }
 
 /// `herdr-pro stop-serve`: end the daemon and remove `serve.json`.
-pub fn stop(layout: &Layout) -> Result<bool> {
+pub(crate) fn stop(layout: &Layout) -> Result<bool> {
     let Some(state) = ServeState::read(layout) else {
         println!("no relay is running");
         return Ok(false);
@@ -340,7 +339,7 @@ pub fn stop(layout: &Layout) -> Result<bool> {
 }
 
 /// `GET /v1/models` with the token; the doctor's liveness row.
-pub fn models_health(runner: &dyn Runner, layout: &Layout) -> Result<String> {
+pub(crate) fn models_health(runner: &dyn Runner, layout: &Layout) -> Result<String> {
     let state = ServeState::read(layout)
         .context("no serve.json; the relay was never started (`herdr-pro serve`)")?;
     let output = runner.run(&super::sh::Cmd::new("curl", Duration::from_secs(10)).args([
@@ -375,7 +374,7 @@ pub fn models_health(runner: &dyn Runner, layout: &Layout) -> Result<String> {
 }
 
 /// Point the shared pi folder's `models.json` at this relay.
-pub fn write_provider(layout: &Layout, port: u16, token: &str) -> Result<()> {
+pub(crate) fn write_provider(layout: &Layout, port: u16, token: &str) -> Result<()> {
     let path = layout.pi_models();
     super::provider::write_merged(&path, &super::provider::base_url(port), token)
         .with_context(|| format!("could not write the pi provider {}", path.display()))
@@ -1180,14 +1179,14 @@ fn child_path(env: &Env) -> String {
 
 /// What one Codex turn produced.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CodexOutcome {
-    pub response_id: String,
-    pub message_id: String,
-    pub answer: String,
-    pub codex_id: Option<String>,
-    pub usage: Value,
+pub(crate) struct CodexOutcome {
+    pub(crate) response_id: String,
+    pub(crate) message_id: String,
+    pub(crate) answer: String,
+    pub(crate) codex_id: Option<String>,
+    pub(crate) usage: Value,
     /// The `codex exec` process exit code, for the relay log.
-    pub exit_code: Option<i32>,
+    pub(crate) exit_code: Option<i32>,
 }
 
 /// The Responses-API view of one `codex exec --json` stream.
@@ -1389,7 +1388,7 @@ impl StreamState {
 
 /// The session key: an explicit `conversation`, else the pi session header,
 /// else the `instructions` hash plus `X-Herdr-Lane`.
-pub fn session_key(headers: &HashMap<String, String>, body: &Value) -> String {
+fn session_key(headers: &HashMap<String, String>, body: &Value) -> String {
     if let Some(conversation) = body.get("conversation") {
         if let Some(id) = conversation.as_str()
             && !id.is_empty()
@@ -1438,7 +1437,7 @@ fn sha256_hex(text: &str) -> String {
 /// The prompt for one turn: the first turn carries the relay protocol and the
 /// pi instructions, later turns carry only the new user message (Codex already
 /// holds the thread).
-pub fn build_prompt(body: &Value, first: bool) -> String {
+fn build_prompt(body: &Value, first: bool) -> String {
     let user = last_user_text(body);
     if !first {
         return user;
@@ -1506,13 +1505,13 @@ fn last_user_text(body: &Value) -> String {
 
 /// One line the model may put at the end of an answer.
 #[derive(Debug, Clone, PartialEq)]
-pub enum FileRequest {
+pub(crate) enum FileRequest {
     Read(PathBuf),
     List(PathBuf),
 }
 
 impl FileRequest {
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         match self {
             FileRequest::Read(path) | FileRequest::List(path) => path,
         }
@@ -1520,7 +1519,7 @@ impl FileRequest {
 }
 
 /// `READ <absolute path>` or `LIST <absolute directory>`, else `None`.
-pub fn parse_request(line: &str) -> Option<FileRequest> {
+fn parse_request(line: &str) -> Option<FileRequest> {
     let line = line.trim();
     for (keyword, list) in [("READ ", false), ("LIST ", true)] {
         if let Some(rest) = line.strip_prefix(keyword) {
@@ -1539,7 +1538,7 @@ pub fn parse_request(line: &str) -> Option<FileRequest> {
 
 /// Split the trailing request lines off an answer. Returns the answer body
 /// without them and the requests in the order the model wrote them.
-pub fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
+fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
     let mut lines: Vec<&str> = answer.lines().collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
@@ -1562,7 +1561,7 @@ pub fn split_requests(answer: &str) -> (String, Vec<FileRequest>) {
 ///
 /// Only punctuation observed from the bridge is unescaped; ordinary
 /// backslashes (including those in paths) stay untouched.
-pub fn unescape_bridge_markdown(answer: &str) -> String {
+fn unescape_bridge_markdown(answer: &str) -> String {
     let mut chars = answer.chars().peekable();
     let mut plain = String::with_capacity(answer.len());
     while let Some(ch) = chars.next() {
@@ -1597,7 +1596,7 @@ pub fn unescape_bridge_markdown(answer: &str) -> String {
 
 /// Drop the bridge's "Local tools unavailable" blockquote: the leading `>`
 /// lines and the blank line that closes them.
-pub fn strip_bridge_note(answer: &str) -> String {
+fn strip_bridge_note(answer: &str) -> String {
     let mut lines = answer.lines().peekable();
     while lines.peek().is_some_and(|line| line.starts_with('>')) {
         lines.next();

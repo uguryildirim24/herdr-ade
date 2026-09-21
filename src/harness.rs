@@ -17,9 +17,9 @@ use crate::remote;
 use crate::runner::Cmd;
 
 /// The saved machine whose box gets the same build and install.
-pub const BOX_MACHINE: &str = "oci";
+const BOX_MACHINE: &str = "oci";
 /// The plugin build's tool path, exactly as the coordinator uses it by hand.
-pub const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
+pub(crate) const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 
 const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const BOX_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -40,7 +40,7 @@ struct HarnessConfig {
 }
 
 /// The harness repositories from `config.toml`. An absent table is an empty list.
-pub fn repos(config_dir: &Path) -> Result<Vec<Repo>> {
+pub(crate) fn repos(config_dir: &Path) -> Result<Vec<Repo>> {
     let file = config_dir.join("config.toml");
     let text = std::fs::read_to_string(&file).unwrap_or_default();
     if text.trim().is_empty() {
@@ -57,7 +57,7 @@ fn canonical_or(path: &str) -> PathBuf {
 }
 
 /// True when `path` is one of the harness repositories.
-pub fn is_harness_repo(config_dir: &Path, path: &str) -> bool {
+pub(crate) fn is_harness_repo(config_dir: &Path, path: &str) -> bool {
     let target = canonical_or(path);
     repos(config_dir)
         .unwrap_or_default()
@@ -67,7 +67,7 @@ pub fn is_harness_repo(config_dir: &Path, path: &str) -> bool {
 
 /// True when a project may start a lane or open a round on `path`: the path is
 /// one of its own listed repositories, or a harness repository.
-pub fn allowed_repo(settings: &Settings, config_dir: &Path, path: &str) -> bool {
+pub(crate) fn allowed_repo(settings: &Settings, config_dir: &Path, path: &str) -> bool {
     let target = canonical_or(path);
     settings
         .repos
@@ -274,11 +274,11 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
 }
 
 /// The machine-wide install lock: two projects never install at once.
-pub struct InstallLock {
+pub(crate) struct InstallLock {
     _file: std::fs::File,
 }
 
-pub fn lock(config_dir: &Path) -> Result<InstallLock> {
+pub(crate) fn lock(config_dir: &Path) -> Result<InstallLock> {
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join(".harness-install.lock");
     let file = std::fs::File::options()
@@ -344,7 +344,7 @@ fn notice_stale_self(installed: &Path, running: &Running) -> Result<()> {
 
 /// `ha harness install`: build every harness repository after a merge and
 /// install it into `~/.local/bin`, then the same on the saved box.
-pub fn install(ctx: &Ctx) -> Result<()> {
+pub(crate) fn install(ctx: &Ctx) -> Result<()> {
     let repos = repos(&ctx.config_dir)?;
     if repos.is_empty() {
         bail!(

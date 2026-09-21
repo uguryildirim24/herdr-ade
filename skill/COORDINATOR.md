@@ -40,7 +40,7 @@ Respect `max_parallel_threads`: when that many threads are open and working, say
 Start a thread by passing the task on standard input:
 
 ```
-hp thread start <slug> --title "<short title>" --repo <path> --task-file - <<'TASK'
+hp thread start <slug> --title "<short title>" --plain "<one sentence about the work>" --repo <path> --task-file - <<'TASK'
 <the task, written for an agent that has not seen this conversation>
 TASK
 ```

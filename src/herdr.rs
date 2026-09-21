@@ -8,11 +8,11 @@ use serde::Deserialize;
 
 use crate::runner::{Cmd, Runner};
 
-pub const MIN_VERSION: Version = Version(0, 9, 1);
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MIN_VERSION: Version = Version(0, 9, 1);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version(pub u64, pub u64, pub u64);
+pub(crate) struct Version(pub u64, pub u64, pub u64);
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -21,7 +21,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Parses `herdr 0.9.1` and `herdr 0.9.2-preview.3`; a pre-release suffix is ignored.
-pub fn parse_version(text: &str) -> Option<Version> {
+fn parse_version(text: &str) -> Option<Version> {
     let token = text
         .split_whitespace()
         .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
@@ -35,7 +35,7 @@ fn bare(bin: &str) -> Cmd {
     Cmd::new(bin, CALL_TIMEOUT)
 }
 
-pub fn version(bin: &str, runner: &dyn Runner) -> Result<Version> {
+pub(crate) fn version(bin: &str, runner: &dyn Runner) -> Result<Version> {
     let out = runner.run(&bare(bin).arg("--version"))?;
     if !out.success() {
         bail!("`{bin} --version` failed: {}", out.error_text());
@@ -45,16 +45,16 @@ pub fn version(bin: &str, runner: &dyn Runner) -> Result<Version> {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct SessionInfo {
-    pub name: String,
+pub(crate) struct SessionInfo {
+    pub(crate) name: String,
     #[serde(default)]
-    pub default: bool,
+    pub(crate) default: bool,
     #[serde(default)]
-    pub running: bool,
-    pub socket_path: PathBuf,
+    pub(crate) running: bool,
+    pub(crate) socket_path: PathBuf,
 }
 
-pub fn session_list(bin: &str, runner: &dyn Runner) -> Result<Vec<SessionInfo>> {
+pub(crate) fn session_list(bin: &str, runner: &dyn Runner) -> Result<Vec<SessionInfo>> {
     #[derive(Deserialize)]
     struct Reply {
         sessions: Vec<SessionInfo>,
@@ -70,7 +70,7 @@ pub fn session_list(bin: &str, runner: &dyn Runner) -> Result<Vec<SessionInfo>> 
 
 /// herdr bound to one session's socket. Every call a project makes goes through
 /// this, so a project always talks to the session it was opened in.
-pub struct Herdr<'a> {
+pub(crate) struct Herdr<'a> {
     bin: String,
     socket: PathBuf,
     /// A saved SSH machine: every call is forwarded as `herdr --machine M ...`.
@@ -79,7 +79,11 @@ pub struct Herdr<'a> {
 }
 
 impl<'a> Herdr<'a> {
-    pub fn new(bin: impl Into<String>, socket: impl Into<PathBuf>, runner: &'a dyn Runner) -> Self {
+    pub(crate) fn new(
+        bin: impl Into<String>,
+        socket: impl Into<PathBuf>,
+        runner: &'a dyn Runner,
+    ) -> Self {
         Herdr {
             bin: bin.into(),
             socket: socket.into(),
@@ -89,7 +93,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// The same session, with calls forwarded to a saved machine.
-    pub fn on_machine(&self, machine: &str) -> Herdr<'a> {
+    pub(crate) fn on_machine(&self, machine: &str) -> Herdr<'a> {
         Herdr {
             bin: self.bin.clone(),
             socket: self.socket.clone(),
@@ -100,7 +104,7 @@ impl<'a> Herdr<'a> {
 
     /// `HERDR_SESSION` is removed so an inherited value can never compete with
     /// the socket this project recorded.
-    pub fn cmd(&self, timeout: Duration) -> Cmd {
+    pub(crate) fn cmd(&self, timeout: Duration) -> Cmd {
         let cmd = Cmd::new(&self.bin, timeout)
             .env("HERDR_SOCKET_PATH", self.socket.to_string_lossy())
             .env_remove("HERDR_SESSION");
@@ -111,7 +115,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// True when the socket file exists and the server answers.
-    pub fn reachable(&self) -> bool {
+    pub(crate) fn reachable(&self) -> bool {
         if !self.socket.exists() {
             return false;
         }
@@ -126,9 +130,9 @@ impl<'a> Herdr<'a> {
 /// `agent_blocked` or `pane_not_found`), or `timeout` / `unreachable` / `failed`
 /// when herdr never answered with one.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HerdrError {
-    pub code: String,
-    pub message: String,
+pub(crate) struct HerdrError {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 impl std::fmt::Display for HerdrError {
@@ -139,87 +143,87 @@ impl std::fmt::Display for HerdrError {
 
 impl std::error::Error for HerdrError {}
 
-pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-pub struct Pane {
-    pub pane_id: String,
-    pub tab_id: String,
-    pub workspace_id: String,
+pub(crate) struct Pane {
+    pub(crate) pane_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) workspace_id: String,
     #[serde(default)]
-    pub cwd: String,
+    pub(crate) cwd: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-pub struct Agent {
-    pub pane_id: String,
-    pub tab_id: String,
-    pub workspace_id: String,
+pub(crate) struct Agent {
+    pub(crate) pane_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) workspace_id: String,
     #[serde(default)]
-    pub name: String,
+    pub(crate) name: String,
     #[serde(default)]
-    pub agent: String,
+    pub(crate) agent: String,
     #[serde(default)]
-    pub agent_status: String,
+    pub(crate) agent_status: String,
     #[serde(default)]
-    pub cwd: String,
+    pub(crate) cwd: String,
     /// Pane tokens from `agent list` (SPEC-ADE D3).
     #[serde(default)]
-    pub tokens: std::collections::BTreeMap<String, String>,
+    pub(crate) tokens: std::collections::BTreeMap<String, String>,
     #[serde(default)]
-    pub agent_session: Option<AgentSession>,
+    pub(crate) agent_session: Option<AgentSession>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-pub struct AgentSession {
+pub(crate) struct AgentSession {
     #[serde(default)]
-    pub id: String,
+    pub(crate) id: String,
 }
 
 impl Agent {
     /// The one "ready for a prompt" predicate: state `idle` or `done`.
-    pub fn ready(&self) -> bool {
+    pub(crate) fn ready(&self) -> bool {
         ready_state(&self.agent_status)
     }
 
-    pub fn parent(&self) -> Option<&str> {
+    pub(crate) fn parent(&self) -> Option<&str> {
         self.tokens.get("parent").map(String::as_str)
     }
 }
 
 /// Arguments for `agent start` including `--parent` and `ready_timeout_ms`.
 #[derive(Debug, Clone)]
-pub struct AgentStart<'a> {
-    pub name: &'a str,
-    pub kind: &'a str,
-    pub pane: &'a str,
-    pub agent_args: &'a [String],
-    pub parent: Option<&'a str>,
-    pub ready_timeout_ms: u64,
+pub(crate) struct AgentStart<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) pane: &'a str,
+    pub(crate) agent_args: &'a [String],
+    pub(crate) parent: Option<&'a str>,
+    pub(crate) ready_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-pub struct ProcessInfo {
+pub(crate) struct ProcessInfo {
     #[serde(default)]
-    pub pane_id: String,
+    pub(crate) pane_id: String,
     #[serde(default)]
-    pub foreground_processes: Vec<ForegroundProcess>,
+    pub(crate) foreground_processes: Vec<ForegroundProcess>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-pub struct ForegroundProcess {
-    pub pid: u32,
+pub(crate) struct ForegroundProcess {
+    pub(crate) pid: u32,
     #[serde(default)]
-    pub name: String,
+    pub(crate) name: String,
     #[serde(default)]
-    pub argv0: Option<String>,
+    pub(crate) argv0: Option<String>,
 }
 
 impl ProcessInfo {
     /// First foreground process, used as identity evidence (SPEC-ADE D3).
     /// Every foreground process: while the agent runs a tool, the tool is
     /// in the foreground beside it.
-    pub fn identities(&self) -> Vec<crate::contracts::ProcessIdentity> {
+    pub(crate) fn identities(&self) -> Vec<crate::contracts::ProcessIdentity> {
         self.foreground_processes
             .iter()
             .map(|proc| crate::contracts::ProcessIdentity {
@@ -235,7 +239,7 @@ impl ProcessInfo {
 
     /// The process to bind for an agent of `kind`: the one whose program is
     /// named for the kind, else the first (A1 review M2).
-    pub fn identity(&self, kind: &str) -> Option<crate::contracts::ProcessIdentity> {
+    pub(crate) fn identity(&self, kind: &str) -> Option<crate::contracts::ProcessIdentity> {
         let all = self.identities();
         all.iter()
             .find(|p| {
@@ -246,20 +250,24 @@ impl ProcessInfo {
     }
 }
 
-pub fn ready_state(state: &str) -> bool {
+pub(crate) fn ready_state(state: &str) -> bool {
     matches!(state, "idle" | "done")
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Created {
-    pub workspace_id: String,
-    pub tab_id: String,
-    pub pane_id: String,
+pub(crate) struct Created {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) pane_id: String,
 }
 
 impl<'a> Herdr<'a> {
     /// Runs one herdr command and returns the `result` object of its JSON reply.
-    pub fn call(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
+    pub(crate) fn call(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, HerdrError> {
         let cmd = self.cmd(timeout).args(args.iter().copied());
         let out = self.runner.run(&cmd).map_err(|e| HerdrError {
             code: "unreachable".into(),
@@ -313,11 +321,11 @@ impl<'a> Herdr<'a> {
         })
     }
 
-    pub fn pane_list(&self) -> Result<Vec<Pane>, HerdrError> {
+    pub(crate) fn pane_list(&self) -> Result<Vec<Pane>, HerdrError> {
         self.call_as(&["pane", "list"], "panes")
     }
 
-    pub fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
+    pub(crate) fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
         self.call_as(&["agent", "list"], "agents")
     }
 
@@ -342,7 +350,7 @@ impl<'a> Herdr<'a> {
 
     /// `workspace create` with `--env KEY=VALUE` for its first pane (the
     /// coordinator's `HERDR_ADE_LAUNCH`, SPEC-ADE D14).
-    pub fn workspace_create_env(
+    pub(crate) fn workspace_create_env(
         &self,
         cwd: &Path,
         label: &str,
@@ -370,7 +378,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// `tab create` with `--env KEY=VALUE` (SPEC-ADE D4).
-    pub fn tab_create_env(
+    pub(crate) fn tab_create_env(
         &self,
         workspace: &str,
         cwd: &Path,
@@ -400,13 +408,13 @@ impl<'a> Herdr<'a> {
         Self::created(&result)
     }
 
-    pub fn tab_close(&self, tab: &str) -> Result<(), HerdrError> {
+    pub(crate) fn tab_close(&self, tab: &str) -> Result<(), HerdrError> {
         self.call(&["tab", "close", tab], CALL_TIMEOUT).map(|_| ())
     }
 
     /// Never passes `--force`: herdr refuses a dirty worktree and that refusal
     /// is reported unchanged.
-    pub fn worktree_remove(&self, workspace: &str) -> Result<(), HerdrError> {
+    pub(crate) fn worktree_remove(&self, workspace: &str) -> Result<(), HerdrError> {
         self.call(
             &["worktree", "remove", "--workspace", workspace],
             Duration::from_secs(20),
@@ -415,7 +423,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// A workspace's label, as the sidebar shows it.
-    pub fn workspace_label(&self, workspace: &str) -> Result<String, HerdrError> {
+    pub(crate) fn workspace_label(&self, workspace: &str) -> Result<String, HerdrError> {
         let result = self.call(&["workspace", "get", workspace], CALL_TIMEOUT)?;
         Ok(result["workspace"]["label"]
             .as_str()
@@ -423,17 +431,17 @@ impl<'a> Herdr<'a> {
             .to_string())
     }
 
-    pub fn workspace_rename(&self, workspace: &str, label: &str) -> Result<(), HerdrError> {
+    pub(crate) fn workspace_rename(&self, workspace: &str, label: &str) -> Result<(), HerdrError> {
         self.call(&["workspace", "rename", workspace, label], CALL_TIMEOUT)
             .map(|_| ())
     }
 
     /// The working directory herdr reports for a new tab's pane.
-    pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
+    pub(crate) fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
         Ok(self.pane_get(pane)?.cwd)
     }
 
-    pub fn pane_get(&self, pane: &str) -> Result<Pane, HerdrError> {
+    pub(crate) fn pane_get(&self, pane: &str) -> Result<Pane, HerdrError> {
         let result = self.call(&["pane", "get", pane], CALL_TIMEOUT)?;
         serde_json::from_value(result["pane"].clone()).map_err(|e| HerdrError {
             code: "failed".into(),
@@ -441,7 +449,7 @@ impl<'a> Herdr<'a> {
         })
     }
 
-    pub fn pane_process_info(&self, pane: &str) -> Result<ProcessInfo, HerdrError> {
+    pub(crate) fn pane_process_info(&self, pane: &str) -> Result<ProcessInfo, HerdrError> {
         let result = self.call(&["pane", "process-info", "--pane", pane], CALL_TIMEOUT)?;
         serde_json::from_value(result["process_info"].clone()).map_err(|e| HerdrError {
             code: "failed".into(),
@@ -450,13 +458,13 @@ impl<'a> Herdr<'a> {
     }
 
     /// Types one command line into a pane's own shell (SPEC-remote §3.3).
-    pub fn pane_run(&self, pane: &str, command: &str) -> Result<(), HerdrError> {
+    pub(crate) fn pane_run(&self, pane: &str, command: &str) -> Result<(), HerdrError> {
         self.call(&["pane", "run", pane, command], CALL_TIMEOUT)
             .map(|_| ())
     }
 
     /// `pane read` prints text, not a JSON reply, so this returns it verbatim.
-    pub fn pane_read_text(&self, pane: &str, source: &str) -> Result<String, HerdrError> {
+    pub(crate) fn pane_read_text(&self, pane: &str, source: &str) -> Result<String, HerdrError> {
         let out = self
             .runner
             .run(
@@ -478,13 +486,13 @@ impl<'a> Herdr<'a> {
     }
 
     /// Closes a whole workspace, used to clean up a probe pane.
-    pub fn workspace_close(&self, workspace: &str) -> Result<(), HerdrError> {
+    pub(crate) fn workspace_close(&self, workspace: &str) -> Result<(), HerdrError> {
         self.call(&["workspace", "close", workspace], CALL_TIMEOUT)
             .map(|_| ())
     }
 
     /// `agent start` with `--parent` and `ready_timeout_ms` (SPEC-ADE D2, D3).
-    pub fn agent_start_opts(&self, opts: &AgentStart<'_>) -> Result<Agent, HerdrError> {
+    pub(crate) fn agent_start_opts(&self, opts: &AgentStart<'_>) -> Result<Agent, HerdrError> {
         let timeout_ms = opts.ready_timeout_ms.to_string();
         let mut args = vec![
             "agent".to_string(),
@@ -517,17 +525,17 @@ impl<'a> Herdr<'a> {
     /// Submits a prompt. herdr's parser takes positionals first and options
     /// after them, and has no `--` separator here; text in the second
     /// position is accepted even when it starts with a dash (checked on 0.9.1).
-    pub fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
+    pub(crate) fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
         self.call(&["agent", "prompt", target, text], CALL_TIMEOUT)
             .map(|_| ())
     }
 
-    pub fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
+    pub(crate) fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
         self.call(&["agent", "focus", target], CALL_TIMEOUT)
             .map(|_| ())
     }
 
-    pub fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
+    pub(crate) fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
         self.call(
             &["notification", "show", title, "--body", body],
             CALL_TIMEOUT,
@@ -537,7 +545,7 @@ impl<'a> Herdr<'a> {
 
     /// Display tokens on a pane row, always with a TTL so they fade if the
     /// ticker stops.
-    pub fn pane_report_tokens(
+    pub(crate) fn pane_report_tokens(
         &self,
         pane: &str,
         tokens: &[(&str, &str)],
@@ -561,7 +569,7 @@ impl<'a> Herdr<'a> {
         self.call(&args, CALL_TIMEOUT).map(|_| ())
     }
 
-    pub fn pane_clear_tokens(&self, pane: &str, names: &[&str]) -> Result<(), HerdrError> {
+    pub(crate) fn pane_clear_tokens(&self, pane: &str, names: &[&str]) -> Result<(), HerdrError> {
         let mut args = vec!["pane", "report-metadata", pane, "--source", SOURCE];
         for name in names {
             args.push("--clear-token");
@@ -571,7 +579,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// Adopt / reconcile parent token: pane path, no TTL (SPEC-ADE D3).
-    pub fn pane_set_parent(&self, pane: &str, parent: &str) -> Result<(), HerdrError> {
+    pub(crate) fn pane_set_parent(&self, pane: &str, parent: &str) -> Result<(), HerdrError> {
         let token = format!("parent={parent}");
         self.call(
             &[
@@ -590,7 +598,7 @@ impl<'a> Herdr<'a> {
 }
 
 /// True when `herdr agent start --help` names `--parent` (the r2 fork).
-pub fn parent_on_start_supported(bin: &str, runner: &dyn Runner) -> bool {
+pub(crate) fn parent_on_start_supported(bin: &str, runner: &dyn Runner) -> bool {
     runner
         .run(&bare(bin).args(["agent", "start", "--help"]))
         .ok()
@@ -601,7 +609,7 @@ pub fn parent_on_start_supported(bin: &str, runner: &dyn Runner) -> bool {
         .unwrap_or(false)
 }
 
-pub const SOURCE: &str = "herdr-ade";
+pub(crate) const SOURCE: &str = "herdr-ade";
 
 impl<'a> Herdr<'a> {
     fn request(
@@ -635,7 +643,7 @@ impl<'a> Herdr<'a> {
     /// Filters the sidebar's agents to one project and sorts them by attention:
     /// the coordinator (rank 0) first, then by the group's display-order digit.
     /// herdr holds one transient view, so this replaces any other tool's view.
-    pub fn agent_view_set_project(&self, slug: &str) -> Result<(), HerdrError> {
+    pub(crate) fn agent_view_set_project(&self, slug: &str) -> Result<(), HerdrError> {
         self.request(
             "agent.view.set",
             serde_json::json!({
@@ -648,7 +656,7 @@ impl<'a> Herdr<'a> {
         .map(|_| ())
     }
 
-    pub fn agent_view_clear(&self) -> Result<(), HerdrError> {
+    pub(crate) fn agent_view_clear(&self) -> Result<(), HerdrError> {
         self.request("agent.view.clear", serde_json::json!({}))
             .map(|_| ())
     }

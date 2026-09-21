@@ -23,12 +23,12 @@ unsafe extern "C" {
 const LOCK_EX: i32 = 2;
 
 /// A process lock used to serialize starts and turn admission.
-pub struct FileLock {
+pub(crate) struct FileLock {
     _file: File,
 }
 
 impl FileLock {
-    pub fn acquire(path: &Path) -> Result<FileLock> {
+    pub(crate) fn acquire(path: &Path) -> Result<FileLock> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
@@ -43,51 +43,38 @@ impl FileLock {
     }
 }
 
-/// Lane states. Only `ready` accepts a turn.
-pub const LANE_STATES: &[&str] = &[
-    "starting",
-    "ready",
-    "in_turn",
-    "answered",
-    "failed",
-    "sign_in_required",
-    "bridge_down",
-    "cooldown",
-    "gone",
-];
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Lane {
-    pub name: String,
+pub(crate) struct Lane {
+    pub(crate) name: String,
     #[serde(default)]
-    pub pane_id: String,
+    pub(crate) pane_id: String,
     #[serde(default)]
-    pub tab_id: String,
+    pub(crate) tab_id: String,
     #[serde(default)]
-    pub workspace_id: String,
+    pub(crate) workspace_id: String,
     #[serde(default)]
-    pub parent: Option<String>,
+    pub(crate) parent: Option<String>,
     #[serde(default)]
-    pub cwd: String,
+    pub(crate) cwd: String,
     /// The Codex config profile this lane runs; `None` is the Pro bridge lane.
     /// A picture lane is `Some("gpt-image-gen")` and never sees the bridge.
     #[serde(default)]
-    pub profile: Option<String>,
+    pub(crate) profile: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(default)]
-    pub rollout: Option<String>,
-    pub started_at: String,
-    pub state: String,
+    pub(crate) rollout: Option<String>,
+    pub(crate) started_at: String,
+    pub(crate) state: String,
     /// The plugin's stop switch: reconcile never prints a resume line for it.
     #[serde(default)]
-    pub stopped: bool,
+    pub(crate) stopped: bool,
     #[serde(default)]
-    pub last_turn: Option<String>,
+    pub(crate) last_turn: Option<String>,
 }
 
 impl Lane {
-    pub fn read(layout: &Layout, name: &str) -> Result<Lane> {
+    pub(crate) fn read(layout: &Layout, name: &str) -> Result<Lane> {
         check_name(name)?;
         let path = layout.lane(name);
         let text = std::fs::read_to_string(&path)
@@ -95,16 +82,16 @@ impl Lane {
         toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
     }
 
-    pub fn write(&self, layout: &Layout) -> Result<()> {
+    pub(crate) fn write(&self, layout: &Layout) -> Result<()> {
         check_name(&self.name)?;
         write_atomic(&layout.lane(&self.name), &self.to_toml()?)
     }
 
-    pub fn to_toml(&self) -> Result<String> {
+    fn to_toml(&self) -> Result<String> {
         toml::to_string(self).context("could not serialize the lane record")
     }
 
-    pub fn list(layout: &Layout) -> Result<Vec<Lane>> {
+    pub(crate) fn list(layout: &Layout) -> Result<Vec<Lane>> {
         let mut lanes = Vec::new();
         let Ok(entries) = std::fs::read_dir(layout.lanes()) else {
             return Ok(lanes);
@@ -121,51 +108,51 @@ impl Lane {
     }
 
     /// Only `ready` accepts a turn (spec Design).
-    pub fn ready(&self) -> bool {
+    pub(crate) fn ready(&self) -> bool {
         self.state == "ready"
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Turn {
-    pub tag: String,
-    pub lane: String,
-    pub brief: String,
-    pub out: String,
-    pub notify: String,
+pub(crate) struct Turn {
+    pub(crate) tag: String,
+    pub(crate) lane: String,
+    pub(crate) brief: String,
+    pub(crate) out: String,
+    pub(crate) notify: String,
     #[serde(default)]
-    pub attachments: Vec<String>,
-    pub state: String,
-    pub started_at: String,
+    pub(crate) attachments: Vec<String>,
+    pub(crate) state: String,
+    pub(crate) started_at: String,
     #[serde(default)]
-    pub finished_at: Option<String>,
+    pub(crate) finished_at: Option<String>,
     #[serde(default)]
-    pub detail: Option<String>,
+    pub(crate) detail: Option<String>,
     #[serde(default)]
-    pub packet: Option<String>,
+    pub(crate) packet: Option<String>,
     /// The path the answer was actually written to (the `.<n>.md` fallback).
     #[serde(default)]
-    pub written: Option<String>,
+    pub(crate) written: Option<String>,
 }
 
 impl Turn {
-    pub fn read(layout: &Layout, tag: &str) -> Result<Turn> {
+    pub(crate) fn read(layout: &Layout, tag: &str) -> Result<Turn> {
         let path = layout.turn(tag);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("no turn `{tag}` ({})", path.display()))?;
         toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
     }
 
-    pub fn write(&self, layout: &Layout) -> Result<()> {
+    pub(crate) fn write(&self, layout: &Layout) -> Result<()> {
         self.write_to(&layout.turn(&self.tag))
     }
 
-    pub fn write_to(&self, path: &Path) -> Result<()> {
+    fn write_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string(self).context("could not serialize the turn record")?;
         write_atomic(path, &text)
     }
 
-    pub fn list(layout: &Layout) -> Result<Vec<Turn>> {
+    pub(crate) fn list(layout: &Layout) -> Result<Vec<Turn>> {
         let mut turns = Vec::new();
         let Ok(entries) = std::fs::read_dir(layout.turns()) else {
             return Ok(turns);
@@ -184,7 +171,7 @@ impl Turn {
 }
 
 /// Atomic write: temp file in the same directory, fsync, rename.
-pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let dir = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
@@ -203,7 +190,7 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
 }
 
 /// Append one line, creating the file when needed.
-pub fn append_line(path: &Path, line: &str) -> Result<()> {
+pub(crate) fn append_line(path: &Path, line: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("could not create {}", dir.display()))?;
@@ -218,7 +205,7 @@ pub fn append_line(path: &Path, line: &str) -> Result<()> {
 }
 
 /// Record one Pro send: the state table's `usage.jsonl`.
-pub fn record_usage(layout: &Layout, lane: &str, tag: &str) -> Result<()> {
+pub(crate) fn record_usage(layout: &Layout, lane: &str, tag: &str) -> Result<()> {
     let line = serde_json::json!({
         "ts": now_rfc3339(),
         "lane": lane,
@@ -229,20 +216,20 @@ pub fn record_usage(layout: &Layout, lane: &str, tag: &str) -> Result<()> {
 }
 
 /// The cooldown stamp, when one is set.
-pub fn cooldown_until(layout: &Layout) -> Option<jiff::Timestamp> {
+pub(crate) fn cooldown_until(layout: &Layout) -> Option<jiff::Timestamp> {
     let text = std::fs::read_to_string(layout.cooldown()).ok()?;
     parse_rfc3339(&text)
 }
 
-pub fn cooldown_active(layout: &Layout, now: jiff::Timestamp) -> bool {
+pub(crate) fn cooldown_active(layout: &Layout, now: jiff::Timestamp) -> bool {
     cooldown_until(layout).is_some_and(|until| until > now)
 }
 
-pub fn set_cooldown(layout: &Layout, until: jiff::Timestamp) -> Result<()> {
+pub(crate) fn set_cooldown(layout: &Layout, until: jiff::Timestamp) -> Result<()> {
     write_atomic(&layout.cooldown(), &until.to_string())
 }
 
-pub fn clear_cooldown(layout: &Layout) -> Result<()> {
+pub(crate) fn clear_cooldown(layout: &Layout) -> Result<()> {
     match std::fs::remove_file(layout.cooldown()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -253,24 +240,24 @@ pub fn clear_cooldown(layout: &Layout) -> Result<()> {
 /// The bridge's last-seen identity; a changed pid means a daemon restart
 /// (spec §4, the breaker).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct BridgeState {
+pub(crate) struct BridgeState {
     #[serde(default)]
-    pub pid: Option<u32>,
+    pub(crate) pid: Option<u32>,
     #[serde(default)]
-    pub version: Option<String>,
+    pub(crate) version: Option<String>,
     #[serde(default)]
-    pub accepting: Option<bool>,
+    pub(crate) accepting: Option<bool>,
 }
 
 impl BridgeState {
-    pub fn read(layout: &Layout) -> BridgeState {
+    pub(crate) fn read(layout: &Layout) -> BridgeState {
         std::fs::read_to_string(layout.bridge_state())
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
     }
 
-    pub fn write(&self, layout: &Layout) -> Result<()> {
+    pub(crate) fn write(&self, layout: &Layout) -> Result<()> {
         write_atomic(
             &layout.bridge_state(),
             &serde_json::to_string(self).context("could not serialize the bridge state")?,
@@ -283,29 +270,29 @@ impl BridgeState {
 /// lock and then spawned a short-lived process cannot be mistaken for dead (a
 /// crash leaves it until [`LOCK_STALE`]).
 #[derive(Debug)]
-pub struct Inflight {
+pub(crate) struct Inflight {
     path: PathBuf,
 }
 
 impl Inflight {
-    pub fn create(layout: &Layout, tag: &str) -> Result<Inflight> {
+    pub(crate) fn create(layout: &Layout, tag: &str) -> Result<Inflight> {
         let path = layout.inflight_lock(tag);
         write_atomic(&path, "turn\n")?;
         Ok(Inflight { path })
     }
 
-    pub fn release(self) {
+    pub(crate) fn release(self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
 /// A lock with no write for this long belongs to a turn that can no longer be
 /// running (two-hour turn timeout plus slack).
-pub const LOCK_STALE: Duration = Duration::from_secs(125 * 60);
+const LOCK_STALE: Duration = Duration::from_secs(125 * 60);
 
 /// The number of in-flight turns, with locks older than [`LOCK_STALE`] removed
 /// first.
-pub fn inflight_count(layout: &Layout) -> usize {
+pub(crate) fn inflight_count(layout: &Layout) -> usize {
     let mut live = 0;
     let Ok(entries) = std::fs::read_dir(layout.inflight()) else {
         return 0;
@@ -330,7 +317,7 @@ pub fn inflight_count(layout: &Layout) -> usize {
 
 /// Failed, refused or cooled turns finished within the window. Two of those in
 /// ten minutes trip the breaker (spec §4).
-pub fn recent_failures(layout: &Layout, now: jiff::Timestamp, window_secs: i64) -> usize {
+pub(crate) fn recent_failures(layout: &Layout, now: jiff::Timestamp, window_secs: i64) -> usize {
     Turn::list(layout)
         .unwrap_or_default()
         .into_iter()
@@ -345,7 +332,7 @@ pub fn recent_failures(layout: &Layout, now: jiff::Timestamp, window_secs: i64) 
 }
 
 /// A lane refuses to start or resume when the name is taken by a live lane.
-pub fn name_taken(layout: &Layout, name: &str) -> bool {
+pub(crate) fn name_taken(layout: &Layout, name: &str) -> bool {
     Lane::read(layout, name)
         .map(|lane| lane.state != "gone")
         .unwrap_or(false)
@@ -353,7 +340,7 @@ pub fn name_taken(layout: &Layout, name: &str) -> bool {
 
 /// Two lanes must never share one Codex thread: launcher Full mode would make
 /// them share a conversation key (spec, resume).
-pub fn session_in_use(layout: &Layout, session: &str, except: &str) -> Option<String> {
+pub(crate) fn session_in_use(layout: &Layout, session: &str, except: &str) -> Option<String> {
     Lane::list(layout).ok()?.into_iter().find_map(|lane| {
         (lane.name != except && lane.state != "gone" && lane.session_id.as_deref() == Some(session))
             .then_some(lane.name)
@@ -361,7 +348,7 @@ pub fn session_in_use(layout: &Layout, session: &str, except: &str) -> Option<St
 }
 
 /// Validate a lane name: it becomes a file name and a herdr agent name.
-pub fn check_name(name: &str) -> Result<()> {
+pub(crate) fn check_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
             .chars()
@@ -373,7 +360,7 @@ pub fn check_name(name: &str) -> Result<()> {
 }
 
 /// Validate a turn id: it becomes a file name and part of the DONE line.
-pub fn check_tag(tag: &str) -> Result<()> {
+pub(crate) fn check_tag(tag: &str) -> Result<()> {
     if tag.is_empty()
         || !tag
             .chars()

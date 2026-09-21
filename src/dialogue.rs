@@ -23,12 +23,12 @@ use crate::round::repo::{commit_files_on_branch, repo_lock};
 use crate::thread::sha256_hex;
 
 /// Check the two dialogue sides, without choosing or pinning their models.
-pub trait PairFilter {
+pub(crate) trait PairFilter {
     fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String>;
 }
 
 /// A role never pairs with itself.
-pub fn same_role(drafter: &str, critic: &str) -> std::result::Result<(), String> {
+pub(crate) fn same_role(drafter: &str, critic: &str) -> std::result::Result<(), String> {
     if drafter == critic {
         return Err(format!(
             "dialogue_pair: the drafter and the critic are both `{drafter}`"
@@ -38,38 +38,38 @@ pub fn same_role(drafter: &str, critic: &str) -> std::result::Result<(), String>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Turn {
-    pub topic: String,
-    pub n: u32,
-    pub expected_path: String,
-    pub sent: String,
+pub(crate) struct Turn {
+    pub(crate) topic: String,
+    pub(crate) n: u32,
+    pub(crate) expected_path: String,
+    pub(crate) sent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TurnRecord {
-    pub n: u32,
-    pub path: String,
-    pub hash: String,
-    pub commit: String,
+pub(crate) struct TurnRecord {
+    pub(crate) n: u32,
+    pub(crate) path: String,
+    pub(crate) hash: String,
+    pub(crate) commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Dialogue {
-    pub topic: String,
-    pub plain: String,
-    pub drafter: String,
-    pub critic: String,
-    pub branch: String,
-    pub repo: String,
+pub(crate) struct Dialogue {
+    pub(crate) topic: String,
+    pub(crate) plain: String,
+    pub(crate) drafter: String,
+    pub(crate) critic: String,
+    pub(crate) branch: String,
+    pub(crate) repo: String,
     /// The integration branch turn files are committed on (D9).
-    pub integration: String,
-    pub started: String,
+    pub(crate) integration: String,
+    pub(crate) started: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub critic_pane: Option<String>,
+    pub(crate) critic_pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<Turn>,
+    pub(crate) turn: Option<Turn>,
     #[serde(default)]
-    pub turns: Vec<TurnRecord>,
+    pub(crate) turns: Vec<TurnRecord>,
 }
 
 fn dir(project: &Project) -> PathBuf {
@@ -80,7 +80,7 @@ fn path(project: &Project, topic: &str) -> PathBuf {
     dir(project).join(format!("{topic}.toml"))
 }
 
-pub fn validate_topic(topic: &str) -> Result<()> {
+fn validate_topic(topic: &str) -> Result<()> {
     if topic.is_empty()
         || topic.len() > 40
         || !topic
@@ -92,7 +92,7 @@ pub fn validate_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load(project: &Project, topic: &str) -> Result<Dialogue> {
+pub(crate) fn load(project: &Project, topic: &str) -> Result<Dialogue> {
     validate_topic(topic)?;
     let p = path(project, topic);
     let text = std::fs::read_to_string(&p).with_context(|| format!("no dialogue `{topic}`"))?;
@@ -104,7 +104,7 @@ fn save(project: &Project, d: &Dialogue) -> Result<()> {
     write_atomic(&path(project, &d.topic), toml::to_string(d)?.as_bytes())
 }
 
-pub fn list(project: &Project) -> Vec<Dialogue> {
+pub(crate) fn list(project: &Project) -> Vec<Dialogue> {
     let Ok(entries) = std::fs::read_dir(dir(project)) else {
         return Vec::new();
     };
@@ -118,19 +118,19 @@ pub fn list(project: &Project) -> Vec<Dialogue> {
     out
 }
 
-pub struct StartArgs {
-    pub topic: String,
-    pub drafter: String,
-    pub critic: String,
-    pub plain: Option<String>,
-    pub repo: Option<String>,
-    pub integration: Option<String>,
+pub(crate) struct StartArgs {
+    pub(crate) topic: String,
+    pub(crate) drafter: String,
+    pub(crate) critic: String,
+    pub(crate) plain: Option<String>,
+    pub(crate) repo: Option<String>,
+    pub(crate) integration: Option<String>,
 }
 
 /// `ha dialogue start`. Records the dialogue and prints the lines that start
 /// its two sides; the drafter thread is started by `thread start` (A1) and
 /// Pro is adopted passively (A1's `thread adopt --role pro --passive`).
-pub fn start(
+pub(crate) fn start(
     ctx: &Ctx,
     slug: &str,
     args: StartArgs,
@@ -206,7 +206,7 @@ pub fn start(
 
 /// Records the critic's pane after validating the recipient: for Pro the
 /// agent in that pane must be kind `chatgpt` and named `pro`.
-pub fn bind_critic(ctx: &Ctx, slug: &str, topic: &str, pane: &str) -> Result<Dialogue> {
+pub(crate) fn bind_critic(ctx: &Ctx, slug: &str, topic: &str, pane: &str) -> Result<Dialogue> {
     let project = Project::load(&ctx.root, slug)?;
     let mut d = load(&project, topic)?;
     let coord = project
@@ -239,12 +239,12 @@ pub fn bind_critic(ctx: &Ctx, slug: &str, topic: &str, pane: &str) -> Result<Dia
     Ok(d)
 }
 
-pub fn turn_path(d: &Dialogue, n: u32) -> String {
+fn turn_path(d: &Dialogue, n: u32) -> String {
     format!("tasks/{}/turns/{n:02}-{}.md", d.topic, d.critic)
 }
 
 /// The one-line `TURN` prompt; its `DONE` reply is an artifact event.
-pub fn turn_line(d: &Dialogue, n: u32) -> String {
+fn turn_line(d: &Dialogue, n: u32) -> String {
     let path = turn_path(d, n);
     format!(
         "TURN {topic}-{n:02}: write your turn to {repo}/{path}, then reply DONE {topic}-{n:02} {path} -",
@@ -254,7 +254,7 @@ pub fn turn_line(d: &Dialogue, n: u32) -> String {
 }
 
 /// `ha dialogue turn <topic>`: pin the turn first, then type the line.
-pub fn turn(ctx: &Ctx, slug: &str, topic: &str, resend: bool) -> Result<Turn> {
+pub(crate) fn turn(ctx: &Ctx, slug: &str, topic: &str, resend: bool) -> Result<Turn> {
     let project = Project::load(&ctx.root, slug)?;
     let (d, t) = {
         let _lock = project.lock()?;
@@ -299,7 +299,7 @@ pub fn turn(ctx: &Ctx, slug: &str, topic: &str, resend: bool) -> Result<Turn> {
 }
 
 /// `ha dialogue commit <topic> <nn>`.
-pub fn commit(ctx: &Ctx, slug: &str, topic: &str, n: u32) -> Result<TurnRecord> {
+pub(crate) fn commit(ctx: &Ctx, slug: &str, topic: &str, n: u32) -> Result<TurnRecord> {
     let project = Project::load(&ctx.root, slug)?;
     let d = load(&project, topic)?;
     let t = d

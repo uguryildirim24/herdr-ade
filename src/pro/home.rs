@@ -19,7 +19,7 @@ use super::Layout;
 use super::state;
 
 /// The short base-instructions file `model_instructions_file` points at.
-pub const INSTRUCTIONS: &str = "\
+pub(crate) const INSTRUCTIONS: &str = "\
 You are Pro, an answer-only worker on the codex-chatgpt-web bridge.
 Read the packet and reply with the full answer in markdown.
 You have no tools and you never ask for one.
@@ -28,10 +28,10 @@ You have no tools and you never ask for one.
 /// The Codex config profile that makes one picture on Codex's own backend.
 /// `--profile <name>` layers `<home>/<name>.config.toml` on the pinned base
 /// (Codex 0.155 removed `[profiles]` tables from `config.toml`).
-pub const IMAGE_PROFILE: &str = "gpt-image-gen";
+pub(crate) const IMAGE_PROFILE: &str = "gpt-image-gen";
 
 /// The image profile's `model_instructions_file`.
-pub const IMAGE_INSTRUCTIONS: &str = "\
+const IMAGE_INSTRUCTIONS: &str = "\
 You are a picture maker on Codex.
 Make one picture from the request you receive.
 Call the image tool exactly once with the request's prompt and its size.
@@ -40,7 +40,7 @@ Reply with one line naming the picture and nothing else. Use no other tools.
 ";
 
 /// The home's `AGENTS.md`: the packet and TURN contract, nothing of Rolf's.
-pub const AGENTS_MD: &str = "\
+const AGENTS_MD: &str = "\
 # Pro
 
 The plugin feeds you one packet and collects one answer.
@@ -149,7 +149,7 @@ fn render(table: &toml::Table) -> Result<String> {
 
 /// `herdr-pro init`: create the home and write its config and instruction
 /// files. Idempotent; an existing `[projects]` trust table is kept.
-pub fn init(layout: &Layout) -> Result<()> {
+pub(crate) fn init(layout: &Layout) -> Result<()> {
     let home = layout.codex_home();
     std::fs::create_dir_all(&home)
         .with_context(|| format!("could not create {}", home.display()))?;
@@ -173,7 +173,7 @@ pub fn init(layout: &Layout) -> Result<()> {
 
 /// Trust exactly `cwd` in the Pro home, so Codex never shows its trust prompt
 /// for a lane. Codex trusts exact project paths only.
-pub fn trust(layout: &Layout, cwd: &Path) -> Result<()> {
+pub(crate) fn trust(layout: &Layout, cwd: &Path) -> Result<()> {
     let home = layout.codex_home();
     std::fs::create_dir_all(&home)
         .with_context(|| format!("could not create {}", home.display()))?;

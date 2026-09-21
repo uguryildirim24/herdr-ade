@@ -14,53 +14,53 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-pub mod bridge;
-pub mod doctor;
-pub mod herdr_cli;
-pub mod home;
-pub mod image;
-pub mod lane;
-pub mod packet;
-pub mod provider;
-pub mod serve;
-pub mod state;
-pub mod turn;
+pub(crate) mod bridge;
+pub(crate) mod doctor;
+pub(crate) mod herdr_cli;
+pub(crate) mod home;
+pub(crate) mod image;
+pub(crate) mod lane;
+pub(crate) mod packet;
+pub(crate) mod provider;
+pub(crate) mod serve;
+pub(crate) mod state;
+pub(crate) mod turn;
 
 /// The `Runner` seam is the pi module's, reused by path (SPEC-pi v2 §7).
 #[path = "../pi/sh.rs"]
-pub mod sh;
+pub(crate) mod sh;
 
 /// The launcher's port (spec §4, Q11). The terminal fallback uses 17941.
-pub const BRIDGE_PORT: u16 = 17841;
-pub const FALLBACK_PORT: u16 = 17941;
+pub(crate) const BRIDGE_PORT: u16 = 17841;
+pub(crate) const FALLBACK_PORT: u16 = 17941;
 /// The routed Pro slug and the effort that fixes it (spec §1).
-pub const MODEL: &str = "chatgpt-web/pro";
-pub const EFFORT: &str = "ultra";
+pub(crate) const MODEL: &str = "chatgpt-web/pro";
+pub(crate) const EFFORT: &str = "ultra";
 /// `!cat` output is delivered whole only with this override (spec §5, check a).
-pub const TOOL_OUTPUT_TOKEN_LIMIT: u64 = 60_000;
+pub(crate) const TOOL_OUTPUT_TOKEN_LIMIT: u64 = 60_000;
 /// Packet caps (spec §4).
-pub const PACKET_MAX_BYTES: usize = 200 * 1024;
-pub const PACKET_MAX_TOKENS: u64 = 60_000;
+pub(crate) const PACKET_MAX_BYTES: usize = 200 * 1024;
+pub(crate) const PACKET_MAX_TOKENS: u64 = 60_000;
 /// In flight: default 2, hard max 4 (upstream browser cap is 5; never 5).
-pub const INFLIGHT_DEFAULT: usize = 2;
-pub const INFLIGHT_MAX: usize = 4;
+const INFLIGHT_DEFAULT: usize = 2;
+pub(crate) const INFLIGHT_MAX: usize = 4;
 /// Turn timeout: Pro turns can last an hour (fold notes item 3).
-pub const TURN_TIMEOUT: Duration = Duration::from_secs(120 * 60);
+pub(crate) const TURN_TIMEOUT: Duration = Duration::from_secs(120 * 60);
 /// The packet `!cat` must show in the rollout this fast.
-pub const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// The breaker (spec §4): 2 h, cleared only by Rolf through `resume-bridge`.
-pub const COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
+pub(crate) const COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
 /// Two failed turns inside this window trip the breaker.
-pub const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
+pub(crate) const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// Bridge majors the plugin has seen (spec Design, check 6).
-pub const SEEN_BRIDGE_MAJORS: &[u64] = &[5];
+pub(crate) const SEEN_BRIDGE_MAJORS: &[u64] = &[5];
 
 /// The process environment, read once, so resolution never depends on plugin
 /// variables that are not there.
 #[derive(Debug, Clone)]
-pub struct Env {
+pub(crate) struct Env {
     vars: BTreeMap<String, String>,
-    pub home: PathBuf,
+    pub(crate) home: PathBuf,
     /// The resolved plugin state root, so the Pro home is available without a
     /// separate `Layout` (the `trusted` check keeps the pi module's `Env`
     /// shape).
@@ -68,7 +68,7 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn from_process() -> Result<Self> {
+    pub(crate) fn from_process() -> Result<Self> {
         let vars: BTreeMap<String, String> = std::env::vars().collect();
         let home = vars
             .get("HOME")
@@ -85,7 +85,7 @@ impl Env {
     }
 
     #[cfg(test)]
-    pub fn for_test(home: &Path, vars: &[(&str, &str)]) -> Self {
+    pub(crate) fn for_test(home: &Path, vars: &[(&str, &str)]) -> Self {
         let mut env = Env {
             vars: vars
                 .iter()
@@ -100,44 +100,44 @@ impl Env {
     }
 
     /// A variable's value; an empty value counts as unset.
-    pub fn var(&self, key: &str) -> Option<&str> {
+    pub(crate) fn var(&self, key: &str) -> Option<&str> {
         self.vars
             .get(key)
             .map(String::as_str)
             .filter(|v| !v.is_empty())
     }
 
-    pub fn expand_tilde(&self, path: &str) -> PathBuf {
+    pub(crate) fn expand_tilde(&self, path: &str) -> PathBuf {
         sh::expand_tilde(path, &self.home)
     }
 
     /// The herdr binary: `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
-    pub fn herdr_bin(&self) -> String {
+    pub(crate) fn herdr_bin(&self) -> String {
         self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
     }
 
     /// Rolf's everyday Codex home, `~/.codex`. Read only, for the doctor check
     /// that the bridge route never lands there.
-    pub fn codex_home(&self) -> PathBuf {
+    pub(crate) fn codex_home(&self) -> PathBuf {
         self.home.join(".codex")
     }
 
     /// The v2 shared Pro home: `<state dir>/codex-home`. It is the only home a
     /// lane uses. There is no `~/.codex` fallback and no override switch.
-    pub fn lane_codex_home(&self) -> PathBuf {
+    pub(crate) fn lane_codex_home(&self) -> PathBuf {
         self.root.join("codex-home")
     }
 
     /// `CODEX_HOME=<pro home>` for a lane tab. Always set: the lane runs in the
     /// plugin's own home. The fork's launch-env persistence makes this survive
     /// a cold restart; until then `herdr-pro resume` passes it again.
-    pub fn codex_home_env(&self) -> Option<String> {
+    pub(crate) fn codex_home_env(&self) -> Option<String> {
         Some(format!("CODEX_HOME={}", self.lane_codex_home().display()))
     }
 
     /// Concurrent Pro turns: two by default, configurable up to the hard cap
     /// of four.
-    pub fn inflight_limit(&self) -> Result<usize> {
+    pub(crate) fn inflight_limit(&self) -> Result<usize> {
         let Some(raw) = self.var("HERDR_PRO_MAX_INFLIGHT") else {
             return Ok(INFLIGHT_DEFAULT);
         };
@@ -153,7 +153,7 @@ impl Env {
     }
 
     /// The bridge's own home: `CODEX_CHATGPT_WEB_HOME` else `~/.codex-chatgpt-web`.
-    pub fn bridge_home(&self) -> PathBuf {
+    pub(crate) fn bridge_home(&self) -> PathBuf {
         match self.var("CODEX_CHATGPT_WEB_HOME") {
             Some(dir) => self.expand_tilde(dir),
             None => self.home.join(".codex-chatgpt-web"),
@@ -167,101 +167,101 @@ impl Env {
 /// run and a coordinator shell therefore agree (the reason `pi::resolve_root`
 /// ignores `HERDR_PLUGIN_STATE_DIR`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Layout {
-    pub root: PathBuf,
+pub(crate) struct Layout {
+    pub(crate) root: PathBuf,
 }
 
 impl Layout {
-    pub fn from_env(env: &Env) -> Result<Layout> {
+    pub(crate) fn from_env(env: &Env) -> Result<Layout> {
         Ok(Layout {
             root: env.root.clone(),
         })
     }
 
     /// The v2 shared Pro Codex home: `<state dir>/codex-home`.
-    pub fn codex_home(&self) -> PathBuf {
+    pub(crate) fn codex_home(&self) -> PathBuf {
         self.root.join("codex-home")
     }
 
     #[cfg(test)]
-    pub fn for_test(root: impl Into<PathBuf>) -> Layout {
+    pub(crate) fn for_test(root: impl Into<PathBuf>) -> Layout {
         Layout { root: root.into() }
     }
 
-    pub fn lanes(&self) -> PathBuf {
+    pub(crate) fn lanes(&self) -> PathBuf {
         self.root.join("lanes")
     }
 
-    pub fn packets(&self) -> PathBuf {
+    fn packets(&self) -> PathBuf {
         self.root.join("packets")
     }
 
-    pub fn turns(&self) -> PathBuf {
+    pub(crate) fn turns(&self) -> PathBuf {
         self.root.join("turns")
     }
 
-    pub fn inflight(&self) -> PathBuf {
+    pub(crate) fn inflight(&self) -> PathBuf {
         self.root.join("inflight")
     }
 
-    pub fn start_lock(&self) -> PathBuf {
+    pub(crate) fn start_lock(&self) -> PathBuf {
         self.root.join("start.lock")
     }
 
-    pub fn turn_lock(&self) -> PathBuf {
+    pub(crate) fn turn_lock(&self) -> PathBuf {
         self.root.join("turn.lock")
     }
 
     /// Serializes `herdr-pro image` calls, so one picture lane serves one
     /// caller at a time.
-    pub fn image_lock(&self) -> PathBuf {
+    pub(crate) fn image_lock(&self) -> PathBuf {
         self.root.join("image.lock")
     }
 
-    pub fn cooldown(&self) -> PathBuf {
+    pub(crate) fn cooldown(&self) -> PathBuf {
         self.root.join("cooldown-until")
     }
 
-    pub fn usage(&self) -> PathBuf {
+    pub(crate) fn usage(&self) -> PathBuf {
         self.root.join("usage.jsonl")
     }
 
-    pub fn bridge_state(&self) -> PathBuf {
+    pub(crate) fn bridge_state(&self) -> PathBuf {
         self.root.join("bridge-state.json")
     }
 
     /// `serve.json`: the relay's port, pid, start time and bearer token.
-    pub fn serve_state(&self) -> PathBuf {
+    pub(crate) fn serve_state(&self) -> PathBuf {
         self.root.join("serve.json")
     }
 
     /// The shared pi folder's `models.json`: `<ADE root>/pi/agent/models.json`,
     /// one level up from `<state dir>/pro-bridge`.
-    pub fn pi_models(&self) -> PathBuf {
+    pub(crate) fn pi_models(&self) -> PathBuf {
         self.root
             .parent()
             .unwrap_or(&self.root)
             .join("pi/agent/models.json")
     }
 
-    pub fn lane(&self, name: &str) -> PathBuf {
+    pub(crate) fn lane(&self, name: &str) -> PathBuf {
         self.lanes().join(format!("{name}.toml"))
     }
 
-    pub fn turn(&self, tag: &str) -> PathBuf {
+    pub(crate) fn turn(&self, tag: &str) -> PathBuf {
         self.turns().join(format!("{tag}.toml"))
     }
 
-    pub fn packet(&self, tag: &str) -> PathBuf {
+    pub(crate) fn packet(&self, tag: &str) -> PathBuf {
         self.packets().join(format!("{tag}.md"))
     }
 
-    pub fn inflight_lock(&self, tag: &str) -> PathBuf {
+    pub(crate) fn inflight_lock(&self, tag: &str) -> PathBuf {
         self.inflight().join(format!("{tag}.lock"))
     }
 
     /// Create every directory the plugin writes into.
-    pub fn ensure(&self) -> Result<()> {
+    pub(crate) fn ensure(&self) -> Result<()> {
         for dir in [
             self.root.clone(),
             self.lanes(),
@@ -279,7 +279,7 @@ impl Layout {
 /// The projects root `ha` keeps: `HERDR_ADE_ROOT`, then `root` in
 /// `~/.config/herdr-ade/config.toml`, then `~/.herdr-ade`. The plugin state
 /// sits one level below it, and so does each project's `.state` directory.
-pub fn ade_root(env: &Env) -> Result<PathBuf> {
+pub(crate) fn ade_root(env: &Env) -> Result<PathBuf> {
     let root = if let Some(dir) = env.var("HERDR_ADE_ROOT") {
         env.expand_tilde(dir)
     } else if let Some(root) = config_root(env)? {
@@ -291,7 +291,7 @@ pub fn ade_root(env: &Env) -> Result<PathBuf> {
 }
 
 /// The plugin root: `HERDR_PRO_STATE_DIR`, else `<ADE root>/pro-bridge`.
-pub fn resolve_root(env: &Env) -> Result<PathBuf> {
+pub(crate) fn resolve_root(env: &Env) -> Result<PathBuf> {
     if let Some(dir) = env.var("HERDR_PRO_STATE_DIR") {
         return absolute(&env.expand_tilde(dir));
     }
@@ -322,24 +322,24 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 }
 
 /// RFC 3339 now.
-pub fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
 
 /// Parse an RFC 3339 stamp the plugin wrote.
-pub fn parse_rfc3339(text: &str) -> Option<jiff::Timestamp> {
+pub(crate) fn parse_rfc3339(text: &str) -> Option<jiff::Timestamp> {
     text.trim().parse().ok()
 }
 
 /// Seconds between a stamp and now; negative when the stamp is in the future.
-pub fn seconds_since(text: &str, now: jiff::Timestamp) -> Option<i64> {
+pub(crate) fn seconds_since(text: &str, now: jiff::Timestamp) -> Option<i64> {
     let then = parse_rfc3339(text)?;
     Some(now.as_second() - then.as_second())
 }
 
 /// The default turn id when the coordinator does not pass `--id`:
 /// `<lane>-<NN>`, numbered by the lane's earlier turns.
-pub fn next_turn_id(layout: &Layout, lane: &str) -> String {
+pub(crate) fn next_turn_id(layout: &Layout, lane: &str) -> String {
     let mut n = 0u32;
     if let Ok(entries) = std::fs::read_dir(layout.turns()) {
         for entry in entries.flatten() {

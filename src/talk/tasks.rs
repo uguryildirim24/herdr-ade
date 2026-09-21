@@ -7,22 +7,22 @@ use std::io::ErrorKind;
 use crate::project::Project;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Task {
-    pub title: String,
-    pub owner: String,
+pub(crate) struct Task {
+    pub(crate) title: String,
+    pub(crate) owner: String,
     /// The thread id after `→`, when this task is delegated.
-    pub thread: Option<String>,
+    pub(crate) thread: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct List {
-    pub heading: String,
-    pub tasks: Vec<Task>,
+pub(crate) struct List {
+    pub(crate) heading: String,
+    pub(crate) tasks: Vec<Task>,
 }
 
 /// Parse the `## <list>` headings and `- [ ] <title> (<owner>)` lines.
 /// Anything else is not a task; a task before its first heading is skipped.
-pub fn parse(text: &str) -> Vec<List> {
+pub(crate) fn parse(text: &str) -> Vec<List> {
     let mut lists: Vec<List> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim_end();
@@ -78,7 +78,7 @@ fn delegate(owner: &str) -> (String, Option<String>) {
 
 /// Read the same file the coordinator's digest reads. `true` when the file is
 /// present but unreadable: unknown is not empty.
-pub fn load(project: &Project) -> (Vec<List>, bool) {
+pub(crate) fn load(project: &Project) -> (Vec<List>, bool) {
     match std::fs::read_to_string(project.dir().join("TASKS.md")) {
         Ok(text) => (parse(&text), false),
         Err(error) if error.kind() == ErrorKind::NotFound => (Vec::new(), false),

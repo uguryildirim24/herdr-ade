@@ -117,7 +117,7 @@ pub(crate) fn recipe_ready_on_box(
 }
 
 /// Prints the report and returns whether every required check passed.
-pub fn run(ctx: &Ctx, session: &SessionFlags) -> Result<bool> {
+pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<bool> {
     let (mut text, mut healthy) = report(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
     // The pi rows read the process's own layout (SPEC-pi §3.4).
     match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root) {

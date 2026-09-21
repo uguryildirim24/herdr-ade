@@ -13,7 +13,7 @@ use crate::threads::{self, Row};
 /// The project a herdr workspace belongs to: the coordinator's workspace or a
 /// local thread's recorded workspace, and only among projects whose recorded
 /// socket is the current one (workspace ids repeat across sessions).
-pub fn project_for_workspace(ctx: &Ctx, workspace_id: &str, socket: &str) -> Option<String> {
+pub(crate) fn project_for_workspace(ctx: &Ctx, workspace_id: &str, socket: &str) -> Option<String> {
     if workspace_id.is_empty() || socket.is_empty() {
         return None;
     }
@@ -36,7 +36,7 @@ pub fn project_for_workspace(ctx: &Ctx, workspace_id: &str, socket: &str) -> Opt
     })
 }
 
-pub enum Resolved {
+pub(crate) enum Resolved {
     Slug(String),
     /// Nothing resolved and there is no terminal to ask on.
     All,
@@ -44,7 +44,7 @@ pub enum Resolved {
 
 /// An explicit slug, else the current herdr workspace, else a numbered picker
 /// when on a terminal, else every project.
-pub fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
+fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
     if let Some(slug) = slug {
         project::validate_slug(slug)?;
         return Ok(Resolved::Slug(slug.to_string()));
@@ -61,7 +61,7 @@ pub fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
 }
 
 /// The slug to act on, for commands that cannot act on "all projects".
-pub fn require_slug(ctx: &Ctx, slug: Option<&str>) -> Result<String> {
+pub(crate) fn require_slug(ctx: &Ctx, slug: Option<&str>) -> Result<String> {
     match resolve_slug(ctx, slug)? {
         Resolved::Slug(slug) => Ok(slug),
         Resolved::All => bail!("no project resolves from the current herdr workspace; pass a slug"),
@@ -76,7 +76,7 @@ fn visible_slugs(ctx: &Ctx) -> Vec<String> {
 }
 
 /// The numbered project picker.
-pub fn pick(ctx: &Ctx) -> Result<String> {
+pub(crate) fn pick(ctx: &Ctx) -> Result<String> {
     let slugs = visible_slugs(ctx);
     match slugs.len() {
         0 => bail!("there are no projects in {}", ctx.root.display()),
@@ -98,7 +98,7 @@ pub fn pick(ctx: &Ctx) -> Result<String> {
 }
 
 /// Threads grouped by state, in the one display order.
-pub fn render(project: &Project, rows: &[Row]) -> String {
+pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
     let mut out = String::new();
     let goal = project
         .read_project_md()
@@ -159,7 +159,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
     out
 }
 
-pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
+pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
     let slugs = match resolve_slug(ctx, slug)? {
         Resolved::Slug(slug) => vec![slug],
         Resolved::All => visible_slugs(ctx),
@@ -185,7 +185,7 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
 }
 
 /// `focus`: show only this project's panes in the sidebar, by attention.
-pub fn focus(ctx: &Ctx, slug: Option<&str>) -> Result<()> {
+pub(crate) fn focus(ctx: &Ctx, slug: Option<&str>) -> Result<()> {
     let slug = require_slug(ctx, slug)?;
     let project = Project::load(&ctx.root, &slug)?;
     let view = threads::session_view(ctx, &project).ok_or_else(|| {
@@ -201,7 +201,7 @@ pub fn focus(ctx: &Ctx, slug: Option<&str>) -> Result<()> {
 }
 
 /// `unfocus`: herdr holds a single transient view, so this clears whatever is set.
-pub fn unfocus(ctx: &Ctx, session: &crate::paths::SessionFlags) -> Result<()> {
+pub(crate) fn unfocus(ctx: &Ctx, session: &crate::paths::SessionFlags) -> Result<()> {
     let session = crate::paths::resolve_session(session, ctx.env, ctx.runner)?;
     let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
     herdr

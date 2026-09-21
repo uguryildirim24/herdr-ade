@@ -1,24 +1,24 @@
-<p align="center"><img src="https://img.shields.io/badge/Herdr%20Projects-Projects%20for%20Herdr-2ea44f?style=flat-square&labelColor=24292f" alt="Herdr Projects | Projects for Herdr" /></p>
+<p align="center"><img src="https://img.shields.io/badge/Herdr%20ADE-Multi--agent%20projects-2ea44f?style=flat-square&labelColor=24292f" alt="Herdr ADE | Multi-agent projects for Herdr" /></p>
 
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>
 
-<p align="center">Herdr Projects lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself, by giving you one coordinator conversation that starts a separate agent for each task on its own branch, gives every one of them the same instructions and memory, and shows you which threads are ready for review, waiting on you, or still working.</p>
+<p align="center">Herdr ADE lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself, by giving you one coordinator conversation that starts a separate agent for each task on its own branch, gives every one of them the same instructions and memory, and shows you which threads are ready for review, waiting on you, or still working.</p>
 
-<p align="center"><img src="assets/herdr-projects-coordinator-threads.svg" width="88%" alt="Illustration: you tell a coordinator what you want, it starts three threads that each work on their own branch, and an overview groups them as ready for review, waiting on you, and working" /></p>
+<p align="center"><img src="assets/herdr-ade-coordinator-threads.svg" width="88%" alt="Illustration: you tell a coordinator what you want, it starts three threads that each work on their own branch, and an overview groups them as ready for review, waiting on you, and working" /></p>
 
-<p align="center"><a href="https://github.com/eliasstravik/herdr-projects/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></p>
+<p align="center"><a href="https://github.com/uguryildirim24/herdr-ade/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></p>
 
-<p align="center"><sub>✓&nbsp;Free,&nbsp;MIT&nbsp;licensed &nbsp; ✓&nbsp;Runs&nbsp;on&nbsp;your&nbsp;machines,&nbsp;no&nbsp;hosted&nbsp;service &nbsp; ✓&nbsp;macOS&nbsp;and&nbsp;Linux,&nbsp;Herdr&nbsp;0.9.1+</sub></p>
+<p align="center"><sub>✓&nbsp;Free,&nbsp;MIT&nbsp;licensed &nbsp; ✓&nbsp;Lane&nbsp;work&nbsp;runs&nbsp;on&nbsp;your&nbsp;machines &nbsp; ✓&nbsp;macOS&nbsp;and&nbsp;Linux,&nbsp;Herdr&nbsp;0.9.1+</sub></p>
 
 <br />
 
 ## Keep one conversation going while the work happens in parallel
 
-The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in a git worktree tab under the coordinator, or in its own folder when there's no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
+The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in a git worktree tab under the coordinator, or in its own tab folder when there is no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
 
 ## Choose between briefing each agent by hand, one long agent session, a cloud projects product, or a coordinator in Herdr
 
-| | **Herdr Projects** | Briefing agents by hand | One long agent session | Cloud projects products |
+| | **Herdr ADE** | Briefing agents by hand | One long agent session | Cloud projects products |
 |---|:---:|:---:|:---:|:---:|
 | **No extra software fee** | ✅ | ✅ | ✅ | ❌ |
 | **Parallel tasks on separate branches** | ✅ | ✅ | ❌ | ✅ |
@@ -30,7 +30,7 @@ The coordinator never does the work itself, so it's always free to answer you. E
 | **Works with the agent CLI you already use** | ✅ | ✅ | ✅ | ❌ |
 | **Runs with no machine of yours switched on** | ❌ | ❌ | ❌ | ✅ |
 
-Keep your attention on decisions. Herdr Projects starts and tracks the threads, your agents do the work, and you choose what to review, answer, or merge.
+Keep your attention on decisions. Herdr ADE starts and tracks the threads, your agents do the work, and you choose what to review, answer, or merge.
 
 ## Tell the coordinator what you want. See which thread needs you in the sidebar.
 
@@ -63,7 +63,7 @@ A thread that waits on a permission prompt for more than 30 seconds moves to Wai
 <td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; A coordinator that delegates and never does the work itself<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Overview by what needs you, in the sidebar and as text<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Pull request follow-up, routines and watched commands<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
 </tr>
 <tr>
-<td align="center"><a href="https://github.com/eliasstravik/herdr-projects/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></td>
+<td align="center"><a href="https://github.com/uguryildirim24/herdr-ade/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></td>
 </tr>
 </table>
 
@@ -73,7 +73,7 @@ A thread that waits on a permission prompt for more than 30 seconds moves to Wai
 
 You need to be comfortable in a terminal. The plugin builds itself on install, and a project is a plain folder of Markdown and TOML files. You'll need macOS or Linux, Herdr 0.9.1 or newer, Rust/Cargo, Git, and an agent CLI Herdr can start, such as Claude Code. The [getting-started guide](docs/getting-started.md) covers the prerequisites.
 
-### How do I check that Herdr Projects is running?
+### How do I check that Herdr ADE is running?
 
 Run:
 
@@ -89,7 +89,7 @@ It runs the `herdr-ade` binary every turn, so you'll want to allow-list it in yo
 
 ### Does the plugin send my project to a hosted service?
 
-No. A project is a folder on your machine, the plugin talks to your local Herdr session, and remote threads use your own SSH machines. Your agent CLI still uses its own service as usual.
+Project files and lane work stay on your machines. Task dispatch sends the full task brief and bounded repository facts to TypeSafe System One so Jev can score the work; the chosen agent CLI then uses its own service. Remote lanes use your own SSH machines.
 
 ### Will it touch my branches or worktrees on its own?
 
@@ -113,12 +113,12 @@ They are soft. By default the coordinator proposes threads and waits, thread age
 
 ### What does it cost?
 
-Herdr Projects is free and [MIT licensed](LICENSE). You need access to the private repository to install it. Your agent CLI's usual usage charges still apply: every thread is a full agent session, and the coordinator spends tokens each turn reading its digest.
+Herdr ADE is free and [MIT licensed](LICENSE). You need access to the private repository to install it. Your agent CLI's usual usage charges still apply: every thread is a full agent session, and the coordinator spends tokens each turn reading its digest.
 
 ## Open your first project in three steps
 
-<p align="center">Your first project starts with an install, a name, and one sentence about what you want. Herdr Projects starts the threads and keeps them in view. You choose what to review and what to merge.</p>
+<p align="center">Your first project starts with an install, a name, and one sentence about what you want. Herdr ADE starts the threads and keeps them in view. You choose what to review and what to merge.</p>
 
-<p align="center"><a href="https://github.com/eliasstravik/herdr-projects/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></p>
+<p align="center"><a href="https://github.com/uguryildirim24/herdr-ade/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></p>
 
-<p align="center"><sub>✓&nbsp;Free,&nbsp;MIT&nbsp;licensed &nbsp; ✓&nbsp;Runs&nbsp;on&nbsp;your&nbsp;machines,&nbsp;no&nbsp;hosted&nbsp;service &nbsp; ✓&nbsp;macOS&nbsp;and&nbsp;Linux,&nbsp;Herdr&nbsp;0.9.1+</sub></p>
+<p align="center"><sub>✓&nbsp;Free,&nbsp;MIT&nbsp;licensed &nbsp; ✓&nbsp;Lane&nbsp;work&nbsp;runs&nbsp;on&nbsp;your&nbsp;machines &nbsp; ✓&nbsp;macOS&nbsp;and&nbsp;Linux,&nbsp;Herdr&nbsp;0.9.1+</sub></p>
