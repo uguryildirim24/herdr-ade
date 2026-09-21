@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0127.md",
+      "tasks/t-0128.md",
+      "tasks/review-r57.md",
       "tasks/t-0125.md",
       "tasks/t-0124.md",
       "tasks/t-0126.md",
@@ -19,16 +22,14 @@
       "tasks/t-0122.md",
       "tasks/review-r55.md",
       "tasks/t-0121.md",
-      "tasks/t-0120.md",
-      "tasks/t-0119.md",
-      "tasks/t-0117.md",
-      "tasks/review-r54.md"
+      "tasks/t-0120.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r57.md",
       "tasks/reviews/code-r56.md",
       "tasks/reviews/code-r55.md",
       "tasks/reviews/code-r54.md",
@@ -39,14 +40,16 @@
       "tasks/reviews/code-r49.md",
       "tasks/reviews/code-r48.md",
       "tasks/reviews/code-r47.md",
-      "tasks/reviews/code-r46.md",
-      "tasks/reviews/code-r45.md"
+      "tasks/reviews/code-r46.md"
     ]
   },
-  "generated": "2026-09-21T09:07:18-04:00",
+  "generated": "2026-09-21T09:25:08-04:00",
   "git": {
     "branches": [
       "main",
+      "hp/adeherdr/t-0127-review-r57-this-round-stops-finished-job",
+      "hp/adeherdr/t-0128-rounds-stop-waiting-for-each-other",
+      "review/r57",
       "hp/adeherdr/t-0126-a-finished-lane-leaves-nothing-behind-on",
       "hp/adeherdr/t-0125-review-r56-this-round-takes-out-code-not",
       "review/r56",
@@ -207,22 +210,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "2160a1a Merge commit '3397d76f8450a531bf71bd8dc6ca3af6cdfc3a0b'",
-      "3397d76 review(r56): verdict",
-      "e99b89c review(cli): repair thread resolve help",
-      "c179722 review(core): remove remaining dead closure",
-      "d9168ce Merge commit '819375cb841c5accb31c163da2bc2696c0c4d654' into hp/adeherdr/t-0125-review-r56-this-round-takes-out-code-not",
-      "837f510 Merge commit 'bfd8e2fd8f4ee2f7d1cf6db6a03aba1195318dae' into hp/adeherdr/t-0125-review-r56-this-round-takes-out-code-not"
+      "c5c83b5 Merge commit '5ecc34996c249a96bd7db8453ad04ef5e7ad097e'",
+      "5ecc349 review(r57): verdict",
+      "779d0a4 review(lanes): preserve workspaces not owned by lanes",
+      "5e48e8f Merge commit '4a537b613d63f07029f574e5fd1a4e3cd7c4bfea' into review/r57",
+      "e0e747a docs(tasks): t-0128",
+      "e98d908 docs(tasks): t-0127"
     ],
-    "remote": "48 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "2160a1a",
+        "head": "c5c83b5",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit '3397d76f8450a531bf71bd8dc6ca3af6cdfc3a0b'"
+        "subject": "Merge commit '5ecc34996c249a96bd7db8453ad04ef5e7ad097e'"
       },
       {
         "branch": "review/r1",
@@ -552,6 +555,13 @@
         "head": "f1451ac",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r56",
         "subject": "docs(tasks): t-0125"
+      },
+      {
+        "branch": "review/r57",
+        "dirty": 0,
+        "head": "e98d908",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r57",
+        "subject": "docs(tasks): t-0127"
       },
       {
         "branch": "review/r6",
@@ -1035,7 +1045,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "blocked",
+      "status": "working",
       "workspace_id": "w1H"
     },
     {
@@ -1052,8 +1062,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r56",
-    "verdict": "3397d76f8450a531bf71bd8dc6ca3af6cdfc3a0b"
+    "round": "r57",
+    "verdict": "5ecc34996c249a96bd7db8453ad04ef5e7ad097e"
   },
   "session": "default",
   "unlinked_agents": [],
