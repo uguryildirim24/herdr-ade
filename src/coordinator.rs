@@ -204,6 +204,8 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         }
         talk_tab(ctx, &project);
         ticker::start(ctx)?;
+        crate::output::insert("workspace_id", record.workspace_id.clone());
+        crate::output::insert("pane_id", record.pane_id.clone());
         println!("coordinator is running in pane {}", record.pane_id);
         println!("Commands: {prefix}");
         return Ok(());
@@ -324,6 +326,8 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     report_tokens(&herdr, slug, &record.pane_id);
     talk_tab(ctx, &project);
     ticker::start(ctx)?;
+    crate::output::insert("workspace_id", record.workspace_id.clone());
+    crate::output::insert("pane_id", record.pane_id.clone());
     println!(
         "opened `{slug}` in workspace {} (pane {})",
         record.workspace_id, record.pane_id

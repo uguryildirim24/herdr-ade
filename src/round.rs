@@ -1153,13 +1153,25 @@ pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thre
 /// standard error with the reason, un-binds the dead reviewer and tries again
 /// on the next pass, up to `MAX_REVIEWER_START_FAILURES`. A round is never
 /// left with a bound reviewer whose agent never came up (E3/D1).
-pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
+#[derive(Debug, Default)]
+pub struct AdvanceOutcome {
+    pub started: Vec<ReviewerStarted>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ReviewerStarted {
+    pub round: String,
+    pub reviewer: String,
+}
+
+pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
     // One advance at a time, across processes (the hook and the ticker).
     let _advance = advance_lock(&project)?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
     let events = sealed_events(&project)?;
+    let mut outcome = AdvanceOutcome::default();
     for listed in checked_list(&project)? {
         if listed.phase.closed() {
             continue;
@@ -1246,9 +1258,13 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             continue;
         }
         let review_branch = reviewer_branch(ctx, slug, &round, &record)?;
-        start_and_bind_reviewer(ctx, &project, slug, &round, &review_branch, &prefix)?;
+        if let Some(reviewer) =
+            start_and_bind_reviewer(ctx, &project, slug, &round, &review_branch, &prefix)?
+        {
+            outcome.started.push(ReviewerStarted { round, reviewer });
+        }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// The hook's entry point: advance the project whose coordinator or thread
@@ -1286,7 +1302,7 @@ pub fn advance_event(ctx: &Ctx) -> Result<()> {
     }
     let targets = if matched.is_empty() { slugs } else { matched };
     for slug in targets {
-        advance(ctx, &slug)?;
+        let _ = advance(ctx, &slug)?;
     }
     Ok(())
 }
@@ -4617,7 +4633,9 @@ mod tests {
             fx.seal_done(id, 1, 1, sha, &format!("# report {id}\n"));
         }
 
-        advance(&ctx, "demo").unwrap();
+        let advanced = advance(&ctx, "demo").unwrap();
+        assert_eq!(advanced.started.len(), 1);
+        assert_eq!(advanced.started[0].round, "r1");
 
         let record = load(&fx.project, "r1").unwrap();
         let branch = record.review_branch.clone().expect("review ran");
@@ -4656,7 +4674,8 @@ mod tests {
             assert!(task.contains(&format!(".reports/{id}.md")), "{task}");
         }
 
-        advance(&ctx, "demo").unwrap();
+        let advanced_again = advance(&ctx, "demo").unwrap();
+        assert!(advanced_again.started.is_empty());
         let again = load(&fx.project, "r1").unwrap();
         assert_eq!(again.reviewer, Some(reviewer.clone()));
         assert_eq!(again.review_branch, Some(branch));
