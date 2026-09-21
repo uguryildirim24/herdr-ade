@@ -1247,7 +1247,7 @@ enum ThreadCommand {
     Resolve {
         slug: String,
         id: String,
-        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied", "keep_pane", "force"])]
+        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied", "keep_pane"])]
         reopen: bool,
         /// Also remove the worktree (never forced; the branch is kept)
         #[arg(long)]
