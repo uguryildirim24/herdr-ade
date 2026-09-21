@@ -65,3 +65,7 @@ Commit: `116910ac54b861c127ccfcb2ac20a69e134d8835`
 Published branch: `hp/adeherdr/t-0159-the-talk-screen-always-moves-to-the-inst`
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `a4e136dc8f8c65748d548e898fba52adb6862389`.
