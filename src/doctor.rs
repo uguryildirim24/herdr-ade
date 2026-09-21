@@ -779,8 +779,9 @@ fn check_workspace_leaks(
 
 /// The machine's own home shell: the workspace the client hides while the
 /// machine has another workspace (fork `is_default_shell_space`): label `~`, no
-/// agent, one tab holding one pane. The display label already carries a custom
-/// name, so the fork's `custom_label` guard folds into the `~` test here.
+/// agent, one tab holding one pane. `herdr workspace list` does not expose the
+/// fork's `custom_label` bit, so a workspace hand-labelled exactly `~` is
+/// indistinguishable here and is also skipped.
 fn default_shell_workspaces(
     workspaces: &[herdr::Workspace],
     agents: &[herdr::Agent],
