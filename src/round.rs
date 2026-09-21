@@ -4278,6 +4278,34 @@ mod tests {
     }
 
     #[test]
+    fn advance_reviewer_obeys_role_floor_and_still_scores() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        let policy_path = fx.world.ctx().config_dir.join("routing.json");
+        let mut policy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&policy_path).unwrap()).unwrap();
+        policy["models"]["test_strong"] =
+            serde_json::json!({"tier":2,"description":"careful helper"});
+        policy["role_floors"] = serde_json::json!({"reviewer":"test_strong"});
+        let config_path = fx.world.ctx().config_dir.join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(config_path, format!("{config}\n[recipes.test_strong]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful helper\"\n")).unwrap();
+        std::fs::write(policy_path, policy.to_string()).unwrap();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&fx.world.ctx(), "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        advance(&fx.world.ctx(), "demo").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        let started = thread::load(&fx.project, record.reviewer.as_ref().unwrap()).unwrap();
+        assert_eq!(started.launch.recipe_id, "test_strong");
+        assert_eq!(fx.world.runner.count("/usr/bin/curl"), 1);
+        let ledger =
+            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
+        assert!(ledger.contains("jev-scores-floor"));
+    }
+
+    #[test]
     fn advance_starts_one_reviewer_and_never_a_second() {
         let fx = fixture();
         let ctx = fx.world.ctx();

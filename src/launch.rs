@@ -183,7 +183,7 @@ pub fn work_contract(task: &str, workflow: &str) -> Result<Value> {
 pub struct ResolveInput<'a> {
     pub task: &'a str,
     pub state: Value,
-    /// Internal workflow label only: determines skill text, never a model role.
+    /// Selects skill text and any explicitly configured routing role floor.
     pub workflow: &'a str,
     pub previous: Option<&'a Launch>,
     pub failure: Option<&'a str>,
@@ -242,6 +242,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         p.strength
             .max(policy.models.get(&p.recipe_id).map_or(0, |m| m.tier))
     });
+    let mut fallback = None;
+    let mut floors = Vec::new();
     let (id, assessment, decision, rule, input_truncation) = if let Some(id) = excluded {
         (
             id.to_string(),
@@ -279,15 +281,39 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
                 "input_truncation":truncation}),
             )?;
         }
-        let assessment = crate::jev::call(ctx, &request, &policy.questions)?;
-        let decision = policy.select(&assessment, previous_tier)?;
-        (
-            decision.recipe.clone(),
-            Some(assessment),
-            Some(decision),
-            "jev-scores",
-            truncation,
-        )
+        match crate::jev::call(ctx, &request, &policy.questions) {
+            Ok(assessment) => {
+                let decision = policy.select(&assessment, previous_tier, input.workflow)?;
+                floors = decision.floors.clone();
+                let rule = if floors.is_empty() {
+                    "jev-scores"
+                } else {
+                    "jev-scores-floor"
+                };
+                (
+                    decision.recipe.clone(),
+                    Some(assessment),
+                    Some(decision),
+                    rule,
+                    truncation,
+                )
+            }
+            Err(error) if error.is::<crate::jev::OversizedRequest>() => {
+                // Routes are validated in strictly increasing tier order. Keep
+                // exclusions, readiness and escalation bounds on their usual paths.
+                let mut id = policy
+                    .routes
+                    .last()
+                    .expect("validated routes")
+                    .recipe
+                    .clone();
+                floors = policy.apply_floors(&mut id, input.workflow, None);
+                fallback =
+                    Some(json!({"cause":"picker-input-too-large", "error":error.to_string()}));
+                (id, None, None, "jev-size-fallback", truncation)
+            }
+            Err(error) => return Err(error),
+        }
     };
     let recipe = config.recipes.get(&id).context("recipe_unknown")?;
     if !recipe.enabled {
@@ -301,7 +327,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     ledger(
         project,
         json!({"kind": if escalations > 0 { "escalation" } else { "pick" },
-        "brief_hash": hash, "recipe": id, "rule": rule, "assessment": assessment, "decision": decision,
+        "brief_hash": hash, "recipe": id, "rule": rule, "floors": floors, "fallback": fallback,
+        "workflow": input.workflow, "assessment": assessment, "decision": decision,
         "low_confidence": decision.as_ref().is_some_and(|d| d.confidence < policy.confidence_floor),
         "previous": input.previous.map(|p| json!({"recipe":p.recipe_id,"tier":p.strength,"attempt":p.attempt})),
         "failure": input.failure, "escalations": escalations,
@@ -472,7 +499,7 @@ pub fn repository_state(ctx: &Ctx, repo: Option<&str>, base: Option<&str>) -> Re
     )
 }
 
-/// Dialogue workflow labels are not model roles. Selection happens only once
+/// Dialogue workflow labels may carry policy floors. Selection happens only once
 /// each complete side's brief exists; no model pin is printed by this command.
 pub struct DialoguePair;
 impl crate::dialogue::PairFilter for DialoguePair {

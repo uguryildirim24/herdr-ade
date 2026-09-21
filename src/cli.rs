@@ -1201,7 +1201,7 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
-        /// Instruction set for this lane; this never selects its model
+        /// Instruction set for this lane; routing policy may set a model floor for it
         #[arg(long, value_name = "FLOW")]
         workflow: Option<String>,
         /// Birth sentence (SPEC-ADE D17 item 6)
