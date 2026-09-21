@@ -79,6 +79,7 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
         steps::deliver_event(ctx, &binding.project, &event)?;
         ticker::start(ctx)?;
     }
+    crate::output::insert("event", event.id.clone());
     println!("sealed {}", event.id);
     Ok(())
 }
@@ -128,6 +129,7 @@ fn seal_message(ctx: &Ctx, text: &str, failed: bool) -> Result<()> {
         }
         ticker::start(ctx)?;
     }
+    crate::output::insert("event", event.id.clone());
     println!("sealed {}", event.id);
     Ok(())
 }
