@@ -59,7 +59,7 @@ A lane reports through its file under `.herdr-project/`. The harness copies repo
 herdr-ade thread resolve billing t-0001
 ```
 
-Use `--remove-worktree` only when you also want the copied worktree removed. The branch is retained, and removal is never forced.
+A finished lane's worktree is removed automatically once its commits have landed or its round has closed. The branch is retained, and removal is never forced; uncommitted changes keep the worktree with a reason.
 
 ## Check your setup
 

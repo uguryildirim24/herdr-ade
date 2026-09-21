@@ -574,7 +574,11 @@ pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<Stri
             .members
             .iter()
             .any(|m| m.thread == thread && m.pin.is_some());
-        if pinned || record.reviewer.as_deref() == Some(thread) {
+        let completed_reviewer =
+            record.reviewer.as_deref() == Some(thread) && record.verdict.is_some();
+        let unfinished_reviewer =
+            record.reviewer.as_deref() == Some(thread) && record.verdict.is_none();
+        if (pinned && !completed_reviewer) || unfinished_reviewer {
             return Ok(Some(record.round));
         }
     }
@@ -1016,7 +1020,67 @@ pub fn abandon(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Round
         eprintln!("note: the plan refresh failed: {e:#}");
     }
     let _ = crate::board::refresh(ctx, &project);
+    for line in cleanup_review_worktrees(ctx, &record) {
+        println!("{line}");
+    }
     Ok(record)
+}
+
+/// Remove every review checkout for a closed round while retaining its review
+/// branches. Repairs use `review-rN-2`, `review-rN-3`, and so on, so cleanup
+/// discovers the actual registered worktrees rather than trusting only the
+/// latest branch on the round record.
+fn cleanup_review_worktrees(ctx: &Ctx, record: &RoundRecord) -> Vec<String> {
+    if !record.phase.closed() || record.repo.is_empty() {
+        return Vec::new();
+    }
+    let expected = format!("review-{}", record.round);
+    let belongs = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name == expected
+                    || name
+                        .strip_prefix(&format!("{expected}-"))
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                        })
+            })
+    };
+    let _lock = match crate::git::lock(ctx.runner, &record.repo) {
+        Ok(lock) => lock,
+        Err(error) => return vec![format!("review worktrees kept: {error:#}")],
+    };
+    let worktrees = match crate::git::worktree_list(ctx.runner, &record.repo) {
+        Ok(rows) => rows,
+        Err(error) => return vec![format!("review worktrees kept: {error:#}")],
+    };
+    let mut lines = Vec::new();
+    for (path, _) in worktrees.into_iter().filter(|(path, _)| belongs(path)) {
+        let path_text = path.to_string_lossy().into_owned();
+        match crate::git::dirty_paths(ctx.runner, &record.repo, &path_text) {
+            Ok(dirty) if !dirty.is_empty() => lines.push(format!(
+                "review worktree {} kept: worktree_dirty ({})",
+                path.display(),
+                dirty.join(", ")
+            )),
+            Ok(_) => match crate::git::worktree_remove(ctx.runner, &record.repo, &path_text) {
+                Ok(()) => lines.push(format!(
+                    "review worktree {} removed; its branch was kept",
+                    path.display()
+                )),
+                Err(error) => lines.push(format!(
+                    "review worktree {} kept: {error:#}",
+                    path.display()
+                )),
+            },
+            Err(error) => lines.push(format!(
+                "review worktree {} kept: {error:#}",
+                path.display()
+            )),
+        }
+    }
+    lines
 }
 
 pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
@@ -2460,6 +2524,15 @@ fn merge_inner(
         }
     }
     let _ = crate::board::refresh(ctx, &project);
+    if matches!(
+        &outcome,
+        Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
+    ) && let Ok(closed) = load(&project, round)
+    {
+        for line in cleanup_review_worktrees(ctx, &closed) {
+            println!("{line}");
+        }
+    }
     if matches!(
         &outcome,
         Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
@@ -4021,8 +4094,17 @@ mod tests {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let (lanes, _b) = reviewed(&fx);
+        let review_worktree = fx.repo.join(".worktrees/review-r1");
+        assert!(review_worktree.is_dir());
         let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
         let out = merge(&ctx, "demo", "r1", None).unwrap();
+        assert!(!review_worktree.exists(), "closed round review worktree");
+        assert!(
+            crate::git::branch_head(ctx.runner, &fx.repo.to_string_lossy(), "review/r1")
+                .unwrap()
+                .is_some(),
+            "review branch is retained"
+        );
         let MergeOutcome::Checkpointed { head, lanes: moved } = out else {
             panic!("{out:?}")
         };
