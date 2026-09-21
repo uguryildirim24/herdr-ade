@@ -1481,7 +1481,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
                 println!("No worktree was recorded for it, so there is nothing to close or remove.")
             }
             Kind::Worktree => println!(
-                "Its workspace, worktree ({}) and branch ({}) were left alone. Close the workspace in herdr, or run `thread resolve {slug} {id} --remove-worktree`.",
+                "Its worktree ({}) and branch ({}) were left alone. Run `thread resolve {slug} {id} --remove-worktree` to remove the worktree.",
                 resolved.worktree_path, resolved.branch
             ),
             _ => {}
@@ -1530,7 +1530,15 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         || agents.iter().any(|agent| {
             agent.workspace_id == record.workspace_id && !thread::agent_matches(record, agent)
         });
-    let result = if owns_pane && !holds_something_else {
+    // A local project workspace remains owned by its coordinator even when
+    // that coordinator's pane is temporarily absent. An adopted workspace was
+    // not created by ADE, so resolving its thread must not close it either.
+    let is_project_workspace = !record.is_remote()
+        && project
+            .coordinator()
+            .is_some_and(|coordinator| coordinator.workspace_id == record.workspace_id);
+    let owns_workspace = record.kind != Kind::Adopted && !is_project_workspace;
+    let result = if owns_workspace && owns_pane && !holds_something_else {
         herdr.workspace_close(&record.workspace_id)
     } else {
         herdr.tab_close(&record.tab_id)
