@@ -11,7 +11,7 @@ use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
-use crate::thread::{self, CopyOutcome, Group, Kind, Live, Status, Thread};
+use crate::thread::{self, CopyOutcome, Group, Kind, Status, Thread};
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -331,7 +331,7 @@ fn start_with_ticker(
                 Err(cleanup) => error.context(format!("failed-start cleanup: {cleanup:#}")),
             };
             Err(error.context(format!(
-                "thread {id} failed to start; `thread restart {slug} {id}` retries"
+                "thread {id} failed to start; `thread retry {slug} {id} --reason <why>` retries"
             )))
         }
     }
@@ -528,7 +528,7 @@ pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch)
     box_launch_ready(ctx, &profile, launch)
 }
 
-/// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
+/// Steps 2 to 5 of starting a thread, also used when recovery must place it.
 fn place_and_brief(
     ctx: &Ctx,
     project: &Project,
@@ -1199,70 +1199,6 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
     Ok(thread)
 }
 
-#[derive(Debug, PartialEq)]
-pub enum RestartPlan {
-    /// (a) nothing was created: run the create step again.
-    Create,
-    /// (c) the recorded pane is alive at a shell prompt: reuse it.
-    ReusePane,
-    /// (e) open the existing worktree, or a new tab in `threads/<id>/`.
-    Reopen,
-}
-
-/// What `thread restart` does, from what the record shows was reached.
-pub fn restart_plan(
-    thread: &Thread,
-    live: &Live,
-    branch_exists: bool,
-    now: jiff::Timestamp,
-) -> Result<RestartPlan> {
-    match thread.kind {
-        Kind::Adopted => bail!("an adopted thread cannot be restarted; adopt a new pane instead"),
-        Kind::Worktree | Kind::Tab => {}
-    }
-    if thread.status == Status::Resolved {
-        bail!("{} is resolved; `thread resolve --reopen` first", thread.id);
-    }
-    if thread.status == Status::Starting
-        && thread::seconds_since(&thread.created, now) < thread::STARTING_TIMEOUT_SECS
-    {
-        bail!("{} is still starting", thread.id);
-    }
-    // (d)
-    if live.agent_state.is_some() {
-        bail!("{} is running: its pane has an agent in it", thread.id);
-    }
-    if live.pane_exists
-        && thread.prompt_pending
-        && thread.launch_attempts < thread::MAX_LAUNCH_ATTEMPTS
-        && thread.status == Status::Open
-    {
-        bail!(
-            "{} is being launched by the ticker (attempt {} of {})",
-            thread.id,
-            thread.launch_attempts,
-            thread::MAX_LAUNCH_ATTEMPTS
-        );
-    }
-    if thread.kind == Kind::Worktree && thread.worktree_path.is_empty() {
-        if branch_exists {
-            // (b)
-            bail!(
-                "{}: no worktree was recorded but its branch already exists. A half-made worktree needs a human look: run `thread resolve`, then start a new thread.",
-                thread.id
-            );
-        }
-        return Ok(RestartPlan::Create);
-    }
-    if thread.kind == Kind::Tab && thread.pane_id.is_empty() {
-        return Ok(RestartPlan::Create);
-    }
-    if live.pane_exists {
-        return Ok(RestartPlan::ReusePane);
-    }
-    Ok(RestartPlan::Reopen)
-}
-
 /// Agents and panes of the server a thread lives in: the project's session,
 /// or its machine's through `herdr --machine`.
 fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pane>)> {
@@ -1314,69 +1250,338 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
         if record.launch.kind == "pi" {
             pi_ready(ctx, &record.launch)?;
         }
-        place_ade_tab(ctx, project, &view, record)?;
-        finish_placement(project, &view, &record.id)?;
+        if record.kind == Kind::Worktree && record.worktree_path.is_empty()
+            || record.kind == Kind::Tab && record.pane_id.is_empty()
+        {
+            place_and_brief(ctx, project, &view, &record.id, true)?;
+        } else {
+            place_ade_tab(ctx, project, &view, record)?;
+            let placed = thread::load(project, &record.id)?;
+            write_brief(ctx, project, &placed)?;
+            finish_placement(project, &view, &record.id)?;
+        }
     }
     thread::update(project, &record.id, |t| t.escalation_pending = false)?;
     Ok(())
 }
 
-pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
+/// Typed recovery result shared by human and JSON rendering.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetryOutcome {
+    pub thread: String,
+    pub attempt: u32,
+    pub pane_id: String,
+    pub recipe: String,
+}
+
+/// Start the same task as a new bounded recovery attempt. Unlike the removed
+/// `restart` command this deliberately replaces a live, blocked, or stuck
+/// process, and every invocation advances the editable routing policy.
+pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
-    ticker::start(ctx)?;
-    let view = require_session(ctx, &project)?;
-    let (agents, panes) = lists_for(&view, &record)?;
-    let now = jiff::Timestamp::now();
-    let live = thread::live_state(&record, &agents, &panes, now);
-    let role = if record.role.is_empty() {
-        "lane"
-    } else {
-        record.role.as_str()
-    };
-    let skill_hash = thread::sha256_hex(crate::lane::skill_text(role).as_bytes());
-    if record.is_remote() {
-        // A box lane restarts from its brief: the same refusals, then the
-        // exact start line again (SPEC-remote §6). The new attempt gets its
-        // own workspace; the brief commit is reused, never rewritten.
-        let _ = restart_plan(&record, &live, false, now)?;
-        thread::update(&project, id, |t| {
-            t.attempt = t.attempt.max(1).saturating_add(1);
-            t.launch.attempt = t.attempt;
-            t.launch.skill_hash = skill_hash.clone();
-        })?;
-        if !record.tab_id.is_empty() {
-            close_pane(ctx, &project, &record)?;
-        }
-        return place_and_brief(ctx, &project, &view, id, true);
+    // A crash after the attempt transition but before placement resumes the
+    // same selected attempt. It must not spend another routing recovery.
+    if record.escalation_pending {
+        place_escalation(ctx, &project, &record)?;
+        let placed = thread::load(&project, id)?;
+        return Ok(RetryOutcome {
+            thread: placed.id,
+            attempt: placed.attempt,
+            pane_id: placed.pane_id,
+            recipe: placed.launch.recipe_id,
+        });
     }
-    let branch_exists = record.kind == Kind::Worktree && record.worktree_path.is_empty() && {
-        let branch = thread::branch_name(slug, id, &record.title);
-        crate::git::branch_head(ctx.runner, &record.repo, &branch)?.is_some()
-    };
+    if record.kind == Kind::Adopted {
+        bail!("retry_adopted: an adopted process has no launch recipe; use `thread rebind`");
+    }
+    if record.status == Status::Resolved {
+        bail!("retry_resolved: {id} is resolved");
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("retry_reason_missing: say why the attempt is being replaced");
+    }
+    let task =
+        std::fs::read_to_string(thread::task_path(&project, id)).context("retry_brief_missing")?;
+    // Select before stopping anything: an exhausted policy leaves the current
+    // process untouched.
+    let mut launch = crate::launch::resolve_launch(
+        ctx,
+        &project,
+        &crate::launch::ResolveInput {
+            task: &task,
+            workflow: if record.role.is_empty() {
+                "lane"
+            } else {
+                &record.role
+            },
+            previous: Some(&record.launch),
+            failure: Some(reason),
+            source_truncation: record.launch.source_truncation.as_ref(),
+        },
+    )?;
+    launch.attempt = record.attempt.max(1).saturating_add(1);
+    launch.brief_hash = record.launch.brief_hash.clone();
 
-    let plan = restart_plan(&record, &live, branch_exists, now)?;
-    thread::update(&project, id, |t| {
+    let selected_recipe = launch.recipe_id.clone();
+    thread::update_checked(&project, id, |t| {
+        if t.attempt != record.attempt || t.pane_id != record.pane_id {
+            bail!("retry_stale: thread changed while its replacement was prepared");
+        }
+        t.attempt = launch.attempt;
+        t.agent = launch.kind.clone();
+        t.launch = launch;
+        t.status = Status::Failed;
+        t.prompt_pending = false;
+        t.launch_attempts = 0;
+        t.bootstrap.clear();
+        t.error.clear();
+        t.last_failure = reason.to_string();
+        t.cleanup_pending = false;
+        t.escalation_pending = true;
+        Ok(())
+    })?;
+
+    ticker::start(ctx)?;
+    place_escalation(ctx, &project, &thread::load(&project, id)?)?;
+    let placed = thread::load(&project, id)?;
+    Ok(RetryOutcome {
+        thread: placed.id,
+        attempt: placed.attempt,
+        pane_id: placed.pane_id,
+        recipe: selected_recipe,
+    })
+}
+
+/// Resume after a server/session interruption. This is not failed-work
+/// recovery: it preserves the selected recipe and does not consume routing's
+/// provider-failure budget. `pickup --start` is its only caller.
+pub(crate) fn resume_interrupted(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
+    let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    if record.kind == Kind::Adopted || record.status == Status::Resolved {
+        bail!("resume_refused: {id} has no resumable launch");
+    }
+    thread::update_checked(&project, id, |t| {
+        if t.attempt != record.attempt {
+            bail!("resume_stale: thread changed while pickup was recovering it");
+        }
         t.attempt = t.attempt.max(1).saturating_add(1);
         t.launch.attempt = t.attempt;
-        t.launch.skill_hash = skill_hash.clone();
+        t.status = Status::Failed;
+        t.prompt_pending = false;
+        t.launch_attempts = 0;
+        t.bootstrap.clear();
+        Ok(())
     })?;
-    match plan {
-        RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
-        RestartPlan::ReusePane | RestartPlan::Reopen => {
-            // The live pane is a bare shell whose HERDR_ADE_LAUNCH names the
-            // previous attempt; the new attempt gets its own tab (D14).
-            if plan == RestartPlan::ReusePane {
-                view.herdr
-                    .tab_close(&record.tab_id)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-            place_ade_tab(ctx, &project, &view, &thread::load(&project, id)?)?;
-        }
+    ticker::start(ctx)?;
+    let view = require_session(ctx, &project)?;
+    let current = thread::load(&project, id)?;
+    if current.is_remote()
+        || current.worktree_path.is_empty() && current.kind == Kind::Worktree
+        || current.pane_id.is_empty() && current.kind == Kind::Tab
+    {
+        return place_and_brief(ctx, &project, &view, id, true);
     }
+    place_ade_tab(ctx, &project, &view, &current)?;
     let placed = thread::load(&project, id)?;
     write_brief(ctx, &project, &placed)?;
     finish_placement(&project, &view, id)
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RebindOutcome {
+    pub thread: String,
+    pub pane_id: String,
+    pub agent: String,
+    pub state: String,
+}
+
+/// Point an existing thread at the live process already doing its work.
+pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOutcome> {
+    let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    if record.status == Status::Resolved {
+        bail!("rebind_resolved: {id} is resolved");
+    }
+    let view = require_session(ctx, &project)?;
+    let herdr = view.herdr.on_machine(record.machine_route());
+    let agents = herdr
+        .agent_list()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let agent = agents
+        .iter()
+        .find(|agent| agent.pane_id == pane_id)
+        .with_context(|| format!("rebind_no_agent: no live agent is in pane {pane_id}"))?;
+    let expected_cwd = if record.worktree_path.is_empty() {
+        record.cwd.as_str()
+    } else {
+        record.worktree_path.as_str()
+    };
+    if !expected_cwd.is_empty() && agent.cwd != expected_cwd {
+        bail!(
+            "rebind_identity_mismatch: pane {pane_id} runs in {}, expected {expected_cwd}",
+            agent.cwd
+        );
+    }
+    if !record.agent_name.is_empty() && agent.name != record.agent_name {
+        bail!(
+            "rebind_identity_mismatch: pane {pane_id} has agent `{}`, expected `{}`",
+            agent.name,
+            record.agent_name
+        );
+    }
+    for other in thread::list(&project) {
+        if other.id != id && other.status != Status::Resolved && other.pane_id == pane_id {
+            bail!(
+                "rebind_pane_owned: pane {pane_id} already belongs to {}",
+                other.id
+            );
+        }
+    }
+    let process = herdr
+        .pane_process_info(pane_id)
+        .ok()
+        .and_then(|info| info.identity(&agent.agent));
+    if process.is_none() && record.identity.process.is_some() {
+        bail!("rebind_identity_unknown: process identity is unavailable for pane {pane_id}");
+    }
+    let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+    let rebound = thread::update_checked(&project, id, |t| {
+        if t.attempt != record.attempt {
+            bail!("rebind_stale: thread changed during identity verification");
+        }
+        t.workspace_id = agent.workspace_id.clone();
+        t.tab_id = agent.tab_id.clone();
+        t.pane_id = agent.pane_id.clone();
+        t.cwd = agent.cwd.clone();
+        t.agent = agent.agent.clone();
+        t.agent_name = agent.name.clone();
+        t.status = Status::Open;
+        t.prompt_pending = false;
+        t.error.clear();
+        t.cleanup_pending = false;
+        thread::bind_identity(t, &socket, agent, process.clone());
+        Ok(())
+    })?;
+    let _ = herdr.pane_set_parent(
+        pane_id,
+        &project.coordinator().map(|c| c.pane_id).unwrap_or_default(),
+    );
+    report_thread_tokens(&herdr, &rebound, slug, Group::Working);
+    Ok(RebindOutcome {
+        thread: id.to_string(),
+        pane_id: pane_id.to_string(),
+        agent: agent.agent.clone(),
+        state: agent.agent_status.clone(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CancelOutcome {
+    pub thread: String,
+    pub state: String,
+    pub reason: String,
+    pub pane: String,
+    pub worktree: String,
+    pub worktree_reason: Option<String>,
+}
+
+/// Stop a thread and retry any cleanup which an earlier cancellation could
+/// not complete. The resolved record is written before external cleanup, so
+/// no ticker can relaunch it while its session is unreachable.
+pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOutcome> {
+    let project = Project::load(&ctx.root, slug)?;
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("cancel_reason_missing: say why {id} is being stopped");
+    }
+    let before = thread::load(&project, id)?;
+    let recorded_reason = if before.cancellation_reason.is_empty() {
+        reason.to_string()
+    } else {
+        before.cancellation_reason.clone()
+    };
+    let record = thread::update(&project, id, |t| {
+        t.status = Status::Resolved;
+        t.resolved_reason = "cancelled".into();
+        t.cancellation_reason = recorded_reason.clone();
+        t.prompt_pending = false;
+        t.cleanup_pending = !t.tab_id.is_empty();
+    })?;
+    if let Some(view) = session_view(ctx, &project) {
+        clear_thread_tokens(&view.herdr, &record);
+    }
+
+    let (pane, close_error) = if record.tab_id.is_empty() {
+        ("already_gone".to_string(), None)
+    } else {
+        match close_pane(ctx, &project, &record) {
+            Ok(true) => ("closed".to_string(), None),
+            Ok(false) => ("already_gone".to_string(), None),
+            Err(error) => ("cleanup_pending".to_string(), Some(format!("{error:#}"))),
+        }
+    };
+    if close_error.is_none() {
+        thread::update(&project, id, |t| t.cleanup_pending = false)?;
+    }
+
+    let mut worktree = "not_applicable".to_string();
+    let mut worktree_reason = close_error;
+    if record.kind == Kind::Worktree && !record.worktree_path.is_empty() {
+        if pane == "cleanup_pending" {
+            worktree = "kept".into();
+        } else if let Some(dirty) = dirty_worktree_reason(ctx, &project, &record)? {
+            worktree = "kept".into();
+            worktree_reason = Some(dirty);
+        } else {
+            match remove_worktree(ctx, &project, &record) {
+                Ok(()) => {
+                    thread::update(&project, id, |t| t.worktree_path.clear())?;
+                    worktree = "removed".into();
+                }
+                Err(error) => {
+                    worktree = "kept".into();
+                    worktree_reason = Some(format!("{error:#}"));
+                }
+            }
+        }
+    }
+    if pane != "cleanup_pending" {
+        remove_scratch_session(ctx, &record)?;
+    }
+    refresh_plan(ctx, &project);
+    Ok(CancelOutcome {
+        thread: id.to_string(),
+        state: if pane == "cleanup_pending" {
+            "cleanup_pending"
+        } else {
+            "cancelled"
+        }
+        .into(),
+        reason: recorded_reason,
+        pane,
+        worktree,
+        worktree_reason,
+    })
+}
+
+/// Retry cleanup which a prior cancellation durably left pending. The ticker
+/// calls this only after it has reached the project session again.
+pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> {
+    for record in thread::list(project)
+        .into_iter()
+        .filter(|record| record.cleanup_pending)
+    {
+        let reason = if record.cancellation_reason.is_empty() {
+            "cancelled work"
+        } else {
+            &record.cancellation_reason
+        };
+        cancel(ctx, &project.slug, &record.id, reason)?;
+    }
+    Ok(())
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
@@ -1413,7 +1618,7 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
     let agent = agents
         .iter()
         .find(|a| thread::agent_matches(record, a))
-        .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread restart`)", record.id))?;
+        .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread retry`)", record.id))?;
     match agent.agent_status.as_str() {
         "blocked" if record.agent != "pi" || record.error.is_empty() => bail!(
             "agent_blocked: {} is waiting on the user in its pane ({})",
@@ -1464,7 +1669,7 @@ impl ResolveOutcome {
     pub fn message(&self, slug: &str) -> String {
         if self.state == "open" {
             return format!(
-                "{} is open again. Nothing was started; `thread restart {slug} {}` brings its agent back.\n",
+                "{} is open again. Nothing was started; `thread retry {slug} {} --reason <why>` brings its agent back.\n",
                 self.thread, self.thread
             );
         }
@@ -1729,7 +1934,11 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         return Ok(false);
     }
     let Some(view) = session_view(ctx, project) else {
-        return Ok(false);
+        bail!(
+            "cleanup_session_unreachable: the pane for {} was not closed; retry recovery when `{}` is reachable",
+            record.id,
+            project.slug
+        );
     };
     let herdr = view.herdr.on_machine(record.machine_route());
     let panes = herdr
@@ -1753,7 +1962,10 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
             .coordinator()
             .is_some_and(|coordinator| coordinator.workspace_id == record.workspace_id);
     let owns_workspace = record.kind != Kind::Adopted && !is_project_workspace;
-    let result = if owns_workspace && owns_pane && !holds_something_else {
+    if !owns_pane {
+        return Ok(false);
+    }
+    let result = if owns_workspace && !holds_something_else {
         herdr.workspace_close(&record.workspace_id)
     } else {
         herdr.tab_close(&record.tab_id)
@@ -2174,10 +2386,6 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn now() -> jiff::Timestamp {
-        "2026-09-17T12:00:00Z".parse().unwrap()
-    }
-
     fn worktree_thread() -> Thread {
         Thread {
             id: "t-0001".into(),
@@ -2187,22 +2395,6 @@ mod tests {
             worktree_path: "/wt".into(),
             pane_id: "w2:p1".into(),
             ..Thread::default()
-        }
-    }
-
-    fn gone() -> Live {
-        Live {
-            pane_exists: false,
-            agent_state: None,
-            state_secs: 0,
-        }
-    }
-
-    fn shell() -> Live {
-        Live {
-            pane_exists: true,
-            agent_state: None,
-            state_secs: 0,
         }
     }
 
@@ -2225,113 +2417,6 @@ mod tests {
         assert_eq!(
             outcome.message("demo"),
             "t-0001 resolved.\nIts pane and tab were closed.\nThe worktree /wt was kept: work_not_done.\n"
-        );
-    }
-
-    #[test]
-    fn restart_case_a_nothing_created() {
-        let t = Thread {
-            status: Status::Failed,
-            worktree_path: String::new(),
-            ..worktree_thread()
-        };
-        assert_eq!(
-            restart_plan(&t, &gone(), false, now()).unwrap(),
-            RestartPlan::Create
-        );
-    }
-
-    #[test]
-    fn restart_case_b_branch_without_worktree_needs_a_human() {
-        let t = Thread {
-            status: Status::Failed,
-            worktree_path: String::new(),
-            ..worktree_thread()
-        };
-        let error = restart_plan(&t, &gone(), true, now())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("thread resolve"), "{error}");
-    }
-
-    #[test]
-    fn restart_case_c_reuses_a_pane_at_a_shell_prompt() {
-        assert_eq!(
-            restart_plan(&worktree_thread(), &shell(), false, now()).unwrap(),
-            RestartPlan::ReusePane
-        );
-    }
-
-    #[test]
-    fn restart_case_d_refuses_a_running_thread() {
-        let running = Live {
-            pane_exists: true,
-            agent_state: Some("working".into()),
-            state_secs: 0,
-        };
-        assert!(restart_plan(&worktree_thread(), &running, false, now()).is_err());
-    }
-
-    #[test]
-    fn restart_case_e_reopens_the_worktree() {
-        assert_eq!(
-            restart_plan(&worktree_thread(), &gone(), false, now()).unwrap(),
-            RestartPlan::Reopen
-        );
-        let tab = Thread {
-            kind: Kind::Tab,
-            worktree_path: String::new(),
-            ..worktree_thread()
-        };
-        assert_eq!(
-            restart_plan(&tab, &gone(), false, now()).unwrap(),
-            RestartPlan::Reopen
-        );
-    }
-
-    #[test]
-    fn restart_refuses_a_launch_in_progress_adopted_resolved_and_young_starting() {
-        let launching = Thread {
-            prompt_pending: true,
-            launch_attempts: 1,
-            ..worktree_thread()
-        };
-        assert!(restart_plan(&launching, &shell(), false, now()).is_err());
-        let exhausted = Thread {
-            prompt_pending: true,
-            launch_attempts: 3,
-            ..worktree_thread()
-        };
-        assert_eq!(
-            restart_plan(&exhausted, &shell(), false, now()).unwrap(),
-            RestartPlan::ReusePane
-        );
-
-        let adopted = Thread {
-            kind: Kind::Adopted,
-            ..worktree_thread()
-        };
-        assert!(restart_plan(&adopted, &gone(), false, now()).is_err());
-        let resolved = Thread {
-            status: Status::Resolved,
-            ..worktree_thread()
-        };
-        assert!(restart_plan(&resolved, &gone(), false, now()).is_err());
-
-        let young = Thread {
-            status: Status::Starting,
-            created: "2026-09-17T11:59:00Z".into(),
-            worktree_path: String::new(),
-            ..worktree_thread()
-        };
-        assert!(restart_plan(&young, &gone(), false, now()).is_err());
-        let stale = Thread {
-            created: "2026-09-17T11:00:00Z".into(),
-            ..young
-        };
-        assert_eq!(
-            restart_plan(&stale, &gone(), false, now()).unwrap(),
-            RestartPlan::Create
         );
     }
 
@@ -2630,17 +2715,18 @@ mod tests {
         *world.agents.borrow_mut() = "[]".into();
 
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
-        let restarted = restart(&ctx, "demo", &started.id).unwrap();
-        assert_eq!(restarted.attempt, 2);
-        assert_eq!(restarted.launch.kind, kind);
-        assert_eq!(restarted.launch.attempt, 2);
+        retry(&ctx, "demo", &started.id, "the first process disappeared").unwrap();
+        let retried = thread::load(&project, &started.id).unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.launch.kind, kind);
+        assert_eq!(retried.launch.attempt, 2);
         let calls = world.runner.calls.borrow();
         assert!(!calls.iter().any(|c| c.display().contains("worktree open")));
         let tabs = calls
             .iter()
             .filter(|c| c.display().contains("tab create"))
             .count();
-        assert!(tabs >= 2, "restart should open a tab, not a workspace");
+        assert!(tabs >= 2, "retry should open a tab, not a workspace");
     }
 
     #[test]

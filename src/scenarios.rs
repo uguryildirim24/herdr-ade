@@ -373,7 +373,66 @@ fn the_ticker_copies_a_changed_report_home_once() {
 }
 
 #[test]
-fn restart_defers_to_the_ticker_and_resets_launch_attempts() {
+fn rebind_moves_an_existing_thread_to_its_verified_live_agent() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    world.thread(&project, world.home.path(), |t| t.status = Status::Failed);
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w3", "w3:t1", "w3:p1", &cwd)
+    );
+    *world.agents.borrow_mut() = format!(
+        "[{}]",
+        agent_json("w3", "w3:t1", "w3:p1", &cwd, "hp-demo-t-0001", "idle")
+    );
+
+    let outcome = threads::rebind(&world.ctx(), "demo", "t-0001", "w3:p1").unwrap();
+    assert_eq!(outcome.pane_id, "w3:p1");
+    let record = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(record.status, Status::Open);
+    assert_eq!(record.workspace_id, "w3");
+    assert_eq!(record.tab_id, "w3:t1");
+    assert_eq!(record.identity.pane_id, "w3:p1");
+}
+
+#[test]
+fn cancel_reports_pending_cleanup_when_the_session_is_unreachable() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |t| {
+        t.kind = crate::thread::Kind::Tab;
+        t.status = Status::Open;
+        t.workspace_id = "w1".into();
+        t.tab_id = "w1:t2".into();
+        t.pane_id = "w1:p2".into();
+        t.worktree_path.clear();
+    });
+    std::fs::remove_file(world.home.path().join("a.sock")).unwrap();
+
+    let outcome = threads::cancel(&world.ctx(), "demo", "t-0001", "no longer needed").unwrap();
+    assert_eq!(outcome.state, "cleanup_pending");
+    assert_eq!(outcome.pane, "cleanup_pending");
+    assert!(outcome.worktree_reason.unwrap().contains("not closed"));
+    let record = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(record.status, Status::Resolved);
+    assert!(record.cleanup_pending);
+    assert_eq!(world.runner.count("tab close"), 0);
+
+    std::fs::write(world.home.path().join("a.sock"), "").unwrap();
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w1", "w1:t2", "w1:p2", &world.home.path().to_string_lossy())
+    );
+    threads::retry_pending_cleanup(&world.ctx(), &project).unwrap();
+    assert!(!thread::load(&project, "t-0001").unwrap().cleanup_pending);
+    assert_eq!(world.runner.count("tab close w1:t2"), 1);
+}
+
+#[test]
+fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().to_string_lossy().into_owned();
@@ -402,19 +461,38 @@ fn restart_defers_to_the_ticker_and_resets_launch_attempts() {
         )),
     );
 
-    let t = threads::restart(&world.ctx(), "demo", "t-0001").unwrap();
+    threads::retry(
+        &world.ctx(),
+        "demo",
+        "t-0001",
+        "the previous agent stopped responding",
+    )
+    .unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
     assert_eq!(
         (t.status, t.prompt_pending, t.launch_attempts),
         (Status::Open, true, 0)
     );
     assert!(t.error.is_empty());
-    assert_eq!(world.runner.count("agent start"), 0);
+    assert_eq!(
+        world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| {
+                let line = call.display();
+                line.contains("agent start") && !line.contains("--help")
+            })
+            .count(),
+        0
+    );
     assert_eq!(world.runner.count("agent prompt"), 0);
     // A1 M5: the bare shell's HERDR_ADE_LAUNCH names attempt 1, so attempt 2
     // gets a new tab carrying its own launch line.
     assert_eq!(t.attempt, 2);
     assert_eq!(t.pane_id, "w1:p3");
-    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+    assert_eq!(world.runner.count("workspace close w2"), 1);
     let calls = world.runner.calls.borrow();
     assert!(calls.iter().any(|c| {
         let line = c.display();
@@ -1005,7 +1083,7 @@ fn a_restarted_session_gives_one_session_item_not_one_per_thread() {
     assert!(
         items_of(&project, "session")[0]
             .summary
-            .contains("1 threads need `thread restart`")
+            .contains("1 threads need `thread retry`")
     );
 }
 

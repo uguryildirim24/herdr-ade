@@ -986,44 +986,88 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
     Ok(record)
 }
 
-pub fn abandon(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<RoundRecord> {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CancelOutcome {
+    pub round: String,
+    pub phase: RoundPhase,
+    pub reason: String,
+    pub threads: Vec<crate::threads::CancelOutcome>,
+    pub review_worktrees: Vec<String>,
+}
+
+/// Stop every process owned by an open round. The round is closed before
+/// external cleanup, making retries safe and ensuring an unreachable pane is
+/// recorded as pending rather than silently leaked.
+pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<CancelOutcome> {
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(crate::refusal::error(format!(
-            "round_abandon_reason_missing: say why `{round}` cannot proceed"
+            "round_cancel_reason_missing: say why `{round}` cannot proceed"
         )));
     }
     let project = Project::load(&ctx.root, slug)?;
+    let _advance = advance_lock(&project)?;
     let _operation = operation_lock(&project, round)?;
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
-        if record.phase.closed() {
+        if record.phase == RoundPhase::Merged {
             return Err(crate::refusal::error(format!(
-                "round_closed: `{round}` is {:?}; its ending cannot be changed",
-                record.phase
+                "round_closed: `{round}` is merged; its ending cannot be changed"
             )));
         }
         if record.merge.is_some() {
             return Err(crate::refusal::error(format!(
-                "round_abandon_refused: `{round}` has begun its merge transaction; finish or repair that transaction"
+                "round_cancel_refused: `{round}` has begun its merge transaction; finish or repair that transaction"
             )));
         }
+        // Preserve the first reason so repeated cleanup is idempotent.
+        let reason = record
+            .abandoned_reason
+            .clone()
+            .unwrap_or_else(|| reason.to_string());
         record.phase = RoundPhase::Abandoned;
         record.review_intent = None;
         record.verdict = None;
-        record.abandoned_reason = Some(reason.to_string());
+        record.abandoned_reason = Some(reason);
         save(&project, &record)?;
         record
     };
+
+    let mut ids: Vec<String> = record
+        .manifest
+        .members
+        .iter()
+        .map(|member| member.thread.clone())
+        .collect();
+    if let Some(reviewer) = &record.reviewer
+        && !ids.contains(reviewer)
+    {
+        ids.push(reviewer.clone());
+    }
+    let mut outcomes = Vec::new();
+    for id in ids {
+        outcomes.push(crate::threads::cancel(
+            ctx,
+            slug,
+            &id,
+            record.abandoned_reason.as_deref().unwrap_or(reason),
+        )?);
+    }
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
     let _ = crate::board::refresh(ctx, &project);
-    for line in cleanup_review_worktrees(ctx, &record) {
-        println!("{line}");
-    }
-    Ok(record)
+    let review_worktrees = cleanup_review_worktrees(ctx, &record);
+    Ok(CancelOutcome {
+        round: round.to_string(),
+        phase: record.phase,
+        reason: record
+            .abandoned_reason
+            .unwrap_or_else(|| reason.to_string()),
+        threads: outcomes,
+        review_worktrees,
+    })
 }
 
 /// Remove every review checkout for a closed round while retaining its review
@@ -1109,8 +1153,8 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
 }
 
 /// Records which thread reviews the round; its sealed `done` sha is `V`.
-/// `advance` and `round reviewer` call this after starting the reviewer, so it
-/// stays the one place a reviewer binding is written.
+/// `advance` and the recovery commands call this after identifying the
+/// reviewer, so it stays the one place a reviewer binding is written.
 pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
@@ -1153,49 +1197,192 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
     Ok(record)
 }
 
-/// The one way to start a reviewer by hand: `round reviewer <slug> <round>`.
-/// It runs the same `round review` and `start_reviewer` path as
-/// `round advance`, so the new thread always bootstraps with the reviewer
-/// skill and reviewer routing workflow. A live bound reviewer is left alone.
-pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thread::Thread> {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecoveryOutcome {
+    pub round: String,
+    pub action: String,
+    pub thread: String,
+    pub phase: RoundPhase,
+}
+
+/// Retry this round's reviewer without allocating a second reviewer record.
+/// If no reviewer was ever bound, this atomically starts and binds one through
+/// the same locked path used by `advance`.
+pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<RecoveryOutcome> {
+    if reason.trim().is_empty() {
+        bail!("retry_reason_missing: say why `{round}` is being retried");
+    }
     let project = Project::load(&ctx.root, slug)?;
-    let _scope = crate::ledger::Scope::new(&[&project]);
-    // Serialize with the hook and ticker's automatic `advance`, or both paths
-    // can observe no bound reviewer and start one each.
     let _advance = advance_lock(&project)?;
-    let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
-    // The pins are the input: refresh them before deciding, as `advance` does.
+    let record = load(&project, round)?;
+    require_mutable(&record)?;
+    if let Some(reviewer) = record.reviewer.as_deref() {
+        let retried = crate::threads::retry(ctx, slug, reviewer, reason)?;
+        return Ok(RecoveryOutcome {
+            round: round.to_string(),
+            action: "retried".into(),
+            thread: retried.thread,
+            phase: load(&project, round)?.phase,
+        });
+    }
     let events = sealed_events(&project)?;
     {
         let _lock = project.lock()?;
-        let mut record = load(&project, round)?;
-        if refresh_pins(&project, &mut record, &events)? {
-            save(&project, &record)?;
+        let mut current = load(&project, round)?;
+        if refresh_pins(&project, &mut current, &events)? {
+            save(&project, &current)?;
         }
     }
-    let record = load(&project, round)?;
-    if let Some(reviewer) = record.reviewer.as_deref()
-        && !reviewer_gone(ctx, &project, reviewer)
+    let current = load(&project, round)?;
+    if current.manifest.members.is_empty()
+        || current
+            .manifest
+            .members
+            .iter()
+            .any(|member| member.pin.is_none())
     {
-        bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
-    }
-    let ready = !record.manifest.members.is_empty()
-        && record.manifest.members.iter().all(|m| m.pin.is_some());
-    if !ready {
         bail!(
-            "round_not_complete: every lane of `{round}` must be pinned before its reviewer starts"
+            "round_not_complete: every lane of `{round}` must be pinned before retrying its reviewer"
         );
     }
-    if members_all_landed(ctx, &record)? {
+    let branch = reviewer_branch(ctx, slug, round, &current)?;
+    let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+    let reviewer = start_and_bind_reviewer(ctx, &project, slug, round, &branch, &prefix)?
+        .context("reviewer_start_pending: the bounded start failed and remains recorded")?;
+    Ok(RecoveryOutcome {
+        round: round.to_string(),
+        action: "started".into(),
+        thread: reviewer,
+        phase: load(&project, round)?.phase,
+    })
+}
+
+/// Bind an already recorded, live reviewer thread to this round after checking
+/// its role and exact review base.
+pub fn rebind(ctx: &Ctx, slug: &str, round: &str, reviewer: &str) -> Result<RecoveryOutcome> {
+    let project = Project::load(&ctx.root, slug)?;
+    let _advance = advance_lock(&project)?;
+    let record = load(&project, round)?;
+    require_mutable(&record)?;
+    let candidate = thread::load(&project, reviewer)?;
+    if candidate.role != "reviewer" {
         bail!(
-            "nothing_to_review: every pin of `{round}` already landed on `{}`",
-            record.branch
+            "reviewer_role_mismatch: `{reviewer}` is `{}`, not reviewer",
+            candidate.role
         );
     }
-    let review_branch = reviewer_branch(ctx, slug, round, &record)?;
-    let thread = start_reviewer(ctx, &project, round, &review_branch, &prefix)?;
-    bind_reviewer(ctx, slug, round, &thread.id)?;
-    Ok(thread)
+    let expected = record.review_branch.as_deref().context("review_missing")?;
+    if candidate.base != expected {
+        bail!(
+            "reviewer_branch_mismatch: `{reviewer}` started from `{}`, expected `{expected}`",
+            candidate.base
+        );
+    }
+    if !matches!(
+        reviewer_state(ctx, &project, reviewer),
+        ReviewerState::Alive
+    ) {
+        bail!("reviewer_not_live: `{reviewer}` has no verified live attempt to bind");
+    }
+    let bound = bind_reviewer(ctx, slug, round, reviewer)?;
+    Ok(RecoveryOutcome {
+        round: round.to_string(),
+        action: "rebound".into(),
+        thread: reviewer.to_string(),
+        phase: bound.phase,
+    })
+}
+
+/// Adopt a lane's sealed commit into the manifest, or a reviewer's sealed
+/// verdict into the current review. Both paths validate immutable evidence
+/// before changing the round, so a later `advance` never starts a duplicate.
+pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOutcome> {
+    let project = Project::load(&ctx.root, slug)?;
+    let _advance = advance_lock(&project)?;
+    let _operation = operation_lock(&project, round)?;
+    let record = load(&project, round)?;
+    require_mutable(&record)?;
+    let candidate = thread::load(&project, id)?;
+    let events = sealed_events(&project)?;
+    let attempt = candidate.attempt.max(1);
+    let pin = done_pin(&events, round, id, attempt).with_context(|| {
+        format!("adopt_completion_missing: `{id}` has no sealed done event for attempt {attempt}")
+    })?;
+
+    if candidate.role == "reviewer" {
+        let expected = record.review_branch.as_deref().context("review_missing")?;
+        if candidate.base != expected {
+            bail!(
+                "reviewer_branch_mismatch: `{id}` started from `{}`, expected `{expected}`",
+                candidate.base
+            );
+        }
+        let git = Git::new(ctx.runner, &record.repo);
+        validate_verdict_inner(&git, &record, &pin.sha, false)?;
+        if let Some(bound) = record.reviewer.as_deref()
+            && bound != id
+            && !reviewer_gone(ctx, &project, bound)
+        {
+            bail!("reviewer_already_bound: `{bound}` already reviews `{round}`");
+        }
+        let mut current = load(&project, round)?;
+        if current.verdict.as_ref() == Some(&pin) && current.reviewer.as_deref() == Some(id) {
+            return Ok(RecoveryOutcome {
+                round: round.to_string(),
+                action: "already_adopted".into(),
+                thread: id.to_string(),
+                phase: current.phase,
+            });
+        }
+        current.reviewer = Some(id.to_string());
+        current.verdict = Some(pin);
+        current.phase = RoundPhase::VerdictIn;
+        current.announced = None;
+        current.attention.clear();
+        save(&project, &current)?;
+        return Ok(RecoveryOutcome {
+            round: round.to_string(),
+            action: "adopted_verdict".into(),
+            thread: id.to_string(),
+            phase: current.phase,
+        });
+    }
+
+    let git = Git::new(ctx.runner, &record.repo);
+    if landed(&git, &record.branch, &pin.sha)? {
+        return Err(already_landed_error(&candidate, &pin.sha, &record.branch));
+    }
+    let mut current = load(&project, round)?;
+    if let Some(member) = current
+        .manifest
+        .members
+        .iter_mut()
+        .find(|member| member.thread == id)
+    {
+        if member.pin.as_ref() == Some(&pin) {
+            return Ok(RecoveryOutcome {
+                round: round.to_string(),
+                action: "already_adopted".into(),
+                thread: id.to_string(),
+                phase: current.phase,
+            });
+        }
+        member.pin = Some(pin);
+    } else {
+        current.manifest.members.push(ManifestMember {
+            thread: id.to_string(),
+            pin: Some(pin),
+        });
+    }
+    current.manifest.revision += 1;
+    return_to_admitting(&mut current);
+    save(&project, &current)?;
+    Ok(RecoveryOutcome {
+        round: round.to_string(),
+        action: "adopted_lane".into(),
+        thread: id.to_string(),
+        phase: current.phase,
+    })
 }
 
 // ------------------------------------------------------------------ advance
@@ -1291,7 +1478,20 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                         &round,
                         &format!("reviewer-gone:{reviewer}"),
                         &format!(
-                            "Round {round}: the reviewer thread {reviewer} is gone; restore its recorded review workflow with `{prefix} thread restart {slug} {reviewer}` (reopen it first if resolved)"
+                            "Round {round}: the reviewer thread {reviewer} is gone; replace its attempt with `{prefix} round retry {slug} {round} --reason <why>`"
+                        ),
+                        None,
+                    )?;
+                    continue;
+                }
+                ReviewerState::Unknown(reason) => {
+                    announce_once(
+                        ctx,
+                        &project,
+                        &round,
+                        &format!("reviewer-unknown:{reviewer}"),
+                        &format!(
+                            "Round {round}: the reviewer state is unknown ({reason}); no replacement was started"
                         ),
                         None,
                     )?;
@@ -1301,7 +1501,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             }
         }
         // No reviewer is bound. This is the one path that starts a review;
-        // `round review` and `round reviewer` are manual repair only. A round
+        // `round review` and the recovery verbs are manual repair only. A round
         // whose members are all pinned and that has no current review branch
         // runs `round review` first; a frozen round whose current review
         // revision already has its branch starts the reviewer here, exactly
@@ -1505,12 +1705,49 @@ fn start_and_bind_reviewer(
     prefix: &str,
 ) -> Result<Option<String>> {
     crate::ledger::retry_after_failure(project, "reviewer-start-failed", round);
+    // A crash can happen after the reviewer thread record is placed but before
+    // the round record is written. Recover that exact current-branch thread;
+    // never allocate a duplicate reviewer for the same immutable review.
+    let unbound: Vec<thread::Thread> = thread::list(project)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.role == "reviewer"
+                && candidate.base == review_branch
+                && matches!(
+                    candidate.status,
+                    thread::Status::Starting | thread::Status::Open
+                )
+        })
+        .collect();
+    if unbound.len() > 1 {
+        bail!(
+            "reviewer_ambiguous: {} unbound reviewers exist for `{review_branch}`",
+            unbound.len()
+        );
+    }
+    if let Some(candidate) = unbound.first() {
+        bind_reviewer(ctx, slug, round, &candidate.id)?;
+        crate::ledger::recovered(project, "reviewer-start-failed", round);
+        return Ok(Some(candidate.id.clone()));
+    }
     match start_reviewer(ctx, project, round, review_branch, prefix) {
-        Ok(thread) => {
-            crate::ledger::recovered(project, "reviewer-start-failed", round);
-            bind_reviewer(ctx, slug, round, &thread.id)?;
-            Ok(Some(thread.id))
-        }
+        Ok(thread) => match bind_reviewer(ctx, slug, round, &thread.id) {
+            Ok(_) => {
+                crate::ledger::recovered(project, "reviewer-start-failed", round);
+                Ok(Some(thread.id))
+            }
+            Err(error) => {
+                // Starting and binding is one recovery effect: never return
+                // with an unbound reviewer left alive beside a later retry.
+                let reason = format!("reviewer binding failed: {error:#}");
+                let cleanup = crate::threads::cancel(ctx, slug, &thread.id, &reason)?;
+                if cleanup.state == "cleanup_pending" {
+                    return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
+                }
+                reviewer_start_failed(ctx, project, round, &reason, None)?;
+                Ok(None)
+            }
+        },
         Err(error) => {
             reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
             Ok(None)
@@ -1689,6 +1926,9 @@ fn verdict_say(record: &RoundRecord) -> String {
 enum ReviewerState {
     Alive,
     Gone,
+    /// Evidence needed to distinguish a dead process from a missing record or
+    /// connection is absent. Unknown never authorizes a replacement.
+    Unknown(String),
     /// The record is there but no agent ever launched for it, or its last
     /// launch failed. The reason is said on standard error.
     Unstarted(String),
@@ -1697,12 +1937,15 @@ enum ReviewerState {
 fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState {
     let rows = crate::threads::rows(ctx, project);
     let Some(row) = rows.iter().find(|row| row.thread.id == reviewer) else {
-        return ReviewerState::Gone;
+        return ReviewerState::Unknown(format!("thread record `{reviewer}` is missing"));
     };
     if row.group == thread::Group::Resolved
         || (!row.thread.prompt_pending && row.note == "pane closed")
     {
         return ReviewerState::Gone;
+    }
+    if row.note == "session unreachable" || row.note.starts_with("not polled yet,") {
+        return ReviewerState::Unknown(row.note.clone());
     }
     let record = &row.thread;
     if record.status == thread::Status::Failed {
@@ -1778,7 +2021,7 @@ fn reviewer_start_failed(
 /// The retry bound was reached: say so once and leave the round for a human.
 fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &str) -> Result<()> {
     eprintln!(
-        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer {} {round}` or end the round with `round abandon {} {round} --reason <why>`",
+        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); use `round retry {} {round} --reason <why>` or `round cancel {} {round} --reason <why>`",
         project.slug, project.slug
     );
     announce_once(
@@ -1787,7 +2030,7 @@ fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &
         round,
         "reviewer-start-exhausted",
         &format!(
-            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer {} {round}`, use `thread restart`, or end it with `round abandon {} {round} --reason <why>`",
+            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); use `round retry {} {round} --reason <why>` or `round cancel {} {round} --reason <why>`",
             project.slug, project.slug
         ),
         None,
@@ -1797,7 +2040,10 @@ fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &
 /// True when the bound reviewer blocks nothing: its record is missing, it is
 /// resolved, its pane closed after it launched, or its start never took.
 fn reviewer_gone(ctx: &Ctx, project: &Project, reviewer: &str) -> bool {
-    !matches!(reviewer_state(ctx, project, reviewer), ReviewerState::Alive)
+    matches!(
+        reviewer_state(ctx, project, reviewer),
+        ReviewerState::Gone | ReviewerState::Unstarted(_)
+    )
 }
 
 /// Records the current action and emits at most one `say` line for a merge
@@ -2120,6 +2366,27 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         current.reviewer_start_failures = 0;
         save(&project, &current)?;
     }
+    // The new repair review supersedes the previous reviewer. It is no longer
+    // bound above, so cancellation can close its pane and remove its clean
+    // worktree instead of leaving an idle process and checkout behind.
+    if repair && let Some(previous) = record.reviewer.as_deref() {
+        let outcome = crate::threads::cancel(
+            ctx,
+            slug,
+            previous,
+            &format!("superseded by repair review {review_branch}"),
+        )?;
+        if outcome.state == "cleanup_pending" {
+            eprintln!(
+                "reviewer cleanup pending for {}: {}",
+                previous,
+                outcome
+                    .worktree_reason
+                    .as_deref()
+                    .unwrap_or("session unreachable")
+            );
+        }
+    }
     let _ = crate::board::refresh(ctx, &project);
     Ok(ReviewOutcome {
         brief_commit: b,
@@ -2306,7 +2573,7 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
     }
     let reviewer = record.reviewer.as_deref().with_context(|| {
         format!(
-            "reviewer_unbound: no reviewer thread is recorded; run `round reviewer {} {}`",
+            "reviewer_unbound: no reviewer thread is recorded; run `round retry {} {} --reason <why>`",
             project.slug, record.round
         )
     })?;
@@ -3756,28 +4023,46 @@ mod tests {
     }
 
     #[test]
-    fn abandon_records_a_reason() {
+    fn adopt_pins_existing_lane_work_once() {
+        let fx = fixture();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+
+        let first = adopt(&fx.world.ctx(), "demo", "r1", &id).unwrap();
+        assert_eq!(first.action, "adopted_lane");
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.manifest.members.len(), 1);
+        assert_eq!(record.manifest.members[0].pin.as_ref().unwrap().sha, sha);
+        let revision = record.manifest.revision;
+
+        let second = adopt(&fx.world.ctx(), "demo", "r1", &id).unwrap();
+        assert_eq!(second.action, "already_adopted");
+        assert_eq!(load(&fx.project, "r1").unwrap().manifest.revision, revision);
+    }
+
+    #[test]
+    fn cancel_records_a_reason_and_is_idempotent() {
         let fx = fixture();
         reviewed(&fx);
         assert!(
-            err(abandon(&fx.world.ctx(), "demo", "r1", " \n "))
-                .starts_with("round_abandon_reason_missing")
+            err(cancel(&fx.world.ctx(), "demo", "r1", " \n "))
+                .starts_with("round_cancel_reason_missing")
         );
-        let record = abandon(
+        let outcome = cancel(
             &fx.world.ctx(),
             "demo",
             "r1",
             "the reviewer could not be dispatched",
         )
         .unwrap();
-        assert_eq!(record.phase, RoundPhase::Abandoned);
-        assert!(
-            err(abandon(&fx.world.ctx(), "demo", "r1", "replace the reason"))
-                .starts_with("round_closed")
-        );
+        assert_eq!(outcome.phase, RoundPhase::Abandoned);
+        let repeated = cancel(&fx.world.ctx(), "demo", "r1", "replace the reason").unwrap();
+        assert_eq!(repeated.reason, outcome.reason);
+        let record = load(&fx.project, "r1").unwrap();
         assert_eq!(
-            load(&fx.project, "r1").unwrap().abandoned_reason,
-            record.abandoned_reason
+            record.abandoned_reason.as_deref(),
+            Some(outcome.reason.as_str())
         );
         assert_eq!(
             record.abandoned_reason.as_deref(),
@@ -3851,13 +4136,13 @@ mod tests {
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(record.phase, RoundPhase::Merging);
         assert!(
-            err(abandon(
+            err(cancel(
                 &fx.world.ctx(),
                 "demo",
                 "r1",
                 "cancel the pending merge"
             ))
-            .starts_with("round_abandon_refused")
+            .starts_with("round_cancel_refused")
         );
         let after = load(&fx.project, "r1").unwrap();
         assert_eq!(after.phase, RoundPhase::Merging);
@@ -4964,8 +5249,8 @@ mod tests {
         assert!(crate::inbox::unhandled(&fx.project).is_empty());
         assert_eq!(
             fx.world.runner.count("tab close w1:t2"),
-            1,
-            "the failed reviewer's tab is closed before a retry"
+            0,
+            "a tab already absent from the live session needs no close call"
         );
         let second = retried.reviewer.clone().expect("a fresh reviewer is bound");
         assert_ne!(second, first, "the same pass replaces the dead reviewer");
@@ -5248,10 +5533,8 @@ mod tests {
         );
     }
 
-    /// The one way to start a reviewer by hand boots a reviewer, not a lane,
-    /// and leaves a live bound reviewer alone.
     #[test]
-    fn round_reviewer_starts_a_reviewer_by_hand() {
+    fn round_retry_starts_and_binds_one_reviewer() {
         let fx = fixture();
         reviewer_ready(&fx);
         let ctx = fx.world.ctx();
@@ -5260,7 +5543,8 @@ mod tests {
         admit(&ctx, "demo", "r1", &id).unwrap();
         fx.seal_done(&id, 1, 1, &sha, "# report\n");
 
-        let started = start_reviewer_by_hand(&ctx, "demo", "r1").unwrap();
+        let outcome = retry(&ctx, "demo", "r1", "the reviewer did not start").unwrap();
+        let started = thread::load(&fx.project, &outcome.thread).unwrap();
         assert_eq!(started.role, "reviewer");
         assert!(!started.base.is_empty(), "the reviewer has a base commit");
         assert_eq!(
@@ -5270,9 +5554,14 @@ mod tests {
         let task = std::fs::read_to_string(thread::task_path(&fx.project, &started.id)).unwrap();
         assert!(task.contains("skill reviewer"), "{task}");
         assert!(task.contains("tasks/review-r1.md"), "{task}");
-
-        let error = err(start_reviewer_by_hand(&ctx, "demo", "r1"));
-        assert!(error.starts_with("reviewer_already_bound"), "{error}");
+        advance(&ctx, "demo").unwrap();
+        assert_eq!(
+            thread::list(&fx.project)
+                .into_iter()
+                .filter(|thread| thread.role == "reviewer")
+                .count(),
+            1
+        );
     }
 
     /// A lane stays held through the merge intent and checkpoint, with no override.
