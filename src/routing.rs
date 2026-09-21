@@ -86,6 +86,25 @@ impl Routing {
         Ok(())
     }
 
+    pub fn retry_limit(&self, work: &WorkContract) -> u32 {
+        self.rules
+            .iter()
+            .find(|rule| {
+                rule.workflow
+                    .as_ref()
+                    .is_none_or(|value| value == &work.workflow)
+                    && rule
+                        .product
+                        .as_ref()
+                        .is_none_or(|value| value == &work.product)
+                    && rule
+                        .requires_claude
+                        .is_none_or(|value| value == work.requires_claude)
+            })
+            .and_then(|rule| rule.retries)
+            .unwrap_or(self.retries)
+    }
+
     pub fn select(
         &self,
         brief_hash: &str,

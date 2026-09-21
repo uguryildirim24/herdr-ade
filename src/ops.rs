@@ -306,14 +306,34 @@ fn event_from_op(op: &Op) -> Result<Event> {
             waiting: None,
             failed: None,
         },
-        (Requested::Waiting { text }, OpKind::Waiting) => EventPayload {
+        (
+            Requested::Waiting {
+                text,
+                class,
+                provider_kind,
+            },
+            OpKind::Waiting,
+        ) => EventPayload {
             done: None,
-            waiting: Some(WaitingPayload { text: text.clone() }),
+            waiting: Some(WaitingPayload {
+                text: text.clone(),
+                class: *class,
+                provider_kind: provider_kind.clone(),
+            }),
             failed: None,
         },
-        (Requested::Failed { failure }, OpKind::Failed) => EventPayload {
+        (
+            Requested::Failed {
+                failure,
+                class,
+                provider_kind,
+            },
+            OpKind::Failed,
+        ) => EventPayload {
             failed: Some(WaitingPayload {
                 text: failure.clone(),
+                class: *class,
+                provider_kind: provider_kind.clone(),
             }),
             ..Default::default()
         },
@@ -629,6 +649,8 @@ mod tests {
         let (_root, project, _runner, recipient) = fixture();
         let requested = Requested::Waiting {
             text: "wait".into(),
+            class: crate::contracts::FailureClass::Unknown,
+            provider_kind: None,
         };
         let first = reserve(
             &project,
@@ -670,6 +692,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "different".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 3,
             },
@@ -692,6 +716,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 1,
             },
@@ -718,6 +744,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "blocked".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 1,
             },
@@ -897,6 +925,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 1,
             },
@@ -958,6 +988,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 1,
             },
@@ -974,6 +1006,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "still here".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 999_999,
             },
@@ -1035,6 +1069,8 @@ mod tests {
                 round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
                 },
                 helper_pid: 999_999,
             },

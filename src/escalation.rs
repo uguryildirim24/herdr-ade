@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-use crate::contracts::Event;
+use crate::contracts::{Event, FailureClass};
 use crate::paths::Ctx;
 use crate::{events, launch, project::Project, thread, threads};
 
@@ -28,9 +28,29 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
     if record.kind == thread::Kind::Adopted {
         bail!("escalation_adopted: an adopted process cannot be replaced");
     }
+    if failure.class == FailureClass::Unknown {
+        thread::update(project, &record.id, |t| {
+            t.failure_event = event.id.clone();
+            t.last_failure = failure.text.clone();
+            t.failure_class = FailureClass::Unknown;
+            t.provider_failure_kind = None;
+            t.status = thread::Status::Failed;
+            t.error = format!(
+                "WAITING: {}: {}",
+                FailureClass::Unknown.plain(),
+                failure.text
+            );
+            t.prompt_pending = false;
+        })?;
+        events::append_delivery(project, &event.id, crate::contracts::DeliveryState::Handled)?;
+        return Ok(());
+    }
     let task = std::fs::read_to_string(thread::task_path(project, &record.id))
         .context("escalation_brief_missing")?;
-    let selected = launch::resolve_launch(
+    // Provider outages and lost connections are infrastructure failures: retry
+    // the exact recipe. A gone process restarts the attempt. Only failed work
+    // consumes the routing table's retries and ordered fallbacks.
+    let selected = launch::resolve_failure(
         ctx,
         project,
         &launch::ResolveInput {
@@ -40,6 +60,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
             failure: Some(&failure.text),
             source_truncation: record.launch.source_truncation.as_ref(),
         },
+        failure.class,
     );
     match selected {
         Ok(mut selected) => {
@@ -54,6 +75,8 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
                 }
                 t.failure_event = event.id.clone();
                 t.last_failure = failure.text.clone();
+                t.failure_class = failure.class;
+                t.provider_failure_kind = failure.provider_kind.clone();
                 t.attempt = selected.attempt;
                 t.agent = selected.kind.clone();
                 t.launch = selected;
@@ -83,6 +106,8 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
                 }
                 t.failure_event = event.id.clone();
                 t.last_failure = failure.text.clone();
+                t.failure_class = failure.class;
+                t.provider_failure_kind = failure.provider_kind.clone();
                 t.error = if exhausted {
                     format!("WAITING: {detail}")
                 } else {
