@@ -150,6 +150,10 @@ pub(crate) struct Workspace {
     pub(crate) workspace_id: String,
     #[serde(default)]
     pub(crate) label: String,
+    #[serde(default)]
+    pub(crate) tab_count: usize,
+    #[serde(default)]
+    pub(crate) pane_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
