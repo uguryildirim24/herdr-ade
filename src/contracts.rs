@@ -165,8 +165,13 @@ pub(crate) struct Launch {
     #[serde(default)]
     pub(crate) skill_hash: String,
     pub(crate) recipe_id: String,
-    /// Number of bounded recovery selections after the first launch.
+    /// Number of failed-work recovery selections after the first launch.
+    /// Infrastructure retries never advance this fallback selector.
     pub(crate) escalations: u32,
+    /// Number of bounded same-recipe retries for provider, connection, and
+    /// process failures.
+    #[serde(default)]
+    pub(crate) same_recipe_retries: u32,
     /// `pin`, `default`, or the ordered `rule[n]` that selected this recipe.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) routing_rule: String,
@@ -222,7 +227,33 @@ pub(crate) struct RoleSpec {
     pub(crate) ready_timeout_ms: u64,
 }
 
-/// `done` or `waiting` (SPEC-ADE D5).
+/// What the evidence says failed. `Unknown` is deliberate: absence of a pane,
+/// poll, or answer is not evidence about a provider or the work itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub(crate) enum FailureClass {
+    Provider,
+    LostConnection,
+    ProcessGone,
+    WorkFailed,
+    #[default]
+    Unknown,
+}
+
+impl FailureClass {
+    pub(crate) fn plain(self) -> &'static str {
+        match self {
+            Self::Provider => "provider failed",
+            Self::LostConnection => "connection lost",
+            Self::ProcessGone => "process gone",
+            Self::WorkFailed => "work failed",
+            Self::Unknown => "failure unknown",
+        }
+    }
+}
+
+/// `done`, `waiting`, or `failed` (SPEC-ADE D5).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OpKind {
@@ -236,9 +267,24 @@ pub(crate) enum OpKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum Requested {
-    Done { sha: String, report_path: String },
-    Waiting { text: String },
-    Failed { failure: String },
+    Done {
+        sha: String,
+        report_path: String,
+    },
+    Waiting {
+        text: String,
+        #[serde(default)]
+        class: FailureClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_kind: Option<String>,
+    },
+    Failed {
+        failure: String,
+        #[serde(default)]
+        class: FailureClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_kind: Option<String>,
+    },
 }
 
 /// Coordinator pane and attempt that must receive the sealed event
@@ -293,6 +339,11 @@ pub(crate) struct DonePayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct WaitingPayload {
     pub(crate) text: String,
+    /// Historical payloads had only text; they truthfully load as unknown.
+    #[serde(default)]
+    pub(crate) class: FailureClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_kind: Option<String>,
 }
 
 /// Tagged event payload: `payload.done` or `payload.waiting` (SPEC-ADE D5).
@@ -790,9 +841,22 @@ mod tests {
                 done: None,
                 waiting: Some(WaitingPayload {
                     text: "need a look".into(),
+                    ..Default::default()
                 }),
                 failed: None,
             },
+        });
+    }
+
+    #[test]
+    fn historical_failure_payload_is_unknown_and_typed_provider_roundtrips() {
+        let old: WaitingPayload = toml::from_str("text = \"no evidence\"\n").unwrap();
+        assert_eq!(old.class, FailureClass::Unknown);
+        assert!(old.provider_kind.is_none());
+        both(&WaitingPayload {
+            text: "fetch failed".into(),
+            class: FailureClass::Provider,
+            provider_kind: Some("unreachable".into()),
         });
     }
 
@@ -936,6 +1000,7 @@ mod tests {
             skill_hash: "aa".into(),
             recipe_id: "agy_gemini_flash".into(),
             escalations: 0,
+            same_recipe_retries: 0,
             routing_rule: "default".into(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),

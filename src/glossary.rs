@@ -165,14 +165,19 @@ pub(crate) fn check_sentence(project: &Project, field: &str, text: &str) -> Resu
     }
     let result = plain::check(trimmed, &registry(project));
     if !result.passed() {
-        bail!("plain_refused: {field}: {}", format_check(trimmed, &result));
+        return Err(crate::refusal::error(format!(
+            "plain_refused: {field}: {}",
+            format_check(trimmed, &result)
+        )));
     }
     let sentences = trimmed
         .split(['.', '?', '!', '\n'])
         .filter(|s| !s.trim().is_empty())
         .count();
     if sentences != 1 {
-        bail!("plain_refused: {field}: write one sentence of at most 25 words");
+        return Err(crate::refusal::error(format!(
+            "plain_refused: {field}: write one sentence of at most 25 words"
+        )));
     }
     Ok(trimmed.to_string())
 }
@@ -188,10 +193,15 @@ pub(crate) fn check_record_sentence(project: &Project, field: &str, text: &str) 
     }
     let result = plain::check_record(trimmed, &registry(project));
     if !result.passed() {
-        bail!("plain_refused: {field}: {}", format_check(trimmed, &result));
+        return Err(crate::refusal::error(format!(
+            "plain_refused: {field}: {}",
+            format_check(trimmed, &result)
+        )));
     }
     if plain::sentence_count(trimmed) != 1 {
-        bail!("plain_refused: {field}: write one sentence of at most 25 words");
+        return Err(crate::refusal::error(format!(
+            "plain_refused: {field}: write one sentence of at most 25 words"
+        )));
     }
     Ok(trimmed.to_string())
 }
@@ -202,7 +212,10 @@ pub(crate) fn gate(project: &Project, text: &str) -> Result<()> {
     if result.passed() {
         Ok(())
     } else {
-        bail!("plain_refused:\n{}", format_check(text, &result))
+        Err(crate::refusal::error(format!(
+            "plain_refused:\n{}",
+            format_check(text, &result)
+        )))
     }
 }
 
@@ -218,7 +231,10 @@ pub(crate) fn gate_row(project: &Project, text: &str) -> Result<()> {
     if result.passed() {
         Ok(())
     } else {
-        bail!("plain_refused:\n{}", format_check(text, &result))
+        Err(crate::refusal::error(format!(
+            "plain_refused:\n{}",
+            format_check(text, &result)
+        )))
     }
 }
 

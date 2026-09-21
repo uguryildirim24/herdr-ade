@@ -19,7 +19,9 @@ ha ledger task f-0001 | ha thread start demo \
 ```
 
 The project resolves from the current workspace or lane launch binding. The
-ledger never creates a lane or closes a failure on its own. A designed refusal
+ledger never creates a lane. It closes an observed failure automatically when
+the same condition answers successfully; `ledger done` records a checked manual
+closure. A designed refusal
 (a safety or authority check that intentionally rejects the requested action,
 or a completed doctor report that refuses to declare the system healthy)
 still exits unsuccessfully, but its structural refusal marker keeps it out of
@@ -35,10 +37,10 @@ id**, not a new failure. Lists and task briefs replay the latest revision per id
 older evidence remains in the journal. Normalization folds whitespace and ANSI
 CSI formatting, not error codes, numbers, paths, or case.
 
-Closing is idempotent. A new occurrence reopens the same id and retains its
-first observation and cumulative count. A successful retry stops subsequent
-healthy passes from being counted as retries; it does not close the failure.
-Recovery and context-read cursors are journal facts, not extra writable records.
+Closing is idempotent and records `closed_at`. A new occurrence reopens the
+same id and retains its first observation and cumulative count. A successful
+re-entry closes the original entry; there is no separate retry entry. Recovery
+and context-read cursors are journal facts, not extra writable records.
 Malformed or torn journal rows produce an error; they are never silently dropped.
 
 ## Observation sites
@@ -59,12 +61,11 @@ Malformed or torn journal rows produce an error; they are never silently dropped
 - Failed reviewer starts in `round advance`, even when advance returns success.
 - Unexpected merge failures, including subprocess errors and conflicts. A
   structurally marked verdict or safety refusal is an outcome, not a failure.
-- Thread error/blocked transitions and failed launches with zero attempts.
-  Polling an unchanged state does not increase its count.
+- Unknown thread startup breakage and failed launches with zero attempts.
+  Provider failures, lost connections, gone processes, and failed work stay on
+  their typed thread/event records rather than becoming harness defects.
 - Failed courier passes, attributed to each project carried by that pass, plus
-  underlying SSH/transport command errors.
-- Retries of failed commands, reviewer starts, merges and courier passes; thread
-  restarts and repeated lane/coordinator launches.
+  underlying SSH/transport command errors. A successful pass closes them.
 
 The CLI installs the observing runner. Ticker and courier scopes explicitly bind
 commands to the project(s) being processed; unrelated projects do not inherit the

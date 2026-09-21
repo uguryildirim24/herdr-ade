@@ -408,8 +408,32 @@ fn machine_passes(
         if matches!(&event, Some(steps::OutageEvent::Down)) {
             for (project, threads) in &entries {
                 for lane in threads {
+                    let detail = format!("the link to machine {machine} is unreachable");
+                    if let Err(error) = thread::update(project, &lane.id, |record| {
+                        record.failure_class = crate::contracts::FailureClass::LostConnection;
+                        record.provider_failure_kind = None;
+                        record.last_failure = detail.clone();
+                        record.error = detail.clone();
+                        record.last_group = thread::Group::WaitingOnYou.token().into();
+                    }) {
+                        log.line(&format!("{error:#}"));
+                    }
                     let line = format!("BLOCKED {} machine {machine} unreachable", lane.id);
                     if let Err(error) = steps::type_remote_line(ctx, project, &line) {
+                        log.line(&format!("{error:#}"));
+                    }
+                }
+            }
+        } else if matches!(&event, Some(steps::OutageEvent::Recovered)) {
+            for (project, threads) in &entries {
+                for lane in threads {
+                    if let Err(error) = thread::update(project, &lane.id, |record| {
+                        if record.failure_class == crate::contracts::FailureClass::LostConnection {
+                            record.failure_class = crate::contracts::FailureClass::Unknown;
+                            record.last_failure.clear();
+                            record.error.clear();
+                        }
+                    }) {
                         log.line(&format!("{error:#}"));
                     }
                 }
@@ -497,10 +521,33 @@ fn thread_pass(
         missing_panes: 0,
         error: None,
     };
+    // If the coordinator and every local lane disappeared together, the
+    // session link failed. That is not evidence that each worker process died,
+    // so session recovery owns it instead of starting replacement lanes.
+    let whole_session_missing = threads.first().is_some_and(|thread| !thread.is_remote())
+        && project.coordinator().is_some_and(|coordinator| {
+            !agents
+                .iter()
+                .any(|agent| coordinator::agent_matches(&coordinator, agent))
+                && !panes
+                    .iter()
+                    .any(|pane| coordinator::pane_matches(&coordinator, pane))
+        })
+        && threads.iter().any(|thread| !thread.pane_id.is_empty())
+        && threads.iter().all(|thread| {
+            thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
+        });
     for t in threads {
         if t.status == thread::Status::Starting {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
-                threads::fail_start(ctx, project, &t.id, "still starting after five minutes")?;
+                threads::fail_start(
+                    ctx,
+                    project,
+                    &t.id,
+                    "still starting after five minutes",
+                    crate::contracts::FailureClass::Unknown,
+                    false,
+                )?;
             }
             continue;
         }
@@ -556,6 +603,26 @@ fn thread_pass(
         } else {
             thread::group(&after, &live, now)
         };
+        let process_gone = !t.is_remote()
+            && after.report_hash.is_empty()
+            && (!live.pane_exists
+                || (live.agent_state.is_none() && !t.prompt_pending && !t.last_state.is_empty()));
+        if process_gone && !whole_session_missing {
+            let recover = !t.launch.recipe_id.is_empty();
+            if let Err(error) = threads::fail_start(
+                ctx,
+                project,
+                &t.id,
+                "the pane or agent is gone without a report",
+                crate::contracts::FailureClass::ProcessGone,
+                recover,
+            ) {
+                pass.error = pass
+                    .error
+                    .or(Some(error.context(format!("{}: process recovery", t.id))));
+            }
+            continue;
+        }
         if delivered || state != t.last_state || group.token() != t.last_group {
             thread::update(project, &t.id, |t| {
                 if delivered {
@@ -564,6 +631,10 @@ fn thread_pass(
                 if state != t.last_state {
                     t.last_state = state.clone();
                     t.last_state_change = project::now();
+                }
+                if t.failure_class == crate::contracts::FailureClass::ProcessGone {
+                    t.failure_class = crate::contracts::FailureClass::Unknown;
+                    t.error.clear();
                 }
                 t.last_group = group.token().to_string();
             })?;
@@ -623,9 +694,16 @@ fn launch_pass(
                 thread::MAX_LAUNCH_ATTEMPTS
             );
             errors.extend(
-                threads::fail_start(pass.ctx, pass.project, &t.id, &reason)
-                    .err()
-                    .map(|error| error.context(format!("{}: failed-start cleanup", t.id))),
+                threads::fail_start(
+                    pass.ctx,
+                    pass.project,
+                    &t.id,
+                    &reason,
+                    crate::contracts::FailureClass::ProcessGone,
+                    false,
+                )
+                .err()
+                .map(|error| error.context(format!("{}: failed-start cleanup", t.id))),
             );
             continue;
         }
@@ -645,9 +723,16 @@ fn launch_pass(
             if let Err(error) = readiness {
                 let message = format!("{error:#}");
                 errors.extend(
-                    threads::fail_start(pass.ctx, pass.project, &t.id, &message)
-                        .err()
-                        .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
+                    threads::fail_start(
+                        pass.ctx,
+                        pass.project,
+                        &t.id,
+                        &message,
+                        crate::contracts::FailureClass::Provider,
+                        true,
+                    )
+                    .err()
+                    .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
                 );
                 continue;
             }
@@ -928,9 +1013,6 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {
             may_start = false;
             let started = (|| -> Result<()> {
-                if record.launch_attempts > 0 {
-                    crate::ledger::observe(project, "retry", "coordinator", "agent launch");
-                }
                 project.update_coordinator(|c| {
                     c.launch_attempts += 1;
                     c.generation += 1;

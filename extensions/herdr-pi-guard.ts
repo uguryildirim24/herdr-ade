@@ -2,10 +2,10 @@
 // Plugin-owned pi extension (SPEC-pi v2 §3.7, §3.10). Written by
 // `herdr-pi setup`; doctor checks the marker on the first line.
 //
-// A provider error does not reach the model, so the model cannot type
-// `ha waiting`. This extension is the deterministic reporter: a settled
+// A provider error does not reach the model, so the model cannot report it.
+// This extension is the deterministic reporter: a settled
 // provider failure becomes `herdr:blocked` on the pane (never idle, never
-// `done`) plus one `ha waiting` line per class per ten minutes.
+// `done`) plus one typed `ha failed` event per class per ten minutes.
 //
 // It never runs a login, never retries, and never runs `ha done`.
 // @ts-nocheck
@@ -113,7 +113,11 @@ export default function (pi) {
     lastSentAt.set(cls, now);
     const text = `${provider} ${cls}: ${first120(label)}`;
     try {
-      await pi.exec("ha", ["waiting", text], { timeout: 5000 });
+      await pi.exec(
+        "ha",
+        ["failed", "--class", "provider", "--provider-kind", cls, text],
+        { timeout: 5000 },
+      );
     } catch {
       // A failed report never stops pi; the pane is blocked either way.
     }

@@ -587,9 +587,9 @@ pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<Stri
 
 pub fn require_resolvable(project: &Project, thread: &str) -> Result<()> {
     if let Some(round) = open_round_pinning(project, thread)? {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "round_unmerged: `{thread}` is held by round `{round}`; run `round merge {round}` to completion before resolving it"
-        );
+        )));
     }
     Ok(())
 }
@@ -1487,7 +1487,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                 save(&project, &record)?;
             }
         }
-        let mut record = load(&project, &round)?;
+        let record = load(&project, &round)?;
         if let Some(reviewer) = record.reviewer.clone() {
             // One herdr read for this reviewer's state. A verdict wins over a
             // dead reviewer: a reviewer that sealed its verdict did its job.
@@ -1510,7 +1510,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                 // in this pass while the retry budget allows.
                 ReviewerState::Unstarted(reason) => {
                     reviewer_start_failed(ctx, &project, &round, &reason, Some(&reviewer))?;
-                    record = load(&project, &round)?;
+                    continue;
                 }
                 ReviewerState::Gone => {
                     announce_once(
@@ -1745,7 +1745,6 @@ fn start_and_bind_reviewer(
     review_branch: &str,
     prefix: &str,
 ) -> Result<Option<String>> {
-    crate::ledger::retry_after_failure(project, "reviewer-start-failed", round);
     // A crash can happen after the reviewer thread record is placed but before
     // the round record is written. Placement replaces `base = review/rN` with
     // the task commit it added at that branch's head, so recognize both sides
@@ -1974,8 +1973,7 @@ enum ReviewerState {
     /// Evidence needed to distinguish a dead process from a missing record or
     /// connection is absent. Unknown never authorizes a replacement.
     Unknown(String),
-    /// The record is there but no agent ever launched for it, or its last
-    /// launch failed. The reason is said on standard error.
+    /// The record is there, but no agent appeared before the measured grace.
     Unstarted(String),
 }
 
@@ -1984,8 +1982,11 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     let Some(row) = rows.iter().find(|row| row.thread.id == reviewer) else {
         return ReviewerState::Unknown(format!("thread record `{reviewer}` is missing"));
     };
+    if row.thread.cleanup_pending {
+        return ReviewerState::Unknown(format!("cleanup for thread `{reviewer}` is still pending"));
+    }
     if row.group == thread::Group::Resolved
-        || (!row.thread.prompt_pending && row.note == "pane closed")
+        || (!row.thread.prompt_pending && row.note.starts_with("process gone:"))
     {
         return ReviewerState::Gone;
     }
@@ -1993,9 +1994,12 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
         return ReviewerState::Unknown(row.note.clone());
     }
     let record = &row.thread;
+    if record.escalation_pending {
+        return ReviewerState::Alive;
+    }
     if record.status == thread::Status::Failed {
-        return ReviewerState::Unstarted(if record.error.is_empty() {
-            "the reviewer thread failed before its agent started".to_string()
+        return ReviewerState::Unknown(if record.error.is_empty() {
+            format!("{} with no further evidence", record.failure_class.plain())
         } else {
             record.error.clone()
         });
@@ -2013,11 +2017,10 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     ReviewerState::Alive
 }
 
-/// The one place a reviewer start that did not take is recorded (E3/D1):
-/// `advance` tried to start the reviewer and got an error, or found a bound
-/// reviewer whose agent never came up. It says so on standard error with the
-/// reason, un-binds and fails the dead thread so the current pass can start a
-/// fresh reviewer, and counts the failure against the retry bound.
+/// The one place a reviewer start that did not take is recorded (E3/D1).
+/// A failure before any reviewer is bound uses the round start counter. A
+/// bound reviewer whose process never appeared stays bound and uses typed
+/// same-recipe recovery, so the two bounds are never charged for one failure.
 fn reviewer_start_failed(
     ctx: &Ctx,
     project: &Project,
@@ -2025,31 +2028,47 @@ fn reviewer_start_failed(
     reason: &str,
     dead_reviewer: Option<&str>,
 ) -> Result<u32> {
-    // Do not unbind until the failed attempt is closed. If cleanup fails the
-    // next pass retries this same binding instead of starting a second live
-    // reviewer beside it.
+    // A bound reviewer with a gone process is recovered as the same typed
+    // attempt. It consumes the launch's same-recipe counter, not the round's
+    // pre-binding start counter, and stays bound so no duplicate can start.
     if let Some(dead) = dead_reviewer {
-        crate::threads::fail_start(ctx, project, dead, reason)?;
+        let failed = crate::threads::fail_start(
+            ctx,
+            project,
+            dead,
+            reason,
+            crate::contracts::FailureClass::ProcessGone,
+            true,
+        )?;
+        let failures = load(project, round)?.reviewer_start_failures;
+        let (key, summary) = if failed.escalation_pending {
+            (
+                "reviewer-process-gone",
+                format!(
+                    "Round {round}: the reviewer process is gone ({reason}); its same recipe recovery is scheduled"
+                ),
+            )
+        } else {
+            (
+                "reviewer-process-gone-exhausted",
+                format!(
+                    "Round {round}: the reviewer process is gone ({reason}); its recovery is exhausted and no replacement was started"
+                ),
+            )
+        };
+        announce_once(ctx, project, round, key, &summary, None)?;
+        return Ok(failures);
     }
     let failures = {
         let _lock = project.lock()?;
         let mut record = load(project, round)?;
         record.reviewer_start_failures += 1;
-        if let Some(dead) = dead_reviewer
-            && record.reviewer.as_deref() == Some(dead)
-        {
-            record.reviewer = None;
-        }
         save(project, &record)?;
         record.reviewer_start_failures
     };
     crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
-    let retry = if dead_reviewer.is_some() {
-        "it is retried now"
-    } else {
-        "it is retried on the next pass"
-    };
+    let retry = "it is retried on the next pass";
     announce_once(
         ctx,
         project,
@@ -2784,11 +2803,9 @@ pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<M
     match &result {
         Err(error) if crate::refusal::is(error) => {}
         Err(error) => {
-            crate::ledger::retry_after_failure(&project, "merge-refused", round);
             crate::ledger::observe(&project, "merge-refused", round, &format!("{error:#}"));
         }
         Ok(_) => {
-            crate::ledger::retry_after_failure(&project, "merge-refused", round);
             crate::ledger::recovered(&project, "merge-refused", round);
         }
     }
@@ -3704,7 +3721,10 @@ pub mod testkit {
                 n,
                 EventPayload {
                     done: None,
-                    waiting: Some(WaitingPayload { text: text.into() }),
+                    waiting: Some(WaitingPayload {
+                        text: text.into(),
+                        ..Default::default()
+                    }),
                     failed: None,
                 },
             )
@@ -5329,7 +5349,7 @@ mod tests {
             .unwrap();
         assert_eq!(start.subject, "r1");
         assert_eq!(start.count, 2);
-        assert!(failures.iter().any(|entry| entry.kind == "retry"));
+        assert!(!failures.iter().any(|entry| entry.kind == "retry"));
 
         // The next pass tries again, and a live project starts the reviewer.
         fx.project
@@ -5344,10 +5364,10 @@ mod tests {
         );
     }
 
-    /// A bound reviewer the ticker never launched is a failed start: it is
-    /// reported, failed and replaced in the same pass.
+    /// A bound reviewer the ticker never launched consumes one typed process
+    /// retry and stays bound while its replacement is placed.
     #[test]
-    fn advance_reports_and_retries_a_reviewer_that_never_launched() {
+    fn advance_schedules_same_recipe_recovery_for_an_unlaunched_reviewer() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         reviewer_ready(&fx);
@@ -5366,30 +5386,29 @@ mod tests {
 
         advance(&ctx, "demo").unwrap();
         let retried = load(&fx.project, "r1").unwrap();
-        assert_eq!(
-            retried.reviewer_start_failures, 1,
-            "the dead start is counted"
-        );
+        assert_eq!(retried.reviewer_start_failures, 0);
+        assert_eq!(retried.reviewer.as_deref(), Some(first.as_str()));
         let record = thread::load(&fx.project, &first).unwrap();
+        assert_eq!(record.status, thread::Status::Failed);
         assert_eq!(
-            record.status,
-            thread::Status::Failed,
-            "the dead thread is failed"
+            record.failure_class,
+            crate::contracts::FailureClass::ProcessGone
         );
+        assert_eq!(record.launch.escalations, 0);
+        assert_eq!(record.launch.same_recipe_retries, 1);
+        assert!(record.escalation_pending);
         assert!(crate::inbox::unhandled(&fx.project).is_empty());
         assert_eq!(
             fx.world.runner.count("tab close w1:t2"),
             0,
             "a tab already absent from the live session needs no close call"
         );
-        let second = retried.reviewer.clone().expect("a fresh reviewer is bound");
-        assert_ne!(second, first, "the same pass replaces the dead reviewer");
     }
 
-    /// A reviewer whose provider readiness check failed is replaced rather
-    /// than remaining the round's final bound reviewer.
+    /// A failed reviewer with no pending typed recovery stays bound. Unknown
+    /// evidence and exhausted provider recovery never allocate a new model.
     #[test]
-    fn advance_replaces_a_bound_reviewer_that_failed_at_start() {
+    fn advance_keeps_a_failed_reviewer_waiting() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         reviewer_ready(&fx);
@@ -5399,16 +5418,16 @@ mod tests {
         thread::update(&fx.project, &first, |t| {
             t.status = thread::Status::Failed;
             t.prompt_pending = false;
-            t.error = "pi_not_ready: stored sign-in timed out".into();
+            t.failure_class = crate::contracts::FailureClass::Provider;
+            t.error = "WAITING: provider recovery is exhausted".into();
         })
         .unwrap();
 
         advance(&ctx, "demo").unwrap();
 
-        let retried = load(&fx.project, "r1").unwrap();
-        assert_eq!(retried.reviewer_start_failures, 1);
-        let second = retried.reviewer.expect("a replacement reviewer is bound");
-        assert_ne!(second, first);
+        let waiting = load(&fx.project, "r1").unwrap();
+        assert_eq!(waiting.reviewer_start_failures, 0);
+        assert_eq!(waiting.reviewer.as_deref(), Some(first.as_str()));
         assert_eq!(
             thread::load(&fx.project, &first).unwrap().status,
             thread::Status::Failed
@@ -5440,51 +5459,42 @@ mod tests {
         assert_eq!(fx.world.runner.count("tab close w1:t2"), 0);
     }
 
-    /// Once the retry bound is reached, `advance` stops starting reviewers and
-    /// says the round is left for a human.
+    /// Exhausted process recovery stays on the bound reviewer and does not
+    /// also consume the round's pre-binding start counter.
     #[test]
-    fn advance_stops_at_the_reviewer_retry_bound() {
+    fn advance_does_not_double_count_exhausted_process_recovery() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         reviewer_ready(&fx);
         let (_, _) = reviewed(&fx);
         advance(&ctx, "demo").unwrap();
         let reviewer = load(&fx.project, "r1").unwrap().reviewer.clone().unwrap();
-        {
-            let mut record = load(&fx.project, "r1").unwrap();
-            record.reviewer_start_failures = MAX_REVIEWER_START_FAILURES - 1;
-            save(&fx.project, &record).unwrap();
-        }
         thread::update(&fx.project, &reviewer, |t| {
             t.launch_attempts = 0;
             t.prompt_pending = true;
             t.created = "2026-09-18T00:00:00Z".into();
+            t.launch.same_recipe_retries = 1;
         })
         .unwrap();
 
-        // The last allowed failure is recorded and the dead reviewer is gone.
         advance(&ctx, "demo").unwrap();
         let at_bound = load(&fx.project, "r1").unwrap();
-        assert_eq!(
-            at_bound.reviewer_start_failures, MAX_REVIEWER_START_FAILURES,
-            "the failure reaches the bound"
+        assert_eq!(at_bound.reviewer_start_failures, 0);
+        assert_eq!(at_bound.reviewer.as_deref(), Some(reviewer.as_str()));
+        let failed = thread::load(&fx.project, &reviewer).unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert!(!failed.escalation_pending);
+        assert!(
+            failed.error.contains("recovery_exhausted"),
+            "{}",
+            failed.error
         );
-        assert!(at_bound.reviewer.is_none());
-        let reviewers = thread::list(&fx.project)
-            .into_iter()
-            .filter(|t| t.role == "reviewer")
-            .count();
 
-        // No pass starts another reviewer; the round is left for a human.
         advance(&ctx, "demo").unwrap();
-        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
         assert_eq!(
-            thread::list(&fx.project)
-                .into_iter()
-                .filter(|t| t.role == "reviewer")
-                .count(),
-            reviewers,
-            "no reviewer is started past the bound"
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(reviewer.as_str()),
+            "exhaustion must not allocate a duplicate reviewer"
         );
     }
 
@@ -5654,8 +5664,16 @@ mod tests {
         std::fs::remove_file(fx.world.home.path().join("a.sock")).unwrap();
         let e = err(bind_reviewer(&ctx, "demo", "r1", &new));
         assert!(e.starts_with("reviewer_already_bound"), "{e}");
-        // Resolved: the new reviewer binds.
-        thread::update(&fx.project, &old, |t| t.status = thread::Status::Resolved).unwrap();
+        // A resolved record whose target may still be alive cannot be replaced
+        // until its pending cleanup finishes.
+        thread::update(&fx.project, &old, |t| {
+            t.status = thread::Status::Resolved;
+            t.cleanup_pending = true;
+        })
+        .unwrap();
+        let e = err(bind_reviewer(&ctx, "demo", "r1", &new));
+        assert!(e.starts_with("reviewer_already_bound"), "{e}");
+        thread::update(&fx.project, &old, |t| t.cleanup_pending = false).unwrap();
         bind_reviewer(&ctx, "demo", "r1", &new).unwrap();
         assert_eq!(
             load(&fx.project, "r1").unwrap().reviewer.as_deref(),
@@ -5684,6 +5702,19 @@ mod tests {
         let task = std::fs::read_to_string(thread::task_path(&fx.project, &started.id)).unwrap();
         assert!(task.contains("skill reviewer"), "{task}");
         assert!(task.contains("tasks/review-r1.md"), "{task}");
+
+        let unknown = err(retry(
+            &ctx,
+            "demo",
+            "r1",
+            "there is no evidence about what failed",
+        ));
+        assert!(unknown.starts_with("recovery_unknown:"), "{unknown}");
+        assert_eq!(
+            thread::load(&fx.project, &started.id).unwrap().attempt,
+            1,
+            "unknown evidence must not spend an attempt"
+        );
 
         // Simulate a crash after placement moved `base` from the review branch
         // name to its task commit, but before the round binding was saved.
