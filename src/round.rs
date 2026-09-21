@@ -1150,9 +1150,9 @@ pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thre
 /// `pane.agent_status_changed` hook and the ticker call.
 ///
 /// A start that does not take is loud and is retried: `advance` says so on
-/// standard error with the reason, un-binds the dead reviewer and tries again
-/// on the next pass, up to `MAX_REVIEWER_START_FAILURES`. A round is never
-/// left with a bound reviewer whose agent never came up (E3/D1).
+/// standard error with the reason, un-binds a dead reviewer and tries again,
+/// up to `MAX_REVIEWER_START_FAILURES`. A round is never left with a bound
+/// reviewer whose agent never came up (E3/D1).
 #[derive(Debug, Default)]
 pub struct AdvanceOutcome {
     pub started: Vec<ReviewerStarted>,
@@ -1195,7 +1195,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                 save(&project, &record)?;
             }
         }
-        let record = load(&project, &round)?;
+        let mut record = load(&project, &round)?;
         if let Some(reviewer) = record.reviewer.clone() {
             // One herdr read for this reviewer's state. A verdict wins over a
             // dead reviewer: a reviewer that sealed its verdict did its job.
@@ -1213,11 +1213,12 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                 continue;
             }
             match state {
-                // A bound reviewer whose agent never came up is a failed
-                // start, not a pending one: report it, drop the dead binding
-                // and let the next pass start a fresh reviewer.
+                // A bound reviewer whose start failed is an attempt, not a
+                // final state: count it, drop the dead binding and replace it
+                // in this pass while the retry budget allows.
                 ReviewerState::Unstarted(reason) => {
                     reviewer_start_failed(ctx, &project, &round, &reason, Some(&reviewer))?;
+                    record = load(&project, &round)?;
                 }
                 ReviewerState::Gone => {
                     announce_once(
@@ -1230,10 +1231,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                         ),
                         None,
                     )?;
+                    continue;
                 }
-                ReviewerState::Alive => {}
+                ReviewerState::Alive => continue,
             }
-            continue;
         }
         // No reviewer is bound. This is the one path that starts a review;
         // `round review` and `round reviewer` are manual repair only. A round
@@ -1663,7 +1664,7 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
 /// The one place a reviewer start that did not take is recorded (E3/D1):
 /// `advance` tried to start the reviewer and got an error, or found a bound
 /// reviewer whose agent never came up. It says so on standard error with the
-/// reason, un-binds and fails the dead thread so the next pass can start a
+/// reason, un-binds and fails the dead thread so the current pass can start a
 /// fresh reviewer, and counts the failure against the retry bound.
 fn reviewer_start_failed(
     ctx: &Ctx,
@@ -1692,13 +1693,18 @@ fn reviewer_start_failed(
     };
     crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
+    let retry = if dead_reviewer.is_some() {
+        "it is retried now"
+    } else {
+        "it is retried on the next pass"
+    };
     announce_once(
         ctx,
         project,
         round,
         "reviewer-start-failed",
         &format!(
-            "Round {round}: the reviewer did not start ({reason}); it is retried on the next pass, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
+            "Round {round}: the reviewer did not start ({reason}); {retry}, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
         ),
         None,
     )?;
@@ -4900,7 +4906,7 @@ mod tests {
     }
 
     /// A bound reviewer the ticker never launched is a failed start: it is
-    /// reported, un-bound and failed, and the next pass starts a fresh one.
+    /// reported, failed and replaced in the same pass.
     #[test]
     fn advance_reports_and_retries_a_reviewer_that_never_launched() {
         let fx = fixture();
@@ -4920,9 +4926,11 @@ mod tests {
         .unwrap();
 
         advance(&ctx, "demo").unwrap();
-        let dead = load(&fx.project, "r1").unwrap();
-        assert_eq!(dead.reviewer_start_failures, 1, "the dead start is counted");
-        assert!(dead.reviewer.is_none(), "the dead reviewer is un-bound");
+        let retried = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            retried.reviewer_start_failures, 1,
+            "the dead start is counted"
+        );
         let record = thread::load(&fx.project, &first).unwrap();
         assert_eq!(
             record.status,
@@ -4935,16 +4943,37 @@ mod tests {
             1,
             "the failed reviewer's tab is closed before a retry"
         );
-        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
-            .unwrap()
-            .0;
-        assert!(digest.contains("no agent appeared"), "{digest}");
-
-        // The next pass starts a different, fresh reviewer.
-        advance(&ctx, "demo").unwrap();
-        let retried = load(&fx.project, "r1").unwrap();
         let second = retried.reviewer.clone().expect("a fresh reviewer is bound");
-        assert_ne!(second, first, "a new reviewer replaces the dead one");
+        assert_ne!(second, first, "the same pass replaces the dead reviewer");
+    }
+
+    /// A reviewer whose provider readiness check failed is replaced rather
+    /// than remaining the round's final bound reviewer.
+    #[test]
+    fn advance_replaces_a_bound_reviewer_that_failed_at_start() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (_, _) = reviewed(&fx);
+        advance(&ctx, "demo").unwrap();
+        let first = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        thread::update(&fx.project, &first, |t| {
+            t.status = thread::Status::Failed;
+            t.prompt_pending = false;
+            t.error = "pi_not_ready: stored sign-in timed out".into();
+        })
+        .unwrap();
+
+        advance(&ctx, "demo").unwrap();
+
+        let retried = load(&fx.project, "r1").unwrap();
+        assert_eq!(retried.reviewer_start_failures, 1);
+        let second = retried.reviewer.expect("a replacement reviewer is bound");
+        assert_ne!(second, first);
+        assert_eq!(
+            thread::load(&fx.project, &first).unwrap().status,
+            thread::Status::Failed
+        );
     }
 
     /// A queued reviewer may take several minutes to reach its first launch
