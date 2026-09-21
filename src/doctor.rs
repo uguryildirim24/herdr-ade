@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -23,11 +23,54 @@ struct NativeProbe {
     args: &'static [&'static str],
 }
 
+/// The cheapest real model call each native runtime offers. Status and model
+/// listing commands only prove that a credential was stored; they do not catch
+/// an expired subscription.
 fn native_probe(kind: &str) -> Option<NativeProbe> {
     let (program, args): (_, &[_]) = match kind {
-        "claude" => ("claude", &["auth", "status"]),
-        "codex" => ("codex", &["login", "status"]),
-        "agy" => ("agy", &["models"]),
+        "claude" => (
+            "claude",
+            &[
+                "-p",
+                "Reply only OK.",
+                "--model",
+                "claude-haiku-4-5-20251001",
+                "--effort",
+                "low",
+                "--max-turns",
+                "1",
+                "--tools",
+                "",
+                "--no-session-persistence",
+            ],
+        ),
+        "codex" => (
+            "codex",
+            &[
+                "exec",
+                "--model",
+                "gpt-5.6-sol",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "Reply only OK.",
+            ],
+        ),
+        "agy" => (
+            "agy",
+            &[
+                "-p",
+                "Reply only OK.",
+                "--model",
+                "gemini-3.8-flash-low",
+                "--effort",
+                "low",
+                "--max-turns",
+                "1",
+                "--tools",
+                "",
+            ],
+        ),
         _ => return None,
     };
     Some(NativeProbe {
@@ -40,10 +83,104 @@ fn native_probe(kind: &str) -> Option<NativeProbe> {
 fn probe_error(kind: &str, output: &crate::runner::Output) -> String {
     let detail = output.error_text();
     if detail.is_empty() {
-        format!("{kind} readiness check exited {:?}", output.code)
+        format!(
+            "{kind} could not reach its smallest model (exit {:?})",
+            output.code
+        )
     } else {
-        format!("{kind} readiness check failed: {detail}")
+        format!(
+            "{kind} could not reach its smallest model; its stored sign-in may no longer work: {detail}"
+        )
     }
+}
+
+fn run_native_probe(
+    ctx: &Ctx,
+    probe: NativeProbe,
+    timeout: Duration,
+) -> Result<crate::runner::Output> {
+    let cache_dir = ctx.root.join(".readiness");
+    let cache = cache_dir.join(format!("native-{}.json", probe.kind));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(bytes) = std::fs::read(&cache)
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let (Some(checked), Some(ok)) = (
+            value
+                .get("checked_unix")
+                .and_then(serde_json::Value::as_u64),
+            value.get("ok").and_then(serde_json::Value::as_bool),
+        )
+        && now.saturating_sub(checked) <= crate::pi::doctor::READINESS_CACHE_TTL.as_secs()
+    {
+        return Ok(crate::runner::Output {
+            code: Some(if ok { 0 } else { 1 }),
+            stderr: value
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            ..Default::default()
+        });
+    }
+    let output = ctx
+        .runner
+        .run(&Cmd::new(probe.program, timeout).args(probe.args.iter().copied()))?;
+    if ctx.root.is_dir() && std::fs::create_dir_all(&cache_dir).is_ok() {
+        let detail = output.error_text();
+        let value = serde_json::json!({
+            "checked_unix": now,
+            "ok": output.success(),
+            "detail": detail.lines().next().unwrap_or_default(),
+        });
+        let staged = cache_dir.join(format!(".native-{}-{}", probe.kind, std::process::id()));
+        if std::fs::write(&staged, value.to_string()).is_ok() {
+            let _ = std::fs::rename(&staged, &cache);
+        }
+        let _ = std::fs::remove_file(staged);
+    }
+    Ok(output)
+}
+
+fn native_probe_command(probe: NativeProbe) -> String {
+    std::iter::once(probe.program)
+        .chain(probe.args.iter().copied())
+        .map(crate::remote::quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A box-side real model call cached for one ticker interval. The cache holds
+/// only `ok`, `failed` or `missing`; provider output never lands on disk.
+fn box_native_probe_script(probe: NativeProbe, fact: bool) -> String {
+    let command = native_probe_command(probe);
+    let finish = if fact {
+        format!("printf 'login_{}\\t%s\\n' \"$probe_status\"", probe.kind)
+    } else {
+        "[ \"$probe_status\" = ok ]".into()
+    };
+    format!(
+        "probe_dir=\"$HOME/.herdr-ade/.readiness\"\n\
+         probe_cache=\"$probe_dir/native-{kind}\"\n\
+         probe_status=\n\
+         probe_now=$(date +%s)\n\
+         probe_then=$(stat -c %Y \"$probe_cache\" 2>/dev/null || echo 0)\n\
+         if [ $((probe_now-probe_then)) -le {ttl} ]; then probe_status=$(cat \"$probe_cache\" 2>/dev/null || true); fi\n\
+         if [ -z \"$probe_status\" ]; then\n\
+           if ! command -v {program} >/dev/null 2>&1; then probe_status=missing;\n\
+           elif {command} >/dev/null 2>&1; then probe_status=ok;\n\
+           else probe_status=failed; fi\n\
+           mkdir -p \"$probe_dir\"\n\
+           printf '%s\\n' \"$probe_status\" > \"$probe_cache.tmp.$$\"\n\
+           mv -f \"$probe_cache.tmp.$$\" \"$probe_cache\"\n\
+         fi\n\
+         {finish}\n",
+        kind = probe.kind,
+        ttl = crate::pi::doctor::READINESS_CACHE_TTL.as_secs(),
+        program = crate::remote::quote(probe.program),
+    )
 }
 
 /// Whether the chosen recipe can run on this Mac. This is the same provider
@@ -58,16 +195,12 @@ pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -
             launch.kind
         )
     })?;
-    let output = ctx
-        .runner
-        .run(
-            &Cmd::new(
-                probe.program,
-                Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
-            )
-            .args(probe.args.iter().copied()),
-        )
-        .with_context(|| format!("{} is not installed", probe.program))?;
+    let output = run_native_probe(
+        ctx,
+        probe,
+        Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
+    )
+    .with_context(|| format!("{} is not installed", probe.program))?;
     if !output.success() {
         anyhow::bail!(probe_error(probe.kind, &output));
     }
@@ -94,15 +227,7 @@ pub(crate) fn recipe_ready_on_box(
             launch.kind
         )
     })?;
-    let command = std::iter::once(probe.program)
-        .chain(probe.args.iter().copied())
-        .map(crate::remote::quote)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = format!(
-        "command -v {program} >/dev/null 2>&1 || {{ printf '%s\\n' '{program} is missing from the lane PATH' >&2; exit 127; }}\n{command}",
-        program = crate::remote::quote(probe.program),
-    );
+    let script = box_native_probe_script(probe, false);
     let output = crate::remote::ssh(
         ctx.runner,
         &profile.target,
@@ -409,68 +534,80 @@ fn report(
         }
     }
 
-    let ctx = Ctx {
-        env,
-        root: root.to_path_buf(),
-        config_dir: config_dir.to_path_buf(),
-        runner,
-        detached_ticker: false,
-    };
-    match crate::launch::doctor_rows(&ctx) {
-        Ok(rows) => {
-            for row in rows {
-                check(&mut out, row.ok, &row.label, row.detail.clone());
+    let worker = config_dir.join(crate::harness::BOX_WORKER_MARKER).is_file();
+    if worker {
+        check(
+            &mut out,
+            Some(true),
+            "lane worker",
+            "RULES.md is local; dispatch recipes, Jev and saved-machine checks stay on the coordinator"
+                .into(),
+        );
+    } else {
+        let ctx = Ctx {
+            env,
+            root: root.to_path_buf(),
+            config_dir: config_dir.to_path_buf(),
+            runner,
+            detached_ticker: false,
+        };
+        match crate::launch::doctor_rows(&ctx) {
+            Ok(rows) => {
+                for row in rows {
+                    check(&mut out, row.ok, &row.label, row.detail.clone());
+                }
             }
+            Err(error) => check(&mut out, Some(false), "recipes", format!("{error:#}")),
         }
-        Err(error) => check(&mut out, Some(false), "recipes", format!("{error:#}")),
-    }
 
-    // Check every machine placement can choose, not only machines with a live
-    // thread. This includes configured defaults, repository rows and every
-    // enabled saved profile (an explicit `--machine` can choose any of them).
-    match machines_to_check(root, config_dir, runner, &bin)
-        .and_then(|machines| Ok((machines, crate::launch::parse_launch_config(config_dir)?)))
-    {
-        Ok((machines, config)) => {
-            for machine in machines {
-                match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
-                    Ok(profile) if profile.is_local() => check(
-                        &mut out,
-                        Some(true),
-                        &format!("machine {machine}"),
-                        "on this Mac".into(),
-                    ),
-                    Ok(profile) => {
-                        check(
+        // Check every machine placement can choose, not only machines with a live
+        // thread. This includes configured defaults, repository rows and every
+        // enabled saved profile (an explicit `--machine` can choose any of them).
+        match machines_to_check(root, config_dir, runner, &bin)
+            .and_then(|machines| Ok((machines, crate::launch::parse_launch_config(config_dir)?)))
+        {
+            Ok((machines, config)) => {
+                for machine in machines {
+                    match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
+                        Ok(profile) if profile.is_local() => check(
                             &mut out,
                             Some(true),
                             &format!("machine {machine}"),
-                            format!("ssh target {}", profile.target),
-                        );
-                        for (ok, label, detail) in box_rows(runner, &bin, &profile, &config.recipes)
-                        {
-                            check(&mut out, ok, &label, detail);
+                            "on this Mac".into(),
+                        ),
+                        Ok(profile) => {
+                            check(
+                                &mut out,
+                                Some(true),
+                                &format!("machine {machine}"),
+                                format!("ssh target {}", profile.target),
+                            );
+                            for (ok, label, detail) in
+                                box_rows(runner, &bin, &profile, &config.recipes)
+                            {
+                                check(&mut out, ok, &label, detail);
+                            }
+                            let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
+                            check_workspace_leaks(
+                                &mut out,
+                                &mut check,
+                                root,
+                                &profile.id,
+                                &format!("machine {}", profile.label),
+                                &herdr,
+                            );
                         }
-                        let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
-                        check_workspace_leaks(
+                        Err(error) => check(
                             &mut out,
-                            &mut check,
-                            root,
-                            &profile.id,
-                            &format!("machine {}", profile.label),
-                            &herdr,
-                        );
+                            Some(false),
+                            &format!("machine {machine}"),
+                            format!("{error:#}"),
+                        ),
                     }
-                    Err(error) => check(
-                        &mut out,
-                        Some(false),
-                        &format!("machine {machine}"),
-                        format!("{error:#}"),
-                    ),
                 }
             }
+            Err(error) => check(&mut out, Some(false), "machines", format!("{error:#}")),
         }
-        Err(error) => check(&mut out, Some(false), "machines", format!("{error:#}")),
     }
 
     (out, healthy)
@@ -673,16 +810,7 @@ fn box_rows(
 ",
     );
     for probe in natives.values() {
-        let command = std::iter::once(probe.program)
-            .chain(probe.args.iter().copied())
-            .map(crate::remote::quote)
-            .collect::<Vec<_>>()
-            .join(" ");
-        script.push_str(&format!(
-            "command -v {program} >/dev/null 2>&1 && {command} >/dev/null 2>&1 && printf 'login_{kind}\\tok\\n' || printf 'login_{kind}\\tmissing\\n'\n",
-            program = crate::remote::quote(probe.program),
-            kind = probe.kind,
-        ));
+        script.push_str(&box_native_probe_script(*probe, true));
     }
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
@@ -784,7 +912,13 @@ fn box_rows(
         rows.push((
             env_bool(&value, &["ok"]),
             format!("box {label} login {kind}"),
-            format!("{kind} authentication: {value}"),
+            if value == "ok" {
+            format!("{kind} reached its smallest model")
+        } else {
+            format!(
+                "{kind} could not reach its smallest model ({value}); its stored sign-in may no longer work"
+            )
+        },
         ));
     }
     // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
@@ -1119,6 +1253,39 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_worker_does_not_validate_coordinator_routing() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(crate::harness::BOX_WORKER_MARKER),
+            "lane worker\n",
+        )
+        .unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+
+        let (text, _) = report(
+            &env,
+            &home.path().join("root"),
+            &config,
+            &SessionFlags::default(),
+            &runner,
+        );
+
+        assert!(text.contains("[ok  ] lane worker:"), "{text}");
+        assert!(!text.contains("routing_recipe_missing"), "{text}");
+        assert!(!text.contains("[FAIL] recipes:"), "{text}");
+        assert!(!text.contains("[FAIL] Jev:"), "{text}");
+        assert_eq!(
+            runner.count("agent start --help"),
+            1,
+            "only the parent CLI check runs; recipe validation is skipped"
+        );
+        assert_eq!(runner.count("machine list"), 0);
+    }
+
+    #[test]
     fn a_registered_machine_without_live_threads_is_checked() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
@@ -1344,10 +1511,8 @@ mod tests {
                 .display();
             let probe = native_probe(kind).unwrap();
             assert!(ssh.contains(&format!("command -v {kind}")), "{ssh}");
-            assert!(
-                ssh.contains(&format!("{kind} {}", probe.args.join(" "))),
-                "{ssh}"
-            );
+            assert!(ssh.contains("Reply only OK."), "{ssh}");
+            assert!(ssh.contains(probe.args[0]), "{ssh}");
         }
     }
 
@@ -1512,15 +1677,19 @@ mod tests {
             "{script}"
         );
         assert!(
-            ssh.contains("command -v claude") && ssh.contains("claude auth status"),
+            ssh.contains("command -v claude")
+                && ssh.contains("claude-haiku-4-5-20251001")
+                && ssh.contains("Reply only OK."),
             "{ssh}"
         );
         assert!(
-            !ssh.contains("command -v codex") && !ssh.contains("codex login status"),
+            !ssh.contains("command -v codex") && !ssh.contains("gpt-5.6-sol"),
             "{ssh}"
         );
         assert!(
-            ssh.contains("command -v agy") && ssh.contains("agy models"),
+            ssh.contains("command -v agy")
+                && ssh.contains("gemini-3.8-flash-low")
+                && ssh.contains("Reply only OK."),
             "{ssh}"
         );
         drop(calls);
