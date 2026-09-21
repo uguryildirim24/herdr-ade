@@ -14,7 +14,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const HEADINGS: [&str; 7] = [
+pub(crate) const HEADINGS: [&str; 7] = [
     "Goal",
     "What you get at the end",
     "How far along",
@@ -23,7 +23,7 @@ pub const HEADINGS: [&str; 7] = [
     "Needs you",
     "Failures",
 ];
-pub const EMPTY: [&str; 7] = [
+pub(crate) const EMPTY: [&str; 7] = [
     "Your goal is not written down yet.",
     "The end result is not written down yet.",
     "The steps are not written down yet.",
@@ -32,27 +32,27 @@ pub const EMPTY: [&str; 7] = [
     "No question is waiting here.",
     "No new or repeated failure is open.",
 ];
-pub const GOAL_INVALID: &str = "Your goal needs a plain sentence.";
-pub const TASK_INVALID: &str = "This task needs a plain description.";
-pub const STEP_INVALID: &str = "This step needs a plain description.";
-pub const DECISION_INVALID: &str = "This choice needs a plain description.";
-pub const CATCH_UP: &str = "The plan needs to catch up.";
-pub const RUNNING_ERROR: &str = "I could not read the running work.";
-pub const FINISHED_ERROR: &str = "I could not read the finished work.";
-pub const DECISIONS_ERROR: &str = "I could not read the choices.";
-pub const NO_DECISIONS: &str = "No choices have been recorded yet.";
-pub const CHANGE: &str = "Tell me what to change in the chat.";
-pub const ASK_WARNING: &str = "More than three questions are waiting here.";
-pub const STALE_HEADING: &str = "Stale";
-pub const COST_HEADING: &str = "Cost";
-pub const TASKS_HEADING: &str = "Tasks";
-pub const NO_COST: &str = "No cost has been recorded yet.";
-pub const COST_ERROR: &str = "I could not read the cost.";
-pub const NO_TASKS: &str = "No tasks are on the list.";
-pub const TASKS_ERROR: &str = "I could not read the task list.";
+pub(crate) const GOAL_INVALID: &str = "Your goal needs a plain sentence.";
+pub(crate) const TASK_INVALID: &str = "This task needs a plain description.";
+pub(crate) const STEP_INVALID: &str = "This step needs a plain description.";
+pub(crate) const DECISION_INVALID: &str = "This choice needs a plain description.";
+pub(crate) const CATCH_UP: &str = "The plan needs to catch up.";
+pub(crate) const RUNNING_ERROR: &str = "I could not read the running work.";
+pub(crate) const FINISHED_ERROR: &str = "I could not read the finished work.";
+pub(crate) const DECISIONS_ERROR: &str = "I could not read the choices.";
+pub(crate) const NO_DECISIONS: &str = "No choices have been recorded yet.";
+pub(crate) const CHANGE: &str = "Tell me what to change in the chat.";
+pub(crate) const ASK_WARNING: &str = "More than three questions are waiting here.";
+pub(crate) const STALE_HEADING: &str = "Stale";
+pub(crate) const COST_HEADING: &str = "Cost";
+pub(crate) const TASKS_HEADING: &str = "Tasks";
+pub(crate) const NO_COST: &str = "No cost has been recorded yet.";
+pub(crate) const COST_ERROR: &str = "I could not read the cost.";
+pub(crate) const NO_TASKS: &str = "No tasks are on the list.";
+pub(crate) const TASKS_ERROR: &str = "I could not read the task list.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Tone {
+pub(crate) enum Tone {
     #[default]
     Text,
     Heading,
@@ -64,11 +64,11 @@ pub enum Tone {
     Accent,
 }
 #[derive(Clone, Debug)]
-pub struct Row {
-    pub text: String,
-    pub prefix: String,
-    pub marker: String,
-    pub tone: Tone,
+pub(crate) struct Row {
+    pub(crate) text: String,
+    pub(crate) prefix: String,
+    pub(crate) marker: String,
+    pub(crate) tone: Tone,
 }
 impl Row {
     fn text(text: impl Into<String>) -> Self {
@@ -79,7 +79,7 @@ impl Row {
             tone: Tone::Text,
         }
     }
-    pub fn full_text(&self) -> String {
+    pub(crate) fn full_text(&self) -> String {
         [&self.prefix, &self.text, &self.marker]
             .into_iter()
             .filter(|part| !part.is_empty())
@@ -89,18 +89,18 @@ impl Row {
     }
 }
 #[derive(Default)]
-pub struct Overview {
-    pub sections: [Vec<Row>; 7],
-    pub progress: Option<(usize, usize)>,
-    pub active: usize,
-    pub needs: usize,
-    pub name: String,
+pub(crate) struct Overview {
+    pub(crate) sections: [Vec<Row>; 7],
+    pub(crate) progress: Option<(usize, usize)>,
+    pub(crate) active: usize,
+    pub(crate) needs: usize,
+    pub(crate) name: String,
     /// LEAN U4: only items that are behind; empty when nothing is stale.
-    pub stale: Vec<Row>,
+    pub(crate) stale: Vec<Row>,
     /// LEAN U1: today's total and the current round, already rendered.
-    pub cost: Vec<Row>,
+    pub(crate) cost: Vec<Row>,
     /// LEAN U5: Rolf's lists, each with its heading and one line per task.
-    pub tasks: Vec<Row>,
+    pub(crate) tasks: Vec<Row>,
 }
 
 /// One workflow word for a thread group, the same words Running now uses.
@@ -115,25 +115,25 @@ fn state_word(group: Group) -> &'static str {
 /// One shared poll for all local rows and the coordinator. Remote records
 /// are the courier's last observation, never a claim of fresh connectivity.
 #[derive(Default)]
-pub struct Live {
-    pub agents: Vec<Agent>,
-    pub panes: Vec<Pane>,
-    pub reachable: bool,
-    pub state: String,
+pub(crate) struct Live {
+    pub(crate) agents: Vec<Agent>,
+    pub(crate) panes: Vec<Pane>,
+    pub(crate) reachable: bool,
+    pub(crate) state: String,
     /// LEAN U4 and U1, refreshed on a slower cadence than the live poll.
-    pub stale: Stale,
-    pub cost: Cost,
+    pub(crate) stale: Stale,
+    pub(crate) cost: Cost,
     groups: BTreeMap<String, Group>,
 }
 impl Live {
     /// The slower scan: staleness and cost read files and, for the box server,
     /// one SSH call. Separate from the three-second live poll.
-    pub fn refresh_slow(&mut self, ctx: &Ctx, project: &Project) {
+    pub(crate) fn refresh_slow(&mut self, ctx: &Ctx, project: &Project) {
         self.stale = super::stale::scan(ctx, project);
         self.cost = super::cost::load(ctx, project);
     }
 
-    pub fn poll(&mut self, ctx: &Ctx, project: &Project) {
+    pub(crate) fn poll(&mut self, ctx: &Ctx, project: &Project) {
         if let Some(view) = threads::session_view(ctx, project) {
             self.agents = view.agents;
             self.panes = view.panes;
@@ -155,7 +155,7 @@ impl Live {
             self.reachable = false;
         }
     }
-    pub fn state(&self, project: &Project) -> &str {
+    pub(crate) fn state(&self, project: &Project) -> &str {
         if super::writer_suspended(project) {
             "other tab"
         } else if !self.reachable {
@@ -248,7 +248,7 @@ fn records<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> (Vec<T>, b
 }
 
 impl Overview {
-    pub fn load(
+    pub(crate) fn load(
         project: &Project,
         journal: &Journal,
         conversation: &Conversation,

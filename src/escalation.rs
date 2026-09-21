@@ -6,7 +6,7 @@ use crate::contracts::Event;
 use crate::paths::Ctx;
 use crate::{events, launch, project::Project, thread, threads};
 
-pub fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()> {
+pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()> {
     let Some(failure) = &event.payload.failed else {
         return Ok(());
     };
@@ -98,7 +98,7 @@ pub fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()> {
     Ok(())
 }
 
-pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first = None;
     for event in events::list(project)
         .into_iter()

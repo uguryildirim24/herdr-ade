@@ -17,19 +17,19 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const BOX_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Item {
-    pub what: String,
-    pub remedy: String,
+pub(crate) struct Item {
+    pub(crate) what: String,
+    pub(crate) remedy: String,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Stale {
-    pub items: Vec<Item>,
+pub(crate) struct Stale {
+    pub(crate) items: Vec<Item>,
 }
 
 /// Compare what is running with what is installed. Best effort: an unreadable
 /// source produces no row.
-pub fn scan(ctx: &Ctx, project: &Project) -> Stale {
+pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     let mut stale = Stale::default();
 
     // 1. This project screen, the running plugin binary against the installed

@@ -14,42 +14,40 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-pub mod doctor;
-pub mod folder;
-pub mod install;
-pub mod launch;
-pub mod provider;
-pub mod recipes;
-pub mod resume;
-pub mod sh;
+pub(crate) mod doctor;
+pub(crate) mod folder;
+pub(crate) mod install;
+pub(crate) mod launch;
+pub(crate) mod provider;
+pub(crate) mod recipes;
+pub(crate) mod resume;
+pub(crate) mod sh;
 
 #[cfg(test)]
 mod scenarios;
 
 /// The pinned pi package. Never a caret range, never `npm install -g`
 /// (SPEC-pi v2 §1, §3.2).
-pub const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+pub(crate) const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 /// The exact pin. Doctor refuses anything else (SPEC-pi v2 §3.2, §3.9).
-pub const PI_VERSION: &str = "0.85.1";
+pub(crate) const PI_VERSION: &str = "0.85.1";
 /// The package's `engines` floor (SPEC-pi v2 §1).
-pub const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
+pub(crate) const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
 /// The guard extension's file name and marker (SPEC-pi v2 §3.9).
-pub const GUARD_FILE: &str = "herdr-pi-guard.ts";
+const GUARD_FILE: &str = "herdr-pi-guard.ts";
 /// Version 2: no pre-ADE parent fallback; a context-length error is `error`.
-pub const GUARD_MARKER: &str = "herdr-pi-guard:version=2";
-/// The herdr state hook the running herdr writes (SPEC-pi v2 §3.3).
-pub const HERDR_EXTENSION_FILE: &str = "herdr-agent-state.ts";
+pub(crate) const GUARD_MARKER: &str = "herdr-pi-guard:version=2";
 
 /// The process environment, read once, so resolution never depends on plugin
 /// variables that are not there.
 #[derive(Debug, Clone)]
-pub struct Env {
+pub(crate) struct Env {
     vars: BTreeMap<String, String>,
-    pub home: PathBuf,
+    pub(crate) home: PathBuf,
 }
 
 impl Env {
-    pub fn from_process() -> Result<Self> {
+    pub(crate) fn from_process() -> Result<Self> {
         let vars: BTreeMap<String, String> = std::env::vars().collect();
         let home = vars
             .get("HOME")
@@ -60,7 +58,7 @@ impl Env {
     }
 
     #[cfg(test)]
-    pub fn for_test(home: &std::path::Path, vars: &[(&str, &str)]) -> Self {
+    pub(crate) fn for_test(home: &std::path::Path, vars: &[(&str, &str)]) -> Self {
         Env {
             vars: vars
                 .iter()
@@ -71,19 +69,19 @@ impl Env {
     }
 
     /// A variable's value; an empty value counts as unset.
-    pub fn var(&self, key: &str) -> Option<&str> {
+    pub(crate) fn var(&self, key: &str) -> Option<&str> {
         self.vars
             .get(key)
             .map(String::as_str)
             .filter(|v| !v.is_empty())
     }
 
-    pub fn expand_tilde(&self, path: &str) -> PathBuf {
+    pub(crate) fn expand_tilde(&self, path: &str) -> PathBuf {
         sh::expand_tilde(path, &self.home)
     }
 
     /// The herdr binary: `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
-    pub fn herdr_bin(&self) -> String {
+    pub(crate) fn herdr_bin(&self) -> String {
         self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
     }
 }
@@ -91,86 +89,82 @@ impl Env {
 /// Every path the pi library owns, all under one root
 /// (SPEC-pi v2 §3.1, §3.3).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Layout {
+pub(crate) struct Layout {
     /// `<ADE root>/pi`: `<HERDR_ADE_ROOT>/pi`, or `<root from
     /// config.toml>/pi`, or `~/.herdr-ade/pi`.
-    pub root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl Layout {
-    pub fn from_env(env: &Env) -> Result<Layout> {
+    pub(crate) fn from_env(env: &Env) -> Result<Layout> {
         Ok(Layout {
             root: resolve_root(env)?,
         })
     }
 
     #[cfg(test)]
-    pub fn for_test(root: impl Into<PathBuf>) -> Layout {
+    pub(crate) fn for_test(root: impl Into<PathBuf>) -> Layout {
         Layout { root: root.into() }
     }
 
     /// The pinned npm prefix (`npm install --prefix <this>`).
-    pub fn npm(&self) -> PathBuf {
+    pub(crate) fn npm(&self) -> PathBuf {
         self.root.join("npm")
     }
 
     /// The wrapper a cold restore reaches through `~/.local/bin/pi`.
-    pub fn wrapper(&self) -> PathBuf {
+    pub(crate) fn wrapper(&self) -> PathBuf {
         self.root.join("bin").join("pi")
     }
 
     /// `PI_CODING_AGENT_DIR` for every lane.
-    pub fn agent(&self) -> PathBuf {
+    pub(crate) fn agent(&self) -> PathBuf {
         self.root.join("agent")
     }
 
-    pub fn settings(&self) -> PathBuf {
+    pub(crate) fn settings(&self) -> PathBuf {
         self.agent().join("settings.json")
     }
 
-    pub fn models(&self) -> PathBuf {
+    pub(crate) fn models(&self) -> PathBuf {
         self.agent().join("models.json")
     }
 
-    pub fn auth(&self) -> PathBuf {
+    pub(crate) fn auth(&self) -> PathBuf {
         self.agent().join("auth.json")
     }
 
-    pub fn trust(&self) -> PathBuf {
+    pub(crate) fn trust(&self) -> PathBuf {
         self.agent().join("trust.json")
     }
 
-    pub fn extensions(&self) -> PathBuf {
+    pub(crate) fn extensions(&self) -> PathBuf {
         self.agent().join("extensions")
     }
 
-    pub fn guard(&self) -> PathBuf {
+    pub(crate) fn guard(&self) -> PathBuf {
         self.extensions().join(GUARD_FILE)
     }
 
-    pub fn herdr_extension(&self) -> PathBuf {
-        self.extensions().join(HERDR_EXTENSION_FILE)
-    }
-
-    pub fn sessions(&self) -> PathBuf {
+    pub(crate) fn sessions(&self) -> PathBuf {
         self.agent().join("sessions")
     }
 
     /// Per-thread session dirs for the two-lanes-one-cwd case (§3.3).
-    pub fn lanes(&self) -> PathBuf {
+    pub(crate) fn lanes(&self) -> PathBuf {
         self.root.join("lanes")
     }
 
     /// The pinned package folder inside the npm prefix.
-    pub fn package(&self) -> PathBuf {
+    pub(crate) fn package(&self) -> PathBuf {
         self.npm().join("node_modules").join(PI_PACKAGE)
     }
 
-    pub fn package_json(&self) -> PathBuf {
+    pub(crate) fn package_json(&self) -> PathBuf {
         self.package().join("package.json")
     }
 
-    pub fn cli_js(&self) -> PathBuf {
+    pub(crate) fn cli_js(&self) -> PathBuf {
         self.package().join("dist").join("bundle").join("cli.js")
     }
 }
@@ -183,7 +177,7 @@ impl Layout {
 /// `herdr-pi setup` run as an action would install into one folder while
 /// `ha thread start` in a coordinator shell, the ticker and `herdr-pi` from a
 /// terminal check another, and every pi start would be refused.
-pub fn resolve_root(env: &Env) -> Result<PathBuf> {
+pub(crate) fn resolve_root(env: &Env) -> Result<PathBuf> {
     let root = if let Some(dir) = env.var("HERDR_ADE_ROOT") {
         env.expand_tilde(dir)
     } else if let Some(root) = config_root(env)? {
@@ -218,7 +212,7 @@ fn config_root(env: &Env) -> Result<Option<String>> {
 
 /// The one-time login per provider (SPEC-pi v2 §2). The plugin prints these
 /// steps; Rolf types `/login` inside pi, in the shared folder.
-pub fn login_instructions() -> [(&'static str, &'static str, &'static str); 3] {
+pub(crate) fn login_instructions() -> [(&'static str, &'static str, &'static str); 3] {
     [
         (
             "openai-codex",

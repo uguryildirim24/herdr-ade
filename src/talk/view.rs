@@ -6,14 +6,14 @@ use super::{AnswerRef, Entry, Journal};
 use crate::{ask, contracts::Ask, contracts::TalkRequestState, project::Project};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
-    pub id: String,
-    pub revision: u32,
-    pub choices: usize,
+pub(crate) struct Target {
+    pub(crate) id: String,
+    pub(crate) revision: u32,
+    pub(crate) choices: usize,
 }
 
 #[derive(Debug, Clone)]
-pub enum Body {
+pub(crate) enum Body {
     Say { what: String, means: Option<String> },
     Rolf(String),
     Card { ask: Box<Ask>, state: CardState },
@@ -21,27 +21,27 @@ pub enum Body {
 }
 
 #[derive(Debug, Clone)]
-pub enum CardState {
+pub(crate) enum CardState {
     Open,
     Answered { choice: u32, text: String },
     AskedAgain,
 }
 
 #[derive(Debug, Clone)]
-pub struct Item {
-    pub at: String,
-    pub body: Body,
-    pub delivery: Option<TalkRequestState>,
+pub(crate) struct Item {
+    pub(crate) at: String,
+    pub(crate) body: Body,
+    pub(crate) delivery: Option<TalkRequestState>,
 }
 
 #[derive(Debug, Default)]
-pub struct Conversation {
-    pub items: Vec<Item>,
-    pub open: Vec<Ask>,
-    pub latest_at: String,
+pub(crate) struct Conversation {
+    pub(crate) items: Vec<Item>,
+    pub(crate) open: Vec<Ask>,
+    pub(crate) latest_at: String,
 }
 
-pub fn clock(at: &str) -> String {
+pub(crate) fn clock(at: &str) -> String {
     local(at)
         .map(|z| z.strftime("%H:%M").to_string())
         .unwrap_or_else(|| "--:--".into())
@@ -53,12 +53,12 @@ fn local(at: &str) -> Option<jiff::Zoned> {
             .to_zoned(jiff::tz::TimeZone::system()),
     )
 }
-pub fn date(at: &str) -> String {
+pub(crate) fn date(at: &str) -> String {
     local(at)
         .map(|z| z.strftime("%a %d %b").to_string())
         .unwrap_or_default()
 }
-pub fn delivery(state: TalkRequestState) -> &'static str {
+pub(crate) fn delivery(state: TalkRequestState) -> &'static str {
     match state {
         TalkRequestState::Queued => "queued",
         TalkRequestState::Submitted => "sent",
@@ -68,7 +68,7 @@ pub fn delivery(state: TalkRequestState) -> &'static str {
 }
 
 impl Conversation {
-    pub fn load(project: &Project, journal: &Journal) -> Self {
+    pub(crate) fn load(project: &Project, journal: &Journal) -> Self {
         let mut lines: Vec<_> = journal.lines.iter().collect();
         lines.sort_by_key(|l| l.seq);
         let mut states = BTreeMap::new();
@@ -257,7 +257,7 @@ impl Conversation {
         result
     }
 
-    pub fn replay(&self) -> String {
+    pub(crate) fn replay(&self) -> String {
         let mut out = String::new();
         let mut day = String::new();
         for item in &self.items {
@@ -311,21 +311,21 @@ impl Conversation {
 }
 
 #[derive(Default)]
-pub struct Selection {
-    pub selected: Option<AnswerRef>,
+pub(crate) struct Selection {
+    pub(crate) selected: Option<AnswerRef>,
     /// Set only after a frame was actually drawn. Never changed by refresh.
-    pub drawn: Option<Target>,
+    pub(crate) drawn: Option<Target>,
 }
 impl Selection {
-    pub fn refresh(&mut self, open: &[Ask]) {
+    pub(crate) fn refresh(&mut self, open: &[Ask]) {
         if !open.iter().any(|a| self.matches(a)) {
             self.selected = open.last().map(reference);
         }
     }
-    pub fn matches(&self, a: &Ask) -> bool {
+    pub(crate) fn matches(&self, a: &Ask) -> bool {
         self.selected.as_ref() == Some(&reference(a))
     }
-    pub fn next(&mut self, open: &[Ask]) {
+    pub(crate) fn next(&mut self, open: &[Ask]) {
         if open.is_empty() {
             return;
         }
@@ -346,12 +346,12 @@ fn reference(a: &Ask) -> AnswerRef {
 /// Only complete bytes advance the cursor. A cut tail is retried on the next
 /// poll; truncation resets the view instead of retaining phantom entries.
 #[derive(Default)]
-pub struct JournalReader {
-    pub journal: Journal,
+pub(crate) struct JournalReader {
+    pub(crate) journal: Journal,
     offset: u64,
 }
 impl JournalReader {
-    pub fn refresh(&mut self, project: &Project) -> std::io::Result<()> {
+    pub(crate) fn refresh(&mut self, project: &Project) -> std::io::Result<()> {
         let mut file = match std::fs::File::open(super::journal_path(project)) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

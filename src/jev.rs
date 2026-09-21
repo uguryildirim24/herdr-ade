@@ -10,30 +10,30 @@ use serde_json::Value;
 use crate::paths::Ctx;
 use crate::runner::Cmd;
 
-pub const URL: &str = "https://api.typesafe.ai/v1/systemone";
+pub(crate) const URL: &str = "https://api.typesafe.ai/v1/systemone";
 /// The authenticated endpoint accepted ordinary requests but refused the
 /// measured 750 KiB review request. Keep a wide margin below that boundary.
-pub const REQUEST_BYTE_CAP: usize = 256 * 1024;
+pub(crate) const REQUEST_BYTE_CAP: usize = 256 * 1024;
 const STATUS_MARKER: &str = "\nHERDR_HTTP_STATUS:";
 const ERROR_TEXT_CAP: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Score {
-    pub score: f64,
-    pub confidence: f64,
-    pub probabilities: BTreeMap<String, f64>,
+pub(crate) struct Score {
+    pub(crate) score: f64,
+    pub(crate) confidence: f64,
+    pub(crate) probabilities: BTreeMap<String, f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Assessment {
-    pub scores: BTreeMap<String, Score>,
-    pub model: String,
-    pub usage: Value,
-    pub response: Value,
+pub(crate) struct Assessment {
+    pub(crate) scores: BTreeMap<String, Score>,
+    pub(crate) model: String,
+    pub(crate) usage: Value,
+    pub(crate) response: Value,
 }
 
 /// Only explicit endpoint size refusals permit an unscored, conservative pick.
 #[derive(Debug)]
-pub struct OversizedRequest(pub String);
+pub(crate) struct OversizedRequest(String);
 impl std::fmt::Display for OversizedRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -50,7 +50,11 @@ fn token_limit_code(value: &Value) -> bool {
     }
 }
 
-pub fn call(ctx: &Ctx, body: &Value, questions: &BTreeMap<String, Value>) -> Result<Assessment> {
+pub(crate) fn call(
+    ctx: &Ctx,
+    body: &Value,
+    questions: &BTreeMap<String, Value>,
+) -> Result<Assessment> {
     let key = ctx
         .env
         .var("TYPESAFE_API_KEY")
@@ -154,7 +158,7 @@ fn safe_error_text(text: &str, key: &str) -> String {
 }
 
 #[cfg(test)]
-pub fn http_response(body: &str, status: u16) -> String {
+pub(crate) fn http_response(body: &str, status: u16) -> String {
     format!("{body}{STATUS_MARKER}{status}")
 }
 
@@ -162,7 +166,7 @@ fn probability(v: f64) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
 
-pub fn parse(text: &str, questions: &BTreeMap<String, Value>) -> Result<Assessment> {
+pub(crate) fn parse(text: &str, questions: &BTreeMap<String, Value>) -> Result<Assessment> {
     let value: Value = serde_json::from_str(text).context("jev_response: invalid JSON")?;
     let mut scores = BTreeMap::new();
     for (id, question) in questions {

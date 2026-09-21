@@ -53,7 +53,7 @@ mod ticker;
 
 /// Crate version plus a build identifier (short git hash and build time), so a
 /// rebuilt binary always differs from the one a running ticker was started from.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD_ID"));
+pub(crate) const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD_ID"));
 
 /// A herdr server that was not started from a login shell hands its plugins a
 /// minimal `PATH`, so `gh`, `rsync` or the agent CLI may be missing for the

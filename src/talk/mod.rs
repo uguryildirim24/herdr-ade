@@ -29,21 +29,21 @@ use crate::project::{self, Project};
 
 mod cost;
 mod overview;
-pub mod screen;
+pub(crate) mod screen;
 mod stale;
 pub(crate) mod tasks;
 mod theme;
-pub mod view;
+pub(crate) mod view;
 
 /// Entries are bounded (D18 item 6).
-pub const MAX_ENTRY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_ENTRY_BYTES: usize = 64 * 1024;
 
 /// One journal entry. Serialized flattened next to `seq`, so an inbound line
 /// is `{"seq":n,...,"inbound":{...}}` and also parses as A0's
 /// `TalkJournalRecord`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Entry {
+pub(crate) enum Entry {
     Inbound(TalkInbound),
     /// Rolf's own line, shown as typed.
     Rolf {
@@ -76,40 +76,40 @@ pub enum Entry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AnswerRef {
-    pub id: String,
-    pub revision: u32,
+pub(crate) struct AnswerRef {
+    pub(crate) id: String,
+    pub(crate) revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Line {
-    pub seq: u64,
+pub(crate) struct Line {
+    pub(crate) seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
+    pub(crate) key: Option<String>,
     #[serde(default)]
-    pub at: String,
+    pub(crate) at: String,
     #[serde(flatten)]
-    pub entry: Entry,
+    pub(crate) entry: Entry,
 }
 
-pub fn talk_dir(project: &Project) -> PathBuf {
+pub(crate) fn talk_dir(project: &Project) -> PathBuf {
     project.dir().join("talk")
 }
 
-pub fn journal_path(project: &Project) -> PathBuf {
+pub(crate) fn journal_path(project: &Project) -> PathBuf {
     talk_dir(project).join("journal.jsonl")
 }
 
 #[derive(Debug, Default)]
-pub struct Journal {
-    pub lines: Vec<Line>,
+pub(crate) struct Journal {
+    pub(crate) lines: Vec<Line>,
     /// Complete lines that did not parse (a terminated partial tail).
-    pub skipped: usize,
+    pub(crate) skipped: usize,
     /// The file ends without a newline: a write was cut.
-    pub tail_incomplete: bool,
+    pub(crate) tail_incomplete: bool,
 }
 
-pub fn parse(bytes: &[u8]) -> Journal {
+pub(crate) fn parse(bytes: &[u8]) -> Journal {
     let mut journal = Journal::default();
     let text = String::from_utf8_lossy(bytes);
     journal.tail_incomplete = !text.is_empty() && !text.ends_with('\n');
@@ -128,7 +128,7 @@ pub fn parse(bytes: &[u8]) -> Journal {
     journal
 }
 
-pub fn read(project: &Project) -> Journal {
+pub(crate) fn read(project: &Project) -> Journal {
     parse(&std::fs::read(journal_path(project)).unwrap_or_default())
 }
 
@@ -149,7 +149,7 @@ fn lock_file(project: &Project, name: &str) -> Result<Locked> {
 
 /// Appends one entry under the journal lock and fsyncs. With `key`, an entry
 /// already carrying that key is not appended again (`Ok(None)`).
-pub fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Option<u64>> {
+pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Option<u64>> {
     let _lock = lock_file(project, "journal.lock")?;
     let path = journal_path(project);
     let bytes = std::fs::read(&path).unwrap_or_default();
@@ -200,7 +200,7 @@ pub fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Opti
 // ------------------------------------------------------------- settings
 
 /// `talk` in `PROJECT.md` front matter, else on for a `claude` coordinator.
-pub fn enabled(project: &Project) -> bool {
+pub(crate) fn enabled(project: &Project) -> bool {
     if let Ok((settings, _)) = project.read_project_md()
         && let Some(on) = settings.talk
     {
@@ -211,7 +211,7 @@ pub fn enabled(project: &Project) -> bool {
 
 /// The kind the coordinator was launched with (the `coordinator` role at
 /// `open`, SPEC-ADE D2); `claude`, the plugin default, before the first open.
-pub fn coordinator_kind(project: &Project) -> String {
+pub(crate) fn coordinator_kind(project: &Project) -> String {
     project
         .coordinator()
         .map(|c| c.launch.kind)
@@ -243,7 +243,7 @@ fn native_path(project: &Project) -> PathBuf {
 
 /// True while Rolf works in the native pane (`!native` until `!back`). The
 /// outbox's writer (A2) must not type into the coordinator while this holds.
-pub fn writer_suspended(project: &Project) -> bool {
+pub(crate) fn writer_suspended(project: &Project) -> bool {
     std::fs::read_to_string(native_path(project))
         .ok()
         .and_then(|t| toml::from_str::<Native>(&t).ok())
@@ -264,18 +264,18 @@ fn set_suspended(project: &Project, on: bool) -> Result<()> {
 
 /// The serialized writer's lock for this coordinator (D8). A2's outbox takes
 /// the same lock around its read-and-prompt.
-pub struct WriterLock {
+pub(crate) struct WriterLock {
     _lock: Locked,
 }
 
-pub fn writer_lock(project: &Project) -> Result<WriterLock> {
+pub(crate) fn writer_lock(project: &Project) -> Result<WriterLock> {
     Ok(WriterLock {
         _lock: lock_file(project, "writer.lock")?,
     })
 }
 
 /// The latest state of every request, in the order they were queued.
-pub fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
+pub(crate) fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
     let mut order: Vec<String> = Vec::new();
     let mut state: std::collections::BTreeMap<String, TalkInbound> = Default::default();
     let mut text: std::collections::BTreeMap<String, String> = Default::default();
@@ -335,7 +335,7 @@ fn coordinator_state(ctx: &Ctx, project: &Project) -> Option<String> {
 
 /// Sends queued requests in order through the serialized writer. Only
 /// `queued` requests are ever sent; `uncertain` ones are never re-sent.
-pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkRequestState)>> {
+fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkRequestState)>> {
     let _writer = writer_lock(project)?;
     let mut out = Vec::new();
     if writer_suspended(project) {
@@ -407,7 +407,7 @@ pub fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkR
 }
 
 /// Rolf typed a line: journal the intent first, then hand it to the writer.
-pub fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
+fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
     submit_with_answer(ctx, project, text, None)
 }
 
@@ -456,7 +456,7 @@ fn submit_with_answer(
 
 /// Called when the coordinator's turn ends after a submission (the
 /// correction hook, A2): every `submitted` request becomes `accepted`.
-pub fn mark_accepted(project: &Project) -> Result<usize> {
+pub(crate) fn mark_accepted(project: &Project) -> Result<usize> {
     let submitted: Vec<TalkInbound> = requests(&read(project))
         .into_iter()
         .map(|(i, _)| i)
@@ -471,7 +471,7 @@ pub fn mark_accepted(project: &Project) -> Result<usize> {
 
 /// Ordinary input keeps the existing commands and delivery path. Numeric
 /// answering is exclusively the screen's last-drawn binding, never text parsing.
-pub fn handle(ctx: &Ctx, project: &Project, line: &str) -> Result<()> {
+pub(crate) fn handle(ctx: &Ctx, project: &Project, line: &str) -> Result<()> {
     match line.trim() {
         "!stop" => {
             if let Some((h, pane)) = coordinator_herdr(ctx, project) {
@@ -538,7 +538,7 @@ fn answer(ctx: &Ctx, project: &Project, target: &view::Target, choice: u32) -> R
     Ok(())
 }
 
-pub fn replay(ctx: &Ctx, slug: &str) -> Result<String> {
+pub(crate) fn replay(ctx: &Ctx, slug: &str) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     Ok(view::Conversation::load(&project, &read(&project)).replay())
 }
@@ -546,10 +546,10 @@ pub fn replay(ctx: &Ctx, slug: &str) -> Result<String> {
 // ------------------------------------------------------------ tab and tick
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SurfaceTab {
-    pub tab_id: String,
-    pub pane_id: String,
-    pub created: String,
+pub(crate) struct SurfaceTab {
+    pub(crate) tab_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) created: String,
 }
 
 fn surface_path(project: &Project) -> PathBuf {
@@ -559,7 +559,7 @@ fn surface_path(project: &Project) -> PathBuf {
 /// Creates the `talk` tab in the coordinator workspace when talk is on and
 /// the recorded tab is gone, and runs `ha talk <slug>` in it. Called by
 /// `ha open` (A2's `coordinator::open`) after the coordinator is bound.
-pub fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceTab>> {
+pub(crate) fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceTab>> {
     if !enabled(project) {
         return Ok(None);
     }
@@ -611,7 +611,7 @@ pub fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceTab>> {
 
 /// Ticker pass: a fixed notice when the coordinator reads `blocked` (once per
 /// episode), and queued requests sent when it is ready.
-pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     if !enabled(project) || !journal_path(project).exists() {
         return Ok(());
     }
