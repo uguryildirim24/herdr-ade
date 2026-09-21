@@ -252,7 +252,9 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let entries: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["outcome"], "listed");
+    let entries = result["data"]["result"].as_array().unwrap();
     assert_eq!(entries[0]["count"], 2);
     assert_eq!(entries[0]["kind"], "command-failed");
     let id = entries[0]["id"].as_str().unwrap();
@@ -272,8 +274,9 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
     assert!(ledger(&["done", id]).status.success());
     let shown: serde_json::Value = serde_json::from_slice(&ledger(&["show", id]).stdout).unwrap();
     assert_eq!(shown["closed"], true);
-    let open: Vec<serde_json::Value> =
+    let listed: serde_json::Value =
         serde_json::from_slice(&ledger(&["list", "--json"]).stdout).unwrap();
+    let open = listed["data"]["result"].as_array().unwrap();
     assert!(open.iter().all(|entry| entry["id"] != id));
 }
 
@@ -312,6 +315,76 @@ fn path_like_names_and_slugs_are_refused() {
     );
     assert!(!root.exists());
     assert!(!home.path().join("x").exists());
+}
+
+#[test]
+fn every_named_verb_returns_a_structured_refusal() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("missing-root");
+    let root_arg = root.to_str().unwrap();
+    let cases: &[&[&str]] = &[
+        &["round", "show", "missing", "r1"],
+        &["thread", "show", "missing", "t-1"],
+        &["ask"],
+        &["decide"],
+        &["plan", "show", "--project", "missing"],
+        &["say", "--what", "This was checked.", "--project", "missing"],
+        &["done", "--report", "report.md", "--sha", "deadbeef"],
+        &["thread", "resolve", "missing", "t-1"],
+        &["context", "missing"],
+        &["doctor", "unexpected"],
+        &["harness", "unexpected"],
+        &["inbox", "done", "missing", "--all"],
+        &["open", "missing"],
+    ];
+    for args in cases {
+        let mut full = vec!["--root", root_arg, "--json"];
+        full.extend_from_slice(args);
+        let output = hp(home.path(), &full);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {:?}", output.stderr);
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "refused", "{args:?}: {result}");
+        assert_eq!(
+            result["command"]
+                .as_str()
+                .and_then(|command| command.split_whitespace().next()),
+            args.first().copied(),
+            "{args:?}: {result}"
+        );
+        assert!(
+            result["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{args:?}: {result}"
+        );
+    }
+}
+
+#[test]
+fn successful_commands_keep_human_text_and_return_one_machine_record() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let ordinary = hp(home.path(), &["--root", root_arg, "new", "demo"]);
+    assert!(ordinary.status.success());
+    assert!(String::from_utf8_lossy(&ordinary.stdout).starts_with("created `demo`"));
+
+    let structured = hp(
+        home.path(),
+        &["--root", root_arg, "context", "demo", "--peek", "--json"],
+    );
+    assert!(structured.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(result["outcome"], "shown");
+    assert_eq!(result["command"], "context");
+    assert_eq!(result["data"]["slug"], "demo");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Commands: ")
+    );
 }
 
 #[test]
