@@ -1083,6 +1083,14 @@ pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thre
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+    // Serialize manual starts with automatic starts and moved-base repairs.
+    let _advance = advance_lock(&project)?;
+    // Refuse before launching a thread, not later in bind_reviewer.
+    let record = load(&project, round)?;
+    require_mutable(&record)?;
+    if record.verdict.is_some() {
+        bail!("verdict_already_accepted: run `round review {slug} {round}` first");
+    }
     // The pins are the input: refresh them before deciding, as `advance` does.
     let events = sealed_events(&project)?;
     {
@@ -1112,9 +1120,9 @@ pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thre
         );
     }
     let review_branch = reviewer_branch(ctx, slug, round, &record)?;
-    let thread = start_reviewer(ctx, &project, round, &review_branch, &prefix)?;
-    bind_reviewer(ctx, slug, round, &thread.id)?;
-    Ok(thread)
+    let id = start_and_bind_reviewer(ctx, &project, slug, round, &review_branch, &prefix)?
+        .context("reviewer_start_failed: the failure is recorded on the round")?;
+    thread::load(&project, &id)
 }
 
 // ------------------------------------------------------------------ advance
@@ -5067,6 +5075,35 @@ mod tests {
 
         let error = err(start_reviewer_by_hand(&ctx, "demo", "r1"));
         assert!(error.starts_with("reviewer_already_bound"), "{error}");
+    }
+
+    #[test]
+    fn manual_reviewer_refuses_an_abandoned_round_before_starting_a_thread() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        review(&ctx, "demo", "r1").unwrap();
+        abandon(&ctx, "demo", "r1", "superseded").unwrap();
+        let before = thread::list(&fx.project).len();
+        let error = err(start_reviewer_by_hand(&ctx, "demo", "r1"));
+        assert!(error.starts_with("round_closed"), "{error}");
+        assert_eq!(thread::list(&fx.project).len(), before);
+    }
+
+    #[test]
+    fn manual_reviewer_records_a_failed_start_for_automatic_retry() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        assert!(start_reviewer_by_hand(&ctx, "demo", "r1").is_err());
+        assert_eq!(load(&fx.project, "r1").unwrap().reviewer_start_failures, 1);
     }
 
     /// A lane stays held through the merge intent and checkpoint, with no override.
