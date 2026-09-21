@@ -1278,11 +1278,33 @@ pub struct RetryOutcome {
 /// `restart` command this deliberately replaces a live, blocked, or stuck
 /// process, and every invocation advances the editable routing policy.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
+    retry_with_ticker(ctx, slug, id, reason, ticker::start)
+}
+
+/// Round recovery already holds the advance lock, so it must not replace and
+/// wait for a ticker which may itself be waiting for that lock.
+pub(crate) fn retry_during_advance(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+) -> Result<RetryOutcome> {
+    retry_with_ticker(ctx, slug, id, reason, ticker::ensure)
+}
+
+fn retry_with_ticker(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+    ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
+) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     // A crash after the attempt transition but before placement resumes the
     // same selected attempt. It must not spend another routing recovery.
     if record.escalation_pending {
+        ensure_ticker(ctx)?;
         place_escalation(ctx, &project, &record)?;
         let placed = thread::load(&project, id)?;
         return Ok(RetryOutcome {
@@ -1343,7 +1365,7 @@ pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutco
         Ok(())
     })?;
 
-    ticker::start(ctx)?;
+    ensure_ticker(ctx)?;
     place_escalation(ctx, &project, &thread::load(&project, id)?)?;
     let placed = thread::load(&project, id)?;
     Ok(RetryOutcome {

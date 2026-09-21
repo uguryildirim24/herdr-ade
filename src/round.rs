@@ -1217,7 +1217,7 @@ pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Recover
     let record = load(&project, round)?;
     require_mutable(&record)?;
     if let Some(reviewer) = record.reviewer.as_deref() {
-        let retried = crate::threads::retry(ctx, slug, reviewer, reason)?;
+        let retried = crate::threads::retry_during_advance(ctx, slug, reviewer, reason)?;
         return Ok(RecoveryOutcome {
             round: round.to_string(),
             action: "retried".into(),
@@ -1257,6 +1257,33 @@ pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Recover
     })
 }
 
+fn require_reviewer_base(
+    git: &Git,
+    record: &RoundRecord,
+    candidate: &thread::Thread,
+) -> Result<()> {
+    let expected = record.review_branch.as_deref().context("review_missing")?;
+    if candidate.repo != record.repo {
+        bail!(
+            "reviewer_repo_mismatch: `{}` belongs to `{}`, expected `{}`",
+            candidate.id,
+            candidate.repo,
+            record.repo
+        );
+    }
+    let head = git
+        .branch_head(expected)?
+        .with_context(|| format!("reviewer_branch_missing: `{expected}` has no local head"))?;
+    if candidate.base != head {
+        bail!(
+            "reviewer_branch_mismatch: `{}` started from `{}`, expected the current `{expected}` head `{head}`",
+            candidate.id,
+            candidate.base
+        );
+    }
+    Ok(())
+}
+
 /// Bind an already recorded, live reviewer thread to this round after checking
 /// its role and exact review base.
 pub fn rebind(ctx: &Ctx, slug: &str, round: &str, reviewer: &str) -> Result<RecoveryOutcome> {
@@ -1271,13 +1298,8 @@ pub fn rebind(ctx: &Ctx, slug: &str, round: &str, reviewer: &str) -> Result<Reco
             candidate.role
         );
     }
-    let expected = record.review_branch.as_deref().context("review_missing")?;
-    if candidate.base != expected {
-        bail!(
-            "reviewer_branch_mismatch: `{reviewer}` started from `{}`, expected `{expected}`",
-            candidate.base
-        );
-    }
+    let git = Git::new(ctx.runner, &record.repo);
+    require_reviewer_base(&git, &record, &candidate)?;
     if !matches!(
         reviewer_state(ctx, &project, reviewer),
         ReviewerState::Alive
@@ -1310,20 +1332,30 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
     })?;
 
     if candidate.role == "reviewer" {
-        let expected = record.review_branch.as_deref().context("review_missing")?;
-        if candidate.base != expected {
-            bail!(
-                "reviewer_branch_mismatch: `{id}` started from `{}`, expected `{expected}`",
-                candidate.base
-            );
-        }
         let git = Git::new(ctx.runner, &record.repo);
+        require_reviewer_base(&git, &record, &candidate)?;
         validate_verdict_inner(&git, &record, &pin.sha, false)?;
         if let Some(bound) = record.reviewer.as_deref()
             && bound != id
-            && !reviewer_gone(ctx, &project, bound)
         {
-            bail!("reviewer_already_bound: `{bound}` already reviews `{round}`");
+            if !reviewer_gone(ctx, &project, bound) {
+                bail!("reviewer_already_bound: `{bound}` already reviews `{round}`");
+            }
+            let cleanup = crate::threads::cancel(
+                ctx,
+                slug,
+                bound,
+                &format!("replaced by adopted reviewer {id} for {round}"),
+            )?;
+            if cleanup.state == "cleanup_pending" {
+                eprintln!(
+                    "reviewer cleanup pending for {bound}: {}",
+                    cleanup
+                        .worktree_reason
+                        .as_deref()
+                        .unwrap_or("session unreachable")
+                );
+            }
         }
         let mut current = load(&project, round)?;
         if current.verdict.as_ref() == Some(&pin) && current.reviewer.as_deref() == Some(id) {
@@ -1706,13 +1738,17 @@ fn start_and_bind_reviewer(
 ) -> Result<Option<String>> {
     crate::ledger::retry_after_failure(project, "reviewer-start-failed", round);
     // A crash can happen after the reviewer thread record is placed but before
-    // the round record is written. Recover that exact current-branch thread;
-    // never allocate a duplicate reviewer for the same immutable review.
+    // the round record is written. Placement replaces `base = review/rN` with
+    // the task commit it added at that branch's head, so recognize both sides
+    // of that transition and never allocate a duplicate reviewer.
+    let git = Git::new(ctx.runner, &load(project, round)?.repo);
+    let review_head = git.branch_head(review_branch)?;
     let unbound: Vec<thread::Thread> = thread::list(project)
         .into_iter()
         .filter(|candidate| {
             candidate.role == "reviewer"
-                && candidate.base == review_branch
+                && (candidate.base == review_branch
+                    || review_head.as_deref() == Some(candidate.base.as_str()))
                 && matches!(
                     candidate.status,
                     thread::Status::Starting | thread::Status::Open
@@ -3800,6 +3836,37 @@ mod tests {
         (c, v)
     }
 
+    /// Writes an unbound reviewer's structurally shaped verdict on the review
+    /// branch so recovery validation can be exercised directly.
+    fn adoptable_reviewer(
+        fx: &Fx,
+        lanes: &[(String, String)],
+        front: impl FnOnce(&str, &RoundRecord) -> String,
+        base: Option<&str>,
+    ) -> String {
+        let record = load(&fx.project, "r1").unwrap();
+        let wt = fx.repo.join(".worktrees/review-r1");
+        let mut args = vec!["merge", "-q", "--no-edit"];
+        args.extend(lanes.iter().map(|(_, sha)| sha.as_str()));
+        git(&wt, &args);
+        let c = git(&wt, &["rev-parse", "HEAD"]);
+        let v = commit_file(
+            &wt,
+            &verdict_path("r1"),
+            &front(&c, &record),
+            "unbound verdict r1",
+        );
+        let reviewer = fx.thread("Unbound reviewer");
+        thread::update(&fx.project, &reviewer, |candidate| {
+            candidate.role = "reviewer".into();
+            candidate.repo = record.repo.clone();
+            candidate.base = base.unwrap_or(&v).into();
+        })
+        .unwrap();
+        fx.seal_done(&reviewer, 1, 1, &v, "# verdict report\n");
+        reviewer
+    }
+
     fn front(verdict: &str, round: &str) -> impl FnOnce(&str, &RoundRecord) -> String {
         let verdict = verdict.to_string();
         let round = round.to_string();
@@ -5554,6 +5621,12 @@ mod tests {
         let task = std::fs::read_to_string(thread::task_path(&fx.project, &started.id)).unwrap();
         assert!(task.contains("skill reviewer"), "{task}");
         assert!(task.contains("tasks/review-r1.md"), "{task}");
+
+        // Simulate a crash after placement moved `base` from the review branch
+        // name to its task commit, but before the round binding was saved.
+        let mut record = load(&fx.project, "r1").unwrap();
+        record.reviewer = None;
+        save(&fx.project, &record).unwrap();
         advance(&ctx, "demo").unwrap();
         assert_eq!(
             thread::list(&fx.project)
@@ -5561,6 +5634,70 @@ mod tests {
                 .filter(|thread| thread.role == "reviewer")
                 .count(),
             1
+        );
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(started.id.as_str())
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_a_verdict_with_mismatched_recovery_evidence() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = adoptable_reviewer(
+            &fx,
+            &lanes,
+            |_, record| front("MERGE", "r1")("not-the-parent", record),
+            None,
+        );
+        assert!(
+            err(adopt(&fx.world.ctx(), "demo", "r1", &reviewer)).starts_with("verdict_candidate")
+        );
+
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = adoptable_reviewer(&fx, &lanes, front("MERGE", "r1"), Some("wrong-base"));
+        assert!(
+            err(adopt(&fx.world.ctx(), "demo", "r1", &reviewer))
+                .starts_with("reviewer_branch_mismatch")
+        );
+
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = adoptable_reviewer(
+            &fx,
+            &lanes,
+            |c, record| {
+                let mut text = front("MERGE", "r1")(c, record);
+                text = text.replace(
+                    record.manifest_hash.as_deref().unwrap(),
+                    "wrong-manifest-hash",
+                );
+                text
+            },
+            None,
+        );
+        assert!(
+            err(adopt(&fx.world.ctx(), "demo", "r1", &reviewer))
+                .starts_with("verdict_manifest_mismatch")
+        );
+
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = adoptable_reviewer(
+            &fx,
+            &lanes,
+            |c, record| {
+                let mut text = front("MERGE", "r1")(c, record);
+                text = text.replace(&record.policy_hash, "wrong-policy-hash");
+                text
+            },
+            None,
+        );
+        assert!(
+            err(adopt(&fx.world.ctx(), "demo", "r1", &reviewer))
+                .starts_with("verdict_manifest_mismatch")
         );
     }
 
