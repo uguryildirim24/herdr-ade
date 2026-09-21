@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0160.md",
+      "tasks/review-r69.md",
+      "tasks/review-r68.md",
+      "tasks/t-0159.md",
       "tasks/t-0158.md",
       "tasks/t-0156.md",
       "tasks/t-0155.md",
@@ -18,17 +22,14 @@
       "tasks/review-r67.md",
       "tasks/t-0157.md",
       "tasks/t-0153.md",
-      "tasks/review-r66.md",
-      "tasks/t-0152.md",
-      "tasks/t-0151.md",
-      "tasks/review-r65.md",
-      "tasks/t-0150.md"
+      "tasks/review-r66.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r68.md",
       "tasks/reviews/code-r67.md",
       "tasks/reviews/code-r66.md",
       "tasks/reviews/code-r65.md",
@@ -39,18 +40,23 @@
       "tasks/reviews/code-r61.md",
       "tasks/reviews/code-r58.md",
       "tasks/reviews/code-r57.md",
-      "tasks/reviews/code-r56.md",
-      "tasks/reviews/code-r55.md"
+      "tasks/reviews/code-r56.md"
     ]
   },
-  "generated": "2026-09-21T12:53:53-04:00",
+  "generated": "2026-09-21T13:17:55-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0158-review-r67-this-round-makes-your-talk-ta",
+      "hp/adeherdr/t-0162-review-r69-this-round-makes-your-talk-ta",
       "main",
+      "review/r69",
+      "hp/adeherdr/t-0160-review-r68-this-round-starts-a-check-on",
+      "hp/adeherdr/t-0161-review-r69-this-round-makes-your-talk-ta",
+      "hp/adeherdr/t-0159-the-talk-screen-always-moves-to-the-inst",
+      "review/r68",
+      "hp/adeherdr/t-0157-a-reviewer-always-ends-up-running",
+      "hp/adeherdr/t-0158-review-r67-this-round-makes-your-talk-ta",
       "review/r67-2",
       "hp/adeherdr/t-0156-review-r67-this-round-makes-your-talk-ta",
-      "hp/adeherdr/t-0157-a-reviewer-always-ends-up-running",
       "review/r67",
       "hp/adeherdr/t-0155-review-r67-this-round-makes-your-talk-ta",
       "hp/adeherdr/t-0153-review-r66-this-round-makes-every-comman",
@@ -254,22 +260,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "7b34bfe docs(review): round r67 repair verdict",
-      "b7cc28e Merge commit 'a2ba114f7fafdc2546a09c4a2d351358dd1d1d76' into hp/adeherdr/t-0158-review-r67-this-round-makes-your-talk-ta",
-      "5c0f316 docs(tasks): t-0158",
-      "f010a15 review(r67): brief for revision 1",
-      "2f35b31 docs(tasks): t-0157",
-      "0e3655e checkpoint(r66): HANDOFF after merging the round"
+      "f6e498c Merge commit '366655cf80224c6ec358a2d6fbc2893a8031fa3f'",
+      "366655c review(r68): verdict",
+      "e19f2d9 review(r69): brief for revision 1",
+      "034dd1c review(round): keep one ticker advance pass",
+      "d6a8359 Merge t-0157 into review r68",
+      "2287228 docs(tasks): t-0160"
     ],
-    "remote": "10 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "7b34bfe",
+        "head": "f6e498c",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r67 repair verdict"
+        "subject": "Merge commit '366655cf80224c6ec358a2d6fbc2893a8031fa3f'"
       },
       {
         "branch": "review/r1",
@@ -711,6 +717,20 @@
         "head": "5c0f316",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r67-2",
         "subject": "docs(tasks): t-0158"
+      },
+      {
+        "branch": "review/r68",
+        "dirty": 0,
+        "head": "2287228",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r68",
+        "subject": "docs(tasks): t-0160"
+      },
+      {
+        "branch": "review/r69",
+        "dirty": 0,
+        "head": "e5dde6a",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r69",
+        "subject": "docs(tasks): t-0162"
       },
       {
         "branch": "review/r7",
@@ -1236,6 +1256,13 @@
         "head": "8e241ec",
         "path": "/home/agent/projects/herdr-ade/.worktrees/t-0155",
         "subject": "docs(tasks): t-0155"
+      },
+      {
+        "branch": "hp/adeherdr/t-0162-review-r69-this-round-makes-your-talk-ta",
+        "dirty": 0,
+        "head": "aeb46dc",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0162",
+        "subject": "merge(talk): t-0159 installed binary hand-off"
       }
     ]
   },
@@ -1260,15 +1287,38 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r67",
-    "verdict": "7b34bfe9d7a4b49c1f4c69d881c9b4a2162be77b"
+    "round": "r68",
+    "verdict": "366655cf80224c6ec358a2d6fbc2893a8031fa3f"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [],
+  "workers": [
+    {
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0162",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0162",
+      "pane_id": "w1G:p3D",
+      "pane_label": null,
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0162--/2026-09-21T17-07-53-761Z_01a0c4f0-3d21-70de-9c9a-3a46f2841454.jsonl",
+      "start_args": [],
+      "status": "working",
+      "tab_id": "w1G:t39",
+      "tab_label": "t-0162",
+      "title": "π - t-0162",
+      "tokens": {
+        "lane": "t-0162",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "3",
+        "review": "working",
+        "thread": "t-0162",
+        "waiting": "openai-codex unreachable: fetch failed"
+      }
+    }
+  ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 2
+    "tabs": 3
   }
 }
