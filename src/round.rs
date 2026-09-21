@@ -498,6 +498,41 @@ pub fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
     Ok(records)
 }
 
+/// Called under the repository lock before a fresh merge intent is written.
+/// Reviews may overlap, but a durable merge transaction owns its integration
+/// ref until checkpointed so another round cannot strand its crash recovery.
+fn require_merge_turn(
+    ctx: &Ctx,
+    project: &Project,
+    git: &Git,
+    branch: &str,
+    except: &str,
+) -> Result<()> {
+    let common = std::fs::canonicalize(git.common_dir()?)?;
+    for slug in project::list_slugs(&ctx.root) {
+        let other = Project::load(&ctx.root, &slug)?;
+        for record in checked_list(&other)? {
+            if slug == project.slug && record.round == except
+                || record.branch != branch
+                || record
+                    .merge
+                    .as_ref()
+                    .is_none_or(|intent| intent.phase == MergePhase::Checkpointed)
+            {
+                continue;
+            }
+            let other_git = Git::new(ctx.runner, &record.repo);
+            if std::fs::canonicalize(other_git.common_dir()?)? == common {
+                return Err(crate::refusal::error(format!(
+                    "round_merge_busy: `{slug}/{}` owns the merge turn for `{branch}` in phase {:?}; retry after its `round merge` completes",
+                    record.round, record.phase
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The open round (no merge record yet) that pins this thread as a lane or
 /// binds it as the reviewer, if any. A resolved or merged round is finished
 /// and holds nothing back.
@@ -1819,17 +1854,24 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         } else {
             brief.clone()
         };
-        if intent.manifest_hash != hash || intent.brief != expected_brief {
+        // Before repair revisions wrote a new B, their durable intent stored
+        // the ordinary brief and created the review branch directly at
+        // `intent.head`. Finish that exact pending output after an upgrade;
+        // newly recorded repairs always use `expected_brief` and a new B.
+        let legacy_repair = intent.reuse_brief.is_some() && intent.brief == brief;
+        if intent.manifest_hash != hash || intent.brief != expected_brief && !legacy_repair {
             bail!(
                 "round_git_mismatch: `{round}` inputs differ from its pending review output; restore the recorded inputs before retrying round review"
             );
         }
         let repair = intent.reuse_brief.is_some();
-        // A repair gets a new brief commit on the new base. A clean text
+        // A new repair gets a new brief commit on the new base. A clean text
         // merge cannot prove that two independently reviewed changes are
         // semantically compatible, so the new reviewer must have an exact,
         // recorded base just like the first reviewer did.
-        let b = if head == intent.head {
+        let b = if legacy_repair {
+            intent.reuse_brief.clone().context("repair brief missing")?
+        } else if head == intent.head {
             commit_files_on_branch(
                 &git,
                 &record.branch,
@@ -1855,7 +1897,11 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                 intent.head
             )
         };
-        let base = b.clone();
+        let base = if legacy_repair {
+            intent.head.clone()
+        } else {
+            b.clone()
+        };
         let review_branch = intent.branch;
         let worktree = PathBuf::from(&record.repo)
             .join(".worktrees")
@@ -2355,34 +2401,33 @@ fn fresh_merge(
     }
     let v = verdict_commit(project, &record, git)?;
     let c = validate_verdict(git, &record, &v)?;
-    // Hold the repository boundary from the base check through the ref
-    // effect. This is the only cross-round serialization: opening, admission
-    // and review have no branch reservation.
-    let mut intent = {
-        let _repo = repo_lock(git)?;
-        let head = git.branch_head(&record.branch)?.context("branch_missing")?;
-        if head != b {
-            if !git.is_ancestor(&b, &head)? {
-                bail!(
-                    "head_moved: `{}` is at {head}, which does not contain the brief commit B {b}",
-                    record.branch
-                );
-            }
-            return Ok(FreshMergeOutcome::BaseMoved { from: b, to: head });
+    // Hold the repository boundary from the base check through both ref
+    // effects, V and checkpoint H. This is the only cross-round
+    // serialization: opening, admission and review have no branch reservation.
+    let repo = repo_lock(git)?;
+    require_merge_turn(ctx, project, git, &record.branch, &round)?;
+    let head = git.branch_head(&record.branch)?.context("branch_missing")?;
+    if head != b {
+        if !git.is_ancestor(&b, &head)? {
+            bail!(
+                "head_moved: `{}` is at {head}, which does not contain the brief commit B {b}",
+                record.branch
+            );
         }
-        let intent = MergeIntent {
-            op: format!("merge-{round}"),
-            expected_old: head,
-            candidate: c,
-            verdict: v,
-            phase: MergePhase::Intent,
-            merged: None,
-            checkpoint: None,
-            head: None,
-        };
-        write_merge(project, &round, &intent)?;
-        effect_merge_locked(project, &record, git, intent)?
+        return Ok(FreshMergeOutcome::BaseMoved { from: b, to: head });
+    }
+    let intent = MergeIntent {
+        op: format!("merge-{round}"),
+        expected_old: head,
+        candidate: c,
+        verdict: v,
+        phase: MergePhase::Intent,
+        merged: None,
+        checkpoint: None,
+        head: None,
     };
+    write_merge(project, &round, &intent)?;
+    let mut intent = effect_merge_locked(project, &record, git, intent)?;
     if stop == Some(Stop::Ref) {
         return Ok(FreshMergeOutcome::Done(MergeOutcome::Stopped {
             phase: MergePhase::Intent,
@@ -2395,7 +2440,7 @@ fn fresh_merge(
             phase: MergePhase::Merged,
         }));
     }
-    checkpoint_phase(ctx, project, &record, git, intent, stop).map(FreshMergeOutcome::Done)
+    checkpoint_phase(ctx, project, &record, git, intent, stop, repo).map(FreshMergeOutcome::Done)
 }
 
 /// A moved base never asks the coordinator to orchestrate repair. The normal
@@ -2455,10 +2500,11 @@ fn effect_merge(
     intent: MergeIntent,
     stop: Option<Stop>,
 ) -> Result<MergeOutcome> {
-    let mut intent = {
-        let _repo = repo_lock(git)?;
-        effect_merge_locked(project, record, git, intent)?
-    };
+    // One merge owns the repository through both ref effects: integrating V
+    // and committing checkpoint H. Otherwise another round could write its
+    // repair brief between them and make the first transaction diverge.
+    let repo = repo_lock(git)?;
+    let mut intent = effect_merge_locked(project, record, git, intent)?;
     if stop == Some(Stop::Ref) {
         return Ok(MergeOutcome::Stopped {
             phase: MergePhase::Intent,
@@ -2471,7 +2517,7 @@ fn effect_merge(
             phase: MergePhase::Merged,
         });
     }
-    checkpoint_phase(ctx, project, record, git, intent, stop)
+    checkpoint_phase(ctx, project, record, git, intent, stop, repo)
 }
 
 /// Apply the recorded ref effect while the caller holds the repository lock.
@@ -2588,6 +2634,7 @@ fn checkpoint_phase(
     git: &Git,
     mut intent: MergeIntent,
     stop: Option<Stop>,
+    repo: crate::git::RepoLock,
 ) -> Result<MergeOutcome> {
     std::fs::create_dir_all(merge_dir(project, &record.round))?;
     let (md_path, json_path) = staged_payload_paths(project, &record.round);
@@ -2629,7 +2676,6 @@ fn checkpoint_phase(
     };
     let cp = intent.checkpoint.clone().context("checkpoint_missing")?;
     let h = {
-        let _repo = repo_lock(git)?;
         let head = git.branch_head(&record.branch)?.context("branch_missing")?;
         if head == cp.parent {
             commit_files_on_branch(
@@ -2650,7 +2696,6 @@ fn checkpoint_phase(
             );
             head
         } else {
-            drop(_repo);
             return diverged(project, record, intent, &head);
         }
     };
@@ -2662,6 +2707,7 @@ fn checkpoint_phase(
     intent.phase = MergePhase::Checkpointed;
     intent.head = Some(h.clone());
     write_merge(project, &record.round, &intent)?;
+    drop(repo);
     let lanes = forward_lanes(ctx, project, record, git, &h);
     Ok(MergeOutcome::Checkpointed { head: h, lanes })
 }
@@ -2727,7 +2773,8 @@ fn resume(
             effect_merge(ctx, project, record, git, intent, stop)
         }
         MergePhase::Merged if intent.at_or_past_merge(&head) => {
-            checkpoint_phase(ctx, project, record, git, intent, stop)
+            let repo = repo_lock(git)?;
+            checkpoint_phase(ctx, project, record, git, intent, stop, repo)
         }
         MergePhase::Merged => match intent.checkpoint.clone() {
             Some(cp) if is_recorded_checkpoint(git, &head, &cp)? => {
@@ -3415,6 +3462,42 @@ mod tests {
             load(&fx.project, "r1").unwrap().phase,
             RoundPhase::UnderReview
         );
+    }
+
+    #[test]
+    fn legacy_repair_intent_finishes_its_recorded_output() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, b) = reviewed(&fx);
+        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let record = load(&fx.project, "r1").unwrap();
+        let repo_git = Git::new(ctx.runner, &fx.repo);
+        verdict_commit(&fx.project, &record, &repo_git).unwrap();
+
+        let late = commit_file(&fx.repo, "late.txt", "x\n", "later round");
+        let mut record = load(&fx.project, "r1").unwrap();
+        record.phase = RoundPhase::PreparingReview;
+        record.review_intent = Some(ReviewIntent {
+            head: late.clone(),
+            branch: "review/r1-2".into(),
+            brief: repo_git
+                .show_file(&b, &review_brief_path("r1"))
+                .unwrap()
+                .unwrap(),
+            manifest_hash: record.manifest_hash.clone().unwrap(),
+            reuse_brief: Some(b.clone()),
+        });
+        save(&fx.project, &record).unwrap();
+
+        let result = review(&ctx, "demo", "r1").unwrap();
+        assert_eq!(result.brief_commit, b);
+        assert_eq!(result.review_branch, "review/r1-2");
+        assert_eq!(main_head(&fx), late);
+        assert_eq!(git(&result.worktree, &["rev-parse", "HEAD"]), late);
+        let recovered = load(&fx.project, "r1").unwrap();
+        assert_eq!(recovered.expected_head.as_deref(), Some(b.as_str()));
+        assert_eq!(recovered.verdict, None);
+        assert_eq!(result.earlier_verdict.as_deref(), Some(v.as_str()));
     }
 
     #[test]
@@ -4136,6 +4219,14 @@ mod tests {
         verdict(&fx, std::slice::from_ref(&lane1), front("MERGE", "r1"));
         assert_ne!(r1_review.review_branch, r2_review.review_branch);
         assert_ne!(r1_review.worktree, r2_review.worktree);
+        assert_eq!(
+            merge(&ctx, "demo", "r1", Some(Stop::Ref)).unwrap(),
+            MergeOutcome::Stopped {
+                phase: MergePhase::Intent
+            }
+        );
+        let busy = err(merge(&ctx, "demo", "r2", None));
+        assert!(busy.starts_with("round_merge_busy"), "{busy}");
         assert!(matches!(
             merge(&ctx, "demo", "r1", None).unwrap(),
             MergeOutcome::Checkpointed { .. }
