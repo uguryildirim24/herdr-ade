@@ -58,7 +58,7 @@ A lane reports through its file under `.herdr-project/`. The harness copies repo
 herdr-ade thread resolve billing t-0001
 ```
 
-A finished lane's worktree is removed automatically once its commits have landed or its round has closed, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored path names such as `target` and `node_modules` under `[worktrees].disposable` in `config.toml`; with no table, all ignored files are kept. Nested worktrees are always kept. The branch is retained and removal is never forced.
+A finished lane's worktree is removed automatically once its commits have landed or its round has closed, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored paths such as `target` and `node_modules` under global `[worktrees].disposable` in `config.toml`, or add `disposable` to one repository row in `PROJECT.md` (and to a harness repository row for harness-only output). Repository lists affect only that repository. `*` matches within one path part, so `runs/pytest-*` leaves other `runs/` output alone; with no matching list, all ignored files are kept. Nested worktrees are always kept. The branch is retained and removal is never forced.
 
 ## Check your setup
 
