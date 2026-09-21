@@ -1373,9 +1373,9 @@ fn pickup_project(
             && project.status() == crate::project::Status::Active
             && safety.start_threads == "auto"
         {
-            out.push_str("started (restarted through the launch record):\n");
+            out.push_str("started (resumed after the session interruption):\n");
             for t in &gone {
-                match crate::threads::restart(ctx, &project.slug, &t.id) {
+                match crate::threads::resume_interrupted(ctx, &project.slug, &t.id) {
                     Ok(thread) => {
                         out.push_str(&format!("  {} now in pane {}\n", t.id, thread.pane_id))
                     }
