@@ -228,3 +228,7 @@ Published branch:
 `origin/hp/adeherdr/t-0133-the-box-has-its-settings-checks-ask-the`
 ````
 
+
+## Repair revision
+
+This revision reviews the integration base `5c6fd5ab9f197b7a9beb2b1ec78c2ec922693489`.
