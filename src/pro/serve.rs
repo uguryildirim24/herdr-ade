@@ -188,6 +188,7 @@ pub(crate) fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
     command
         .env("HERDR_PRO_STATE_DIR", layout.root.display().to_string())
         .args(&args)
+        .current_dir(layout.root.parent().unwrap_or(&layout.root))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
