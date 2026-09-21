@@ -1156,7 +1156,7 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
 /// The one way to start a reviewer by hand: `round reviewer <slug> <round>`.
 /// It runs the same `round review` and `start_reviewer` path as
 /// `round advance`, so the new thread always bootstraps with the reviewer
-/// skill and the reviewer role floor. A live bound reviewer is left alone.
+/// skill and reviewer routing workflow. A live bound reviewer is left alone.
 pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thread::Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
@@ -3555,7 +3555,7 @@ mod tests {
         std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
         std::fs::write(
             fx.world.home.path().join("cfg/config.toml"),
-            "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
+            "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
         )
         .unwrap();
         fx.world.runner.on(
@@ -4648,45 +4648,15 @@ mod tests {
         assert!(task.contains("deliberately omitted, not empty"));
         assert!(!task.contains("LARGE-DIFF-MARKER"));
         assert!(!task.contains("LARGE-REPORT-MARKER"));
-
-        let calls = fx.world.runner.calls.borrow();
-        let curl = calls.iter().find(|c| c.program == "/usr/bin/curl").unwrap();
-        let encoded = curl
-            .stdin
-            .as_ref()
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("data = "))
-            .unwrap();
-        let body: String = serde_json::from_str(encoded).unwrap();
-        assert!(body.len() <= crate::jev::REQUEST_BYTE_CAP);
-        assert!(body.contains("omitted_sources"));
-        assert!(!body.contains("LARGE-DIFF-MARKER"));
-        assert!(!body.contains("LARGE-REPORT-MARKER"));
-        let ledger =
-            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
-        assert!(ledger.contains("dispatch-input-truncated"));
-        assert!(ledger.contains("source_truncation"));
     }
 
     #[test]
-    fn advance_reviewer_obeys_role_floor_and_still_scores() {
+    fn advance_reviewer_obeys_ordered_routing_rule() {
         let fx = fixture();
         reviewer_ready(&fx);
-        let policy_path = fx.world.ctx().config_dir.join("routing.json");
-        let mut policy: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&policy_path).unwrap()).unwrap();
-        policy["models"]["test_strong"] = serde_json::json!({
-            "tier":2,
-            "coding_index":77.2,
-            "price_per_million":2.0,
-            "description":"careful helper"
-        });
-        policy["role_floors"] = serde_json::json!({"reviewer":"test_strong"});
         let config_path = fx.world.ctx().config_dir.join("config.toml");
         let config = std::fs::read_to_string(&config_path).unwrap();
-        std::fs::write(config_path, format!("{config}\n[recipes.test_strong]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful helper\"\n")).unwrap();
-        std::fs::write(policy_path, policy.to_string()).unwrap();
+        std::fs::write(config_path, format!("{config}\n[recipes.test_strong]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful helper\"\n\n[[routing.rules]]\nworkflow = \"reviewer\"\nrecipe = \"test_strong\"\n")).unwrap();
         open_r1(&fx);
         let (id, sha) = fx.lane(1);
         admit(&fx.world.ctx(), "demo", "r1", &id).unwrap();
@@ -4695,10 +4665,7 @@ mod tests {
         let record = load(&fx.project, "r1").unwrap();
         let started = thread::load(&fx.project, record.reviewer.as_ref().unwrap()).unwrap();
         assert_eq!(started.launch.recipe_id, "test_strong");
-        assert_eq!(fx.world.runner.count("/usr/bin/curl"), 1);
-        let ledger =
-            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
-        assert!(ledger.contains("jev-scores-floor"));
+        assert_eq!(started.launch.routing_rule, "rule[0]");
     }
 
     #[test]
@@ -4726,24 +4693,7 @@ mod tests {
         assert_eq!(started.role, "reviewer");
         assert_eq!(started.title, format!("Review r1: {PLAIN}"));
         assert_eq!(started.launch.recipe_id, "test_claude");
-        assert_eq!(
-            fx.world.runner.count("/usr/bin/curl"),
-            1,
-            "review uses the task scorer"
-        );
-        let calls = fx.world.runner.calls.borrow();
-        let curl = calls.iter().find(|c| c.program == "/usr/bin/curl").unwrap();
-        let encoded = curl
-            .stdin
-            .as_ref()
-            .unwrap()
-            .lines()
-            .find_map(|l| l.strip_prefix("data = "))
-            .unwrap();
-        let body: String = serde_json::from_str(encoded).unwrap();
-        assert!(body.contains("Review inputs") && body.contains("git diff"));
-        assert!(body.len() <= crate::jev::REQUEST_BYTE_CAP);
-        drop(calls);
+        assert_eq!(started.launch.routing_rule, "default");
         assert!(!started.base.is_empty(), "the reviewer has a base commit");
 
         let task = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer)).unwrap();

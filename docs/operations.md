@@ -26,14 +26,13 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator pane, ticker state, lock
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
-~/.config/herdr-ade/config.toml             executable model recipes, dispatch placement, machines and harness repositories; any coordinator may edit it
-~/.config/herdr-ade/routing.json             one index question, measured model cards, confidence floor and routing floors
+~/.config/herdr-ade/config.toml             executable recipes, editable routing, dispatch placement, machines and harness repositories; any coordinator may edit it
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
 Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The lane is primed with `Run <prefix> skill <role>, then read tasks/<id>.md and do what it says.` The thread directory is `<worktree>/.herdr-project/<project>-<id>/`: `report.md` and `library/` (written by the agent); a tab thread with no repository gets its `brief.md` there instead. That folder, and `.worktrees/`, are added to `info/exclude`. Resolving removes a finished worktree with `git worktree remove` without `--force`, after a complete copy home. A dirty or not-yet-landed worktree is retained with the reason in the result. The branch is always kept.
 
-`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`), `talk` (default: on for a `claude` coordinator), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. `[roles.*]` is gone from both files and is refused. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). At dispatch, the full task and repository facts are scored by Jev; `routing.json` maps the scores to a recipe. Workflow labels such as reviewer select skill text and any explicitly configured routing floor, not a fixed model table.
+`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`), `talk` (default: on for a `claude` coordinator), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`). `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. `[roles.*]` is gone from both files and is refused. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). The ordered `[routing]` table selects a recipe by workflow or task product.
 
 The birth sentence is required: `thread start` and `thread adopt` take `--plain`. The checker refuses an empty sentence, more than one sentence, or an identifier-shaped token; a thread or round sentence drops the known-word rule, because it is a row on a screen and may name a file. The default workflow is `lane`. `--passive` on adopt sets the parent token and sends no primer.
 
@@ -52,7 +51,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
-| `thread start <project> --title T --plain S [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | The full brief is scored before any worktree or tab exists. Its selected recipe supplies kind and args. The brief `tasks/<id>.md` is committed on the integration branch, then the worktree and tab are created. `--plain` is required; returns before the agent is up. `[dispatch].machine` supplies default box placement for repositories with a box clone. |
+| `thread start <project> --title T --plain S [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | Routing is resolved before any worktree or tab exists. Its selected recipe supplies kind and args. The brief `tasks/<id>.md` is committed on the integration branch, then the worktree and tab are created. `--plain` is required; returns before the agent is up. `[dispatch].machine` supplies default box placement for repositories with a box clone. |
 | `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
 | `thread resolve <project> <id> [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy and close the pane and tab. A landed or closed-round worktree is removed by default; a dirty worktree is kept with a reason, and its branch is always retained. |
 | `pickup [<project>] [--all] [--start] [--dry-run]` | Re-link live threads to the coordinator pane: local lanes from the session, box lanes from the courier's box-local lists (one SSH per machine). Gone threads print start lines, or restart through their launch records with `--start` when the project's `start_threads` is `auto`. `--all` covers every active project. |
@@ -112,51 +111,45 @@ When Rolf asks in chat to change a recorded choice, the coordinator treats it li
 
 `.state/rounds/rNN.toml` owns each round's phase, pins, review output intent, accepted verdict and merge/checkpoint transaction. Old round files migrate in place on read; the old merge sidecar is absorbed once and removed. Branches, committed briefs, verdict files and checkpoints are checked outputs of that record. `round show` displays its phase.
 
-A round is a set of lanes that are reviewed and merged together. `hp round advance <slug>` starts the reviewer on its own, including after a REJECT once `hp round review <slug> <round>` makes the next revision. Rounds may be reviewed side by side: later lane tasks, review briefs, verdict files and HANDOFF checkpoints are bookkeeping, so they do not make an earlier verdict stale. When `hp round merge <slug> <round>` finds any other changed path after the brief commit, it makes the next `review/<round>-<n>` revision on the new base and starts a repair reviewer. That reviewer's task names the earlier candidate C and verdict commit V, so it merges C, including the earlier reviewer's fixes, over the new base instead of merging the raw lane shas. This happens even when Git reports a clean merge: textual compatibility does not establish that two independently reviewed changes work together. Merge transactions on the same integration branch take one durable turn at a time; if one is interrupted, retry that round's merge before merging another. `hp round reviewer <slug> <round>` is the manual repair command for a resolved or gone reviewer; it starts and binds a thread with the reviewer skill and reviewer model floor through the same path as `round advance`. A start that does not take says so on standard error and is retried on the next `advance` pass, up to three failures; a round is never left with a bound reviewer whose agent never came up. `hp round abandon <slug> <round> --reason "<why>"` ends a round that will not merge and records why; it refuses after a merge transaction begins.
+A round is a set of lanes that are reviewed and merged together. `hp round advance <slug>` starts the reviewer on its own, including after a REJECT once `hp round review <slug> <round>` makes the next revision. Rounds may be reviewed side by side: later lane tasks, review briefs, verdict files and HANDOFF checkpoints are bookkeeping, so they do not make an earlier verdict stale. When `hp round merge <slug> <round>` finds any other changed path after the brief commit, it makes the next `review/<round>-<n>` revision on the new base and starts a repair reviewer. That reviewer's task names the earlier candidate C and verdict commit V, so it merges C, including the earlier reviewer's fixes, over the new base instead of merging the raw lane shas. This happens even when Git reports a clean merge: textual compatibility does not establish that two independently reviewed changes work together. Merge transactions on the same integration branch take one durable turn at a time; if one is interrupted, retry that round's merge before merging another. `hp round reviewer <slug> <round>` is the manual repair command for a resolved or gone reviewer; it starts and binds a thread with the reviewer workflow through the same routing path as `round advance`. A start that does not take says so on standard error and is retried on the next `advance` pass, up to three failures; a round is never left with a bound reviewer whose agent never came up. `hp round abandon <slug> <round> --reason "<why>"` ends a round that will not merge and records why; it refuses after a merge transaction begins.
 
 ## Task-based routing
 
-The coordinator does not choose a model. `thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. `--workflow` selects instruction text and may trigger a policy floor. `hp round reviewer <slug> <round>` starts a hand-run reviewer with the same reviewer skill and configured floor as one started by `round advance`. The title is a display label, never classifier state. Repository facts include HEAD, tracked paths, status and recent changes. The serialized TypeSafe request is capped at 256 KiB: the complete task brief is kept, cheaper repository evidence is removed first, and visible truncation metadata is sent and logged. A brief that cannot fit is refused. Reviewer priming tasks are capped at 128 KiB and always name the committed review-brief path and every pinned commit range; whole source text is inlined only when it fits, because the reviewer can read the named inputs from its checkout.
+`thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. `--workflow` selects instruction text and is available to routing rules. Optional task front matter may set `product = "code"`, `"spec"` or `"web-research"`, and `requires_claude = true`. The title and body do not select a recipe.
 
-Install the tracked `config/routing.json` at `~/.config/herdr-ade/routing.json` before starting lanes. There is no embedded policy fallback or old-format reader. Keep executable rows in `config.toml`; remove every `[roles.*]` table. A model card names its published Coding Index, blended price per million tokens and escalation tier. Configured recipe rows replace built-in rows completely, not field by field.
+Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table.
 
-The dispatch process (including a background ticker that starts reviews) must inherit `TYPESAFE_API_KEY`. The client posts to `https://api.typesafe.ai/v1/systemone` with `model: jev-latest` and one Score question: the Coding Index required by the work. Its ordered criteria have matching real-unit `index_values`. No model roster enters the prompt. Exact recipe/model ids are scrubbed; the brief is never reduced to a title or excerpt. The key travels on curl's stdin, not argv, and is removed from its child environment. A non-success HTTP response reports its status and bounded, key-redacted body; timeouts and transport failures remain separate errors.
+The starting table is:
 
-The raw Score is interpolated between `index_values`. Dispatch chooses the lowest-price model whose published `coding_index` clears that requirement; fixed normalized cutoffs and a hand-ordered price ladder do not exist. Capability tiers must rise with Coding Index, and the strongest model must cover the top index anchor, so an incapable model is never used as a fallback. A result below `confidence_floor` chooses the cheapest capable higher tier. Explicit endpoint size refusals select the highest tier, with any higher role floor, and record `rule: "jev-size-fallback"` plus a redacted cause instead of invented scores. Local request-size guards still refuse briefs that cannot fit; authentication, transport, other HTTP, config and malformed-response failures still refuse.
+```toml
+[routing]
+default = "pi_codex_sol_high"
+retries = 1
+fallback = []
 
-Floors express non-compensating constraints. The shipped policy keeps the reviewer floor and the top-answer veto:
+[[routing.rules]]
+workflow = "coordinator"
+recipe = "claude_coordinator_opus"
 
-```json
-"role_floors": { "reviewer": "pi_codex_sol_high" },
-"answer_floors": [
-  { "question": "required_index", "min_score": 3, "recipe": "pi_codex_sol_high" }
-]
+[[routing.rules]]
+product = "spec"
+recipe = "claude_fable_xhigh"
+
+[[routing.rules]]
+product = "web-research"
+recipe = "agy_gemini_flash"
+
+[[routing.rules]]
+requires_claude = true
+recipe = "claude_fable_xhigh"
+
+[routing.pins]
+# "SHA256-of-exact-task-file-bytes" = "recipe-id"
 ```
 
-An answer floor compares the raw zero-based Score to `min_score`; fractional thresholds are allowed within the criterion range. Every floor target needs a measured model card and an enabled recipe. After index selection, confidence and escalation, the strongest triggered floor raises the pick only if its tier is higher. Unknown roles/questions, out-of-range thresholds, unknown recipes and disabled targets are refused. Floors do not override the fixed exclusions below.
+A rule may override the global recovery policy with `retries = N` and `fallback = ["recipe-a", "recipe-b"]`. `ha failed "<failure and evidence>"` first retries the selected recipe up to that bound, then tries each fallback once in order. When the list is exhausted, the lane remains failed with a `WAITING` reason for the coordinator; no other recipe is guessed. The old fixed escalation count no longer exists.
 
-A raised pick records `rule: "jev-scores-floor"` and a `floors` array next to it. Each entry names the recipe, tier and cause (`kind: "role"` with `role`, or `kind: "answer"` with question, threshold and observed score). All triggered floors above the original pick are recorded, including a weaker floor dominated by another; already-satisfied floors do not claim an upgrade. Jev still scores reviews; a floor is not a pin.
-
-Four exclusions are code rules and never call Jev:
-
-- Web **research as the product** goes to agy. State `product = "web-research"` in opening `+++` TOML task front matter. A coding task that cites URLs does not qualify.
-- `requires_claude = true` uses the Claude binary. Coordinators also use the Claude binary, without Jev.
-- `product = "spec"` uses Fable for specification writing. Pro through the relay remains available via a user pin.
-- Rolf's hand pin is `pins[SHA256(exact task-file bytes)] = recipe-id` in `routing.json`. There is no coordinator CLI pin.
-
-`ha failed "<failure and evidence>"` seals a lane-bound event locally or on the box. The ticker/courier consumes it once, assesses the same full task with the failure, and chooses the cheapest capable model at a strictly stronger tier. It preserves the dirty worktree, replaces only that lane's tab, increments its attempt and tells the replacement what failed. Three upgrades is the hard bound; no stronger measured model or a fixed exclusion produces a recorded refusal. `waiting` still means missing input, not a model failure. Transport/placement errors are visible and never spin through models indefinitely.
-
-`<project>/.state/dispatch.jsonl` is the append-only dispatch ledger: rubric hash, recipe-policy hash, task hash, full score distributions/confidences, arithmetic result, upgrades and failure evidence. The original task file remains the source of brief bytes. Sealed failure events remain in `events/`; a `failure_event` marker and pending-placement state on the thread make replay safe.
-
-### Measure and replay the policy
-
-```sh
-ha routing-eval <project>
-```
-
-The command makes no model call. It joins the current attempt's sealed completion and first dispatch pick to `.state/dispatch.jsonl` and the carrying round. Each outcome says which model was first tried, the final model, whether the lane escalated, and whether its round merged without a REJECT. The first model is observed good enough only when the lane did not escalate and its round merged without a REJECT. An unfinished round with no REJECT has no outcome yet; it is not guessed bad.
-
-Saved first-pick assessments are replayed through the current policy. When the current policy selects the model that was first tried, the observed outcome confirms it good or bad. A different selection is `untried`, not an invented label. `confidence_clear` reports how many saved assessments meet the current floor. Old dispatch and round records still load; records made before rejection counting or the current one-question rubric remain visible but may be `not-scored`.
+Each launch record and dispatch-ledger row says `pin`, `default` or `rule[n]`, so the reason for selection stays inspectable. Historical launch, dispatch and round records may still contain removed fields; serde ignores those fields when loading them.
 
 ## Safety settings
 

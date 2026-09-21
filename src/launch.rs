@@ -1,4 +1,4 @@
-//! Dispatch resolves the full work brief, never a coordinator-selected model.
+//! Dispatch resolves work through the editable recipe table.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
@@ -15,7 +15,6 @@ use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 
 pub const HELP_TIMEOUT: Duration = Duration::from_secs(10);
-pub const MAX_ESCALATIONS: u32 = 3;
 pub const COMPACT_LIMIT: usize = 80;
 pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
 pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, chosen for this work.";
@@ -32,6 +31,7 @@ pub struct DispatchConfig {
 pub struct LaunchConfig {
     pub recipes: BTreeMap<String, Recipe>,
     pub dispatch: DispatchConfig,
+    pub routing: crate::routing::Routing,
     pub policy_hash: String,
 }
 
@@ -40,6 +40,7 @@ pub struct LaunchConfig {
 struct RawConfig {
     recipes: BTreeMap<String, Recipe>,
     dispatch: DispatchConfig,
+    routing: crate::routing::Routing,
 }
 
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
@@ -59,13 +60,17 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
     let mut recipes = builtin_recipes();
     // A configured row is a complete recipe, not an old inline role or a partial patch.
     recipes.extend(raw.recipes);
-    let policy_hash =
-        crate::thread::sha256_hex(serde_json::to_vec(&(&recipes, &raw.dispatch))?.as_slice());
-    Ok(LaunchConfig {
+    let policy_hash = crate::thread::sha256_hex(
+        serde_json::to_vec(&(&recipes, &raw.dispatch, &raw.routing))?.as_slice(),
+    );
+    let config = LaunchConfig {
         recipes,
         dispatch: raw.dispatch,
+        routing: raw.routing,
         policy_hash,
-    })
+    };
+    config.routing.validate(&config.recipes)?;
+    Ok(config)
 }
 
 fn builtin_recipes() -> BTreeMap<String, Recipe> {
@@ -150,23 +155,23 @@ pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Resul
 
 /// Optional task front matter describes the deliverable or a hard runtime
 /// requirement, not a model preference. URLs in the body never trigger a rule.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct WorkContract {
+struct TaskContract {
     product: String,
     requires_claude: bool,
 }
 
-pub fn work_contract(task: &str, workflow: &str) -> Result<Value> {
+pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkContract> {
     let contract = if workflow == "coordinator" {
-        WorkContract::default()
+        TaskContract::default()
     } else if let Some(rest) = task.strip_prefix("+++\n") {
         let (front, _) = rest
             .split_once("\n+++\n")
             .context("task_contract: unclosed front matter")?;
-        toml::from_str::<WorkContract>(front).context("task_contract: describe product and requires_claude; model/recipe/role overrides are forbidden")?
+        toml::from_str::<TaskContract>(front).context("task_contract: describe product and requires_claude; model/recipe/role overrides are forbidden")?
     } else {
-        WorkContract::default()
+        TaskContract::default()
     };
     if !matches!(
         contract.product.as_str(),
@@ -174,21 +179,22 @@ pub fn work_contract(task: &str, workflow: &str) -> Result<Value> {
     ) {
         bail!("task_contract: product must be code, web-research or spec");
     }
-    let mut value = serde_json::to_value(contract)?;
-    value["workflow"] = json!(workflow);
-    Ok(value)
+    Ok(crate::routing::WorkContract {
+        workflow: workflow.to_string(),
+        product: contract.product,
+        requires_claude: contract.requires_claude,
+    })
 }
 
 #[derive(Debug, Default)]
 pub struct ResolveInput<'a> {
     pub task: &'a str,
-    pub state: Value,
-    /// Selects skill text and any explicitly configured routing role floor.
+    /// Selects skill text and an ordered routing rule.
     pub workflow: &'a str,
     pub previous: Option<&'a Launch>,
     pub failure: Option<&'a str>,
     /// Evidence omitted by an upstream task builder, already disclosed in the
-    /// brief; copied into scorer state and the dispatch ledger.
+    /// brief; copied into the launch record and dispatch ledger.
     pub source_truncation: Option<&'a Value>,
 }
 
@@ -211,120 +217,38 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     }
     let config = parse_launch_config(&ctx.config_dir)?;
     validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
-    let policy_path = ctx.config_dir.join("routing.json");
-    let policy_bytes =
-        std::fs::read(&policy_path).context("routing_policy_missing: install routing.json")?;
-    let policy = crate::routing::Policy::parse(&policy_bytes)?;
-    policy.validate_recipes(&config.recipes)?;
     let work = work_contract(input.task, input.workflow)?;
     let hash = crate::thread::sha256_hex(input.task.as_bytes());
-    let excluded = policy.exclusion(input.task, &work);
-    let escalations = input
+    let recovery = input
         .previous
-        .map_or(0, |p| p.escalations.saturating_add(1));
-    if escalations > MAX_ESCALATIONS {
-        bail!("escalation_bound: at most {MAX_ESCALATIONS} model changes per lane");
-    }
-    if input.previous.is_some() && input.failure.is_none_or(|f| f.trim().is_empty()) {
-        bail!("escalation_failure_missing");
-    }
-    // Fixed exclusions are never sent to Jev, including after failure.
-    if excluded.is_some() && input.previous.is_some() {
-        bail!(
-            "escalation_excluded: fixed research, Claude, spec or human-pinned work cannot change models"
-        );
-    }
-    if input.previous.is_some_and(|p| p.strength == 0) {
-        bail!("escalation_tier_missing: the earlier launch has no recorded capability tier");
-    }
-    // A policy edit cannot turn the same recipe into its own escalation.
-    let previous_tier = input.previous.map(|p| {
-        p.strength
-            .max(policy.models.get(&p.recipe_id).map_or(0, |m| m.tier))
-    });
-    let mut fallback = None;
-    let mut floors = Vec::new();
-    let (id, assessment, decision, rule, input_truncation) = if let Some(id) = excluded {
-        (
-            id.to_string(),
-            None,
-            None,
-            if policy.pins.contains_key(&hash) {
-                "human-pin"
-            } else {
-                "exclusion"
-            },
-            None,
-        )
-    } else {
-        if previous_tier.is_some_and(|tier| policy.models.values().all(|m| m.tier <= tier)) {
-            bail!("escalation_exhausted: no stronger model remains");
-        }
-        let state = crate::routing::scrub(
-            json!({"brief": input.task, "repository": input.state,
-            "failure": input.failure, "source_truncation": input.source_truncation}),
-            &config.recipes,
-        );
-        let (request, truncation) = bounded_request(&policy, state)?;
-        if truncation.is_some() || input.source_truncation.is_some() {
-            // This row is written before the call so a refusal by the endpoint
-            // cannot erase the fact that dispatch used incomplete evidence.
-            ledger(
-                project,
-                json!({"kind":"dispatch-input-truncated", "brief_hash":hash,
-                "source_truncation":input.source_truncation,
-                "input_truncation":truncation}),
-            )?;
-        }
-        match crate::jev::call(ctx, &request, &policy.questions) {
-            Ok(assessment) => {
-                let decision = policy.select(&assessment, previous_tier, input.workflow)?;
-                floors = decision.floors.clone();
-                let rule = if floors.is_empty() {
-                    "jev-scores"
-                } else {
-                    "jev-scores-floor"
-                };
-                (
-                    decision.recipe.clone(),
-                    Some(assessment),
-                    Some(decision),
-                    rule,
-                    truncation,
-                )
-            }
-            Err(error) if error.is::<crate::jev::OversizedRequest>() => {
-                // Routes are validated in strictly increasing tier order. Keep
-                // exclusions, readiness and escalation bounds on their usual paths.
-                let mut id = policy.strongest().to_string();
-                floors = policy.apply_floors(&mut id, input.workflow, None);
-                fallback =
-                    Some(json!({"cause":"picker-input-too-large", "error":error.to_string()}));
-                (id, None, None, "jev-size-fallback", truncation)
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    let recipe = config.recipes.get(&id).context("recipe_unknown")?;
-    if !recipe.enabled {
-        bail!("recipe_disabled: {id}");
-    }
-    if parse_launch_config(&ctx.config_dir)?.policy_hash != config.policy_hash
-        || std::fs::read(&policy_path)? != policy_bytes
+        .map_or(0, |previous| previous.escalations.saturating_add(1));
+    if input.previous.is_some()
+        && input
+            .failure
+            .is_none_or(|failure| failure.trim().is_empty())
     {
+        bail!("recovery_failure_missing");
+    }
+    let selected = config.routing.select(&hash, &work, recovery)?;
+    let recipe = config
+        .recipes
+        .get(&selected.recipe)
+        .context("routing_recipe_unknown")?;
+    if !recipe.enabled {
+        bail!("routing_recipe_disabled: {}", selected.recipe);
+    }
+    if parse_launch_config(&ctx.config_dir)?.policy_hash != config.policy_hash {
         bail!("dispatch_policy_changed: config changed during selection; dispatch again");
     }
     ledger(
         project,
-        json!({"kind": if escalations > 0 { "escalation" } else { "pick" },
-        "brief_hash": hash, "recipe": id, "rule": rule, "floors": floors, "fallback": fallback,
-        "workflow": input.workflow, "assessment": assessment, "decision": decision,
-        "low_confidence": decision.as_ref().is_some_and(|d| d.confidence < policy.confidence_floor),
-        "previous": input.previous.map(|p| json!({"recipe":p.recipe_id,"tier":p.strength,"attempt":p.attempt})),
-        "failure": input.failure, "escalations": escalations,
+        json!({"kind": if recovery > 0 { "recovery" } else { "pick" },
+        "brief_hash": hash, "recipe": selected.recipe, "rule": selected.rule,
+        "workflow": input.workflow,
+        "previous": input.previous.map(|previous| json!({"recipe":previous.recipe_id,"attempt":previous.attempt})),
+        "failure": input.failure, "recovery": recovery,
         "source_truncation": input.source_truncation,
-        "input_truncation": input_truncation,
-        "policy_hash": config.policy_hash, "routing_hash": crate::thread::sha256_hex(&policy_bytes)}),
+        "policy_hash": config.policy_hash}),
     )?;
     Ok(Launch {
         kind: recipe.kind.clone(),
@@ -333,10 +257,10 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         ready_timeout_ms: recipe.ready_timeout_ms,
         policy_hash: config.policy_hash,
         attempt: 1,
-        strength: policy.models.get(&id).map_or(0, |m| m.tier),
-        recipe_id: id,
-        escalations,
-        reason: if rule == "human-pin" {
+        recipe_id: selected.recipe,
+        escalations: recovery,
+        routing_rule: selected.rule,
+        reason: if selected.pinned {
             pinned_reason(input.workflow, &recipe.plain)
         } else {
             usual_reason(input.workflow, &recipe.plain)
@@ -346,106 +270,6 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         machine: config.dispatch.machine,
         ..Launch::default()
     })
-}
-
-/// Build the exact wire request while preserving the brief and shedding
-/// repository evidence in a deterministic, visible order.
-fn bounded_request(
-    policy: &crate::routing::Policy,
-    mut state: Value,
-) -> Result<(Value, Option<Value>)> {
-    let request_len = |state: &Value| policy.request(state.clone()).to_string().len();
-    let mut fixed_only = state.clone();
-    fixed_only["brief"] = json!("");
-    fixed_only["repository"] = Value::Null;
-    fixed_only["failure"] = Value::Null;
-    let fixed_bytes = request_len(&fixed_only);
-    if fixed_bytes > crate::jev::REQUEST_BYTE_CAP {
-        bail!(
-            "dispatch_fixed_input_too_large: routing policy needs {fixed_bytes} bytes; request cap is {}",
-            crate::jev::REQUEST_BYTE_CAP
-        );
-    }
-    let mut brief_only = state.clone();
-    brief_only["repository"] = Value::Null;
-    brief_only["failure"] = Value::Null;
-    let brief_bytes = request_len(&brief_only);
-    if brief_bytes > crate::jev::REQUEST_BYTE_CAP {
-        bail!(
-            "dispatch_brief_too_large: the complete brief needs {brief_bytes} request bytes; cap is {}",
-            crate::jev::REQUEST_BYTE_CAP
-        );
-    }
-
-    let original_bytes = request_len(&state);
-    if original_bytes <= crate::jev::REQUEST_BYTE_CAP {
-        return Ok((policy.request(state), None));
-    }
-
-    let mut omitted = Vec::<String>::new();
-    let build = |state: &mut Value, omitted: &[String]| -> (Value, Value) {
-        let mut details = json!({
-            "cut": true,
-            "request_byte_cap": crate::jev::REQUEST_BYTE_CAP,
-            "original_request_bytes": original_bytes,
-            "sent_request_bytes": 0,
-            "omitted_fields": omitted,
-            "note": "Repository or failure evidence was omitted; the brief is complete."
-        });
-        state["input_truncation"] = details.clone();
-        // The byte count is part of the request. Iterate until its digit width
-        // is stable, then return the exact serialized request.
-        let mut request = policy.request(state.clone());
-        for _ in 0..3 {
-            let sent = request.to_string().len();
-            details["sent_request_bytes"] = json!(sent);
-            details["omitted_bytes"] = json!(original_bytes.saturating_sub(sent));
-            state["input_truncation"] = details.clone();
-            let next = policy.request(state.clone());
-            if next.to_string().len() == sent {
-                request = next;
-                break;
-            }
-            request = next;
-        }
-        (request, details)
-    };
-
-    // A file inventory and recent stat log are weaker than the actual task;
-    // the review diff follows. Small identity facts survive whenever possible.
-    for field in ["files", "recent_changes", "changes_under_review", "diff"] {
-        let removed = state["repository"]
-            .as_object_mut()
-            .and_then(|repository| repository.remove(field));
-        if removed.is_some() {
-            omitted.push(format!("repository.{field}"));
-            let (request, details) = build(&mut state, &omitted);
-            if request.to_string().len() <= crate::jev::REQUEST_BYTE_CAP {
-                return Ok((request, Some(details)));
-            }
-        }
-    }
-
-    if !state["repository"].is_null() {
-        state["repository"] = Value::Null;
-        omitted.push("repository (remaining evidence)".into());
-        let (request, details) = build(&mut state, &omitted);
-        if request.to_string().len() <= crate::jev::REQUEST_BYTE_CAP {
-            return Ok((request, Some(details)));
-        }
-    }
-    if !state["failure"].is_null() {
-        state["failure"] = Value::Null;
-        omitted.push("failure".into());
-        let (request, details) = build(&mut state, &omitted);
-        if request.to_string().len() <= crate::jev::REQUEST_BYTE_CAP {
-            return Ok((request, Some(details)));
-        }
-    }
-    bail!(
-        "dispatch_brief_too_large: the complete brief leaves no room for the required truncation notice under the {} byte request cap",
-        crate::jev::REQUEST_BYTE_CAP
-    )
 }
 
 /// Append-only dispatch ledger. No network call is made while holding its lock.
@@ -462,34 +286,7 @@ pub fn ledger(project: &Project, mut row: Value) -> Result<()> {
     Ok(())
 }
 
-/// Only measured repository facts, never a summary invented from a title.
-pub fn repository_state(ctx: &Ctx, repo: Option<&str>, base: Option<&str>) -> Result<Value> {
-    let Some(repo) = repo else {
-        return Ok(json!({"repository": null}));
-    };
-    let run = |args: &[&str]| -> Result<String> {
-        let out = ctx.runner.run(
-            &Cmd::new("git", HELP_TIMEOUT)
-                .arg("-C")
-                .arg(repo)
-                .args(args.iter().copied()),
-        )?;
-        if !out.success() {
-            bail!(
-                "dispatch_repository: git probe failed: {}",
-                out.error_text()
-            );
-        }
-        Ok(out.stdout)
-    };
-    Ok(
-        json!({"path": repo, "base": base, "head": run(&["rev-parse", "HEAD"])?,
-        "status": run(&["status", "--short"])?, "files": run(&["ls-files"])?,
-        "recent_changes": run(&["log", "-5", "--oneline", "--stat"])?}),
-    )
-}
-
-/// Dialogue workflow labels may carry policy floors. Selection happens only once
+/// Dialogue workflow labels may match routing rules. Selection happens only once
 /// each complete side's brief exists; no model pin is printed by this command.
 pub struct DialoguePair;
 impl crate::dialogue::PairFilter for DialoguePair {
@@ -507,31 +304,20 @@ pub struct DoctorRow {
 }
 pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
     let config = parse_launch_config(&ctx.config_dir)?;
-    let valid = validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?).and_then(|()| {
-        crate::routing::Policy::read(&ctx.config_dir.join("routing.json"))?
-            .validate_recipes(&config.recipes)
-    });
-    Ok(vec![
-        DoctorRow {
-            ok: Some(valid.is_ok()),
-            label: "recipes".into(),
-            detail: valid.err().map(|e| format!("{e:#}")).unwrap_or_else(|| {
+    let valid = validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?);
+    Ok(vec![DoctorRow {
+        ok: Some(valid.is_ok()),
+        label: "recipes and routing".into(),
+        detail: valid
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| {
                 format!(
-                    "{} model recipes; Jev chooses from the full brief",
+                    "{} recipes; editable routing table is valid",
                     config.recipes.len()
                 )
             }),
-        },
-        DoctorRow {
-            ok: Some(
-                ctx.env
-                    .var("TYPESAFE_API_KEY")
-                    .is_some_and(|k| !k.trim().is_empty()),
-            ),
-            label: "Jev".into(),
-            detail: "TYPESAFE_API_KEY must be set in the dispatch process environment".into(),
-        },
-    ])
+    }])
 }
 /// The kinds `herdr agent start` accepts, read from its `--help`.
 pub fn agent_kinds(env: &Env, runner: &dyn Runner) -> Result<BTreeSet<String>> {
