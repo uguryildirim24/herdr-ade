@@ -528,8 +528,10 @@ fn check_workspace_leaks(
         .map(|thread| thread.workspace_id.clone())
         .filter(|workspace| !workspace.is_empty())
         .collect();
+    let default_shell = default_shell_workspaces(&workspaces, &agents);
     let leaked: Vec<_> = workspaces
         .iter()
+        .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
         .filter(|workspace| {
             !open.contains(&workspace.workspace_id)
                 && !agents
@@ -598,6 +600,7 @@ fn check_workspace_leaks(
         project_workspaces.extend(
             matching
                 .into_iter()
+                .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
                 .map(|workspace| workspace.workspace_id.clone()),
         );
     }
@@ -642,6 +645,31 @@ fn check_workspace_leaks(
         &format!("{display} project tabs"),
         detail,
     );
+}
+
+/// The machine's own home shell: the workspace the client hides while the
+/// machine has another workspace (fork `is_default_shell_space`): label `~`, no
+/// agent, one tab holding one pane. The display label already carries a custom
+/// name, so the fork's `custom_label` guard folds into the `~` test here.
+fn default_shell_workspaces(
+    workspaces: &[herdr::Workspace],
+    agents: &[herdr::Agent],
+) -> BTreeSet<String> {
+    if workspaces.len() <= 1 {
+        return BTreeSet::new();
+    }
+    workspaces
+        .iter()
+        .filter(|workspace| {
+            workspace.label == "~"
+                && workspace.tab_count == 1
+                && workspace.pane_count == 1
+                && !agents
+                    .iter()
+                    .any(|agent| agent.workspace_id == workspace.workspace_id)
+        })
+        .map(|workspace| workspace.workspace_id.clone())
+        .collect()
 }
 
 fn machines_to_check(
@@ -1115,6 +1143,35 @@ mod tests {
         assert!(!healthy);
         assert!(
             text.contains("1 of 3 hold no agent and belong to no open lane: w1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_machines_own_home_workspace_is_not_a_leak() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "workspace list",
+            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"~","tab_count":1,"pane_count":1},{"workspace_id":"w2"}]}}"#),
+        );
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
+        let mut text = String::new();
+        let mut healthy = true;
+        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
+            healthy &= ok != Some(false);
+            let _ = writeln!(out, "{label}: {detail}");
+        };
+
+        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+
+        assert!(!healthy);
+        assert!(
+            text.contains("1 of 2 hold no agent and belong to no open lane: w2"),
             "{text}"
         );
     }
