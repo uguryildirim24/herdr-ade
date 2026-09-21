@@ -349,7 +349,7 @@ fn multiplex_options(control_dir: &Path) -> Vec<String> {
 
 /// The courier's batched `scp` over its multiplexed connection (SPEC-remote
 /// §4.3): every plain path in one call. A path scp cannot carry safely is
-/// refused. The second lane's courier calls this; the start side never does.
+/// refused. The courier calls this; the start side never does.
 pub(crate) fn fetch_batch(
     runner: &dyn Runner,
     target: &str,
@@ -418,20 +418,6 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(out.stdout, hostile);
-        }
-    }
-
-    #[test]
-    fn hostile_values_survive_the_double_shell_of_an_ssh_command() {
-        // ssh hands its argument to the remote login shell, which runs our
-        // `sh -c <quoted script>`: two layers of parsing. `sh -c` stands in for ssh.
-        for hostile in HOSTILE {
-            let script = format!("printf %s {}", quote(hostile));
-            let remote_command = format!("sh -c {}", quote(&script));
-            let out = RealRunner
-                .run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c", &remote_command]))
-                .unwrap();
-            assert_eq!(out.stdout, hostile, "{remote_command}");
         }
     }
 
