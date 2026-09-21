@@ -107,3 +107,7 @@ pass on `74ce0d4`:
 No push. No live `~/.herdr-ade` or `~/.config/herdr-ade` was modified.
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `02d268f5e10a15335b9b7de75b5a6be19ac00e76`.
