@@ -94,6 +94,20 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
             "roles_removed: remove [roles] and every [roles.*] table from config.toml; keep model rows in [recipes.*]"
         );
     }
+    if value
+        .get("routing")
+        .and_then(|routing| routing.get("rules"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.get("requires_claude").is_some())
+        })
+    {
+        bail!(
+            "routing_requires_claude_removed: replace `requires_claude = true` with `capability = \"native-chat\"` in each [[routing.rules]] row"
+        );
+    }
     let raw: RawConfig = value.try_into()?;
     validate_doctor_config(&raw.doctor)?;
     let defaults: RawConfig = toml::from_str(include_str!("../assets/default-recipes.toml"))
@@ -126,7 +140,7 @@ pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Resul
             .adapters
             .get(&recipe.kind)
             .with_context(|| format!("adapter_unknown: recipe `{id}` uses `{}`", recipe.kind))?;
-        crate::adapters::validate_recipe(&recipe.kind, adapter, id, recipe)?;
+        crate::adapters::validate_recipe(adapter, id, recipe)?;
         check_plain(&format!("recipe {id}"), &recipe.plain)?;
     }
     Ok(())
@@ -430,5 +444,30 @@ pub fn compact_reason(role: &str, plain: &str) -> String {
     match sentence[..end].rfind(char::is_whitespace) {
         Some(pos) if pos > 0 => sentence[..pos].trim_end().to_string(),
         _ => sentence[..end].trim_end().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_claude_matcher_names_the_exact_config_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"[routing]
+default = "claude_fable_xhigh"
+[[routing.rules]]
+requires_claude = true
+recipe = "claude_fable_xhigh"
+"#,
+        )
+        .unwrap();
+        let error = parse_launch_config(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("replace `requires_claude = true` with `capability = \"native-chat\"`"),
+            "{error}"
+        );
     }
 }

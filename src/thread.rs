@@ -12,9 +12,6 @@ use crate::project::{self, Project, slugify, write_atomic};
 use crate::runner::{Cmd, Runner};
 
 pub(crate) const STARTING_TIMEOUT_SECS: i64 = 300;
-/// Herdr's maximum event wait for a newly launched pi process. Cloud starts
-/// have crossed two minutes, so every pi launch gets the full outer bound.
-pub(crate) const PI_START_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 const NOT_READY_SECS: i64 = 60;
 /// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`

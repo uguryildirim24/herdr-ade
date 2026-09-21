@@ -30,6 +30,8 @@ pub(crate) struct HookAdapter {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct DoctorAdapter {
+    /// `command` runs the declared binary; `pi` uses the provider bridge.
+    pub(crate) readiness: String,
     /// Argument template. `{args}` expands to the selected recipe's args.
     pub(crate) args: Vec<String>,
 }
@@ -43,6 +45,8 @@ pub(crate) struct Adapter {
     pub(crate) ready_timeout_ms: u64,
     pub(crate) coordinator: bool,
     pub(crate) talk: bool,
+    /// A blocked process with a recorded lane error resumes when prompted.
+    pub(crate) blocked_error_resumable: bool,
     pub(crate) capabilities: Vec<String>,
     pub(crate) required_flags: Vec<String>,
     pub(crate) efforts: Vec<String>,
@@ -105,6 +109,15 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
             row.hook.block
         );
     }
+    if !matches!(row.doctor.readiness.as_str(), "command" | "pi") {
+        bail!(
+            "adapter_invalid: `{kind}` has unknown readiness driver `{}`",
+            row.doctor.readiness
+        );
+    }
+    if row.doctor.readiness == "command" && row.doctor.args.is_empty() {
+        bail!("adapter_invalid: command adapter `{kind}` needs doctor arguments");
+    }
     Ok(())
 }
 
@@ -134,6 +147,7 @@ fn native(binary: &str, hook: HookAdapter, doctor: &[&str]) -> Adapter {
         talk: true,
         hook,
         doctor: DoctorAdapter {
+            readiness: "command".into(),
             args: doctor.iter().map(|value| (*value).into()).collect(),
         },
         ..Adapter::default()
@@ -156,8 +170,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             "{args}",
             "-p",
             "Reply only OK.",
-            "--max-turns",
-            "1",
             "--tools",
             "",
             "--no-session-persistence",
@@ -170,6 +182,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
         .into_iter()
         .map(str::to_string)
         .collect();
+    claude.capabilities.push("native-chat".into());
     rows.insert("claude".into(), claude);
 
     rows.insert(
@@ -196,7 +209,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
     );
 
     let mut cursor = native(
-        "cursor",
+        "cursor-agent",
         hook(
             "cursor",
             ".cursor/hooks.json",
@@ -220,15 +233,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
             &["last_assistant_message", "text"],
             "block",
         ),
-        &[
-            "{args}",
-            "-p",
-            "Reply only OK.",
-            "--max-turns",
-            "1",
-            "--tools",
-            "",
-        ],
+        &["{args}", "-p", "Reply only OK.", "--print-timeout", "60s"],
     );
     agy.required_flags
         .push("--dangerously-skip-permissions".into());
@@ -245,6 +250,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ready_timeout_ms: 30_000,
             coordinator: true,
             talk: true,
+            blocked_error_resumable: true,
             hook: hook(
                 "claude",
                 ".pi/hooks.json",
@@ -253,8 +259,10 @@ fn builtin() -> BTreeMap<String, Adapter> {
                 &["last_assistant_message", "text"],
                 "block",
             ),
-            // Pi readiness is supplied by its adapter module because provider
-            // authentication is not a native executable probe.
+            doctor: DoctorAdapter {
+                readiness: "pi".into(),
+                ..DoctorAdapter::default()
+            },
             ..Adapter::default()
         },
     );
@@ -271,15 +279,17 @@ pub(crate) fn launch_args(adapter: &Adapter, recipe: &Recipe) -> Vec<String> {
     args
 }
 
-pub(crate) fn validate_recipe(
-    kind: &str,
-    adapter: &Adapter,
-    id: &str,
-    recipe: &Recipe,
-) -> Result<()> {
+pub(crate) fn validate_recipe(adapter: &Adapter, id: &str, recipe: &Recipe) -> Result<()> {
     for flag in &adapter.required_flags {
         if !recipe.args.contains(flag) && !adapter.launch_flags.contains(flag) {
             bail!("recipe_permission_missing: `{id}` has no permission flag `{flag}`");
+        }
+    }
+    for capability in &recipe.capabilities {
+        if !adapter.capabilities.contains(capability) {
+            bail!(
+                "recipe_capability_unknown: `{id}` names `{capability}`, but its adapter does not declare it"
+            );
         }
     }
     if !adapter.efforts.is_empty()
@@ -289,8 +299,9 @@ pub(crate) fn validate_recipe(
     {
         bail!("recipe_effort_unknown: `{id}` names effort {effort:?}");
     }
-    // Provider-specific syntax belongs to the adapter module, not dispatch.
-    if kind == "pi" {
+    // Provider-specific syntax belongs to its declared readiness driver, not
+    // to dispatch or to an agent-kind name.
+    if adapter.doctor.readiness == "pi" {
         crate::pi::launch::validate_args(&recipe.args)?;
         crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args)?;
     }
@@ -346,6 +357,7 @@ coordinator = true
 talk = true
 launch_flags = ["--yes"]
 capabilities = ["pictures"]
+doctor.readiness = "command"
 doctor.args = ["check", "{args}"]
 hook.shape = "claude"
 hook.path = ".acme/hooks.json"
@@ -363,5 +375,16 @@ hook.block = "block"
             reply_text(&row, &serde_json::json!({"answer":"done"})),
             Some("done")
         );
+    }
+
+    #[test]
+    fn agy_probe_uses_only_its_print_mode_flags() {
+        let row = builtin().remove("agy").unwrap();
+        assert_eq!(
+            row.doctor.args,
+            ["{args}", "-p", "Reply only OK.", "--print-timeout", "60s"]
+        );
+        assert!(!row.doctor.args.iter().any(|arg| arg == "--max-turns"));
+        assert!(!row.doctor.args.iter().any(|arg| arg == "--tools"));
     }
 }
