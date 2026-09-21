@@ -258,6 +258,13 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
     assert_eq!(entries[0]["count"], 2);
     assert_eq!(entries[0]["kind"], "command-failed");
     let id = entries[0]["id"].as_str().unwrap();
+    let shown = ledger(&["show", id, "--json"]);
+    assert!(shown.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["outcome"], "shown");
+    assert_eq!(shown["data"]["record"]["id"], id);
+    assert_eq!(shown["data"]["record"]["count"], 2);
+
     let out = ledger(&["task", id]);
     assert!(out.status.success());
     let task = String::from_utf8(out.stdout).unwrap();
@@ -271,7 +278,15 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
     ] {
         assert!(task.contains(text), "{task}");
     }
-    assert!(ledger(&["done", id]).status.success());
+    let closed = ledger(&["done", id, "--json"]);
+    assert!(closed.status.success());
+    let closed: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(closed["outcome"], "closed");
+    assert_eq!(closed["data"]["record"]["id"], id);
+    assert_eq!(closed["data"]["record"]["closed"], true);
+    assert_eq!(closed["data"]["changed"], true);
+    assert_eq!(closed["message"], format!("{id} closed\n"));
+
     let shown: serde_json::Value = serde_json::from_slice(&ledger(&["show", id]).stdout).unwrap();
     assert_eq!(shown["closed"], true);
     let listed: serde_json::Value =

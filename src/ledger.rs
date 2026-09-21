@@ -217,17 +217,27 @@ pub(crate) fn show(project: &Project, id: &str) -> Result<Entry> {
         .with_context(|| format!("no failure `{id}`"))
 }
 
-pub(crate) fn done(project: &Project, id: &str) -> Result<()> {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DoneOutcome {
+    pub(crate) record: Entry,
+    pub(crate) changed: bool,
+}
+
+pub(crate) fn done(project: &Project, id: &str) -> Result<DoneOutcome> {
     let _lock = lock(project)?;
     let mut entry = load(project)?
         .entries
         .remove(id)
         .with_context(|| format!("no failure `{id}`"))?;
-    if !entry.closed {
+    let changed = !entry.closed;
+    if changed {
         entry.closed = true;
-        append(project, &Line::Failure(entry))?;
+        append(project, &Line::Failure(entry.clone()))?;
     }
-    Ok(())
+    Ok(DoneOutcome {
+        record: entry,
+        changed,
+    })
 }
 
 pub(crate) fn task(entry: &Entry) -> String {
