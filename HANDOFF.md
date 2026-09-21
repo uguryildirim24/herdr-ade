@@ -14,35 +14,25 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-21T11:27:58-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-21T11:48:33-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
-Workspace `w1G` (Adeherdr), 3 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
+Workspace `w1G` (Adeherdr), 2 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
 
 Coordinator session id `22e30006-6abc-4f92-9bcc-c002ce0ce442`.
 
-The coordinator has no agent name, so workers cannot `herdr agent prompt` it. Name it: `herdr agent rename "$HERDR_PANE_ID" coordinator`.
-
 ### Workers nested under the coordinator
 
-| name | kind | status | pane | tab (label) | cwd | tokens | last title |
-|---|---|---|---|---|---|---|---|
-| hp-adeherdr-t-0148 | pi | done | `w1G:p3B` | `w1G:t37` (t-0148) | `/home/agent/projects/herdr-ade/.worktrees/t-0148` | done=1 lane=t-0148 project=adeherdr rank=5 review=idle thread=t-0148 | π - t-0148 |
-
-Start lines as they run now (from `pane process-info`), for restarting a worker that is gone:
-
-```bash
-herdr agent start hp-adeherdr-t-0148 --kind pi --pane <new pane> --parent "$HERDR_PANE_ID"
-```
+_none_
 
 Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done), `w1J` Venator (idle), `w1K` Elicio (idle)
 
 ### Git
 
-Repo `/home/agent/projects/herdr-ade`, integration branch `main` (14 ahead, 0 behind origin/main).
+Repo `/home/agent/projects/herdr-ade`, integration branch `main` (7 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/home/agent/projects/herdr-ade` | `main` | cb6265f | 0 | docs(review): round r64 verdict |
+| `/home/agent/projects/herdr-ade` | `main` | 37bd2f2 | 0 | docs(review): round r65 verdict |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -102,6 +92,7 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (14 ahead, 0 be
 | `/home/agent/projects/herdr-ade/.worktrees/review-r62-2` | `review/r62-2` | e384897 | 0 | docs(tasks): t-0146 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r63` | `review/r63` | cd6250e | 0 | docs(tasks): t-0147 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r64` | `review/r64` | 1fa6855 | 0 | docs(tasks): t-0148 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r65` | `review/r65` | 308d78c | 0 | docs(tasks): t-0151 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r7` | `review/r7` | 7cb564e | 0 | docs(tasks): t-0015 |
 | `/home/agent/projects/herdr-ade/.worktrees/review-r9` | `review/r9` | ef62484 | 0 | docs(tasks): t-0022 |
 | `/home/agent/projects/herdr-ade/.worktrees/t-0001` | `hp/adeherdr/t-0001-plain-language-check-everyday-words-pass` | c482aa9 | 0 | checkpoint(r1): HANDOFF after merging the round |
@@ -180,19 +171,19 @@ Repo `/home/agent/projects/herdr-ade`, integration branch `main` (14 ahead, 0 be
 Last commits on the integration branch:
 
 ```
-cb6265f docs(review): round r64 verdict
-98544db review(round): serialize manual reviewer starts
-6dfaaab review(talk): allow later screen handoffs
-d678dc2 review(doctor): finish merged coordinator checks
-77826b5 Merge commit '4fb1c69914d04beb3f19decaa9741b1890168db6' into hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta
-380df85 Merge commit '221e94fbc7304113385ad740b452278a96d293f0' into hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta
+37bd2f2 docs(review): round r65 verdict
+b7ba243 Merge commit '7096cd613801c190d755cf9a0791a8900835986b' into hp/adeherdr/t-0151-review-r65-this-round-stops-a-round-i-ga
+308d78c docs(tasks): t-0151
+bd99ca4 review(r65): brief for revision 1
+7096cd6 fix(round): release abandoned members
+32a8225 docs(tasks): t-0150
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0148.md`, `tasks/review-r64.md`, `tasks/t-0147.md`, `tasks/review-r63.md`, `tasks/t-0146.md`, `tasks/t-0145.md`, `tasks/review-r62.md`, `tasks/t-0144.md`, `tasks/t-0143.md`, `tasks/t-0138.md`, `tasks/review-r60.md`, `tasks/t-0142.md`
-- verdicts: `tasks/reviews/code-r64.md`, `tasks/reviews/code-r63.md`, `tasks/reviews/code-r62.md`, `tasks/reviews/code-r60.md`, `tasks/reviews/code-r61.md`, `tasks/reviews/code-r58.md`, `tasks/reviews/code-r57.md`, `tasks/reviews/code-r56.md`, `tasks/reviews/code-r55.md`, `tasks/reviews/code-r54.md`, `tasks/reviews/code-r53.md`, `tasks/reviews/code-r52.md`
+- briefs: `tasks/t-0151.md`, `tasks/review-r65.md`, `tasks/t-0150.md`, `tasks/t-0149.md`, `tasks/t-0148.md`, `tasks/review-r64.md`, `tasks/t-0147.md`, `tasks/review-r63.md`, `tasks/t-0146.md`, `tasks/t-0145.md`, `tasks/review-r62.md`, `tasks/t-0144.md`
+- verdicts: `tasks/reviews/code-r65.md`, `tasks/reviews/code-r64.md`, `tasks/reviews/code-r63.md`, `tasks/reviews/code-r62.md`, `tasks/reviews/code-r60.md`, `tasks/reviews/code-r61.md`, `tasks/reviews/code-r58.md`, `tasks/reviews/code-r57.md`, `tasks/reviews/code-r56.md`, `tasks/reviews/code-r55.md`, `tasks/reviews/code-r54.md`, `tasks/reviews/code-r53.md`
 
 ### Pickup
 
@@ -204,5 +195,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /home/agent/.herdr-ade/adeherdr && claude --resume 22e30006-6abc-4f92-9bcc-c002ce0ce442
 ```
 
-Round `r64` was merged into `main` at verdict commit `cb6265f2504c262543d05e888943da94dba240e9`; this checkpoint is its child.
+Round `r65` was merged into `main` at verdict commit `37bd2f2b3df11bdd25af3377b470b0a72ceabdbe`; this checkpoint is its child.
 
