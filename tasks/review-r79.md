@@ -65,3 +65,7 @@ Gates passed with `PATH=/bin:$PATH DEVELOPER_DIR=/Library/Developer/CommandLineT
 The Mac-only `/home/agent/projects/herdr/HANDOFF.md` was unavailable on `oci`; I read the committed `HANDOFF.md` in this checkout instead.
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `64c73b38497adc72c0792f3bebdb6b8669771539`.
