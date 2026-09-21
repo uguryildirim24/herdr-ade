@@ -59,7 +59,7 @@ pub(crate) fn describe_data(paths: &[DataPath]) -> String {
         .join(", ")
 }
 
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
