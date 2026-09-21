@@ -734,7 +734,6 @@ pub(crate) fn views(project: &Project) -> (Vec<View>, Vec<anyhow::Error>) {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum EvidenceKind {
-    Installed,
     Verified,
 }
 
@@ -752,19 +751,16 @@ pub(crate) fn record_evidence(
     }
     let before = view(project, load(project, id)?);
     let required = required_states(project, &before.record)?;
-    let word = match kind {
-        EvidenceKind::Installed => "installed",
-        EvidenceKind::Verified => "verified",
-    };
+    let word = "verified";
     if !required.iter().any(|state| state == word) {
         return Err(crate::refusal::error(format!(
             "task_evidence: `{word}` is not enabled for this task's repository"
         )));
     }
-    let prerequisite = match kind {
-        EvidenceKind::Installed => "merged",
-        EvidenceKind::Verified if required.iter().any(|state| state == "installed") => "installed",
-        EvidenceKind::Verified => "merged",
+    let prerequisite = if required.iter().any(|state| state == "installed") {
+        "installed"
+    } else {
+        "merged"
     };
     let reached = STATES
         .iter()
@@ -780,30 +776,24 @@ pub(crate) fn record_evidence(
             before.state.word()
         )));
     }
-    if matches!(kind, EvidenceKind::Verified) {
-        if required.iter().any(|state| state == "installed") && !running_current(&before.record) {
-            return Err(crate::refusal::error(
-                "task_evidence: verification needs a successful running-processes check after installation",
-            ));
-        }
-        if acceptance.is_empty() {
-            return Err(crate::refusal::error(
-                "task_evidence: verification needs at least one --acceptance number",
-            ));
-        }
-        if acceptance
-            .iter()
-            .any(|index| *index == 0 || *index > before.record.acceptance.len())
-        {
-            return Err(crate::refusal::error(format!(
-                "task_evidence: an acceptance number is outside 1..={}",
-                before.record.acceptance.len()
-            )));
-        }
-    } else if !acceptance.is_empty() {
+    if required.iter().any(|state| state == "installed") && !running_current(&before.record) {
         return Err(crate::refusal::error(
-            "task_evidence: installation evidence does not take acceptance numbers",
+            "task_evidence: verification needs a successful running-processes check after installation",
         ));
+    }
+    if acceptance.is_empty() {
+        return Err(crate::refusal::error(
+            "task_evidence: verification needs at least one --acceptance number",
+        ));
+    }
+    if acceptance
+        .iter()
+        .any(|index| *index == 0 || *index > before.record.acceptance.len())
+    {
+        return Err(crate::refusal::error(format!(
+            "task_evidence: an acceptance number is outside 1..={}",
+            before.record.acceptance.len()
+        )));
     }
     let mut acceptance = acceptance;
     acceptance.sort_unstable();
@@ -816,10 +806,8 @@ pub(crate) fn record_evidence(
             machine: None,
             build: None,
         };
-        match kind {
-            EvidenceKind::Installed => task.installed.push(evidence),
-            EvidenceKind::Verified => task.verified.push(evidence),
-        }
+        let EvidenceKind::Verified = kind;
+        task.verified.push(evidence);
         Ok(())
     })
 }
@@ -1188,14 +1176,10 @@ mod tests {
         assert_eq!(merged.next, "none");
         // This repository inherits a workflow with no install state.
         assert!(
-            record_evidence(
-                &fx.project,
-                "job-0001",
-                EvidenceKind::Installed,
-                "install",
-                vec![]
-            )
-            .is_err()
+            !required_states(&fx.project, &merged.record)
+                .unwrap()
+                .iter()
+                .any(|state| state == "installed")
         );
 
         let (mut settings, body) = fx.project.read_project_md().unwrap();
@@ -1206,12 +1190,11 @@ mod tests {
             format!("+++\n{front}+++\n\n{body}"),
         )
         .unwrap();
-        let installed = record_evidence(
+        let installed = record_installed(
             &fx.project,
             "job-0001",
-            EvidenceKind::Installed,
-            "ha harness install",
-            vec![],
+            "local",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .unwrap();
         assert_eq!(view(&fx.project, installed).state, State::Installed);

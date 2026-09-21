@@ -863,12 +863,6 @@ fn record_task_proofs(
             )
         })
         .collect();
-    let machines: Vec<String> = builds
-        .iter()
-        .map(|build| build.machine.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
     let mut recorded = Vec::new();
     for slug in crate::project::list_slugs(&ctx.root) {
         let project = crate::project::Project::load(&ctx.root, &slug)?;
@@ -912,10 +906,16 @@ fn record_task_proofs(
                 }
             }
             if processes_pass && !task_builds.is_empty() {
+                let task_machines = task_builds
+                    .iter()
+                    .map(|build| build.machine.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
                 crate::task::record_running(
                     &project,
                     &task.id,
-                    machines.clone(),
+                    task_machines,
                     process_lines.clone(),
                 )?;
             }
@@ -950,12 +950,19 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
     for repo in &repos {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
+        let commit = repo_head(ctx, &repo.path)?;
         local_build(ctx, &repo.path, kind)?;
+        let after_build = repo_head(ctx, &repo.path)?;
+        if after_build != commit {
+            bail!(
+                "harness_build_changed: {} moved from {commit} to {after_build} while it was building",
+                repo.path
+            );
+        }
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin)?;
             reexec_if_replaced(&ctx.env.home.join(".local/bin").join(bin), &running)?;
         }
-        let commit = repo_head(ctx, &repo.path)?;
         builds.push(InstalledBuild {
             repo: repo.path.clone(),
             machine: "local".into(),
@@ -1024,7 +1031,7 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok};
     use std::os::unix::fs::PermissionsExt;
 
     /// Write an executable `zig` that answers `zig version` with `version`.
@@ -1151,6 +1158,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_box_has_unknown_process_state() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("ssh", fail(255, "connection refused"));
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        let proofs = box_process_proofs(&ctx, "box");
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].machine, BOX_MACHINE);
+        assert_eq!(proofs[0].state, "unknown");
+        assert_eq!(proofs[0].build, None);
+        assert!(
+            proofs[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("connection refused"))
+        );
+    }
+
+    #[test]
     fn the_installer_reexecutes_when_it_replaced_its_own_binary() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("herdr-ade");
@@ -1182,7 +1216,6 @@ mod tests {
     #[test]
     fn install_evidence_lands_only_on_tasks_carried_by_the_build() {
         use crate::contracts::{MergeIntent, MergePhase, RoundPhase, RoundRecord};
-        use crate::runner::fake::fail;
 
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
@@ -1248,11 +1281,18 @@ mod tests {
         world.runner.on("no-head installed-head", fail(1, ""));
         let proofs = record_task_proofs(
             &world.ctx(),
-            &[InstalledBuild {
-                repo: repo.to_string_lossy().into_owned(),
-                machine: "local".into(),
-                head: "installed-head".into(),
-            }],
+            &[
+                InstalledBuild {
+                    repo: repo.to_string_lossy().into_owned(),
+                    machine: "local".into(),
+                    head: "installed-head".into(),
+                },
+                InstalledBuild {
+                    repo: "/unrelated/repository".into(),
+                    machine: BOX_MACHINE.into(),
+                    head: "other-head".into(),
+                },
+            ],
             &[ProcessProof {
                 machine: "local".into(),
                 process: "ticker".into(),
@@ -1266,13 +1306,9 @@ mod tests {
 
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].task, "job-0001");
-        assert_eq!(
-            crate::task::load(&project, "job-0001")
-                .unwrap()
-                .installed
-                .len(),
-            1
-        );
+        let carried = crate::task::load(&project, "job-0001").unwrap();
+        assert_eq!(carried.installed.len(), 1);
+        assert_eq!(carried.running[0].machines, ["local"]);
         assert!(
             crate::task::load(&project, "job-0002")
                 .unwrap()
