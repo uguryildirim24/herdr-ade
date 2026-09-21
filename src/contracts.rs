@@ -493,6 +493,19 @@ pub(crate) struct RoundRecord {
     pub(crate) abandoned_reason: Option<String>,
 }
 
+impl RoundRecord {
+    /// Whether this round currently carries a lane. The manifest preserves
+    /// historical admissions, but abandoning the round releases its members.
+    pub(crate) fn carries(&self, thread: &str) -> bool {
+        self.phase != RoundPhase::Abandoned
+            && self
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.thread == thread)
+    }
+}
+
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
 /// (SPEC-ADE D6, item 34).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
