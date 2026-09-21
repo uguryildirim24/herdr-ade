@@ -1329,16 +1329,13 @@ enum ThreadCommand {
     Resolve {
         slug: String,
         id: String,
-        #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied", "keep_pane"])]
+        #[arg(long, conflicts_with_all = ["skip_copy", "discard_uncopied", "keep_pane"])]
         reopen: bool,
-        /// Also remove the worktree (never forced; the branch is kept)
-        #[arg(long)]
-        remove_worktree: bool,
         /// Resolve even though the final copy cannot be made
         #[arg(long)]
         skip_copy: bool,
-        /// With --remove-worktree: accept losing what could not be copied
-        #[arg(long, requires = "remove_worktree")]
+        /// Accept removing a finished worktree when some files could not be copied
+        #[arg(long)]
         discard_uncopied: bool,
         /// Leave the lane's pane and tab open instead of closing them
         #[arg(long)]
@@ -1822,7 +1819,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 slug,
                 id,
                 reopen,
-                remove_worktree,
                 skip_copy,
                 discard_uncopied,
                 keep_pane,
@@ -1833,7 +1829,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     &id,
                     &ResolveArgs {
                         reopen,
-                        remove_worktree,
                         skip_copy,
                         discard_uncopied,
                         keep_pane,

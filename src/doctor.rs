@@ -422,6 +422,20 @@ fn report(
     if root.is_dir() {
         let count = project::list_slugs(root).len();
         check(&mut out, Some(true), "root", format!("{count} project(s)"));
+        let ctx = Ctx {
+            env,
+            root: root.to_path_buf(),
+            config_dir: config_dir.to_path_buf(),
+            runner,
+            detached_ticker: false,
+        };
+        let (leftovers, errors) = finished_worktrees(&ctx, None);
+        check(
+            &mut out,
+            Some(leftovers.is_empty() && errors.is_empty()),
+            "finished worktrees local",
+            worktree_check_detail(&leftovers, &errors),
+        );
     } else {
         check(
             &mut out,
@@ -625,6 +639,21 @@ fn report(
                                 &format!("machine {}", profile.label),
                                 &herdr,
                             );
+                            let ctx = Ctx {
+                                env,
+                                root: root.to_path_buf(),
+                                config_dir: config_dir.to_path_buf(),
+                                runner,
+                                detached_ticker: false,
+                            };
+                            let (leftovers, errors) =
+                                finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
+                            check(
+                                &mut out,
+                                Some(leftovers.is_empty() && errors.is_empty()),
+                                &format!("finished worktrees {}", profile.label),
+                                worktree_check_detail(&leftovers, &errors),
+                            );
                         }
                         Err(error) => check(
                             &mut out,
@@ -640,6 +669,65 @@ fn report(
     }
 
     (out, healthy)
+}
+
+fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
+    match (leftovers.is_empty(), errors.is_empty()) {
+        (true, true) => "none whose work is done".into(),
+        (false, true) => format!("remove these finished worktrees: {}", leftovers.join(", ")),
+        (true, false) => format!("could not check: {}", errors.join("; ")),
+        (false, false) => format!(
+            "remove these finished worktrees: {}; could not check: {}",
+            leftovers.join(", "),
+            errors.join("; ")
+        ),
+    }
+}
+
+/// Finished thread worktrees that still exist on one machine. Completion is
+/// derived from the same records as `thread resolve`; existence is checked on
+/// the machine that owns the checkout.
+fn finished_worktrees(ctx: &Ctx, remote: Option<(&str, &str)>) -> (Vec<String>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut errors = Vec::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let Ok(project) = project::Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        for thread in crate::thread::list(&project) {
+            if thread.kind != crate::thread::Kind::Worktree || thread.worktree_path.is_empty() {
+                continue;
+            }
+            let on_machine = match remote {
+                None => !thread.is_remote(),
+                Some((machine, _)) => thread.is_remote() && thread.machine_route() == machine,
+            };
+            if !on_machine {
+                continue;
+            }
+            match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
+                Ok(None) => candidates.push(thread.worktree_path),
+                Ok(Some(_)) => {}
+                Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
+            }
+        }
+    }
+    if let Some((_, target)) = remote {
+        let mut existing = Vec::new();
+        for path in candidates {
+            let script = format!("test -d {}", crate::remote::quote(&path));
+            match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
+                Ok(output) if output.success() => existing.push(path),
+                Ok(output) if output.code == Some(1) && output.stderr.trim().is_empty() => {}
+                Ok(output) => errors.push(format!("{path}: {}", output.error_text())),
+                Err(error) => errors.push(format!("{path}: {error:#}")),
+            }
+        }
+        (existing, errors)
+    } else {
+        candidates.retain(|path| Path::new(path).is_dir());
+        (candidates, errors)
+    }
 }
 
 fn check_workspace_leaks(
@@ -879,9 +967,7 @@ fn machines_to_check(
         machines.extend(
             crate::thread::list(&project)
                 .into_iter()
-                .filter(|thread| {
-                    thread.is_remote() && thread.status != crate::thread::Status::Resolved
-                })
+                .filter(|thread| thread.is_remote() && !thread.worktree_path.is_empty())
                 .map(|thread| thread.machine),
         );
     }
@@ -1538,6 +1624,58 @@ mod tests {
         assert!(text.contains("[warn] project demo memory"), "{text}");
         assert!(text.contains("memory/state.md"), "{text}");
         assert!(text.contains("memory/archive/"), "{text}");
+    }
+
+    #[test]
+    fn a_finished_worktree_left_on_disk_fails_the_doctor_row() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(crate::harness::BOX_WORKER_MARKER),
+            "lane worker\n",
+        )
+        .unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let worktree = home.path().join("finished-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.status = crate::thread::Status::Resolved;
+            thread.worktree_path = worktree.to_string_lossy().into_owned();
+            thread.repo = "/repo".into();
+            thread.branch = "lane".into();
+        })
+        .unwrap();
+        let rounds = project.state_dir().join("rounds");
+        std::fs::create_dir_all(&rounds).unwrap();
+        let record = crate::contracts::RoundRecord {
+            phase: crate::contracts::RoundPhase::Abandoned,
+            round: "r1".into(),
+            branch: "main".into(),
+            plain: "The work is closed.".into(),
+            policy_hash: "policy".into(),
+            manifest: crate::contracts::AdmissionManifest {
+                revision: 1,
+                members: vec![crate::contracts::ManifestMember {
+                    thread: thread.id,
+                    pin: None,
+                }],
+            },
+            repo: "/repo".into(),
+            abandoned_reason: Some("not needed".into()),
+            ..crate::contracts::RoundRecord::default()
+        };
+        std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+
+        let (text, healthy) = report(&env, &root, &config, &SessionFlags::default(), &runner);
+
+        assert!(!healthy, "{text}");
+        assert!(text.contains("[FAIL] finished worktrees local"), "{text}");
+        assert!(text.contains(worktree.to_string_lossy().as_ref()), "{text}");
     }
 
     #[test]

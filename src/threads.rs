@@ -598,7 +598,10 @@ fn box_repo_candidate(
     }
 }
 
-fn box_repo_row(settings: &crate::project::Settings, repo: &str) -> Result<(String, String)> {
+pub(crate) fn box_repo_row(
+    settings: &crate::project::Settings,
+    repo: &str,
+) -> Result<(String, String)> {
     box_repo_candidate(repo.into(), settings.repos.iter().find(|r| r.path == repo))
 }
 
@@ -1442,7 +1445,6 @@ pub fn ack(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 #[derive(Default)]
 pub struct ResolveArgs {
     pub reopen: bool,
-    pub remove_worktree: bool,
     pub skip_copy: bool,
     pub discard_uncopied: bool,
     /// Leave the lane's pane and tab open (the idle agent still runs).
@@ -1466,18 +1468,13 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         );
         return Ok(());
     }
-    if args.skip_copy && args.remove_worktree {
-        bail!("--skip-copy cannot be combined with --remove-worktree");
-    }
-    if args.remove_worktree && record.kind != Kind::Worktree {
-        bail!(
-            "--remove-worktree is only for worktree threads; {id} is a {:?} thread",
-            record.kind
-        );
+    if args.skip_copy && args.discard_uncopied {
+        bail!("--skip-copy cannot be combined with --discard-uncopied");
     }
     crate::round::require_resolvable(&project, id)?;
 
     // Every path that resolves a thread performs a final copy first.
+    let mut removal_refusal = None;
     if !args.skip_copy {
         let copied = final_copy(ctx, &project, &record);
         match &copied.outcome {
@@ -1487,9 +1484,10 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
                 for note in notes {
                     println!("  - {note}");
                 }
-                if args.remove_worktree && !args.discard_uncopied {
-                    bail!(
-                        "refusing --remove-worktree: removing the worktree would delete what was not copied. Pass --discard-uncopied to accept that loss."
+                if !args.discard_uncopied {
+                    removal_refusal = Some(
+                        "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
+                            .to_string(),
                     );
                 }
             }
@@ -1501,10 +1499,32 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         }
     }
 
-    if args.remove_worktree {
-        remove_worktree(ctx, &project, &record)?;
-        // The record says what exists: `delete` lists leftovers from it.
-        thread::update(&project, id, |t| t.worktree_path.clear())?;
+    let mut pane_closed = false;
+    let mut worktree_removed = false;
+    if record.kind == Kind::Worktree && !record.worktree_path.is_empty() {
+        if args.keep_pane {
+            removal_refusal = Some(
+                "worktree_in_use: the worktree was kept because --keep-pane leaves its pane open"
+                    .into(),
+            );
+        }
+        if removal_refusal.is_none() {
+            removal_refusal = finished_worktree_reason(ctx, &project, &record)?;
+        }
+        if removal_refusal.is_none()
+            && let Some(reason) = dirty_worktree_reason(ctx, &project, &record)?
+        {
+            return Err(crate::refusal::error(reason));
+        }
+        if removal_refusal.is_none() {
+            // Stop the idle agent before removing its current directory. This
+            // also makes the raw box-side `git worktree remove` independent of
+            // Herdr workspace ownership.
+            pane_closed = close_pane(ctx, &project, &record)?;
+            remove_worktree(ctx, &project, &record)?;
+            thread::update(&project, id, |t| t.worktree_path.clear())?;
+            worktree_removed = true;
+        }
     }
     let resolved = thread::update(&project, id, |t| {
         t.status = Status::Resolved;
@@ -1514,8 +1534,8 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &resolved);
     }
-    let pane_closed = if args.keep_pane {
-        false
+    let pane_closed = if args.keep_pane || pane_closed {
+        pane_closed
     } else {
         close_pane(ctx, &project, &resolved)?
     };
@@ -1530,22 +1550,23 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     } else {
         println!("Its pane and tab were already gone.");
     }
-    if !args.remove_worktree {
-        match resolved.kind {
-            Kind::Worktree if resolved.worktree_path.is_empty() => {
-                println!("No worktree was recorded for it, so there is nothing to close or remove.")
-            }
-            Kind::Worktree => println!(
-                "Its worktree ({}) and branch ({}) were left alone. Run `thread resolve {slug} {id} --remove-worktree` to remove the worktree.",
-                resolved.worktree_path, resolved.branch
-            ),
-            _ => {}
-        }
-    } else {
+    if worktree_removed {
+        crate::output::insert(
+            "worktree",
+            serde_json::json!({"outcome": "removed", "path": record.worktree_path, "branch_kept": resolved.branch}),
+        );
         println!(
             "The worktree {} was removed; the branch {} was kept.",
             record.worktree_path, resolved.branch
         );
+    } else if let Some(reason) = removal_refusal {
+        crate::output::insert(
+            "worktree",
+            serde_json::json!({"outcome": "kept", "path": record.worktree_path, "reason": reason}),
+        );
+        println!("The worktree {} was kept: {reason}.", record.worktree_path);
+    } else if resolved.kind == Kind::Worktree {
+        println!("No worktree was recorded for it, so there is nothing to remove.");
     }
     refresh_plan(ctx, &project);
     Ok(())
@@ -1736,8 +1757,99 @@ fn imported_report(project: &Project, record: &Thread) -> thread::Copied {
     }
 }
 
-/// Never forces. herdr's or git's refusal (for example uncommitted changes) is
-/// reported unchanged.
+/// Why a recorded worktree is not finished yet. `None` means one of the
+/// durable completion conditions permits removal.
+pub(crate) fn finished_worktree_reason(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+) -> Result<Option<String>> {
+    for round in crate::round::checked_list(project)? {
+        let member = round
+            .manifest
+            .members
+            .iter()
+            .any(|member| member.thread == record.id);
+        if member && round.phase.closed() {
+            return Ok(None);
+        }
+        if round.reviewer.as_deref() == Some(record.id.as_str()) && round.verdict.is_some() {
+            return Ok(None);
+        }
+    }
+
+    if record.branch.is_empty() {
+        return Ok(Some(
+            "work_not_done: no lane branch is recorded and no closed round contains the thread"
+                .into(),
+        ));
+    }
+    let Some(lane_head) = crate::git::branch_head(ctx.runner, &record.repo, &record.branch)? else {
+        return Ok(Some(format!(
+            "work_not_done: branch `{}` is missing and no closed round contains the thread",
+            record.branch
+        )));
+    };
+    let integration = crate::git::symbolic_head(ctx.runner, &record.repo)?;
+    let integration_head = crate::git::branch_head(ctx.runner, &record.repo, &integration)?
+        .with_context(|| format!("integration branch `{integration}` is missing"))?;
+    if crate::git::is_ancestor(ctx.runner, &record.repo, &lane_head, &integration_head)? {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "work_not_done: branch `{}` is not on integration branch `{integration}` and no closed round contains the thread",
+            record.branch
+        )))
+    }
+}
+
+fn dirty_worktree_reason(ctx: &Ctx, project: &Project, record: &Thread) -> Result<Option<String>> {
+    let paths = if record.is_remote() {
+        let (settings, _) = project.read_project_md()?;
+        let (box_repo, _) = box_repo_row(&settings, &record.repo)?;
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        let script = format!(
+            "git -C {} status --porcelain --untracked-files=all",
+            remote::quote(&record.worktree_path)
+        );
+        let out = remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &script,
+            None,
+            Duration::from_secs(20),
+        )?;
+        if !out.success() {
+            bail!(
+                "worktree_status_failed: {} in {}: {}",
+                record.worktree_path,
+                box_repo,
+                out.error_text()
+            );
+        }
+        out.stdout
+            .lines()
+            .filter(|line| line.len() > 3)
+            .map(|line| line[3..].trim().trim_matches('"').to_string())
+            .collect()
+    } else {
+        crate::git::dirty_paths(ctx.runner, &record.repo, &record.worktree_path)?
+    };
+    Ok((!paths.is_empty()).then(|| {
+        format!(
+            "worktree_dirty: uncommitted changes in {}; not removing ({})",
+            record.worktree_path,
+            paths.join(", ")
+        )
+    }))
+}
+
+/// Never forces. Git's refusal is reported unchanged.
 fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if !record.is_remote() {
         return remove_ade_worktree(ctx, project, record);
@@ -1745,19 +1857,8 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     if record.worktree_path.is_empty() {
         bail!("{} has no recorded worktree", record.id);
     }
-    let view = require_session(ctx, project)?;
-    let (_, panes) = lists_for(&view, record)?;
-    let workspace_open = panes.iter().any(|p| {
-        p.workspace_id == record.workspace_id
-            && Path::new(&p.cwd).starts_with(&record.worktree_path)
-    });
-    if workspace_open {
-        return view
-            .herdr
-            .on_machine(record.machine_route())
-            .worktree_remove(&record.workspace_id)
-            .map_err(|error| anyhow::anyhow!("{error}"));
-    }
+    let (settings, _) = project.read_project_md()?;
+    let (box_repo, _) = box_repo_row(&settings, &record.repo)?;
     let target = remote::machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
@@ -1767,7 +1868,7 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     .target;
     let script = format!(
         "cd {} && git worktree remove {}",
-        remote::quote(&record.repo),
+        remote::quote(&box_repo),
         remote::quote(&record.worktree_path)
     );
     let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
