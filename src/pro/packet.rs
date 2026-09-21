@@ -11,22 +11,22 @@ use anyhow::{Context, Result, bail};
 use super::{PACKET_MAX_BYTES, PACKET_MAX_TOKENS};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Packet {
-    pub text: String,
-    pub bytes: usize,
-    pub tokens: u64,
+pub(crate) struct Packet {
+    pub(crate) text: String,
+    pub(crate) bytes: usize,
+    pub(crate) tokens: u64,
     /// The absolute path of every file that went in, brief first.
-    pub files: Vec<String>,
+    pub(crate) files: Vec<String>,
 }
 
 /// A rough token estimate: four bytes per token, rounded up.
-pub fn estimate_tokens(bytes: usize) -> u64 {
+fn estimate_tokens(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(4)
 }
 
 /// The reason a path must not enter a packet, if any (spec §3, the
 /// secret-name filter).
-pub fn secret_reason(path: &Path) -> Option<&'static str> {
+fn secret_reason(path: &Path) -> Option<&'static str> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
@@ -86,7 +86,7 @@ fn section(path: &Path, text: &str) -> Result<String> {
 
 /// Build the packet for one turn. The brief and every attachment must exist
 /// and pass the secret filter.
-pub fn build(brief: &Path, attachments: &[PathBuf], out: &Path) -> Result<Packet> {
+pub(crate) fn build(brief: &Path, attachments: &[PathBuf], out: &Path) -> Result<Packet> {
     refuse_secret(out)?;
     if let (Some(parent), Some(name)) = (out.parent(), out.file_name()) {
         let parent = std::fs::canonicalize(parent)

@@ -23,7 +23,7 @@ fn artifacts_dir(project: &Project) -> PathBuf {
     project.dir().join("artifacts")
 }
 
-pub fn op_path(project: &Project, id: &str) -> Result<PathBuf> {
+fn op_path(project: &Project, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
     Ok(ops_dir(project).join(format!("{id}.toml")))
 }
@@ -41,14 +41,14 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load(project: &Project, id: &str) -> Result<Op> {
+pub(crate) fn load(project: &Project, id: &str) -> Result<Op> {
     let path = op_path(project, id)?;
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("could not read operation {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
-pub fn list(project: &Project) -> Vec<Op> {
+pub(crate) fn list(project: &Project) -> Vec<Op> {
     let Ok(entries) = std::fs::read_dir(ops_dir(project)) else {
         return Vec::new();
     };
@@ -68,19 +68,19 @@ fn write_op(project: &Project, op: &Op) -> Result<()> {
 }
 
 /// The complete payload of one `ha done` or `ha waiting`.
-pub struct Reservation<'a> {
-    pub thread: &'a str,
-    pub attempt: u32,
-    pub kind: OpKind,
-    pub recipient: Recipient,
-    pub round: Option<String>,
-    pub requested: Requested,
-    pub helper_pid: u32,
+pub(crate) struct Reservation<'a> {
+    pub(crate) thread: &'a str,
+    pub(crate) attempt: u32,
+    pub(crate) kind: OpKind,
+    pub(crate) recipient: Recipient,
+    pub(crate) round: Option<String>,
+    pub(crate) requested: Requested,
+    pub(crate) helper_pid: u32,
 }
 
 /// Reserve the complete payload under the project lock. Same-payload retries
 /// resume one op. A changed payload abandons it and allocates the next id.
-pub fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
+pub(crate) fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
     let Reservation {
         thread,
         attempt,
@@ -142,7 +142,7 @@ pub fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
 
 /// The published lane ref must equal `sha` before a box `done` stages
 /// (SPEC-remote §4.3): one `git ls-remote` against the URL-matched remote.
-pub fn check_published_ref(
+pub(crate) fn check_published_ref(
     runner: &dyn Runner,
     worktree: &Path,
     branch: &str,
@@ -179,7 +179,12 @@ pub fn check_published_ref(
 
 /// Stage a `done` without the project lock. Git is invoked only here, then the
 /// revision-1 marker is advanced under the lock.
-pub fn stage_done(project: &Project, id: &str, worktree: &Path, runner: &dyn Runner) -> Result<Op> {
+pub(crate) fn stage_done(
+    project: &Project,
+    id: &str,
+    worktree: &Path,
+    runner: &dyn Runner,
+) -> Result<Op> {
     let op = load(project, id)?;
     if op.state == OpState::Staged || op.state == OpState::Sealed {
         return Ok(op);
@@ -227,7 +232,7 @@ pub fn stage_done(project: &Project, id: &str, worktree: &Path, runner: &dyn Run
     advance_staged(project, id, Some(artifact))
 }
 
-pub fn stage_waiting(project: &Project, id: &str) -> Result<Op> {
+pub(crate) fn stage_waiting(project: &Project, id: &str) -> Result<Op> {
     let op = load(project, id)?;
     if op.state == OpState::Staged || op.state == OpState::Sealed {
         return Ok(op);
@@ -262,7 +267,7 @@ fn advance_staged(project: &Project, id: &str, artifact: Option<String>) -> Resu
 
 /// Seal under the project lock after the caller re-verifies the attempt and
 /// recipient binding. A matching X2b event repairs the marker.
-pub fn seal(
+pub(crate) fn seal(
     project: &Project,
     id: &str,
     validate: impl FnOnce(&Op) -> Result<()>,
@@ -326,7 +331,7 @@ fn event_from_op(op: &Op) -> Result<Event> {
     })
 }
 
-pub fn abandon(project: &Project, id: &str) -> Result<Op> {
+pub(crate) fn abandon(project: &Project, id: &str) -> Result<Op> {
     let _lock = project.lock()?;
     let mut op = load(project, id)?;
     if op.state != OpState::Sealed && op.state != OpState::Abandoned {
@@ -340,7 +345,7 @@ pub fn abandon(project: &Project, id: &str) -> Result<Op> {
 /// A2 ticker pass. A1 wires this from its ticker with the existing `Ctx` and
 /// project. Staged operations are sealable from their own durable payload;
 /// reserved operations are abandoned only when their exact helper is dead.
-pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
     for op in list(project) {
         if let Err(error) = tick_op(ctx, project, &op) {
@@ -388,7 +393,7 @@ fn tick_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
 /// Box-side D5 recovery (SPEC-remote §4.3, gate R15). The courier helper runs
 /// this once per pass on the box, before it reads the sealed events. The lane
 /// card, not a Mac-side thread record, is the box authority.
-pub fn recover_box(ctx: &Ctx) -> Result<()> {
+pub(crate) fn recover_box(ctx: &Ctx) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
     for slug in project::list_slugs(&ctx.root) {
         let Ok(project) = Project::load(&ctx.root, &slug) else {

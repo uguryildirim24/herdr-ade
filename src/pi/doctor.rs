@@ -13,21 +13,21 @@ use serde_json::Value;
 use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, recipes, sh};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
+pub(crate) enum Level {
     Ok,
     Warn,
     Fail,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Row {
-    pub level: Level,
-    pub label: String,
-    pub detail: String,
+pub(crate) struct Row {
+    pub(crate) level: Level,
+    pub(crate) label: String,
+    pub(crate) detail: String,
 }
 
 impl Row {
-    pub fn ok(label: impl Into<String>, detail: impl Into<String>) -> Row {
+    pub(crate) fn ok(label: impl Into<String>, detail: impl Into<String>) -> Row {
         Row {
             level: Level::Ok,
             label: label.into(),
@@ -35,7 +35,7 @@ impl Row {
         }
     }
 
-    pub fn warn(label: impl Into<String>, detail: impl Into<String>) -> Row {
+    pub(crate) fn warn(label: impl Into<String>, detail: impl Into<String>) -> Row {
         Row {
             level: Level::Warn,
             label: label.into(),
@@ -43,7 +43,7 @@ impl Row {
         }
     }
 
-    pub fn fail(label: impl Into<String>, detail: impl Into<String>) -> Row {
+    pub(crate) fn fail(label: impl Into<String>, detail: impl Into<String>) -> Row {
         Row {
             level: Level::Fail,
             label: label.into(),
@@ -52,7 +52,7 @@ impl Row {
     }
 
     /// `[ok  ] label: detail`, the plugin's doctor line shape.
-    pub fn line(&self) -> String {
+    pub(crate) fn line(&self) -> String {
         let mark = match self.level {
             Level::Ok => "ok  ",
             Level::Warn => "warn",
@@ -62,13 +62,13 @@ impl Row {
     }
 }
 
-pub fn healthy(rows: &[Row]) -> bool {
+pub(crate) fn healthy(rows: &[Row]) -> bool {
     !rows.iter().any(|r| r.level == Level::Fail)
 }
 
 /// Run every row from the process environment (A1 wires this into
 /// `herdr-ade doctor`). `Err` only when the environment cannot be read.
-pub fn doctor_rows() -> Result<(Vec<Row>, bool)> {
+pub(crate) fn doctor_rows() -> Result<(Vec<Row>, bool)> {
     let env = Env::from_process()?;
     let layout = Layout::from_env(&env)?;
     let providers = recipes::enabled_providers();
@@ -77,7 +77,7 @@ pub fn doctor_rows() -> Result<(Vec<Row>, bool)> {
     Ok((rows, ok))
 }
 
-pub fn doctor_rows_with(
+pub(crate) fn doctor_rows_with(
     env: &Env,
     layout: &Layout,
     runner: &dyn sh::Runner,
@@ -389,7 +389,7 @@ pub fn doctor_rows_with(
 }
 
 /// The `--provider` a `check <provider>` call must refuse before any start.
-pub fn check_provider_allowed(provider: &str) -> Result<()> {
+fn check_provider_allowed(provider: &str) -> Result<()> {
     if provider.eq_ignore_ascii_case("cursor") {
         anyhow::bail!("pi_cursor_forbidden: Cursor stays outside pi (decision 18:30)");
     }
@@ -402,21 +402,21 @@ pub fn check_provider_allowed(provider: &str) -> Result<()> {
 /// Read-only readiness for one provider (SPEC-pi v2 §3, §3.4): wrapper
 /// identity, pin, trust setting, both extensions, `pi auth check`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CheckReport {
-    pub ok: bool,
-    pub provider: String,
-    pub rows: Vec<Row>,
+pub(crate) struct CheckReport {
+    pub(crate) ok: bool,
+    pub(crate) provider: String,
+    pub(crate) rows: Vec<Row>,
 }
 
 impl CheckReport {
-    pub fn failures(&self) -> Vec<&Row> {
+    pub(crate) fn failures(&self) -> Vec<&Row> {
         self.rows
             .iter()
             .filter(|r| r.level == Level::Fail)
             .collect()
     }
 
-    pub fn error_text(&self) -> String {
+    pub(crate) fn error_text(&self) -> String {
         let mut text = format!("pi is not ready for `{}`", self.provider);
         for row in self.failures() {
             text.push_str(&format!("; {}: {}", row.label, row.detail));
@@ -425,7 +425,7 @@ impl CheckReport {
     }
 
     /// The shape `herdr-pi check <provider>` prints and A1 records.
-    pub fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         let rows: Vec<Value> = self
             .rows
             .iter()
@@ -451,7 +451,7 @@ impl CheckReport {
 }
 
 /// The full `check <provider>`: everything A1 refuses a start on.
-pub fn check_report(
+pub(crate) fn check_report(
     env: &Env,
     layout: &Layout,
     runner: &dyn sh::Runner,
@@ -554,7 +554,7 @@ pub fn check_report(
 }
 
 /// Do not start a lane A1 will have to kill: refuse with the failing rows.
-pub fn check_with(
+pub(crate) fn check_with(
     layout: &Layout,
     env: &Env,
     runner: &dyn sh::Runner,

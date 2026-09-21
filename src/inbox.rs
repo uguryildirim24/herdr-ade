@@ -10,17 +10,17 @@ use crate::project::{self, Project};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
-pub struct Item {
-    pub id: String,
-    pub kind: String,
-    pub subject: String,
-    pub created: String,
-    pub summary: String,
+pub(crate) struct Item {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) subject: String,
+    pub(crate) created: String,
+    pub(crate) summary: String,
     /// Sealed event id when this item is a delivery projection.
-    pub event: String,
+    pub(crate) event: String,
     /// Empty except for `routine` items.
     #[serde(skip)]
-    pub body: String,
+    pub(crate) body: String,
 }
 
 fn inbox_dir(project: &Project) -> PathBuf {
@@ -55,7 +55,7 @@ fn removed_kind(kind: &str) -> bool {
 }
 
 /// File-name-safe form of a subject (a thread id, routine name, machine label).
-pub fn safe_subject(subject: &str) -> String {
+fn safe_subject(subject: &str) -> String {
     let cleaned: String = subject
         .chars()
         .map(|c| {
@@ -78,7 +78,7 @@ pub fn safe_subject(subject: &str) -> String {
 /// Writes one item. The id is `<UTC timestamp>-<kind>-<subject>-<n>`, where
 /// `<n>` is a counter allocated under the project lock, so two events in one
 /// tick never share a name. `body` is empty except for `routine` items.
-pub fn write(
+pub(crate) fn write(
     project: &Project,
     kind: &str,
     subject: &str,
@@ -124,7 +124,7 @@ pub fn write(
 
 /// Writes the one stable inbox projection for a sealed event. A retry observes
 /// the existing item instead of allocating a second counter id.
-pub fn write_event(
+pub(crate) fn write_event(
     project: &Project,
     event: &crate::contracts::Event,
     kind: &str,
@@ -173,7 +173,7 @@ pub fn write_event(
 }
 
 /// Deletes handled items older than `days`.
-pub fn prune_done(project: &Project, days: u64) {
+pub(crate) fn prune_done(project: &Project, days: u64) {
     let Ok(entries) = std::fs::read_dir(inbox_dir(project).join("done")) else {
         return;
     };
@@ -192,7 +192,7 @@ pub fn prune_done(project: &Project, days: u64) {
 }
 
 /// Unhandled items, oldest first (ids start with a UTC timestamp).
-pub fn unhandled(project: &Project) -> Vec<Item> {
+pub(crate) fn unhandled(project: &Project) -> Vec<Item> {
     let Ok(entries) = std::fs::read_dir(inbox_dir(project)) else {
         return Vec::new();
     };
@@ -206,12 +206,12 @@ pub fn unhandled(project: &Project) -> Vec<Item> {
     items
 }
 
-pub fn seen(project: &Project) -> BTreeSet<String> {
+pub(crate) fn seen(project: &Project) -> BTreeSet<String> {
     project::read_json(&project.state_dir().join("inbox-seen.json")).unwrap_or_default()
 }
 
 /// Records that `context` showed these items, so they are nudged once only.
-pub fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
+pub(crate) fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -226,7 +226,7 @@ pub fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
 
 /// A context read acknowledges only events shown to their exact coordinator
 /// pane and attempt. `--peek` never calls this function.
-pub fn acknowledge_events(
+pub(crate) fn acknowledge_events(
     project: &Project,
     ids: &[String],
     pane: &str,
@@ -270,7 +270,7 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 /// Handles event-linked items only when the caller is their bound coordinator.
-pub fn done_bound(
+pub(crate) fn done_bound(
     project: &Project,
     ids: &[String],
     all: bool,

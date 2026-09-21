@@ -14,22 +14,22 @@ use crate::thread;
 
 /// One glossary line: `- <name>: <sentence> (<path>)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub name: String,
-    pub sentence: String,
-    pub path: String,
+pub(crate) struct Entry {
+    pub(crate) name: String,
+    pub(crate) sentence: String,
+    pub(crate) path: String,
     /// Birth time; `GLOSSARY.md` lists newest last.
-    pub born: String,
+    pub(crate) born: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Term {
-    pub name: String,
-    pub sentence: String,
+pub(crate) struct Term {
+    pub(crate) name: String,
+    pub(crate) sentence: String,
     #[serde(default)]
-    pub path: String,
+    pub(crate) path: String,
     #[serde(default)]
-    pub added: String,
+    pub(crate) added: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -42,11 +42,11 @@ fn terms_path(project: &Project) -> PathBuf {
     project.dir().join("terms.toml")
 }
 
-pub fn glossary_path(project: &Project) -> PathBuf {
+pub(crate) fn glossary_path(project: &Project) -> PathBuf {
     project.dir().join("GLOSSARY.md")
 }
 
-pub fn terms(project: &Project) -> Vec<Term> {
+pub(crate) fn terms(project: &Project) -> Vec<Term> {
     std::fs::read_to_string(terms_path(project))
         .ok()
         .and_then(|t| toml::from_str::<TermsFile>(&t).ok())
@@ -56,7 +56,7 @@ pub fn terms(project: &Project) -> Vec<Term> {
 
 /// Every born name: threads (id and branch), rounds, dialogues. Terms are
 /// kept apart: a glossary term is never an exemption (R2).
-pub fn names(project: &Project) -> Vec<Entry> {
+pub(crate) fn names(project: &Project) -> Vec<Entry> {
     let mut out = Vec::new();
     for t in thread::list(project) {
         let sentence = crate::round::thread_plain(project, &t.id);
@@ -102,7 +102,7 @@ pub fn names(project: &Project) -> Vec<Entry> {
 }
 
 /// The checker's input value for this project (D17 item 1).
-pub fn registry(project: &Project) -> Glossary {
+pub(crate) fn registry(project: &Project) -> Glossary {
     let mut names_map = BTreeMap::new();
     for e in names(project) {
         names_map.entry(e.name).or_insert(e.sentence);
@@ -139,7 +139,7 @@ fn max_sentence_words(project: &Project) -> usize {
 
 /// The check's output in the form a model corrects from: each failing span,
 /// its rule and the fixed fix text.
-pub fn format_check(text: &str, result: &CheckResult) -> String {
+pub(crate) fn format_check(text: &str, result: &CheckResult) -> String {
     result
         .violations
         .iter()
@@ -158,7 +158,7 @@ pub fn format_check(text: &str, result: &CheckResult) -> String {
 /// One checked plain sentence for a coordinator-written field (plan step,
 /// result sentence). Uses the project registry so a born name may appear in
 /// gloss form, and requires exactly one sentence. Returns the trimmed text.
-pub fn check_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
+pub(crate) fn check_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         bail!("plain_envelope: required field {field} is missing or empty");
@@ -181,7 +181,7 @@ pub fn check_sentence(project: &Project, field: &str, text: &str) -> Result<Stri
 /// rule [`check_sentence`] keeps except the known-word rule, so the line may
 /// name a file; the length limit still holds because the line is a row on a
 /// screen.
-pub fn check_record_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
+pub(crate) fn check_record_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         bail!("plain_envelope: required field {field} is missing or empty");
@@ -197,7 +197,7 @@ pub fn check_record_sentence(project: &Project, field: &str, text: &str) -> Resu
 }
 
 /// Checks a text for Rolf's plane; the error carries the check's output.
-pub fn gate(project: &Project, text: &str) -> Result<()> {
+pub(crate) fn gate(project: &Project, text: &str) -> Result<()> {
     let result = plain::check(text, &registry(project));
     if result.passed() {
         Ok(())
@@ -210,7 +210,7 @@ pub fn gate(project: &Project, text: &str) -> Result<()> {
 /// sentence cap. The compact overview cuts a long sentence to one line and
 /// the full overview wraps it, so length alone never hides a record; jargon,
 /// names and identifiers still do.
-pub fn gate_row(project: &Project, text: &str) -> Result<()> {
+pub(crate) fn gate_row(project: &Project, text: &str) -> Result<()> {
     let mut result = plain::check(text, &registry(project));
     result
         .violations
@@ -224,7 +224,7 @@ pub fn gate_row(project: &Project, text: &str) -> Result<()> {
 
 /// The first born name or term `text` carries, even in gloss form. Board
 /// values carry none (item 14).
-pub fn name_in(project: &Project, text: &str) -> Option<String> {
+pub(crate) fn name_in(project: &Project, text: &str) -> Option<String> {
     names(project)
         .into_iter()
         .map(|e| e.name)
@@ -256,14 +256,14 @@ fn is_name_char(b: u8) -> bool {
 
 /// The birth check (D17 item 6): one sentence, at most the word cap, every
 /// word admitted by R4, no registry name and no identifier-shaped token.
-pub fn check_birth(project: &Project, sentence: &str) -> Result<()> {
+pub(crate) fn check_birth(project: &Project, sentence: &str) -> Result<()> {
     check_birth_with(project, sentence, plain::check)
 }
 
 /// The birth check for a coordinator record (`round open`): the same rules as
 /// [`check_birth`] except the known-word rule. The round sentence is a row on a
 /// screen and may name a file.
-pub fn check_record_birth(project: &Project, sentence: &str) -> Result<()> {
+pub(crate) fn check_record_birth(project: &Project, sentence: &str) -> Result<()> {
     check_birth_with(project, sentence, plain::check_record)
 }
 
@@ -301,7 +301,7 @@ fn check_birth_with(
 
 /// Rewrites `GLOSSARY.md` atomically from the records and the terms table,
 /// one line per name, newest last.
-pub fn rewrite(project: &Project) -> Result<()> {
+pub(crate) fn rewrite(project: &Project) -> Result<()> {
     let mut entries: Vec<Entry> = names(project)
         .into_iter()
         .filter(|e| !e.sentence.is_empty())
@@ -339,7 +339,7 @@ fn validate_term_name(name: &str) -> Result<()> {
 }
 
 /// `ha term add <name> --plain "<sentence>"`.
-pub fn add_term(
+pub(crate) fn add_term(
     ctx: &Ctx,
     slug: &str,
     name: &str,
@@ -386,7 +386,7 @@ pub fn add_term(
 }
 
 /// `ha explain <name>`: the recorded line plus its path.
-pub fn explain(ctx: &Ctx, slug: &str, name: &str) -> Result<String> {
+pub(crate) fn explain(ctx: &Ctx, slug: &str, name: &str) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let found = names(&project)
         .into_iter()

@@ -16,7 +16,7 @@ const DEFAULT_TASK: &str = "Continue the work you were already doing in this pan
 
 /// The refusals shared by `thread adopt` and `adopt-workspace`, checked before
 /// anything is created. Returns the agent herdr detects in the pane.
-pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Result<Agent> {
+pub(crate) fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Result<Agent> {
     let agents = herdr
         .agent_list()
         .map_err(|e| anyhow::anyhow!("the herdr session at {socket} is not reachable: {e}"))?;
@@ -52,13 +52,13 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct AdeAdopt {
-    pub plain: String,
-    pub role: Option<String>,
-    pub passive: bool,
+pub(crate) struct AdeAdopt {
+    pub(crate) plain: String,
+    pub(crate) role: Option<String>,
+    pub(crate) passive: bool,
 }
 
-pub fn adopt(
+pub(crate) fn adopt(
     ctx: &Ctx,
     slug: &str,
     pane: &str,
@@ -206,19 +206,19 @@ pub fn adopt(
     Ok(adopted)
 }
 
-pub struct AdoptWorkspace {
-    pub name: String,
-    pub goal: String,
+pub(crate) struct AdoptWorkspace {
+    pub(crate) name: String,
+    pub(crate) goal: String,
     /// The adopted thread's birth sentence (SPEC-ADE D17 item 6).
-    pub plain: String,
-    pub pane: String,
-    pub workspace_cwd: String,
-    pub session: SessionFlags,
+    pub(crate) plain: String,
+    pub(crate) pane: String,
+    pub(crate) workspace_cwd: String,
+    pub(crate) session: SessionFlags,
 }
 
 /// "Continue as a project": `new`, then `open`, then `thread adopt`. It
 /// refuses, before creating anything, under the same conditions as `thread adopt`.
-pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
+pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
     crate::threads::check_birth_plain(&args.plain)?;
     let session = paths::resolve_session(&args.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();

@@ -12,21 +12,21 @@ use super::state;
 use super::{Env, Layout, bridge, serve};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
+pub(crate) enum Level {
     Ok,
     Warn,
     Fail,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Row {
-    pub level: Level,
-    pub label: String,
-    pub detail: String,
+pub(crate) struct Row {
+    pub(crate) level: Level,
+    pub(crate) label: String,
+    pub(crate) detail: String,
 }
 
 impl Row {
-    pub fn ok(label: impl Into<String>, detail: impl Into<String>) -> Row {
+    pub(crate) fn ok(label: impl Into<String>, detail: impl Into<String>) -> Row {
         Row {
             level: Level::Ok,
             label: label.into(),
@@ -34,7 +34,7 @@ impl Row {
         }
     }
 
-    pub fn warn(label: impl Into<String>, detail: impl Into<String>) -> Row {
+    pub(crate) fn warn(label: impl Into<String>, detail: impl Into<String>) -> Row {
         Row {
             level: Level::Warn,
             label: label.into(),
@@ -42,7 +42,7 @@ impl Row {
         }
     }
 
-    pub fn fail(label: impl Into<String>, detail: impl Into<String>) -> Row {
+    pub(crate) fn fail(label: impl Into<String>, detail: impl Into<String>) -> Row {
         Row {
             level: Level::Fail,
             label: label.into(),
@@ -51,7 +51,7 @@ impl Row {
     }
 
     /// `[ok  ] label: detail`, the plugin's doctor line shape.
-    pub fn line(&self) -> String {
+    pub(crate) fn line(&self) -> String {
         let mark = match self.level {
             Level::Ok => "ok  ",
             Level::Warn => "warn",
@@ -61,11 +61,11 @@ impl Row {
     }
 }
 
-pub fn healthy(rows: &[Row]) -> bool {
+pub(crate) fn healthy(rows: &[Row]) -> bool {
     !rows.iter().any(|row| row.level == Level::Fail)
 }
 
-pub fn json(rows: &[Row]) -> Value {
+pub(crate) fn json(rows: &[Row]) -> Value {
     let checks: Vec<Value> = rows
         .iter()
         .map(|row| {
@@ -85,7 +85,7 @@ pub fn json(rows: &[Row]) -> Value {
 }
 
 /// Every row, from the process environment.
-pub fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> {
+pub(crate) fn doctor_rows(env: &Env, layout: &Layout, runner: &dyn Runner) -> Vec<Row> {
     let mut rows = Vec::new();
 
     // 1, 2, 6: the bridge answers, is browser-only, and is a seen major.
@@ -276,7 +276,7 @@ fn herdr_row(env: &Env, runner: &dyn Runner) -> Row {
 }
 
 /// `doctor` and `start` share one gate: any failing row stops a start.
-pub fn gate(env: &Env, layout: &Layout, runner: &dyn Runner) -> Result<()> {
+pub(crate) fn gate(env: &Env, layout: &Layout, runner: &dyn Runner) -> Result<()> {
     let rows = doctor_rows(env, layout, runner);
     if healthy(&rows) {
         return Ok(());

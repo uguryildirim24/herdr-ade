@@ -11,15 +11,14 @@ use serde::Deserialize;
 use crate::contracts::{BOX_REPOS, BoxRepoMap, MACHINE_LOCAL, MachineProfile};
 use crate::runner::{Cmd, Output, Runner};
 
-pub const SSH_TIMEOUT: Duration = Duration::from_secs(10);
-pub const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
-#[allow(dead_code)]
-pub const COPY_TIMEOUT: Duration = Duration::from_secs(60);
+const SSH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
+const COPY_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_OPTIONS: [&str; 4] = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"];
 
 /// Single-quote escaping: safe for any value in an `sh` command string. Plain
 /// words are left bare so printed commands stay readable and stable.
-pub fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     if is_plain(value) {
         value.to_string()
     } else {
@@ -29,7 +28,7 @@ pub fn quote(value: &str) -> String {
 
 /// Only characters that no shell, and neither scp nor rsync in any of their
 /// remote-path modes, treat specially.
-pub fn is_plain(value: &str) -> bool {
+fn is_plain(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
         && value.chars().all(|c| {
@@ -53,7 +52,7 @@ struct SavedMachine {
 
 /// The stable profile of one saved machine (SPEC-remote §4.1). `local` is a
 /// real profile with no SSH target.
-pub fn machine_profile(
+pub(crate) fn machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
     config_dir: &Path,
@@ -65,7 +64,7 @@ pub fn machine_profile(
 
 /// The saved profile when it exists. A missing profile is distinct from a
 /// failed or malformed machine list so callers never silently skip box work.
-pub fn optional_machine_profile(
+pub(crate) fn optional_machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
     _config_dir: &Path,
@@ -110,7 +109,10 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
 
 /// Names of every enabled saved machine. An explicit `--machine` may place
 /// work on any one of these, even when no current thread uses it.
-pub fn registered_machine_names(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<String>> {
+pub(crate) fn registered_machine_names(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+) -> Result<Vec<String>> {
     saved_machines(runner, herdr_bin)?
         .into_iter()
         .filter(|machine| machine.enabled)
@@ -128,14 +130,14 @@ pub fn registered_machine_names(runner: &dyn Runner, herdr_bin: &str) -> Result<
 
 /// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box
 /// path is never derived from the Mac path.
-pub fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
+pub(crate) fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
     BOX_REPOS.iter().find(|row| row.mac == mac_path)
 }
 
 /// The URL-matched remote name in `repo`, never by remote name alone. The
 /// second lane's courier calls this to fetch the lane commit (SPEC-remote
 /// §4.3); the start side pushes by URL directly.
-pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
+pub(crate) fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
     let out = runner.run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote"]))?;
     if !out.success() {
         bail!("git remote in {repo}: {}", out.error_text());
@@ -154,7 +156,7 @@ pub fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<Stri
 /// A remote URL reduced to the repository it names: surrounding whitespace,
 /// every trailing `/` and every trailing `.git` removed. `https://…/repo` and
 /// `https://…/repo.git` are the same remote, however it was written down.
-pub fn normalize_url(url: &str) -> String {
+fn normalize_url(url: &str) -> String {
     url.trim()
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -191,7 +193,7 @@ fn check_target(target: &str) -> Result<()> {
 
 /// Runs `script` on the machine with `sh -c`. The script is one argument; every
 /// value inside it must already have gone through `quote`.
-pub fn ssh(
+pub(crate) fn ssh(
     runner: &dyn Runner,
     target: &str,
     script: &str,
@@ -214,15 +216,15 @@ pub fn ssh(
 /// One box start's git effect (SPEC-remote §4.2 step 3): the box fetches the
 /// lane branch, verifies `FETCH_HEAD = B`, and creates the worktree from it
 /// under the box clone. One SSH call; nothing is copied.
-pub struct Provision<'a> {
-    pub box_repo: &'a str,
-    pub worktree: &'a str,
-    pub branch: &'a str,
-    pub base: &'a str,
-    pub publish_url: &'a str,
+pub(crate) struct Provision<'a> {
+    pub(crate) box_repo: &'a str,
+    pub(crate) worktree: &'a str,
+    pub(crate) branch: &'a str,
+    pub(crate) base: &'a str,
+    pub(crate) publish_url: &'a str,
 }
 
-pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Result<()> {
+pub(crate) fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Result<()> {
     let script = format!(
         "set -e\n\
          cd {repo} || exit 3\n\
@@ -274,7 +276,7 @@ pub fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Resu
 /// The box's lane card: created after the pane id exists (SPEC-remote §4.2
 /// step 5). One SSH call, card bytes on stdin. A minimal `PROJECT.md` is
 /// written when the box has none, so the box's own `ha` can resolve it.
-pub fn provision_card(
+pub(crate) fn provision_card(
     runner: &dyn Runner,
     target: &str,
     slug: &str,
@@ -312,7 +314,7 @@ pub fn provision_card(
 /// The courier's helper call over its multiplexed connection (SPEC-remote
 /// §4.3): the box-local helper runs `sh -c <script>` and the following
 /// `scp` reuses the same control socket.
-pub fn ssh_courier(
+pub(crate) fn ssh_courier(
     runner: &dyn Runner,
     target: &str,
     control_dir: &Path,
@@ -332,7 +334,7 @@ pub fn ssh_courier(
 
 /// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per
 /// pass. The courier passes these on its helper and `scp` calls.
-pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
+fn multiplex_options(control_dir: &Path) -> Vec<String> {
     let dir = control_dir.join("ssh");
     let _ = std::fs::create_dir_all(&dir);
     vec![
@@ -345,49 +347,10 @@ pub fn multiplex_options(control_dir: &Path) -> Vec<String> {
     ]
 }
 
-/// Copies one remote file to a local path with `scp`. A path scp cannot carry
-/// unchanged in every mode (spaces, quotes, globs) is fetched with `ssh cat`
-/// through the quoting helper instead. The second lane's ingress calls this.
-#[allow(dead_code)]
-pub fn fetch_file(
-    runner: &dyn Runner,
-    target: &str,
-    remote_path: &str,
-    local_path: &Path,
-) -> Result<()> {
-    check_target(target)?;
-    if is_plain(remote_path) {
-        let out = runner.run(&Cmd::new("scp", COPY_TIMEOUT).args(SSH_OPTIONS).args([
-            "-q",
-            "--",
-            &format!("{target}:{remote_path}"),
-            &local_path.to_string_lossy(),
-        ]))?;
-        if !out.success() {
-            bail!("scp from {target}: {}", out.error_text());
-        }
-        return Ok(());
-    }
-    let out = ssh(
-        runner,
-        target,
-        &format!("cat -- {}", quote(remote_path)),
-        None,
-        COPY_TIMEOUT,
-    )?;
-    if !out.success() {
-        bail!("ssh {target} cat: {}", out.error_text());
-    }
-    std::fs::write(local_path, out.stdout.as_bytes())?;
-    Ok(())
-}
-
 /// The courier's batched `scp` over its multiplexed connection (SPEC-remote
 /// §4.3): every plain path in one call. A path scp cannot carry safely is
-/// refused here and fetched with [`fetch_file`]. The second lane's courier
-/// calls this; the start side never does.
-#[allow(dead_code)]
-pub fn fetch_batch(
+/// refused. The second lane's courier calls this; the start side never does.
+pub(crate) fn fetch_batch(
     runner: &dyn Runner,
     target: &str,
     control_dir: &Path,
@@ -758,23 +721,7 @@ mod tests {
     #[test]
     fn unsafe_remote_paths_never_reach_scp() {
         let runner = FakeRunner::new();
-        runner.on("ssh", ok("file body"));
-        runner.on("scp", ok(""));
         let dir = tempfile::tempdir().unwrap();
-        fetch_file(
-            &runner,
-            "box",
-            "/wt/my repo/report.md",
-            &dir.path().join("r"),
-        )
-        .unwrap();
-        assert_eq!(runner.count("scp"), 0);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("r")).unwrap(),
-            "file body"
-        );
-        fetch_file(&runner, "box", "/wt/repo/report.md", &dir.path().join("r2")).unwrap();
-        assert_eq!(runner.count("scp"), 1);
         assert!(
             fetch_batch(
                 &runner,
@@ -785,6 +732,6 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(runner.count("scp"), 1);
+        assert_eq!(runner.count("scp"), 0);
     }
 }

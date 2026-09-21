@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::runner::{Cmd, Runner};
 
-pub const GH_TIMEOUT: Duration = Duration::from_secs(10);
+const GH_TIMEOUT: Duration = Duration::from_secs(10);
 const NAME_LIMIT: usize = 80;
 
 /// The `PR:` value of a report's first line, only when it is exactly
 /// `https://github.com/<owner>/<repo>/pull/<number>`. `Err` carries a note for
 /// the inbox item when a `PR:` line is present but not acceptable.
-pub fn pr_line(report: &str) -> Result<Option<String>, String> {
+pub(crate) fn pr_line(report: &str) -> Result<Option<String>, String> {
     let Some(first) = report.lines().next() else {
         return Ok(None);
     };
@@ -30,7 +30,7 @@ pub fn pr_line(report: &str) -> Result<Option<String>, String> {
     }
 }
 
-pub fn valid_pr_url(url: &str) -> bool {
+fn valid_pr_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://github.com/") else {
         return false;
     };
@@ -52,7 +52,7 @@ pub fn valid_pr_url(url: &str) -> bool {
 }
 
 /// `owner/repo`, lower-cased, from the three URL forms git uses for GitHub.
-pub fn normalize_origin(origin: &str) -> Option<String> {
+fn normalize_origin(origin: &str) -> Option<String> {
     let origin = origin.trim();
     let rest = origin
         .strip_prefix("https://github.com/")
@@ -73,7 +73,7 @@ pub fn normalize_origin(origin: &str) -> Option<String> {
 
 /// Check names and logins are attacker-chosen: cut to 80 characters and
 /// stripped of control characters and newlines before they are written.
-pub fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_control())
         .take(NAME_LIMIT)
@@ -85,16 +85,16 @@ pub fn sanitize(name: &str) -> String {
 /// What is kept of a pull request. No bodies, no titles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
-pub struct Summary {
-    pub state: String,
-    pub review_decision: String,
-    pub failing_checks: Vec<String>,
-    pub comment_count: usize,
-    pub commenters: Vec<String>,
+pub(crate) struct Summary {
+    pub(crate) state: String,
+    pub(crate) review_decision: String,
+    pub(crate) failing_checks: Vec<String>,
+    pub(crate) comment_count: usize,
+    pub(crate) commenters: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Checked {
+pub(crate) enum Checked {
     Summary(Summary),
     /// The pull request is not this thread's; the reason goes in one inbox item.
     Ignored(String),
@@ -143,7 +143,7 @@ struct GhOwner {
 /// branch or head repository is not the thread's. Matching on the head
 /// repository, not the URL, keeps fork workflows working: there `origin` is the
 /// fork and the pull request URL is upstream.
-pub fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
+pub(crate) fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
     let view: GhView = serde_json::from_str(json)?;
     if branch.is_empty() {
         return Ok(Checked::Ignored("the thread has no branch".into()));
@@ -216,7 +216,7 @@ pub fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
     }))
 }
 
-pub fn view(runner: &dyn Runner, url: &str) -> Result<String> {
+pub(crate) fn view(runner: &dyn Runner, url: &str) -> Result<String> {
     if !valid_pr_url(url) {
         bail!("not a pull request URL");
     }
@@ -235,7 +235,7 @@ pub fn view(runner: &dyn Runner, url: &str) -> Result<String> {
 }
 
 /// One line describing what changed between two summaries; fields only.
-pub fn describe_change(old: Option<&Summary>, new: &Summary) -> String {
+pub(crate) fn describe_change(old: Option<&Summary>, new: &Summary) -> String {
     let mut parts = vec![format!("state {}", new.state)];
     if !new.review_decision.is_empty() {
         parts.push(format!("review {}", new.review_decision));

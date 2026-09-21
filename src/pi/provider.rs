@@ -16,20 +16,20 @@ use serde_json::{Value, json};
 use super::recipes;
 
 /// The provider that serves the DeepSeek rows.
-pub const PROVIDER_ID: &str = "opencode-go";
+pub(crate) const PROVIDER_ID: &str = "opencode-go";
 
 /// The context size a DeepSeek lane should compact at (Rolf, 2026-09-19).
-pub const DEEPSEEK_COMPACT_AT: u64 = 372_000;
+const DEEPSEEK_COMPACT_AT: u64 = 372_000;
 
 /// pi's default `compaction.reserveTokens` (docs/compaction.md).
-pub const PI_RESERVE_TOKENS: u64 = 16_384;
+const PI_RESERVE_TOKENS: u64 = 16_384;
 
 /// The `contextWindow` that makes pi compact at [`DEEPSEEK_COMPACT_AT`].
-pub const DEEPSEEK_CONTEXT_WINDOW: u64 = DEEPSEEK_COMPACT_AT + PI_RESERVE_TOKENS;
+pub(crate) const DEEPSEEK_CONTEXT_WINDOW: u64 = DEEPSEEK_COMPACT_AT + PI_RESERVE_TOKENS;
 
 /// The model id of every `opencode-go` recipe row that starts with
 /// `deepseek`, in row order. Derived from the rows, never repeated here.
-pub fn deepseek_models() -> Vec<&'static str> {
+fn deepseek_models() -> Vec<&'static str> {
     recipes::pi_recipes()
         .iter()
         .filter(|row| row.provider == PROVIDER_ID && row.model_family.starts_with("deepseek"))
@@ -40,7 +40,7 @@ pub fn deepseek_models() -> Vec<&'static str> {
 /// Merge the DeepSeek `contextWindow` overrides into `models.json`, keeping
 /// every other provider, overrides and keys. A missing or unreadable file
 /// starts from the empty table. Idempotent.
-pub fn write_overrides(path: &Path) -> Result<()> {
+pub(crate) fn write_overrides(path: &Path) -> Result<()> {
     let mut root: Value = match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
             .with_context(|| format!("{} does not parse", path.display()))?,
@@ -88,7 +88,7 @@ pub fn write_overrides(path: &Path) -> Result<()> {
 /// Whether `models.json` names `provider` in its `providers` table. The `pro`
 /// relay is written into `models.json` only on the machine running the
 /// bridge, so doctor treats an absent `pro` as informational, not a failure.
-pub fn has_provider(path: &Path, provider: &str) -> bool {
+pub(crate) fn has_provider(path: &Path, provider: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -103,7 +103,7 @@ pub fn has_provider(path: &Path, provider: &str) -> bool {
 
 /// The DeepSeek recipe models whose `models.json` `contextWindow` is missing
 /// or is not [`DEEPSEEK_CONTEXT_WINDOW`]. Doctor prints the names.
-pub fn missing_overrides(path: &Path) -> Result<Vec<&'static str>> {
+pub(crate) fn missing_overrides(path: &Path) -> Result<Vec<&'static str>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))?;
     let value: Value = serde_json::from_str(&text)
@@ -135,12 +135,6 @@ mod tests {
             assert!(model.starts_with("deepseek"), "{model}");
         }
         assert!(models.contains(&"deepseek-v4.1-flash"));
-    }
-
-    #[test]
-    fn the_window_is_the_compaction_point_plus_the_pi_reserve() {
-        assert_eq!(PI_RESERVE_TOKENS, 16_384);
-        assert_eq!(DEEPSEEK_CONTEXT_WINDOW, 372_000 + 16_384);
     }
 
     #[test]

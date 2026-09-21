@@ -32,23 +32,23 @@ const ROLLOUT_POLL: Duration = Duration::from_millis(250);
 /// The exact trust prompt Codex shows for an untrusted directory (2026-09-19
 /// live run, Codex 0.155.1). It does not always read as `blocked`, so the
 /// screen is checked too.
-pub const TRUST_PROMPT: &str = "Do you trust the contents of this directory?";
+const TRUST_PROMPT: &str = "Do you trust the contents of this directory?";
 
 #[derive(Debug, Clone)]
-pub struct StartOptions {
-    pub name: String,
-    pub cwd: Option<String>,
+pub(crate) struct StartOptions {
+    pub(crate) name: String,
+    pub(crate) cwd: Option<String>,
     /// A Codex config profile to launch instead of the Pro bridge route. A
     /// picture lane is `Some("gpt-image-gen")` and never sees the bridge.
-    pub profile: Option<String>,
+    pub(crate) profile: Option<String>,
     /// Reference pictures Codex attaches at start (`--image`), used by the
     /// picture lane.
-    pub images: Vec<PathBuf>,
+    pub(crate) images: Vec<PathBuf>,
 }
 
 /// The four `-c` overrides every Pro Codex process carries (spec Design,
 /// "Codex home (v1)"). They change nothing on disk.
-pub fn codex_args(port: u16) -> Vec<String> {
+pub(crate) fn codex_args(port: u16) -> Vec<String> {
     vec![
         "-c".into(),
         format!("model={MODEL}"),
@@ -63,13 +63,13 @@ pub fn codex_args(port: u16) -> Vec<String> {
 
 /// The `--profile` overrides for a lane that runs on Codex's own backend
 /// (Codex 0.155 reads `<name>.config.toml` from the home).
-pub fn profile_args(profile: &str) -> Vec<String> {
+fn profile_args(profile: &str) -> Vec<String> {
     vec!["--profile".into(), profile.into()]
 }
 
 /// The pictures a picture lane attaches at start: Codex's `--image <file>`
 /// (repeatable; `codex --help`, 0.155.1).
-pub fn image_args(files: &[PathBuf]) -> Vec<String> {
+fn image_args(files: &[PathBuf]) -> Vec<String> {
     let mut args = Vec::new();
     for file in files {
         args.push("--image".into());
@@ -105,14 +105,14 @@ fn coordinator_pane(env: &Env) -> Option<String> {
 
 /// The pane a lane started by this call sits under: the caller's own herdr
 /// pane, else the project's coordinator pane, else none.
-pub fn parent_pane(env: &Env) -> Option<String> {
+fn parent_pane(env: &Env) -> Option<String> {
     env.var("HERDR_PANE_ID")
         .map(str::to_string)
         .or_else(|| coordinator_pane(env))
 }
 
 /// The resume line for a profile lane: `codex resume --profile <name>`.
-pub fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
+fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
     vec![
         "resume".into(),
         "--profile".into(),
@@ -123,7 +123,7 @@ pub fn profile_resume_args(profile: &str, session_id: &str) -> Vec<String> {
 
 /// The start line, with `resume <id>` first for a resume (spec, "Resume after
 /// a cold restart").
-pub fn codex_resume_args(port: u16, session_id: &str) -> Vec<String> {
+fn codex_resume_args(port: u16, session_id: &str) -> Vec<String> {
     let mut args = vec!["resume".to_string()];
     args.extend(codex_args(port));
     args.push(session_id.to_string());
@@ -152,7 +152,7 @@ fn workspace_for(
 /// `[projects."<path>"] trust_level = "trusted"`. Codex trusts exact project
 /// paths only: a trusted ancestor such as `/Users/rolfie` does not cover a
 /// subdirectory, so the check never walks up.
-pub fn trusted(env: &Env, cwd: &Path) -> bool {
+pub(crate) fn trusted(env: &Env, cwd: &Path) -> bool {
     let config = env.lane_codex_home().join("config.toml");
     let Ok(text) = std::fs::read_to_string(&config) else {
         return false;
@@ -173,7 +173,7 @@ pub fn trusted(env: &Env, cwd: &Path) -> bool {
 /// The newest rollout for this lane. Prefers a session-id match; otherwise the
 /// newest file whose `session_meta.cwd` equals the lane cwd and whose stamp is
 /// after the lane started.
-pub fn find_rollout(
+pub(crate) fn find_rollout(
     codex_home: &Path,
     cwd: &str,
     after: jiff::Timestamp,
@@ -255,7 +255,7 @@ fn session_meta(path: &Path) -> Option<Meta> {
 
 /// Point `lane.rollout` at the lane's newest rollout, or return `None` when
 /// Codex has not written one yet. Also fills in `session_id` when it is empty.
-pub fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
+pub(crate) fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
     let existing = lane
         .rollout
         .as_deref()
@@ -285,7 +285,7 @@ pub fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
 /// How the rollout wait ended. Every arm is an event, not a clock tick.
 enum RolloutWait {
     /// Codex wrote the session rollout: the lane is usable.
-    Ready(PathBuf),
+    Ready,
     /// The pane shows Codex's trust prompt.
     TrustPrompt,
     /// Herdr reports the agent blocked; the reason is its last screen line.
@@ -328,8 +328,8 @@ fn wait_for_rollout(
 ) -> RolloutWait {
     let deadline = clock.now() + timeout;
     loop {
-        if let Some(path) = refresh_rollout(env, lane) {
-            return RolloutWait::Ready(path);
+        if refresh_rollout(env, lane).is_some() {
+            return RolloutWait::Ready;
         }
         if trust_prompt_showing(runner, bin, &lane.pane_id) {
             return RolloutWait::TrustPrompt;
@@ -364,7 +364,12 @@ fn trust_prompt_showing(runner: &dyn Runner, bin: &str, pane: &str) -> bool {
 }
 
 /// `herdr-pro start`: doctor, one serialized Codex start, then record.
-pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOptions) -> Result<Lane> {
+pub(crate) fn start(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn Runner,
+    opts: &StartOptions,
+) -> Result<Lane> {
     layout.ensure()?;
     state::check_name(&opts.name)?;
     // Serialize the whole decision, including the shared-home trust write and
@@ -484,7 +489,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     if opts.profile.is_none() {
         let timeout = ROLLOUT_TIMEOUT;
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
-            RolloutWait::Ready(_) => {}
+            RolloutWait::Ready => {}
             RolloutWait::TrustPrompt => {
                 let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
                 bail!(
@@ -546,7 +551,7 @@ fn screen_reason(runner: &dyn Runner, bin: &str, pane: &str) -> String {
 }
 
 /// `herdr-pro resume`: start the lane again and resume its Codex thread.
-pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
+pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
     // Re-read the lane only after owning the start lock. Otherwise two resume
     // processes can both observe `gone` before either writes `ready`.
     let _lock = state::FileLock::acquire(&layout.start_lock())?;
@@ -639,7 +644,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     if lane.profile.is_none() {
         let timeout = ROLLOUT_TIMEOUT;
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
-            RolloutWait::Ready(_) => {}
+            RolloutWait::Ready => {}
             RolloutWait::TrustPrompt => {
                 let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
                 bail!(
@@ -682,7 +687,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
 
 /// `herdr-pro reconcile`: mark lanes whose pane no longer runs Codex as gone
 /// and return one resume line each. It never starts anything.
-pub fn reconcile(env: &Env, layout: &Layout, runner: &dyn Runner) -> Result<Vec<String>> {
+pub(crate) fn reconcile(env: &Env, layout: &Layout, runner: &dyn Runner) -> Result<Vec<String>> {
     let bin = env.herdr_bin();
     let mut lines = Vec::new();
     for mut lane in Lane::list(layout)? {
@@ -704,7 +709,7 @@ pub fn reconcile(env: &Env, layout: &Layout, runner: &dyn Runner) -> Result<Vec<
 
 /// `herdr-pro stop`: the plugin's stop switch. Mark the lane stopped and close
 /// its tab so reconcile never brings it back.
-pub fn stop(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
+pub(crate) fn stop(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Result<Lane> {
     let _start = state::FileLock::acquire(&layout.start_lock())?;
     let _turn = state::FileLock::acquire(&layout.turn_lock())?;
     let mut lane = Lane::read(layout, name)?;
@@ -718,7 +723,7 @@ pub fn stop(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Resu
 }
 
 /// Whether the lane's herdr pane is ready for a prompt.
-pub fn agent_ready(env: &Env, runner: &dyn Runner, lane: &Lane) -> Result<Agent> {
+pub(crate) fn agent_ready(env: &Env, runner: &dyn Runner, lane: &Lane) -> Result<Agent> {
     let agent = herdr_cli::agent_find(runner, &env.herdr_bin(), &lane.name)?
         .with_context(|| format!("herdr has no agent named `{}`", lane.name))?;
     Ok(agent)
@@ -970,7 +975,7 @@ mod tests {
             &clock,
         );
         assert!(
-            matches!(outcome, RolloutWait::Ready(_)),
+            matches!(outcome, RolloutWait::Ready),
             "the late rollout was not found"
         );
         assert!(

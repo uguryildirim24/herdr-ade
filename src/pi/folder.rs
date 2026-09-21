@@ -18,7 +18,7 @@ use super::Layout;
 /// discovery (a `~/.agents/skills` probe still loaded). `skills` is now a
 /// list of paths and patterns; `!**` excludes every discovered skill, so a
 /// bare `pi --session` restore without `--no-skills` loads none.
-pub const SETTINGS_JSON: &str = r#"{
+pub(crate) const SETTINGS_JSON: &str = r#"{
   "defaultProjectTrust": "never",
   "enableInstallTelemetry": false,
   "quietStartup": true,
@@ -34,21 +34,21 @@ pub const SETTINGS_JSON: &str = r#"{
 /// The empty provider table setup starts from. `herdr-pro serve` and
 /// `herdr-pi setup` merge the `pro` relay provider into it; nothing else adds
 /// a provider this round (Cursor stays outside pi, decisions 18:05, 18:30).
-pub const MODELS_JSON: &str = "{\n  \"providers\": {}\n}\n";
+const MODELS_JSON: &str = "{\n  \"providers\": {}\n}\n";
 
 /// What setup created; printed by `herdr-pi setup`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FolderReport {
-    pub created_dirs: Vec<std::path::PathBuf>,
-    pub wrote_settings: bool,
-    pub wrote_models: bool,
-    pub wrote_trust: bool,
+pub(crate) struct FolderReport {
+    pub(crate) created_dirs: Vec<std::path::PathBuf>,
+    pub(crate) wrote_settings: bool,
+    pub(crate) wrote_models: bool,
+    pub(crate) wrote_trust: bool,
 }
 
 /// Create the shared folder and write the plugin-owned files. Idempotent:
 /// an existing `settings.json` is never clobbered (settings drift is
 /// cooperative, and doctor reports it), and `auth.json` is never written.
-pub fn ensure(layout: &Layout) -> Result<FolderReport> {
+pub(crate) fn ensure(layout: &Layout) -> Result<FolderReport> {
     let mut report = FolderReport {
         created_dirs: Vec::new(),
         wrote_settings: false,
@@ -92,14 +92,14 @@ pub fn ensure(layout: &Layout) -> Result<FolderReport> {
 
 /// What doctor needs from `settings.json` (SPEC-pi v2 §3.3, §3.9).
 #[derive(Debug, Clone, PartialEq)]
-pub struct SettingsState {
-    pub trust_never: bool,
-    pub skills_disabled: bool,
-    pub telemetry_off: bool,
-    pub retries_capped: bool,
+pub(crate) struct SettingsState {
+    pub(crate) trust_never: bool,
+    pub(crate) skills_disabled: bool,
+    pub(crate) telemetry_off: bool,
+    pub(crate) retries_capped: bool,
 }
 
-pub fn read_settings(layout: &Layout) -> Result<SettingsState> {
+pub(crate) fn read_settings(layout: &Layout) -> Result<SettingsState> {
     let text = std::fs::read_to_string(layout.settings())
         .with_context(|| format!("could not read {}", layout.settings().display()))?;
     let value: Value = serde_json::from_str(&text)
@@ -127,7 +127,7 @@ pub fn read_settings(layout: &Layout) -> Result<SettingsState> {
 
 /// True when `trust.json` holds a `true` value anywhere. Doctor fails then
 /// (SPEC-pi v2 §3.9): a trusted folder executes repository pi code.
-pub fn trust_has_true(layout: &Layout) -> Result<bool> {
+pub(crate) fn trust_has_true(layout: &Layout) -> Result<bool> {
     let path = layout.trust();
     if !path.exists() {
         return Ok(false);
@@ -152,7 +152,7 @@ fn any_true(value: &Value) -> bool {
 }
 
 /// Sanity used by setup and doctor: the folder exists and has a settings file.
-pub fn exists(layout: &Layout) -> bool {
+pub(crate) fn exists(layout: &Layout) -> bool {
     layout.agent().is_dir() && layout.settings().is_file()
 }
 

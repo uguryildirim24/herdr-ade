@@ -21,7 +21,7 @@ fn deliveries_dir(project: &Project) -> PathBuf {
     project.dir().join("deliveries")
 }
 
-pub fn event_path(project: &Project, id: &str) -> Result<PathBuf> {
+pub(crate) fn event_path(project: &Project, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
     Ok(events_dir(project).join(format!("{id}.toml")))
 }
@@ -58,12 +58,12 @@ fn validate_machine(machine: &str) -> Result<()> {
 }
 
 /// The Mac's content-addressed artifact folder (SPEC-remote §4.3).
-pub fn artifact_dir(project: &Project) -> PathBuf {
+fn artifact_dir(project: &Project) -> PathBuf {
     project.dir().join("artifacts")
 }
 
 /// The Mac path of one artifact, named by its own hash.
-pub fn artifact_path(project: &Project, hash: &str) -> PathBuf {
+pub(crate) fn artifact_path(project: &Project, hash: &str) -> PathBuf {
     artifact_dir(project).join(hash)
 }
 
@@ -72,16 +72,16 @@ pub fn artifact_path(project: &Project, hash: &str) -> PathBuf {
 /// id and the hash of the box's own bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct ImportSource {
+pub(crate) struct ImportSource {
     /// Stable saved-profile id the envelope came from.
-    pub machine: String,
+    pub(crate) machine: String,
     /// Box project slug (the Mac's slug).
-    pub project: String,
-    pub event: String,
-    pub event_hash: String,
+    pub(crate) project: String,
+    pub(crate) event: String,
+    pub(crate) event_hash: String,
     /// Empty for a `waiting` envelope.
-    pub artifact_hash: String,
-    pub imported: String,
+    pub(crate) artifact_hash: String,
+    pub(crate) imported: String,
 }
 
 fn imports_dir(project: &Project) -> PathBuf {
@@ -96,34 +96,15 @@ fn import_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf>
         .join(format!("{event}.toml")))
 }
 
-pub fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSource> {
+fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSource> {
     let path = import_path(project, machine, event).ok()?;
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str(&text).ok()
 }
 
-#[allow(dead_code)]
-pub fn list_imports(project: &Project, machine: &str) -> Vec<ImportSource> {
-    if validate_machine(machine).is_err() {
-        return Vec::new();
-    }
-    let dir = imports_dir(project).join(machine);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut imports: Vec<ImportSource> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_owned))
-        .filter_map(|id| load_import(project, machine, &id))
-        .collect();
-    imports.sort_by(|a, b| a.event.cmp(&b.event));
-    imports
-}
-
 /// What an [`import_box_event`] call did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImportOutcome {
+pub(crate) enum ImportOutcome {
     /// The event and its artifact were written to the Mac ledger.
     New,
     /// The exact `(machine, event id, hash)` was already imported; nothing
@@ -137,7 +118,7 @@ pub enum ImportOutcome {
 /// same id and payload but its `report_path` is rewritten to the Mac artifact
 /// path, so the typed DONE line names a path the Mac owns. The same event id
 /// with different bytes is corruption and refuses.
-pub fn import_box_event(
+pub(crate) fn import_box_event(
     project: &Project,
     machine: &str,
     box_bytes: &[u8],
@@ -269,13 +250,13 @@ fn write_artifact_create_only(project: &Project, hash: &str, bytes: &[u8]) -> Re
 /// and no agent; `gone` and `blocked` stop a line being typed twice.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct RemoteState {
-    pub boot_id: String,
-    pub last_pass: String,
-    pub taken: BTreeMap<String, String>,
-    pub missing: BTreeMap<String, u32>,
-    pub gone: BTreeSet<String>,
-    pub blocked: BTreeSet<String>,
+pub(crate) struct RemoteState {
+    pub(crate) boot_id: String,
+    pub(crate) last_pass: String,
+    pub(crate) taken: BTreeMap<String, String>,
+    pub(crate) missing: BTreeMap<String, u32>,
+    pub(crate) gone: BTreeSet<String>,
+    pub(crate) blocked: BTreeSet<String>,
 }
 
 fn remote_state_path(project: &Project, machine: &str) -> Result<PathBuf> {
@@ -286,14 +267,18 @@ fn remote_state_path(project: &Project, machine: &str) -> Result<PathBuf> {
         .join(format!("{machine}.json")))
 }
 
-pub fn remote_state(project: &Project, machine: &str) -> RemoteState {
+pub(crate) fn remote_state(project: &Project, machine: &str) -> RemoteState {
     remote_state_path(project, machine)
         .ok()
         .and_then(|path| project::read_json(&path))
         .unwrap_or_default()
 }
 
-pub fn save_remote_state(project: &Project, machine: &str, state: &RemoteState) -> Result<()> {
+pub(crate) fn save_remote_state(
+    project: &Project,
+    machine: &str,
+    state: &RemoteState,
+) -> Result<()> {
     let path = remote_state_path(project, machine)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -306,20 +291,9 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// The import record's path, exposed for tests.
-#[allow(dead_code)]
-pub fn source_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf> {
-    import_path(project, machine, event)
-}
-
-#[allow(dead_code)]
-pub fn artifact_dir_path(project: &Project) -> PathBuf {
-    artifact_dir(project)
-}
-
 /// Canonical bytes used both for the create-if-absent write and the X2b
 /// equality check. The event's field order is fixed by the contract type.
-pub fn bytes(event: &Event) -> Result<Vec<u8>> {
+pub(crate) fn bytes(event: &Event) -> Result<Vec<u8>> {
     let mut text = toml::to_string(event)?;
     if !text.ends_with('\n') {
         text.push('\n');
@@ -329,7 +303,7 @@ pub fn bytes(event: &Event) -> Result<Vec<u8>> {
 
 /// Creates an immutable event. If another helper already created it, only
 /// exact byte equality is accepted.
-pub fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
+pub(crate) fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
     std::fs::create_dir_all(events_dir(project))?;
     let path = event_path(project, &event.id)?;
     let expected = bytes(event)?;
@@ -369,27 +343,27 @@ pub fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
 /// compares it with the fetched bytes before the taken cursor advances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct Receipt {
-    pub event: String,
-    pub event_hash: String,
+pub(crate) struct Receipt {
+    pub(crate) event: String,
+    pub(crate) event_hash: String,
     /// The content-addressed artifact name; empty for `waiting`.
-    pub artifact: String,
-    pub artifact_hash: String,
-    pub created: String,
+    pub(crate) artifact: String,
+    pub(crate) artifact_hash: String,
+    pub(crate) created: String,
 }
 
 fn receipts_dir(project: &Project) -> PathBuf {
     project.dir().join("receipts")
 }
 
-pub fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
+pub(crate) fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
     Ok(receipts_dir(project).join(format!("{id}.toml")))
 }
 
 /// Writes the receipt create-only. A retry with the same bytes is a no-op;
 /// different bytes for a sealed event are corruption.
-pub fn write_receipt(project: &Project, event: &Event) -> Result<()> {
+pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
     let event_hash = hash_bytes(&bytes(event)?);
     let (artifact, artifact_hash) = match &event.payload.done {
         Some(done) => (done.artifact.clone(), done.artifact.clone()),
@@ -432,14 +406,14 @@ pub fn write_receipt(project: &Project, event: &Event) -> Result<()> {
     sync_parent(&path)
 }
 
-pub fn load(project: &Project, id: &str) -> Result<Event> {
+pub(crate) fn load(project: &Project, id: &str) -> Result<Event> {
     let path = event_path(project, id)?;
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("could not read event {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
-pub fn list(project: &Project) -> Vec<Event> {
+pub(crate) fn list(project: &Project) -> Vec<Event> {
     let Ok(entries) = std::fs::read_dir(events_dir(project)) else {
         return Vec::new();
     };
@@ -456,7 +430,7 @@ pub fn list(project: &Project) -> Vec<Event> {
 /// Appends a fact once. Re-running acknowledgement or handling is idempotent;
 /// `submitted` may still be duplicated when the transport succeeded before a
 /// crash, which is the intentional X4 at-least-once boundary.
-pub fn append_delivery(project: &Project, event: &str, state: DeliveryState) -> Result<()> {
+pub(crate) fn append_delivery(project: &Project, event: &str, state: DeliveryState) -> Result<()> {
     let _lock = project.lock()?;
     append_delivery_locked(project, event, state)
 }
@@ -482,7 +456,7 @@ pub(crate) fn append_delivery_locked(
     sync_parent(&path)
 }
 
-pub fn delivery_lines(project: &Project, event: &str) -> Result<Vec<DeliveryLine>> {
+fn delivery_lines(project: &Project, event: &str) -> Result<Vec<DeliveryLine>> {
     let path = journal_path(project, event)?;
     let Ok(text) = std::fs::read_to_string(path) else {
         return Ok(Vec::new());
@@ -493,14 +467,14 @@ pub fn delivery_lines(project: &Project, event: &str) -> Result<Vec<DeliveryLine
         .collect()
 }
 
-pub fn states(project: &Project, event: &str) -> Result<Vec<DeliveryState>> {
+pub(crate) fn states(project: &Project, event: &str) -> Result<Vec<DeliveryState>> {
     Ok(delivery_lines(project, event)?
         .into_iter()
         .map(|line| line.state)
         .collect())
 }
 
-pub fn typed_line(event: &Event) -> Result<String> {
+pub(crate) fn typed_line(event: &Event) -> Result<String> {
     match &event.payload {
         EventPayload {
             done: Some(done),
