@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::paths::Ctx;
 use crate::project::{Repo, Settings};
@@ -93,6 +93,61 @@ impl Kind {
             Kind::Plugin => &["herdr-ade", "herdr-pi"],
             Kind::Fork => &["herdr"],
         }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Plugin => "plugin",
+            Kind::Fork => "fork",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct InstalledBinary {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) version: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct InstalledRepo {
+    pub(crate) path: String,
+    pub(crate) kind: String,
+    pub(crate) binaries: Vec<InstalledBinary>,
+    pub(crate) box_path: Option<String>,
+    pub(crate) box_installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct InstallOutcome {
+    pub(crate) repositories: Vec<InstalledRepo>,
+    pub(crate) box_target: Option<String>,
+    pub(crate) box_settings_installed: bool,
+    pub(crate) live_handoff_required: bool,
+    #[serde(skip)]
+    warnings: Vec<String>,
+}
+
+impl InstallOutcome {
+    pub(crate) fn message(&self) -> String {
+        let mut message = self
+            .repositories
+            .iter()
+            .flat_map(|repo| repo.binaries.iter())
+            .map(|binary| format!("{}\n", binary.version))
+            .collect::<String>();
+        if self.live_handoff_required {
+            message.push_str("the running server keeps its image; a live handoff is Rolf's call\n");
+        }
+        message
+    }
+
+    pub(crate) fn warnings(&self) -> String {
+        self.warnings
+            .iter()
+            .map(|warning| format!("{warning}\n"))
+            .collect()
     }
 }
 
@@ -189,7 +244,7 @@ fn local_install(ctx: &Ctx, repo: &str, bin: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_version(ctx: &Ctx, bin: &str) -> Result<()> {
+fn installed_version(ctx: &Ctx, bin: &str) -> Result<InstalledBinary> {
     let path = ctx.env.home.join(".local/bin").join(bin);
     let out = ctx
         .runner
@@ -201,8 +256,11 @@ fn print_version(ctx: &Ctx, bin: &str) -> Result<()> {
             out.error_text()
         );
     }
-    println!("{}", out.stdout.trim());
-    Ok(())
+    Ok(InstalledBinary {
+        name: bin.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        version: out.stdout.trim().to_string(),
+    })
 }
 
 /// The box's PATH for a build, exported before the zig probe and the cargo
@@ -373,7 +431,7 @@ fn notice_stale_self(installed: &Path, running: &Running) -> Result<()> {
 
 /// `ha harness install`: build every harness repository after a merge and
 /// install it into `~/.local/bin`, then the same on the saved box.
-pub(crate) fn install(ctx: &Ctx) -> Result<()> {
+pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
     let repos = repos(&ctx.config_dir)?;
     if repos.is_empty() {
         bail!(
@@ -391,6 +449,8 @@ pub(crate) fn install(ctx: &Ctx) -> Result<()> {
     )?
     .map(|profile| profile.target);
     let mut fork = false;
+    let mut installed = Vec::new();
+    let mut warnings = Vec::new();
     for repo in &repos {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
@@ -399,24 +459,42 @@ pub(crate) fn install(ctx: &Ctx) -> Result<()> {
             local_install(ctx, &repo.path, bin)?;
             notice_stale_self(&ctx.env.home.join(".local/bin").join(bin), &running)?;
         }
+        let mut binaries = Vec::new();
         for bin in kind.binaries() {
-            print_version(ctx, bin)?;
+            binaries.push(installed_version(ctx, bin)?);
         }
-        match (&box_target, &repo.box_path) {
-            (Some(target), Some(box_path)) => box_build(ctx, target, box_path, kind)?,
-            (Some(_), None) => {
-                eprintln!("note: {} has no box_path; skipped the box step", repo.path)
+        let box_installed = match (&box_target, &repo.box_path) {
+            (Some(target), Some(box_path)) => {
+                box_build(ctx, target, box_path, kind)?;
+                true
             }
-            (None, _) => {}
-        }
+            (Some(_), None) => {
+                warnings.push(format!(
+                    "note: {} has no box_path; skipped the box step",
+                    repo.path
+                ));
+                false
+            }
+            (None, _) => false,
+        };
+        installed.push(InstalledRepo {
+            path: repo.path.clone(),
+            kind: kind.name().into(),
+            binaries,
+            box_path: repo.box_path.clone(),
+            box_installed,
+        });
     }
     if let Some(target) = &box_target {
         box_settings(ctx, target)?;
     }
-    if fork {
-        println!("the running server keeps its image; a live handoff is Rolf's call");
-    }
-    Ok(())
+    Ok(InstallOutcome {
+        repositories: installed,
+        box_settings_installed: box_target.is_some(),
+        box_target,
+        live_handoff_required: fork,
+        warnings,
+    })
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::contracts::{
     CheckpointIntent, CompletionPin, Event, ManifestMember, MergeIntent, MergePhase, ReviewIntent,
@@ -2256,7 +2256,8 @@ impl std::str::FromStr for Stop {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum MergeOutcome {
     /// `H` is recorded; `lanes` lists what happened to each lane worktree.
     Checkpointed { head: String, lanes: Vec<String> },
@@ -2532,15 +2533,6 @@ fn merge_inner(
         for line in cleanup_review_worktrees(ctx, &closed) {
             println!("{line}");
         }
-    }
-    if matches!(
-        &outcome,
-        Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
-    ) && crate::harness::is_harness_repo(&ctx.config_dir, &record.repo)
-    {
-        // Repeat this on a no-op: the prior process may have died after the
-        // checkpoint commit and before the coordinator saw the instruction.
-        println!("run ha harness install");
     }
     outcome
 }

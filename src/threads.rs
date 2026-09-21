@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
@@ -1451,22 +1452,84 @@ pub struct ResolveArgs {
     pub keep_pane: bool,
 }
 
-pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()> {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ResolveOutcome {
+    pub thread: String,
+    pub state: String,
+    pub final_copy: String,
+    pub copy_notes: Vec<String>,
+    pub pane: String,
+    pub worktree: String,
+    pub worktree_path: String,
+    pub worktree_reason: Option<String>,
+    pub branch: String,
+}
+
+impl ResolveOutcome {
+    pub fn message(&self, slug: &str) -> String {
+        if self.state == "open" {
+            return format!(
+                "{} is open again. Nothing was started; `thread restart {slug} {}` brings its agent back.\n",
+                self.thread, self.thread
+            );
+        }
+        let mut message = String::new();
+        if self.final_copy == "partial" {
+            message.push_str("the final copy was partial:\n");
+            for note in &self.copy_notes {
+                message.push_str(&format!("  - {note}\n"));
+            }
+        }
+        message.push_str(&format!("{} resolved.\n", self.thread));
+        match self.pane.as_str() {
+            "kept_open" => message.push_str(
+                "Its pane and tab were left open (--keep-pane); close them in herdr when you are done.\n",
+            ),
+            "closed" => message.push_str("Its pane and tab were closed.\n"),
+            "already_gone" => message.push_str("Its pane and tab were already gone.\n"),
+            _ => {}
+        }
+        match self.worktree.as_str() {
+            "not_recorded" => message
+                .push_str("No worktree was recorded for it, so there is nothing to remove.\n"),
+            "removed" => message.push_str(&format!(
+                "The worktree {} was removed; the branch {} was kept.\n",
+                self.worktree_path, self.branch
+            )),
+            "kept" => message.push_str(&format!(
+                "The worktree {} was kept: {}.\n",
+                self.worktree_path,
+                self.worktree_reason.as_deref().unwrap_or("reason unknown")
+            )),
+            _ => {}
+        }
+        message
+    }
+}
+
+pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<ResolveOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if args.reopen {
         if record.status != Status::Resolved {
             bail!("{id} is not resolved");
         }
-        thread::update(&project, id, |t| {
+        let reopened = thread::update(&project, id, |t| {
             t.status = Status::Open;
             t.resolved_reason.clear();
         })?;
         refresh_plan(ctx, &project);
-        println!(
-            "{id} is open again. Nothing was started; `thread restart {slug} {id}` brings its agent back."
-        );
-        return Ok(());
+        return Ok(ResolveOutcome {
+            thread: id.to_string(),
+            state: "open".into(),
+            final_copy: "not_run".into(),
+            copy_notes: Vec::new(),
+            pane: "unchanged".into(),
+            worktree: "unchanged".into(),
+            worktree_path: reopened.worktree_path,
+            worktree_reason: None,
+            branch: reopened.branch,
+        });
     }
     if args.skip_copy && args.discard_uncopied {
         bail!("--skip-copy cannot be combined with --discard-uncopied");
@@ -1475,21 +1538,20 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
 
     // Every path that resolves a thread performs a final copy first.
     let mut removal_refusal = None;
-    if !args.skip_copy {
+    let (final_copy, copy_notes) = if args.skip_copy {
+        ("skipped".to_string(), Vec::new())
+    } else {
         let copied = final_copy(ctx, &project, &record);
-        match &copied.outcome {
-            CopyOutcome::Complete => {}
+        match copied.outcome {
+            CopyOutcome::Complete => ("complete".to_string(), Vec::new()),
             CopyOutcome::Partial(notes) => {
-                println!("the final copy was partial:");
-                for note in notes {
-                    println!("  - {note}");
-                }
                 if !args.discard_uncopied {
                     removal_refusal = Some(
                         "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
                             .to_string(),
                     );
                 }
+                ("partial".to_string(), notes)
             }
             CopyOutcome::Failed(error) => {
                 bail!(
@@ -1497,7 +1559,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
                 );
             }
         }
-    }
+    };
 
     let mut pane_closed = false;
     let mut worktree_removed = false;
@@ -1541,36 +1603,39 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         close_pane(ctx, &project, &resolved)?
     };
     remove_scratch_session(ctx, &resolved)?;
-    println!("{id} resolved.");
-    if args.keep_pane {
-        println!(
-            "Its pane and tab were left open (--keep-pane); close them in herdr when you are done."
-        );
+    let pane = if args.keep_pane {
+        "kept_open"
     } else if pane_closed {
-        println!("Its pane and tab were closed.");
+        "closed"
     } else {
-        println!("Its pane and tab were already gone.");
-    }
-    if worktree_removed {
-        crate::output::insert(
-            "worktree",
-            serde_json::json!({"outcome": "removed", "path": record.worktree_path, "branch_kept": resolved.branch}),
-        );
-        println!(
-            "The worktree {} was removed; the branch {} was kept.",
-            record.worktree_path, resolved.branch
-        );
+        "already_gone"
+    };
+    let (worktree, worktree_reason) = if worktree_removed {
+        ("removed", None)
     } else if let Some(reason) = removal_refusal {
-        crate::output::insert(
-            "worktree",
-            serde_json::json!({"outcome": "kept", "path": record.worktree_path, "reason": reason}),
-        );
-        println!("The worktree {} was kept: {reason}.", record.worktree_path);
-    } else if resolved.kind == Kind::Worktree {
-        println!("No worktree was recorded for it, so there is nothing to remove.");
-    }
+        ("kept", Some(reason))
+    } else {
+        match resolved.kind {
+            Kind::Worktree => ("not_recorded", None),
+            _ => ("not_applicable", None),
+        }
+    };
     refresh_plan(ctx, &project);
-    Ok(())
+    Ok(ResolveOutcome {
+        thread: id.to_string(),
+        state: "resolved".into(),
+        final_copy,
+        copy_notes,
+        pane: pane.into(),
+        worktree: worktree.into(),
+        worktree_path: if worktree_removed {
+            record.worktree_path
+        } else {
+            resolved.worktree_path
+        },
+        worktree_reason,
+        branch: resolved.branch,
+    })
 }
 
 /// The shared plan refresh at a thread lifecycle change. A refresh failure is
