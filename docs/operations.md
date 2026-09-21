@@ -41,6 +41,10 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 
 ## Commands
 
+Every command accepts the global `--json` flag. It returns one record with an
+`outcome`, the command name, the ordinary human `message`, and useful ids under
+`data`. A refusal exits non-zero and includes its `reason` in that record.
+
 | Command | What it does |
 | --- | --- |
 | `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder. |
@@ -53,8 +57,8 @@ The birth sentence is required: `thread start` and `thread adopt` take `--plain`
 | `thread resolve <project> <id> [--remove-worktree] [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy: close the pane and tab through Herdr (`--keep-pane` leaves them), and optionally remove the worktree (the branch is kept). |
 | `pickup [<project>] [--all] [--start] [--dry-run]` | Re-link live threads to the coordinator pane: local lanes from the session, box lanes from the courier's box-local lists (one SSH per machine). Gone threads print start lines, or restart through their launch records with `--start` when the project's `start_threads` is `auto`. `--all` covers every active project. |
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
-| `plan show [--json]`, `plan set`, `plan step add\|edit\|link\|unlink\|remove\|move`, `plan sync` | The plan card: goal, end result and up to seven steps. A step is `done` only when all its bound work has landed in a merged round. |
-| `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list [--json]`, `decide show <id>` | The log of choices the coordinator made without asking. |
+| `plan show`, `plan set`, `plan step add\|edit\|link\|unlink\|remove\|move`, `plan sync` | The plan card: goal, end result and up to seven steps. A step is `done` only when all its bound work has landed in a merged round. |
+| `decide "<line>" --class <what-you-get\|money\|undo\|routine>`, `decide list`, `decide show <id>` | The log of choices the coordinator made without asking. |
 | `decide overturn <id> "<reason>"` | Overturn a choice by id, keeping the original and recording who (`USER`), when and why. The screen and context show it as overturned. |
 | `ask "<question>?" --choice "<sentence>" --choice "<sentence>"` | Record a question; return one line with its id first. A normalized duplicate of another open question is refused with the existing id. |
 | `ask withdraw <id> "<reason>"` | Remove an open question from the board, retaining its record and withdrawal reason, actor (`USER`) and time. Answered questions cannot be withdrawn. |
