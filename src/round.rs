@@ -498,39 +498,6 @@ pub fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
     Ok(records)
 }
 
-/// Called under the repository lock, before taking the project lock. Other
-/// projects and worktree paths can name the same integration ref.
-fn require_branch_available(
-    ctx: &Ctx,
-    project: &Project,
-    git: &Git,
-    branch: &str,
-    except: &str,
-) -> Result<()> {
-    let common = std::fs::canonicalize(git.common_dir()?)?;
-    for slug in project::list_slugs(&ctx.root) {
-        let other = Project::load(&ctx.root, &slug)?;
-        for record in checked_list(&other)? {
-            if (slug == project.slug && record.round == except)
-                || record.branch != branch
-                || record.phase.closed()
-            {
-                continue;
-            }
-            let other_git = Git::new(ctx.runner, &record.repo);
-            if std::fs::canonicalize(other_git.common_dir()?)? == common {
-                bail!(
-                    "round_head_reserved: `{slug}/{}` owns `{branch}` in phase {:?}; finish it, or run `round abandon {slug} {} --reason <why>` before opening or reviewing `{except}` (another integration branch is also independent)",
-                    record.round,
-                    record.phase,
-                    record.round
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The open round (no merge record yet) that pins this thread as a lane or
 /// binds it as the reviewer, if any. A resolved or merged round is finished
 /// and holds nothing back.
@@ -864,8 +831,6 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
         ..Default::default()
     };
     {
-        let _repo = repo_lock(&git)?;
-        require_branch_available(ctx, &project, &git, &record.branch, &record.round)?;
         let _lock = project.lock()?;
         if round_path(&project, &args.round).exists() {
             bail!("round_exists: `{}` is already open", args.round);
@@ -1193,16 +1158,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
             (Some(branch), true) => branch,
             _ => review(ctx, slug, &round)?.review_branch,
         };
-        crate::ledger::retry_after_failure(&project, "reviewer-start-failed", &round);
-        match start_reviewer(ctx, &project, &round, &review_branch, &prefix) {
-            Ok(thread) => {
-                crate::ledger::recovered(&project, "reviewer-start-failed", &round);
-                bind_reviewer(ctx, slug, &round, &thread.id)?;
-            }
-            Err(error) => {
-                reviewer_start_failed(ctx, &project, &round, &format!("{error:#}"), None)?;
-            }
-        }
+        start_and_bind_reviewer(ctx, &project, slug, &round, &review_branch, &prefix)?;
     }
     Ok(())
 }
@@ -1351,6 +1307,30 @@ fn start_reviewer(
                 "note": "The reviewer task names every omitted source for tool-based reading."
             }),
         )
+    }
+}
+
+/// The shared reviewer-start effect used by `advance` and automatic moved-base
+/// repair. A failed launch is recorded and left for the normal bounded retry.
+fn start_and_bind_reviewer(
+    ctx: &Ctx,
+    project: &Project,
+    slug: &str,
+    round: &str,
+    review_branch: &str,
+    prefix: &str,
+) -> Result<Option<String>> {
+    crate::ledger::retry_after_failure(project, "reviewer-start-failed", round);
+    match start_reviewer(ctx, project, round, review_branch, prefix) {
+        Ok(thread) => {
+            crate::ledger::recovered(project, "reviewer-start-failed", round);
+            bind_reviewer(ctx, slug, round, &thread.id)?;
+            Ok(Some(thread.id))
+        }
+        Err(error) => {
+            reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
+            Ok(None)
+        }
     }
 }
 
@@ -1770,7 +1750,6 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let earlier = completed_review(&project, &record, &git);
     let (b, review_branch, worktree, repair) = {
         let _repo = repo_lock(&git)?;
-        require_branch_available(ctx, &project, &git, &record.branch, round)?;
         let head = git
             .branch_head(&record.branch)?
             .with_context(|| format!("branch_missing: `{}`", record.branch))?;
@@ -1799,6 +1778,13 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                     .expected_head
                     .clone()
                     .filter(|_| same_frozen_manifest && earlier.is_some());
+                let intent_brief = if frozen.is_some() {
+                    format!(
+                        "{brief}\n## Repair revision\n\nThis revision reviews the integration base `{head}`.\n"
+                    )
+                } else {
+                    brief.clone()
+                };
                 let mut branch = format!("review/{round}");
                 let mut n = 2;
                 while git.branch_head(&branch)?.is_some() {
@@ -1808,7 +1794,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                 let intent = ReviewIntent {
                     head: head.clone(),
                     branch,
-                    brief: brief.clone(),
+                    brief: intent_brief,
                     manifest_hash: hash.clone(),
                     reuse_brief: frozen,
                 };
@@ -1825,15 +1811,26 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                 intent
             }
         };
-        if intent.manifest_hash != hash || intent.brief != brief {
+        let expected_brief = if intent.reuse_brief.is_some() {
+            format!(
+                "{brief}\n## Repair revision\n\nThis revision reviews the integration base `{}`.\n",
+                intent.head
+            )
+        } else {
+            brief.clone()
+        };
+        if intent.manifest_hash != hash || intent.brief != expected_brief {
             bail!(
                 "round_git_mismatch: `{round}` inputs differ from its pending review output; restore the recorded inputs before retrying round review"
             );
         }
         let repair = intent.reuse_brief.is_some();
-        let b = match &intent.reuse_brief {
-            Some(b) if head == intent.head => b.clone(),
-            None if head == intent.head => commit_files_on_branch(
+        // A repair gets a new brief commit on the new base. A clean text
+        // merge cannot prove that two independently reviewed changes are
+        // semantically compatible, so the new reviewer must have an exact,
+        // recorded base just like the first reviewer did.
+        let b = if head == intent.head {
+            commit_files_on_branch(
                 &git,
                 &record.branch,
                 &[(brief_path.as_str(), intent.brief.as_str())],
@@ -1843,22 +1840,22 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                 ),
                 &intent.head,
                 &project.state_dir().join("tmp"),
-            )?,
-            None if git.parents(&head)? == [intent.head.clone()]
-                && git.diff_names(&intent.head, &head)? == [brief_path.clone()]
-                && git.show_file(&head, &brief_path)?.as_deref() == Some(intent.brief.as_str()) =>
-            {
-                eprintln!(
-                    "round_output_recovered: `{round}` brief matches the recorded intent at {head}"
-                );
-                head.clone()
-            }
-            _ => bail!(
+            )?
+        } else if git.parents(&head)? == [intent.head.clone()]
+            && git.diff_names(&intent.head, &head)? == [brief_path.clone()]
+            && git.show_file(&head, &brief_path)?.as_deref() == Some(intent.brief.as_str())
+        {
+            eprintln!(
+                "round_output_recovered: `{round}` brief matches the recorded intent at {head}"
+            );
+            head.clone()
+        } else {
+            bail!(
                 "round_git_mismatch: `{round}` expected integration head {}; found {head}; restore the recorded head before retrying round review",
                 intent.head
-            ),
+            )
         };
-        let base = if repair { intent.head } else { b.clone() };
+        let base = b.clone();
         let review_branch = intent.branch;
         let worktree = PathBuf::from(&record.repo)
             .join(".worktrees")
@@ -2060,8 +2057,20 @@ pub enum MergeOutcome {
     Checkpointed { head: String, lanes: Vec<String> },
     /// A second merge after `checkpointed`: nothing was done.
     NoOp { head: String },
+    /// The reviewed base moved, so the next review revision and its reviewer
+    /// were started automatically instead of merging an unreviewed pairing.
+    RepairReviewStarted {
+        review_branch: String,
+        reviewer: Option<String>,
+    },
     /// Stopped by the test-only fault injection.
     Stopped { phase: MergePhase },
+}
+
+#[derive(Debug)]
+enum FreshMergeOutcome {
+    Done(MergeOutcome),
+    BaseMoved { from: String, to: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -2266,13 +2275,22 @@ fn merge_inner(
     round: &str,
     stop: Option<Stop>,
 ) -> Result<MergeOutcome> {
-    // Serialize all explicit round changes, then read the owning record.
-    let _operation = operation_lock(&project, round)?;
+    // Serialize explicit changes to this round. The repository lock inside
+    // the merge effect serializes only the ref transaction across rounds.
+    let operation = operation_lock(&project, round)?;
     let record = load(&project, round)?;
     let git = Git::new(ctx.runner, &record.repo);
     let outcome = match read_merge(&project, round)? {
         Some(intent) => resume(ctx, &project, &record, &git, intent, stop),
-        None => fresh_merge(ctx, &project, record.clone(), &git, stop),
+        None => match fresh_merge(ctx, &project, record.clone(), &git, stop)? {
+            FreshMergeOutcome::Done(outcome) => Ok(outcome),
+            FreshMergeOutcome::BaseMoved { from, to } => {
+                // `review` owns the next operation lock. Release this one
+                // before entering the ordinary review + advance path.
+                drop(operation);
+                return start_moved_base_repair(ctx, &project, slug, round, &from, &to);
+            }
+        },
     };
     // The durable completion boundary: the landing evidence and the shared
     // plan refresh. Both are retry-safe and never roll back the merge
@@ -2310,7 +2328,7 @@ fn fresh_merge(
     record: RoundRecord,
     git: &Git,
     stop: Option<Stop>,
-) -> Result<MergeOutcome> {
+) -> Result<FreshMergeOutcome> {
     let round = record.round.clone();
     let record = {
         let _lock = project.lock()?;
@@ -2337,40 +2355,96 @@ fn fresh_merge(
     }
     let v = verdict_commit(project, &record, git)?;
     let c = validate_verdict(git, &record, &v)?;
-    // B is the brief commit, but the integration branch may have moved on: a
-    // later round's brief or a `thread start` task commit lands there. The
-    // effect merges V into whatever the branch holds now, as a fast-forward
-    // when possible and a real merge commit otherwise, so a moved head is no
-    // longer a reason to re-review. A head that no longer contains B (a
-    // rewind) fails closed, and a conflict is refused here, before the intent
-    // is written, so it leaves no merge record behind.
-    let head = git.branch_head(&record.branch)?.context("branch_missing")?;
-    if head != b && !git.is_ancestor(&b, &head)? {
-        bail!(
-            "head_moved: `{}` is at {head}, which does not contain the brief commit B {b}",
-            record.branch
-        );
-    }
-    if !git.is_ancestor(&head, &v)?
-        && let Err(error) = git.merge_tree(&head, &v)
-    {
-        bail!("{error}; run `round review {round}`, then `round advance`");
-    }
-    let intent = MergeIntent {
-        op: format!("merge-{round}"),
-        // The compare-and-swap base is the integration head observed for this
-        // merge, which may be newer than B. Recording B here made a crash
-        // before the effect impossible to resume when the branch had moved.
-        expected_old: head,
-        candidate: c,
-        verdict: v,
-        phase: MergePhase::Intent,
-        merged: None,
-        checkpoint: None,
-        head: None,
+    // Hold the repository boundary from the base check through the ref
+    // effect. This is the only cross-round serialization: opening, admission
+    // and review have no branch reservation.
+    let mut intent = {
+        let _repo = repo_lock(git)?;
+        let head = git.branch_head(&record.branch)?.context("branch_missing")?;
+        if head != b {
+            if !git.is_ancestor(&b, &head)? {
+                bail!(
+                    "head_moved: `{}` is at {head}, which does not contain the brief commit B {b}",
+                    record.branch
+                );
+            }
+            return Ok(FreshMergeOutcome::BaseMoved { from: b, to: head });
+        }
+        let intent = MergeIntent {
+            op: format!("merge-{round}"),
+            expected_old: head,
+            candidate: c,
+            verdict: v,
+            phase: MergePhase::Intent,
+            merged: None,
+            checkpoint: None,
+            head: None,
+        };
+        write_merge(project, &round, &intent)?;
+        effect_merge_locked(project, &record, git, intent)?
     };
-    write_merge(project, &round, &intent)?;
-    effect_merge(ctx, project, &record, git, intent, stop)
+    if stop == Some(Stop::Ref) {
+        return Ok(FreshMergeOutcome::Done(MergeOutcome::Stopped {
+            phase: MergePhase::Intent,
+        }));
+    }
+    intent.phase = MergePhase::Merged;
+    write_merge(project, &record.round, &intent)?;
+    if stop == Some(Stop::Merged) {
+        return Ok(FreshMergeOutcome::Done(MergeOutcome::Stopped {
+            phase: MergePhase::Merged,
+        }));
+    }
+    checkpoint_phase(ctx, project, &record, git, intent, stop).map(FreshMergeOutcome::Done)
+}
+
+/// A moved base never asks the coordinator to orchestrate repair. The normal
+/// review revision is created and `advance` starts its reviewer. Even a clean
+/// tree merge needs this review: textual compatibility does not establish
+/// semantic compatibility between independently reviewed rounds.
+fn start_moved_base_repair(
+    ctx: &Ctx,
+    project: &Project,
+    slug: &str,
+    round: &str,
+    from: &str,
+    to: &str,
+) -> Result<MergeOutcome> {
+    let output = review(ctx, slug, round)?;
+    let reviewer = {
+        // Use the same start effect as `advance`, under its process-wide
+        // project lock, without making this round depend on unrelated rounds
+        // encountered earlier in a full advance pass.
+        let _advance = advance_lock(project)?;
+        let current = load(project, round)?;
+        match current.reviewer {
+            Some(reviewer) => Some(reviewer),
+            None => {
+                let prefix =
+                    crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+                start_and_bind_reviewer(ctx, project, slug, round, &output.review_branch, &prefix)?
+            }
+        }
+    };
+    {
+        let _lock = project.lock()?;
+        let mut record = load(project, round)?;
+        record.attention = match reviewer.as_deref() {
+            Some(reviewer) => format!(
+                "{round}: the integration base moved from {from} to {to}; repair review {} started with {reviewer}",
+                output.review_branch
+            ),
+            None => format!(
+                "{round}: the integration base moved from {from} to {to}; repair review {} is ready and its reviewer start will retry automatically",
+                output.review_branch
+            ),
+        };
+        save(project, &record)?;
+    }
+    Ok(MergeOutcome::RepairReviewStarted {
+        review_branch: output.review_branch,
+        reviewer,
+    })
 }
 
 fn effect_merge(
@@ -2378,48 +2452,13 @@ fn effect_merge(
     project: &Project,
     record: &RoundRecord,
     git: &Git,
-    mut intent: MergeIntent,
+    intent: MergeIntent,
     stop: Option<Stop>,
 ) -> Result<MergeOutcome> {
-    {
+    let mut intent = {
         let _repo = repo_lock(git)?;
-        let head = git.branch_head(&record.branch)?.context("branch_missing")?;
-        // A crash after the ref update already recorded `merged`, or left the
-        // branch past V; record it and never merge again.
-        let already = intent.merged.clone().filter(|merged| head == *merged);
-        let merged = match already {
-            Some(merged) => merged,
-            // The branch already holds exactly the ref result (a crash after
-            // the update, or an old-format record from before `merged`
-            // existed): record it and merge nothing again.
-            None if is_unrecorded_merge_result(git, &intent, &head)? => {
-                eprintln!(
-                    "round_output_recovered: `{}` git merge matches the recorded intent at {head}",
-                    record.round
-                );
-                head.clone()
-            }
-            None => {
-                let b = record
-                    .expected_head
-                    .as_deref()
-                    .context("merge_revalidation: brief commit B is missing")?;
-                if head != intent.expected_old
-                    || !git.is_ancestor(b, &intent.candidate)?
-                    || git.parents(&intent.verdict)? != [intent.candidate.clone()]
-                {
-                    bail!(
-                        "merge_revalidation: ancestry or the integration head changed under the lock"
-                    );
-                }
-                integrate(git, record, &head, &intent.verdict)?
-            }
-        };
-        intent.merged = Some(merged);
-        // Record the ref move before the phase flips, so a crash between the
-        // two (the `ref` stop point) resumes without merging twice.
-        write_merge(project, &record.round, &intent)?;
-    }
+        effect_merge_locked(project, record, git, intent)?
+    };
     if stop == Some(Stop::Ref) {
         return Ok(MergeOutcome::Stopped {
             phase: MergePhase::Intent,
@@ -2433,6 +2472,54 @@ fn effect_merge(
         });
     }
     checkpoint_phase(ctx, project, record, git, intent, stop)
+}
+
+/// Apply the recorded ref effect while the caller holds the repository lock.
+/// Project-record writes happen inside that lock, preserving the global lock
+/// order: repository first, then project.
+fn effect_merge_locked(
+    project: &Project,
+    record: &RoundRecord,
+    git: &Git,
+    mut intent: MergeIntent,
+) -> Result<MergeIntent> {
+    let head = git.branch_head(&record.branch)?.context("branch_missing")?;
+    // A crash after the ref update already recorded `merged`, or left the
+    // branch past V; record it and never merge again.
+    let already = intent.merged.clone().filter(|merged| head == *merged);
+    let merged = match already {
+        Some(merged) => merged,
+        // The branch already holds exactly the ref result (a crash after the
+        // update, or an old-format record from before `merged` existed):
+        // record it and merge nothing again.
+        None if is_unrecorded_merge_result(git, &intent, &head)? => {
+            eprintln!(
+                "round_output_recovered: `{}` git merge matches the recorded intent at {head}",
+                record.round
+            );
+            head.clone()
+        }
+        None => {
+            let b = record
+                .expected_head
+                .as_deref()
+                .context("merge_revalidation: brief commit B is missing")?;
+            if head != intent.expected_old
+                || !git.is_ancestor(b, &intent.candidate)?
+                || git.parents(&intent.verdict)? != [intent.candidate.clone()]
+            {
+                bail!(
+                    "merge_revalidation: ancestry or the integration head changed under the lock"
+                );
+            }
+            integrate(git, record, &head, &intent.verdict)?
+        }
+    };
+    intent.merged = Some(merged);
+    // Record the ref move before the phase flips, so a crash between the two
+    // resumes without merging twice.
+    write_merge(project, &record.round, &intent)?;
+    Ok(intent)
 }
 
 /// Put `verdict` onto the integration branch whatever it now holds: a
@@ -2794,6 +2881,9 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
     out.push_str(&format!("phase: {:?}\n", record.phase));
     if let Some(reason) = &record.abandoned_reason {
         out.push_str(&format!("abandoned because: {reason}\n"));
+    }
+    if !record.attention.is_empty() {
+        out.push_str(&format!("attention: {}\n", record.attention));
     }
     for m in &record.manifest.members {
         match &m.pin {
@@ -3160,16 +3250,31 @@ mod tests {
         lanes: &[(String, String)],
         front: impl FnOnce(&str, &RoundRecord) -> String,
     ) -> (String, String) {
-        let record = load(&fx.project, "r1").unwrap();
-        let wt = fx.repo.join(".worktrees").join("review-r1");
+        verdict_for(fx, "r1", lanes, front)
+    }
+
+    fn verdict_for(
+        fx: &Fx,
+        round: &str,
+        lanes: &[(String, String)],
+        front: impl FnOnce(&str, &RoundRecord) -> String,
+    ) -> (String, String) {
+        let record = load(&fx.project, round).unwrap();
+        let branch = record.review_branch.as_ref().unwrap().replace('/', "-");
+        let wt = fx.repo.join(".worktrees").join(branch);
         let mut args = vec!["merge", "-q", "--no-edit"];
         args.extend(lanes.iter().map(|(_, s)| s.as_str()));
         git(&wt, &args);
         let c = git(&wt, &["rev-parse", "HEAD"]);
-        let v = commit_file(&wt, &verdict_path("r1"), &front(&c, &record), "verdict r1");
+        let v = commit_file(
+            &wt,
+            &verdict_path(round),
+            &front(&c, &record),
+            &format!("verdict {round}"),
+        );
         let reviewer = fx.thread("Reviewer");
         fx.seal_done(&reviewer, 1, 1, &v, "# verdict report\n");
-        bind_reviewer(&fx.world.ctx(), "demo", "r1", &reviewer).unwrap();
+        bind_reviewer(&fx.world.ctx(), "demo", round, &reviewer).unwrap();
         (c, v)
     }
 
@@ -3341,10 +3446,10 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_to_move_another_rounds_target() {
+    fn two_rounds_can_open_on_the_same_integration_branch() {
         let fx = fixture();
         let (_, b) = reviewed(&fx);
-        let e = err(open(
+        open(
             &fx.world.ctx(),
             "demo",
             OpenArgs {
@@ -3353,32 +3458,14 @@ mod tests {
                 plain: Some(PLAIN.into()),
                 repo: None,
             },
-        ));
-        assert!(
-            e.starts_with("round_head_reserved")
-                && e.contains("r1")
-                && e.contains("round abandon demo r1"),
-            "{e}"
-        );
-        assert_eq!(main_head(&fx), b);
-        assert!(!round_path(&fx.project, "r2").exists());
-        // Independent integration branches remain independent.
-        git(&fx.repo, &["branch", "other"]);
-        open(
-            &fx.world.ctx(),
-            "demo",
-            OpenArgs {
-                round: "r2".into(),
-                branch: "other".into(),
-                plain: Some(PLAIN.into()),
-                repo: None,
-            },
         )
         .unwrap();
+        assert_eq!(main_head(&fx), b);
+        assert_eq!(load(&fx.project, "r2").unwrap().branch, "main");
     }
 
     #[test]
-    fn abandon_records_a_reason_and_releases_the_integration_branch() {
+    fn abandon_records_a_reason() {
         let fx = fixture();
         reviewed(&fx);
         assert!(
@@ -3409,42 +3496,6 @@ mod tests {
             show(&fx.world.ctx(), "demo", "r1")
                 .unwrap()
                 .contains("abandoned because: the reviewer could not be dispatched")
-        );
-        open(
-            &fx.world.ctx(),
-            "demo",
-            OpenArgs {
-                round: "r2".into(),
-                branch: "main".into(),
-                plain: Some(PLAIN.into()),
-                repo: None,
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn reservation_covers_other_projects_and_worktree_aliases() {
-        let fx = fixture();
-        let (lanes, _) = reviewed(&fx);
-        let other = fx.world.project("other", "b.sock");
-        let alias = thread::load(&fx.project, &lanes[0].0)
-            .unwrap()
-            .worktree_path;
-        fx.world.add_repo(&other, &alias);
-        let e = err(open(
-            &fx.world.ctx(),
-            "other",
-            OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some(PLAIN.into()),
-                repo: Some(alias),
-            },
-        ));
-        assert!(
-            e.starts_with("round_head_reserved") && e.contains("demo/r1"),
-            "{e}"
         );
     }
 
@@ -4027,56 +4078,6 @@ mod tests {
             err(merge(&fx.world.ctx(), "demo", "r1", None)).starts_with("lane_not_in_candidate")
         );
 
-        // The head moved after review: a later commit merges cleanly, so the
-        // round lands instead of needing `round review` again.
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        let (lanes, b) = reviewed(&fx);
-        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
-        let late = commit_file(&fx.repo, "late.txt", "x\n", "late commit");
-        let MergeOutcome::Checkpointed { head, .. } = merge(&ctx, "demo", "r1", None).unwrap()
-        else {
-            panic!()
-        };
-        // A real merge commit: its first parent is the moved head, the second
-        // is V; the checkpoint sits on top of it.
-        let merged = read_merge(&fx.project, "r1")
-            .unwrap()
-            .unwrap()
-            .merged
-            .unwrap();
-        assert_eq!(
-            git(&fx.repo, &["rev-list", "--parents", "-n", "1", &merged]),
-            format!("{merged} {late} {v}")
-        );
-        assert_eq!(
-            git(&fx.repo, &["rev-list", "--parents", "-n", "1", &head]),
-            format!("{head} {merged}")
-        );
-        assert_eq!(phase(&fx), MergePhase::Checkpointed);
-        assert_ne!(late, b);
-
-        // A conflict in a moved head refuses and leaves the branch alone: the
-        // late commit touches a file the verdict also changes.
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        let (lanes, _) = reviewed(&fx);
-        verdict(&fx, &lanes, front("MERGE", "r1"));
-        let late = commit_file(
-            &fx.repo,
-            "src/lane1.rs",
-            "conflicting\n",
-            "conflicting commit",
-        );
-        let e = err(merge(&ctx, "demo", "r1", None));
-        assert!(e.starts_with("merge_conflict"), "{e}");
-        assert!(
-            e.ends_with("run `round review r1`, then `round advance`"),
-            "{e}"
-        );
-        assert_eq!(main_head(&fx), late, "nothing moved on a conflict");
-        assert!(read_merge(&fx.project, "r1").unwrap().is_none());
-
         // A head rewound past B no longer contains the reviewed base: refuse.
         let fx = fixture();
         let (lanes, b) = reviewed(&fx);
@@ -4098,41 +4099,94 @@ mod tests {
     }
 
     #[test]
-    fn a_task_commit_after_b_merges_without_a_new_review() {
-        // The real case: r1 and r2 were both open on `main`; a `thread start`
-        // committed `docs(tasks): t-0009` after r1's brief commit B. r1 must
-        // land with a real merge commit, not `head_moved` and a re-review.
+    fn two_reviewing_rounds_merge_in_turn_with_automatic_repair() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        let (lanes, b) = reviewed(&fx);
-        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
-        let task = commit_file(
-            &fx.repo,
-            "tasks/t-0009.md",
-            "# t-0009\n",
-            "docs(tasks): t-0009",
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        open(
+            &ctx,
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+
+        let lane1 = fx.lane(1);
+        let lane2 = fx.lane(2);
+        admit(&ctx, "demo", "r1", &lane1.0).unwrap();
+        admit(&ctx, "demo", "r2", &lane2.0).unwrap();
+        fx.seal_done(&lane1.0, 1, 1, &lane1.1, "# r1 report\n");
+        fx.seal_done(&lane2.0, 1, 1, &lane2.1, "# r2 report\n");
+
+        // Review r2 first and r1 second. Both branches and worktrees coexist;
+        // r1 is based on the newest integration head and can merge first.
+        let r2_review = review(&ctx, "demo", "r2").unwrap();
+        let (r2_candidate, r2_verdict) = verdict_for(
+            &fx,
+            "r2",
+            std::slice::from_ref(&lane2),
+            front("MERGE", "r2"),
         );
-        let MergeOutcome::Checkpointed { head, .. } = merge(&ctx, "demo", "r1", None).unwrap()
+        let r1_review = review(&ctx, "demo", "r1").unwrap();
+        verdict(&fx, std::slice::from_ref(&lane1), front("MERGE", "r1"));
+        assert_ne!(r1_review.review_branch, r2_review.review_branch);
+        assert_ne!(r1_review.worktree, r2_review.worktree);
+        assert!(matches!(
+            merge(&ctx, "demo", "r1", None).unwrap(),
+            MergeOutcome::Checkpointed { .. }
+        ));
+        let after_r1 = main_head(&fx);
+
+        // r2's verdict was built on the old base. `round merge` creates the
+        // repair revision and starts its reviewer without coordinator steps.
+        let outcome = merge(&ctx, "demo", "r2", None).unwrap();
+        let MergeOutcome::RepairReviewStarted {
+            review_branch,
+            reviewer: Some(repairer),
+        } = outcome
         else {
-            panic!()
+            panic!("{outcome:?}")
         };
-        let merged = read_merge(&fx.project, "r1")
-            .unwrap()
-            .unwrap()
-            .merged
-            .unwrap();
+        assert_eq!(review_branch, "review/r2-2");
+        assert!(read_merge(&fx.project, "r2").unwrap().is_none());
+        let repair = load(&fx.project, "r2").unwrap();
+        let repair_b = repair.expected_head.clone().unwrap();
         assert_eq!(
-            git(&fx.repo, &["rev-list", "--parents", "-n", "1", &merged]),
-            format!("{merged} {task} {v}")
+            git(&fx.repo, &["rev-parse", &format!("{repair_b}^")]),
+            after_r1
         );
-        assert_eq!(main_head(&fx), head);
-        assert_ne!(task, b);
-        // The round's record still names B as the brief commit, so `round
-        // show` reads the same B it reviewed.
-        assert_eq!(
-            load(&fx.project, "r1").unwrap().expected_head.as_deref(),
-            Some(b.as_str())
+        assert!(repair.attention.contains("integration base moved"));
+        assert!(
+            show(&ctx, "demo", "r2")
+                .unwrap()
+                .contains("attention: r2: the integration base moved")
         );
+        let task = std::fs::read_to_string(thread::task_path(&fx.project, &repairer)).unwrap();
+        assert!(task.contains(&r2_candidate), "{task}");
+        assert!(task.contains(&r2_verdict), "{task}");
+
+        // The repair reviewer carries the first review's candidate over the
+        // new base, seals its verdict, and the second merge now lands.
+        let wt = fx.repo.join(".worktrees/review-r2-2");
+        git(&wt, &["merge", "-q", "--no-edit", &r2_candidate]);
+        let c = git(&wt, &["rev-parse", "HEAD"]);
+        let v = commit_file(
+            &wt,
+            &verdict_path("r2"),
+            &front("MERGE", "r2")(&c, &repair),
+            "verdict r2 repair",
+        );
+        fx.seal_done(&repairer, 1, 1, &v, "# repair verdict report\n");
+        assert!(matches!(
+            merge(&ctx, "demo", "r2", None).unwrap(),
+            MergeOutcome::Checkpointed { .. }
+        ));
+        assert_eq!(load(&fx.project, "r2").unwrap().phase, RoundPhase::Merged);
     }
 
     #[test]
@@ -4746,11 +4800,10 @@ mod tests {
         );
     }
 
-    /// A frozen round whose brief is unchanged is repaired: `round review`
-    /// reuses B and opens the next review branch from the moved integration
-    /// head; the reviewer task names the earlier candidate C and verdict V.
+    /// A manual repair gets a new B on the current integration base, and its
+    /// reviewer task names the earlier candidate C and verdict V.
     #[test]
-    fn repair_review_reuses_b_and_names_the_earlier_candidate() {
+    fn repair_review_records_the_new_base_and_names_the_earlier_candidate() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         reviewer_ready(&fx);
@@ -4796,11 +4849,18 @@ mod tests {
         assert_ne!(late, b);
 
         let outcome = review(&ctx, "demo", "r1").unwrap();
-        assert_eq!(outcome.brief_commit, b, "B stays the existing brief commit");
+        assert_ne!(outcome.brief_commit, b);
         assert_eq!(outcome.review_branch, "review/r1-2");
         assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
+        assert_eq!(
+            git(
+                &fx.repo,
+                &["rev-parse", &format!("{}^", outcome.brief_commit)]
+            ),
+            late
+        );
         let wt = fx.repo.join(".worktrees/review-r1-2");
-        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), late);
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), outcome.brief_commit);
 
         // `advance` starts a reviewer for the branch already on the record.
         advance(&ctx, "demo").unwrap();

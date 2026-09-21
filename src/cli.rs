@@ -369,7 +369,7 @@ enum RoundCommand {
         round: String,
         thread: String,
     },
-    /// End a round that will not be merged and release its integration branch
+    /// End a round that will not be merged and record why
     Abandon {
         slug: String,
         round: String,
@@ -724,6 +724,17 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     round::MergeOutcome::NoOp { head } => {
                         println!("already checkpointed at H {head}; nothing to do")
                     }
+                    round::MergeOutcome::RepairReviewStarted {
+                        review_branch,
+                        reviewer,
+                    } => match reviewer {
+                        Some(reviewer) => println!(
+                            "integration base moved; started repair review {review_branch} with {reviewer}"
+                        ),
+                        None => println!(
+                            "integration base moved; prepared repair review {review_branch}; its reviewer start will retry automatically"
+                        ),
+                    },
                     round::MergeOutcome::Stopped { phase } => {
                         println!("stopped (test fault injection) at phase {phase:?}")
                     }
