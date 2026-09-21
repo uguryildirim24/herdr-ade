@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,10 @@ struct Cli {
     /// Projects root (default: $HERDR_ADE_ROOT, then config.toml, then ~/.herdr-ade)
     #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
+
+    /// Return one structured result instead of the human sentence
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -448,8 +453,6 @@ enum DialogueCommand {
 enum PlanCommand {
     /// Print the plan card; a missing card prints revision zero
     Show {
-        #[arg(long)]
-        json: bool,
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
     },
@@ -558,16 +561,12 @@ enum DecideCommand {
     },
     /// List the current choices, newest first
     List {
-        #[arg(long)]
-        json: bool,
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
     },
     /// Show one decision and whether it is still current
     Show {
         id: String,
-        #[arg(long)]
-        json: bool,
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
     },
@@ -630,6 +629,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         repo,
                     },
                 )?;
+                crate::output::insert("phase", serde_json::to_value(r.phase)?);
                 println!(
                     "opened {} on `{}` (gates: {})",
                     r.round,
@@ -644,6 +644,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 thread,
             } => {
                 let r = round::admit(ctx, &slug, &id, &thread)?;
+                crate::output::insert("phase", serde_json::to_value(r.phase)?);
                 println!(
                     "{thread} admitted to {id}; manifest revision {}",
                     r.manifest.revision
@@ -656,6 +657,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 thread,
             } => {
                 let r = round::remove(ctx, &slug, &id, &thread)?;
+                crate::output::insert("phase", serde_json::to_value(r.phase)?);
                 println!(
                     "{thread} removed from {id}; manifest revision {}",
                     r.manifest.revision
@@ -673,6 +675,9 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             }
             RoundCommand::Review { slug, round: id } => {
                 let o = round::review(ctx, &slug, &id)?;
+                crate::output::insert("brief_commit", o.brief_commit.clone());
+                crate::output::insert("review_branch", o.review_branch.clone());
+                crate::output::insert("manifest_hash", o.manifest_hash.clone());
                 println!("brief commit B {} ({})", o.brief_commit, o.brief_path);
                 println!(
                     "review branch {} at {}",
@@ -695,6 +700,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             }
             RoundCommand::Reviewer { slug, round: id } => {
                 let reviewer = round::start_reviewer_by_hand(ctx, &slug, &id)?;
+                crate::output::insert("reviewer", reviewer.id.clone());
                 println!(
                     "{} reviews {id} (manual repair; `round advance` starts reviewers on its own)",
                     reviewer.id
@@ -709,36 +715,74 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 let stop = stop_after.map(|s| s.parse()).transpose()?;
                 match round::merge(ctx, &slug, &id, stop)? {
                     round::MergeOutcome::Checkpointed { head, lanes } => {
+                        crate::output::insert("head", head.clone());
+                        crate::output::insert("lanes", serde_json::to_value(&lanes)?);
                         println!("merged and checkpointed: H {head}");
                         for l in lanes {
                             println!("  {l}");
                         }
                     }
                     round::MergeOutcome::NoOp { head } => {
+                        crate::output::set_outcome("already_checkpointed");
+                        crate::output::insert("head", head.clone());
                         println!("already checkpointed at H {head}; nothing to do")
                     }
                     round::MergeOutcome::RepairReviewStarted {
                         review_branch,
                         reviewer,
-                    } => match reviewer {
-                        Some(reviewer) => println!(
-                            "integration base moved; started repair review {review_branch} with {reviewer}"
-                        ),
-                        None => println!(
-                            "integration base moved; prepared repair review {review_branch}; its reviewer start will retry automatically"
-                        ),
-                    },
+                    } => {
+                        crate::output::insert("review_branch", review_branch.clone());
+                        match reviewer {
+                            Some(reviewer) => {
+                                crate::output::set_outcome("repair_review_started");
+                                crate::output::insert("reviewer", reviewer.clone());
+                                println!(
+                                    "integration base moved; started repair review {review_branch} with {reviewer}"
+                                )
+                            }
+                            None => {
+                                crate::output::set_outcome("repair_review_prepared");
+                                println!(
+                                    "integration base moved; prepared repair review {review_branch}; its reviewer start will retry automatically"
+                                )
+                            }
+                        }
+                    }
                     round::MergeOutcome::Stopped { phase } => {
+                        crate::output::set_outcome("stopped");
+                        crate::output::insert("phase", format!("{phase:?}"));
                         println!("stopped (test fault injection) at phase {phase:?}")
                     }
                 }
                 Ok(())
             }
             RoundCommand::Advance { slug } => match slug {
-                Some(slug) => round::advance(ctx, &slug),
-                None => round::advance_event(ctx),
+                Some(slug) => {
+                    let outcome = round::advance(ctx, &slug)?;
+                    crate::output::insert("started", serde_json::to_value(&outcome.started)?);
+                    if outcome.started.is_empty() {
+                        println!("no reviewer started");
+                    } else {
+                        for started in outcome.started {
+                            println!(
+                                "started reviewer {} for {}",
+                                started.reviewer, started.round
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                None => {
+                    let outcome = round::advance_event(ctx)?;
+                    crate::output::insert("started", serde_json::to_value(&outcome.started)?);
+                    println!("rounds advanced for the event's projects");
+                    Ok(())
+                }
             },
             RoundCommand::Show { slug, round: id } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = round::load(&project, &id)?;
+                crate::output::insert("phase", serde_json::to_value(record.phase)?);
                 print!("{}", round::show(ctx, &slug, &id)?);
                 Ok(())
             }
@@ -859,6 +903,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     .var("USER")
                     .context("USER is required to record who withdrew the ask")?;
                 ask::withdraw(ctx, &slug, &id, &reason, by)?;
+                crate::output::insert("ask", id.clone());
                 println!("{id} withdrawn: {reason}");
                 Ok(())
             }
@@ -870,6 +915,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             }) => {
                 let slug = slug_of(project)?;
                 let a = ask::answer(ctx, &slug, &id, revision, choice, "command")?;
+                crate::output::insert("ask", id.clone());
                 println!("{id} revision {revision}: {} ({})", a.choice, a.text);
                 Ok(())
             }
@@ -888,6 +934,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         reask,
                     },
                 )?;
+                crate::output::insert("ask", a.id.clone());
                 println!(
                     "{} revision {}: {}",
                     a.id,
@@ -901,9 +948,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             }
         },
         Command::Plan { command } => match command {
-            PlanCommand::Show { json, project } => {
+            PlanCommand::Show { project } => {
                 let slug = slug_of(project)?;
-                print!("{}", plan::show(ctx, &slug, json)?);
+                let text = plan::show(ctx, &slug, false)?;
+                if crate::output::structured() {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&plan::show(ctx, &slug, true)?)?;
+                    crate::output::insert("result", value);
+                }
+                print!("{text}");
                 Ok(())
             }
             PlanCommand::Set {
@@ -914,6 +967,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             } => {
                 let slug = slug_of(project)?;
                 let p = plan::set(ctx, &slug, &kind, &does, expect)?;
+                crate::output::insert("revision", p.revision);
                 println!("plan revision {} set to `{}`", p.revision, p.kind);
                 Ok(())
             }
@@ -928,6 +982,8 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     let slug = slug_of(project)?;
                     let p = plan::step_add(ctx, &slug, &text, threads, rounds, expect)?;
                     let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
+                    crate::output::insert("revision", p.revision);
+                    crate::output::insert("step", id.clone());
                     println!("plan revision {}: added {id}", p.revision);
                     Ok(())
                 }
@@ -939,6 +995,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_edit(ctx, &slug, &id, &text, expect)?;
+                    crate::output::insert("revision", p.revision);
                     println!("plan revision {}: edited {id}", p.revision);
                     Ok(())
                 }
@@ -951,6 +1008,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_link(ctx, &slug, &id, threads, rounds, expect)?;
+                    crate::output::insert("revision", p.revision);
                     println!("plan revision {}: linked {id}", p.revision);
                     Ok(())
                 }
@@ -964,6 +1022,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_unlink(ctx, &slug, &id, threads, rounds, &why, expect)?;
+                    crate::output::insert("revision", p.revision);
                     println!("plan revision {}: unlinked {id}", p.revision);
                     Ok(())
                 }
@@ -975,6 +1034,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_remove(ctx, &slug, &id, &why, expect)?;
+                    crate::output::insert("revision", p.revision);
                     println!("plan revision {}: removed {id}", p.revision);
                     Ok(())
                 }
@@ -986,6 +1046,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_move(ctx, &slug, &id, &before, expect)?;
+                    crate::output::insert("revision", p.revision);
                     println!("plan revision {}: moved {id}", p.revision);
                     Ok(())
                 }
@@ -993,11 +1054,17 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             PlanCommand::Sync { project } => {
                 let slug = slug_of(project)?;
                 match plan::sync(ctx, &slug)? {
-                    plan::SyncOutcome::Missing => println!("no plan is written down yet"),
+                    plan::SyncOutcome::Missing => {
+                        crate::output::set_outcome("plan_missing");
+                        println!("no plan is written down yet")
+                    }
                     plan::SyncOutcome::Unchanged { revision } => {
+                        crate::output::set_outcome("unchanged");
+                        crate::output::insert("revision", revision);
                         println!("plan revision {revision}: no step state changed")
                     }
                     plan::SyncOutcome::Changed { revision } => {
+                        crate::output::insert("revision", revision);
                         println!("plan revision {revision}: step states refreshed")
                     }
                 }
@@ -1025,17 +1092,30 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     .var("USER")
                     .context("USER is required to record who overturned the decision")?;
                 let record = decide::overturn(ctx, &slug, &id, &reason, by)?;
+                crate::output::insert("decision", id.clone());
                 println!("{}", decide::status_line(&record));
                 Ok(())
             }
-            Some(DecideCommand::List { json, project }) => {
+            Some(DecideCommand::List { project }) => {
                 let slug = slug_of(project)?;
-                print!("{}", decide::list(ctx, &slug, json)?);
+                let text = decide::list(ctx, &slug, false)?;
+                if crate::output::structured() {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&decide::list(ctx, &slug, true)?)?;
+                    crate::output::insert("result", value);
+                }
+                print!("{text}");
                 Ok(())
             }
-            Some(DecideCommand::Show { id, json, project }) => {
+            Some(DecideCommand::Show { id, project }) => {
                 let slug = slug_of(project)?;
-                print!("{}", decide::show(ctx, &slug, &id, json)?);
+                let text = decide::show(ctx, &slug, &id, false)?;
+                if crate::output::structured() {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&decide::show(ctx, &slug, &id, true)?)?;
+                    crate::output::insert("result", value);
+                }
+                print!("{text}");
                 Ok(())
             }
             None => {
@@ -1054,6 +1134,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         request: request.as_deref(),
                     },
                 )?;
+                crate::output::insert("decision", d.id.clone());
                 println!("{} {}", d.id, d.class);
                 Ok(())
             }
@@ -1164,10 +1245,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
 #[derive(Subcommand)]
 enum LedgerCommand {
     /// Open failures, worst repeat count first
-    List {
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Show a failure and its evidence
     Show { id: String },
     /// Close a failure
@@ -1335,9 +1413,92 @@ enum PlainCommand {
     },
 }
 
+fn machine_outcome(command: &str) -> String {
+    let outcome = match command {
+        "open" | "round open" => "opened",
+        "context" | "round show" | "plan show" | "decide show" => "shown",
+        "thread start" | "thread restart" => "started",
+        "thread adopt" => "adopted",
+        "thread prompt" => "prompted",
+        "thread resolve" => "resolved",
+        "thread ack" => "acknowledged",
+        "thread list" | "decide list" | "ledger list" => "listed",
+        "thread show" => "shown",
+        "ask" => "asked",
+        "ask answer" => "answered",
+        "ask withdraw" => "withdrawn",
+        "decide" => "decided",
+        "decide overturn" => "overturned",
+        "say" => "said",
+        "done" | "waiting" | "failed" => "sealed",
+        "round advance" => "advanced",
+        "round admit" => "admitted",
+        "round remove" => "removed",
+        "round abandon" => "abandoned",
+        "round review" => "review_prepared",
+        "round reviewer" => "reviewer_started",
+        "round merge" => "merged",
+        "round tick" => "ticked",
+        "doctor" => "healthy",
+        "harness install" => "installed",
+        "inbox done" => "moved",
+        command if command.starts_with("plan ") => "plan_changed",
+        _ => "succeeded",
+    };
+    outcome.to_string()
+}
+
+fn machine_command(matches: &clap::ArgMatches) -> (String, BTreeMap<String, serde_json::Value>) {
+    let mut leaf = matches;
+    let mut path = Vec::new();
+    let mut data = BTreeMap::new();
+    loop {
+        for key in [
+            "slug", "project", "round", "thread", "id", "name", "sha", "report", "branch", "pane",
+        ] {
+            if let Ok(Some(value)) = leaf.try_get_one::<String>(key) {
+                data.insert(key.to_string(), serde_json::Value::String(value.clone()));
+            }
+        }
+        match leaf.subcommand() {
+            Some((name, child)) => {
+                path.push(name.to_string());
+                leaf = child;
+            }
+            None => break,
+        }
+    }
+    (path.join(" "), data)
+}
+
+fn partial_machine_result() -> (String, BTreeMap<String, serde_json::Value>) {
+    Cli::command()
+        .ignore_errors(true)
+        .try_get_matches()
+        .ok()
+        .map(|matches| machine_command(&matches))
+        .unwrap_or_default()
+}
+
 pub fn run() -> Result<()> {
-    let matches = Cli::command().get_matches();
+    let wants_json = std::env::args_os().any(|arg| arg == "--json");
+    let matches = match Cli::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) if !wants_json => error.exit(),
+        Err(error) => {
+            let (command, data) = partial_machine_result();
+            crate::output::begin(true, command, "refused".into(), data);
+            return Err(error.into());
+        }
+    };
     let cli = Cli::from_arg_matches(&matches)?;
+    let (result_command, result_data) = machine_command(&matches);
+    crate::output::begin(
+        cli.json,
+        result_command.clone(),
+        machine_outcome(&result_command),
+        result_data,
+    );
     let mut leaf = &matches;
     let mut command_path = Vec::new();
     let mut explicit_slug = None;
@@ -1395,6 +1556,9 @@ pub fn run() -> Result<()> {
     let subject = format!("ha {command_name}");
     let result = dispatch(ctx, cli.command, observed_project.as_ref());
     record_command_outcome(observed_project.as_ref(), &subject, &result);
+    if result.is_ok() {
+        crate::output::finish_success()?;
+    }
     result
 }
 
@@ -1491,14 +1655,13 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 .as_ref()
                 .context("no project resolves from this workspace or lane")?;
             match command {
-                LedgerCommand::List { json } => {
+                LedgerCommand::List => {
                     let entries = crate::ledger::list(project)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&entries)?);
-                    } else {
-                        for entry in entries {
-                            println!("{}", crate::ledger::summary(&entry));
-                        }
+                    if crate::output::structured() {
+                        crate::output::insert("result", serde_json::to_value(&entries)?);
+                    }
+                    for entry in entries {
+                        println!("{}", crate::ledger::summary(&entry));
                     }
                 }
                 LedgerCommand::Show { id } => println!(
@@ -1522,6 +1685,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     .as_ref()
                     .and_then(|record| pane.as_deref().map(|pane| (pane, record.attempt())));
                 let moved = inbox::done_bound(&project, &ids, all, binding)?;
+                crate::output::insert("moved", moved as u64);
                 println!("{moved} item(s) moved to inbox/done");
                 Ok(())
             }
@@ -1589,6 +1753,10 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         workflow,
                     },
                 )?;
+                crate::output::insert("id", thread.id.clone());
+                crate::output::insert("kind", serde_json::to_value(thread.kind)?);
+                crate::output::insert("branch", thread.branch.clone());
+                crate::output::insert("pane_id", thread.pane_id.clone());
                 println!(
                     "{}",
                     serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id })
@@ -1597,6 +1765,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             }
             ThreadCommand::Restart { slug, id } => {
                 let thread = threads::restart(&ctx, &slug, &id)?;
+                crate::output::insert("pane_id", thread.pane_id.clone());
                 println!(
                     "{} is back in pane {}; the ticker launches its agent",
                     thread.id, thread.pane_id
@@ -1610,6 +1779,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             } => {
                 let text = read_text(&text_file)?;
                 let state = threads::prompt(&ctx, &slug, &id, &text)?;
+                crate::output::insert("agent_state", state.clone());
                 println!("sent to {id} (agent was {state})");
                 Ok(())
             }
@@ -1635,6 +1805,10 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         passive,
                     },
                 )?;
+                crate::output::insert("id", thread.id.clone());
+                crate::output::insert("kind", serde_json::to_value(thread.kind)?);
+                crate::output::insert("pane_id", thread.pane_id.clone());
+                crate::output::insert("prompt_pending", thread.prompt_pending);
                 println!(
                     "{}",
                     serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id, "prompt_pending": thread.prompt_pending })
@@ -1652,18 +1826,24 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 skip_copy,
                 discard_uncopied,
                 keep_pane,
-            } => threads::resolve(
-                &ctx,
-                &slug,
-                &id,
-                &ResolveArgs {
-                    reopen,
-                    remove_worktree,
-                    skip_copy,
-                    discard_uncopied,
-                    keep_pane,
-                },
-            ),
+            } => {
+                threads::resolve(
+                    &ctx,
+                    &slug,
+                    &id,
+                    &ResolveArgs {
+                        reopen,
+                        remove_worktree,
+                        skip_copy,
+                        discard_uncopied,
+                        keep_pane,
+                    },
+                )?;
+                if reopen {
+                    crate::output::set_outcome("reopened");
+                }
+                Ok(())
+            }
         },
         Command::Routine { command } => match command {
             RoutineCommand::Approve { slug, name } => {
