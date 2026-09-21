@@ -187,7 +187,10 @@ impl Conversation {
                     text,
                     answer,
                 } => {
-                    if answer.is_some() || old_carriers.contains(request) {
+                    if answer.is_some()
+                        || old_carriers.contains(request)
+                        || super::is_historical_system_prompt(text)
+                    {
                         continue;
                     }
                     status = states.get(request).copied();
@@ -488,6 +491,51 @@ mod tests {
         assert!(!v.replay().contains("ANSWER"));
         assert!(!v.items.iter().any(|i| matches!(i.body, Body::Rolf(_))));
     }
+    #[test]
+    fn historical_claude_system_prompts_are_not_shown_as_rolfs_words() {
+        let fx = fixture();
+        for (request, text) in [
+            (
+                "q-done",
+                "\n<pasted_content id=\"2459\">\nDONE t-0151 artifact sha\n</pasted_content id=\"2459\">\n",
+            ),
+            (
+                "q-task",
+                "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>",
+            ),
+            (
+                "q-human",
+                "<pasted_content id=\"2460\">\nThese are Rolf's pasted words.\n</pasted_content id=\"2460\">",
+            ),
+        ] {
+            super::super::append(
+                &fx.project,
+                None,
+                Entry::Rolf {
+                    request: request.into(),
+                    text: text.into(),
+                    answer: None,
+                },
+            )
+            .unwrap();
+        }
+        let view = Conversation::load(&fx.project, &super::super::read(&fx.project));
+        let shown: Vec<_> = view
+            .items
+            .iter()
+            .filter_map(|item| match &item.body {
+                Body::Rolf(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "<pasted_content id=\"2460\">\nThese are Rolf's pasted words.\n</pasted_content id=\"2460\">"
+            ]
+        );
+    }
+
     #[test]
     fn incremental_reader_retries_tail_and_resets_after_truncation() {
         let fx = fixture();
