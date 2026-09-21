@@ -1271,7 +1271,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
 /// the event's pane belongs to, or every project when it belongs to none.
 /// A lane lives in its own workspace, so its thread record is the map from
 /// the envelope to the project.
-pub fn advance_event(ctx: &Ctx) -> Result<()> {
+pub fn advance_event(ctx: &Ctx) -> Result<AdvanceOutcome> {
     let event = ctx
         .env
         .var("HERDR_PLUGIN_EVENT_JSON")
@@ -1301,10 +1301,11 @@ pub fn advance_event(ctx: &Ctx) -> Result<()> {
         }
     }
     let targets = if matched.is_empty() { slugs } else { matched };
+    let mut outcome = AdvanceOutcome::default();
     for slug in targets {
-        let _ = advance(ctx, &slug)?;
+        outcome.started.extend(advance(ctx, &slug)?.started);
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn advance_lock(project: &Project) -> Result<std::fs::File> {

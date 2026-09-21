@@ -773,7 +773,8 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     Ok(())
                 }
                 None => {
-                    round::advance_event(ctx)?;
+                    let outcome = round::advance_event(ctx)?;
+                    crate::output::insert("started", serde_json::to_value(&outcome.started)?);
                     println!("rounds advanced for the event's projects");
                     Ok(())
                 }
@@ -1470,13 +1471,23 @@ fn machine_command(matches: &clap::ArgMatches) -> (String, BTreeMap<String, serd
     (path.join(" "), data)
 }
 
+fn partial_machine_result() -> (String, BTreeMap<String, serde_json::Value>) {
+    Cli::command()
+        .ignore_errors(true)
+        .try_get_matches()
+        .ok()
+        .map(|matches| machine_command(&matches))
+        .unwrap_or_default()
+}
+
 pub fn run() -> Result<()> {
     let wants_json = std::env::args_os().any(|arg| arg == "--json");
     let matches = match Cli::command().try_get_matches() {
         Ok(matches) => matches,
         Err(error) if !wants_json => error.exit(),
         Err(error) => {
-            crate::output::begin(true, String::new(), "refused".into(), BTreeMap::new());
+            let (command, data) = partial_machine_result();
+            crate::output::begin(true, command, "refused".into(), data);
             return Err(error.into());
         }
     };
@@ -1754,6 +1765,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             }
             ThreadCommand::Restart { slug, id } => {
                 let thread = threads::restart(&ctx, &slug, &id)?;
+                crate::output::insert("pane_id", thread.pane_id.clone());
                 println!(
                     "{} is back in pane {}; the ticker launches its agent",
                     thread.id, thread.pane_id
@@ -1767,6 +1779,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             } => {
                 let text = read_text(&text_file)?;
                 let state = threads::prompt(&ctx, &slug, &id, &text)?;
+                crate::output::insert("agent_state", state.clone());
                 println!("sent to {id} (agent was {state})");
                 Ok(())
             }
@@ -1813,18 +1826,24 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 skip_copy,
                 discard_uncopied,
                 keep_pane,
-            } => threads::resolve(
-                &ctx,
-                &slug,
-                &id,
-                &ResolveArgs {
-                    reopen,
-                    remove_worktree,
-                    skip_copy,
-                    discard_uncopied,
-                    keep_pane,
-                },
-            ),
+            } => {
+                threads::resolve(
+                    &ctx,
+                    &slug,
+                    &id,
+                    &ResolveArgs {
+                        reopen,
+                        remove_worktree,
+                        skip_copy,
+                        discard_uncopied,
+                        keep_pane,
+                    },
+                )?;
+                if reopen {
+                    crate::output::set_outcome("reopened");
+                }
+                Ok(())
+            }
         },
         Command::Routine { command } => match command {
             RoutineCommand::Approve { slug, name } => {
