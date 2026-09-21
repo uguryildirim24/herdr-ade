@@ -355,6 +355,12 @@ pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         for error in tick_slow(ctx, project, seen, memory) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
+        // A launch can fail without producing a Herdr agent-state event (for
+        // example, a transient provider readiness timeout). Advance here so a
+        // failed bound reviewer is counted and replaced without hand repair.
+        if let Err(error) = crate::round::advance(ctx, &project.slug) {
+            log.line(&format!("{}: round advance: {error:#}", project.slug));
+        }
     }
     !reachable.is_empty()
 }
