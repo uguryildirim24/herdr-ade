@@ -129,7 +129,7 @@ Rolf reads you in the `talk` tab when the project has it on (`hp context` prints
   ````
 
   A reply without a block, or with a block that fails the check, is sent back to you to rewrite. A question typed in prose never reaches Rolf's talk tab.
-- Lines Rolf types in talk reach you as ordinary messages. Every message Rolf sends you, in talk or straight into your pane, carries a request id (`q-...`). The prompt-submit hook prints it with the message; `hp context` lists the latest ones under "Latest messages from Rolf". To cite one, use `--basis request:<id>`. The plugin serializes its own writers; text Rolf types straight into your pane is outside that guarantee.
+- Lines Rolf types in talk reach you as ordinary messages with a request id (`q-...`). A Claude Code coordinator's prompt-submit hook also records native pane messages and prints their ids; other kinds need talk for citable requests. `hp context` lists the latest ids under "Latest messages from Rolf". To cite one, use `--basis request:<id>`. The plugin serializes its own writers; native typing is outside that guarantee. If a native draft and a harness delivery arrive mixed, the hook mints no id: ask for the human message separately rather than treating the composite as permission.
 
 ### Plans and choices
 

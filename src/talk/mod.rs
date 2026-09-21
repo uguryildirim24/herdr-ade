@@ -207,16 +207,23 @@ pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Resu
 pub(crate) enum PendingPrompt {
     Delivery(String),
     Automated,
+    /// Native text and a harness delivery were submitted together. Their
+    /// provenance cannot be separated reliably, so neither authorizes a choice.
+    Mixed,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingPromptRecord {
     delivery: Option<String>,
     at: i64,
+    #[serde(default)]
+    pane: String,
+    #[serde(default)]
+    text: String,
 }
 
-/// A marker older than this belongs to a hook that never fired; it must not
-/// claim a later prompt with the same text.
+/// An old delivery marker must not cite a possibly unrelated human request.
+/// It still proves harness provenance: expiration must never create authority.
 const PENDING_PROMPT_SECS: i64 = 120;
 
 fn pending_prompt_path(project: &Project, pane: &str, text: &str) -> PathBuf {
@@ -250,6 +257,8 @@ fn mark_pending_prompt(
         &PendingPromptRecord {
             delivery: delivery.map(str::to_string),
             at: jiff::Timestamp::now().as_second(),
+            pane: pane.to_string(),
+            text: text.trim_end().to_string(),
         },
     )
 }
@@ -270,17 +279,36 @@ pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -
     mark_pending_prompt(project, pane, text, None)
 }
 
-/// Reads and removes the marker for this pane and exact prompt.
+/// Reads and removes markers consumed by this prompt. Herdr can submit a
+/// partially typed native draft together with a harness line; that composite
+/// is not a human authorization. Unknown portions must be sent separately.
 pub(crate) fn take_pending_prompt(
     project: &Project,
     pane: &str,
     text: &str,
 ) -> Option<PendingPrompt> {
     let path = pending_prompt_path(project, pane, text);
-    let record: PendingPromptRecord = project::read_json(&path)?;
+    let Some(record) = project::read_json::<PendingPromptRecord>(&path) else {
+        let mut mixed = false;
+        for entry in std::fs::read_dir(talk_dir(project).join("prompts"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Some(marker) = project::read_json::<PendingPromptRecord>(&entry.path())
+                && marker.pane == pane
+                && !marker.text.is_empty()
+                && text.contains(&marker.text)
+            {
+                mixed = true;
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        return mixed.then_some(PendingPrompt::Mixed);
+    };
     let _ = std::fs::remove_file(&path);
     if jiff::Timestamp::now().as_second() - record.at > PENDING_PROMPT_SECS {
-        return None;
+        return Some(PendingPrompt::Automated);
     }
     Some(match record.delivery {
         Some(request) => PendingPrompt::Delivery(request),
@@ -813,6 +841,28 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_expired_harness_marker_never_becomes_human_authority() {
+        let fx = fixture();
+        let text = "DONE t-0001 report.md sha";
+        let path = pending_prompt_path(&fx.project, "w1:p1", text);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        project::write_json(
+            &path,
+            &PendingPromptRecord {
+                delivery: None,
+                at: jiff::Timestamp::now().as_second() - PENDING_PROMPT_SECS - 1,
+                pane: "w1:p1".into(),
+                text: text.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            take_pending_prompt(&fx.project, "w1:p1", text),
+            Some(PendingPrompt::Automated)
+        );
     }
 
     #[test]

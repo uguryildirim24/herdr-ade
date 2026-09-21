@@ -417,6 +417,12 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
     match crate::talk::take_pending_prompt(project, pane, text) {
         Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
         Some(crate::talk::PendingPrompt::Automated) => Ok(None),
+        Some(crate::talk::PendingPrompt::Mixed) => {
+            println!(
+                "This prompt includes harness text. Send the human message separately to obtain a request id."
+            );
+            Ok(None)
+        }
         None => Ok(Some(crate::talk::record_pane_request(project, text)?)),
     }
 }
@@ -746,6 +752,18 @@ mod tests {
         crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap();
         assert_eq!(
             handle_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap(),
+            None
+        );
+        assert!(crate::talk::recent_requests(&project, 5).is_empty());
+
+        crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0002 report.md sha").unwrap();
+        assert_eq!(
+            handle_prompt(
+                &project,
+                "w1:p1",
+                "my half-typed wordsDONE t-0002 report.md sha"
+            )
+            .unwrap(),
             None
         );
         assert!(crate::talk::recent_requests(&project, 5).is_empty());
