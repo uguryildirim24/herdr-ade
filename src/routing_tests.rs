@@ -615,10 +615,34 @@ fn evaluator_uses_finished_lane_and_round_outcomes_without_labels() {
         };
     });
     std::fs::write(thread::task_path(&project, &lane.id), task).unwrap();
+    let escalated_task = "Make the change that needed a stronger helper.";
+    let escalated_hash = thread::sha256_hex(escalated_task.as_bytes());
+    let escalated_lane = world.thread(&project, &cwd, |t| {
+        t.role = "lane".into();
+        t.attempt = 2;
+        t.launch = Launch {
+            recipe_id: "test_strong".into(),
+            strength: 2,
+            brief_hash: escalated_hash.clone(),
+            escalations: 1,
+            ..Launch::default()
+        };
+    });
+    std::fs::write(
+        thread::task_path(&project, &escalated_lane.id),
+        escalated_task,
+    )
+    .unwrap();
     std::fs::write(
         project.state_dir().join("dispatch.jsonl"),
-        format!("{}\n", json!({"kind":"pick","brief_hash":hash,"recipe":"test_claude","escalations":0,"failure":null,"assessment":assessment})),
-    ).unwrap();
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"kind":"pick","brief_hash":hash,"recipe":"test_claude","escalations":0,"failure":null,"assessment":assessment}),
+            json!({"kind":"pick","brief_hash":escalated_hash,"recipe":"test_claude","escalations":0,"failure":null,"assessment":assessment}),
+            json!({"kind":"escalation","brief_hash":escalated_hash,"recipe":"test_strong","escalations":1,"failure":"the first run failed","previous":{"recipe":"test_claude"},"assessment":assessment}),
+        ),
+    )
+    .unwrap();
     let event = Event {
         id: "done-1".into(),
         op: "done-1".into(),
@@ -638,15 +662,39 @@ fn evaluator_uses_finished_lane_and_round_outcomes_without_labels() {
         toml::to_string(&event).unwrap(),
     )
     .unwrap();
+    let escalated_event = Event {
+        id: "done-2".into(),
+        op: "done-2".into(),
+        thread: escalated_lane.id.clone(),
+        attempt: 2,
+        round: Some("r1".into()),
+        recipient: Default::default(),
+        created: crate::project::now(),
+        payload: EventPayload {
+            done: Some(DonePayload::default()),
+            ..Default::default()
+        },
+    };
+    std::fs::write(
+        crate::round::events_dir(&project).join("done-2.toml"),
+        toml::to_string(&escalated_event).unwrap(),
+    )
+    .unwrap();
     let round = RoundRecord {
         phase: RoundPhase::Merged,
         round: "r1".into(),
         manifest: AdmissionManifest {
             revision: 1,
-            members: vec![ManifestMember {
-                thread: lane.id.clone(),
-                pin: None,
-            }],
+            members: vec![
+                ManifestMember {
+                    thread: lane.id.clone(),
+                    pin: None,
+                },
+                ManifestMember {
+                    thread: escalated_lane.id.clone(),
+                    pin: None,
+                },
+            ],
         },
         rejections: Some(0),
         merge: Some(MergeIntent {
@@ -669,11 +717,34 @@ fn evaluator_uses_finished_lane_and_round_outcomes_without_labels() {
     .unwrap();
 
     let result = routing::evaluate(&world.ctx(), &project).unwrap();
-    assert_eq!(result.finished_lanes, 1);
+    assert_eq!(result.finished_lanes, 2);
     assert_eq!(result.observed_good_enough, 1);
+    assert_eq!(result.observed_not_good_enough, 1);
     assert_eq!(result.policy_confirmed_good, 1);
-    assert_eq!(result.confidence_clear, 1);
-    assert_eq!(result.outcomes[0]["model_run"], "test_claude");
+    assert_eq!(result.policy_confirmed_bad, 1);
+    assert_eq!(result.confidence_clear, 2);
+    let escalated = result
+        .outcomes
+        .iter()
+        .find(|outcome| outcome["thread"] == escalated_lane.id)
+        .unwrap();
+    assert_eq!(escalated["model_run"], "test_claude");
+    assert_eq!(escalated["final_model"], "test_strong");
+    assert_eq!(escalated["failure"], "the first run failed");
+    assert_eq!(escalated["policy_result"], "confirmed-bad");
+
+    let mut pending = round;
+    pending.phase = RoundPhase::UnderReview;
+    pending.merge = None;
+    std::fs::write(
+        crate::round::round_path(&project, "r1"),
+        toml::to_string(&pending).unwrap(),
+    )
+    .unwrap();
+    let pending_result = routing::evaluate(&world.ctx(), &project).unwrap();
+    assert_eq!(pending_result.no_round_outcome, 2);
+    assert_eq!(pending_result.observed_not_good_enough, 0);
+    assert_eq!(pending_result.policy_confirmed_bad, 0);
     assert_eq!(world.runner.count("/usr/bin/curl"), 0);
 }
 
@@ -801,6 +872,18 @@ fn timeout_is_reported_as_a_timeout_not_a_server_or_transport_failure() {
         assert!(!error.contains("jev_server_refused"), "{error}");
         assert!(!error.contains("jev_transport"), "{error}");
     }
+}
+
+#[test]
+fn a_policy_cannot_route_to_a_model_below_the_required_index() {
+    let (world, _) = setup();
+    edit_policy(&world, |policy| {
+        policy["models"]["test_strong"]["coding_index"] = json!(77.1);
+    });
+    let error = routing::Policy::read(&world.home.path().join("cfg/routing.json"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cover every index value"), "{error}");
 }
 
 #[test]

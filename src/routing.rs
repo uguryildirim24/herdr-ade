@@ -139,6 +139,21 @@ impl Policy {
         if self.models.values().any(|m| !tiers.insert(m.tier)) {
             bail!("routing_policy_invalid: model capability tiers must be unique");
         }
+        let mut capabilities: Vec<(u32, f64)> = self
+            .models
+            .values()
+            .map(|model| (model.tier, model.coding_index))
+            .collect();
+        capabilities.sort_by_key(|(tier, _)| *tier);
+        if !capabilities.windows(2).all(|pair| pair[0].1 <= pair[1].1)
+            || capabilities
+                .last()
+                .is_none_or(|(_, index)| *index < *self.index_values.last().expect("index values"))
+        {
+            bail!(
+                "routing_policy_invalid: capability tiers must increase by Coding Index and cover every index value"
+            );
+        }
         for (hash, recipe) in &self.pins {
             if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) || recipe.is_empty()
             {
@@ -276,13 +291,6 @@ impl Policy {
                     .then_with(|| a_id.cmp(b_id))
             })
             .map(|(id, _)| id.clone())
-            .or_else(|| {
-                self.models
-                    .iter()
-                    .filter(|(_, card)| card.tier >= min_tier)
-                    .max_by(|a, b| a.1.coding_index.total_cmp(&b.1.coding_index))
-                    .map(|(id, _)| id.clone())
-            })
             .context("routing_model_missing: no model satisfies the required index and tier")
     }
 
@@ -430,15 +438,27 @@ pub fn evaluate(ctx: &crate::paths::Ctx, project: &crate::project::Project) -> R
     policy.validate_recipes(&config.recipes)?;
     let ledger = read_dispatch_ledger(project)?;
     let events = crate::round::sealed_events(project)?;
-    let rounds = crate::round::list(project);
+    let rounds = crate::round::checked_list(project)?;
+    let finished_ids: BTreeSet<&str> = events
+        .iter()
+        .filter(|event| event.payload.done.is_some())
+        .map(|event| event.thread.as_str())
+        .collect();
     let mut result = Evaluation::default();
 
-    for thread in crate::thread::list(project) {
+    for id in finished_ids {
+        let thread = crate::thread::load(project, id)?;
         let Some(done) = events
             .iter()
-            .filter(|event| event.thread == thread.id && event.payload.done.is_some())
+            .filter(|event| {
+                event.thread == thread.id
+                    && event.attempt == thread.attempt.max(1)
+                    && event.payload.done.is_some()
+            })
             .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
         else {
+            // A completion from an older attempt does not make the current
+            // attempt a finished run.
             continue;
         };
         result.finished_lanes += 1;
@@ -453,9 +473,15 @@ pub fn evaluate(ctx: &crate::paths::Ctx, project: &crate::project::Project) -> R
                 })
             });
         let merged_without_reject = carrying_round.and_then(|round| {
-            round.rejections.map(|rejections| {
-                round.phase == crate::contracts::RoundPhase::Merged && rejections == 0
-            })
+            let rejections = round.rejections?;
+            if rejections > 0 {
+                return Some(false);
+            }
+            match round.phase {
+                crate::contracts::RoundPhase::Merged => Some(true),
+                crate::contracts::RoundPhase::Abandoned => Some(false),
+                _ => None,
+            }
         });
         let escalated = thread.launch.escalations > 0;
         let observed_good = merged_without_reject == Some(true) && !escalated;
@@ -472,11 +498,32 @@ pub fn evaluate(ctx: &crate::paths::Ctx, project: &crate::project::Project) -> R
         } else {
             thread.launch.brief_hash.clone()
         };
+        // Replay the first pick, not the final launch after a failure. The
+        // first pick is the policy decision whose later escalation is outcome
+        // evidence; calling the successful replacement "bad" would invert it.
+        let first_escalation = escalated
+            .then(|| {
+                ledger.iter().rev().find(|row| {
+                    row["brief_hash"] == brief_hash && row["escalations"].as_u64() == Some(1)
+                })
+            })
+            .flatten();
+        let initial_recipe = first_escalation
+            .and_then(|row| row.pointer("/previous/recipe"))
+            .and_then(Value::as_str)
+            .unwrap_or(&thread.launch.recipe_id);
         let dispatch = ledger.iter().rev().find(|row| {
             row["brief_hash"] == brief_hash
-                && row["recipe"] == thread.launch.recipe_id
-                && row["escalations"].as_u64() == Some(thread.launch.escalations as u64)
+                && row["recipe"] == initial_recipe
+                && row["escalations"].as_u64() == Some(0)
         });
+        let model_run = dispatch
+            .and_then(|row| row.get("recipe"))
+            .and_then(Value::as_str)
+            .unwrap_or(initial_recipe);
+        let failure = first_escalation
+            .and_then(|row| row.get("failure"))
+            .filter(|value| !value.is_null());
         let assessment: Option<Assessment> = dispatch
             .and_then(|row| row.get("assessment"))
             .filter(|value| !value.is_null())
@@ -495,14 +542,15 @@ pub fn evaluate(ctx: &crate::paths::Ctx, project: &crate::project::Project) -> R
             }
         }
         let policy_result = match decision.as_ref() {
-            Some(d) if d.recipe == thread.launch.recipe_id && observed_good => {
+            Some(d) if d.recipe == model_run && observed_good => {
                 result.policy_confirmed_good += 1;
                 "confirmed-good"
             }
-            Some(d) if d.recipe == thread.launch.recipe_id => {
+            Some(d) if d.recipe == model_run && merged_without_reject.is_some() => {
                 result.policy_confirmed_bad += 1;
                 "confirmed-bad"
             }
+            Some(d) if d.recipe == model_run => "not-scored",
             Some(_) => {
                 result.policy_untried += 1;
                 "untried"
@@ -511,10 +559,11 @@ pub fn evaluate(ctx: &crate::paths::Ctx, project: &crate::project::Project) -> R
         };
         result.outcomes.push(json!({
             "thread": thread.id,
-            "model_run": thread.launch.recipe_id,
-            "price_per_million": policy.models.get(&thread.launch.recipe_id).map(|m| m.price_per_million),
+            "model_run": model_run,
+            "final_model": thread.launch.recipe_id,
+            "price_per_million": policy.models.get(model_run).map(|m| m.price_per_million),
             "escalated": escalated,
-            "failure": dispatch.and_then(|row| row.get("failure")).filter(|v| !v.is_null()),
+            "failure": failure,
             "round": carrying_round.map(|round| &round.round),
             "merged_without_reject": merged_without_reject,
             "saved_assessment": assessment,
