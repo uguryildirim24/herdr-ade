@@ -1898,14 +1898,14 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
     Ok(())
 }
 
-/// The rounds whose manifest includes `thread`: its carrying rounds. This is
-/// durable membership, never inferred from branch names or commits
-/// (SPEC-talk §6.5).
+/// The rounds that currently carry `thread`. The durable manifest is the
+/// authority, never branch names or commits; an abandoned round releases all
+/// of its members (SPEC-talk §6.5).
 pub fn carrying_rounds(project: &Project, thread: &str) -> Vec<String> {
     crate::round::list(project)
         .into_iter()
-        .filter(|r| r.manifest.members.iter().any(|m| m.thread == thread))
-        .map(|r| r.round)
+        .filter(|round| round.carries(thread))
+        .map(|round| round.round)
         .collect()
 }
 

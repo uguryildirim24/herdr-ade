@@ -337,10 +337,8 @@ impl Overview {
             records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));
         let mut seen_work = BTreeSet::new();
         for t in tasks {
-            let carrying: Vec<&crate::contracts::RoundRecord> = rounds
-                .iter()
-                .filter(|r| r.manifest.members.iter().any(|m| m.thread == t.id))
-                .collect();
+            let carrying: Vec<&crate::contracts::RoundRecord> =
+                rounds.iter().filter(|round| round.carries(&t.id)).collect();
             if !carrying.is_empty()
                 && carrying
                     .iter()
@@ -348,8 +346,7 @@ impl Overview {
             {
                 continue;
             }
-            // An abandoned round never lands, so a handed-in lane it held is no
-            // longer running; a closed round cannot keep a pin pending.
+            // A closed round cannot keep a pin pending.
             let pending_pin = carrying.iter().any(|r| {
                 !threads::round_landed(project, &r.round)
                     && !r.phase.closed()
