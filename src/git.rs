@@ -115,6 +115,7 @@ pub(crate) fn worktree_status_with_ignored(
             "--porcelain",
             "--ignored",
             "--untracked-files=all",
+            "-z",
         ],
         GIT_TIMEOUT,
     )

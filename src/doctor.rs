@@ -810,6 +810,7 @@ fn finished_worktrees(
             continue;
         }
         match crate::threads::inspect_worktree_for_removal(ctx, &thread) {
+            Ok(inspection) if !inspection.dirty.is_empty() => leftovers.push(path.clone()),
             Ok(inspection) if !inspection.ignored_data.is_empty() => data_kept.push(format!(
                 "{} ({})",
                 path,
