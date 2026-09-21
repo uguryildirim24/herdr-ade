@@ -34,10 +34,10 @@ pub const MAX_REVIEWER_START_FAILURES: u32 = 3;
 pub const REVIEW_TASK_BYTE_CAP: usize = 128 * 1024;
 
 /// A bound reviewer with no launch attempt is a failed start once this many
-/// seconds have passed since its record was written. The ticker starts at
-/// most one thread per project per 15s pass, so a reviewer may wait behind a
-/// few lanes; this covers that without mistaking a slow start for a dead one.
-const REVIEWER_LAUNCH_GRACE_SECS: i64 = 120;
+/// seconds have passed since its record was written. The box is polled once
+/// a minute and cold readiness can take minutes; this outer bound covers a
+/// loaded cloud box without mistaking a slow start for a dead one.
+const REVIEWER_LAUNCH_GRACE_SECS: i64 = 600;
 
 /// Git reads for rounds, dialogue and checkpoint. Every lock and ref write
 /// goes through A1's `crate::git`: one repository lock, one D9 commit.
@@ -1588,6 +1588,12 @@ fn reviewer_start_failed(
     reason: &str,
     dead_reviewer: Option<&str>,
 ) -> Result<u32> {
+    // Do not unbind until the failed attempt is closed. If cleanup fails the
+    // next pass retries this same binding instead of starting a second live
+    // reviewer beside it.
+    if let Some(dead) = dead_reviewer {
+        crate::threads::fail_start(ctx, project, dead, reason)?;
+    }
     let failures = {
         let _lock = project.lock()?;
         let mut record = load(project, round)?;
@@ -1600,13 +1606,6 @@ fn reviewer_start_failed(
         save(project, &record)?;
         record.reviewer_start_failures
     };
-    if let Some(dead) = dead_reviewer {
-        let _ = thread::update(project, dead, |t| {
-            t.status = thread::Status::Failed;
-            t.prompt_pending = false;
-            t.error = reason.to_string();
-        });
-    }
     crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
     announce_once(
@@ -4755,6 +4754,11 @@ mod tests {
             "the dead thread is failed"
         );
         assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        assert_eq!(
+            fx.world.runner.count("tab close w1:t2"),
+            1,
+            "the failed reviewer's tab is closed before a retry"
+        );
         let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
             .unwrap()
             .0;
@@ -4765,6 +4769,31 @@ mod tests {
         let retried = load(&fx.project, "r1").unwrap();
         let second = retried.reviewer.clone().expect("a fresh reviewer is bound");
         assert_ne!(second, first, "a new reviewer replaces the dead one");
+    }
+
+    /// A queued reviewer may take several minutes to reach its first launch
+    /// event on the cloud box. It remains bound inside the measured outer
+    /// grace instead of being replaced by a duplicate.
+    #[test]
+    fn advance_keeps_a_slow_reviewer_start_inside_the_outer_bound() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        let (_, _) = reviewed(&fx);
+        advance(&ctx, "demo").unwrap();
+        let first = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        thread::update(&fx.project, &first, |t| {
+            t.launch_attempts = 0;
+            t.prompt_pending = true;
+            t.created = (jiff::Timestamp::now() - jiff::SignedDuration::from_mins(3)).to_string();
+        })
+        .unwrap();
+
+        advance(&ctx, "demo").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.reviewer.as_deref(), Some(first.as_str()));
+        assert_eq!(record.reviewer_start_failures, 0);
+        assert_eq!(fx.world.runner.count("tab close w1:t2"), 0);
     }
 
     /// Once the retry bound is reached, `advance` stops starting reviewers and

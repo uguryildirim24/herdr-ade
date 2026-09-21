@@ -334,12 +334,12 @@ fn start_with_ticker(
             Ok(thread)
         }
         Err(error) => {
-            // Nothing is cleaned up automatically; `thread restart` retries.
             let message = format!("{error:#}");
-            let _ = thread::update(&project, &id, |t| {
-                t.status = Status::Failed;
-                t.error = message.clone();
-            });
+            let cleanup = fail_start(ctx, &project, &id, &message);
+            let error = match cleanup {
+                Ok(_) => error,
+                Err(cleanup) => error.context(format!("failed-start cleanup: {cleanup:#}")),
+            };
             Err(error.context(format!(
                 "thread {id} failed to start; `thread restart {slug} {id}` retries"
             )))
@@ -715,12 +715,43 @@ fn place_box_worktree(
         &record.machine,
         &spec,
     );
-    let created = herdr
-        .workspace_create_env(Path::new(&box_worktree), &label, false, &env)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    herdr
-        .tab_rename(&created.tab_id, &record.id)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // One project owns one workspace on this machine. Starts can provision
+    // repositories independently, but find-or-create is serialized so two
+    // simultaneous lanes cannot both observe "missing" and create duplicates.
+    let _workspace_lock = project::remote_workspace_lock(&ctx.root, &project.slug, &profile.id)?;
+    let matching: Vec<_> = herdr
+        .workspace_list()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .into_iter()
+        .filter(|workspace| workspace.label == label)
+        .collect();
+    if matching.len() > 1 {
+        bail!(
+            "remote_workspace_duplicate: machine `{}` has {} workspaces labelled `{label}`",
+            record.machine,
+            matching.len()
+        );
+    }
+    let (created, first_tab) = match matching.first() {
+        Some(workspace) => (
+            herdr
+                .tab_create_env(
+                    &workspace.workspace_id,
+                    Path::new(&box_worktree),
+                    &record.id,
+                    false,
+                    &env,
+                )
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+            false,
+        ),
+        None => (
+            herdr
+                .workspace_create_env(Path::new(&box_worktree), &label, false, &env)
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+            true,
+        ),
+    };
     let cwd = herdr
         .pane_cwd(&created.pane_id)
         .unwrap_or_else(|_| box_worktree.clone());
@@ -729,6 +760,20 @@ fn place_box_worktree(
     } else {
         cwd
     };
+    // Persist ownership before any later call can fail. Failed-start cleanup
+    // can now close this exact workspace instead of leaking an unrecorded one.
+    thread::update(project, &record.id, |t| {
+        t.cwd = cwd.clone();
+        t.workspace_id = created.workspace_id.clone();
+        t.tab_id = created.tab_id.clone();
+        t.pane_id = created.pane_id.clone();
+        t.partial = Some("lane_card".into());
+    })?;
+    if first_tab {
+        herdr
+            .tab_rename(&created.tab_id, &record.id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     // The box lane nests under its coordinator from its first second: the
     // machine-qualified parent token is written before the ticker starts the
@@ -1465,6 +1510,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     } else {
         close_pane(ctx, &project, &resolved)?
     };
+    remove_scratch_session(ctx, &resolved)?;
     println!("{id} resolved.");
     if args.keep_pane {
         println!(
@@ -1503,6 +1549,81 @@ pub fn refresh_plan(ctx: &Ctx, project: &Project) {
     if let Err(e) = crate::plan::refresh(ctx, project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
+}
+
+/// Deletes a lane's isolated throwaway session if it exists. Scratch work is
+/// never hosted in the watched project session, locally or on a lane machine.
+pub(crate) fn remove_scratch_session(ctx: &Ctx, record: &Thread) -> Result<()> {
+    let name = format!("scratch-{}", record.id);
+    let bin = ctx.env.herdr_bin();
+    if !record.is_remote() {
+        let sessions = crate::herdr::session_list(&bin, ctx.runner)?;
+        let Some(session) = sessions.iter().find(|session| session.name == name) else {
+            return Ok(());
+        };
+        if session.running {
+            let out = ctx.runner.run(
+                &Cmd::new(&bin, Duration::from_secs(20)).args(["session", "stop", &name, "--json"]),
+            )?;
+            if !out.success() {
+                bail!(
+                    "could not stop scratch session {name}: {}",
+                    out.error_text()
+                );
+            }
+        }
+        let out = ctx.runner.run(
+            &Cmd::new(&bin, Duration::from_secs(20)).args(["session", "delete", &name, "--json"]),
+        )?;
+        if !out.success() {
+            bail!(
+                "could not delete scratch session {name}: {}",
+                out.error_text()
+            );
+        }
+        return Ok(());
+    }
+
+    let profile =
+        remote::machine_profile(ctx.runner, &bin, &ctx.config_dir, record.machine_route())?;
+    let quoted = remote::quote(&name);
+    let script = format!(
+        "state=$(herdr session list --json | python3 -c 'import json,sys; n=sys.argv[1]; rows=json.load(sys.stdin).get(\"sessions\",[]); r=next((r for r in rows if r.get(\"name\")==n),None); print(\"missing\" if r is None else (\"running\" if r.get(\"running\") else \"stopped\"))' {quoted}); case \"$state\" in running) herdr session stop {quoted} --json >/dev/null; herdr session delete {quoted} --json >/dev/null;; stopped) herdr session delete {quoted} --json >/dev/null;; missing) :;; *) exit 1;; esac"
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        Duration::from_secs(30),
+    )?;
+    if !out.success() {
+        bail!(
+            "could not delete scratch session {name} on {}: {}",
+            record.machine,
+            out.error_text()
+        );
+    }
+    Ok(())
+}
+
+/// Marks a start failed, removes its Working metadata, and closes everything
+/// the attempt opened. The failed state is durable even when cleanup itself
+/// reports an error, so no view can keep presenting the attempt as Working.
+pub(crate) fn fail_start(ctx: &Ctx, project: &Project, id: &str, reason: &str) -> Result<Thread> {
+    let failed = thread::update(project, id, |t| {
+        t.status = Status::Failed;
+        t.prompt_pending = false;
+        t.error = reason.to_string();
+        t.last_group = Group::WaitingOnYou.token().to_string();
+    })?;
+    if !failed.tab_id.is_empty() {
+        let view = session_view(ctx, project)
+            .context("failed-start cleanup could not reach the session; the attempt stays bound")?;
+        clear_thread_tokens(&view.herdr, &failed);
+    }
+    close_pane(ctx, project, &failed)?;
+    Ok(failed)
 }
 
 /// Close the thread's pane and tab. A dedicated lane workspace is closed as
@@ -1816,12 +1937,9 @@ pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
 }
 
 fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
-    // Before the first poll a thread that is waiting for its launch is Working.
-    let recorded = Group::from_token(&t.last_group).unwrap_or(if t.prompt_pending {
-        Group::Working
-    } else {
-        Group::Idle
-    });
+    // Remote records use their last poll, except that durable lifecycle state
+    // wins: in particular a failed start can never remain Working.
+    let recorded = thread::recorded_group(t, now);
     if t.status == Status::Resolved {
         return Row {
             thread: t.clone(),
@@ -2569,15 +2687,30 @@ mod tests {
             "agent start --help",
             ok("      --kind <KIND>\n          [possible values: pi, claude, cursor, agy]\n"),
         );
-        fx.world.runner.on(
-            "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#),
+        let workspace_exists = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = workspace_exists.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("workspace list"),
+            move |_| {
+                Ok(ok(if seen.get() {
+                    r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"Demo"}]}}"#
+                } else {
+                    r#"{"result":{"workspaces":[]}}"#
+                }))
+            },
+        );
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("workspace create"),
+            move |_| {
+                workspace_exists.set(true);
+                Ok(ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#))
+            },
         );
         fx.world.runner.on("tab rename", ok(r#"{"result":{}}"#));
         // Local fallbacks still create a tab in the coordinator workspace.
         fx.world.runner.on(
             "tab create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#),
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","cwd":"/box/wt"}}}"#),
         );
         // `provision` verifies the fetched commit is the one the Mac pushed:
         // answer with the base the script names. The card write needs nothing.
@@ -2652,7 +2785,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_on_a_box_repo_lands_on_the_dispatch_machine() {
+    fn box_lanes_share_one_project_workspace_and_take_separate_tabs() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, LANE_CONFIG);
         stub_box(&fx);
@@ -2673,6 +2806,13 @@ mod tests {
             say_lines(&fx.project).is_empty(),
             "a box start says nothing"
         );
+        let second = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert_eq!(second.workspace_id, started.workspace_id);
         let calls = fx.world.runner.calls.borrow();
         assert_eq!(
             calls
@@ -2684,6 +2824,7 @@ mod tests {
         assert!(calls.iter().any(|call| {
             let line = call.display();
             line.contains("workspace create")
+                && line.contains("--label Demo")
                 && line.contains(&format!("HERDR_ADE_LAUNCH=demo/{}/1/", started.id))
                 && line.contains(&format!("--cwd {}", started.worktree_path))
         }));
@@ -2696,8 +2837,8 @@ mod tests {
                 .iter()
                 .filter(|call| call.display().contains("tab create"))
                 .count(),
-            0,
-            "the workspace's first tab is the lane"
+            1,
+            "only the later lane adds a tab to the shared workspace"
         );
     }
 

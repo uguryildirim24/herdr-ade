@@ -24,7 +24,7 @@ const READY_TIMEOUT_MS: u64 = 120_000;
 /// rollout. A trust prompt never creates one, so a missing rollout means the
 /// lane is not usable. The wait ends on an event; this is only the outer
 /// bound so nothing hangs forever.
-const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(180);
+const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The rollout poll interval.
 const ROLLOUT_POLL: Duration = Duration::from_millis(250);
@@ -445,20 +445,20 @@ pub(crate) fn start(
         Ok(agent) => agent,
         Err(error) => {
             let error = blocked_reason(runner, &bin, &pane.pane_id, error);
-            let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+            close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
             return Err(error);
         }
     };
     if agent.blocked() {
         let reason = screen_reason(runner, &bin, &pane.pane_id);
-        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
         bail!(
             "WAITING pro-bridge the lane is blocked in pane {}: {reason}",
             pane.pane_id
         );
     }
     if trust_prompt_showing(runner, &bin, &pane.pane_id) {
-        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
         bail!(
             "WAITING pro-bridge `{cwd_text}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory in {} once, then start again (never press through the prompt)",
             pane.pane_id,
@@ -491,7 +491,7 @@ pub(crate) fn start(
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
             RolloutWait::Ready => {}
             RolloutWait::TrustPrompt => {
-                let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge `{}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory in {} once, then start again (never press through the prompt)",
                     lane.cwd,
@@ -500,14 +500,14 @@ pub(crate) fn start(
                 );
             }
             RolloutWait::Blocked(reason) => {
-                let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge the lane is blocked in pane {}: {reason}",
                     pane.pane_id
                 );
             }
             RolloutWait::Gone => {
-                let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge the lane's Codex agent died in pane {}",
                     pane.pane_id
@@ -515,7 +515,7 @@ pub(crate) fn start(
             }
             RolloutWait::TimedOut => {
                 let reason = screen_reason(runner, &bin, &pane.pane_id);
-                let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge the lane has no Codex rollout after {}s in pane {}: {reason}",
                     timeout.as_secs(),
@@ -525,10 +525,33 @@ pub(crate) fn start(
         }
     }
     if let Err(error) = lane.write(layout) {
-        let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+        close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
         return Err(error);
     }
     Ok(lane)
+}
+
+/// Close a start that will be reported as failed. A close refusal is checked
+/// against the pane process so the caller never describes a still-running
+/// Codex lane as gone.
+fn close_failed_start(runner: &dyn Runner, bin: &str, pane: &str, tab: &str) -> Result<()> {
+    let closed = herdr_cli::tab_close(runner, bin, tab);
+    let process_still_runs = herdr_cli::process_info(runner, bin, pane)
+        .map(|info| info.runs("codex"))
+        .unwrap_or(false);
+    let agent_still_runs = herdr_cli::agent_list(runner, bin)
+        .map(|agents| {
+            agents
+                .iter()
+                .any(|agent| agent.pane_id == pane && agent.agent == "codex")
+        })
+        .unwrap_or(false);
+    if process_still_runs || agent_still_runs {
+        bail!(
+            "failed_start_live: pane {pane} still runs Codex; the lane remains live and is not gone"
+        );
+    }
+    closed.with_context(|| format!("could not close failed lane tab {tab}"))
 }
 
 fn blocked_reason(
@@ -615,20 +638,20 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
         Ok(agent) => agent,
         Err(error) => {
             let error = blocked_reason(runner, &bin, &pane.pane_id, error);
-            let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+            close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
             return Err(error);
         }
     };
     if agent.blocked() {
         let reason = screen_reason(runner, &bin, &pane.pane_id);
-        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
         bail!(
             "WAITING pro-bridge the resumed lane is blocked in pane {}: {reason}",
             pane.pane_id
         );
     }
     if trust_prompt_showing(runner, &bin, &pane.pane_id) {
-        let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
+        close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
         bail!(
             "WAITING pro-bridge `{}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory once, then resume",
             lane.cwd,
@@ -646,7 +669,7 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
             RolloutWait::Ready => {}
             RolloutWait::TrustPrompt => {
-                let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge `{}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory once, then resume",
                     lane.cwd,
@@ -654,14 +677,14 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
                 );
             }
             RolloutWait::Blocked(reason) => {
-                let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge the resumed lane is blocked in pane {}: {reason}",
                     lane.pane_id
                 );
             }
             RolloutWait::Gone => {
-                let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge the resumed lane's Codex agent died in pane {}",
                     lane.pane_id
@@ -669,7 +692,7 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
             }
             RolloutWait::TimedOut => {
                 let reason = screen_reason(runner, &bin, &lane.pane_id);
-                let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
                 bail!(
                     "WAITING pro-bridge the resumed lane has no Codex rollout after {}s in pane {}: {reason}",
                     timeout.as_secs(),
@@ -679,7 +702,7 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
         }
     }
     if let Err(error) = lane.write(layout) {
-        let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
+        close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
         return Err(error);
     }
     Ok(lane)
@@ -1016,7 +1039,7 @@ mod tests {
 
     #[test]
     fn the_outer_bound_still_fails_without_a_rollout() {
-        assert_eq!(ROLLOUT_TIMEOUT, Duration::from_secs(180));
+        assert_eq!(ROLLOUT_TIMEOUT, Duration::from_secs(600));
         let dir = tempfile::tempdir().unwrap();
         let (env, _layout) = test_env(dir.path());
         let mut lane = test_lane(dir.path());
@@ -1031,6 +1054,19 @@ mod tests {
         let outcome = wait_for_rollout(&env, &mut lane, &runner, "/h/herdr", bound, &clock);
         assert!(matches!(outcome, RolloutWait::TimedOut));
         assert!(clock.elapsed() >= bound, "{:?}", clock.elapsed());
+    }
+
+    #[test]
+    fn failed_start_does_not_call_a_still_running_codex_pane_gone() {
+        let runner = FakeRunner::new();
+        runner.on("tab close", fail(1, "close refused"));
+        runner.on(
+            "pane process-info",
+            ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"codex"}]}}}"#),
+        );
+        let error = close_failed_start(&runner, "/h/herdr", "w1:p2", "w1:t2").unwrap_err();
+        assert!(error.to_string().contains("still runs Codex"), "{error}");
+        assert!(error.to_string().contains("not gone"), "{error}");
     }
 
     #[test]
@@ -1174,6 +1210,7 @@ mod tests {
             |_| Ok(fail(1, "timed out waiting for ready")),
         );
         runner.on("pane read", ok("Sign in with ChatGPT\n"));
+        runner.on("tab close", ok(r#"{"result":{}}"#));
         let error = start(
             &env,
             &layout,

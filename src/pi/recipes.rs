@@ -9,6 +9,9 @@ use anyhow::Result;
 
 use super::launch;
 
+/// Herdr's event wait outer bound for a cold pi process on the cloud box.
+const PI_READY_TIMEOUT_MS: u64 = 300_000;
+
 /// One ready-made recipe row. Fields line up with `Recipe` plus
 /// `model_family` and the D17 `plain` phrase.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +71,7 @@ fn recipe(
         model_family: model,
         args: launch::start_args(provider, model, thinking),
         env: Vec::new(),
-        ready_timeout_ms: 30_000,
+        ready_timeout_ms: PI_READY_TIMEOUT_MS,
         enabled,
         plain,
     }
@@ -149,7 +152,7 @@ mod tests {
             row.validate().unwrap_or_else(|e| panic!("{}: {e}", row.id));
             assert_eq!(row.kind, "pi");
             assert!(row.env.is_empty());
-            assert_eq!(row.ready_timeout_ms, 30_000);
+            assert_eq!(row.ready_timeout_ms, PI_READY_TIMEOUT_MS);
             assert!(row.args.contains(&"--no-skills".to_string()));
             assert_eq!(
                 launch::flag_value(&row.args, "--provider").as_deref(),
