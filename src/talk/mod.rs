@@ -267,8 +267,41 @@ pub(crate) fn is_task_notification_prompt(text: &str) -> bool {
 /// Historical hook mistakes stay in the append-only journal but are omitted
 /// from the conversation. A pasted human message is retained; only known
 /// harness lines inside a pure paste wrapper are hidden.
+fn is_parent_status_line(text: &str) -> bool {
+    let marker = marker_text(text);
+    let mut words = marker.split_whitespace();
+    let Some(status) = words.next() else {
+        return false;
+    };
+    if !matches!(status, "BLOCKED" | "GONE") {
+        return false;
+    }
+    let Some(name) = words.next() else {
+        return false;
+    };
+    if words.next().is_some() {
+        return false;
+    }
+    let Some(rest) = name.strip_prefix("hp-") else {
+        return false;
+    };
+    let Some((slug, thread)) = rest.rsplit_once("-t-") else {
+        return false;
+    };
+    !slug.is_empty() && thread.len() >= 4 && thread.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Herdr's parent notifier keys BLOCKED/GONE by the full agent name, unlike
+/// the plugin courier's `t-NNNN` lines. They are machine input, not a request.
+pub(crate) fn mark_parent_status_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
+    if is_parent_status_line(text) {
+        mark_automated_prompt(project, pane, text)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
-    if is_task_notification_prompt(text) {
+    if is_task_notification_prompt(text) || is_parent_status_line(text) {
         return true;
     }
     let Some(text) = pasted_contents(text) else {

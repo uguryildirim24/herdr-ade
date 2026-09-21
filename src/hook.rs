@@ -417,6 +417,10 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
     if crate::talk::is_task_notification_prompt(text) {
         return Ok(None);
     }
+    // Herdr, rather than the plugin, sends parent BLOCKED/GONE lines. Mark
+    // those full-agent-name prompts through the same exact-text path used by
+    // DONE/WAITING before the hook classifies this submission.
+    crate::talk::mark_parent_status_prompt(project, pane, text)?;
     match crate::talk::take_pending_prompt(project, pane, text) {
         Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
         Some(crate::talk::PendingPrompt::Automated) => Ok(None),
@@ -756,6 +760,16 @@ mod tests {
 
         let task_notice = "<task-notification>\n<task-id>abc</task-id>\n<tool-use-id>tool</tool-use-id>\n<output-file>/tmp/task</output-file>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>";
         assert_eq!(handle_prompt(&project, "w1:p1", task_notice).unwrap(), None);
+        assert!(crate::talk::recent_requests(&project, 5).is_empty());
+
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", "GONE hp-demo-t-0162").unwrap(),
+            None
+        );
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", "BLOCKED hp-demo-t-0162").unwrap(),
+            None
+        );
         assert!(crate::talk::recent_requests(&project, 5).is_empty());
 
         let id = handle_prompt(&project, "w1:p1", "Spend five dollars on the check.")
