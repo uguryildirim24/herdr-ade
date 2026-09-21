@@ -11,12 +11,12 @@ use sha2::{Digest, Sha256};
 
 use crate::contracts::{Launch, RoleSpec};
 
-pub const MAX_SLUG: usize = 40;
-pub const BODY_WARN_CHARS: usize = 16_000;
+const MAX_SLUG: usize = 40;
+pub(crate) const BODY_WARN_CHARS: usize = 16_000;
 
 /// A slug matches `[a-z0-9][a-z0-9-]*` and is at most 40 characters. Every
 /// subcommand validates the slug it is given before building any path from it.
-pub fn validate_slug(slug: &str) -> Result<()> {
+pub(crate) fn validate_slug(slug: &str) -> Result<()> {
     let mut chars = slug.chars();
     let first_ok = chars
         .next()
@@ -32,7 +32,7 @@ pub fn validate_slug(slug: &str) -> Result<()> {
 
 /// Lower-cases and turns each run of other characters into one hyphen. Used for
 /// project names and for thread titles in branch names.
-pub fn slugify(text: &str) -> String {
+pub(crate) fn slugify(text: &str) -> String {
     let mut slug = String::new();
     for c in text.chars().flat_map(char::to_lowercase) {
         if c.is_ascii_lowercase() || c.is_ascii_digit() {
@@ -49,7 +49,7 @@ pub fn slugify(text: &str) -> String {
 }
 
 /// The slug `new` gives a project name, refusing names that look like paths.
-pub fn slug_from_name(name: &str) -> Result<String> {
+pub(crate) fn slug_from_name(name: &str) -> Result<String> {
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         bail!("a project name may not contain `/`, `\\` or `..`");
     }
@@ -64,7 +64,7 @@ pub fn slug_from_name(name: &str) -> Result<String> {
 /// Words split on `-` and `_`, each with its first letter upper-cased:
 /// `herdr-projects` becomes `Herdr Projects`. Plain title case, so `gtm-ai`
 /// becomes `Gtm Ai`; a user who wants `GTM AI` sets `name` in PROJECT.md.
-pub fn humanize(slug: &str) -> String {
+fn humanize(slug: &str) -> String {
     slug.split(['-', '_'])
         .filter(|word| !word.is_empty())
         .map(|word| {
@@ -82,7 +82,7 @@ pub fn humanize(slug: &str) -> String {
 /// a slug (lower-case letters, digits, `-` and `_` only), else the humanized
 /// form of it or of `slug`. A herdr workspace never shows a bare slug, which
 /// would read the same as a repository's own workspace.
-pub fn display_name(name: &str, slug: &str) -> String {
+pub(crate) fn display_name(name: &str, slug: &str) -> String {
     let name = name.trim();
     let base = if name.is_empty() { slug } else { name };
     let slug_like = base
@@ -97,7 +97,7 @@ pub fn display_name(name: &str, slug: &str) -> String {
 
 /// Writes through a temporary file in the same directory plus a rename. It never
 /// creates parent directories: only `new` creates a project's directories.
-pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let dir = path.parent().context("path has no parent")?;
     let name = path.file_name().context("path has no file name")?;
     let tmp = dir.join(format!(
@@ -118,7 +118,7 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     result.with_context(|| format!("could not write {}", path.display()))
 }
 
-pub fn now() -> String {
+pub(crate) fn now() -> String {
     jiff::Timestamp::now()
         .round(jiff::Unit::Second)
         .map(|t| t.to_string())
@@ -126,35 +126,35 @@ pub fn now() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct Repo {
-    pub path: String,
+pub(crate) struct Repo {
+    pub(crate) path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub machine: Option<String>,
+    pub(crate) machine: Option<String>,
     /// The box clone path for this repository (SPEC-remote §4.1). When
     /// present, the project's own row wins over the committed default map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub box_path: Option<String>,
+    pub(crate) box_path: Option<String>,
     /// The URL-matched remote the lane branch publishes to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub publish_url: Option<String>,
+    pub(crate) publish_url: Option<String>,
 }
 
 /// `PROJECT.md` front matter. `repos` is last so the TOML tables follow the
 /// plain keys when `new` serializes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct Settings {
-    pub name: String,
-    pub goal: String,
-    pub max_parallel_threads: u32,
-    pub auto_resolve_days: u32,
-    pub nudge: bool,
+pub(crate) struct Settings {
+    pub(crate) name: String,
+    pub(crate) goal: String,
+    pub(crate) max_parallel_threads: u32,
+    pub(crate) auto_resolve_days: u32,
+    pub(crate) nudge: bool,
     /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
     /// default of item 24: on for a `claude` coordinator, off otherwise
     /// (`talk::enabled`). Never written by `new`, so the default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub talk: Option<bool>,
-    pub repos: Vec<Repo>,
+    pub(crate) talk: Option<bool>,
+    pub(crate) repos: Vec<Repo>,
 }
 
 impl Default for Settings {
@@ -175,7 +175,7 @@ impl Default for Settings {
 }
 
 /// Splits `+++` TOML front matter from the body.
-pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
+fn parse_project_md(text: &str) -> Result<(Settings, String)> {
     let rest = text
         .strip_prefix("+++\n")
         .context("PROJECT.md must start with a `+++` line")?;
@@ -203,7 +203,7 @@ pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
 }
 
 /// Keys D2 removes. Present in the front-matter table, not merely defaulted.
-pub fn legacy_agent_keys(front: &str) -> Vec<String> {
+pub(crate) fn legacy_agent_keys(front: &str) -> Vec<String> {
     let Ok(value) = toml::from_str::<toml::Value>(front) else {
         return Vec::new();
     };
@@ -223,7 +223,7 @@ pub fn legacy_agent_keys(front: &str) -> Vec<String> {
 }
 
 /// Front matter between the `+++` lines.
-pub fn project_md_front(text: &str) -> Result<&str> {
+pub(crate) fn project_md_front(text: &str) -> Result<&str> {
     let rest = text
         .strip_prefix("+++\n")
         .context("PROJECT.md must start with a `+++` line")?;
@@ -237,7 +237,7 @@ pub fn project_md_front(text: &str) -> Result<&str> {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum Status {
+pub(crate) enum Status {
     #[default]
     Active,
     Paused,
@@ -263,47 +263,47 @@ struct ProjectState {
 /// The coordinator's pane and the session the project belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct Coordinator {
-    pub socket: String,
+pub(crate) struct Coordinator {
+    pub(crate) socket: String,
     /// Empty when the session was chosen by socket path alone.
-    pub session: String,
-    pub workspace_id: String,
-    pub tab_id: String,
-    pub pane_id: String,
-    pub agent_name: String,
-    pub cwd: String,
-    pub prime_pending: bool,
-    pub launch_attempts: u32,
-    pub updated: String,
+    pub(crate) session: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) agent_name: String,
+    pub(crate) cwd: String,
+    pub(crate) prime_pending: bool,
+    pub(crate) launch_attempts: u32,
+    pub(crate) updated: String,
     /// The coordinator's launch recipe from the `coordinator` role (SPEC-ADE
     /// D2), stored at `open` and reused by the ticker's relaunch. `attempt`
     /// counts coordinator tabs; `brief_hash` is the SHA-256 of `PROJECT.md`
     /// at `open`. Both reach the pane in `HERDR_ADE_LAUNCH` (D14).
-    pub launch: Launch,
+    pub(crate) launch: Launch,
     /// The priming line was submitted for this binding. Transport is not the
     /// receipt: `prime_pending` clears only on the `ha context` receipt, and
     /// the ticker never re-sends a submitted line on its own (D14).
-    pub prime_sent: bool,
+    pub(crate) prime_sent: bool,
     /// `"acknowledged"` after the matching bootstrap call (D14).
-    pub bootstrap: String,
+    pub(crate) bootstrap: String,
     /// Counts coordinator agent starts for this project and never resets:
     /// `open` and the ticker's relaunch each start a new incarnation, and a
     /// sealed event is bound to the one it was sealed for (D5 X5).
-    pub generation: u32,
+    pub(crate) generation: u32,
 }
 
 impl Coordinator {
     /// The recipient attempt events and receipts bind (D5 `coordinator_attempt`).
-    pub fn attempt(&self) -> u32 {
+    pub(crate) fn attempt(&self) -> u32 {
         self.generation.max(1)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct Safety {
-    pub start_threads: String,
-    pub routine_commands: bool,
+pub(crate) struct Safety {
+    pub(crate) start_threads: String,
+    pub(crate) routine_commands: bool,
 }
 
 impl Default for Safety {
@@ -316,25 +316,25 @@ impl Default for Safety {
 }
 
 #[derive(Debug, Clone)]
-pub struct Project {
-    pub root: PathBuf,
-    pub slug: String,
+pub(crate) struct Project {
+    pub(crate) root: PathBuf,
+    pub(crate) slug: String,
 }
 
 /// Held while reading and rewriting anything under `threads/`, `inbox/` or
 /// `.state/`. Never held across a herdr, git, gh, ssh or scp call.
-pub struct ProjectLock {
+pub(crate) struct ProjectLock {
     _file: File,
 }
 
 /// Held while a box start fetches and creates its worktree, keyed by the
 /// stable profile id and the box repository so starts for one box repository
 /// serialize (SPEC-remote §4.2 step 3).
-pub struct BoxLock {
+pub(crate) struct BoxLock {
     _file: File,
 }
 
-pub fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<BoxLock> {
+pub(crate) fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<BoxLock> {
     let dir = root.join(".locks");
     std::fs::create_dir_all(&dir)?;
     let mut hasher = Sha256::new();
@@ -359,7 +359,7 @@ pub fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<BoxLock
 
 impl Project {
     /// An existing project. Validates the slug before building any path.
-    pub fn load(root: &Path, slug: &str) -> Result<Project> {
+    pub(crate) fn load(root: &Path, slug: &str) -> Result<Project> {
         validate_slug(slug)?;
         let project = Project {
             root: root.to_path_buf(),
@@ -371,28 +371,28 @@ impl Project {
         Ok(project)
     }
 
-    pub fn dir(&self) -> PathBuf {
+    pub(crate) fn dir(&self) -> PathBuf {
         self.root.join(&self.slug)
     }
 
-    pub fn project_md(&self) -> PathBuf {
+    pub(crate) fn project_md(&self) -> PathBuf {
         self.dir().join("PROJECT.md")
     }
 
-    pub fn state_dir(&self) -> PathBuf {
+    pub(crate) fn state_dir(&self) -> PathBuf {
         self.dir().join(".state")
     }
 
     /// The canonical folder (symlinks resolved): the key of the project's
     /// `[safety]` table and of its routine approvals.
-    pub fn canonical_dir(&self) -> PathBuf {
+    pub(crate) fn canonical_dir(&self) -> PathBuf {
         std::fs::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
     }
 
     /// Takes the per-project lock. The lock file is opened without creating
     /// parent directories, and the project is re-checked afterwards, so a
     /// `delete` that lands mid-operation cannot be resurrected by a writer.
-    pub fn lock(&self) -> Result<ProjectLock> {
+    pub(crate) fn lock(&self) -> Result<ProjectLock> {
         let path = self.state_dir().join("lock");
         let file = File::options()
             .create(true)
@@ -407,19 +407,19 @@ impl Project {
         Ok(ProjectLock { _file: file })
     }
 
-    pub fn read_project_md(&self) -> Result<(Settings, String)> {
+    pub(crate) fn read_project_md(&self) -> Result<(Settings, String)> {
         let text = std::fs::read_to_string(self.project_md())
             .with_context(|| format!("could not read {}", self.project_md().display()))?;
         parse_project_md(&text)
     }
 
-    pub fn status(&self) -> Status {
+    pub(crate) fn status(&self) -> Status {
         read_json::<ProjectState>(&self.state_dir().join("project.json"))
             .unwrap_or_default()
             .status
     }
 
-    pub fn set_status(&self, status: Status) -> Result<()> {
+    pub(crate) fn set_status(&self, status: Status) -> Result<()> {
         let _lock = self.lock()?;
         write_json(
             &self.state_dir().join("project.json"),
@@ -427,13 +427,16 @@ impl Project {
         )
     }
 
-    pub fn coordinator(&self) -> Option<Coordinator> {
+    pub(crate) fn coordinator(&self) -> Option<Coordinator> {
         read_json(&self.state_dir().join("coordinator.json"))
     }
 
     /// Read-modify-write of `coordinator.json` under the lock: re-reads the
     /// file, lets `change` touch only the fields its step owns, writes.
-    pub fn update_coordinator(&self, change: impl FnOnce(&mut Coordinator)) -> Result<Coordinator> {
+    pub(crate) fn update_coordinator(
+        &self,
+        change: impl FnOnce(&mut Coordinator),
+    ) -> Result<Coordinator> {
         let _lock = self.lock()?;
         let mut record = self.coordinator().unwrap_or_default();
         change(&mut record);
@@ -442,14 +445,14 @@ impl Project {
         Ok(record)
     }
 
-    pub fn safety(&self, config_dir: &Path) -> Result<Safety> {
+    pub(crate) fn safety(&self, config_dir: &Path) -> Result<Safety> {
         load_safety(config_dir, &self.canonical_dir())
     }
 }
 
 /// `ha machine hold <machine>`: new box starts are held until released
 /// (SPEC-remote §2.4). The marker lives under the ADE root, not on the box.
-pub fn machine_hold(root: &Path, machine: &str) -> Result<PathBuf> {
+pub(crate) fn machine_hold(root: &Path, machine: &str) -> Result<PathBuf> {
     let path = machine_hold_path(root, machine)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -459,12 +462,12 @@ pub fn machine_hold(root: &Path, machine: &str) -> Result<PathBuf> {
 }
 
 /// Removes the hold. Returns whether one was present.
-pub fn machine_release(root: &Path, machine: &str) -> Result<bool> {
+pub(crate) fn machine_release(root: &Path, machine: &str) -> Result<bool> {
     let path = machine_hold_path(root, machine)?;
     Ok(std::fs::remove_file(&path).is_ok())
 }
 
-pub fn machine_held(root: &Path, machine: &str) -> bool {
+pub(crate) fn machine_held(root: &Path, machine: &str) -> bool {
     machine_hold_path(root, machine).is_ok_and(|path| path.exists())
 }
 
@@ -479,12 +482,12 @@ fn machine_hold_path(root: &Path, machine: &str) -> Result<PathBuf> {
     Ok(root.join(".machines").join(format!("{machine}.hold")))
 }
 
-pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut text = serde_json::to_string_pretty(value)?;
     text.push('\n');
     write_atomic(path, text.as_bytes())
@@ -492,7 +495,7 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// The effective safety settings: `[safety."<canonical project path>"]` in
 /// `<config_dir>/config.toml`, with defaults for an absent table or key.
-pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
+fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
     #[derive(Deserialize, Default)]
     struct Config {
         #[serde(default)]
@@ -519,7 +522,7 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
 }
 
 /// SHA-256 of executable settings, routing policy and standing rules.
-pub fn policy_hash(config_dir: &Path) -> String {
+pub(crate) fn policy_hash(config_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(std::fs::read(config_dir.join("config.toml")).unwrap_or_default());
     hasher.update(std::fs::read(config_dir.join("routing.json")).unwrap_or_default());
@@ -532,7 +535,7 @@ pub fn policy_hash(config_dir: &Path) -> String {
 }
 
 /// Launch recipe stored on the thread, never rebuilt from mutable settings.
-pub fn launch_recipe(
+pub(crate) fn launch_recipe(
     spec: &RoleSpec,
     attempt: u32,
     brief_hash: String,
@@ -559,7 +562,7 @@ pub fn launch_recipe(
 /// `--env` values for `tab create`, including `HERDR_ADE_LAUNCH` (SPEC-ADE D4).
 /// A box lane also gets the box PATH and its own `CARGO_TARGET_DIR`
 /// (SPEC-remote §§3.3, 4.2).
-pub fn tab_env(
+pub(crate) fn tab_env(
     slug: &str,
     thread: &str,
     attempt: u32,
@@ -607,15 +610,15 @@ pub fn tab_env(
 /// `HERDR_ADE_LAUNCH=<project>/<thread>/<attempt>/<brief hash>` (SPEC-ADE
 /// D4, D14), parsed. The thread is `coordinator` for a coordinator pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchEnv {
-    pub project: String,
-    pub thread: String,
-    pub attempt: u32,
-    pub brief_hash: String,
+pub(crate) struct LaunchEnv {
+    pub(crate) project: String,
+    pub(crate) thread: String,
+    pub(crate) attempt: u32,
+    pub(crate) brief_hash: String,
 }
 
 impl LaunchEnv {
-    pub fn parse(value: &str) -> Option<LaunchEnv> {
+    pub(crate) fn parse(value: &str) -> Option<LaunchEnv> {
         let mut parts = value.trim().split('/');
         let project = parts.next()?.to_string();
         let thread = parts.next()?.to_string();
@@ -637,7 +640,7 @@ impl LaunchEnv {
     }
 
     /// The pane's own value, `None` when unset or malformed.
-    pub fn from_process() -> Option<LaunchEnv> {
+    pub(crate) fn from_process() -> Option<LaunchEnv> {
         std::env::var("HERDR_ADE_LAUNCH")
             .ok()
             .and_then(|value| LaunchEnv::parse(&value))
@@ -646,7 +649,7 @@ impl LaunchEnv {
 
 /// Slugs of the projects in `root`: folders that contain `PROJECT.md`. Entries
 /// whose names start with a dot are ignored. A missing root has no projects.
-pub fn list_slugs(root: &Path) -> Vec<String> {
+pub(crate) fn list_slugs(root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -661,7 +664,7 @@ pub fn list_slugs(root: &Path) -> Vec<String> {
 }
 
 /// `PATH[@MACHINE]` as given to `new --repo`.
-pub fn parse_repo_arg(arg: &str) -> Repo {
+pub(crate) fn parse_repo_arg(arg: &str) -> Repo {
     if let Some((path, machine)) = arg.rsplit_once('@') {
         let label_like = !machine.is_empty()
             && machine
@@ -700,7 +703,7 @@ notification instead.
 
 /// Creates the folder and skeleton files. The only code path that creates a
 /// project's directories. Fails if the slug exists.
-pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
+pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
     let slug = slug_from_name(name)?;
     let project = Project {
         root: root.to_path_buf(),

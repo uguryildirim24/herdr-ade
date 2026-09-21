@@ -27,17 +27,22 @@ const POLL: Duration = Duration::from_millis(500);
 const NOTIFY_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
-pub struct TurnOptions {
-    pub lane: String,
-    pub brief: PathBuf,
-    pub out: PathBuf,
-    pub notify: String,
-    pub attachments: Vec<PathBuf>,
-    pub id: Option<String>,
+pub(crate) struct TurnOptions {
+    pub(crate) lane: String,
+    pub(crate) brief: PathBuf,
+    pub(crate) out: PathBuf,
+    pub(crate) notify: String,
+    pub(crate) attachments: Vec<PathBuf>,
+    pub(crate) id: Option<String>,
 }
 
 /// `herdr-pro turn`: preflight, packet, record, then a detached collector.
-pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &TurnOptions) -> Result<Turn> {
+pub(crate) fn start(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn Runner,
+    opts: &TurnOptions,
+) -> Result<Turn> {
     let turn = prepare(env, layout, runner, opts)?;
     match spawn(layout, &turn.tag) {
         Ok(()) => Ok(turn),
@@ -57,7 +62,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &TurnOptions
 
 /// Validate one turn and write the packet and the turn record. Everything that
 /// can be known up front is refused here, while the coordinator is waiting.
-pub fn prepare(
+pub(crate) fn prepare(
     env: &Env,
     layout: &Layout,
     runner: &dyn Runner,
@@ -201,7 +206,7 @@ unsafe extern "C" {
 
 /// Fork the collector, detached with null stdio so it outlives the coordinator
 /// call and pins no plugin slot.
-pub fn spawn(layout: &Layout, tag: &str) -> Result<()> {
+pub(crate) fn spawn(layout: &Layout, tag: &str) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let binary = std::env::current_exe().context("could not find this binary's own path")?;
     let mut command = Command::new(binary);
@@ -243,7 +248,7 @@ impl Drop for InflightGuard {
 }
 
 /// The detached worker (`herdr-pro collector`).
-pub fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Result<()> {
+pub(crate) fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Result<()> {
     let result = collect_inner(env, layout, runner, tag);
     if let Err(error) = result {
         if let Ok(mut turn) = Turn::read(layout, tag) {
@@ -444,7 +449,7 @@ fn record_note(layout: &Layout, turn: &mut Turn, note: Result<(), String>) {
 
 /// The breaker: write the cooldown and drain the bridge so Codex retries get a
 /// local 503. Returns the detail line.
-pub fn trip_breaker(
+fn trip_breaker(
     env: &Env,
     layout: &Layout,
     runner: &dyn Runner,
@@ -545,7 +550,7 @@ fn write_answer(requested: &Path, answer: &str) -> Result<PathBuf> {
 
 /// What the completed turn's events say.
 #[derive(Debug, PartialEq)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     Delivered(String),
     Cooldown(String),
     Failed(String),
@@ -601,11 +606,11 @@ fn error_event(event: &Value) -> bool {
 
 /// The turn's result from the rollout.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Completion {
-    pub turn_id: String,
-    pub answer: String,
+pub(crate) struct Completion {
+    pub(crate) turn_id: String,
+    pub(crate) answer: String,
     /// Every event between the TURN's `task_started` and its `task_complete`.
-    pub events: Vec<Value>,
+    pub(crate) events: Vec<Value>,
 }
 
 fn task_started_id(event: &Value) -> Option<String> {

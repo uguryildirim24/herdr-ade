@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 /// thresholds live in routing.json. Placement belongs to `[dispatch]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct Recipe {
-    pub kind: String,
-    pub args: Vec<String>,
-    pub env: Vec<String>,
-    pub ready_timeout_ms: u64,
-    pub provider: String,
-    pub enabled: bool,
-    pub plain: String,
+pub(crate) struct Recipe {
+    pub(crate) kind: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<String>,
+    pub(crate) ready_timeout_ms: u64,
+    pub(crate) provider: String,
+    pub(crate) enabled: bool,
+    pub(crate) plain: String,
 }
 
 impl Default for Recipe {
@@ -31,31 +31,31 @@ impl Default for Recipe {
 }
 
 /// The `local` machine sentinel: the Mac itself (SPEC-remote §4.1).
-pub const MACHINE_LOCAL: &str = "local";
+pub(crate) const MACHINE_LOCAL: &str = "local";
 
 /// The local machine's display label, the one herdr's sidebar shows. It is the
 /// machine part of a cross-machine `parent` token (the fork lane t-0053 form).
-pub const MACHINE_LOCAL_LABEL: &str = "Local";
+pub(crate) const MACHINE_LOCAL_LABEL: &str = "Local";
 
 /// The box's PATH, passed to every box lane's `tab create --env`
 /// (SPEC-remote §3.3, check c C4).
-pub const BOX_PATH: &str =
+pub(crate) const BOX_PATH: &str =
     "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
 /// The box user's home, the cwd for a doctor probe pane (SPEC-remote §3.3).
-pub const BOX_HOME: &str = "/home/ubuntu";
+pub(crate) const BOX_HOME: &str = "/home/ubuntu";
 /// The plugin binary and ADE root on the box (SPEC-remote §4.2 step 6).
-pub const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
+const BOX_BIN: &str = "/home/ubuntu/.local/bin/herdr-ade";
 /// The pi binary on the box: `setup`, `login`, `doctor` and `check` are
 /// `herdr-pi` verbs, so a pi readiness probe never runs through [`BOX_BIN`]
 /// (SPEC-remote §4.2 step 6).
-pub const BOX_PI_BIN: &str = "/home/ubuntu/.local/bin/herdr-pi";
-pub const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";
+pub(crate) const BOX_PI_BIN: &str = "/home/ubuntu/.local/bin/herdr-pi";
+pub(crate) const BOX_ROOT: &str = "/home/ubuntu/.herdr-ade";
 /// The box's per-lane build folders (SPEC-remote §3.2).
-pub const BOX_BUILD: &str = "/home/ubuntu/build/lanes";
+pub(crate) const BOX_BUILD: &str = "/home/ubuntu/build/lanes";
 
 /// The fixed box command prefix `/home/ubuntu/.local/bin/herdr-ade --root
 /// /home/ubuntu/.herdr-ade` (SPEC-remote D12/D14, §4.2 step 6).
-pub fn box_prefix() -> String {
+pub(crate) fn box_prefix() -> String {
     format!("{BOX_BIN} --root {BOX_ROOT}")
 }
 
@@ -65,27 +65,27 @@ pub fn box_prefix() -> String {
 /// invisible without this. Exporting keeps the path for every command, even
 /// when the script starts with a regular builtin. Every SSH script the plugin
 /// runs on the box goes through here.
-pub fn with_box_path(script: &str) -> String {
+pub(crate) fn with_box_path(script: &str) -> String {
     format!("PATH={BOX_PATH}; export PATH\n{script}")
 }
 
 /// The box path of one lane's card (SPEC-remote §4.3).
-pub fn box_lane_card(slug: &str, thread: &str) -> String {
+pub(crate) fn box_lane_card(slug: &str, thread: &str) -> String {
     format!("{BOX_ROOT}/{slug}/lanes/{thread}.toml")
 }
 
 /// A saved machine's stable profile (SPEC-remote §4.1). `id` is the plugin's
 /// identity; `label` is renameable and is only shown.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MachineProfile {
-    pub id: String,
-    pub label: String,
-    pub target: String,
-    pub session: String,
+pub(crate) struct MachineProfile {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) target: String,
+    pub(crate) session: String,
 }
 
 impl MachineProfile {
-    pub fn is_local(&self) -> bool {
+    pub(crate) fn is_local(&self) -> bool {
         self.id == MACHINE_LOCAL || self.label == MACHINE_LOCAL
     }
 }
@@ -93,15 +93,15 @@ impl MachineProfile {
 /// One row of the Mac→box repository map (SPEC-remote §4.1). The plugin never
 /// derives a box path from a Mac path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BoxRepoMap {
-    pub mac: &'static str,
-    pub box_path: &'static str,
-    pub publish_url: &'static str,
+pub(crate) struct BoxRepoMap {
+    pub(crate) mac: &'static str,
+    pub(crate) box_path: &'static str,
+    pub(crate) publish_url: &'static str,
 }
 
 /// The committed default map: the two tool repositories. Other projects add
 /// their own row before first remote use.
-pub const BOX_REPOS: &[BoxRepoMap] = &[
+pub(crate) const BOX_REPOS: &[BoxRepoMap] = &[
     BoxRepoMap {
         mac: "/home/agent/projects/herdr",
         box_path: "/home/ubuntu/projects/herdr",
@@ -119,31 +119,31 @@ pub const BOX_REPOS: &[BoxRepoMap] = &[
 /// `HERDR_ADE_LAUNCH`, `HERDR_PANE_ID`, cwd and process identity against it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct LaneCard {
-    pub project: String,
-    pub thread: String,
-    pub attempt: u32,
-    pub brief_hash: String,
-    pub role: String,
-    pub kind: String,
-    pub pane_id: String,
+pub(crate) struct LaneCard {
+    pub(crate) project: String,
+    pub(crate) thread: String,
+    pub(crate) attempt: u32,
+    pub(crate) brief_hash: String,
+    pub(crate) role: String,
+    pub(crate) kind: String,
+    pub(crate) pane_id: String,
     /// The renameable label the board shows.
-    pub machine_label: String,
+    pub(crate) machine_label: String,
     /// The stable profile id the Mac supplied (SPEC-remote §4.1).
-    pub machine_id: String,
+    pub(crate) machine_id: String,
     /// The box clone and checkout paths; never derived from the Mac path.
-    pub box_repo: String,
-    pub box_worktree: String,
+    pub(crate) box_repo: String,
+    pub(crate) box_worktree: String,
     /// The brief commit `B` the box fetch verified as `FETCH_HEAD`.
-    pub brief_commit: String,
+    pub(crate) brief_commit: String,
     /// The lane branch and the URL-matched remote it publishes to
     /// (SPEC-remote §4.2 step 7). `ha done` checks the published ref.
-    pub branch: String,
-    pub publish_url: String,
-    pub recipient: Recipient,
+    pub(crate) branch: String,
+    pub(crate) publish_url: String,
+    pub(crate) recipient: Recipient,
     /// The exact line typed at start (SPEC-remote §4.2 step 6).
-    pub start_line: String,
-    pub created: String,
+    pub(crate) start_line: String,
+    pub(crate) created: String,
 }
 
 /// The thread record's `launch` object: the chosen recipe's full D2 row.
@@ -151,78 +151,78 @@ pub struct LaneCard {
 /// time (D2, D9).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
-pub struct Launch {
-    pub kind: String,
-    pub args: Vec<String>,
-    pub env: Vec<String>,
-    pub ready_timeout_ms: u64,
-    pub policy_hash: String,
-    pub attempt: u32,
-    pub brief_hash: String,
+pub(crate) struct Launch {
+    pub(crate) kind: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<String>,
+    pub(crate) ready_timeout_ms: u64,
+    pub(crate) policy_hash: String,
+    pub(crate) attempt: u32,
+    pub(crate) brief_hash: String,
     /// The SHA-256 of the role's skill text at the moment this lane (or the
     /// coordinator) was primed. Staleness compares it with the skill file now
     /// on disk, so a running agent stuck on an old copy is visible (LEAN U4).
     #[serde(default)]
-    pub skill_hash: String,
-    pub recipe_id: String,
-    pub strength: u32,
-    pub escalations: u32,
-    pub reason: String,
+    pub(crate) skill_hash: String,
+    pub(crate) recipe_id: String,
+    pub(crate) strength: u32,
+    pub(crate) escalations: u32,
+    pub(crate) reason: String,
     /// The compact `<job> runs on <plain>` sentence for the board's
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
     /// never rereads live config.
-    pub compact_reason: String,
+    pub(crate) compact_reason: String,
     /// Evidence intentionally left out before dispatch (for example a review
     /// diff that the agent reads from its checkout). Escalations retain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_truncation: Option<serde_json::Value>,
+    pub(crate) source_truncation: Option<serde_json::Value>,
     /// Default machine from `[dispatch]`; empty keeps the launch local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub machine: String,
+    pub(crate) machine: String,
 }
 
 /// Process identity from `pane process-info` once the agent is ready
 /// (SPEC-ADE D3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ProcessIdentity {
-    pub pid: u32,
-    pub argv0: String,
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) argv0: String,
 }
 
 /// Identity binding compared on live reads. `terminal_id` is never stored
 /// or compared (SPEC-ADE D3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct IdentityBinding {
-    pub socket: String,
-    pub workspace_id: String,
-    pub tab_id: String,
-    pub pane_id: String,
-    pub cwd: String,
+pub(crate) struct IdentityBinding {
+    pub(crate) socket: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) cwd: String,
     /// Absent on an adopted thread (SPEC-ADE D3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<String>,
+    pub(crate) agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process: Option<ProcessIdentity>,
+    pub(crate) process: Option<ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_session: Option<String>,
+    pub(crate) agent_session: Option<String>,
 }
 
 /// The executable portion of a resolved launch, passed to process creation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct RoleSpec {
-    pub kind: String,
+pub(crate) struct RoleSpec {
+    pub(crate) kind: String,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub(crate) args: Vec<String>,
     #[serde(default)]
-    pub env: Vec<String>,
+    pub(crate) env: Vec<String>,
     #[serde(default)]
-    pub ready_timeout_ms: u64,
+    pub(crate) ready_timeout_ms: u64,
 }
 
 /// `done` or `waiting` (SPEC-ADE D5).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum OpKind {
+pub(crate) enum OpKind {
     Done,
     Waiting,
     Failed,
@@ -232,7 +232,7 @@ pub enum OpKind {
 /// helper memory (SPEC-ADE D5, item 32).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
-pub enum Requested {
+pub(crate) enum Requested {
     Done { sha: String, report_path: String },
     Waiting { text: String },
     Failed { failure: String },
@@ -241,15 +241,15 @@ pub enum Requested {
 /// Coordinator pane and attempt that must receive the sealed event
 /// (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Recipient {
-    pub pane: String,
-    pub coordinator_attempt: u32,
+pub(crate) struct Recipient {
+    pub(crate) pane: String,
+    pub(crate) coordinator_attempt: u32,
 }
 
 /// Op state machine (SPEC-ADE D5).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum OpState {
+pub(crate) enum OpState {
     Reserved,
     Staged,
     Sealed,
@@ -259,69 +259,69 @@ pub enum OpState {
 /// `ops/<op id>.toml`. Op id is `<thread>-<attempt>-<n>`. The event id is
 /// this op id, fixed at reserve (SPEC-ADE D5, item 32).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Op {
-    pub op: String,
-    pub revision: u32,
-    pub thread: String,
-    pub attempt: u32,
-    pub kind: OpKind,
-    pub recipient: Recipient,
+pub(crate) struct Op {
+    pub(crate) op: String,
+    pub(crate) revision: u32,
+    pub(crate) thread: String,
+    pub(crate) attempt: u32,
+    pub(crate) kind: OpKind,
+    pub(crate) recipient: Recipient,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub round: Option<String>,
-    pub helper_pid: u32,
-    pub requested: Requested,
+    pub(crate) round: Option<String>,
+    pub(crate) helper_pid: u32,
+    pub(crate) requested: Requested,
     /// Fixed event id: equal to `op` (SPEC-ADE D5, item 32).
-    pub event: String,
-    pub state: OpState,
-    pub created: String,
+    pub(crate) event: String,
+    pub(crate) state: OpState,
+    pub(crate) created: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact: Option<String>,
+    pub(crate) artifact: Option<String>,
 }
 
 /// Sealed `done` payload (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct DonePayload {
-    pub sha: String,
-    pub report_path: String,
-    pub artifact: String,
+pub(crate) struct DonePayload {
+    pub(crate) sha: String,
+    pub(crate) report_path: String,
+    pub(crate) artifact: String,
 }
 
 /// Sealed `waiting` payload (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct WaitingPayload {
-    pub text: String,
+pub(crate) struct WaitingPayload {
+    pub(crate) text: String,
 }
 
 /// Tagged event payload: `payload.done` or `payload.waiting` (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct EventPayload {
+pub(crate) struct EventPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub done: Option<DonePayload>,
+    pub(crate) done: Option<DonePayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting: Option<WaitingPayload>,
+    pub(crate) waiting: Option<WaitingPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failed: Option<WaitingPayload>,
+    pub(crate) failed: Option<WaitingPayload>,
 }
 
 /// Immutable sealed event `events/<event id>.toml` (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Event {
-    pub id: String,
-    pub op: String,
-    pub thread: String,
-    pub attempt: u32,
+pub(crate) struct Event {
+    pub(crate) id: String,
+    pub(crate) op: String,
+    pub(crate) thread: String,
+    pub(crate) attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub round: Option<String>,
-    pub recipient: Recipient,
-    pub created: String,
-    pub payload: EventPayload,
+    pub(crate) round: Option<String>,
+    pub(crate) recipient: Recipient,
+    pub(crate) created: String,
+    pub(crate) payload: EventPayload,
 }
 
 /// Delivery journal states appended to `deliveries/<event id>.jsonl`
 /// (SPEC-ADE D5).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum DeliveryState {
+pub(crate) enum DeliveryState {
     Submitted,
     Acknowledged,
     Handled,
@@ -329,34 +329,34 @@ pub enum DeliveryState {
 
 /// One line of the delivery journal (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeliveryLine {
-    pub event: String,
-    pub state: DeliveryState,
+pub(crate) struct DeliveryLine {
+    pub(crate) event: String,
+    pub(crate) state: DeliveryState,
 }
 
 /// Durable `asks/<ask id>/r<revision>.toml` written before any publication
 /// (SPEC-ADE D17 item 4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Ask {
-    pub id: String,
-    pub revision: u32,
-    pub project: String,
+pub(crate) struct Ask {
+    pub(crate) id: String,
+    pub(crate) revision: u32,
+    pub(crate) project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub round: Option<String>,
-    pub question: String,
-    pub choices: Vec<String>,
+    pub(crate) round: Option<String>,
+    pub(crate) question: String,
+    pub(crate) choices: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub what: Option<String>,
+    pub(crate) what: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub means: Option<String>,
-    pub asked: String,
-    pub coordinator_binding: String,
+    pub(crate) means: Option<String>,
+    pub(crate) asked: String,
+    pub(crate) coordinator_binding: String,
 }
 
 /// The only values `publish()` accepts (SPEC-ADE D17 item 3, item 35).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum HumanMessage {
+pub(crate) enum HumanMessage {
     Say {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,34 +377,34 @@ pub enum HumanMessage {
 /// Completion pin projected onto a manifest member from a sealed `done`
 /// event (SPEC-ADE D6, item 33).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct CompletionPin {
-    pub event: String,
-    pub attempt: u32,
-    pub sha: String,
-    pub artifact: String,
+pub(crate) struct CompletionPin {
+    pub(crate) event: String,
+    pub(crate) attempt: u32,
+    pub(crate) sha: String,
+    pub(crate) artifact: String,
 }
 
 /// One admitted lane in the round manifest (SPEC-ADE D6, item 33).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ManifestMember {
-    pub thread: String,
+pub(crate) struct ManifestMember {
+    pub(crate) thread: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pin: Option<CompletionPin>,
+    pub(crate) pin: Option<CompletionPin>,
 }
 
 /// Authoritative admitted set. Membership is never inferred from completions
 /// (SPEC-ADE D6, item 33).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct AdmissionManifest {
-    pub revision: u64,
+pub(crate) struct AdmissionManifest {
+    pub(crate) revision: u64,
     #[serde(default)]
-    pub members: Vec<ManifestMember>,
+    pub(crate) members: Vec<ManifestMember>,
 }
 
 /// Lifecycle owned by the round record, not by events or git refs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum RoundPhase {
+pub(crate) enum RoundPhase {
     #[default]
     Admitting,
     PreparingReview,
@@ -418,90 +418,90 @@ pub enum RoundPhase {
 }
 
 impl RoundPhase {
-    pub fn closed(self) -> bool {
+    pub(crate) fn closed(self) -> bool {
         matches!(self, Self::Merged | Self::Abandoned)
     }
 }
 
 /// Planned review outputs, saved before any branch or brief commit is written.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReviewIntent {
-    pub head: String,
-    pub branch: String,
-    pub brief: String,
-    pub manifest_hash: String,
+pub(crate) struct ReviewIntent {
+    pub(crate) head: String,
+    pub(crate) branch: String,
+    pub(crate) brief: String,
+    pub(crate) manifest_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reuse_brief: Option<String>,
+    pub(crate) reuse_brief: Option<String>,
 }
 
 /// `.state/rounds/r<n>.toml` owns the entire round transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct RoundRecord {
+pub(crate) struct RoundRecord {
     #[serde(default)]
-    pub phase: RoundPhase,
+    pub(crate) phase: RoundPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_intent: Option<ReviewIntent>,
+    pub(crate) review_intent: Option<ReviewIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merge: Option<MergeIntent>,
+    pub(crate) merge: Option<MergeIntent>,
     /// Accepted reviewer completion; later events cannot replace this pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verdict: Option<CompletionPin>,
-    pub round: String,
-    pub branch: String,
-    pub plain: String,
+    pub(crate) verdict: Option<CompletionPin>,
+    pub(crate) round: String,
+    pub(crate) branch: String,
+    pub(crate) plain: String,
     #[serde(default)]
-    pub gates: Vec<String>,
-    pub policy_hash: String,
-    pub manifest: AdmissionManifest,
+    pub(crate) gates: Vec<String>,
+    pub(crate) policy_hash: String,
+    pub(crate) manifest: AdmissionManifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_head: Option<String>,
+    pub(crate) expected_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_hash: Option<String>,
+    pub(crate) manifest_hash: Option<String>,
     /// When `ha round open` wrote the record; orders `GLOSSARY.md` (A3).
     #[serde(default)]
-    pub opened: String,
+    pub(crate) opened: String,
     /// Repository the integration branch lives in, fixed at open (A3).
     #[serde(default)]
-    pub repo: String,
+    pub(crate) repo: String,
     /// Manifest revision frozen at the review brief commit `B` (SPEC-ADE D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frozen_revision: Option<u64>,
+    pub(crate) frozen_revision: Option<u64>,
     /// `review/r<n>`, created from `B` (SPEC-ADE D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_branch: Option<String>,
+    pub(crate) review_branch: Option<String>,
     /// The reviewer thread whose sealed `done` sha is `V` (SPEC-ADE D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reviewer: Option<String>,
+    pub(crate) reviewer: Option<String>,
     /// What `round advance` last announced for this round (a verdict or a
     /// gone reviewer), so each state is announced once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub announced: Option<String>,
+    pub(crate) announced: Option<String>,
     /// Current coordinator action, owned by this round rather than the inbox.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub attention: String,
+    pub(crate) attention: String,
     /// How many reviewer starts `advance` has tried and failed for this round
     /// (a refused start or a reviewer whose agent never came up). The retry is
     /// bounded by `round::MAX_REVIEWER_START_FAILURES` (E3/D1).
     #[serde(default)]
-    pub reviewer_start_failures: u32,
+    pub(crate) reviewer_start_failures: u32,
     /// Human-supplied reason for deliberately ending an unmergeable round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub abandoned_reason: Option<String>,
+    pub(crate) abandoned_reason: Option<String>,
 }
 
 /// Checkpoint intent bound to `V` and the HANDOFF payload hash
 /// (SPEC-ADE D6, item 34).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct CheckpointIntent {
-    pub parent: String,
-    pub op: String,
-    pub payload_hash: String,
+pub(crate) struct CheckpointIntent {
+    pub(crate) parent: String,
+    pub(crate) op: String,
+    pub(crate) payload_hash: String,
 }
 
 /// Merge transaction phase (SPEC-ADE D6, item 34).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MergePhase {
+pub(crate) enum MergePhase {
     Intent,
     Merged,
     Checkpointed,
@@ -510,27 +510,27 @@ pub enum MergePhase {
 
 /// Merge/checkpoint transaction embedded in the owning round record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MergeIntent {
-    pub op: String,
-    pub expected_old: String,
-    pub candidate: String,
-    pub verdict: String,
-    pub phase: MergePhase,
+pub(crate) struct MergeIntent {
+    pub(crate) op: String,
+    pub(crate) expected_old: String,
+    pub(crate) candidate: String,
+    pub(crate) verdict: String,
+    pub(crate) phase: MergePhase,
     /// The commit the integration branch held after merging V in: `V` on a
     /// fast-forward, otherwise a merge commit whose first parent is the moved
     /// head (SPEC-ADE D6, item 34). The checkpoint commits on top of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merged: Option<String>,
+    pub(crate) merged: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<CheckpointIntent>,
+    pub(crate) checkpoint: Option<CheckpointIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head: Option<String>,
+    pub(crate) head: Option<String>,
 }
 
 /// Talk inbound request states (SPEC-ADE D18 item 2, item 35).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TalkRequestState {
+pub(crate) enum TalkRequestState {
     Queued,
     Submitted,
     Uncertain,
@@ -539,17 +539,17 @@ pub enum TalkRequestState {
 
 /// `inbound { request, state }` on the talk journal (SPEC-ADE D18 item 2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TalkInbound {
-    pub request: String,
-    pub state: TalkRequestState,
-    pub recipient: Recipient,
+pub(crate) struct TalkInbound {
+    pub(crate) request: String,
+    pub(crate) state: TalkRequestState,
+    pub(crate) recipient: Recipient,
 }
 
 // --------------------------------------------------------------- plan card
 
 /// The seven end-result kinds and their fixed display sentence
 /// (SPEC-talk §2.7, §6.5). The coordinator picks one; the file stores it.
-pub const PLAN_KINDS: &[(&str, &str)] = &[
+pub(crate) const PLAN_KINDS: &[(&str, &str)] = &[
     ("screen", "A screen you open."),
     ("command", "A command you run."),
     ("background", "A program that runs underneath."),
@@ -560,7 +560,7 @@ pub const PLAN_KINDS: &[(&str, &str)] = &[
 ];
 
 /// The fixed sentence for a stored kind, or `None` for an unknown one.
-pub fn plan_kind_sentence(kind: &str) -> Option<&'static str> {
+pub(crate) fn plan_kind_sentence(kind: &str) -> Option<&'static str> {
     PLAN_KINDS.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v)
 }
 
@@ -568,7 +568,7 @@ pub fn plan_kind_sentence(kind: &str) -> Option<&'static str> {
 /// the bound work, never a coordinator-supplied status.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum StepState {
+pub(crate) enum StepState {
     #[default]
     Left,
     Running,
@@ -576,7 +576,7 @@ pub enum StepState {
 }
 
 impl StepState {
-    pub fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             StepState::Left => "left",
             StepState::Running => "running",
@@ -589,70 +589,70 @@ impl StepState {
 /// work, not related discussions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct PlanStep {
-    pub id: String,
-    pub text: String,
-    pub state: StepState,
-    pub threads: Vec<String>,
-    pub rounds: Vec<String>,
+pub(crate) struct PlanStep {
+    pub(crate) id: String,
+    pub(crate) text: String,
+    pub(crate) state: StepState,
+    pub(crate) threads: Vec<String>,
+    pub(crate) rounds: Vec<String>,
 }
 
 /// `<project>/plan.toml` (SPEC-talk §6.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct Plan {
-    pub schema: u32,
-    pub revision: u64,
-    pub next_step: u64,
-    pub goal: String,
-    pub kind: String,
-    pub what_you_get: String,
-    pub does: String,
-    pub steps: Vec<PlanStep>,
+pub(crate) struct Plan {
+    pub(crate) schema: u32,
+    pub(crate) revision: u64,
+    pub(crate) next_step: u64,
+    pub(crate) goal: String,
+    pub(crate) kind: String,
+    pub(crate) what_you_get: String,
+    pub(crate) does: String,
+    pub(crate) steps: Vec<PlanStep>,
 }
 
 // ---------------------------------------------------------- decision log
 
 /// The four decision classes (SPEC-talk §6.6). `what-you-get`, `money` and
 /// `undo` need human authority; `routine` does not.
-pub const DECISION_CLASSES: &[&str] = &["what-you-get", "money", "undo", "routine"];
+pub(crate) const DECISION_CLASSES: &[&str] = &["what-you-get", "money", "undo", "routine"];
 
 /// One complete line of `<project>/decisions.jsonl` (SPEC-talk §6.6). Nullable
 /// fields stay present as `null` so an old reader sees the shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct Decision {
-    pub schema: u32,
-    pub seq: u64,
-    pub id: String,
-    pub at: String,
-    pub line: String,
-    pub class: String,
-    pub key: Option<String>,
-    pub basis: Option<String>,
-    pub replaces: Option<String>,
-    pub request: Option<String>,
-    pub overturned: Option<DecisionOverturn>,
+pub(crate) struct Decision {
+    pub(crate) schema: u32,
+    pub(crate) seq: u64,
+    pub(crate) id: String,
+    pub(crate) at: String,
+    pub(crate) line: String,
+    pub(crate) class: String,
+    pub(crate) key: Option<String>,
+    pub(crate) basis: Option<String>,
+    pub(crate) replaces: Option<String>,
+    pub(crate) request: Option<String>,
+    pub(crate) overturned: Option<DecisionOverturn>,
 }
 
 /// An append-only change to a decision; the original line remains in the log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DecisionOverturn {
-    pub by: String,
-    pub at: String,
-    pub reason: String,
+pub(crate) struct DecisionOverturn {
+    pub(crate) by: String,
+    pub(crate) at: String,
+    pub(crate) reason: String,
 }
 
 /// A `--basis` reference: an existing human message (`request:<id>`) or a
 /// current, nonzero answered ask (`ask:<id>@<revision>`) (SPEC-talk §6.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthorityRef {
+pub(crate) enum AuthorityRef {
     Request(String),
     Ask { id: String, revision: u32 },
 }
 
 impl AuthorityRef {
-    pub fn parse(text: &str) -> Option<AuthorityRef> {
+    pub(crate) fn parse(text: &str) -> Option<AuthorityRef> {
         if let Some(id) = text.strip_prefix("request:") {
             if id.is_empty() {
                 return None;
@@ -667,7 +667,7 @@ impl AuthorityRef {
         })
     }
 
-    pub fn as_str(&self) -> String {
+    pub(crate) fn as_str(&self) -> String {
         match self {
             AuthorityRef::Request(id) => format!("request:{id}"),
             AuthorityRef::Ask { id, revision } => format!("ask:{id}@{revision}"),
@@ -678,9 +678,9 @@ impl AuthorityRef {
 /// One JSON object on `talk/journal.jsonl` (SPEC-ADE D18 items 2 and 6).
 #[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TalkJournalRecord {
-    pub seq: u64,
-    pub inbound: TalkInbound,
+pub(crate) struct TalkJournalRecord {
+    pub(crate) seq: u64,
+    pub(crate) inbound: TalkInbound,
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::talk;
 
-pub fn decisions_path(project: &Project) -> PathBuf {
+pub(crate) fn decisions_path(project: &Project) -> PathBuf {
     project.dir().join("decisions.jsonl")
 }
 
@@ -46,12 +46,12 @@ fn decisions_lock(project: &Project) -> Result<DecisionsLock> {
 /// The complete lines of the log, in order, plus whether the file ends without
 /// a newline (a cut write that blocks further appends).
 #[derive(Debug, Default)]
-pub struct Log {
-    pub records: Vec<Decision>,
-    pub broken_tail: bool,
+pub(crate) struct Log {
+    pub(crate) records: Vec<Decision>,
+    pub(crate) broken_tail: bool,
 }
 
-pub fn read(project: &Project) -> Log {
+pub(crate) fn read(project: &Project) -> Log {
     let text = std::fs::read_to_string(decisions_path(project)).unwrap_or_default();
     let mut log = Log {
         broken_tail: !text.is_empty() && !text.ends_with('\n'),
@@ -80,7 +80,7 @@ fn replaced_ids(log: &Log) -> std::collections::BTreeSet<String> {
 
 /// The latest state of each unreplaced choice, oldest change first, including
 /// overturned choices. The screen reads this rather than re-folding the log.
-pub fn current(project: &Project) -> Vec<Decision> {
+pub(crate) fn current(project: &Project) -> Vec<Decision> {
     fold_current(&read(project))
 }
 
@@ -98,7 +98,13 @@ fn fold_current(log: &Log) -> Vec<Decision> {
 }
 
 /// Keep the original record and append its overturned state under the same id.
-pub fn overturn(ctx: &Ctx, slug: &str, id: &str, reason: &str, by: &str) -> Result<Decision> {
+pub(crate) fn overturn(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+    by: &str,
+) -> Result<Decision> {
     let project = Project::load(&ctx.root, slug)?;
     if reason.trim().is_empty() || by.trim().is_empty() {
         bail!("decision_overturn: a reason and actor are required");
@@ -131,7 +137,7 @@ pub fn overturn(ctx: &Ctx, slug: &str, id: &str, reason: &str, by: &str) -> Resu
     Ok(record)
 }
 
-pub fn status_line(record: &Decision) -> String {
+pub(crate) fn status_line(record: &Decision) -> String {
     match &record.overturned {
         Some(change) => format!(
             "{}  {}  overturned by {} at {}: {}",
@@ -141,13 +147,13 @@ pub fn status_line(record: &Decision) -> String {
     }
 }
 
-pub struct NewDecision<'a> {
-    pub line: &'a str,
-    pub class: &'a str,
-    pub key: Option<&'a str>,
-    pub basis: Option<&'a str>,
-    pub replaces: Option<&'a str>,
-    pub request: Option<&'a str>,
+pub(crate) struct NewDecision<'a> {
+    pub(crate) line: &'a str,
+    pub(crate) class: &'a str,
+    pub(crate) key: Option<&'a str>,
+    pub(crate) basis: Option<&'a str>,
+    pub(crate) replaces: Option<&'a str>,
+    pub(crate) request: Option<&'a str>,
 }
 
 fn check_class(class: &str) -> Result<()> {
@@ -200,7 +206,7 @@ fn validate_basis(project: &Project, text: &str) -> Result<String> {
 
 /// `ha decide` (SPEC-talk §6.6). An existing key with the same payload returns
 /// its record; the same key with different content fails.
-pub fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
+pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Decision> {
     let project = Project::load(&ctx.root, slug)?;
     check_class(new.class)?;
     let line = glossary::check_record_sentence(&project, "line", new.line)?;
@@ -309,7 +315,7 @@ fn log_current(log: &Log, id: &str) -> bool {
 }
 
 /// `ha decide list [--json]`: current choices, newest first.
-pub fn list(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
+pub(crate) fn list(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let broken_tail = read(&project).broken_tail;
     let mut records = current(&project);
@@ -333,7 +339,7 @@ pub fn list(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
 }
 
 /// `ha decide show <id> [--json]`.
-pub fn show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<String> {
+pub(crate) fn show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let log = read(&project);
     let record = log

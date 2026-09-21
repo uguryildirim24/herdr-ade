@@ -16,7 +16,7 @@ use crate::pi::sh;
 use crate::pi::{Env, Layout};
 
 /// `crate::runner::Runner` as a `pi::sh::Runner`.
-pub struct Adapter<'a>(pub &'a dyn crate::runner::Runner);
+pub(crate) struct Adapter<'a>(pub &'a dyn crate::runner::Runner);
 
 impl sh::Runner for Adapter<'_> {
     fn run(&self, cmd: &sh::Cmd) -> Result<sh::Output> {
@@ -56,7 +56,7 @@ fn layout(root: &Path) -> Layout {
 
 /// Readiness for one provider before a `kind = "pi"` launch (SPEC-pi §3.4):
 /// every failing row in one refusal. Runs through the plugin's runner.
-pub fn check_with(
+pub(crate) fn check_with(
     runner: &dyn crate::runner::Runner,
     root: &Path,
     provider: &str,
@@ -68,7 +68,7 @@ pub fn check_with(
 /// Box pi readiness (SPEC-remote §4.1, SPEC-pi §3.4, item 101): the check runs
 /// on the box through its own wrapper and login store. A Mac login never
 /// counts, and the model is resolved from the box's shared store.
-pub fn check_on_machine(
+pub(crate) fn check_on_machine(
     runner: &dyn crate::runner::Runner,
     target: &str,
     provider: &str,
@@ -96,7 +96,7 @@ pub fn check_on_machine(
 }
 
 /// The pi doctor rows through the plugin's runner, for `doctor`.
-pub fn doctor_rows_with(
+pub(crate) fn doctor_rows_with(
     runner: &dyn crate::runner::Runner,
     root: &Path,
 ) -> Result<(Vec<doctor::Row>, bool)> {

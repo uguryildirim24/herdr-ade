@@ -32,7 +32,7 @@ use crate::thread::{self, sha256_hex};
 const CALL: Duration = Duration::from_secs(15);
 
 /// The hash the checkpoint intent binds: both files' exact bytes (item 34).
-pub fn payload_hash(md: &str, json: &str) -> String {
+pub(crate) fn payload_hash(md: &str, json: &str) -> String {
     let mut bytes = b"HANDOFF.md\0".to_vec();
     bytes.extend_from_slice(md.as_bytes());
     bytes.extend_from_slice(b"\0HANDOFF.json\0");
@@ -280,15 +280,15 @@ fn record_files(repo: &Path) -> Value {
 
 // ----------------------------------------------------------------- collect
 
-pub struct Where<'a> {
-    pub herdr: &'a Herdr<'a>,
-    pub pane: String,
-    pub session: String,
-    pub repo: Option<PathBuf>,
+pub(crate) struct Where<'a> {
+    pub(crate) herdr: &'a Herdr<'a>,
+    pub(crate) pane: String,
+    pub(crate) session: String,
+    pub(crate) repo: Option<PathBuf>,
 }
 
 /// `state.py collect`: the live state around a coordinator pane.
-pub fn collect(ctx: &Ctx, at: &Where) -> Result<Value> {
+pub(crate) fn collect(ctx: &Ctx, at: &Where) -> Result<Value> {
     let snap = at
         .herdr
         .call(&["api", "snapshot"], CALL)
@@ -436,7 +436,7 @@ fn text_or(v: Option<&Value>, fallback: &str) -> String {
 }
 
 /// `state.py render`: the `## Herdr` section.
-pub fn render(st: &Value, prefix: &str) -> String {
+pub(crate) fn render(st: &Value, prefix: &str) -> String {
     let c = &st["coordinator"];
     let mut o = String::new();
     o.push_str(&format!(
@@ -670,7 +670,7 @@ pub fn render(st: &Value, prefix: &str) -> String {
 
 /// Replaces the `## Herdr` section of a handoff (through the next `## `
 /// heading) or appends it.
-pub fn splice_herdr(document: &str, section: &str) -> String {
+fn splice_herdr(document: &str, section: &str) -> String {
     let mut out = String::new();
     let mut skipping = false;
     let mut replaced = false;
@@ -707,7 +707,7 @@ pub fn splice_herdr(document: &str, section: &str) -> String {
 
 /// `state.py check`, over a document and the collected live state. Returns
 /// the problem classes; empty means the document checks out.
-pub fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, BTreeSet<String>> {
+fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut problems: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut add = |class: &str, item: String| {
         problems.entry(class.to_string()).or_default().insert(item);
@@ -1029,7 +1029,7 @@ fn integration(
 
 /// The HANDOFF pair for an automatic checkpoint after a round merge: the
 /// handoff at `V` (or a skeleton) with a fresh `## Herdr` section.
-pub fn compose_for_round(
+pub(crate) fn compose_for_round(
     ctx: &Ctx,
     project: &Project,
     record: &RoundRecord,
@@ -1075,18 +1075,18 @@ fn skeleton() -> String {
     "# HANDOFF\n\n## Goal\n\n## Authority\n\n## Settled\n\n## In flight\n\n## Open\n\n## Next\n\n## Traps\n\n".into()
 }
 
-pub struct CheckpointArgs {
-    pub pane: Option<String>,
-    pub repo: Option<String>,
-    pub branch: Option<String>,
+pub(crate) struct CheckpointArgs {
+    pub(crate) pane: Option<String>,
+    pub(crate) repo: Option<String>,
+    pub(crate) branch: Option<String>,
     /// Print the generated section only; write nothing.
-    pub print: bool,
+    pub(crate) print: bool,
     /// Check the committed handoff only; write nothing.
-    pub check_only: bool,
+    pub(crate) check_only: bool,
 }
 
 /// `ha checkpoint <slug>`: snapshot, check, commit both files as `H`.
-pub fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<String> {
+pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let (repo, branch) = integration(ctx, &project, args.repo.as_deref(), args.branch.as_deref())?;
     let (h, pane, session) = coordinator_where(ctx, &project, args.pane.as_deref())?;
@@ -1173,15 +1173,15 @@ fn report(problems: &BTreeMap<String, BTreeSet<String>>, doc: &str, st: &Value) 
 /// machine, never a second bridge). Gone lanes are printed as start lines, or
 /// restarted through the existing restart path when `--start` runs under a
 /// project whose `start_threads` is `auto`.
-pub struct PickupArgs<'a> {
-    pub slug: Option<&'a str>,
-    pub pane: Option<&'a str>,
-    pub dry_run: bool,
-    pub all: bool,
-    pub start: bool,
+pub(crate) struct PickupArgs<'a> {
+    pub(crate) slug: Option<&'a str>,
+    pub(crate) pane: Option<&'a str>,
+    pub(crate) dry_run: bool,
+    pub(crate) all: bool,
+    pub(crate) start: bool,
 }
 
-pub fn pickup(ctx: &Ctx, args: PickupArgs<'_>) -> Result<String> {
+pub(crate) fn pickup(ctx: &Ctx, args: PickupArgs<'_>) -> Result<String> {
     if !args.all && args.slug.is_none() {
         bail!("pickup_needs_project: pass a project slug or --all");
     }

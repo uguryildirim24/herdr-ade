@@ -16,73 +16,73 @@ use super::sh::{Cmd, Runner};
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct Pane {
+pub(crate) struct Pane {
     #[serde(default)]
-    pub pane_id: String,
+    pub(crate) pane_id: String,
     #[serde(default)]
-    pub tab_id: String,
+    pub(crate) tab_id: String,
     #[serde(default)]
-    pub workspace_id: String,
+    pub(crate) workspace_id: String,
     #[serde(default)]
-    pub cwd: String,
+    pub(crate) cwd: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct Agent {
+pub(crate) struct Agent {
     #[serde(default)]
-    pub pane_id: String,
+    pub(crate) pane_id: String,
     #[serde(default)]
-    pub tab_id: String,
+    pub(crate) tab_id: String,
     #[serde(default)]
-    pub workspace_id: String,
+    pub(crate) workspace_id: String,
     #[serde(default)]
-    pub name: String,
+    pub(crate) name: String,
     #[serde(default)]
-    pub agent: String,
+    pub(crate) agent: String,
     #[serde(default)]
-    pub agent_status: String,
+    pub(crate) agent_status: String,
     #[serde(default)]
-    pub cwd: String,
+    pub(crate) cwd: String,
     #[serde(default)]
-    pub agent_session: Option<AgentSession>,
+    pub(crate) agent_session: Option<AgentSession>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct AgentSession {
+pub(crate) struct AgentSession {
     #[serde(default)]
-    pub id: String,
+    pub(crate) id: String,
 }
 
 impl Agent {
     /// The one "ready for a prompt" predicate: `idle` or `done`.
-    pub fn ready(&self) -> bool {
+    pub(crate) fn ready(&self) -> bool {
         matches!(self.agent_status.as_str(), "idle" | "done")
     }
 
-    pub fn blocked(&self) -> bool {
+    pub(crate) fn blocked(&self) -> bool {
         self.agent_status == "blocked"
     }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct ProcessInfo {
+pub(crate) struct ProcessInfo {
     #[serde(default)]
-    pub foreground_processes: Vec<ForegroundProcess>,
+    pub(crate) foreground_processes: Vec<ForegroundProcess>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct ForegroundProcess {
+pub(crate) struct ForegroundProcess {
     #[serde(default)]
-    pub pid: u32,
+    pub(crate) pid: u32,
     #[serde(default)]
-    pub name: String,
+    pub(crate) name: String,
     #[serde(default)]
-    pub argv0: Option<String>,
+    pub(crate) argv0: Option<String>,
 }
 
 impl ProcessInfo {
     /// True when a process named for the kind is still foreground.
-    pub fn runs(&self, kind: &str) -> bool {
+    pub(crate) fn runs(&self, kind: &str) -> bool {
         self.foreground_processes.iter().any(|proc| {
             let program = proc
                 .argv0
@@ -132,21 +132,21 @@ fn call_as<T: serde::de::DeserializeOwned>(
         .with_context(|| format!("herdr's reply to `{}` changed", args.join(" ")))
 }
 
-pub fn agent_list(runner: &dyn Runner, bin: &str) -> Result<Vec<Agent>> {
+pub(crate) fn agent_list(runner: &dyn Runner, bin: &str) -> Result<Vec<Agent>> {
     call_as(runner, bin, &["agent", "list"], "agents")
 }
 
-pub fn agent_find(runner: &dyn Runner, bin: &str, name: &str) -> Result<Option<Agent>> {
+pub(crate) fn agent_find(runner: &dyn Runner, bin: &str, name: &str) -> Result<Option<Agent>> {
     Ok(agent_list(runner, bin)?
         .into_iter()
         .find(|agent| agent.name == name))
 }
 
-pub fn pane_get(runner: &dyn Runner, bin: &str, pane: &str) -> Result<Pane> {
+pub(crate) fn pane_get(runner: &dyn Runner, bin: &str, pane: &str) -> Result<Pane> {
     call_as(runner, bin, &["pane", "get", pane], "pane")
 }
 
-pub fn process_info(runner: &dyn Runner, bin: &str, pane: &str) -> Result<ProcessInfo> {
+pub(crate) fn process_info(runner: &dyn Runner, bin: &str, pane: &str) -> Result<ProcessInfo> {
     call_as(
         runner,
         bin,
@@ -155,12 +155,12 @@ pub fn process_info(runner: &dyn Runner, bin: &str, pane: &str) -> Result<Proces
     )
 }
 
-pub fn tab_close(runner: &dyn Runner, bin: &str, tab: &str) -> Result<()> {
+pub(crate) fn tab_close(runner: &dyn Runner, bin: &str, tab: &str) -> Result<()> {
     call(runner, bin, &["tab", "close", tab], CALL_TIMEOUT).map(|_| ())
 }
 
 /// The pane's visible text. `herdr pane read` prints plain text, not JSON.
-pub fn pane_read(runner: &dyn Runner, bin: &str, pane: &str) -> Result<String> {
+pub(crate) fn pane_read(runner: &dyn Runner, bin: &str, pane: &str) -> Result<String> {
     let output = runner.run(&Cmd::new(bin, CALL_TIMEOUT).args([
         "pane",
         "read",
@@ -181,7 +181,7 @@ pub fn pane_read(runner: &dyn Runner, bin: &str, pane: &str) -> Result<String> {
 
 /// `herdr tab create`; returns the root pane the lane will live in. `env` is
 /// the Pro home pair (`CODEX_HOME=<state dir>/codex-home`).
-pub fn tab_create(
+pub(crate) fn tab_create(
     runner: &dyn Runner,
     bin: &str,
     workspace: &str,
@@ -207,17 +207,17 @@ pub fn tab_create(
 
 /// Arguments for `herdr agent start` including `--parent` and the ready
 /// timeout.
-pub struct StartSpec<'a> {
-    pub name: &'a str,
-    pub kind: &'a str,
-    pub pane: &'a str,
-    pub parent: Option<&'a str>,
-    pub extra: &'a [String],
-    pub ready_timeout_ms: u64,
+pub(crate) struct StartSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) pane: &'a str,
+    pub(crate) parent: Option<&'a str>,
+    pub(crate) extra: &'a [String],
+    pub(crate) ready_timeout_ms: u64,
 }
 
 /// `herdr agent start`; `extra` is passed after `--`.
-pub fn agent_start(runner: &dyn Runner, bin: &str, spec: &StartSpec<'_>) -> Result<Agent> {
+pub(crate) fn agent_start(runner: &dyn Runner, bin: &str, spec: &StartSpec<'_>) -> Result<Agent> {
     let timeout = spec.ready_timeout_ms.to_string();
     let mut args = vec![
         "agent".to_string(),
@@ -246,7 +246,7 @@ pub fn agent_start(runner: &dyn Runner, bin: &str, spec: &StartSpec<'_>) -> Resu
 
 /// Submit a prompt. Text in the second position is accepted even when it
 /// starts with a dash (checked on 0.9.1).
-pub fn agent_prompt(runner: &dyn Runner, bin: &str, target: &str, text: &str) -> Result<()> {
+pub(crate) fn agent_prompt(runner: &dyn Runner, bin: &str, target: &str, text: &str) -> Result<()> {
     call(
         runner,
         bin,

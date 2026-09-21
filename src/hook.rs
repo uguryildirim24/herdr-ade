@@ -76,7 +76,7 @@ fn settings_path(project: &Project, kind: &str) -> Option<(PathBuf, ConfigShape)
     }
 }
 
-pub fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<bool> {
+pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<bool> {
     let Some((path, shape)) = settings_path(project, kind) else {
         return Ok(false);
     };
@@ -108,7 +108,7 @@ pub fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> Result<b
     Ok(true)
 }
 
-pub fn remove(project: &Project) -> Result<()> {
+pub(crate) fn remove(project: &Project) -> Result<()> {
     let _lock = project.lock()?;
     let binding: Option<Binding> = project::read_json(&binding_path(project));
     if let Some(binding) = binding
@@ -220,7 +220,7 @@ fn verify_owned_entry(path: &Path, pane: &str, shape: ConfigShape) -> Result<()>
 
 /// Runs from a native CLI hook. Non-matching pane/session invocations are out
 /// of scope and exit successfully without checking or publishing.
-pub fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result<()> {
+pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let inherited = std::env::var("HERDR_PANE_ID").unwrap_or_default();
     if inherited != pane {

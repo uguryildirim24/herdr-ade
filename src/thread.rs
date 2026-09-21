@@ -11,20 +11,20 @@ use crate::herdr::{Agent, Pane, ready_state};
 use crate::project::{self, Project, slugify, write_atomic};
 use crate::runner::{Cmd, Runner};
 
-pub const STARTING_TIMEOUT_SECS: i64 = 300;
-pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
-pub const NOT_READY_SECS: i64 = 60;
+pub(crate) const STARTING_TIMEOUT_SECS: i64 = 300;
+pub(crate) const BLOCKED_DEBOUNCE_SECS: i64 = 30;
+const NOT_READY_SECS: i64 = 60;
 /// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`
 /// past this, and `ha doctor` / `ha context` warn at it: the warning fires at
 /// the point where a brief starts dropping files, and 32k is a small enough
 /// share of a lane's context to prune before it costs real tokens.
-pub const MEMORY_CAP_CHARS: usize = 32_000;
-pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
-pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
+pub(crate) const MEMORY_CAP_CHARS: usize = 32_000;
+const LIBRARY_CAP_KB: u64 = 50 * 1024;
+pub(crate) const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum Status {
+pub(crate) enum Status {
     #[default]
     Starting,
     Open,
@@ -34,7 +34,7 @@ pub enum Status {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum Kind {
+pub(crate) enum Kind {
     #[default]
     Worktree,
     Tab,
@@ -45,73 +45,73 @@ pub enum Kind {
 /// they are on the thread's own machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
-pub struct Thread {
-    pub id: String,
-    pub title: String,
-    pub status: Status,
-    pub error: String,
-    pub prompt_pending: bool,
-    pub launch_attempts: u32,
-    pub failure_event: String,
-    pub last_failure: String,
-    pub escalation_pending: bool,
-    pub kind: Kind,
-    pub repo: String,
-    pub origin: String,
-    pub branch: String,
-    pub base: String,
-    pub machine: String,
+pub(crate) struct Thread {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) status: Status,
+    pub(crate) error: String,
+    pub(crate) prompt_pending: bool,
+    pub(crate) launch_attempts: u32,
+    pub(crate) failure_event: String,
+    pub(crate) last_failure: String,
+    pub(crate) escalation_pending: bool,
+    pub(crate) kind: Kind,
+    pub(crate) repo: String,
+    pub(crate) origin: String,
+    pub(crate) branch: String,
+    pub(crate) base: String,
+    pub(crate) machine: String,
     /// The stable saved-profile id the lane resolved to (SPEC-remote §4.1).
     /// Empty on a local lane; a renamed label does not change it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub machine_id: String,
-    pub worktree_path: String,
-    pub thread_dir: String,
-    pub workspace_id: String,
-    pub tab_id: String,
-    pub pane_id: String,
-    pub agent: String,
-    pub agent_name: String,
-    pub cwd: String,
-    pub created: String,
-    pub updated: String,
-    pub last_state: String,
-    pub last_state_change: String,
-    pub last_group: String,
-    pub report_hash: String,
-    pub last_report_change: String,
+    pub(crate) machine_id: String,
+    pub(crate) worktree_path: String,
+    pub(crate) thread_dir: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) agent: String,
+    pub(crate) agent_name: String,
+    pub(crate) cwd: String,
+    pub(crate) created: String,
+    pub(crate) updated: String,
+    pub(crate) last_state: String,
+    pub(crate) last_state_change: String,
+    pub(crate) last_group: String,
+    pub(crate) report_hash: String,
+    pub(crate) last_report_change: String,
     /// Incomplete report/library copy, kept with the report it describes.
-    pub copy_notes: Vec<String>,
+    pub(crate) copy_notes: Vec<String>,
     /// Current pull request validation problem (not a second inbox record).
-    pub pr_note: String,
-    pub lineage_mismatch: bool,
-    pub acked_report_hash: String,
-    pub pr: String,
-    pub pr_state: String,
-    pub pr_review: String,
-    pub pr_summary: Option<crate::pr::Summary>,
-    pub resolved_reason: String,
+    pub(crate) pr_note: String,
+    pub(crate) lineage_mismatch: bool,
+    pub(crate) acked_report_hash: String,
+    pub(crate) pr: String,
+    pub(crate) pr_state: String,
+    pub(crate) pr_review: String,
+    pub(crate) pr_summary: Option<crate::pr::Summary>,
+    pub(crate) resolved_reason: String,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
-    pub role: String,
-    pub launch: crate::contracts::Launch,
-    pub attempt: u32,
+    pub(crate) role: String,
+    pub(crate) launch: crate::contracts::Launch,
+    pub(crate) attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partial: Option<String>,
-    pub bootstrap: String,
-    pub plain: String,
-    pub identity: crate::contracts::IdentityBinding,
+    pub(crate) partial: Option<String>,
+    pub(crate) bootstrap: String,
+    pub(crate) plain: String,
+    pub(crate) identity: crate::contracts::IdentityBinding,
     #[serde(default)]
-    pub passive: bool,
+    pub(crate) passive: bool,
 }
 
 impl Thread {
-    pub fn is_remote(&self) -> bool {
+    pub(crate) fn is_remote(&self) -> bool {
         !self.machine.is_empty()
     }
 
     /// The stable saved-profile id used for machine routing. The label is
     /// display-only and may be renamed without changing an attempt's identity.
-    pub fn machine_route(&self) -> &str {
+    pub(crate) fn machine_route(&self) -> &str {
         if self.machine_id.is_empty() {
             &self.machine
         } else {
@@ -119,16 +119,16 @@ impl Thread {
         }
     }
 
-    pub fn report_path(&self) -> String {
+    pub(crate) fn report_path(&self) -> String {
         format!("{}/report.md", self.thread_dir)
     }
 
-    pub fn library_path(&self) -> String {
+    fn library_path(&self) -> String {
         format!("{}/library", self.thread_dir)
     }
 }
 
-pub fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     let digits = id.strip_prefix("t-").unwrap_or("");
     if digits.len() < 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
         bail!("`{id}` is not a thread id (expected the form t-0001)");
@@ -140,19 +140,19 @@ fn threads_dir(project: &Project) -> PathBuf {
     project.dir().join("threads")
 }
 
-pub fn record_path(project: &Project, id: &str) -> PathBuf {
+fn record_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.toml"))
 }
 
-pub fn task_path(project: &Project, id: &str) -> PathBuf {
+pub(crate) fn task_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.task.md"))
 }
 
-pub fn home_report_path(project: &Project, id: &str) -> PathBuf {
+pub(crate) fn home_report_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.md"))
 }
 
-pub fn load(project: &Project, id: &str) -> Result<Thread> {
+pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
     validate_id(id)?;
     let path = record_path(project, id);
     let text = std::fs::read_to_string(&path)
@@ -160,7 +160,7 @@ pub fn load(project: &Project, id: &str) -> Result<Thread> {
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
-pub fn list(project: &Project) -> Vec<Thread> {
+pub(crate) fn list(project: &Project) -> Vec<Thread> {
     let Ok(entries) = std::fs::read_dir(threads_dir(project)) else {
         return Vec::new();
     };
@@ -183,7 +183,11 @@ fn write_record(project: &Project, thread: &Thread) -> Result<()> {
 
 /// Read-modify-write under the project lock: re-reads the record, lets `change`
 /// touch only the fields its step owns, writes.
-pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
+pub(crate) fn update(
+    project: &Project,
+    id: &str,
+    change: impl FnOnce(&mut Thread),
+) -> Result<Thread> {
     update_checked(project, id, |thread| {
         change(thread);
         Ok(())
@@ -191,7 +195,7 @@ pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> 
 }
 
 /// Compare-and-change for transitions which awaited external work.
-pub fn update_checked(
+pub(crate) fn update_checked(
     project: &Project,
     id: &str,
     change: impl FnOnce(&mut Thread) -> Result<()>,
@@ -241,7 +245,7 @@ fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
 }
 
 /// Allocates the next id under the project lock and writes the first record.
-pub fn allocate(project: &Project, fill: impl FnOnce(&mut Thread)) -> Result<Thread> {
+pub(crate) fn allocate(project: &Project, fill: impl FnOnce(&mut Thread)) -> Result<Thread> {
     let _lock = project.lock()?;
     let next = list(project)
         .iter()
@@ -265,7 +269,7 @@ pub fn allocate(project: &Project, fill: impl FnOnce(&mut Thread)) -> Result<Thr
     Ok(thread)
 }
 
-pub fn branch_name(slug: &str, id: &str, title: &str) -> String {
+pub(crate) fn branch_name(slug: &str, id: &str, title: &str) -> String {
     let title = slugify(title);
     if title.is_empty() {
         format!("hp/{slug}/{id}")
@@ -274,12 +278,12 @@ pub fn branch_name(slug: &str, id: &str, title: &str) -> String {
     }
 }
 
-pub fn agent_name(slug: &str, id: &str) -> String {
+pub(crate) fn agent_name(slug: &str, id: &str) -> String {
     format!("hp-{slug}-{id}")
 }
 
 /// `<agent working directory>/.herdr-project/<slug>-<id>`, for every kind.
-pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
+pub(crate) fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
     format!("{}/.herdr-project/{slug}-{id}", cwd.trim_end_matches('/'))
 }
 
@@ -289,7 +293,7 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 /// `tasks/<id>.md` in a worktree (D9) or `brief.md` in a tab's folder. An
 /// adopted pane has no launch receipt and a remote one no `ha` (D13): they
 /// read `brief.md`, which carries the lane skill.
-pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
+pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     let id = &t.id;
     let role = if t.role.is_empty() { "lane" } else { &t.role };
     let continuation = if t.last_failure.is_empty() {
@@ -325,12 +329,12 @@ pub fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
 
 /// The line that opens every thread skill: the skills write `hp`, and this
 /// names the prefix `hp` stands for.
-pub fn commands_line(prefix: &str) -> String {
+pub(crate) fn commands_line(prefix: &str) -> String {
     format!("Commands: `{prefix}`. Every `hp` command below means that prefix.\n\n")
 }
 
 /// A brief read without `hp skill` (adopted, remote) carries the lane skill.
-pub fn with_lane_skill(prefix: &str, brief: &str) -> String {
+pub(crate) fn with_lane_skill(prefix: &str, brief: &str) -> String {
     format!(
         "{}{}\n\n{brief}",
         commands_line(prefix),
@@ -343,20 +347,20 @@ pub fn with_lane_skill(prefix: &str, brief: &str) -> String {
 /// including a file the cap would drop, so the warning describes the budget
 /// itself rather than only what fits.
 #[derive(Debug, Clone, Default)]
-pub struct MemoryUse {
-    pub index: String,
-    pub files: Vec<(String, String)>,
-    pub total_chars: usize,
+pub(crate) struct MemoryUse {
+    pub(crate) index: String,
+    pub(crate) files: Vec<(String, String)>,
+    pub(crate) total_chars: usize,
 }
 
 impl MemoryUse {
-    pub fn over_budget(&self) -> bool {
+    fn over_budget(&self) -> bool {
         self.total_chars > MEMORY_CAP_CHARS
     }
 
     /// The `ha doctor` / `ha context` warning, or `None` when the memory fits.
     /// Names the file and its size and points at `memory/archive/`.
-    pub fn warning(&self) -> Option<String> {
+    pub(crate) fn warning(&self) -> Option<String> {
         if !self.over_budget() {
             return None;
         }
@@ -378,7 +382,7 @@ impl MemoryUse {
 
 /// Reads the memory exactly as `brief_for` inlines it. Regular files only: a
 /// symbolic link in `memory/` is never followed.
-pub fn memory_use(project: &Project) -> MemoryUse {
+pub(crate) fn memory_use(project: &Project) -> MemoryUse {
     let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
     let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
         .map(|entries| {
@@ -413,18 +417,18 @@ pub fn memory_use(project: &Project) -> MemoryUse {
     }
 }
 
-pub struct BriefInput<'a> {
-    pub instructions: &'a str,
-    pub memory_index: &'a str,
+pub(crate) struct BriefInput<'a> {
+    pub(crate) instructions: &'a str,
+    pub(crate) memory_index: &'a str,
     /// (file name, contents), in the order they should be inlined.
-    pub memory_files: &'a [(String, String)],
-    pub task: &'a str,
-    pub restart: bool,
-    pub report_path: &'a str,
-    pub library_path: &'a str,
+    pub(crate) memory_files: &'a [(String, String)],
+    pub(crate) task: &'a str,
+    pub(crate) restart: bool,
+    pub(crate) report_path: &'a str,
+    pub(crate) library_path: &'a str,
 }
 
-pub fn compose_brief(input: &BriefInput) -> String {
+fn compose_brief(input: &BriefInput) -> String {
     let mut brief = String::new();
     if input.restart {
         brief.push_str(
@@ -465,7 +469,12 @@ pub fn compose_brief(input: &BriefInput) -> String {
 }
 
 /// Reads the project's instructions and memory and composes the brief.
-pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) -> Result<String> {
+pub(crate) fn brief_for(
+    project: &Project,
+    thread: &Thread,
+    task: &str,
+    restart: bool,
+) -> Result<String> {
     let (_, instructions) = project.read_project_md()?;
     let memory = memory_use(project);
     Ok(compose_brief(&BriefInput {
@@ -482,7 +491,7 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
 // ---------------------------------------------------------------- groups
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Group {
+pub(crate) enum Group {
     ReadyForReview,
     WaitingOnYou,
     Working,
@@ -494,7 +503,7 @@ pub enum Group {
 impl Group {
     /// Display order, shared by the sidebar `rank` token and the overview:
     /// separate from the precedence in `group()`.
-    pub fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             Group::ReadyForReview => 1,
             Group::WaitingOnYou => 2,
@@ -505,7 +514,7 @@ impl Group {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Group::ReadyForReview => "Ready for review",
             Group::WaitingOnYou => "Waiting on you",
@@ -517,7 +526,7 @@ impl Group {
     }
 
     /// Lower-case hyphenated form, used in the `review` token and `last_group`.
-    pub fn token(self) -> &'static str {
+    pub(crate) fn token(self) -> &'static str {
         match self {
             Group::ReadyForReview => "ready-for-review",
             Group::WaitingOnYou => "waiting-on-you",
@@ -528,7 +537,7 @@ impl Group {
         }
     }
 
-    pub fn from_token(token: &str) -> Option<Group> {
+    pub(crate) fn from_token(token: &str) -> Option<Group> {
         [
             Group::ReadyForReview,
             Group::WaitingOnYou,
@@ -541,7 +550,7 @@ impl Group {
         .find(|g| g.token() == token)
     }
 
-    pub const DISPLAY_ORDER: [Group; 6] = [
+    pub(crate) const DISPLAY_ORDER: [Group; 6] = [
         Group::ReadyForReview,
         Group::WaitingOnYou,
         Group::Working,
@@ -553,15 +562,15 @@ impl Group {
 
 /// What herdr shows for a thread's pane right now.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Live {
-    pub pane_exists: bool,
+pub(crate) struct Live {
+    pub(crate) pane_exists: bool,
     /// `None` when no agent is detected in the pane.
-    pub agent_state: Option<String>,
+    pub(crate) agent_state: Option<String>,
     /// How long the agent has been in that state.
-    pub state_secs: i64,
+    pub(crate) state_secs: i64,
 }
 
-pub fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
+pub(crate) fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
     timestamp
         .parse::<jiff::Timestamp>()
         .map(|then| now.as_second() - then.as_second())
@@ -570,7 +579,7 @@ pub fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
 
 /// The group of a thread. First matching row wins. One function, so the CLI
 /// and the ticker always agree.
-pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
+pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
     let state = live.agent_state.as_deref();
     let has_report = !thread.report_hash.is_empty();
     // 1
@@ -614,14 +623,14 @@ pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
 /// A pane is the thread's pane only when workspace, tab and working directory
 /// match the record, and — for threads the binary started — the agent name.
 /// Ids are compared only among panes listed through the project's own socket.
-pub fn pane_matches(thread: &Thread, pane: &Pane) -> bool {
+pub(crate) fn pane_matches(thread: &Thread, pane: &Pane) -> bool {
     pane.pane_id == thread.pane_id
         && pane.workspace_id == thread.workspace_id
         && pane.tab_id == thread.tab_id
         && pane.cwd == thread.cwd
 }
 
-pub fn agent_matches(thread: &Thread, agent: &Agent) -> bool {
+pub(crate) fn agent_matches(thread: &Thread, agent: &Agent) -> bool {
     let ids = agent.pane_id == thread.pane_id
         && agent.workspace_id == thread.workspace_id
         && agent.tab_id == thread.tab_id
@@ -636,7 +645,12 @@ pub fn agent_matches(thread: &Thread, agent: &Agent) -> bool {
 /// Live state from one `agent list` and one `pane list`. `recorded` supplies
 /// the duration: the ticker keeps `last_state_change` current; a CLI call uses
 /// it when the live state equals the recorded one and zero otherwise.
-pub fn live_state(thread: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Timestamp) -> Live {
+pub(crate) fn live_state(
+    thread: &Thread,
+    agents: &[Agent],
+    panes: &[Pane],
+    now: jiff::Timestamp,
+) -> Live {
     let agent = agents.iter().find(|a| agent_matches(thread, a));
     let pane_exists = agent.is_some() || panes.iter().any(|p| pane_matches(thread, p));
     // A pane whose ids match but which holds someone else's agent is not ours.
@@ -657,7 +671,7 @@ pub fn live_state(thread: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::
 
 /// Compare a live agent and process with the stored binding (SPEC-ADE D3).
 /// `terminal_id` is never compared.
-pub fn identity_verifies(
+pub(crate) fn identity_verifies(
     thread: &Thread,
     agent: &Agent,
     live: &[crate::contracts::ProcessIdentity],
@@ -675,7 +689,7 @@ pub fn identity_verifies(
         .any(|p| stored.pid == p.pid && stored.argv0 == p.argv0)
 }
 
-pub fn bind_identity(
+pub(crate) fn bind_identity(
     thread: &mut Thread,
     socket: &str,
     agent: &Agent,
@@ -704,14 +718,14 @@ pub fn bind_identity(
 // ---------------------------------------------------------------- copy home
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CopyOutcome {
+pub(crate) enum CopyOutcome {
     Complete,
     /// The report was copied but something was skipped; each note says what.
     Partial(Vec<String>),
     Failed(String),
 }
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -742,7 +756,7 @@ fn symlinks_under(dir: &Path, found: &mut Vec<String>) {
 
 /// The hash of a local thread's report when it is a regular file inside a real
 /// thread directory. Cheap enough to run every tick.
-pub fn local_report_hash(thread: &Thread) -> Option<String> {
+pub(crate) fn local_report_hash(thread: &Thread) -> Option<String> {
     let dir = Path::new(&thread.thread_dir);
     if thread.thread_dir.is_empty() || !is_real_dir(dir) {
         return None;
@@ -755,16 +769,16 @@ pub fn local_report_hash(thread: &Thread) -> Option<String> {
         .map(|bytes| sha256_hex(&bytes))
 }
 
-pub struct Copied {
-    pub outcome: CopyOutcome,
+pub(crate) struct Copied {
+    pub(crate) outcome: CopyOutcome,
     /// The report's hash, when a regular report file exists.
-    pub report_hash: Option<String>,
+    pub(crate) report_hash: Option<String>,
 }
 
 /// Copies a local thread's report and, when `with_library`, its library home.
 /// Nothing that is a symbolic link is followed or copied. The caller must not
 /// hold the project lock: this runs `du` and `rsync`.
-pub fn copy_home_local(
+pub(crate) fn copy_home_local(
     project: &Project,
     thread: &Thread,
     with_library: bool,

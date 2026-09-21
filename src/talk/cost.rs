@@ -16,16 +16,16 @@ use crate::thread;
 
 /// Tokens, money in micro-dollars, whole minutes and send count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Totals {
-    pub tokens: u64,
-    pub micros: u64,
-    pub minutes: u64,
-    pub runs: u64,
-    pub unknown: bool,
+pub(crate) struct Totals {
+    pub(crate) tokens: u64,
+    pub(crate) micros: u64,
+    pub(crate) minutes: u64,
+    pub(crate) runs: u64,
+    pub(crate) unknown: bool,
 }
 
 impl Totals {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.tokens == 0 && self.micros == 0 && self.minutes == 0 && self.runs == 0 && !self.unknown
     }
 
@@ -39,16 +39,16 @@ impl Totals {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Cost {
-    pub today: Totals,
-    pub round: Option<(String, Totals)>,
+pub(crate) struct Cost {
+    pub(crate) today: Totals,
+    pub(crate) round: Option<(String, Totals)>,
     /// One entry per lane that could be read, for the record.
-    pub lanes: Vec<(String, Totals)>,
-    pub failed: bool,
+    pub(crate) lanes: Vec<(String, Totals)>,
+    pub(crate) failed: bool,
 }
 
 /// The whole cost view. Filesystem only; no command runs.
-pub fn load(ctx: &Ctx, project: &Project) -> Cost {
+pub(crate) fn load(ctx: &Ctx, project: &Project) -> Cost {
     let lanes = thread::list(project);
     let now = crate::project::now();
     let now_stamp = now.parse::<jiff::Timestamp>().ok();
@@ -120,7 +120,7 @@ pub fn load(ctx: &Ctx, project: &Project) -> Cost {
 
 /// pi names a session directory after the working directory: the path with
 /// its leading slash removed and every separator replaced by a dash.
-pub fn session_dir_name(cwd: &str) -> String {
+pub(crate) fn session_dir_name(cwd: &str) -> String {
     let trimmed = cwd.trim_start_matches('/').trim_end_matches('/');
     format!("--{}--", trimmed.replace(['/', '\\'], "-"))
 }
@@ -342,7 +342,7 @@ fn current_round(project: &Project) -> Option<(String, Vec<String>)> {
 }
 
 /// `1234567` -> `1.2m`; a small number stays whole.
-pub fn format_tokens(tokens: u64) -> String {
+fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
@@ -352,11 +352,11 @@ pub fn format_tokens(tokens: u64) -> String {
     }
 }
 
-pub fn format_money(micros: u64) -> String {
+fn format_money(micros: u64) -> String {
     format!("${:.2}", micros as f64 / 1_000_000.0)
 }
 
-pub fn format_totals(totals: &Totals) -> String {
+pub(crate) fn format_totals(totals: &Totals) -> String {
     if totals.tokens == 0 && totals.micros == 0 {
         return format!("{} min, cost unknown", totals.minutes);
     }

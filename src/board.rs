@@ -20,9 +20,9 @@ use crate::thread;
 
 /// Token lifetime: a dead ticker lets the rows expire rather than show a
 /// stale all-clear. The ticker refreshes well inside it.
-pub const TTL: Duration = Duration::from_secs(300);
+pub(crate) const TTL: Duration = Duration::from_secs(300);
 
-pub const KEYS: [&str; 5] = [
+pub(crate) const KEYS: [&str; 5] = [
     "ade_stage",
     "ade_lanes",
     "ade_needs_you",
@@ -31,25 +31,25 @@ pub const KEYS: [&str; 5] = [
 ];
 
 /// The fork cuts token values at 80 characters; the board never relies on it.
-pub const MAX_VALUE_CHARS: usize = 80;
+const MAX_VALUE_CHARS: usize = 80;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct BoardState {
+pub(crate) struct BoardState {
     /// The last value published per key.
     #[serde(default)]
-    pub values: BTreeMap<String, String>,
+    pub(crate) values: BTreeMap<String, String>,
     /// The last `say` line or fixed notice for `ade_last`, and when.
     #[serde(default)]
-    pub last_say: String,
+    pub(crate) last_say: String,
     #[serde(default)]
-    pub last_say_at: String,
+    pub(crate) last_say_at: String,
 }
 
 fn state_path(project: &Project) -> PathBuf {
     project.state_dir().join("board.json")
 }
 
-pub fn state(project: &Project) -> BoardState {
+pub(crate) fn state(project: &Project) -> BoardState {
     project::read_json(&state_path(project)).unwrap_or_default()
 }
 
@@ -61,7 +61,7 @@ fn save_state(project: &Project, change: impl FnOnce(&mut BoardState)) {
 }
 
 /// Remembers a published `say` line so the next template pass keeps it.
-pub fn remember_last(project: &Project, line: &str) {
+pub(crate) fn remember_last(project: &Project, line: &str) {
     save_state(project, |s| {
         s.last_say = line.to_string();
         s.last_say_at = project::now();
@@ -69,7 +69,7 @@ pub fn remember_last(project: &Project, line: &str) {
 }
 
 /// Gate B for one value: bounded, no control characters, passes the check.
-pub fn check_value(project: &Project, value: &str) -> Result<()> {
+pub(crate) fn check_value(project: &Project, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("board_refused: an empty value");
     }
@@ -128,7 +128,7 @@ fn send(ctx: &Ctx, project: &Project, pairs: &[(String, String)]) -> Result<()> 
 }
 
 /// Publishes one value; a failing value is refused and the old one stays.
-pub fn publish_value(ctx: &Ctx, project: &Project, key: &str, value: &str) -> Result<()> {
+pub(crate) fn publish_value(ctx: &Ctx, project: &Project, key: &str, value: &str) -> Result<()> {
     if !KEYS.contains(&key) {
         bail!("board_refused: `{key}` is not a board row");
     }
@@ -137,7 +137,7 @@ pub fn publish_value(ctx: &Ctx, project: &Project, key: &str, value: &str) -> Re
 }
 
 /// Age as the checker admits it: `5m`, `2h`, `3d`.
-pub fn age(since: &str) -> Option<String> {
+pub(crate) fn age(since: &str) -> Option<String> {
     let then: jiff::Timestamp = since.parse().ok()?;
     let secs = jiff::Timestamp::now().as_second() - then.as_second();
     let secs = secs.max(0);
@@ -168,7 +168,7 @@ fn agent_states(ctx: &Ctx, project: &Project) -> Option<BTreeMap<String, String>
 
 /// `ade_stage`: the newest round's phase, with its birth sentence if it
 /// fits. Also the stage line of `ha overview`.
-pub fn stage(project: &Project) -> String {
+pub(crate) fn stage(project: &Project) -> String {
     let rounds = crate::round::list(project);
     match rounds.last() {
         None => "no round is open yet".to_string(),
@@ -202,7 +202,7 @@ pub fn stage(project: &Project) -> String {
 }
 
 /// The five templated values, before the check.
-pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
+pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     let events = crate::round::sealed_events(project).unwrap_or_default();
     let mut out = Vec::new();
 
@@ -289,7 +289,7 @@ pub fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
 
 /// Publishes every row that passes; a row that fails keeps its previous
 /// value (re-sent with a fresh TTL). Returns the refused rows.
-pub fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
+pub(crate) fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
     if workspace_herdr(ctx, project).is_none() {
         return Ok(Vec::new());
     }
