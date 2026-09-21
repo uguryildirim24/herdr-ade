@@ -18,9 +18,6 @@ pub const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const COMPACT_LIMIT: usize = 80;
 pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
 pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, chosen for this work.";
-pub const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-pub const AGY_EFFORTS: [&str; 3] = ["low", "medium", "high"];
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatchConfig {
@@ -30,6 +27,7 @@ pub struct DispatchConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchConfig {
     pub recipes: BTreeMap<String, Recipe>,
+    pub adapters: BTreeMap<String, crate::adapters::Adapter>,
     pub dispatch: DispatchConfig,
     pub routing: crate::routing::Routing,
     pub policy_hash: String,
@@ -57,14 +55,18 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
         );
     }
     let raw: RawConfig = value.try_into()?;
-    let mut recipes = builtin_recipes();
-    // A configured row is a complete recipe, not an old inline role or a partial patch.
+    let defaults: RawConfig = toml::from_str(include_str!("../assets/default-recipes.toml"))
+        .context("shipped recipe declarations do not parse")?;
+    let mut recipes = defaults.recipes;
+    // A configured row is complete and replaces the shipped data row.
     recipes.extend(raw.recipes);
+    let adapters = crate::adapters::declarations(config_dir)?;
     let policy_hash = crate::thread::sha256_hex(
-        serde_json::to_vec(&(&recipes, &raw.dispatch, &raw.routing))?.as_slice(),
+        serde_json::to_vec(&(&recipes, &adapters, &raw.dispatch, &raw.routing))?.as_slice(),
     );
     let config = LaunchConfig {
         recipes,
+        adapters,
         dispatch: raw.dispatch,
         routing: raw.routing,
         policy_hash,
@@ -73,81 +75,16 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
     Ok(config)
 }
 
-fn builtin_recipes() -> BTreeMap<String, Recipe> {
-    let mut recipes = BTreeMap::new();
-    for (id, model, plain) in [
-        (
-            "agy_gemini_flash",
-            "gemini-3.8-flash-high",
-            "the web research helper",
-        ),
-        (
-            "claude_fable_xhigh",
-            "claude-fable-5-1",
-            "the planning helper",
-        ),
-        (
-            "claude_coordinator_opus",
-            "claude-opus-5",
-            "the planning helper",
-        ),
-    ] {
-        let kind = if id.starts_with("agy") {
-            "agy"
-        } else {
-            "claude"
-        };
-        let mut args = vec![
-            "--model".into(),
-            model.into(),
-            "--dangerously-skip-permissions".into(),
-        ];
-        if kind == "claude" {
-            let effort = if id == "claude_coordinator_opus" {
-                "high"
-            } else {
-                "xhigh"
-            };
-            args.extend(["--effort".into(), effort.into()]);
-        }
-        recipes.insert(
-            id.into(),
-            Recipe {
-                kind: kind.into(),
-                provider: kind.into(),
-                args,
-                plain: plain.into(),
-                ..Recipe::default()
-            },
-        );
-    }
-    for row in crate::pi::recipes::pi_recipes() {
-        recipes.insert(
-            row.id.into(),
-            Recipe {
-                kind: row.kind.into(),
-                provider: row.provider.into(),
-                args: row.args,
-                env: row.env,
-                ready_timeout_ms: row.ready_timeout_ms,
-                enabled: row.enabled,
-                plain: row.plain.into(),
-            },
-        );
-    }
-    recipes
-}
-
 pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Result<()> {
     for (id, recipe) in &config.recipes {
         if !kinds.contains(recipe.kind.trim()) {
             bail!("recipe_kind_unknown: {id}: {}", recipe.kind);
         }
-        validate_flags(id, recipe)?;
-        if recipe.kind == "pi" {
-            crate::pi::launch::validate_args(&recipe.args)?;
-            crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args)?;
-        }
+        let adapter = config
+            .adapters
+            .get(&recipe.kind)
+            .with_context(|| format!("adapter_unknown: recipe `{id}` uses `{}`", recipe.kind))?;
+        crate::adapters::validate_recipe(&recipe.kind, adapter, id, recipe)?;
         check_plain(&format!("recipe {id}"), &recipe.plain)?;
     }
     Ok(())
@@ -159,7 +96,7 @@ pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Resul
 #[serde(default, deny_unknown_fields)]
 struct TaskContract {
     product: String,
-    requires_claude: bool,
+    capability: Option<String>,
 }
 
 pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkContract> {
@@ -169,7 +106,7 @@ pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkC
         let (front, _) = rest
             .split_once("\n+++\n")
             .context("task_contract: unclosed front matter")?;
-        toml::from_str::<TaskContract>(front).context("task_contract: describe product and requires_claude; model/recipe/role overrides are forbidden")?
+        toml::from_str::<TaskContract>(front).context("task_contract: describe product and capability; model/recipe/role overrides are forbidden")?
     } else {
         TaskContract::default()
     };
@@ -182,7 +119,7 @@ pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkC
     Ok(crate::routing::WorkContract {
         workflow: workflow.to_string(),
         product: contract.product,
-        requires_claude: contract.requires_claude,
+        capability: contract.capability,
     })
 }
 
@@ -275,6 +212,14 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         .recipes
         .get(&selected.recipe)
         .context("routing_recipe_unknown")?;
+    if let Some(capability) = &work.capability
+        && !recipe.capabilities.contains(capability)
+    {
+        bail!(
+            "routing_capability_missing: recipe `{}` does not declare `{capability}`",
+            selected.recipe
+        );
+    }
     if !recipe.enabled {
         bail!("routing_recipe_disabled: {}", selected.recipe);
     }
@@ -293,7 +238,13 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     )?;
     Ok(Launch {
         kind: recipe.kind.clone(),
-        args: recipe.args.clone(),
+        args: crate::adapters::launch_args(
+            config
+                .adapters
+                .get(&recipe.kind)
+                .context("adapter_unknown")?,
+            recipe,
+        ),
         env: recipe.env.clone(),
         ready_timeout_ms: recipe.ready_timeout_ms,
         policy_hash: config.policy_hash,
@@ -383,41 +334,6 @@ pub fn parse_kinds(help: &str) -> Option<BTreeSet<String>> {
     if kinds.is_empty() { None } else { Some(kinds) }
 }
 
-fn validate_flags(id: &str, recipe: &Recipe) -> Result<()> {
-    let args: Vec<&str> = recipe.args.iter().map(String::as_str).collect();
-    let has = |flag: &str| args.contains(&flag);
-    match recipe.kind.as_str() {
-        "claude" => {
-            check_effort(id, &args, &CLAUDE_EFFORTS)?;
-            if !has("--dangerously-skip-permissions") {
-                bail!("recipe_permission_missing: `{id}` has no permission flag");
-            }
-        }
-        "agy" => {
-            check_effort(id, &args, &AGY_EFFORTS)?;
-            if !has("--dangerously-skip-permissions") {
-                bail!("recipe_permission_missing: `{id}` has no permission flag");
-            }
-        }
-        "cursor" if !has("--force") => {
-            bail!("recipe_permission_missing: `{id}` has no permission flag");
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// The check only verifies the effort is one of the values the CLI knows; the
-/// recipe table no longer caps Opus or Fable.
-fn check_effort(id: &str, args: &[&str], known: &[&str]) -> Result<()> {
-    if let Some(effort) = effort_value(args)
-        && !known.contains(&effort.as_str())
-    {
-        bail!("recipe_effort_unknown: `{id}` names effort {effort:?}");
-    }
-    Ok(())
-}
-
 fn check_plain(context: &str, sentence: &str) -> Result<()> {
     let result = plain::check(sentence, &Glossary::default());
     if !result.passed() {
@@ -432,17 +348,6 @@ fn check_plain(context: &str, sentence: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn effort_value(args: &[&str]) -> Option<String> {
-    let mut index = 0;
-    while index < args.len() {
-        if args[index] == "--effort" {
-            return args.get(index + 1).map(|value| (*value).to_string());
-        }
-        index += 1;
-    }
-    None
 }
 
 /// The job noun of each role.

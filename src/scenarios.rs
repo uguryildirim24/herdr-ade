@@ -35,7 +35,7 @@ impl World {
         let root = home.path().join("root");
         let env = Env::for_test(home.path(), &[]);
         std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n").unwrap();
+        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[machines.box]\ntarget = \"box\"\nsession = \"default\"\nhome = \"/home/ubuntu\"\nroot = \"/home/ubuntu/.herdr-ade\"\nworktrees = \"/home/ubuntu/projects\"\nbuild = \"/home/ubuntu/build/lanes\"\npath = \"/home/ubuntu/.local/bin:/usr/bin:/bin\"\nade_bin = \"/home/ubuntu/.local/bin/herdr-ade\"\npi_bin = \"/home/ubuntu/.local/bin/herdr-pi\"\n").unwrap();
         let world = World {
             env,
             root,
@@ -2504,7 +2504,10 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
         .collect();
     std::fs::write(
         dir.join("config.toml"),
-        format!("[harness]\nrepos = [\n{}\n]\n", rows.join("\n")),
+        format!(
+            "[harness]\nrepos = [\n{}\n]\n[dispatch]\nmachine = \"oci\"\n",
+            rows.join("\n")
+        ),
     )
     .unwrap();
     std::fs::write(dir.join("RULES.md"), "# Lane rules\n").unwrap();
