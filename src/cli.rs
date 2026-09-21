@@ -175,8 +175,8 @@ enum Command {
     Waiting { what: String },
     /// Record a failed lane attempt and request automatic stronger-model dispatch
     Failed { what: String },
-    /// Evaluate the editable routing policy against labelled full-brief cases
-    RoutingEval { cases: std::path::PathBuf },
+    /// Evaluate routing against completed work and its recorded outcomes
+    RoutingEval { project: String },
     /// Print a role skill and the runtime-only standing rules
     Skill {
         #[arg(default_value = "coordinator")]
@@ -1724,10 +1724,11 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
         Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
         Command::Failed { what } => crate::lane::failed(&ctx, &what),
-        Command::RoutingEval { cases } => {
+        Command::RoutingEval { project } => {
+            let project = crate::project::Project::load(&ctx.root, &project)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&crate::routing::evaluate(&ctx, &cases)?)?
+                serde_json::to_string_pretty(&crate::routing::evaluate(&ctx, &project)?)?
             );
             Ok(())
         }
