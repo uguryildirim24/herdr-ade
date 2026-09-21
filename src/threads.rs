@@ -2218,10 +2218,12 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         record.machine_route(),
     )?
     .target;
+    let build = crate::contracts::box_build_folder(&project.slug, &record.id);
     let script = format!(
-        "cd {} && git worktree remove {}",
+        "cd {} && git worktree remove {} && rm -rf -- {}",
         remote::quote(&box_repo),
-        remote::quote(&record.worktree_path)
+        remote::quote(&record.worktree_path),
+        remote::quote(&build)
     );
     let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
     if !out.success() {
