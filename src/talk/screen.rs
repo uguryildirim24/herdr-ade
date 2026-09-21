@@ -1453,17 +1453,16 @@ fn guarded<T>(cleanup: impl FnMut(), run: impl FnOnce() -> Result<T>) -> Result<
     run()
 }
 
-/// True when the installed build differs from the running one.
-fn screen_version_behind(installed: Option<&str>) -> bool {
-    installed.is_some_and(|version| version != crate::VERSION)
+/// True when the installed build differs from the running one and is not the
+/// same build this process was already asked to start. The attempted version
+/// stops a broken hand-off loop without suppressing a later install.
+fn screen_should_reexec(installed: Option<&str>, attempted: Option<&str>) -> bool {
+    installed.is_some_and(|version| version != crate::VERSION && Some(version) != attempted)
 }
 
 /// Hand over to the installed program when it is a different build. The
 /// terminal, screen and the composer draft are inherited by the new process.
 fn reexec_if_stale(ctx: &Ctx, draft: &str) {
-    if std::env::var_os("HERDR_TALK_REEXEC").is_some() {
-        return;
-    }
     let installed = ctx.env.home.join(".local/bin/herdr-ade");
     let same = std::fs::canonicalize(&installed)
         .ok()
@@ -1473,14 +1472,20 @@ fn reexec_if_stale(ctx: &Ctx, draft: &str) {
         return;
     }
     let version = super::stale::installed_version(ctx);
-    if !screen_version_behind(version.as_deref()) {
+    let attempted = std::env::var("HERDR_TALK_REEXEC").ok();
+    if !screen_should_reexec(version.as_deref(), attempted.as_deref()) {
         return;
     }
     use std::os::unix::process::CommandExt;
     let error = std::process::Command::new(&installed)
         .args(std::env::args_os().skip(1))
         .env("HERDR_TALK_DRAFT", draft)
-        .env("HERDR_TALK_REEXEC", "1")
+        .env(
+            "HERDR_TALK_REEXEC",
+            version
+                .as_deref()
+                .expect("a stale installed version exists"),
+        )
         .exec();
     eprintln!("herdr-ade: could not restart the project screen: {error}");
 }
@@ -2071,9 +2076,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_different_installed_build_is_stale() {
-        assert!(!screen_version_behind(None));
-        assert!(!screen_version_behind(Some(crate::VERSION)));
-        assert!(screen_version_behind(Some("0.1.0+older")));
+    fn only_a_different_untried_installed_build_is_stale() {
+        assert!(!screen_should_reexec(None, None));
+        assert!(!screen_should_reexec(Some(crate::VERSION), None));
+        assert!(screen_should_reexec(Some("0.1.0+new"), None));
+        assert!(!screen_should_reexec(Some("0.1.0+new"), Some("0.1.0+new")));
+        assert!(screen_should_reexec(Some("0.1.0+newer"), Some("0.1.0+new")));
     }
 }
