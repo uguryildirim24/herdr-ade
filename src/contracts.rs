@@ -945,8 +945,8 @@ mod tests {
     }
 
     #[test]
-    fn historical_launch_with_removed_routing_fields_still_loads() {
-        let launch: Launch = serde_json::from_value(serde_json::json!({
+    fn historical_records_with_removed_routing_fields_still_load() {
+        let json: Launch = serde_json::from_value(serde_json::json!({
             "recipe_id": "old",
             "strength": 3,
             "assessment": {"score": 1},
@@ -955,7 +955,41 @@ mod tests {
             "routing_hash": "aa"
         }))
         .unwrap();
-        assert_eq!(launch.recipe_id, "old");
+        assert_eq!(json.recipe_id, "old");
+
+        let toml: Launch = toml::from_str(
+            r#"recipe_id = "old"
+strength = 3
+assessment = { score = 1 }
+decision = { recipe = "old" }
+low_confidence = true
+routing_hash = "aa"
+"#,
+        )
+        .unwrap();
+        assert_eq!(toml.recipe_id, "old");
+
+        let dispatch: serde_json::Value = serde_json::from_str(
+            r#"{"kind":"pick","assessment":{"score":1},"decision":{"recipe":"old"},"low_confidence":true,"routing_hash":"aa"}"#,
+        )
+        .unwrap();
+        assert_eq!(dispatch["decision"]["recipe"], "old");
+
+        let round: RoundRecord = toml::from_str(
+            r#"round = "r1"
+branch = "main"
+plain = "This round checks old records."
+policy_hash = "old"
+routing_hash = "aa"
+assessment = { score = 1 }
+
+[manifest]
+revision = 1
+members = []
+"#,
+        )
+        .unwrap();
+        assert_eq!(round.round, "r1");
     }
 
     #[test]

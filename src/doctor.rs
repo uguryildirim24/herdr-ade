@@ -1526,6 +1526,30 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
+    fn doctor_without_a_routing_table_names_the_config_fix() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "").unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let (text, healthy) = report(
+            &env,
+            &home.path().join("root"),
+            &config,
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy, "{text}");
+        assert!(
+            text.contains(
+                "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn doctor_rejects_a_rule_with_an_unknown_recipe() {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("cfg");

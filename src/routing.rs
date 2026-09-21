@@ -45,7 +45,9 @@ pub struct Selection {
 impl Routing {
     pub fn validate(&self, recipes: &BTreeMap<String, Recipe>) -> Result<()> {
         if self.default.trim().is_empty() {
-            bail!("routing_default_empty: [routing].default must name a recipe");
+            bail!(
+                "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
+            );
         }
         self.validate_recipe(recipes, &self.default)?;
         for recipe in &self.fallback {
@@ -217,6 +219,18 @@ mod tests {
             .to_string();
         assert!(error.contains("recovery_exhausted"), "{error}");
         assert!(error.contains("waiting for the coordinator"), "{error}");
+    }
+
+    #[test]
+    fn missing_table_names_the_config_fix() {
+        let error = Routing::default()
+            .validate(&recipes())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
+        );
     }
 
     #[test]

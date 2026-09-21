@@ -1655,6 +1655,28 @@ fn open_leaves_a_matching_label_alone_and_a_failed_rename_does_not_block_it() {
 }
 
 #[test]
+fn launch_without_a_routing_table_names_the_config_fix() {
+    let world = World::new();
+    std::fs::write(world.home.path().join("cfg/config.toml"), "").unwrap();
+    let project = world.project("demo", "a.sock");
+    let error = crate::launch::resolve_launch(
+        &world.ctx(),
+        &project,
+        &crate::launch::ResolveInput {
+            task: "Do the work.",
+            workflow: "lane",
+            ..Default::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        error,
+        "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
+    );
+}
+
+#[test]
 fn open_accepts_a_non_claude_coordinator_recipe() {
     let world = World::new();
     let config = world.home.path().join("cfg/config.toml");

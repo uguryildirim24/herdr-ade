@@ -305,7 +305,7 @@ pub struct DoctorRow {
 pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
     let config = parse_launch_config(&ctx.config_dir)?;
     let valid = validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?);
-    let mut rows = vec![DoctorRow {
+    Ok(vec![DoctorRow {
         ok: Some(valid.is_ok()),
         label: "recipes and routing".into(),
         detail: valid
@@ -317,15 +317,7 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
                     config.recipes.len()
                 )
             }),
-    }];
-    if ctx.config_dir.join("routing.json").exists() {
-        rows.push(DoctorRow {
-            ok: None,
-            label: "unused routing.json".into(),
-            detail: "remove it; routing now lives in config.toml".into(),
-        });
-    }
-    Ok(rows)
+    }])
 }
 /// The kinds `herdr agent start` accepts, read from its `--help`.
 pub fn agent_kinds(env: &Env, runner: &dyn Runner) -> Result<BTreeSet<String>> {
