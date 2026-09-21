@@ -385,6 +385,9 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
 
 pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    if !peek {
+        crate::task::refresh_tasks_md(&project)?;
+    }
     // A peek reads; it is not the coordinator's receipt (D14).
     if !peek {
         acknowledge_bootstrap(&project)?;
@@ -540,31 +543,34 @@ fn digest_snapshot(
         let _ = writeln!(out, "{warning}");
     }
 
-    let _ = writeln!(out, "\n## Tasks (TASKS.md)");
-    let (lists, unreadable) = crate::talk::tasks::load(project);
-    let total = lists.iter().map(|list| list.tasks.len()).sum();
-    if unreadable {
-        let _ = writeln!(out, "config-error: TASKS.md is unreadable");
-    } else if total == 0 {
+    let _ = writeln!(out, "\n## Open tasks (generated from task records)");
+    let (task_views, task_errors) = crate::task::views(project);
+    for error in &task_errors {
+        let _ = writeln!(out, "config-error: {error:#}");
+    }
+    let open_tasks: Vec<_> = task_views
+        .iter()
+        .filter(|view| !view.terminal(project))
+        .collect();
+    if open_tasks.is_empty() && task_errors.is_empty() {
         let _ = writeln!(out, "(none)");
     }
-    let mut remaining = DIGEST_ROWS;
-    for list in lists.iter().filter(|list| !list.tasks.is_empty()) {
-        if remaining == 0 {
-            break;
-        }
-        let _ = writeln!(out, "### {}", list.heading);
-        for task in list.tasks.iter().take(remaining) {
-            let delegate = task
-                .thread
-                .as_ref()
-                .map(|id| format!(" → {id}"))
-                .unwrap_or_default();
-            let _ = writeln!(out, "- [ ] {} ({}{delegate})", task.title, task.owner);
-        }
-        remaining = remaining.saturating_sub(list.tasks.len());
+    for view in open_tasks.iter().take(DIGEST_ROWS) {
+        let class = view
+            .failure_class
+            .map(|class| format!(" ({})", class.plain()))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "- {} [{}{}] {} — next: {}",
+            view.record.id,
+            view.state.word(),
+            class,
+            view.record.title,
+            view.next
+        );
     }
-    overflow(&mut out, total, "TASKS.md");
+    overflow(&mut out, open_tasks.len(), "tasks/");
 
     out.push_str(&crate::ledger::section(project)?);
 
