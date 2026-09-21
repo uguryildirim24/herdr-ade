@@ -326,7 +326,7 @@ fn current_round(project: &Project) -> Option<(String, Vec<String>)> {
         let Ok(record) = toml::from_str::<crate::contracts::RoundRecord>(&text) else {
             continue;
         };
-        if crate::threads::round_landed(project, &record.round) {
+        if record.phase.closed() || crate::threads::round_landed(project, &record.round) {
             continue;
         }
         if best

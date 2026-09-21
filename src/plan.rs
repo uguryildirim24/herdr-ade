@@ -564,27 +564,32 @@ mod tests {
         .unwrap();
     }
 
-    /// Drive a real review and merge for `r1`, so the plan sees a landed
-    /// carrying round rather than a hand-written merge record.
-    fn land_r1(fx: &Fx, lanes: &[(String, String)]) {
+    /// Drive a real review and merge, so the plan sees a landed carrying round
+    /// rather than a hand-written merge record.
+    fn land_round(fx: &Fx, round: &str, lanes: &[(String, String)]) {
         let ctx = fx.world.ctx();
-        let o = crate::round::review(&ctx, "demo", "r1").unwrap();
+        let o = crate::round::review(&ctx, "demo", round).unwrap();
         let wt = o.worktree;
         for (_, sha) in lanes {
             git(&wt, &["merge", "-q", "--no-edit", sha]);
         }
         let c = git(&wt, &["rev-parse", "HEAD"]);
-        let record = crate::round::load(&fx.project, "r1").unwrap();
+        let record = crate::round::load(&fx.project, round).unwrap();
         let front = format!(
-            "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll gates pass.\n",
+            "+++\nverdict = \"MERGE\"\nround = \"{round}\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll gates pass.\n",
             record.manifest_hash.clone().unwrap(),
             record.policy_hash
         );
-        let v = commit_file(&wt, &crate::round::verdict_path("r1"), &front, "verdict r1");
+        let v = commit_file(
+            &wt,
+            &crate::round::verdict_path(round),
+            &front,
+            &format!("verdict {round}"),
+        );
         let reviewer = fx.thread("Reviewer");
         fx.seal_done(&reviewer, 1, 1, &v, "# verdict report\n");
-        crate::round::bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
-        let out = crate::round::merge(&ctx, "demo", "r1", None).unwrap();
+        crate::round::bind_reviewer(&ctx, "demo", round, &reviewer).unwrap();
+        let out = crate::round::merge(&ctx, "demo", round, None).unwrap();
         assert!(matches!(
             out,
             crate::round::MergeOutcome::Checkpointed { .. }
@@ -810,7 +815,7 @@ mod tests {
         let _ = sync(&ctx, "demo").unwrap();
         assert_eq!(state(&fx), StepState::Running);
 
-        land_r1(&fx, &[(lane.clone(), sha.clone())]);
+        land_round(&fx, "r1", &[(lane.clone(), sha.clone())]);
         assert!(
             MergePhase::Checkpointed
                 == crate::round::read_merge(&fx.project, "r1")
@@ -839,6 +844,39 @@ mod tests {
         crate::round::admit(&ctx, "demo", "r2", &lane).unwrap();
         let _ = sync(&ctx, "demo").unwrap();
         assert_eq!(state(&fx), StepState::Running);
+    }
+
+    #[test]
+    fn an_abandoned_round_releases_a_lane_that_lands_in_a_later_round() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
+        let (lane, sha) = fx.lane(1);
+        add(&fx, "Land the lane once.", 1);
+        step_link(&ctx, "demo", "s-1", vec![lane.clone()], vec![], 2).unwrap();
+
+        open_r1(&fx, "The first round tries to land the lane.");
+        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        crate::round::abandon(&ctx, "demo", "r1", "the review cannot proceed").unwrap();
+
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some("The later round lands the lane.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        crate::round::admit(&ctx, "demo", "r2", &lane).unwrap();
+        assert_eq!(threads::carrying_rounds(&fx.project, &lane), ["r2"]);
+
+        land_round(&fx, "r2", &[(lane, sha)]);
+        let _ = sync(&ctx, "demo").unwrap();
+        assert_eq!(state(&fx), StepState::Done);
     }
 
     #[test]
