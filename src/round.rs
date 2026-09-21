@@ -1150,9 +1150,9 @@ pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thre
 /// `pane.agent_status_changed` hook and the ticker call.
 ///
 /// A start that does not take is loud and is retried: `advance` says so on
-/// standard error with the reason, un-binds the dead reviewer and tries again
-/// on the next pass, up to `MAX_REVIEWER_START_FAILURES`. A round is never
-/// left with a bound reviewer whose agent never came up (E3/D1).
+/// standard error with the reason, un-binds a dead reviewer and tries again,
+/// up to `MAX_REVIEWER_START_FAILURES`. A round is never left with a bound
+/// reviewer whose agent never came up (E3/D1).
 #[derive(Debug, Default)]
 pub struct AdvanceOutcome {
     pub started: Vec<ReviewerStarted>,
@@ -1693,13 +1693,18 @@ fn reviewer_start_failed(
     };
     crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
+    let retry = if dead_reviewer.is_some() {
+        "it is retried now"
+    } else {
+        "it is retried on the next pass"
+    };
     announce_once(
         ctx,
         project,
         round,
         "reviewer-start-failed",
         &format!(
-            "Round {round}: the reviewer did not start ({reason}); it is retried on the next pass, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
+            "Round {round}: the reviewer did not start ({reason}); {retry}, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
         ),
         None,
     )?;
