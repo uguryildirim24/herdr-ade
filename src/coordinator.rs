@@ -18,6 +18,8 @@ pub(crate) const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 /// The digest is a work queue, not an archive. Full records remain at the
 /// source named by each overflow notice. Apply this to nested lists too.
 const DIGEST_ROWS: usize = 20;
+/// How many of Rolf's latest messages the digest prints so an id is findable.
+const REQUEST_ROWS: usize = 5;
 
 fn overflow(out: &mut String, total: usize, source: &str) {
     if total > DIGEST_ROWS {
@@ -66,12 +68,45 @@ pub(crate) fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
         && pane.cwd == record.cwd
 }
 
-pub(crate) fn agent_matches(record: &Coordinator, agent: &Agent) -> bool {
+/// True when `agent` runs in the pane the record describes, whatever its name.
+/// `agent start` drops the name when interactive readiness times out, and a
+/// live server handoff drops it on respawn, so the pane can outlive the name.
+pub(crate) fn agent_on_pane(record: &Coordinator, agent: &Agent) -> bool {
     agent.pane_id == record.pane_id
         && agent.workspace_id == record.workspace_id
         && agent.tab_id == record.tab_id
         && agent.cwd == record.cwd
-        && agent.name == record.agent_name
+}
+
+pub(crate) fn agent_matches(record: &Coordinator, agent: &Agent) -> bool {
+    agent_on_pane(record, agent) && agent.name == record.agent_name
+}
+
+/// Restores the recorded name on the agent still running in the bound pane.
+/// Returns the agent when the pane hosts one, the recorded one when the name
+/// already resolves, and `None` when the pane holds no agent. A successful
+/// restore is durable: `name_restored` counts it.
+pub(crate) fn restore_agent_name(
+    project: &Project,
+    herdr: &Herdr,
+    record: &Coordinator,
+    agents: &[Agent],
+) -> Result<Option<Agent>> {
+    if let Some(agent) = agents.iter().find(|a| agent_matches(record, a)) {
+        return Ok(Some(agent.clone()));
+    }
+    let Some(agent) = agents
+        .iter()
+        .find(|a| agent_on_pane(record, a))
+        .filter(|_| !record.agent_name.is_empty())
+    else {
+        return Ok(None);
+    };
+    herdr
+        .agent_rename(&record.pane_id, &record.agent_name)
+        .map_err(|e| anyhow::anyhow!("agent name restore: {e}"))?;
+    project.update_coordinator(|c| c.name_restored = c.name_restored.saturating_add(1))?;
+    Ok(Some(agent.clone()))
 }
 
 pub(crate) fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
@@ -153,16 +188,19 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let prompt = priming_prompt(&prefix, slug);
     let label = crate::project::display_name(&settings.name, slug);
 
-    // Already open and alive: focus it.
+    // Already open and alive: focus it. A launch whose interactive readiness
+    // timed out, or a live server handoff, can leave the agent running without
+    // its recorded name; put the name back and keep the pane instead of
+    // opening a second coordinator.
     if let Some(record) = &previous
-        && let Some(agent) = agents.iter().find(|a| agent_matches(record, a))
+        && let Some(agent) = restore_agent_name(&project, &herdr, record, &agents)?
     {
         crate::hook::install(ctx, &project, &record.launch.kind, &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
         report_tokens(&herdr, slug, &record.pane_id);
         if options.reprime {
-            deliver_or_defer(&project, &herdr, agent, &prompt)?;
+            deliver_or_defer(&project, &herdr, &agent, &prompt)?;
         }
         talk_tab(ctx, &project);
         ticker::start(ctx)?;
@@ -261,6 +299,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             prime_sent: false,
             bootstrap: String::new(),
             generation: generation + 1,
+            name_restored: previous.as_ref().map_or(0, |r| r.name_restored),
         }
     })?;
 
@@ -318,14 +357,16 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// Sends the priming prompt now when the agent is ready for one; otherwise
 /// leaves `prime_pending` set so the ticker delivers it. One delivery path.
 fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &str) -> Result<()> {
-    let sent = agent.ready()
-        && match herdr.agent_prompt(&agent.pane_id, prompt) {
+    let sent = agent.ready() && {
+        crate::talk::mark_automated_prompt(project, &agent.pane_id, prompt)?;
+        match herdr.agent_prompt(&agent.pane_id, prompt) {
             Ok(()) => true,
             Err(error) => {
                 println!("the priming prompt was not accepted ({error})");
                 false
             }
-        };
+        }
+    };
     // Transport is not the bootstrap receipt: `prime_pending` clears only when
     // the matching `ha context` call records `bootstrap = acknowledged`.
     project.update_coordinator(|c| {
@@ -457,6 +498,20 @@ fn digest_snapshot(
         }
         Err(error) => {
             let _ = writeln!(out, "config-error: {error:#}");
+        }
+    }
+
+    // Rolf's own words, each under the request id `ha decide --basis` cites.
+    let requests = crate::talk::recent_requests(project, REQUEST_ROWS);
+    if !requests.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## Latest messages from Rolf — cite one with --basis request:<id>"
+        );
+        for (request, text) in &requests {
+            let first = text.lines().next().unwrap_or_default();
+            let short: String = first.chars().take(160).collect();
+            let _ = writeln!(out, "- {request}: {short}");
         }
     }
 
@@ -894,7 +949,22 @@ mod tests {
             &record,
             &Agent {
                 tab_id: "w1:t2".into(),
-                ..agent
+                ..agent.clone()
+            }
+        ));
+        // A dropped name does not move the agent off the pane: the restore
+        // path needs the pane identity without the name.
+        let unnamed = Agent {
+            name: String::new(),
+            ..agent.clone()
+        };
+        assert!(agent_on_pane(&record, &unnamed));
+        assert!(!agent_matches(&record, &unnamed));
+        assert!(!agent_on_pane(
+            &record,
+            &Agent {
+                cwd: "/elsewhere".into(),
+                ..unnamed
             }
         ));
     }

@@ -91,7 +91,7 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     );
     let _lock = project.lock()?;
     let mut value = read_json_object(&path)?;
-    install_entry(&mut value, shape, &command)?;
+    install_entry(&mut value, shape, kind, &command)?;
     write_json_atomic(&path, &value)?;
     let dir = project.state_dir().join("plain");
     std::fs::create_dir_all(&dir)?;
@@ -104,7 +104,7 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
             session_id: String::new(),
         },
     )?;
-    verify_owned_entry(&path, pane, shape)?;
+    verify_owned_entry(&path, pane, shape, kind)?;
     Ok(true)
 }
 
@@ -116,11 +116,41 @@ pub(crate) fn remove(project: &Project) -> Result<()> {
         && path.exists()
     {
         let mut value = read_json_object(&path)?;
-        remove_entries(&mut value, shape);
+        remove_entries(&mut value, shape, &binding.kind);
         write_json_atomic(&path, &value)?;
     }
     let _ = std::fs::remove_file(binding_path(project));
     Ok(())
+}
+
+/// True when a prompt-submit hook is bound to this pane, so the talk layer
+/// knows to write prompt markers for it.
+pub(crate) fn captures(project: &Project, pane: &str) -> bool {
+    let Some(binding) = project::read_json::<Binding>(&binding_path(project)) else {
+        return false;
+    };
+    if binding.pane != pane {
+        return false;
+    }
+    settings_path(project, &binding.kind)
+        .is_some_and(|(_, shape)| owned_events(shape, &binding.kind).contains(&"UserPromptSubmit"))
+}
+
+/// The hook events this kind installs. Only Claude Code exposes a
+/// prompt-submit event; the other kinds keep their end-of-turn checks.
+fn owned_events(shape: ConfigShape, kind: &str) -> &'static [&'static str] {
+    match shape {
+        ConfigShape::ClaudeLike if kind == "claude" => &["Stop", "UserPromptSubmit"],
+        ConfigShape::ClaudeLike => &["Stop"],
+        ConfigShape::Cursor => &["afterAgentResponse", "stop"],
+    }
+}
+
+fn event_phase(event: &str) -> Option<&'static str> {
+    match event {
+        "UserPromptSubmit" => Some("prompt"),
+        _ => None,
+    }
 }
 
 fn owned_hook(value: &serde_json::Value) -> bool {
@@ -134,7 +164,12 @@ fn owned_hook(value: &serde_json::Value) -> bool {
         })
 }
 
-fn install_entry(value: &mut serde_json::Value, shape: ConfigShape, command: &str) -> Result<()> {
+fn install_entry(
+    value: &mut serde_json::Value,
+    shape: ConfigShape,
+    kind: &str,
+    command: &str,
+) -> Result<()> {
     let object = value
         .as_object_mut()
         .context("hook_install_failed: the settings file is not a JSON object")?;
@@ -148,16 +183,24 @@ fn install_entry(value: &mut serde_json::Value, shape: ConfigShape, command: &st
         .context("hook_config_invalid: `hooks` is not an object")?;
     match shape {
         ConfigShape::ClaudeLike => {
-            let stop = hooks
-                .entry("Stop")
-                .or_insert_with(|| serde_json::json!([]))
-                .as_array_mut()
-                .context("hook_config_invalid: `hooks.Stop` is not an array")?;
-            stop.retain(|entry| !owned_hook(entry));
-            stop.push(serde_json::json!({
-                "matcher": "",
-                "hooks": [{ "type": "command", "command": command }]
-            }));
+            for event in owned_events(shape, kind) {
+                let entries = hooks
+                    .entry(*event)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .with_context(|| {
+                        format!("hook_config_invalid: `hooks.{event}` is not an array")
+                    })?;
+                entries.retain(|entry| !owned_hook(entry));
+                let command = match event_phase(event) {
+                    Some(phase) => format!("{command} --phase {phase}"),
+                    None => command.to_string(),
+                };
+                entries.push(serde_json::json!({
+                    "matcher": "",
+                    "hooks": [{ "type": "command", "command": command }]
+                }));
+            }
         }
         ConfigShape::Cursor => {
             for (event, phase) in [("afterAgentResponse", "observe"), ("stop", "stop")] {
@@ -179,12 +222,8 @@ fn install_entry(value: &mut serde_json::Value, shape: ConfigShape, command: &st
     Ok(())
 }
 
-fn remove_entries(value: &mut serde_json::Value, shape: ConfigShape) {
-    let names: &[&str] = match shape {
-        ConfigShape::ClaudeLike => &["Stop"],
-        ConfigShape::Cursor => &["afterAgentResponse", "stop"],
-    };
-    for name in names {
+fn remove_entries(value: &mut serde_json::Value, shape: ConfigShape, kind: &str) {
+    for name in owned_events(shape, kind) {
         if let Some(entries) = value
             .get_mut("hooks")
             .and_then(|hooks| hooks.get_mut(*name))
@@ -195,12 +234,9 @@ fn remove_entries(value: &mut serde_json::Value, shape: ConfigShape) {
     }
 }
 
-fn verify_owned_entry(path: &Path, pane: &str, shape: ConfigShape) -> Result<()> {
+fn verify_owned_entry(path: &Path, pane: &str, shape: ConfigShape, kind: &str) -> Result<()> {
     let value = read_json_object(path)?;
-    let names: &[&str] = match shape {
-        ConfigShape::ClaudeLike => &["Stop"],
-        ConfigShape::Cursor => &["afterAgentResponse", "stop"],
-    };
+    let names = owned_events(shape, kind);
     let found: usize = names
         .iter()
         .map(|event| {
@@ -238,6 +274,18 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
         serde_json::from_slice(&bytes).context("hook input is not JSON")?;
     let session = input["session_id"].as_str().unwrap_or_default();
     if !scope_binding(&project, kind, pane, session)? {
+        return Ok(());
+    }
+    // A prompt Rolf typed straight into the pane: record it under a request id
+    // the coordinator can cite. A talk delivery or a harness line is not his
+    // words and is not recorded again.
+    if phase == "prompt" {
+        let text = prompt_text(&input).unwrap_or_default();
+        if !text.trim().is_empty()
+            && let Some(request) = handle_prompt(&project, pane, text)?
+        {
+            println!("request {request}");
+        }
         return Ok(());
     }
     // The coordinator's turn ended: talk requests it was handed are taken.
@@ -356,6 +404,27 @@ fn scope_binding(project: &Project, kind: &str, pane: &str, session: &str) -> Re
         return Ok(false);
     }
     Ok(true)
+}
+
+/// The submitted user text from a prompt-submit hook.
+fn prompt_text(input: &serde_json::Value) -> Option<&str> {
+    input["prompt"].as_str()
+}
+
+/// Records a prompt typed into the coordinator pane and returns the request id
+/// to print, or `None` when a harness line must not be recorded as Rolf's.
+fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<String>> {
+    match crate::talk::take_pending_prompt(project, pane, text) {
+        Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
+        Some(crate::talk::PendingPrompt::Automated) => Ok(None),
+        Some(crate::talk::PendingPrompt::Mixed) => {
+            println!(
+                "This prompt includes harness text. Send the human message separately to obtain a request id."
+            );
+            Ok(None)
+        }
+        None => Ok(Some(crate::talk::record_pane_request(project, text)?)),
+    }
 }
 
 fn reply_text<'a>(kind: &str, input: &'a serde_json::Value) -> Option<&'a str> {
@@ -644,9 +713,111 @@ mod tests {
         install(&ctx, &project, "claude", "w1:p1").unwrap();
         let value = read_json_object(&path).unwrap();
         assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        let prompt = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(prompt.len(), 1, "the prompt-submit hook is installed once");
+        assert!(
+            prompt[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--phase prompt")
+        );
         remove(&project).unwrap();
         let value = read_json_object(&path).unwrap();
         assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(
+            value["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_pane_prompt_gets_a_request_id_but_a_harness_line_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        install(&ctx, &project, "claude", "w1:p1").unwrap();
+
+        crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap();
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap(),
+            None
+        );
+        assert!(crate::talk::recent_requests(&project, 5).is_empty());
+
+        crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0002 report.md sha").unwrap();
+        assert_eq!(
+            handle_prompt(
+                &project,
+                "w1:p1",
+                "my half-typed wordsDONE t-0002 report.md sha"
+            )
+            .unwrap(),
+            None
+        );
+        assert!(crate::talk::recent_requests(&project, 5).is_empty());
+
+        let id = handle_prompt(&project, "w1:p1", "Spend five dollars on the check.")
+            .unwrap()
+            .unwrap();
+        assert!(id.starts_with("q-"), "{id}");
+        assert_eq!(
+            crate::talk::recent_requests(&project, 5),
+            vec![(id.clone(), "Spend five dollars on the check.".to_string())]
+        );
+        let record = crate::decide::decide(
+            &ctx,
+            "demo",
+            crate::decide::NewDecision {
+                line: "I will spend five dollars on the check.",
+                class: "money",
+                key: None,
+                basis: Some(&format!("request:{id}")),
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            record.basis.as_deref(),
+            Some(format!("request:{id}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_talk_delivery_reuses_the_request_the_talk_tab_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        install(&ctx, &project, "claude", "w1:p1").unwrap();
+        crate::talk::mark_talk_delivery(&project, "w1:p1", "q-42-7", "please look at the tests")
+            .unwrap();
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", "please look at the tests").unwrap(),
+            Some("q-42-7".into())
+        );
+        assert!(crate::talk::recent_requests(&project, 5).is_empty());
     }
 
     /// Review defect: Claude's key was the transcript path, so the budget of

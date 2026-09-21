@@ -131,7 +131,7 @@ impl Scroll {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Composer {
     text: String,
     cursor: usize,
@@ -186,6 +186,9 @@ struct App {
     reveal: bool,
     hint: Option<(String, Instant)>,
     chat_items: Option<usize>,
+    /// After an Esc, the bytes of a split mouse report can arrive as plain
+    /// characters; collect and drop them instead of typing them.
+    escape_tail: Option<(String, Composer)>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -209,6 +212,7 @@ impl Default for App {
             reveal: false,
             hint: None,
             chat_items: None,
+            escape_tail: None,
         }
     }
 }
@@ -321,6 +325,33 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Input::None;
         }
+        if let Some((mut tail, draft)) = self.escape_tail.take() {
+            if let KeyCode::Char(ch) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                tail.push(ch);
+                if mouse_report(&tail) {
+                    // A split mouse report is not a clear command.
+                    self.composer = draft;
+                    return Input::None;
+                }
+                if mouse_report_prefix(&tail) {
+                    self.escape_tail = Some((tail, draft));
+                    return Input::None;
+                }
+                // The Esc was a real clear; type what followed it.
+                self.composer.insert(&tail);
+                return Input::None;
+            }
+            // A truncated report must neither erase the draft nor leak bytes.
+            if tail.starts_with("[<") {
+                self.composer = draft;
+            } else {
+                self.composer.insert(&tail);
+            }
+        }
         let action =
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 Some(Action::Exit)
@@ -330,6 +361,9 @@ impl App {
                     .map(|(_, a, _, _)| *a)
             };
         if let Some(action) = action {
+            if matches!(action, Action::Clear) {
+                self.escape_tail = Some((String::new(), self.composer.clone()));
+            }
             match action {
                 Action::Exit => return Input::Exit,
                 Action::Send if !self.composer.text.is_empty() => {
@@ -365,6 +399,32 @@ enum Input {
     Send(String),
     Answer(Target, u32),
     Exit,
+}
+
+/// A complete SGR mouse report, e.g. `[<64;15;5M` or `[<64;15;5m`.
+fn mouse_report(text: &str) -> bool {
+    let Some(last) = text.chars().last() else {
+        return false;
+    };
+    if last != 'M' && last != 'm' {
+        return false;
+    }
+    let body = &text[..text.len() - last.len_utf8()];
+    let Some(body) = body.strip_prefix("[<") else {
+        return false;
+    };
+    !body.is_empty()
+        && body
+            .split(';')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// A prefix of the SGR mouse report grammar, `[`, `[<`, `[<64;` and so on.
+fn mouse_report_prefix(text: &str) -> bool {
+    match text.strip_prefix("[<") {
+        Some(body) => body.chars().all(|c| c.is_ascii_digit() || c == ';'),
+        None => text == "[",
+    }
 }
 
 #[derive(Default)]
@@ -792,7 +852,7 @@ fn timeline(
     for (i, item) in c.items.iter().enumerate() {
         let key = format!("chat-{i}");
         let next = view::date(&item.at);
-        if day != next {
+        if !next.is_empty() && day != next {
             d.prose(
                 &key,
                 vec![span(format!("── {next} ──"), t.overlay0)],
@@ -1224,7 +1284,16 @@ fn draw(
                 }
             }
         } else {
-            let oh = body.height.saturating_sub(9).min(26);
+            // Give the selected question card enough room to read in full; the
+            // overview keeps its own scroll position. Never starve the chat.
+            let selected = c.open.iter().find(|a| app.selection.matches(a));
+            let oh = match selected {
+                Some(a) => {
+                    let card_h = card(a, false, true, 36, t).lines.len() as u16;
+                    body.height.saturating_sub(card_h + 2).clamp(6, 26)
+                }
+                None => body.height.saturating_sub(9).min(26),
+            };
             let or = Rect { height: oh, ..body };
             app.regions.push((Area::Overview, or));
             viewport(f, or, &odoc, &mut app.overview, t, true);
@@ -1261,13 +1330,17 @@ fn draw(
                 let content = Rect::new(qr.x, qr.y + 1, qr.width, qr.height.saturating_sub(1));
                 let mut doc = Document::default();
                 let mut selected_range = None;
+                let mut first = true;
                 for a in &c.open {
+                    if !first {
+                        doc.push("question-gap", Line::default());
+                    }
+                    first = false;
                     let start = doc.lines.len();
                     doc.extend(card(a, app.selection.matches(a), true, 36, t));
                     if app.selection.matches(a) {
                         selected_range = Some((start, doc.lines.len(), a));
                     }
-                    doc.push("question-gap", Line::default());
                 }
                 if app.reveal
                     && let Some((start, _, _)) = selected_range
@@ -1385,20 +1458,66 @@ fn guarded<T>(cleanup: impl FnMut(), run: impl FnOnce() -> Result<T>) -> Result<
     run()
 }
 
+/// True when the installed build differs from the running one.
+fn screen_version_behind(installed: Option<&str>) -> bool {
+    installed.is_some_and(|version| version != crate::VERSION)
+}
+
+fn should_reexec(installed: Option<&str>, attempted: Option<&str>) -> bool {
+    screen_version_behind(installed) && installed != attempted
+}
+
+fn enter_terminal() -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        event::EnableMouseCapture,
+        SetCursorStyle::SteadyBlock
+    )?;
+    Ok(())
+}
+
+/// Compare builds, not paths: an atomic install replaces the same pathname.
+/// Restore termios before exec so the new process saves the original cooked
+/// mode, not our raw mode. A failed exec re-enters the current screen.
+fn reexec_if_stale(ctx: &Ctx, draft: &str, active: bool) -> Result<bool> {
+    let version = super::stale::installed_version(ctx);
+    let attempted = std::env::var("HERDR_TALK_REEXEC").ok();
+    if !should_reexec(version.as_deref(), attempted.as_deref()) {
+        return Ok(false);
+    }
+    let installed = ctx.env.home.join(".local/bin/herdr-ade");
+    if active {
+        restore();
+    }
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(&installed)
+        .args(std::env::args_os().skip(1))
+        .env("HERDR_TALK_DRAFT", draft)
+        // Prevent a broken binary from looping, without blocking later installs.
+        .env("HERDR_TALK_REEXEC", version.as_deref().unwrap_or_default())
+        .exec();
+    eprintln!("herdr-ade: could not restart the project screen: {error}");
+    if active {
+        enter_terminal()?;
+    }
+    Ok(true)
+}
+
 pub(crate) fn run(ctx: &Ctx, slug: &str) -> Result<()> {
+    // A stale screen replaces itself before it paints, so an install never
+    // leaves an old copy running in the tab.
+    let draft = std::env::var("HERDR_TALK_DRAFT").unwrap_or_default();
+    reexec_if_stale(ctx, &draft, false)?;
     let project = Project::load(&ctx.root, slug)?;
     guarded(restore, || {
-        enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            event::EnableMouseCapture,
-            SetCursorStyle::SteadyBlock
-        )?;
+        enter_terminal()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         let theme = Theme::load(ctx.env);
         let mut app = App::default();
+        app.composer.insert(&draft);
         let mut journal = JournalReader::default();
         let mut live = Live::default();
         let mut poll = Instant::now() - Duration::from_secs(3);
@@ -1418,6 +1537,9 @@ pub(crate) fn run(ctx: &Ctx, slug: &str) -> Result<()> {
             if slow.elapsed() >= Duration::from_secs(30) {
                 live.refresh_slow(ctx, &project);
                 slow = Instant::now();
+                if reexec_if_stale(ctx, &app.composer.text, true)? {
+                    terminal.clear()?;
+                }
             }
             journal.refresh(&project)?;
             let mut conversation = Conversation::load(&project, &journal.journal);
@@ -1862,6 +1984,7 @@ mod tests {
             overview::CHANGE,
             overview::ASK_WARNING,
             overview::STALE_HEADING,
+            overview::STALE_UNKNOWN,
             overview::COST_HEADING,
             overview::TASKS_HEADING,
             overview::NO_COST,
@@ -1880,5 +2003,99 @@ mod tests {
             })
             .collect();
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn a_split_mouse_report_is_not_typed_into_the_composer() {
+        let mut app = App::default();
+        let c = Conversation::default();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        // The Esc arrives alone, then the rest of the SGR report is read as
+        // plain characters, as a slow terminal can split it. Keep the draft.
+        app.composer.insert("unsent draft");
+        app.composer.left();
+        let cursor = app.composer.cursor;
+        app.key(esc, &c);
+        for letter in "[<64;15;5M".chars() {
+            app.key(ch(letter), &c);
+        }
+        assert_eq!(app.composer.text, "unsent draft");
+        assert_eq!(app.composer.cursor, cursor);
+        // A real clear still lets ordinary typing through.
+        app.key(esc, &c);
+        for letter in "hello".chars() {
+            app.key(ch(letter), &c);
+        }
+        assert_eq!(app.composer.text, "hello");
+    }
+
+    #[test]
+    fn the_selected_question_fits_at_the_default_sizes() {
+        let fx = fixture();
+        let a = crate::ask::ask(
+            &fx.world.ctx(),
+            "demo",
+            crate::ask::NewAsk {
+                question: "May I spend five dollars on this check?".into(),
+                choices: vec![
+                    "Keep it running.".into(),
+                    "Stop it now.".into(),
+                    "Wait for me.".into(),
+                ],
+                what: None,
+                means: None,
+                round: None,
+                reask: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(a.choices.len(), 3);
+        let j = super::super::read(&fx.project);
+        let c = Conversation::load(&fx.project, &j);
+        let o = Overview::load(&fx.project, &j, &c, &Live::default());
+        for (w, h) in [(120u16, 40u16), (134u16, 40u16), (60u16, 40u16)] {
+            let mut app = App::default();
+            app.refresh(&c);
+            let text = capture(w, h, &mut app, &o, &c);
+            assert_eq!(app.questions.max(), 0, "{w}x{h} needs scrolling:\n{text}");
+            assert!(
+                text.contains("I did not understand the question"),
+                "{w}x{h}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untimed_notice_does_not_draw_an_empty_date_rule() {
+        let mut c = Conversation::default();
+        c.items.push(view::Item {
+            at: String::new(),
+            body: Body::Notice("Your message waits until the coordinator is ready.".into()),
+            delivery: None,
+        });
+        let d = timeline(&c, &Selection::default(), 60, false, Theme::default());
+        let text: String = d
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("── ──"), "{text}");
+    }
+
+    #[test]
+    fn only_a_different_installed_build_is_stale() {
+        assert!(!screen_version_behind(None));
+        assert!(!screen_version_behind(Some(crate::VERSION)));
+        assert!(screen_version_behind(Some("0.1.0+older")));
+        assert!(!should_reexec(Some("build-b"), Some("build-b")));
+        assert!(should_reexec(Some("build-c"), Some("build-b")));
+        assert!(should_reexec(Some("build-b"), None));
     }
 }

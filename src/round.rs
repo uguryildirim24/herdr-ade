@@ -1031,7 +1031,8 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
 }
 
 /// Records which thread reviews the round; its sealed `done` sha is `V`.
-/// Manual repair only: `advance` is the path that starts and binds a reviewer.
+/// `advance` and `round reviewer` call this after starting the reviewer, so it
+/// stays the one place a reviewer binding is written.
 pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
@@ -1072,6 +1073,56 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
     record.attention.clear();
     save(&project, &record)?;
     Ok(record)
+}
+
+/// The one way to start a reviewer by hand: `round reviewer <slug> <round>`.
+/// It runs the same `round review` and `start_reviewer` path as
+/// `round advance`, so the new thread always bootstraps with the reviewer
+/// skill and the reviewer role floor. A live bound reviewer is left alone.
+pub fn start_reviewer_by_hand(ctx: &Ctx, slug: &str, round: &str) -> Result<thread::Thread> {
+    let project = Project::load(&ctx.root, slug)?;
+    let _scope = crate::ledger::Scope::new(&[&project]);
+    let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+    // Serialize manual starts with automatic starts and moved-base repairs.
+    let _advance = advance_lock(&project)?;
+    // Refuse before launching a thread, not later in bind_reviewer.
+    let record = load(&project, round)?;
+    require_mutable(&record)?;
+    if record.verdict.is_some() {
+        bail!("verdict_already_accepted: run `round review {slug} {round}` first");
+    }
+    // The pins are the input: refresh them before deciding, as `advance` does.
+    let events = sealed_events(&project)?;
+    {
+        let _lock = project.lock()?;
+        let mut record = load(&project, round)?;
+        if refresh_pins(&project, &mut record, &events)? {
+            save(&project, &record)?;
+        }
+    }
+    let record = load(&project, round)?;
+    if let Some(reviewer) = record.reviewer.as_deref()
+        && !reviewer_gone(ctx, &project, reviewer)
+    {
+        bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
+    }
+    let ready = !record.manifest.members.is_empty()
+        && record.manifest.members.iter().all(|m| m.pin.is_some());
+    if !ready {
+        bail!(
+            "round_not_complete: every lane of `{round}` must be pinned before its reviewer starts"
+        );
+    }
+    if members_all_landed(ctx, &record)? {
+        bail!(
+            "nothing_to_review: every pin of `{round}` already landed on `{}`",
+            record.branch
+        );
+    }
+    let review_branch = reviewer_branch(ctx, slug, round, &record)?;
+    let id = start_and_bind_reviewer(ctx, &project, slug, round, &review_branch, &prefix)?
+        .context("reviewer_start_failed: the failure is recorded on the round")?;
+    thread::load(&project, &id)
 }
 
 // ------------------------------------------------------------------ advance
@@ -1185,14 +1236,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
         if members_all_landed(ctx, &record)? {
             continue;
         }
-        let current_hash = manifest_hash(&record);
-        let review_is_current = record.phase != RoundPhase::PreparingReview
-            && record.frozen_revision == Some(record.manifest.revision)
-            && record.manifest_hash.as_deref() == Some(current_hash.as_str());
-        let review_branch = match (record.review_branch.clone(), review_is_current) {
-            (Some(branch), true) => branch,
-            _ => review(ctx, slug, &round)?.review_branch,
-        };
+        let review_branch = reviewer_branch(ctx, slug, &round, &record)?;
         start_and_bind_reviewer(ctx, &project, slug, &round, &review_branch, &prefix)?;
     }
     Ok(())
@@ -1248,6 +1292,20 @@ fn advance_lock(project: &Project) -> Result<std::fs::File> {
         .open(dir.join("advance.lock"))?;
     file.lock()?;
     Ok(file)
+}
+
+/// The review branch a reviewer for this round starts from: the existing
+/// branch when the current manifest is already frozen, else a fresh
+/// `round review`. Never a branch made stale by a changed or missing pin.
+fn reviewer_branch(ctx: &Ctx, slug: &str, round: &str, record: &RoundRecord) -> Result<String> {
+    let current_hash = manifest_hash(record);
+    let review_is_current = record.phase != RoundPhase::PreparingReview
+        && record.frozen_revision == Some(record.manifest.revision)
+        && record.manifest_hash.as_deref() == Some(current_hash.as_str());
+    match (record.review_branch.clone(), review_is_current) {
+        (Some(branch), true) => Ok(branch),
+        _ => Ok(review(ctx, slug, round)?.review_branch),
+    }
 }
 
 /// The reviewer task: the review brief, the pinned members with their report
@@ -1624,8 +1682,8 @@ fn reviewer_start_failed(
 /// The retry bound was reached: say so once and leave the round for a human.
 fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &str) -> Result<()> {
     eprintln!(
-        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand or run `round abandon {} {round} --reason <why>`",
-        project.slug
+        "round {round}: the reviewer still has not started after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer {} {round}` or end the round with `round abandon {} {round} --reason <why>`",
+        project.slug, project.slug
     );
     announce_once(
         ctx,
@@ -1633,8 +1691,8 @@ fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &
         round,
         "reviewer-start-exhausted",
         &format!(
-            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer`, use `thread restart`, or end it with `round abandon {} {round} --reason <why>`",
-            project.slug
+            "Round {round}: the reviewer did not start after {MAX_REVIEWER_START_FAILURES} failures ({reason}); start it by hand with `round reviewer {} {round}`, use `thread restart`, or end it with `round abandon {} {round} --reason <why>`",
+            project.slug, project.slug
         ),
         None,
     )
@@ -2143,10 +2201,12 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
     if let Some(intent) = &record.merge {
         return Ok(intent.verdict.clone());
     }
-    let reviewer = record
-        .reviewer
-        .as_deref()
-        .context("reviewer_unbound: no reviewer thread is recorded; run `round reviewer`")?;
+    let reviewer = record.reviewer.as_deref().with_context(|| {
+        format!(
+            "reviewer_unbound: no reviewer thread is recorded; run `round reviewer {} {}`",
+            project.slug, record.round
+        )
+    })?;
     let attempt = thread_attempt(project, reviewer)?;
     let events = sealed_events(project)?;
     let pin = done_pin(&events, &record.round, reviewer, attempt)
@@ -5017,6 +5077,62 @@ mod tests {
             load(&fx.project, "r1").unwrap().reviewer.as_deref(),
             Some(new.as_str())
         );
+    }
+
+    /// The one way to start a reviewer by hand boots a reviewer, not a lane,
+    /// and leaves a live bound reviewer alone.
+    #[test]
+    fn round_reviewer_starts_a_reviewer_by_hand() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+
+        let started = start_reviewer_by_hand(&ctx, "demo", "r1").unwrap();
+        assert_eq!(started.role, "reviewer");
+        assert!(!started.base.is_empty(), "the reviewer has a base commit");
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer,
+            Some(started.id.clone())
+        );
+        let task = std::fs::read_to_string(thread::task_path(&fx.project, &started.id)).unwrap();
+        assert!(task.contains("skill reviewer"), "{task}");
+        assert!(task.contains("tasks/review-r1.md"), "{task}");
+
+        let error = err(start_reviewer_by_hand(&ctx, "demo", "r1"));
+        assert!(error.starts_with("reviewer_already_bound"), "{error}");
+    }
+
+    #[test]
+    fn manual_reviewer_refuses_an_abandoned_round_before_starting_a_thread() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        review(&ctx, "demo", "r1").unwrap();
+        abandon(&ctx, "demo", "r1", "superseded").unwrap();
+        let before = thread::list(&fx.project).len();
+        let error = err(start_reviewer_by_hand(&ctx, "demo", "r1"));
+        assert!(error.starts_with("round_closed"), "{error}");
+        assert_eq!(thread::list(&fx.project).len(), before);
+    }
+
+    #[test]
+    fn manual_reviewer_records_a_failed_start_for_automatic_retry() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        assert!(start_reviewer_by_hand(&ctx, "demo", "r1").is_err());
+        assert_eq!(load(&fx.project, "r1").unwrap().reviewer_start_failures, 1);
     }
 
     /// A lane stays held through the merge intent and checkpoint, with no override.

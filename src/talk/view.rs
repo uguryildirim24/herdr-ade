@@ -145,11 +145,39 @@ impl Conversation {
         }
         let authoritative = ask::open_asks(project);
         let mut seen = BTreeSet::new();
+        let mut seen_landed = BTreeSet::new();
         let mut result = Self {
             latest_at: lines.last().map(|l| l.at.clone()).unwrap_or_default(),
             ..Self::default()
         };
         for l in lines {
+            // One event, one line: a keyed landing sentence published twice
+            // reads once, as does the same ordinary line repeated with nothing
+            // in between.
+            if let Entry::Say {
+                what,
+                means,
+                landed_round,
+            } = &l.entry
+            {
+                if let Some(round) = landed_round {
+                    if !seen_landed.insert(round.clone()) {
+                        continue;
+                    }
+                } else if let Some(Item {
+                    body:
+                        Body::Say {
+                            what: previous,
+                            means: previous_means,
+                        },
+                    ..
+                }) = result.items.last()
+                    && previous == what
+                    && previous_means == means
+                {
+                    continue;
+                }
+            }
             let mut at = l.at.clone();
             let mut status = None;
             let body = match &l.entry {
@@ -484,5 +512,19 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         r.refresh(&fx.project).unwrap();
         assert!(r.journal.lines.is_empty());
+    }
+    #[test]
+    fn a_repeated_say_line_reads_once() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        ask::say(&ctx, "demo", "The first screen is ready.", None).unwrap();
+        ask::say(&ctx, "demo", "The first screen is ready.", None).unwrap();
+        let v = Conversation::load(&fx.project, &super::super::read(&fx.project));
+        let count = v
+            .items
+            .iter()
+            .filter(|i| matches!(&i.body, Body::Say { what, .. } if what == "The first screen is ready."))
+            .count();
+        assert_eq!(count, 1, "{:?}", v.items);
     }
 }
