@@ -285,7 +285,7 @@ pub fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
 /// How the rollout wait ended. Every arm is an event, not a clock tick.
 enum RolloutWait {
     /// Codex wrote the session rollout: the lane is usable.
-    Ready(PathBuf),
+    Ready,
     /// The pane shows Codex's trust prompt.
     TrustPrompt,
     /// Herdr reports the agent blocked; the reason is its last screen line.
@@ -328,8 +328,8 @@ fn wait_for_rollout(
 ) -> RolloutWait {
     let deadline = clock.now() + timeout;
     loop {
-        if let Some(path) = refresh_rollout(env, lane) {
-            return RolloutWait::Ready(path);
+        if refresh_rollout(env, lane).is_some() {
+            return RolloutWait::Ready;
         }
         if trust_prompt_showing(runner, bin, &lane.pane_id) {
             return RolloutWait::TrustPrompt;
@@ -484,7 +484,7 @@ pub fn start(env: &Env, layout: &Layout, runner: &dyn Runner, opts: &StartOption
     if opts.profile.is_none() {
         let timeout = ROLLOUT_TIMEOUT;
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
-            RolloutWait::Ready(_) => {}
+            RolloutWait::Ready => {}
             RolloutWait::TrustPrompt => {
                 let _ = herdr_cli::tab_close(runner, &bin, &pane.tab_id);
                 bail!(
@@ -639,7 +639,7 @@ pub fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str) -> Re
     if lane.profile.is_none() {
         let timeout = ROLLOUT_TIMEOUT;
         match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
-            RolloutWait::Ready(_) => {}
+            RolloutWait::Ready => {}
             RolloutWait::TrustPrompt => {
                 let _ = herdr_cli::tab_close(runner, &bin, &lane.tab_id);
                 bail!(
@@ -970,7 +970,7 @@ mod tests {
             &clock,
         );
         assert!(
-            matches!(outcome, RolloutWait::Ready(_)),
+            matches!(outcome, RolloutWait::Ready),
             "the late rollout was not found"
         );
         assert!(
