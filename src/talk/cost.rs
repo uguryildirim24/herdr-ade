@@ -25,10 +25,6 @@ pub(crate) struct Totals {
 }
 
 impl Totals {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.tokens == 0 && self.micros == 0 && self.minutes == 0 && self.runs == 0 && !self.unknown
-    }
-
     fn merge(&mut self, other: &Totals) {
         self.tokens += other.tokens;
         self.micros += other.micros;
@@ -42,6 +38,8 @@ impl Totals {
 pub(crate) struct Cost {
     pub(crate) today: Totals,
     pub(crate) round: Option<(String, Totals)>,
+    /// Elapsed minutes of the work that is open right now (LEAN U4/U1).
+    pub(crate) running: u64,
     /// One entry per lane that could be read, for the record.
     pub(crate) lanes: Vec<(String, Totals)>,
     pub(crate) failed: bool,
@@ -57,6 +55,7 @@ pub(crate) fn load(ctx: &Ctx, project: &Project) -> Cost {
     let (pro, pro_failed) = pro_sends(&ctx.root.join("pro-bridge/usage.jsonl"), today.as_deref());
     let mut per_lane: BTreeMap<String, Totals> = BTreeMap::new();
     let mut today_totals = Totals::default();
+    let mut running = 0u64;
     let mut failed = pro_failed;
     for t in &lanes {
         let (mut all, mut day, lane_failed) = if t.worktree_path.is_empty() {
@@ -92,11 +91,17 @@ pub(crate) fn load(ctx: &Ctx, project: &Project) -> Cost {
                 day.unknown = true;
             }
         }
+        // What is running now is measured from its own start, not from any
+        // session span or past lane.
+        if t.status != thread::Status::Resolved {
+            running += lane_elapsed(t, now_stamp).0;
+        }
         today_totals.merge(&day);
         per_lane.insert(t.id.clone(), all);
     }
     let mut cost = Cost {
         today: today_totals,
+        running,
         failed,
         ..Cost::default()
     };
@@ -358,7 +363,7 @@ fn format_money(micros: u64) -> String {
 
 pub(crate) fn format_totals(totals: &Totals) -> String {
     if totals.tokens == 0 && totals.micros == 0 {
-        return format!("{} min, cost unknown", totals.minutes);
+        return String::new();
     }
     let mut text = format!(
         "{} tokens, {}, {} min",
@@ -412,7 +417,7 @@ mod tests {
         assert!(all.unknown);
         assert!(!failed);
         let (empty, _, failed) = read_pi_sessions(&dir.path().join("nope"), Some("2026-09-20"));
-        assert!(empty.is_empty());
+        assert_eq!(empty, Totals::default());
         assert!(!failed);
     }
 

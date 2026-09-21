@@ -44,6 +44,7 @@ pub(crate) const NO_DECISIONS: &str = "No choices have been recorded yet.";
 pub(crate) const CHANGE: &str = "Tell me what to change in the chat.";
 pub(crate) const ASK_WARNING: &str = "More than three questions are waiting here.";
 pub(crate) const STALE_HEADING: &str = "Stale";
+pub(crate) const STALE_UNKNOWN: &str = "Some running programs could not be checked.";
 pub(crate) const COST_HEADING: &str = "Cost";
 pub(crate) const TASKS_HEADING: &str = "Tasks";
 pub(crate) const NO_COST: &str = "No cost has been recorded yet.";
@@ -334,17 +335,24 @@ impl Overview {
             .collect();
         let (rounds, rounds_failed) =
             records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));
+        let mut seen_work = BTreeSet::new();
         for t in tasks {
-            let carrying: Vec<_> = rounds
+            let carrying: Vec<&crate::contracts::RoundRecord> = rounds
                 .iter()
                 .filter(|r| r.manifest.members.iter().any(|m| m.thread == t.id))
-                .map(|r| r.round.clone())
                 .collect();
-            if !carrying.is_empty() && carrying.iter().all(|r| threads::round_landed(project, r)) {
+            if !carrying.is_empty()
+                && carrying
+                    .iter()
+                    .all(|r| threads::round_landed(project, &r.round))
+            {
                 continue;
             }
-            let pending_pin = rounds.iter().any(|r| {
+            // An abandoned round never lands, so a handed-in lane it held is no
+            // longer running; a closed round cannot keep a pin pending.
+            let pending_pin = carrying.iter().any(|r| {
                 !threads::round_landed(project, &r.round)
+                    && !r.phase.closed()
                     && r.manifest
                         .members
                         .iter()
@@ -359,19 +367,22 @@ impl Overview {
                 live.group(&t)
             };
             let (state, tone) = match group {
-                Group::WaitingOnYou => {
-                    out.needs += 1;
-                    ("needs you", Tone::Red)
-                }
+                Group::WaitingOnYou => ("needs you", Tone::Red),
                 Group::ReadyForReview | Group::Landing => ("checking", Tone::Yellow),
                 _ => ("working", Tone::Yellow),
             };
             let marker = match (t.is_remote(), live.reachable) {
-                (true, _) => "box last seen",
+                (true, true) => "box",
+                (true, false) => "box, last seen",
                 (false, false) => "last seen",
                 (false, true) => "",
             };
             let text = safe(project, &t.plain, TASK_INVALID);
+            // A round and its reviewer carry the round's sentence; show the
+            // work once. An unnamed row keeps its own fallback.
+            if checked(project, &t.plain) && !seen_work.insert(text.clone()) {
+                continue;
+            }
             out.sections[3].push(tagged_with_marker(
                 project,
                 state,
@@ -385,7 +396,6 @@ impl Overview {
             if !t.error.is_empty() && checked(project, &t.error) {
                 out.sections[3].push(Row::text(t.error));
             }
-            out.active += 1;
         }
         if failed || rounds_failed {
             out.sections[3].push(Row::text(RUNNING_ERROR));
@@ -425,7 +435,7 @@ impl Overview {
         {
             out.sections[4].push(Row::text(FINISHED_ERROR));
         }
-        out.needs += conversation.open.len();
+        out.needs = conversation.open.len();
         for a in &conversation.open {
             out.sections[5].push(Row::text(safe(
                 project,
@@ -519,17 +529,28 @@ impl Overview {
                 tone: Tone::Red,
             })
             .collect();
+        if live.stale.unknown {
+            out.stale.push(Row {
+                text: STALE_UNKNOWN.into(),
+                prefix: String::new(),
+                marker: String::new(),
+                tone: Tone::Peach,
+            });
+        }
         out.cost = cost_rows(&live.cost);
-        out.tasks = task_rows(project, &known);
+        let (tasks, open_tasks) = task_rows(project, &known);
+        out.tasks = tasks;
+        out.active = open_tasks;
         out
     }
 }
 
 /// One line per task, a heading per list, and the thread state for a
 /// delegated task (LEAN U5).
-fn task_rows(project: &Project, known: &BTreeMap<String, Group>) -> Vec<Row> {
+fn task_rows(project: &Project, known: &BTreeMap<String, Group>) -> (Vec<Row>, usize) {
     let (lists, failed) = tasks::load(project);
     let mut rows = Vec::new();
+    let mut count = 0;
     if failed {
         rows.push(Row::text(TASKS_ERROR));
     }
@@ -544,6 +565,7 @@ fn task_rows(project: &Project, known: &BTreeMap<String, Group>) -> Vec<Row> {
             tone: Tone::Heading,
         });
         for task in &list.tasks {
+            count += 1;
             let marker = task
                 .thread
                 .as_ref()
@@ -563,28 +585,40 @@ fn task_rows(project: &Project, known: &BTreeMap<String, Group>) -> Vec<Row> {
     if rows.is_empty() && !failed {
         rows.push(Row::text(NO_TASKS));
     }
-    rows
+    (rows, count)
 }
 
-/// Today's total and the current round (LEAN U1). Numeric facts are drawn
-/// verbatim; they are not prose and carry no names.
+/// Today's money and tokens when the ledger has them, the current round when
+/// one is open, and the elapsed time of the work running now (LEAN U1).
 fn cost_rows(cost: &Cost) -> Vec<Row> {
     let mut rows = Vec::new();
     if cost.failed {
         rows.push(Row::text(COST_ERROR));
     }
-    if !cost.today.is_empty() {
+    let today = super::cost::format_totals(&cost.today);
+    if !today.is_empty() {
         rows.push(Row {
             prefix: "today".into(),
-            text: super::cost::format_totals(&cost.today),
+            text: today,
             marker: String::new(),
             tone: Tone::Text,
         });
     }
     if let Some((round, totals)) = &cost.round {
+        let text = super::cost::format_totals(totals);
+        if !text.is_empty() {
+            rows.push(Row {
+                prefix: format!("round {round}"),
+                text,
+                marker: String::new(),
+                tone: Tone::Text,
+            });
+        }
+    }
+    if cost.running > 0 {
         rows.push(Row {
-            prefix: format!("round {round}"),
-            text: super::cost::format_totals(totals),
+            prefix: "running".into(),
+            text: format!("{} min so far", cost.running),
             marker: String::new(),
             tone: Tone::Text,
         });
@@ -658,6 +692,11 @@ mod tests {
         live.poll(&fx.world.ctx(), &fx.project);
         assert!(!live.reachable);
         assert_eq!(live.state(&fx.project), "unreachable");
+        std::fs::write(
+            fx.project.dir().join("TASKS.md"),
+            "## Backlog\n- [ ] First thing (me)\n- [ ] Second thing (agent)\n",
+        )
+        .unwrap();
         let before = fx.world.runner.calls.borrow().len();
         let o = Overview::load(
             &fx.project,
@@ -665,7 +704,9 @@ mod tests {
             &Conversation::default(),
             &live,
         );
-        assert_eq!(o.needs, 2);
+        // The header counts the task list and the open questions, while the
+        // running rows keep their own state words.
+        assert_eq!(o.needs, 0);
         assert_eq!(o.active, 2);
         assert!(o.sections[3].iter().all(|r| {
             r.full_text()
@@ -801,6 +842,102 @@ mod tests {
     }
 
     #[test]
+    fn an_abandoned_round_does_not_keep_a_handed_in_lane_running() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lane, sha) = fx.lane(1);
+        thread::update(&fx.project, &lane, |t| {
+            t.plain = "Check the abandoned path.".into();
+            t.last_group = "ready-for-review".into();
+        })
+        .unwrap();
+        round::open(
+            &ctx,
+            "demo",
+            round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The abandoned check is ready.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        round::review(&ctx, "demo", "r1").unwrap();
+        thread::update(&fx.project, &lane, |t| t.status = Status::Resolved).unwrap();
+        round::abandon(&ctx, "demo", "r1", "superseded").unwrap();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        assert!(
+            o.sections[3]
+                .iter()
+                .all(|r| !r.text.contains("abandoned path")),
+            "{:?}",
+            o.sections[3]
+        );
+    }
+
+    #[test]
+    fn a_lane_and_its_round_reviewer_show_the_work_once() {
+        let fx = fixture();
+        let (lane, _) = fx.lane(1);
+        thread::update(&fx.project, &lane, |t| {
+            t.plain = "Show pretend trades.".into();
+            t.last_group = "working".into();
+        })
+        .unwrap();
+        let reviewer = fx.thread("Reviewer");
+        thread::update(&fx.project, &reviewer, |t| {
+            t.plain = "Show pretend trades.".into();
+            t.last_group = "working".into();
+            t.role = "reviewer".into();
+        })
+        .unwrap();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        let rows = o.sections[3]
+            .iter()
+            .filter(|r| r.text == "Show pretend trades.")
+            .count();
+        assert_eq!(rows, 1, "{:?}", o.sections[3]);
+    }
+
+    #[test]
+    fn the_cost_rows_show_money_or_running_time_not_an_invented_total() {
+        let mut cost = Cost {
+            running: 42,
+            ..Cost::default()
+        };
+        let rows = cost_rows(&cost);
+        assert!(
+            rows.iter()
+                .any(|r| r.prefix == "running" && r.text == "42 min so far")
+        );
+        assert!(rows.iter().all(|r| !r.full_text().contains("cost unknown")));
+        cost.today = super::super::cost::Totals {
+            tokens: 1_200,
+            micros: 750_000,
+            minutes: 10,
+            runs: 1,
+            unknown: false,
+        };
+        let rows = cost_rows(&cost);
+        assert!(
+            rows.iter()
+                .any(|r| r.prefix == "today" && r.text.contains("$0.75"))
+        );
+    }
+
+    #[test]
     fn fixture_projection_is_read_only_and_keeps_all_work() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -855,10 +992,10 @@ mod tests {
         let j = super::super::read(&fx.project);
         let c = Conversation::load(&fx.project, &j);
         let o = Overview::load(&fx.project, &j, &c, &Live::default());
-        assert_eq!(o.active, 18);
+        assert_eq!(o.sections[3].len(), 18);
         assert_eq!(o.needs, 1);
         assert_eq!(o.progress, Some((0, 1)));
-        assert!(o.sections[3][0].full_text().contains("box last seen"));
+        assert!(o.sections[3][0].full_text().contains("box, last seen"));
         assert!(
             o.sections[5]
                 .iter()
