@@ -347,47 +347,9 @@ fn multiplex_options(control_dir: &Path) -> Vec<String> {
     ]
 }
 
-/// Copies one remote file to a local path with `scp`. A path scp cannot carry
-/// unchanged in every mode (spaces, quotes, globs) is fetched with `ssh cat`
-/// through the quoting helper instead. The second lane's ingress calls this.
-#[allow(dead_code)]
-fn fetch_file(
-    runner: &dyn Runner,
-    target: &str,
-    remote_path: &str,
-    local_path: &Path,
-) -> Result<()> {
-    check_target(target)?;
-    if is_plain(remote_path) {
-        let out = runner.run(&Cmd::new("scp", COPY_TIMEOUT).args(SSH_OPTIONS).args([
-            "-q",
-            "--",
-            &format!("{target}:{remote_path}"),
-            &local_path.to_string_lossy(),
-        ]))?;
-        if !out.success() {
-            bail!("scp from {target}: {}", out.error_text());
-        }
-        return Ok(());
-    }
-    let out = ssh(
-        runner,
-        target,
-        &format!("cat -- {}", quote(remote_path)),
-        None,
-        COPY_TIMEOUT,
-    )?;
-    if !out.success() {
-        bail!("ssh {target} cat: {}", out.error_text());
-    }
-    std::fs::write(local_path, out.stdout.as_bytes())?;
-    Ok(())
-}
-
 /// The courier's batched `scp` over its multiplexed connection (SPEC-remote
 /// §4.3): every plain path in one call. A path scp cannot carry safely is
-/// refused here and fetched with [`fetch_file`]. The second lane's courier
-/// calls this; the start side never does.
+/// refused. The second lane's courier calls this; the start side never does.
 pub(crate) fn fetch_batch(
     runner: &dyn Runner,
     target: &str,
@@ -759,23 +721,7 @@ mod tests {
     #[test]
     fn unsafe_remote_paths_never_reach_scp() {
         let runner = FakeRunner::new();
-        runner.on("ssh", ok("file body"));
-        runner.on("scp", ok(""));
         let dir = tempfile::tempdir().unwrap();
-        fetch_file(
-            &runner,
-            "box",
-            "/wt/my repo/report.md",
-            &dir.path().join("r"),
-        )
-        .unwrap();
-        assert_eq!(runner.count("scp"), 0);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("r")).unwrap(),
-            "file body"
-        );
-        fetch_file(&runner, "box", "/wt/repo/report.md", &dir.path().join("r2")).unwrap();
-        assert_eq!(runner.count("scp"), 1);
         assert!(
             fetch_batch(
                 &runner,
@@ -786,6 +732,6 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(runner.count("scp"), 1);
+        assert_eq!(runner.count("scp"), 0);
     }
 }

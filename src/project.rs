@@ -165,8 +165,8 @@ impl Default for Settings {
             max_parallel_threads: 3,
             auto_resolve_days: 7,
             // Off by default: on herdr 0.9.1 a prompt merges with, and submits,
-            // text the user has half-typed (docs/herdr-notes.md, stage 2). With
-            // `false` the ticker shows a herdr notification instead.
+            // text the user has half-typed. With `false` the ticker shows a
+            // herdr notification instead.
             nudge: false,
             talk: None,
             repos: Vec::new(),
