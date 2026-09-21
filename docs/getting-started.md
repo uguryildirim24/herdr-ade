@@ -58,7 +58,7 @@ A lane reports through its file under `.herdr-project/`. The harness copies repo
 herdr-ade thread resolve billing t-0001
 ```
 
-A finished lane's worktree is removed automatically once its commits have landed or its round has closed. The branch is retained, and removal is never forced; uncommitted changes keep the worktree with a reason.
+A finished lane's worktree is removed automatically once its commits have landed or its round has closed, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored path names such as `target` and `node_modules` under `[worktrees].disposable` in `config.toml`; with no table, all ignored files are kept. Nested worktrees are always kept. The branch is retained and removal is never forced.
 
 ## Check your setup
 
@@ -71,6 +71,6 @@ herdr-ade ticker status
 - **A lane failed, blocked, or got stuck:** inspect `thread show`, then use `thread retry --reason "<why>"`. It replaces the process through bounded routing. Use `thread cancel` to stop it or `thread rebind` when its verified process is already live elsewhere.
 - **A provider is not ready:** use the provider's login flow on the same machine and rerun `doctor`.
 - **The coordinator needs its instructions again:** run `open <project> --reprime`.
-- **A worktree cannot be removed:** the final copy may be incomplete or Git may consider the worktree dirty. The refusal names the safe next action; removal is not forced.
+- **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and `doctor` lists what was kept; only configured rebuildable paths are discarded. Removal is not forced.
 
 See [Operations](operations.md) for records, routing, rounds, safety settings, remote lanes, and the complete command surface.
