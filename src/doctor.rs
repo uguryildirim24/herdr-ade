@@ -1656,7 +1656,6 @@ mod tests {
         );
         assert!(!healthy, "{text}");
         assert!(text.contains("unread"), "{text}");
->>>>>>> 221e94fbc7304113385ad740b452278a96d293f0
     }
 
     #[test]
