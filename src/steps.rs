@@ -894,7 +894,9 @@ pub(crate) fn remote_attention(
         } else {
             state.blocked.remove(&lane.id);
         }
-        if live.pane_exists {
+        let process_present = live.pane_exists
+            && (live.agent_state.is_some() || lane.prompt_pending || lane.last_state.is_empty());
+        if process_present {
             state.missing.insert(lane.id.clone(), 0);
         } else {
             let count = state.missing.entry(lane.id.clone()).or_insert(0);
@@ -913,7 +915,20 @@ pub(crate) fn remote_attention(
                     state.blocked.insert(lane);
                 }
                 Signal::Gone(lane) => {
-                    state.gone.insert(lane);
+                    state.gone.insert(lane.clone());
+                    if let Some(record) = threads.iter().find(|record| record.id == lane) {
+                        let recover = !record.launch.recipe_id.is_empty();
+                        if let Err(error) = crate::threads::fail_start(
+                            ctx,
+                            project,
+                            &lane,
+                            "the pane or agent is gone without a report",
+                            crate::contracts::FailureClass::ProcessGone,
+                            recover,
+                        ) {
+                            errors.push(error.context(format!("{lane}: process recovery")));
+                        }
+                    }
                 }
             },
             // A suspended or busy writer has not consumed the transition. Do

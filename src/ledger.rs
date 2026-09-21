@@ -553,4 +553,24 @@ mod tests {
         assert!(list(&p).unwrap().is_empty());
         assert!(!p.dir().join("ledger.jsonl").exists());
     }
+
+    #[test]
+    fn already_gone_cleanup_answers_close_old_failures_without_new_entries() {
+        let (_root, p) = fixture();
+        let _scope = Scope::new(&[&p]);
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        for code in ["tab_not_found", "pane_not_found"] {
+            let script = format!(
+                "printf '%s\\n' '{{\"error\":{{\"code\":\"{code}\",\"message\":\"already gone\"}}}}' >&2; exit 1"
+            );
+            let cmd = Cmd::new("/bin/sh", Duration::from_secs(5))
+                .args(["-c".to_string(), script])
+                .exit_meaning(crate::runner::ExitMeaning::Structured);
+            let subject = command_subject(&cmd);
+            let old = record(&p, "command-failed", &subject, "connection dropped").unwrap();
+            assert!(!runner.run(&cmd).unwrap().success());
+            assert!(show(&p, &old.id).unwrap().closed);
+            assert!(list(&p).unwrap().is_empty());
+        }
+    }
 }

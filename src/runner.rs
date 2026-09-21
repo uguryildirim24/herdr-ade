@@ -28,7 +28,13 @@ impl ExitMeaning {
             || (self == Self::Structured
                 && out.code.is_some()
                 && !out.timed_out
-                && serde_json::from_str::<serde_json::Value>(&out.stdout).is_ok())
+                && [&out.stdout, &out.stderr].into_iter().any(|text| {
+                    serde_json::from_str::<serde_json::Value>(text.trim())
+                        .ok()
+                        .is_some_and(|reply| {
+                            reply.get("result").is_some() || reply.get("error").is_some()
+                        })
+                }))
             || (self == Self::Boolean && out.boolean_answer().is_some())
     }
 }
