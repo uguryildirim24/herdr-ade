@@ -20,9 +20,10 @@ pub struct World {
     pub env: Env,
     pub root: PathBuf,
     pub runner: FakeRunner,
-    /// JSON arrays served for `agent list` and `pane list`, changeable mid-test.
+    /// JSON arrays served for live lists, changeable mid-test.
     pub agents: Rc<RefCell<String>>,
     pub panes: Rc<RefCell<String>>,
+    pub sessions: Rc<RefCell<String>>,
 }
 
 impl World {
@@ -44,6 +45,7 @@ impl World {
             runner: FakeRunner::new(),
             agents: Rc::new(RefCell::new("[]".into())),
             panes: Rc::new(RefCell::new("[]".into())),
+            sessions: Rc::new(RefCell::new("[]".into())),
             home,
         };
         world.runner.on(
@@ -99,6 +101,13 @@ impl World {
                 )))
             },
         );
+        let sessions = world.sessions.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("session list --json"),
+            move |_| Ok(ok(&format!(r#"{{"sessions":{}}}"#, sessions.borrow()))),
+        );
+        world.runner.on("session stop", ok(r#"{}"#));
+        world.runner.on("session delete", ok(r#"{}"#));
         world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
         // `thread resolve` closes a dedicated workspace or a shared tab.
         world.runner.on("workspace close", ok(r#"{"result":{}}"#));
@@ -513,6 +522,20 @@ fn resolve_closes_the_pane_unless_keep_pane() {
         thread::load(&project, "t-0001").unwrap().status,
         Status::Resolved
     );
+}
+
+#[test]
+fn resolve_deletes_a_leftover_isolated_scratch_session() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    *world.sessions.borrow_mut() =
+        r#"[{"name":"scratch-t-0001","running":true,"socket_path":"/tmp/scratch.sock"}]"#.into();
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+
+    assert_eq!(world.runner.count("session stop scratch-t-0001"), 1);
+    assert_eq!(world.runner.count("session delete scratch-t-0001"), 1);
 }
 
 #[test]

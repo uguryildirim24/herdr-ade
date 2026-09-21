@@ -9,6 +9,7 @@ You review one round of a herdr project: the lanes the coordinator admitted, pin
 - Fix what you find in place, as small commits named `review(<package>): <what>`. Do not rewrite the lanes' history.
 - Run every gate the brief lists and paste each command with its last lines into your report. Never claim a gate you did not run.
 - If the brief's manifest hash is stale (the coordinator admitted or removed a lane after the brief), stop and say so with `hp waiting`; a verdict against a stale manifest is refused.
+- Never add a throwaway tab or pane to your reviewer workspace or to the watched session. Run visual checks and probes in the isolated session `herdr --session scratch-<lane id> ...` on your machine. When done, run `herdr session stop scratch-<lane id>` and `herdr session delete scratch-<lane id>`; resolve also removes a leftover session.
 
 ## The verdict
 

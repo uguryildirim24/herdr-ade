@@ -1168,6 +1168,7 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
         t.prompt_pending = false;
     })?;
     threads::close_pane(ctx, project, &resolved)?;
+    threads::remove_scratch_session(ctx, &resolved)?;
     Ok(true)
 }
 

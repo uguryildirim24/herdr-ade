@@ -173,7 +173,7 @@ impl Live {
         {
             return *group;
         }
-        Group::from_token(&t.last_group).unwrap_or(Group::Working)
+        thread::recorded_group(t, jiff::Timestamp::now())
     }
 }
 

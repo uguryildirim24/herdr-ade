@@ -12,6 +12,9 @@ use crate::project::{self, Project, slugify, write_atomic};
 use crate::runner::{Cmd, Runner};
 
 pub(crate) const STARTING_TIMEOUT_SECS: i64 = 300;
+/// Herdr's maximum event wait for a newly launched pi process. Cloud starts
+/// have crossed two minutes, so every pi launch gets the full outer bound.
+pub(crate) const PI_START_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 const NOT_READY_SECS: i64 = 60;
 /// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`
@@ -579,6 +582,22 @@ pub(crate) fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
 
 /// The group of a thread. First matching row wins. One function, so the CLI
 /// and the ticker always agree.
+pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
+    match thread.status {
+        Status::Resolved => Group::Resolved,
+        Status::Failed => Group::WaitingOnYou,
+        Status::Starting if seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS => {
+            Group::WaitingOnYou
+        }
+        Status::Starting => Group::Working,
+        Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
+            Group::Working
+        } else {
+            Group::Idle
+        }),
+    }
+}
+
 pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
     let state = live.agent_state.as_deref();
     let has_report = !thread.report_hash.is_empty();
@@ -987,6 +1006,15 @@ mod tests {
         assert_eq!(
             group(&failed, &live(Some("working"), 0), now()),
             Group::WaitingOnYou
+        );
+        let stale_box_view = Thread {
+            last_group: "working".into(),
+            ..failed
+        };
+        assert_eq!(
+            recorded_group(&stale_box_view, now()),
+            Group::WaitingOnYou,
+            "a failed box start must not stay Working from its last poll"
         );
 
         let pending = Thread {

@@ -350,43 +350,69 @@ fn observe_current(kind: &str, subject: &str, detail: &str) {
 }
 
 pub(crate) struct RecordingRunner<'a>(pub &'a dyn Runner);
+
+fn command_subject(cmd: &Cmd) -> String {
+    // Never collect environment or stdin (credentials and prompts). Args are
+    // required evidence for identifying which command failed.
+    format!(
+        "{} {}",
+        cmd.program,
+        cmd.args
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn command_started(subject: &str) {
+    PROJECTS.with(|projects| {
+        for project in projects.borrow().iter() {
+            retry_after_failure(project, "command-failed", subject);
+        }
+    });
+}
+
+fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
+    match result {
+        Ok(out) if cmd.exit_meaning.answered(out) => PROJECTS.with(|projects| {
+            for project in projects.borrow().iter() {
+                recovered(project, "command-failed", subject);
+            }
+        }),
+        Ok(out) => observe_current(
+            "command-failed",
+            subject,
+            &format!(
+                "exit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
+                out.code, out.timed_out, out.stdout, out.stderr
+            ),
+        ),
+        Err(error) => observe_current("command-failed", subject, &format!("{error:#}")),
+    }
+}
+
 impl Runner for RecordingRunner<'_> {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
-        // Never collect environment or stdin (credentials and prompts). Args
-        // are required evidence for identifying which command failed.
-        let subject = format!(
-            "{} {}",
-            cmd.program,
-            cmd.args
-                .iter()
-                .map(|a| format!("{a:?}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        PROJECTS.with(|projects| {
-            for project in projects.borrow().iter() {
-                retry_after_failure(project, "command-failed", &subject);
-            }
-        });
+        let subject = command_subject(cmd);
+        command_started(&subject);
         let result = self.0.run(cmd);
-        match &result {
-            Ok(out) if cmd.exit_meaning.answered(out) => PROJECTS.with(|projects| {
-                for project in projects.borrow().iter() {
-                    recovered(project, "command-failed", &subject);
-                }
-            }),
-            Ok(out) => observe_current(
-                "command-failed",
-                &subject,
-                &format!(
-                    "exit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
-                    out.code, out.timed_out, out.stdout, out.stderr
-                ),
-            ),
-            Err(error) => observe_current("command-failed", &subject, &format!("{error:#}")),
-        }
+        command_finished(cmd, &subject, &result);
         result
     }
+
+    fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
+        let subjects: Vec<_> = commands.iter().map(command_subject).collect();
+        for subject in &subjects {
+            command_started(subject);
+        }
+        let results = self.0.run_parallel(commands);
+        for ((command, subject), result) in commands.iter().zip(&subjects).zip(&results) {
+            command_finished(command, subject, result);
+        }
+        results
+    }
+
     fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
         self.0.socket_request(socket, line, timeout)
     }
@@ -401,6 +427,24 @@ mod tests {
         let p = project::create(root.path(), "demo", "", vec![]).unwrap();
         (root, p)
     }
+    #[test]
+    fn recording_preserves_the_wrapped_runners_parallel_execution() {
+        let commands = [
+            Cmd::new("sleep", Duration::from_secs(2)).arg("0.5"),
+            Cmd::new("sleep", Duration::from_secs(2)).arg("0.5"),
+            Cmd::new("sleep", Duration::from_secs(2)).arg("0.5"),
+        ];
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        let started = std::time::Instant::now();
+        let results = runner.run_parallel(&commands);
+        assert!(results.into_iter().all(|result| result.unwrap().success()));
+        assert!(
+            started.elapsed() < Duration::from_millis(1100),
+            "recording serialized parallel commands: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn repeats_fold_close_and_reopen_without_rewriting_evidence() {
         let (_root, p) = fixture();
