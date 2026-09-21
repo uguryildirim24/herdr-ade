@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0171.md",
+      "tasks/t-0169.md",
+      "tasks/review-r72.md",
       "tasks/t-0170.md",
       "tasks/t-0168.md",
       "tasks/review-r71.md",
       "tasks/t-0167.md",
-      "tasks/review-r72.md",
       "tasks/review-r70.md",
       "tasks/t-0166.md",
       "tasks/t-0165.md",
       "tasks/t-0164.md",
-      "tasks/t-0163.md",
-      "tasks/t-0162.md",
-      "tasks/t-0161.md"
+      "tasks/t-0163.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r72.md",
       "tasks/reviews/code-r71.md",
       "tasks/reviews/code-r70.md",
       "tasks/reviews/code-r69.md",
@@ -39,15 +40,16 @@
       "tasks/reviews/code-r64.md",
       "tasks/reviews/code-r63.md",
       "tasks/reviews/code-r62.md",
-      "tasks/reviews/code-r60.md",
-      "tasks/reviews/code-r61.md"
+      "tasks/reviews/code-r60.md"
     ]
   },
-  "generated": "2026-09-21T14:41:21-04:00",
+  "generated": "2026-09-21T14:56:32-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0170-review-r71-this-round-makes-every-comman",
+      "hp/adeherdr/t-0171-review-r72-this-round-removes-the-part-t",
       "main",
+      "review/r72-2",
+      "hp/adeherdr/t-0170-review-r71-this-round-makes-every-comman",
       "hp/adeherdr/t-0169-review-r72-this-round-removes-the-part-t",
       "review/r71-2",
       "hp/adeherdr/t-0168-review-r71-this-round-makes-every-comman",
@@ -273,12 +275,12 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "668d59d review(herdr-ade): approve repaired r71 typed results",
-      "2c901ca review(herdr-ade): type integrated cleanup results",
-      "a15d8fe Merge earlier r71 candidate into repair review",
-      "9512387 docs(tasks): t-0170",
-      "5111744 review(r71): brief for revision 1",
-      "1ee48b3 checkpoint(r70): HANDOFF after merging the round"
+      "9b7960a review(r72): approve repaired editable routing",
+      "34a3208 Merge earlier r72 candidate into repair review",
+      "bfa0f5b docs(tasks): t-0171",
+      "ae2382e review(r72): brief for revision 1",
+      "08071c3 checkpoint(r71): HANDOFF after merging the round",
+      "668d59d review(herdr-ade): approve repaired r71 typed results"
     ],
     "remote": "8 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
@@ -286,23 +288,9 @@
       {
         "branch": "main",
         "dirty": 0,
-        "head": "668d59d",
+        "head": "9b7960a",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(herdr-ade): approve repaired r71 typed results"
-      },
-      {
-        "branch": "review/r71",
-        "dirty": 0,
-        "head": "aac28db",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r71",
-        "subject": "docs(tasks): t-0168"
-      },
-      {
-        "branch": "review/r71-2",
-        "dirty": 0,
-        "head": "9512387",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r71-2",
-        "subject": "docs(tasks): t-0170"
+        "subject": "review(r72): approve repaired editable routing"
       },
       {
         "branch": "review/r72",
@@ -310,6 +298,13 @@
         "head": "a5388d7",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r72",
         "subject": "docs(tasks): t-0169"
+      },
+      {
+        "branch": "review/r72-2",
+        "dirty": 0,
+        "head": "bfa0f5b",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r72-2",
+        "subject": "docs(tasks): t-0171"
       }
     ]
   },
@@ -334,8 +329,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r71",
-    "verdict": "668d59da9d3c077f3579ee58069e8b45dcd765ec"
+    "round": "r72",
+    "verdict": "9b7960a17aa5e6df64ce7e73d26e7bf42d6bbede"
   },
   "session": "default",
   "unlinked_agents": [],
