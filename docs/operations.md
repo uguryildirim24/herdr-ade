@@ -18,7 +18,7 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
   PROJECT.md              settings (TOML between +++ lines) and your standing instructions; yours
   MEMORY.md, memory/      project memory; the coordinator's
   tasks/job-NNNN.toml     stable tasks: request, acceptance, links and evidence; the binary's
-  TASKS.md                generated task view; never edit it
+  TASKS.md                generated task view; never edit it (the first task archives any old hand-written list in memory/archive/)
   routines/<name>.md      routines; the coordinator's
   scratch/                the coordinator's temporary files
   threads/<id>.toml       thread record          threads/<id>.md   home copy of its report
