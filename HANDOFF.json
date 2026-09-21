@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
-      "tasks/t-0188.md",
+      "tasks/t-0191.md",
+      "tasks/t-0189.md",
       "tasks/review-r79.md",
+      "tasks/t-0190.md",
+      "tasks/t-0188.md",
       "tasks/review-r78.md",
       "tasks/t-0187.md",
       "tasks/t-0185.md",
       "tasks/t-0186.md",
       "tasks/review-r77.md",
       "tasks/t-0184.md",
-      "tasks/t-0183.md",
-      "tasks/t-0182.md",
-      "tasks/t-0180.md",
-      "tasks/t-0177.md"
+      "tasks/t-0183.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r79.md",
       "tasks/reviews/code-r78.md",
       "tasks/reviews/code-r77.md",
       "tasks/reviews/code-r75.md",
@@ -39,16 +40,18 @@
       "tasks/reviews/code-r71.md",
       "tasks/reviews/code-r70.md",
       "tasks/reviews/code-r69.md",
-      "tasks/reviews/code-r68.md",
-      "tasks/reviews/code-r67.md"
+      "tasks/reviews/code-r68.md"
     ]
   },
-  "generated": "2026-09-21T18:24:57-04:00",
+  "generated": "2026-09-21T18:47:18-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0191-review-r79-a-finished-lane-s-build-folde",
       "main",
-      "hp/adeherdr/t-0188-review-r78-each-job-is-tied-to-your-word",
+      "review/r79-2",
+      "hp/adeherdr/t-0190-d5b-install-proof",
       "hp/adeherdr/t-0189-review-r79-a-finished-lane-s-build-folde",
+      "hp/adeherdr/t-0188-review-r78-each-job-is-tied-to-your-word",
       "review/r79",
       "hp/adeherdr/t-0186-w4-remove-build-folders",
       "review/r78",
@@ -303,12 +306,12 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "26ad8f5 Merge commit 'feba2cc54ff6debdc2a66db66ede13956a7b7880'",
-      "feba2cc review(tasks): round r78 verdict",
-      "7131f53 review(tasks): preserve task evidence on migration",
-      "3764a7e review(r79): brief for revision 1",
-      "f4c3c82 Merge commit '742dda6f3ebddf9388eeb1d8454192a88dac37dd'",
-      "b8e18c9 docs(tasks): t-0188"
+      "8035351 docs(review): round r79 repair verdict",
+      "ebd209a review(doctor): preserve unknown disk and build ownership",
+      "ce99313 Merge commit 'c3daa1bea72619abe7369204f4f93f4ab12bf6df' into hp/adeherdr/t-0191-review-r79-a-finished-lane-s-build-folde",
+      "dce5e00 docs(tasks): t-0191",
+      "06562c9 review(r79): brief for revision 1",
+      "64c73b3 docs(tasks): t-0190"
     ],
     "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
@@ -316,16 +319,9 @@
       {
         "branch": "main",
         "dirty": 0,
-        "head": "26ad8f5",
+        "head": "8035351",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit 'feba2cc54ff6debdc2a66db66ede13956a7b7880'"
-      },
-      {
-        "branch": "review/r78",
-        "dirty": 0,
-        "head": "b8e18c9",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r78",
-        "subject": "docs(tasks): t-0188"
+        "subject": "docs(review): round r79 repair verdict"
       },
       {
         "branch": "review/r79",
@@ -333,6 +329,13 @@
         "head": "6a73245",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r79",
         "subject": "docs(tasks): t-0189"
+      },
+      {
+        "branch": "review/r79-2",
+        "dirty": 0,
+        "head": "dce5e00",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r79-2",
+        "subject": "docs(tasks): t-0191"
       }
     ]
   },
@@ -357,8 +360,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r78",
-    "verdict": "feba2cc54ff6debdc2a66db66ede13956a7b7880"
+    "round": "r79",
+    "verdict": "8035351597d7828d747ac65f5fc0434ee643c44d"
   },
   "session": "default",
   "unlinked_agents": [],
