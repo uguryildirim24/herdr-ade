@@ -90,27 +90,34 @@ pub(crate) fn worktree_add(
     Ok(path)
 }
 
-/// `git worktree remove` without `--force`. A dirty tree refuses.
+/// `git worktree remove` without `--force`. Callers run ADE's stricter status
+/// inspection first because Git itself permits deletion of ignored files.
 pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
     git(runner, repo, &["worktree", "remove", path], GIT_TIMEOUT)?;
     Ok(())
 }
 
-/// Tracked and untracked changes in a worktree. Removal callers use this to
-/// return a stable refusal instead of depending on Git's version-specific
-/// `worktree remove` diagnostic.
-pub(crate) fn dirty_paths(runner: &dyn Runner, repo: &str, path: &str) -> Result<Vec<String>> {
-    let text = git(
+/// Full removal status, including ignored files. This is only for worktree
+/// deletion safety: callers must classify `!!` rows against the editable
+/// disposable-path list before removing anything.
+pub(crate) fn worktree_status_with_ignored(
+    runner: &dyn Runner,
+    repo: &str,
+    path: &str,
+) -> Result<String> {
+    git(
         runner,
         repo,
-        &["-C", path, "status", "--porcelain", "--untracked-files=all"],
+        &[
+            "-C",
+            path,
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+        ],
         GIT_TIMEOUT,
-    )?;
-    Ok(text
-        .lines()
-        .filter(|line| line.len() > 3)
-        .map(|line| line[3..].trim().trim_matches('"').to_string())
-        .collect())
+    )
 }
 
 /// The branch checked out in the repository's main checkout.

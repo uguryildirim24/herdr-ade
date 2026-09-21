@@ -483,13 +483,21 @@ fn report_with_checks(
             runner,
             detached_ticker: false,
         };
-        let (leftovers, errors) = finished_worktrees(&ctx, None);
+        let (leftovers, data_kept, errors) = finished_worktrees(&ctx, None);
         check(
             &mut out,
             Some(leftovers.is_empty() && errors.is_empty()),
             "finished worktrees local",
             worktree_check_detail(&leftovers, &errors),
         );
+        if !data_kept.is_empty() {
+            check(
+                &mut out,
+                None,
+                "worktree data kept local",
+                data_kept.join("; "),
+            );
+        }
     } else {
         check(
             &mut out,
@@ -700,7 +708,7 @@ fn report_with_checks(
                                 runner,
                                 detached_ticker: false,
                             };
-                            let (leftovers, errors) =
+                            let (leftovers, data_kept, errors) =
                                 finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
                             check(
                                 &mut out,
@@ -708,6 +716,14 @@ fn report_with_checks(
                                 &format!("finished worktrees {}", profile.label),
                                 worktree_check_detail(&leftovers, &errors),
                             );
+                            if !data_kept.is_empty() {
+                                check(
+                                    &mut out,
+                                    None,
+                                    &format!("worktree data kept {}", profile.label),
+                                    data_kept.join("; "),
+                                );
+                            }
                         }
                         Err(error) => check(
                             &mut out,
@@ -741,7 +757,10 @@ fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
 /// Finished thread worktrees that still exist on one machine. Completion is
 /// derived from the same records as `thread resolve`; existence is checked on
 /// the machine that owns the checkout.
-fn finished_worktrees(ctx: &Ctx, remote: Option<(&str, &str)>) -> (Vec<String>, Vec<String>) {
+fn finished_worktrees(
+    ctx: &Ctx,
+    remote: Option<(&str, &str)>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -760,28 +779,47 @@ fn finished_worktrees(ctx: &Ctx, remote: Option<(&str, &str)>) -> (Vec<String>, 
                 continue;
             }
             match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
-                Ok(None) => candidates.push(thread.worktree_path),
+                Ok(None) => candidates.push(thread),
                 Ok(Some(_)) => {}
                 Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
             }
         }
     }
-    if let Some((_, target)) = remote {
-        let mut existing = Vec::new();
-        for path in candidates {
-            let script = format!("test -d {}", crate::remote::quote(&path));
+    let mut leftovers = Vec::new();
+    let mut data_kept = Vec::new();
+    for thread in candidates {
+        let path = &thread.worktree_path;
+        let exists = if let Some((_, target)) = remote {
+            let script = format!("test -d {}", crate::remote::quote(path));
             match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
-                Ok(output) if output.success() => existing.push(path),
-                Ok(output) if output.code == Some(1) && output.stderr.trim().is_empty() => {}
-                Ok(output) => errors.push(format!("{path}: {}", output.error_text())),
-                Err(error) => errors.push(format!("{path}: {error:#}")),
+                Ok(output) if output.success() => true,
+                Ok(output) if output.code == Some(1) && output.stderr.trim().is_empty() => false,
+                Ok(output) => {
+                    errors.push(format!("{path}: {}", output.error_text()));
+                    false
+                }
+                Err(error) => {
+                    errors.push(format!("{path}: {error:#}"));
+                    false
+                }
             }
+        } else {
+            Path::new(path).is_dir()
+        };
+        if !exists {
+            continue;
         }
-        (existing, errors)
-    } else {
-        candidates.retain(|path| Path::new(path).is_dir());
-        (candidates, errors)
+        match crate::threads::inspect_worktree_for_removal(ctx, &thread) {
+            Ok(inspection) if !inspection.ignored_data.is_empty() => data_kept.push(format!(
+                "{} ({})",
+                path,
+                crate::worktrees::describe_data(&inspection.ignored_data)
+            )),
+            Ok(_) => leftovers.push(path.clone()),
+            Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
+        }
     }
+    (leftovers, data_kept, errors)
 }
 
 fn check_workspace_leaks(
@@ -1792,6 +1830,7 @@ recipe = "claude_fable_xhigh"
         };
         std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on("status --porcelain --ignored --untracked-files=all", ok(""));
 
         let (text, healthy, checks) =
             report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
@@ -1803,6 +1842,72 @@ recipe = "claude_fable_xhigh"
             check.status == "failed"
                 && check.label == "finished worktrees local"
                 && check.detail.contains(worktree.to_string_lossy().as_ref())
+        }));
+    }
+
+    #[test]
+    fn ignored_data_is_listed_separately_from_finished_worktree_leaks() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(crate::harness::BOX_WORKER_MARKER),
+            "lane worker\n",
+        )
+        .unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let worktree = home.path().join("finished-worktree-with-data");
+        std::fs::create_dir_all(worktree.join("camber-runs")).unwrap();
+        std::fs::write(worktree.join("camber-runs/raw.bin"), vec![0; 2048]).unwrap();
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.status = crate::thread::Status::Resolved;
+            thread.worktree_path = worktree.to_string_lossy().into_owned();
+            thread.repo = "/repo".into();
+            thread.branch = "lane".into();
+        })
+        .unwrap();
+        let rounds = project.state_dir().join("rounds");
+        std::fs::create_dir_all(&rounds).unwrap();
+        let record = crate::contracts::RoundRecord {
+            phase: crate::contracts::RoundPhase::Abandoned,
+            round: "r1".into(),
+            branch: "main".into(),
+            plain: "The work closed.".into(),
+            policy_hash: "policy".into(),
+            manifest: crate::contracts::AdmissionManifest {
+                revision: 1,
+                members: vec![crate::contracts::ManifestMember {
+                    thread: thread.id,
+                    pin: None,
+                }],
+            },
+            repo: "/repo".into(),
+            abandoned_reason: Some("not needed".into()),
+            ..crate::contracts::RoundRecord::default()
+        };
+        std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "status --porcelain --ignored --untracked-files=all",
+            ok("!! camber-runs/raw.bin\n"),
+        );
+
+        let (text, healthy, checks) =
+            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+
+        assert!(healthy, "{text}");
+        assert!(text.contains("[warn] worktree data kept local"), "{text}");
+        assert!(
+            text.contains("camber-runs") && text.contains("KiB"),
+            "{text}"
+        );
+        assert!(checks.iter().any(|check| {
+            check.status == "warning"
+                && check.label == "worktree data kept local"
+                && check.detail.contains("camber-runs")
         }));
     }
 
