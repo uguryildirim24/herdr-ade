@@ -247,11 +247,13 @@ fn server_stale(runner: &dyn Runner, bin: &str, target: Option<&str>) -> Option<
         return None;
     }
     let value = serde_json::from_str::<Value>(&output.stdout).ok()?;
-    Some(flag(&value, "server_binary_stale") || flag(&value, "restart_needed"))
-}
-
-fn flag(value: &Value, key: &str) -> bool {
-    value.get(key).and_then(Value::as_bool).unwrap_or(false)
+    let stale = value.get("server_binary_stale").and_then(Value::as_bool);
+    let restart = value.get("restart_needed").and_then(Value::as_bool);
+    match (stale, restart) {
+        (Some(a), Some(b)) => Some(a || b),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
 }
 
 /// The SSH target of the machine this project's lanes run on.
@@ -476,6 +478,8 @@ mod tests {
         // No rule: the check fails, and that is unknown, not fine.
         assert_eq!(server_stale(&runner, "herdr", Some("remote-host")), None);
         runner.on("status server", ok("not json"));
+        assert_eq!(server_stale(&runner, "herdr", None), None);
+        runner.on("status server", ok(r#"{"status":"unknown"}"#));
         assert_eq!(server_stale(&runner, "herdr", None), None);
     }
 }

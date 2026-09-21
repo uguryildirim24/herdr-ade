@@ -93,9 +93,7 @@ pub(crate) fn load(ctx: &Ctx, project: &Project) -> Cost {
         }
         // What is running now is measured from its own start, not from any
         // session span or past lane.
-        if t.status != thread::Status::Resolved {
-            running += lane_elapsed(t, now_stamp).0;
-        }
+        running += running_minutes(t, now_stamp);
         today_totals.merge(&day);
         per_lane.insert(t.id.clone(), all);
     }
@@ -268,6 +266,19 @@ fn pro_sends(path: &Path, today: Option<&str>) -> (BTreeMap<String, (u64, u64)>,
     (runs, false)
 }
 
+fn running_minutes(lane: &thread::Thread, now: Option<jiff::Timestamp>) -> u64 {
+    if !matches!(lane.status, thread::Status::Starting | thread::Status::Open)
+        || matches!(lane.last_state.as_str(), "done" | "gone")
+        || matches!(
+            lane.last_group.as_str(),
+            "ready-for-review" | "landing" | "resolved"
+        )
+    {
+        return 0;
+    }
+    lane_elapsed(lane, now).0
+}
+
 /// All-time elapsed minutes and, when the lane overlaps today, today's part.
 fn lane_elapsed(lane: &thread::Thread, now: Option<jiff::Timestamp>) -> (u64, Option<u64>) {
     let (Some(start), Some(now)) = (lane.created.parse::<jiff::Timestamp>().ok(), now) else {
@@ -379,6 +390,26 @@ pub(crate) fn format_totals(totals: &Totals) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finished_and_failed_lanes_do_not_add_to_running_time() {
+        let now = "2026-09-21T12:30:00Z".parse().ok();
+        let mut lane = crate::thread::Thread {
+            status: crate::thread::Status::Open,
+            created: "2026-09-21T12:00:00Z".into(),
+            last_state_change: "2026-09-21T12:20:00Z".into(),
+            ..Default::default()
+        };
+        assert_eq!(super::running_minutes(&lane, now), 30);
+        lane.last_state = "done".into();
+        assert_eq!(super::running_minutes(&lane, now), 0);
+        lane.last_state.clear();
+        lane.status = crate::thread::Status::Failed;
+        assert_eq!(super::running_minutes(&lane, now), 0);
+        lane.status = crate::thread::Status::Open;
+        lane.last_group = "ready-for-review".into();
+        assert_eq!(super::running_minutes(&lane, now), 0);
+    }
+
     use super::*;
 
     #[test]

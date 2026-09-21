@@ -131,7 +131,7 @@ impl Scroll {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Composer {
     text: String,
     cursor: usize,
@@ -188,7 +188,7 @@ struct App {
     chat_items: Option<usize>,
     /// After an Esc, the bytes of a split mouse report can arrive as plain
     /// characters; collect and drop them instead of typing them.
-    escape_tail: Option<String>,
+    escape_tail: Option<(String, Composer)>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -325,7 +325,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Input::None;
         }
-        if let Some(mut tail) = self.escape_tail.take() {
+        if let Some((mut tail, draft)) = self.escape_tail.take() {
             if let KeyCode::Char(ch) = key.code
                 && !key
                     .modifiers
@@ -333,19 +333,24 @@ impl App {
             {
                 tail.push(ch);
                 if mouse_report(&tail) {
-                    // A split SGR mouse report; swallow it whole.
+                    // A split mouse report is not a clear command.
+                    self.composer = draft;
                     return Input::None;
                 }
                 if mouse_report_prefix(&tail) {
-                    self.escape_tail = Some(tail);
+                    self.escape_tail = Some((tail, draft));
                     return Input::None;
                 }
                 // The Esc was a real clear; type what followed it.
                 self.composer.insert(&tail);
                 return Input::None;
             }
-            // Any other key ends the collection and keeps the text.
-            self.composer.insert(&tail);
+            // A truncated report must neither erase the draft nor leak bytes.
+            if tail.starts_with("[<") {
+                self.composer = draft;
+            } else {
+                self.composer.insert(&tail);
+            }
         }
         let action =
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -356,15 +361,15 @@ impl App {
                     .map(|(_, a, _, _)| *a)
             };
         if let Some(action) = action {
+            if matches!(action, Action::Clear) {
+                self.escape_tail = Some((String::new(), self.composer.clone()));
+            }
             match action {
                 Action::Exit => return Input::Exit,
                 Action::Send if !self.composer.text.is_empty() => {
                     return Input::Send(self.composer.text.clone());
                 }
                 _ => self.action(action, c),
-            }
-            if matches!(action, Action::Clear) {
-                self.escape_tail = Some(String::new());
             }
         } else if let KeyCode::Char(ch) = key.code
             && !key
@@ -1458,53 +1463,61 @@ fn screen_version_behind(installed: Option<&str>) -> bool {
     installed.is_some_and(|version| version != crate::VERSION)
 }
 
-/// Hand over to the installed program when it is a different build. The
-/// terminal, screen and the composer draft are inherited by the new process.
-fn reexec_if_stale(ctx: &Ctx, draft: &str) {
-    if std::env::var_os("HERDR_TALK_REEXEC").is_some() {
-        return;
+fn should_reexec(installed: Option<&str>, attempted: Option<&str>) -> bool {
+    screen_version_behind(installed) && installed != attempted
+}
+
+fn enter_terminal() -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        event::EnableMouseCapture,
+        SetCursorStyle::SteadyBlock
+    )?;
+    Ok(())
+}
+
+/// Compare builds, not paths: an atomic install replaces the same pathname.
+/// Restore termios before exec so the new process saves the original cooked
+/// mode, not our raw mode. A failed exec re-enters the current screen.
+fn reexec_if_stale(ctx: &Ctx, draft: &str, active: bool) -> Result<bool> {
+    let version = super::stale::installed_version(ctx);
+    let attempted = std::env::var("HERDR_TALK_REEXEC").ok();
+    if !should_reexec(version.as_deref(), attempted.as_deref()) {
+        return Ok(false);
     }
     let installed = ctx.env.home.join(".local/bin/herdr-ade");
-    let same = std::fs::canonicalize(&installed)
-        .ok()
-        .zip(std::env::current_exe().ok())
-        .is_some_and(|(a, b)| a == b);
-    if same {
-        return;
-    }
-    let version = super::stale::installed_version(ctx);
-    if !screen_version_behind(version.as_deref()) {
-        return;
+    if active {
+        restore();
     }
     use std::os::unix::process::CommandExt;
     let error = std::process::Command::new(&installed)
         .args(std::env::args_os().skip(1))
         .env("HERDR_TALK_DRAFT", draft)
-        .env("HERDR_TALK_REEXEC", "1")
+        // Prevent a broken binary from looping, without blocking later installs.
+        .env("HERDR_TALK_REEXEC", version.as_deref().unwrap_or_default())
         .exec();
     eprintln!("herdr-ade: could not restart the project screen: {error}");
+    if active {
+        enter_terminal()?;
+    }
+    Ok(true)
 }
 
 pub(crate) fn run(ctx: &Ctx, slug: &str) -> Result<()> {
     // A stale screen replaces itself before it paints, so an install never
     // leaves an old copy running in the tab.
-    reexec_if_stale(ctx, "");
+    let draft = std::env::var("HERDR_TALK_DRAFT").unwrap_or_default();
+    reexec_if_stale(ctx, &draft, false)?;
     let project = Project::load(&ctx.root, slug)?;
     guarded(restore, || {
-        enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            event::EnableMouseCapture,
-            SetCursorStyle::SteadyBlock
-        )?;
+        enter_terminal()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         let theme = Theme::load(ctx.env);
         let mut app = App::default();
-        if let Ok(draft) = std::env::var("HERDR_TALK_DRAFT") {
-            app.composer.insert(&draft);
-        }
+        app.composer.insert(&draft);
         let mut journal = JournalReader::default();
         let mut live = Live::default();
         let mut poll = Instant::now() - Duration::from_secs(3);
@@ -1524,7 +1537,9 @@ pub(crate) fn run(ctx: &Ctx, slug: &str) -> Result<()> {
             if slow.elapsed() >= Duration::from_secs(30) {
                 live.refresh_slow(ctx, &project);
                 slow = Instant::now();
-                reexec_if_stale(ctx, &app.composer.text);
+                if reexec_if_stale(ctx, &app.composer.text, true)? {
+                    terminal.clear()?;
+                }
             }
             journal.refresh(&project)?;
             let mut conversation = Conversation::load(&project, &journal.journal);
@@ -1997,12 +2012,16 @@ mod tests {
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         // The Esc arrives alone, then the rest of the SGR report is read as
-        // plain characters, as a slow terminal can split it.
+        // plain characters, as a slow terminal can split it. Keep the draft.
+        app.composer.insert("unsent draft");
+        app.composer.left();
+        let cursor = app.composer.cursor;
         app.key(esc, &c);
         for letter in "[<64;15;5M".chars() {
             app.key(ch(letter), &c);
         }
-        assert_eq!(app.composer.text, "");
+        assert_eq!(app.composer.text, "unsent draft");
+        assert_eq!(app.composer.cursor, cursor);
         // A real clear still lets ordinary typing through.
         app.key(esc, &c);
         for letter in "hello".chars() {
@@ -2075,5 +2094,8 @@ mod tests {
         assert!(!screen_version_behind(None));
         assert!(!screen_version_behind(Some(crate::VERSION)));
         assert!(screen_version_behind(Some("0.1.0+older")));
+        assert!(!should_reexec(Some("build-b"), Some("build-b")));
+        assert!(should_reexec(Some("build-c"), Some("build-b")));
+        assert!(should_reexec(Some("build-b"), None));
     }
 }

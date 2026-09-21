@@ -335,7 +335,7 @@ impl Overview {
             .collect();
         let (rounds, rounds_failed) =
             records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));
-        let mut seen_work = BTreeSet::new();
+        let mut seen_work: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for t in tasks {
             let carrying: Vec<&crate::contracts::RoundRecord> = rounds
                 .iter()
@@ -378,10 +378,23 @@ impl Overview {
                 (false, true) => "",
             };
             let text = safe(project, &t.plain, TASK_INVALID);
-            // A round and its reviewer carry the round's sentence; show the
-            // work once. An unnamed row keeps its own fallback.
-            if checked(project, &t.plain) && !seen_work.insert(text.clone()) {
-                continue;
+            // Only fold a reviewer into its own round's member. Equal prose
+            // alone does not make two independent tasks the same work, and a
+            // blocked reviewer must remain visible even beside a working lane.
+            if checked(project, &t.plain) {
+                let prior = seen_work.entry(text.clone()).or_default();
+                let duplicate = prior.iter().any(|id| {
+                    rounds.iter().any(|r| {
+                        (r.reviewer.as_deref() == Some(t.id.as_str())
+                            && r.manifest.members.iter().any(|m| &m.thread == id))
+                            || (r.reviewer.as_deref() == Some(id.as_str())
+                                && r.manifest.members.iter().any(|m| m.thread == t.id))
+                    })
+                });
+                if duplicate && group != Group::WaitingOnYou {
+                    continue;
+                }
+                prior.push(t.id.clone());
             }
             out.sections[3].push(tagged_with_marker(
                 project,
@@ -885,7 +898,8 @@ mod tests {
     #[test]
     fn a_lane_and_its_round_reviewer_show_the_work_once() {
         let fx = fixture();
-        let (lane, _) = fx.lane(1);
+        let ctx = fx.world.ctx();
+        let (lane, sha) = fx.lane(1);
         thread::update(&fx.project, &lane, |t| {
             t.plain = "Show pretend trades.".into();
             t.last_group = "working".into();
@@ -898,6 +912,21 @@ mod tests {
             t.role = "reviewer".into();
         })
         .unwrap();
+        round::open(
+            &ctx,
+            "demo",
+            round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("Show pretend trades.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        round::review(&ctx, "demo", "r1").unwrap();
+        round::bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
         let o = Overview::load(
             &fx.project,
             &Journal::default(),
@@ -909,6 +938,25 @@ mod tests {
             .filter(|r| r.text == "Show pretend trades.")
             .count();
         assert_eq!(rows, 1, "{:?}", o.sections[3]);
+        let other = fx.thread("Independent work");
+        thread::update(&fx.project, &other, |t| {
+            t.plain = "Show pretend trades.".into();
+            t.last_group = "working".into();
+        })
+        .unwrap();
+        let o = Overview::load(
+            &fx.project,
+            &Journal::default(),
+            &Conversation::default(),
+            &Live::default(),
+        );
+        assert_eq!(
+            o.sections[3]
+                .iter()
+                .filter(|r| r.text == "Show pretend trades.")
+                .count(),
+            2
+        );
     }
 
     #[test]
