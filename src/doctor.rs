@@ -505,24 +505,60 @@ fn report(
                 let pane = panes
                     .iter()
                     .any(|p| crate::coordinator::pane_matches(&record, p));
-                check(
-                    &mut out,
-                    if pane { Some(true) } else { None },
-                    &label,
-                    format!(
-                        "{}; socket {}; workspace {} {}; coordinator pane {} {}",
-                        project.status(),
-                        record.socket,
-                        record.workspace_id,
-                        if workspace { "exists" } else { "is gone" },
-                        record.pane_id,
-                        if pane {
-                            "exists"
-                        } else {
-                            "is gone (run `open`)"
-                        },
+                // The name must resolve to the bound pane, or nothing can wake
+                // this coordinator. An `agent list` error is a warn, not a
+                // false failure: the pane is still the honest reading.
+                let named = match herdr.agent_list() {
+                    Ok(agents) => Some(
+                        agents
+                            .iter()
+                            .any(|a| crate::coordinator::agent_matches(&record, a)),
                     ),
+                    Err(_) => None,
+                };
+                let unread = crate::steps::announced_unread(&project);
+                let mut detail = format!(
+                    "{}; socket {}; workspace {} {}; coordinator pane {} {}",
+                    project.status(),
+                    record.socket,
+                    record.workspace_id,
+                    if workspace { "exists" } else { "is gone" },
+                    record.pane_id,
+                    if pane {
+                        "exists"
+                    } else {
+                        "is gone (run `open`)"
+                    },
                 );
+                if pane {
+                    detail.push_str(&format!(
+                        "; agent `{}` {}",
+                        record.agent_name,
+                        match named {
+                            Some(true) => "resolves".to_string(),
+                            Some(false) =>
+                                "does not resolve (the ticker restores it; `open` otherwise)"
+                                    .to_string(),
+                            None => "could not be read".to_string(),
+                        },
+                    ));
+                }
+                if record.name_restored > 0 {
+                    detail.push_str(&format!("; name restored {}x", record.name_restored));
+                }
+                if let Some(passes) = unread {
+                    detail.push_str(&format!(
+                        "; announced inbox items unread for {passes} ticker passes"
+                    ));
+                }
+                let ok = if unread.is_some() {
+                    Some(false)
+                } else if !pane {
+                    None
+                } else {
+                    named
+                };
+                check(&mut out, ok, &label, detail);
             }
         }
     }
@@ -1236,6 +1272,47 @@ mod tests {
         runner_with_machine_list(version, "[]")
     }
 
+    /// Like `runner_with_herdr`, but the local session answers `pane list` and
+    /// `agent list` with the given JSON, so a project row can be read.
+    fn runner_with_project(version: &str, panes: &str, agents: &str) -> FakeRunner {
+        let runner = FakeRunner::new();
+        runner.on("herdr --version", ok(version));
+        runner.on("session list --json", ok(r#"{"sessions":[]}"#));
+        runner.on("git --version", ok("git version 2.50.0\n"));
+        runner.on("ssh -V", ok(""));
+        runner.on("rsync --version", ok("rsync 3\n"));
+        runner.on("gh --version", ok("gh version 2\n"));
+        runner.on_fn(
+            |cmd| cmd.program == "gh" && cmd.args == ["auth", "status"],
+            |_| Ok(fail(1, "not logged in")),
+        );
+        runner.on("machine list --json", ok("[]"));
+        runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+        runner.on("pane list", ok(panes));
+        runner.on("agent list", ok(agents));
+        runner
+    }
+
+    /// A project with a coordinator record bound to `pane` and a real socket
+    /// file, so `report` reads it as an opened project.
+    fn opened_project(home: &Path, root: &Path, pane: &str, agent_name: &str) -> project::Project {
+        let project = project::create(root, "demo", "", vec![]).unwrap();
+        let socket = home.join("herdr.sock");
+        std::fs::write(&socket, b"").unwrap();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        project
+            .update_coordinator(|c| {
+                c.socket = socket.to_string_lossy().into_owned();
+                c.workspace_id = "w1".into();
+                c.tab_id = "w1:t1".into();
+                c.pane_id = pane.into();
+                c.agent_name = agent_name.into();
+                c.cwd = cwd;
+            })
+            .unwrap();
+        project
+    }
+
     #[test]
     fn a_cached_native_failure_still_names_the_stored_sign_in_without_provider_output() {
         let home = tempfile::tempdir().unwrap();
@@ -1494,6 +1571,92 @@ mod tests {
             "only the parent CLI check runs; recipe validation is skipped"
         );
         assert_eq!(runner.count("machine list"), 0);
+    }
+
+    #[test]
+    fn a_coordinator_whose_name_does_not_resolve_fails_the_project_row() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
+        let root = home.path().join("root");
+        let project = opened_project(home.path(), &root, "w1:p1", "hp-demo-coordinator");
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        let panes = format!(
+            r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}"}}]}}}}"#
+        );
+        let agents = format!(
+            r#"{{"result":{{"agents":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}","name":"someone-else","agent":"claude","agent_status":"idle"}}]}}}}"#
+        );
+        let runner = runner_with_project("herdr 0.9.1\n", &panes, &agents);
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy, "{text}");
+        assert!(text.contains("does not resolve"), "{text}");
+    }
+
+    #[test]
+    fn announced_items_unread_across_passes_fail_the_project_row() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(
+            home.path().join("cfg/routing.json"),
+            include_str!("../config/routing.json"),
+        )
+        .unwrap();
+        let root = home.path().join("root");
+        let project = opened_project(home.path(), &root, "w1:p1", "hp-demo-coordinator");
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        let panes = format!(
+            r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}"}}]}}}}"#
+        );
+        let agents = format!(
+            r#"{{"result":{{"agents":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"}}]}}}}"#
+        );
+        let runner = runner_with_project("herdr 0.9.1\n", &panes, &agents);
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("notification show", ok(r#"{"result":{"shown":true}}"#));
+        // Announce an item and let the ticker count the passes where it stays
+        // unread. `nudge = false` keeps the announcement out of the runner's
+        // prompt path; the pass count is the same either way.
+        crate::inbox::write(&project, "routine", "r", "due", "Prompt").unwrap();
+        let herdr = Herdr::new("herdr", "", &runner);
+        let settings = project::Settings {
+            nudge: false,
+            ..project::Settings::default()
+        };
+        let mut state = crate::steps::load_state(&project);
+        for _ in 0..(crate::steps::UNREAD_NUDGE_PASSES + 1) {
+            crate::steps::nudge(&project, &mut state, &settings, &herdr, None).unwrap();
+        }
+        crate::steps::save_state(&project, &state).unwrap();
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy, "{text}");
+        assert!(text.contains("unread"), "{text}");
+>>>>>>> 221e94fbc7304113385ad740b452278a96d293f0
     }
 
     #[test]
