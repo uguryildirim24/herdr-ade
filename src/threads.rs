@@ -141,17 +141,6 @@ pub fn check_birth_plain(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The open lanes that hold a slot: open or starting, and not finished. A
-/// lane whose last agent state is `done` keeps its pane but holds no slot.
-pub fn open_lane_count(project: &Project) -> usize {
-    thread::list(project)
-        .iter()
-        .filter(|t| {
-            (t.status == Status::Open || t.status == Status::Starting) && t.last_state != "done"
-        })
-        .count()
-}
-
 /// Creates the worktree or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
@@ -284,13 +273,6 @@ fn start_with_ticker(
         fallback_say(ctx, slug, &placement)?;
     }
     let machine = placement.machine.clone();
-    let open_count = open_lane_count(&project);
-    if open_count as u32 >= settings.max_parallel_threads {
-        eprintln!(
-            "warning: {open_count} threads are already open; max_parallel_threads is {}",
-            settings.max_parallel_threads
-        );
-    }
 
     // Recipe and repository readiness both ran on the selected machine
     // during placement, before a thread record exists.

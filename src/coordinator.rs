@@ -469,8 +469,8 @@ fn digest_snapshot(
             );
             let _ = writeln!(
                 out,
-                "Settings: max_parallel_threads={} auto_resolve_days={} nudge={}",
-                settings.max_parallel_threads, settings.auto_resolve_days, settings.nudge
+                "Settings: auto_resolve_days={} nudge={}",
+                settings.auto_resolve_days, settings.nudge
             );
             if settings.repos.is_empty() {
                 let _ = writeln!(out, "Repos: (none)");
