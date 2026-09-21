@@ -325,7 +325,14 @@ fn start_with_ticker(
         }
         Err(error) => {
             let message = format!("{error:#}");
-            let cleanup = fail_start(ctx, &project, &id, &message);
+            let cleanup = fail_start(
+                ctx,
+                &project,
+                &id,
+                &message,
+                crate::contracts::FailureClass::Unknown,
+                false,
+            );
             let error = match cleanup {
                 Ok(_) => error,
                 Err(cleanup) => error.context(format!("failed-start cleanup: {cleanup:#}")),
@@ -1388,10 +1395,12 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
         bail!("the text is empty");
     }
     if record.status == Status::Resolved {
-        bail!("{id} is resolved");
+        return Err(crate::refusal::error(format!("{id} is resolved")));
     }
     if record.prompt_pending {
-        bail!("{id} has not received its brief yet; try again once it has started");
+        return Err(crate::refusal::error(format!(
+            "{id} has not received its brief yet; try again once it has started"
+        )));
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
@@ -1415,12 +1424,16 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread restart`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" if record.agent != "pi" || record.error.is_empty() => bail!(
-            "agent_blocked: {} is waiting on the user in its pane ({})",
-            record.id,
-            record.pane_id
-        ),
-        "unknown" => bail!("{}'s agent state is unknown; not sending", record.id),
+        "blocked" if record.agent != "pi" || record.error.is_empty() => {
+            Err(crate::refusal::error(format!(
+                "agent_blocked: {} is waiting on the user in its pane ({})",
+                record.id, record.pane_id
+            )))
+        }
+        "unknown" => Err(crate::refusal::error(format!(
+            "{}'s agent state is unknown; not sending",
+            record.id
+        ))),
         state => Ok(state.to_string()),
     }
 }
@@ -1704,11 +1717,50 @@ pub(crate) fn remove_scratch_session(ctx: &Ctx, record: &Thread) -> Result<()> {
 /// Marks a start failed, removes its Working metadata, and closes everything
 /// the attempt opened. The failed state is durable even when cleanup itself
 /// reports an error, so no view can keep presenting the attempt as Working.
-pub(crate) fn fail_start(ctx: &Ctx, project: &Project, id: &str, reason: &str) -> Result<Thread> {
+pub(crate) fn fail_start(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    reason: &str,
+    class: crate::contracts::FailureClass,
+    recover: bool,
+) -> Result<Thread> {
+    let provider_kind = None;
+    let (recovery, recovery_error) = if !recover {
+        (None, None)
+    } else {
+        let record = thread::load(project, id)?;
+        let task = std::fs::read_to_string(thread::task_path(project, id)).unwrap_or_default();
+        match crate::launch::resolve_failure(
+            ctx,
+            project,
+            &crate::launch::ResolveInput {
+                task: &task,
+                workflow: &record.role,
+                previous: Some(&record.launch),
+                failure: Some(reason),
+                source_truncation: record.launch.source_truncation.as_ref(),
+            },
+            class,
+        ) {
+            Ok(selected) => (Some(selected), None),
+            Err(error) => (None, Some(format!("WAITING: {error:#}"))),
+        }
+    };
     let failed = thread::update(project, id, |t| {
         t.status = Status::Failed;
         t.prompt_pending = false;
-        t.error = reason.to_string();
+        t.error = recovery_error.clone().unwrap_or_else(|| reason.to_string());
+        t.failure_class = class;
+        t.provider_failure_kind = provider_kind.clone();
+        if let Some(mut selected) = recovery.clone() {
+            t.attempt = t.attempt.max(1).saturating_add(1);
+            selected.attempt = t.attempt;
+            selected.brief_hash = t.launch.brief_hash.clone();
+            t.launch = selected;
+            t.launch_attempts = 0;
+            t.escalation_pending = true;
+        }
         t.last_group = Group::WaitingOnYou.token().to_string();
     })?;
     if !failed.tab_id.is_empty() {
@@ -2128,9 +2180,9 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     };
     let group = thread::group(&fresh, &live, now);
     let note = if t.status == Status::Failed {
-        format!("failed: {}", t.error)
+        format!("{}: {}", t.failure_class.plain(), t.error)
     } else if !live.pane_exists {
-        "pane closed".to_string()
+        "process gone: pane or agent is gone without a report".to_string()
     } else {
         live.agent_state.unwrap_or_else(|| "no agent".into())
     };

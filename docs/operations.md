@@ -68,7 +68,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. `delete` moves the folder to `.trash/`. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 
-Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a pane gone with no report, or blocked for 30 seconds); **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. Threads idle for `auto_resolve_days` are resolved after a final copy home.
+Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a process gone with no report, or blocked for 30 seconds); **Unknown** for a box lane that has not been polled; **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. Threads idle for `auto_resolve_days` are resolved after a final copy home.
 
 `focus` replaces any sidebar view another tool has set, and `unfocus` clears whatever view is set, because Herdr holds a single one. `focus` covers local threads only.
 
@@ -147,7 +147,7 @@ recipe = "claude_fable_xhigh"
 # "SHA256-of-exact-task-file-bytes" = "recipe-id"
 ```
 
-A rule may override the global recovery policy with `retries = N` and `fallback = ["recipe-a", "recipe-b"]`. `ha failed "<failure and evidence>"` first retries the selected recipe up to that bound, then tries each fallback once in order. When the list is exhausted, the lane remains failed with a `WAITING` reason for the coordinator; no other recipe is guessed. The old fixed escalation count no longer exists.
+A rule may override the global recovery policy with `retries = N` and `fallback = ["recipe-a", "recipe-b"]`. `ha failed "<failure and evidence>"` reports failed work by default: it retries up to that bound, then tries each fallback once in order. `--class provider --provider-kind <kind>` and `--class lost_connection` use only bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. When recovery is exhausted, no other recipe is guessed.
 
 Each launch record and dispatch-ledger row says `pin`, `default` or `rule[n]`, so the reason for selection stays inspectable. Historical launch, dispatch and round records may still contain removed fields; serde ignores those fields when loading them.
 
@@ -208,7 +208,7 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 ## Lane completion deliveries
 
-A lane's `DONE`/`WAITING` line is the wake-up: the ticker types it once into the coordinator's ready pane, so the coordinator is roused even when it already handled the result. `context` reads the current attempt's sealed completion evidence directly, alongside thread and round records. Local completions write no inbox item. A courier import leaves one `courier-delivery` message; a changed recipient leaves a `recipient-changed` message. Only a command the bound coordinator runs (`context`, or `inbox done` for messages) acknowledges a delivery; `--peek` and automation never do. Old thread/round inbox projections are ignored on read, not migrated.
+A lane's typed event line is the wake-up: the ticker types it once into the coordinator's ready pane. `context` reads the current attempt's sealed completion evidence directly, alongside thread and round records. Local and courier completions write no duplicate inbox item; a changed recipient leaves a `recipient-changed` message. Only a command the bound coordinator runs (`context`, or `inbox done` for messages) acknowledges a delivery; `--peek` and automation never do. Old thread/round inbox projections are ignored on read, not migrated.
 
 ## Routines
 

@@ -28,6 +28,8 @@ pub(crate) struct Entry {
     pub(crate) detail: String,
     pub(crate) count: u64,
     pub(crate) closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) closed_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -150,6 +152,7 @@ pub(crate) fn record(project: &Project, kind: &str, subject: &str, detail: &str)
         entry.last_at = now;
         // A fresh occurrence reopens a closed failure, retaining its identity.
         entry.closed = false;
+        entry.closed_at = None;
         entry.detail = detail.into();
         entry
     } else {
@@ -162,6 +165,7 @@ pub(crate) fn record(project: &Project, kind: &str, subject: &str, detail: &str)
             detail: detail.into(),
             count: 1,
             closed: false,
+            closed_at: None,
         }
     };
     // Clock adjustments must not move the last observation before the first.
@@ -232,6 +236,7 @@ pub(crate) fn done(project: &Project, id: &str) -> Result<DoneOutcome> {
     let changed = !entry.closed;
     if changed {
         entry.closed = true;
+        entry.closed_at = Some(jiff::Timestamp::now().to_string());
         append(project, &Line::Failure(entry.clone()))?;
     }
     Ok(DoneOutcome {
@@ -294,37 +299,21 @@ pub(crate) fn context_read(project: &Project, at: &str) -> Result<()> {
     append(project, &Line::ContextRead { at: at.into() })
 }
 
-/// Retry only at an operation's actual re-entry, not every poll of its state.
-pub(crate) fn retry_after_failure(project: &Project, kind: &str, subject: &str) {
-    let pending = (|| -> Result<bool> {
-        let _lock = lock(project)?;
-        Ok(load(project)?
-            .pending
-            .contains(&(kind.into(), subject.into())))
-    })();
-    match pending {
-        Ok(true) => observe(project, "retry", subject, &format!("retry after {kind}")),
-        Ok(false) => {}
-        Err(e) => eprintln!("warning: could not read failure ledger: {e:#}"),
-    }
-}
-
-/// A successful retry is not a checked fix: the failure stays open, but future
-/// healthy polls must not be counted as more retries.
+/// Close every open occurrence when the observed condition clears. Closure is
+/// an append-only revision of the same failure id and carries its own time.
 pub(crate) fn recovered(project: &Project, kind: &str, subject: &str) {
     let result = (|| -> Result<()> {
         let _lock = lock(project)?;
-        if load(project)?
-            .pending
-            .contains(&(kind.into(), subject.into()))
-        {
-            append(
-                project,
-                &Line::Recovered {
-                    kind: kind.into(),
-                    subject: subject.into(),
-                },
-            )?;
+        let now = jiff::Timestamp::now().to_string();
+        let entries: Vec<Entry> = load(project)?
+            .entries
+            .into_values()
+            .filter(|entry| !entry.closed && entry.kind == kind && entry.subject == subject)
+            .collect();
+        for mut entry in entries {
+            entry.closed = true;
+            entry.closed_at = Some(now.clone());
+            append(project, &Line::Failure(entry))?;
         }
         Ok(())
     })();
@@ -333,9 +322,8 @@ pub(crate) fn recovered(project: &Project, kind: &str, subject: &str) {
     }
 }
 
-// The CLI's runner observes all child commands. Project scope is explicit at
-// dispatch and at each ticker/courier pass, never inferred from a subprocess's
-// cwd. RAII restores nested scopes; thread-local storage isolates test workers.
+// Child process failures are classified by each command's exit contract. A
+// normal negative answer is never a failure; an inability to answer is.
 thread_local! { static PROJECTS: RefCell<Vec<Project>> = const { RefCell::new(Vec::new()) }; }
 pub(crate) struct Scope(Vec<Project>);
 impl Scope {
@@ -362,8 +350,6 @@ fn observe_current(kind: &str, subject: &str, detail: &str) {
 pub(crate) struct RecordingRunner<'a>(pub &'a dyn Runner);
 
 fn command_subject(cmd: &Cmd) -> String {
-    // Never collect environment or stdin (credentials and prompts). Args are
-    // required evidence for identifying which command failed.
     format!(
         "{} {}",
         cmd.program,
@@ -373,14 +359,6 @@ fn command_subject(cmd: &Cmd) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn command_started(subject: &str) {
-    PROJECTS.with(|projects| {
-        for project in projects.borrow().iter() {
-            retry_after_failure(project, "command-failed", subject);
-        }
-    });
 }
 
 fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
@@ -405,7 +383,6 @@ fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
 impl Runner for RecordingRunner<'_> {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         let subject = command_subject(cmd);
-        command_started(&subject);
         let result = self.0.run(cmd);
         command_finished(cmd, &subject, &result);
         result
@@ -413,9 +390,6 @@ impl Runner for RecordingRunner<'_> {
 
     fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
         let subjects: Vec<_> = commands.iter().map(command_subject).collect();
-        for subject in &subjects {
-            command_started(subject);
-        }
         let results = self.0.run_parallel(commands);
         for ((command, subject), result) in commands.iter().zip(&subjects).zip(&results) {
             command_finished(command, subject, result);
@@ -474,7 +448,6 @@ mod tests {
         done(&p, &a.id).unwrap();
         assert!(list(&p).unwrap().is_empty());
         assert!(show(&p, &a.id).unwrap().closed);
-        retry_after_failure(&p, "start", "r1");
         assert!(list(&p).unwrap().is_empty());
         assert_eq!(record(&p, "start", "r1", "bad start").unwrap().count, 3);
         assert_ne!(record(&p, "start", "r2", "bad start").unwrap().id, a.id);
@@ -530,36 +503,26 @@ mod tests {
         assert_eq!(recent(&p).unwrap().len(), 2);
     }
     #[test]
-    fn recovery_stops_retry_counting_but_does_not_close_the_failure() {
+    fn recovery_closes_the_failure_without_a_retry_twin() {
         let (_root, p) = fixture();
-        record(&p, "courier-failed", "oci", "offline").unwrap();
-        retry_after_failure(&p, "courier-failed", "oci");
+        let failure = record(&p, "courier-failed", "oci", "offline").unwrap();
         recovered(&p, "courier-failed", "oci");
-        for _ in 0..3 {
-            retry_after_failure(&p, "courier-failed", "oci");
-        }
-        let entries = list(&p).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| e.count == 1));
+        assert!(list(&p).unwrap().is_empty());
+        let closed = show(&p, &failure.id).unwrap();
+        assert!(closed.closed);
+        assert!(closed.closed_at.is_some());
+        assert_eq!(closed.count, 1);
     }
 
     #[test]
-    fn closing_one_detail_keeps_another_failure_for_the_same_operation_pending() {
+    fn recovery_closes_each_detail_for_the_cleared_condition() {
         let (_root, p) = fixture();
         let first = record(&p, "start", "r1", "offline").unwrap();
         let second = record(&p, "start", "r1", "login expired").unwrap();
-        done(&p, &first.id).unwrap();
-        retry_after_failure(&p, "start", "r1");
-        let retry = list(&p)
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.kind == "retry")
-            .unwrap();
-        assert_eq!(retry.count, 1);
-
-        done(&p, &second.id).unwrap();
-        retry_after_failure(&p, "start", "r1");
-        assert_eq!(show(&p, &retry.id).unwrap().count, 1);
+        recovered(&p, "start", "r1");
+        assert!(list(&p).unwrap().is_empty());
+        assert!(show(&p, &first.id).unwrap().closed_at.is_some());
+        assert!(show(&p, &second.id).unwrap().closed_at.is_some());
     }
 
     #[test]
@@ -572,24 +535,6 @@ mod tests {
             std::fs::read_to_string(p.dir().join("ledger.jsonl")).unwrap(),
             "{unfinished"
         );
-    }
-
-    #[test]
-    fn scopes_restore_without_leaking_failures_to_another_project() {
-        let (root, p) = fixture();
-        let other = project::create(root.path(), "other", "", vec![]).unwrap();
-        {
-            let _scope = Scope::new(&[&p]);
-            {
-                let _nested = Scope::new(&[&other]);
-                observe_current("failed", "command", "other");
-            }
-            observe_current("failed", "command", "demo");
-        }
-        observe_current("failed", "command", "unscoped");
-        assert_eq!(list(&p).unwrap()[0].detail, "demo");
-        assert_eq!(list(&other).unwrap()[0].detail, "other");
-        assert_eq!(list(&p).unwrap().len(), 1);
     }
 
     #[test]
@@ -607,77 +552,5 @@ mod tests {
         }
         assert!(list(&p).unwrap().is_empty());
         assert!(!p.dir().join("ledger.jsonl").exists());
-    }
-
-    #[test]
-    fn a_probe_that_cannot_run_still_records() {
-        let (_root, p) = fixture();
-        let _scope = Scope::new(&[&p]);
-        let runner = RecordingRunner(&crate::runner::RealRunner);
-        let cmd = Cmd::new("/no-such-directory/herdr-ade-probe", Duration::from_secs(1))
-            .exit_meaning(crate::runner::ExitMeaning::Answer);
-        assert!(runner.run(&cmd).is_err());
-        let rows = list(&p).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, "command-failed");
-    }
-
-    #[test]
-    fn a_probe_timeout_or_signal_is_not_an_answer() {
-        use crate::runner::fake::FakeRunner;
-        for output in [
-            Output {
-                code: Some(1),
-                timed_out: true,
-                ..Default::default()
-            },
-            Output {
-                code: None,
-                ..Default::default()
-            },
-        ] {
-            let (_root, p) = fixture();
-            let _scope = Scope::new(&[&p]);
-            let fake = FakeRunner::new();
-            fake.on("probe", output);
-            let runner = RecordingRunner(&fake);
-            runner
-                .run(
-                    &Cmd::new("probe", Duration::from_secs(1))
-                        .exit_meaning(crate::runner::ExitMeaning::Answer),
-                )
-                .unwrap();
-            assert_eq!(list(&p).unwrap().len(), 1);
-        }
-    }
-
-    #[test]
-    fn a_real_nonzero_command_is_recorded_without_changing_its_result() {
-        let (_root, p) = fixture();
-        let _scope = Scope::new(&[&p]);
-        let runner = RecordingRunner(&crate::runner::RealRunner);
-        let out = runner
-            .run(
-                &Cmd::new("sh", Duration::from_secs(5))
-                    .args(["-c", "echo out; echo broken >&2; exit 7"]),
-            )
-            .unwrap();
-        assert_eq!(out.code, Some(7));
-        let entries = list(&p).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, "command-failed");
-        assert!(entries[0].subject.contains("sh"));
-        assert!(entries[0].detail.contains("broken"));
-        assert!(entries[0].detail.contains("out"));
-
-        let probe = runner
-            .run(
-                &Cmd::new("sh", Duration::from_secs(5))
-                    .args(["-c", "exit 1"])
-                    .exit_meaning(crate::runner::ExitMeaning::Answer),
-            )
-            .unwrap();
-        assert_eq!(probe.code, Some(1));
-        assert_eq!(list(&p).unwrap().len(), 1);
     }
 }

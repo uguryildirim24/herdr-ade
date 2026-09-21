@@ -27,7 +27,7 @@ When your approach fails, preserve the worktree and run:
 hp failed "<what failed, what you tried, and the evidence>"
 ```
 
-This seals a failure event. The harness follows the matched routing rule: retry the same recipe, then try its ordered fallback recipes, while keeping the worktree. When that list is exhausted it leaves the lane waiting for the coordinator. No settings edit or permission step is needed. Do not keep editing after sealing it. Use `waiting` for missing input, not for a failed approach.
+This seals a `work_failed` event. The harness follows the matched routing rule's retries and ordered fallbacks while keeping the worktree. Provider and connection failures are classified by the harness and never switch model; a gone process restarts; missing evidence is reported as unknown and waits for the coordinator. Do not keep editing after sealing it. Use `waiting` for missing input, not for a failed approach.
 
 ## Finish
 

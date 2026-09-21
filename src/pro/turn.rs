@@ -185,6 +185,7 @@ pub(crate) fn prepare(
             "packet {} bytes, about {} tokens",
             packet.bytes, packet.tokens
         )),
+        failure_class: None,
         packet: Some(packet_path.display().to_string()),
         written: None,
     };
@@ -374,8 +375,8 @@ fn collect_inner(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> 
             let detail = trip_breaker(env, layout, runner, port_from_health(runner), &reason);
             finish_failed(env, layout, runner, &mut turn, "cooldown", &detail, false)
         }
-        Outcome::Failed(reason) => {
-            finish_failed(env, layout, runner, &mut turn, "failed", &reason, true)
+        Outcome::ProviderFailed(reason) => {
+            finish_failed(env, layout, runner, &mut turn, "provider", &reason, true)
         }
     }
 }
@@ -416,12 +417,24 @@ fn finish_failed(
 
     turn.state = "failed".into();
     turn.finished_at = Some(super::now_rfc3339());
+    turn.failure_class = Some(
+        match code {
+            "cooldown" | "provider" | "timeout" => "provider",
+            "write" => "work_failed",
+            _ => "unknown",
+        }
+        .into(),
+    );
     turn.detail = Some(format!("{code}: {detail}"));
     turn.write(layout)?;
     // The turn record keeps the failure. The lane returns to ready; the
     // global cooldown file is the breaker gate when this failure tripped.
     let _ = release_lane(layout, &turn.lane);
-    let waiting = format!("WAITING {} pro {code}: {detail}", turn.tag);
+    let waiting = format!(
+        "WAITING {} pro {} ({code}): {detail}",
+        turn.tag,
+        turn.failure_class.as_deref().unwrap_or("unknown")
+    );
     let note = notify(runner, &env.herdr_bin(), &turn.notify, &waiting);
     record_note(layout, turn, note);
     Ok(())
@@ -553,7 +566,7 @@ fn write_answer(requested: &Path, answer: &str) -> Result<PathBuf> {
 pub(crate) enum Outcome {
     Delivered(String),
     Cooldown(String),
-    Failed(String),
+    ProviderFailed(String),
 }
 
 fn classify(completion: &Completion) -> Outcome {
@@ -573,16 +586,16 @@ fn classify(completion: &Completion) -> Outcome {
         .clone()
         .any(|event| value_contains(event, "chatgpt_session_expired"))
     {
-        return Outcome::Failed("login: the ChatGPT session expired".into());
+        return Outcome::ProviderFailed("login: the ChatGPT session expired".into());
     }
     let has_error = completion.events.iter().any(error_event);
     if has_error {
-        return Outcome::Failed("the turn contained an error or stream_error event".into());
+        return Outcome::ProviderFailed("the turn contained an error or stream_error event".into());
     }
     if !completion.answer.trim().is_empty() {
         return Outcome::Delivered(completion.answer.clone());
     }
-    Outcome::Failed("the turn completed with no answer".into())
+    Outcome::ProviderFailed("the turn completed with no answer".into())
 }
 
 fn value_contains(value: &Value, needle: &str) -> bool {
@@ -830,6 +843,7 @@ mod tests {
             started_at: crate::pro::now_rfc3339(),
             finished_at: None,
             detail: None,
+            failure_class: None,
             packet: Some("/p.md".into()),
             written: None,
         }
@@ -861,7 +875,7 @@ mod tests {
         };
         assert_eq!(
             classify(&expired),
-            Outcome::Failed("login: the ChatGPT session expired".into())
+            Outcome::ProviderFailed("login: the ChatGPT session expired".into())
         );
 
         let empty = Completion {
@@ -869,7 +883,16 @@ mod tests {
             answer: String::new(),
             events: vec![],
         };
-        assert!(matches!(classify(&empty), Outcome::Failed(_)));
+        assert!(matches!(classify(&empty), Outcome::ProviderFailed(_)));
+
+        let stopped = Completion {
+            turn_id: "t".into(),
+            answer: String::new(),
+            events: vec![
+                json!({"type":"stream_error","message":"stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"}),
+            ],
+        };
+        assert!(matches!(classify(&stopped), Outcome::Cooldown(_)));
     }
 
     #[test]
