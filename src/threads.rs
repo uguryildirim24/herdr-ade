@@ -197,10 +197,6 @@ fn start_with_ticker(
     ensure_ticker(ctx)?;
     let view = require_session(ctx, &project)?;
 
-    let listed = args
-        .repo
-        .as_ref()
-        .and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     check_birth_plain(&args.plain)?;
     // A box lane needs a repository: no repository means a tab in this Mac's
     // project workspace, which is local (SPEC-remote §4.2).
@@ -242,6 +238,9 @@ fn start_with_ticker(
             path
         }
     };
+    let listed = (!repo.is_empty())
+        .then(|| settings.repos.iter().find(|row| row.path == repo))
+        .flatten();
     let launch = crate::launch::resolve_launch(
         ctx,
         &project,
@@ -266,7 +265,7 @@ fn start_with_ticker(
         explicit_machine,
         role,
         &launch,
-        args.repo.as_deref(),
+        (!repo.is_empty()).then_some(repo.as_str()),
         listed,
     ) {
         Ok(placement) => placement,
@@ -286,7 +285,7 @@ fn start_with_ticker(
             "tried":placement.tried}),
     )?;
     if placement.fell_back {
-        fallback_say(ctx, slug)?;
+        fallback_say(ctx, slug, &placement)?;
     }
     let machine = placement.machine.clone();
     let open_count = open_lane_count(&project);
@@ -297,13 +296,8 @@ fn start_with_ticker(
         );
     }
 
-    // Recipe readiness ran on the selected machine during placement. A box
-    // start resolves its box repository row before a thread record
-    // exists, so a missing piece refuses early and leaves no record behind
-    // (t-0070).
-    if !machine.is_empty() && !repo.is_empty() {
-        box_repo_row(&settings, &repo)?;
-    }
+    // Recipe and repository readiness both ran on the selected machine
+    // during placement, before a thread record exists.
     let machine_id = placement.machine_id.clone();
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
@@ -369,22 +363,14 @@ impl Placement {
 }
 
 /// The default machine of a start without `--machine` (SPEC-remote §4.1,
-/// d-0005): lane/review work with a dispatch machine, on a
-/// repository that has a box clone, runs on that box. Every other start
-/// stays on this Mac.
-fn default_machine(
-    role: &str,
-    role_machine: &str,
-    repo: Option<&str>,
-    listed: Option<&crate::project::Repo>,
-) -> Option<String> {
-    if !matches!(role, "lane" | "reviewer") || role_machine.is_empty() {
+/// d-0005): lane/review work with a dispatch machine and a repository tries
+/// that box. Placement validates the repository mapping before selecting it;
+/// every other start stays on this Mac.
+fn default_machine(role: &str, role_machine: &str, repo: Option<&str>) -> Option<String> {
+    if !matches!(role, "lane" | "reviewer") || role_machine.is_empty() || repo.is_none() {
         return None;
     }
-    let repo = repo?;
-    let has_box = listed.is_some_and(|row| row.box_path.is_some())
-        || crate::remote::box_repo_for(repo).is_some();
-    has_box.then(|| role_machine.to_string())
+    Some(role_machine.to_string())
 }
 
 /// Resolves a start's machine before any tab or worktree exists. Placement is
@@ -400,7 +386,7 @@ fn resolve_placement(
 ) -> Result<Placement> {
     let candidates: Vec<String> = match explicit {
         Some(machine) => vec![machine.to_string()],
-        None => match default_machine(role, &launch.machine, repo, listed) {
+        None => match default_machine(role, &launch.machine, repo) {
             Some(machine) if machine == crate::contracts::MACHINE_LOCAL => vec![machine],
             Some(machine) => vec![machine, crate::contracts::MACHINE_LOCAL.to_string()],
             None => vec![crate::contracts::MACHINE_LOCAL.to_string()],
@@ -423,13 +409,20 @@ fn resolve_placement(
                 Ok(profile) if profile.is_local() => crate::doctor::recipe_ready_local(ctx, launch)
                     .map(|_| None)
                     .map_err(|error| format!("{error:#}")),
-                Ok(profile) if project::machine_held(&ctx.root, &profile.id) => Err(format!(
-                    "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
-                    profile.label, profile.label
-                )),
-                Ok(profile) => crate::doctor::recipe_ready_on_box(ctx, &profile, launch)
-                    .map(|_| Some(profile))
-                    .map_err(|error| format!("{error:#}")),
+                Ok(profile) => box_repo_candidate(repo, listed)
+                    .map_err(|error| format!("{error:#}"))
+                    .and_then(|_| {
+                        if project::machine_held(&ctx.root, &profile.id) {
+                            Err(format!(
+                                "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
+                                profile.label, profile.label
+                            ))
+                        } else {
+                            crate::doctor::recipe_ready_on_box(ctx, &profile, launch)
+                                .map(|_| Some(profile))
+                                .map_err(|error| format!("{error:#}"))
+                        }
+                    }),
             }
         };
         match checked {
@@ -493,13 +486,22 @@ fn resolve_placement(
 
 /// The one plain line when a default box start falls back to this Mac
 /// (SPEC-remote §4.1, d-0005).
-fn fallback_say(ctx: &Ctx, slug: &str) -> Result<()> {
-    crate::ask::say(
-        ctx,
-        slug,
-        "the box was not ready, so this lane runs here",
-        None,
-    )
+fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
+    let missing = placement
+        .tried
+        .iter()
+        .find_map(|row| row["missing"].as_str())
+        .unwrap_or_default();
+    let what = if missing.contains("box_publish_url_missing") {
+        "the box has no publishing address for this repository, so this lane runs here"
+    } else if missing.contains("box_path_missing") {
+        "the box has no folder for this repository, so this lane runs here"
+    } else if missing.contains("box_repo_unmapped") {
+        "this repository has no box location, so this lane runs here"
+    } else {
+        "the box was not ready, so this lane runs here"
+    };
+    crate::ask::say(ctx, slug, what, None)
 }
 
 /// A `kind = "pi"` launch is refused unless its provider is ready (SPEC-pi
@@ -569,8 +571,11 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
 /// `box_path` is set but whose `publish_url` is not names the missing URL; a
 /// repo with neither falls back to the built-in harness map, or keeps the
 /// mapping message (t-0070).
-fn box_repo_row(settings: &crate::project::Settings, repo: &str) -> Result<(String, String)> {
-    let row = settings.repos.iter().find(|r| r.path == repo);
+fn box_repo_candidate(
+    repo: Option<&str>,
+    row: Option<&crate::project::Repo>,
+) -> Result<(String, String)> {
+    let repo = repo.context("box_repo_unmapped: a box lane needs a repository")?;
     match (
         row.and_then(|r| r.box_path.clone()),
         row.and_then(|r| r.publish_url.clone()),
@@ -591,6 +596,10 @@ fn box_repo_row(settings: &crate::project::Settings, repo: &str) -> Result<(Stri
             Ok((map.box_path.to_string(), map.publish_url.to_string()))
         }
     }
+}
+
+fn box_repo_row(settings: &crate::project::Settings, repo: &str) -> Result<(String, String)> {
+    box_repo_candidate(repo.into(), settings.repos.iter().find(|r| r.path == repo))
 }
 
 /// The box start side (SPEC-remote §4.2 steps 2–5): commit the brief `B` on
@@ -2755,33 +2764,17 @@ mod tests {
 
     #[test]
     fn only_lane_and_reviewer_default_to_the_box() {
-        let row = crate::project::Repo {
-            path: "/r".into(),
-            box_path: Some("/box/r".into()),
-            ..Default::default()
-        };
         assert_eq!(
-            default_machine("lane", "oci", Some("/r"), Some(&row)),
+            default_machine("lane", "oci", Some("/r")),
             Some("oci".into())
         );
         assert_eq!(
-            default_machine("reviewer", "oci", Some("/r"), Some(&row)),
+            default_machine("reviewer", "oci", Some("/r")),
             Some("oci".into())
         );
-        assert_eq!(
-            default_machine("research", "oci", Some("/r"), Some(&row)),
-            None
-        );
-        assert_eq!(default_machine("lane", "", Some("/r"), Some(&row)), None);
-        let plain = crate::project::Repo {
-            path: "/r".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            default_machine("lane", "oci", Some("/r"), Some(&plain)),
-            None
-        );
-        assert_eq!(default_machine("lane", "oci", None, Some(&row)), None);
+        assert_eq!(default_machine("research", "oci", Some("/r")), None);
+        assert_eq!(default_machine("lane", "", Some("/r")), None);
+        assert_eq!(default_machine("lane", "oci", None), None);
     }
 
     #[test]
@@ -2986,6 +2979,7 @@ mod tests {
         let row = crate::project::Repo {
             path: "/repo".into(),
             box_path: Some("/box/repo".into()),
+            publish_url: Some("https://example/repo.git".into()),
             ..Default::default()
         };
         let error = resolve_placement(&ctx, None, "lane", &launch, Some("/repo"), Some(&row))
@@ -3035,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn a_box_repo_without_a_publish_url_names_it_and_leaves_no_thread() {
+    fn a_default_start_with_no_box_publish_url_falls_back_to_this_mac() {
         let (fx, _remote) = box_fixture();
         let (mut settings, body) = fx.project.read_project_md().unwrap();
         settings.repos[0].publish_url = None;
@@ -3043,22 +3037,41 @@ mod tests {
         std::fs::write(fx.project.project_md(), text).unwrap();
         write_config(&fx, LANE_CONFIG);
         stub_box(&fx);
-        let error = start(
+        let started = start(
             &fx.world.ctx(),
             "demo",
             start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
         )
+        .unwrap();
+        assert!(started.machine.is_empty());
+        assert!(
+            started
+                .worktree_path
+                .starts_with(&fx.repo.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            say_lines(&fx.project),
+            vec![
+                "the box has no publishing address for this repository, so this lane runs here"
+                    .to_string()
+            ]
+        );
+        let ledger =
+            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
+        assert!(ledger.contains("box_publish_url_missing"), "{ledger}");
+
+        let error = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                Some("oci".into()),
+            ),
+        )
         .unwrap_err()
         .to_string();
         assert!(error.contains("box_publish_url_missing"), "{error}");
-        assert!(
-            error.contains("publish_url") && error.contains("PROJECT.md"),
-            "{error}"
-        );
-        assert!(
-            thread::list(&fx.project).is_empty(),
-            "a refused box start leaves no thread record"
-        );
+        assert_eq!(thread::list(&fx.project).len(), 1);
     }
 
     #[test]
