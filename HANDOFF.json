@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0188.md",
+      "tasks/review-r79.md",
+      "tasks/review-r78.md",
+      "tasks/t-0187.md",
       "tasks/t-0185.md",
       "tasks/t-0186.md",
       "tasks/review-r77.md",
@@ -18,17 +22,14 @@
       "tasks/t-0183.md",
       "tasks/t-0182.md",
       "tasks/t-0180.md",
-      "tasks/t-0177.md",
-      "tasks/review-r75.md",
-      "tasks/t-0181.md",
-      "tasks/review-r76.md",
-      "tasks/t-0178.md"
+      "tasks/t-0177.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r78.md",
       "tasks/reviews/code-r77.md",
       "tasks/reviews/code-r75.md",
       "tasks/reviews/code-r76.md",
@@ -39,17 +40,21 @@
       "tasks/reviews/code-r70.md",
       "tasks/reviews/code-r69.md",
       "tasks/reviews/code-r68.md",
-      "tasks/reviews/code-r67.md",
-      "tasks/reviews/code-r66.md"
+      "tasks/reviews/code-r67.md"
     ]
   },
-  "generated": "2026-09-21T18:03:15-04:00",
+  "generated": "2026-09-21T18:24:57-04:00",
   "git": {
     "branches": [
       "main",
+      "hp/adeherdr/t-0188-review-r78-each-job-is-tied-to-your-word",
+      "hp/adeherdr/t-0189-review-r79-a-finished-lane-s-build-folde",
+      "review/r79",
+      "hp/adeherdr/t-0186-w4-remove-build-folders",
+      "review/r78",
+      "hp/adeherdr/t-0187-d6-adapters",
       "hp/adeherdr/t-0184-d5-task-records",
       "hp/adeherdr/t-0185-review-r77-background-jobs-run-from-a-fo",
-      "hp/adeherdr/t-0186-w4-remove-build-folders",
       "review/r77",
       "hp/adeherdr/t-0183-w3-stable-folders",
       "hp/adeherdr/t-0182-review-r75-each-failure-says-what-failed",
@@ -298,29 +303,36 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "f59e11c Merge commit 'd75dba04cb198929b36ce4b4985cfd75d41ff6b2'",
-      "d75dba0 docs(review): round r77 verdict",
-      "289f66b review(runtime): keep timeouts unknown and root ticker loop",
-      "ae0db4b docs(tasks): t-0186",
-      "0813e5d review(r77): merge pinned t-0183",
-      "545e667 docs(tasks): t-0185"
+      "26ad8f5 Merge commit 'feba2cc54ff6debdc2a66db66ede13956a7b7880'",
+      "feba2cc review(tasks): round r78 verdict",
+      "7131f53 review(tasks): preserve task evidence on migration",
+      "3764a7e review(r79): brief for revision 1",
+      "f4c3c82 Merge commit '742dda6f3ebddf9388eeb1d8454192a88dac37dd'",
+      "b8e18c9 docs(tasks): t-0188"
     ],
-    "remote": "10 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "f59e11c",
+        "head": "26ad8f5",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'd75dba04cb198929b36ce4b4985cfd75d41ff6b2'"
+        "subject": "Merge commit 'feba2cc54ff6debdc2a66db66ede13956a7b7880'"
       },
       {
-        "branch": "review/r77",
+        "branch": "review/r78",
         "dirty": 0,
-        "head": "545e667",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r77",
-        "subject": "docs(tasks): t-0185"
+        "head": "b8e18c9",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r78",
+        "subject": "docs(tasks): t-0188"
+      },
+      {
+        "branch": "review/r79",
+        "dirty": 0,
+        "head": "6a73245",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r79",
+        "subject": "docs(tasks): t-0189"
       }
     ]
   },
@@ -345,8 +357,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r77",
-    "verdict": "d75dba04cb198929b36ce4b4985cfd75d41ff6b2"
+    "round": "r78",
+    "verdict": "feba2cc54ff6debdc2a66db66ede13956a7b7880"
   },
   "session": "default",
   "unlinked_agents": [],
