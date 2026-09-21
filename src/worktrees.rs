@@ -396,6 +396,15 @@ mod tests {
         assert!(roots(vec!["runs/pytest-x/output.bin".into()], vec![], &configured).is_empty());
         assert_eq!(
             roots(
+                vec!["runs/pytest-x/output.bin".into()],
+                vec!["runs/pytest-x/nested".into()],
+                &configured
+            ),
+            BTreeSet::from(["runs/pytest-x/nested".to_string()]),
+            "a wildcard must never make a nested checkout disposable"
+        );
+        assert_eq!(
+            roots(
                 vec![
                     "runs/pytest-x/output.bin".into(),
                     "runs/seed-1/output.bin".into()

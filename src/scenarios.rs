@@ -465,6 +465,34 @@ fn cancel_keeps_non_disposable_ignored_data() {
 }
 
 #[test]
+fn cancel_uses_the_repository_specific_disposable_list() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.add_repo(&project, "/repo");
+    let (mut settings, body) = project.read_project_md().unwrap();
+    settings.repos[0].disposable = vec!["runs/pytest-*".into()];
+    let front = toml::to_string(&settings).unwrap();
+    std::fs::write(project.project_md(), format!("+++\n{front}+++\n\n{body}")).unwrap();
+    let worktree = world.home.path().join("cancel-generated-worktree");
+    std::fs::create_dir_all(worktree.join("runs/pytest-cancel")).unwrap();
+    std::fs::write(worktree.join("runs/pytest-cancel/cache"), "generated").unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    world.runner.on(
+        "status --porcelain --ignored --untracked-files=all",
+        ok("!! runs/pytest-cancel/cache\n"),
+    );
+    world.runner.on("worktree remove", ok(""));
+
+    let outcome = threads::cancel(&world.ctx(), "demo", &t.id, "stop this run").unwrap();
+
+    assert_eq!(outcome.worktree, "removed");
+    assert_eq!(world.runner.count("worktree remove"), 1);
+}
+
+#[test]
 fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -799,6 +827,35 @@ fn resolving_disposable_ignored_output_removes_the_worktree() {
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
         ok("!! target/debug/cache\n"),
+    );
+    world.runner.on("worktree remove", ok(""));
+
+    let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
+
+    assert_eq!(outcome.worktree, "removed");
+    assert_eq!(world.runner.count("worktree remove"), 1);
+}
+
+#[test]
+fn resolve_uses_the_repository_specific_disposable_list() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.add_repo(&project, "/repo");
+    let (mut settings, body) = project.read_project_md().unwrap();
+    settings.repos[0].disposable = vec!["runs/pytest-*".into()];
+    let front = toml::to_string(&settings).unwrap();
+    std::fs::write(project.project_md(), format!("+++\n{front}+++\n\n{body}")).unwrap();
+    let worktree = world.home.path().join("repo-generated-worktree");
+    std::fs::create_dir_all(worktree.join("runs/pytest-resolve")).unwrap();
+    std::fs::write(worktree.join("runs/pytest-resolve/cache"), "generated").unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    world.runner.on(
+        "status --porcelain --ignored --untracked-files=all",
+        ok("!! runs/pytest-resolve/cache\n"),
     );
     world.runner.on("worktree remove", ok(""));
 

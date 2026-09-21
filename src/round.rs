@@ -4447,6 +4447,40 @@ mod tests {
     }
 
     #[test]
+    fn closed_round_cleanup_uses_the_repository_specific_disposable_list() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].disposable = vec!["runs/pytest-*".into()];
+        let front_matter = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front_matter}+++\n\n{body}"),
+        )
+        .unwrap();
+        let (lanes, _) = reviewed(&fx);
+        let review_worktree = fx.repo.join(".worktrees/review-r1");
+        let exclude = fx.repo.join(".git/info/exclude");
+        let mut exclusions = std::fs::read_to_string(&exclude).unwrap_or_default();
+        exclusions.push_str("runs/\n");
+        std::fs::write(exclude, exclusions).unwrap();
+        std::fs::create_dir_all(review_worktree.join("runs/pytest-review")).unwrap();
+        std::fs::write(
+            review_worktree.join("runs/pytest-review/cache"),
+            "generated",
+        )
+        .unwrap();
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+
+        merge(&ctx, "demo", "r1", None).unwrap();
+
+        assert!(
+            !review_worktree.exists(),
+            "repository-specific disposable output must not retain a closed review worktree"
+        );
+    }
+
+    #[test]
     fn item33_member_added_after_b_supersedes_the_active_review() {
         let fx = fixture();
         let ctx = fx.world.ctx();
