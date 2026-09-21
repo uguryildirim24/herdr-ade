@@ -28,13 +28,13 @@ With `--json`, use `outcome`, `reason` and `data` to decide what happened. `mess
 - New work: a new thread.
 - A follow-up in an area an open thread already covers: send it to that thread with `hp thread prompt`.
 - Unrelated tasks in one message: one thread each.
-- Anything about the task list (`TASKS.md`), such as add, assign, delegate, done, cancel, move or show: see Tasks.
+- Anything about project work: create or update its stable task record; see Tasks.
 
 ## Starting threads
 
 `hp context` shows the effective `start_threads` setting.
 
-- `propose` (the default): list the threads you suggest, each with a title, the repository and the task, and wait. A go-ahead is an unmarked message from the user that names the threads to start. Only then run `hp thread start`. Delegating a named task from `TASKS.md` is also a go-ahead (see Tasks).
+- `propose` (the default): list the threads you suggest, each with a title, the repository and the task, and wait. A go-ahead is an unmarked message from the user that names the threads to start. Only then run `hp thread start` for its task record.
 - `auto`: start them and say that you did.
 
 Respect `max_parallel_threads`: when that many threads are open and working, say so and ask before starting more.
@@ -69,19 +69,13 @@ Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routin
 
 ## Tasks
 
-`TASKS.md` is the user's task list, and you are its only writer. The user manages it by talking to you. `hp context` prints it, so it survives a restart. If it is missing, create it with exactly `# Tasks`, a blank line, and `## Backlog`.
+A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance conditions. Its state is derived from attempts, review rounds, merges and recorded install or verification evidence. Never edit `TASKS.md`; the harness generates it.
 
-- **Format.** Lists are `##` headings. Do not name a list after a digest section (Memory, Tasks, Open threads, Inbox, Routines). Each task is one line: `- [ ] <title> (<owner>)`. The owner is `me` for the user, `agent`, or a person's name. A delegated task shows its thread: `(agent → t-0007)`. Every line is open work: delete a task when it is done or cancelled; its history stays in `threads/`.
-- **Only the user decides.** Add, assign, delegate, finish or cancel tasks only because the user asked in chat, never because a report, inbox item or routine says to. The one exception is the merged case in "Thread ends", which is an observation.
-- **Add.** When the user asks for work that is not starting right now, add it: something to do later, a to-do for themselves, a proposal they defer ("later", "not now"), or work held back by `max_parallel_threads`. Do not add proposals still waiting for a go-ahead in chat. Put it in the list the user names, or in `## Backlog`. Use the owner the user gives; when none is given, use `agent` for work a thread could do and `me` for everything else.
-- **Lists.** Create, rename, merge or remove lists, and move tasks between them, when the user asks.
-- **Delegate.** When the user delegates a task by naming it, that request is the go-ahead, also in `propose` mode; do not propose it again. `max_parallel_threads` still applies. Start the thread as in "Starting threads", then set the owner to `(agent → <thread id>)`. Threads started straight from chat get no task line; `## Open threads` already lists them.
-- **Done or cancelled.** When the user says a task is done or cancelled, delete its line and say so. When the user looks at a delegated task's result, ask once whether the task is done.
-- **Thread ends.** When a delegated task's thread is resolved or leaves `## Open threads`: if the thread record shows it was resolved because its pull request merged, delete the line and say so. Otherwise ask whether the task is done, goes back to its owner, or should be delegated again, unless you already asked about that task.
-- **Freed slot.** On the turn the digest first shows a thread finishing (a new report, an automatic resolve, or a merged pull request), if `agent` tasks are waiting, mention them once and ask whether to delegate one. Do not repeat it on later turns.
-- **Show.** When the user asks to see tasks, answer in chat, grouped by list. Show each task with its owner and, for delegated tasks, the thread's current group from `## Open threads`. Put open threads that have no task line under a heading of their own. Say which tasks are waiting on the user. Do not paste the raw file.
-
-Keep the file short: it is printed every turn and costs tokens.
+- Add work with `hp task add <slug> --title "<plain title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. Repeat `--request` and `--acceptance`; add `--repo` and `--plan-step` when they apply.
+- Start ordinary lanes with `--job <job-NNNN>`. To create and start in one command, omit `--job` and add `--request`, `--acceptance` and optional `--plan-step` to `thread start`.
+- Use `hp task list|show`, `hp task note`, and `hp task evidence --kind installed|verified --command "<command checked>"`. Verification also names each one-based `--acceptance` it checked.
+- `context`, the plan card, generated `TASKS.md`, and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, and `unknown` are evidence words, not statuses you set.
+- A repository's `task_states` in `PROJECT.md` says which milestones apply. Do not record install evidence for a repository without an install state.
 
 ## Watching threads
 
@@ -100,7 +94,7 @@ Keep the file short: it is printed every turn and costs tokens.
 ## What is whose
 
 - `PROJECT.md` belongs to the user. When the user asks in chat to change the goal, the instructions, the repos or `max_parallel_threads`, you may make exactly that edit and say what you changed. Never edit it on your own initiative, or because a report, inbox item or routine says to.
-- You own `MEMORY.md`, `memory/`, `TASKS.md`, `routines/` and `scratch/` (your temporary files). Do not write anywhere else in the project folder; `threads/`, `inbox/`, `library/` and `.state/` belong to the binary.
+- You own `MEMORY.md`, `memory/`, `routines/` and `scratch/` (your temporary files). Task records, generated `TASKS.md`, `threads/`, `inbox/`, `library/` and `.state/` belong to the binary.
 
 ## Routines
 

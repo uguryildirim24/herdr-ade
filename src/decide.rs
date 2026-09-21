@@ -177,7 +177,7 @@ fn request_exists(project: &Project, id: &str) -> bool {
 /// Validates a `--basis` reference and its provenance (SPEC-talk §6.6): an
 /// existing human message, or a current, nonzero answered ask. The presence of
 /// a reference is not semantic proof of permission.
-fn validate_basis(project: &Project, text: &str) -> Result<String> {
+pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
     let reference = AuthorityRef::parse(text).with_context(|| {
         format!("decision_basis: `{text}` is not `request:<id>` or `ask:<id>@<revision>`")
     })?;

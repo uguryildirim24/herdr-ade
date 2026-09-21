@@ -489,6 +489,7 @@ fn return_to_admitting(record: &mut RoundRecord) {
     record.phase = RoundPhase::Admitting;
     record.reviewer = None;
     record.verdict = None;
+    record.verdict_kind = None;
     record.announced = None;
     record.attention.clear();
     record.reviewer_start_failures = 0;
@@ -978,6 +979,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         save(&project, &record)?;
         record
     };
+    crate::task::link_round_for_thread(&project, round, thread_id)?;
     let _ = crate::glossary::rewrite(&project);
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
@@ -1029,6 +1031,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
         record.phase = RoundPhase::Abandoned;
         record.review_intent = None;
         record.verdict = None;
+        record.verdict_kind = None;
         record.abandoned_reason = Some(reason);
         save(&project, &record)?;
         record
@@ -1198,6 +1201,7 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
         }
     }
     record.verdict = None;
+    record.verdict_kind = None;
     record.phase = RoundPhase::UnderReview;
     record.reviewer = Some(thread_id.to_string());
     record.announced = None;
@@ -1344,6 +1348,11 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
         let git = Git::new(ctx.runner, &record.repo);
         require_reviewer_base(&git, &record, &candidate)?;
         validate_verdict_inner(&git, &record, &pin.sha, false)?;
+        let verdict_kind = git
+            .show_file(&pin.sha, &verdict_path(&record.round))?
+            .and_then(|text| parse_verdict(&text).ok())
+            .map(|verdict| verdict.verdict)
+            .context("verdict_unreadable: validated verdict disappeared")?;
         if let Some(bound) = record.reviewer.as_deref()
             && bound != id
         {
@@ -1377,6 +1386,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
         }
         current.reviewer = Some(id.to_string());
         current.verdict = Some(pin);
+        current.verdict_kind = Some(verdict_kind);
         current.phase = RoundPhase::VerdictIn;
         current.announced = None;
         current.attention.clear();
@@ -1570,6 +1580,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             outcome.started.push(ReviewerStarted { round, reviewer });
         }
     }
+    let _ = crate::task::refresh_tasks_md(&project);
     Ok(outcome)
 }
 
@@ -2420,6 +2431,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         current.phase = RoundPhase::UnderReview;
         current.review_intent = None;
         current.verdict = None;
+        current.verdict_kind = None;
         current.expected_head = Some(b.clone());
         current.frozen_revision = Some(current.manifest.revision);
         current.manifest_hash = Some(hash.clone());
@@ -2630,6 +2642,19 @@ fn parse_verdict(text: &str) -> Result<Verdict> {
 /// The reviewer's sealed `done` sha for its current attempt: `V`.
 fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<String> {
     if let Some(pin) = &record.verdict {
+        if record.verdict_kind.is_none() {
+            let kind = git
+                .show_file(&pin.sha, &verdict_path(&record.round))?
+                .and_then(|text| parse_verdict(&text).ok())
+                .map(|verdict| verdict.verdict)
+                .context("verdict_unreadable: accepted verdict cannot be read")?;
+            let _lock = project.lock()?;
+            let mut current = load(project, &record.round)?;
+            if current.verdict.as_ref() == Some(pin) && current.verdict_kind.is_none() {
+                current.verdict_kind = Some(kind);
+                save(project, &current)?;
+            }
+        }
         return Ok(pin.sha.clone());
     }
     if let Some(intent) = &record.merge {
@@ -2646,10 +2671,12 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
     let pin = done_pin(&events, &record.round, reviewer, attempt)
         .context("verdict_missing: the reviewer has no sealed done event for this round and attempt; finish the review and run done with its verdict commit")?;
     validate_verdict_inner(git, record, &pin.sha, false)?;
-    let rejected = git
+    let verdict_kind = git
         .show_file(&pin.sha, &verdict_path(&record.round))?
         .and_then(|text| parse_verdict(&text).ok())
-        .is_some_and(|verdict| verdict.verdict == "REJECT");
+        .map(|verdict| verdict.verdict)
+        .context("verdict_unreadable: validated verdict disappeared")?;
+    let rejected = verdict_kind == "REJECT";
     let _lock = project.lock()?;
     let mut current = load(project, &record.round)?;
     if current.reviewer != record.reviewer
@@ -2665,6 +2692,7 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         return Ok(accepted.sha);
     }
     current.verdict = Some(pin.clone());
+    current.verdict_kind = Some(verdict_kind);
     current.phase = RoundPhase::VerdictIn;
     if rejected {
         *current.rejections.get_or_insert(0) += 1;
@@ -2848,6 +2876,9 @@ fn merge_inner(
         let what = record.plain.trim().to_string();
         if let Err(e) = crate::ask::say_landed(ctx, slug, &what, None, round) {
             eprintln!("note: the landing line could not be published: {e:#}");
+        }
+        if let Err(e) = crate::task::refresh_tasks_md(&project) {
+            eprintln!("note: the task list refresh failed: {e:#}");
         }
         if let Err(e) = crate::plan::refresh(ctx, &project) {
             eprintln!("note: the plan refresh failed: {e:#}");

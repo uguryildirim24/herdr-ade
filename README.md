@@ -101,7 +101,7 @@ A birth sentence. `thread start` and `thread adopt` require `--plain`. The sente
 
 ### Where does my project live?
 
-In `~/.herdr-ade/<name>/` by default: `PROJECT.md` for your settings and standing instructions, `MEMORY.md` and `memory/` for what the coordinator remembers, `TASKS.md` for the task list the coordinator keeps for you, `threads/` for thread records and reports, and `library/` for files threads produced. The safety settings live outside it, in `~/.config/herdr-ade/config.toml`, where no agent works. [Operations](docs/operations.md#where-things-live) lists every file.
+In `~/.herdr-ade/<name>/` by default: `PROJECT.md` for your settings and standing instructions, `MEMORY.md` and `memory/` for what the coordinator remembers, `tasks/` for stable task records, generated `TASKS.md` for their shared view, `threads/` for thread records and reports, and `library/` for files threads produced. The safety settings live outside it, in `~/.config/herdr-ade/config.toml`, where no agent works. [Operations](docs/operations.md#where-things-live) lists every file.
 
 ### Do I have to start every thread through the coordinator?
 
