@@ -199,21 +199,22 @@ pub fn pane_json(workspace: &str, tab: &str, pane: &str, cwd: &str) -> String {
     format!(r#"{{"pane_id":"{pane}","tab_id":"{tab}","workspace_id":"{workspace}","cwd":"{cwd}"}}"#)
 }
 
-fn record_closed_round(project: &Project, thread: &str, repo: &str) {
+fn record_closed_round(project: &Project, thread: &str, repo: &str, phase: RoundPhase) {
     let dir = project.state_dir().join("rounds");
     std::fs::create_dir_all(&dir).unwrap();
+    let merge = (phase == RoundPhase::Merged).then(|| MergeIntent {
+        op: "merge-r1".into(),
+        expected_old: "b".into(),
+        candidate: "c".into(),
+        verdict: "v".into(),
+        phase: MergePhase::Checkpointed,
+        merged: Some("v".into()),
+        checkpoint: None,
+        head: Some("h".into()),
+    });
     let record = RoundRecord {
-        phase: RoundPhase::Merged,
-        merge: Some(MergeIntent {
-            op: "merge-r1".into(),
-            expected_old: "b".into(),
-            candidate: "c".into(),
-            verdict: "v".into(),
-            phase: MergePhase::Checkpointed,
-            merged: Some("v".into()),
-            checkpoint: None,
-            head: Some("h".into()),
-        }),
+        phase,
+        merge,
         round: "r1".into(),
         branch: "main".into(),
         plain: "The work is merged.".into(),
@@ -640,7 +641,7 @@ fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo");
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
     world.runner.on(
         "status --porcelain --untracked-files=all",
         ok("?? scratch.txt\n"),
@@ -658,6 +659,30 @@ fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
 }
 
 #[test]
+fn resolving_a_clean_lane_from_an_abandoned_round_removes_its_worktree() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let worktree = world.home.path().join("abandoned-worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Abandoned);
+    world
+        .runner
+        .on("status --porcelain --untracked-files=all", ok(""));
+    world.runner.on("worktree remove", ok(""));
+
+    threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
+
+    let resolved = thread::load(&project, &t.id).unwrap();
+    assert_eq!(resolved.status, Status::Resolved);
+    assert!(resolved.worktree_path.is_empty());
+    assert_eq!(world.runner.count("worktree remove"), 1);
+}
+
+#[test]
 fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -671,7 +696,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
             thread.machine_id = "oci-id".into();
         },
     );
-    record_closed_round(&project, &t.id, &t.repo);
+    record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
     world.runner.on(
         "machine list --json",
         ok(r#"[{"id":"oci-id","label":"oci","target":"remote-host","session":"default","enabled":true}]"#),
