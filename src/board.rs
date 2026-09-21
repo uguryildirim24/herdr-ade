@@ -186,6 +186,9 @@ pub(crate) fn stage(project: &Project) -> String {
                 Some(MergePhase::Checkpointed) => format!("round {n} has landed"),
                 Some(MergePhase::MergeDiverged) => format!("round {n} stopped and needs a look"),
                 Some(_) => format!("round {n} is being merged"),
+                None if r.phase == crate::contracts::RoundPhase::Abandoned => {
+                    format!("round {n} was abandoned")
+                }
                 None if r.expected_head.is_some() => format!("round {n} is in review"),
                 None if members == 0 => format!("round {n} is open with no lanes yet"),
                 None if done == members => format!("round {n} has all {members} lanes done"),
