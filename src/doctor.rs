@@ -169,8 +169,9 @@ fn run_native_probe(
             .args(probe.args.iter().copied())
             .cwd(&ctx.root),
     )?;
-    let provider_failure =
-        !output.success() && crate::pi::doctor::positive_sign_in_evidence(&output.error_text());
+    let provider_failure = !output.timed_out
+        && !output.success()
+        && crate::pi::doctor::positive_sign_in_evidence(&output.error_text());
     // Unknown diagnostics may be local, or may be provider text we do not
     // recognize. Do not persist either. A later check reruns and keeps the
     // original text in its immediate result.
@@ -1685,6 +1686,45 @@ recipe = "claude_fable_xhigh"
         let calls = runner.calls.borrow();
         let probe = calls.iter().find(|call| call.program == "claude").unwrap();
         assert_eq!(probe.cwd.as_deref(), Some(ctx.root.as_path()));
+    }
+
+    #[test]
+    fn a_timed_out_native_probe_is_unknown_and_is_not_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "claude",
+            |_| {
+                Ok(crate::runner::Output {
+                    stderr: "authentication failed before the probe stalled".into(),
+                    timed_out: true,
+                    ..Default::default()
+                })
+            },
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let launch = crate::contracts::Launch {
+            kind: "claude".into(),
+            ready_timeout_ms: 1_000,
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            let error = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
+            assert!(error.contains("timed out"), "{error}");
+            assert!(!error.contains("stored sign-in"), "{error}");
+        }
+        assert_eq!(runner.count("claude"), 2);
+        assert!(!ctx.root.join(".readiness/native-claude.json").exists());
     }
 
     #[test]

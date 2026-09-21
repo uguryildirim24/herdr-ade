@@ -268,9 +268,15 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     if project::list_slugs(&ctx.root).is_empty() {
         return Ok(());
     }
-    // `ticker run` can also be invoked directly. Do not rely on the process's
-    // inherited folder: every external command in every ticker path receives
-    // the projects root explicitly.
+    // `ticker run` can also be invoked directly. Move the loop itself off the
+    // caller's possibly disposable worktree, then give every external command
+    // the same explicit projects root.
+    std::env::set_current_dir(&ctx.root).with_context(|| {
+        format!(
+            "could not move the ticker to the projects root {}",
+            ctx.root.display()
+        )
+    })?;
     let runner = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
     let stable = Ctx {
         env: ctx.env,

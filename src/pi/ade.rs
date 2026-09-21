@@ -132,26 +132,30 @@ pub(crate) fn check_on_machine(
         return Ok(());
     }
     let parsed = serde_json::from_str::<serde_json::Value>(&out.stdout).ok();
-    let evidence = parsed
-        .as_ref()
-        .and_then(|value| value.get("checks"))
-        .and_then(serde_json::Value::as_array)
-        .filter(|checks| {
-            checks
-                .iter()
-                .any(|check| check.get("ok").and_then(serde_json::Value::as_bool) == Some(false))
-        })
-        .is_some_and(|checks| {
-            checks
-                .iter()
-                .filter(|check| check.get("ok").and_then(serde_json::Value::as_bool) == Some(false))
-                .all(|check| {
-                    check
-                        .get("failure_class")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("provider")
+    let evidence = !out.timed_out
+        && out.code != Some(255)
+        && parsed
+            .as_ref()
+            .and_then(|value| value.get("checks"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|checks| {
+                checks.iter().any(|check| {
+                    check.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
                 })
-        });
+            })
+            .is_some_and(|checks| {
+                checks
+                    .iter()
+                    .filter(|check| {
+                        check.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                    })
+                    .all(|check| {
+                        check
+                            .get("failure_class")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("provider")
+                    })
+            });
     Err(ReadinessError {
         class: if evidence {
             crate::contracts::FailureClass::Provider
@@ -243,6 +247,27 @@ mod tests {
         assert!(
             error.contains("error: unrecognized subcommand 'check'"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_box_check_stays_unknown_despite_partial_provider_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            crate::runner::Output {
+                code: Some(1),
+                stdout: r#"{"checks":[{"ok":false,"failure_class":"provider"}]}"#.into(),
+                timed_out: true,
+                ..Default::default()
+            },
+        );
+
+        let error = check_on_machine(&runner, dir.path(), "me@box", "opencode-go").unwrap_err();
+        assert_eq!(
+            failure_class(&error),
+            crate::contracts::FailureClass::Unknown
         );
     }
 }
