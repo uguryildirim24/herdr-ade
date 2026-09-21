@@ -214,6 +214,7 @@ pub(crate) fn spawn(layout: &Layout, tag: &str) -> Result<()> {
     command
         .env("HERDR_PRO_STATE_DIR", layout.root.display().to_string())
         .args(["collector", "--turn", tag])
+        .current_dir(layout.root.parent().unwrap_or(&layout.root))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
