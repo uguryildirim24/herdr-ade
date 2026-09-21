@@ -94,6 +94,12 @@ pub(crate) struct Thread {
     pub(crate) pr_review: String,
     pub(crate) pr_summary: Option<crate::pr::Summary>,
     pub(crate) resolved_reason: String,
+    /// Why recovery deliberately stopped this thread. Empty on historical and
+    /// normally resolved records.
+    pub(crate) cancellation_reason: String,
+    /// Cleanup still owes a pane/tab close because its session was unreachable.
+    /// A repeated `thread cancel` retries it instead of claiming it was done.
+    pub(crate) cleanup_pending: bool,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub(crate) role: String,
     pub(crate) launch: crate::contracts::Launch,
@@ -240,7 +246,7 @@ fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
         );
     }
     if after.attempt > before.attempt && before.attempt > 0 {
-        crate::ledger::observe(project, "retry", &after.id, "thread restart");
+        crate::ledger::observe(project, "retry", &after.id, "thread retry");
     }
     if after.launch_attempts > before.launch_attempts && before.launch_attempts > 0 {
         crate::ledger::observe(project, "retry", &after.id, "agent launch");

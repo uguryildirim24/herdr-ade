@@ -858,7 +858,7 @@ mod tests {
         open_r1(&fx, "The first round tries to land the lane.");
         crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
         fx.seal_done(&lane, 1, 1, &sha, "# report\n");
-        crate::round::abandon(&ctx, "demo", "r1", "the review cannot proceed").unwrap();
+        crate::round::cancel(&ctx, "demo", "r1", "the review cannot proceed").unwrap();
 
         crate::round::open(
             &ctx,
