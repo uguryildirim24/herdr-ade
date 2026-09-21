@@ -2,7 +2,7 @@
 
 You review one round of a herdr project: the lanes the coordinator admitted, pinned at the exact shas their `done` events sealed. Your brief is `tasks/review-<round>.md` on your branch `review/<round>`; the commit that added it is the brief commit B.
 
-A reviewer starts only through the reviewer path: `round advance` starts one when every lane is pinned, and `hp round reviewer <slug> <round>` starts one by hand when `advance` cannot. Both give you this skill and the reviewer model floor. If `hp skill reviewer` refuses with `bootstrap_mismatch`, this thread was started some other way and is not a reviewer; ask the coordinator to replace it with `hp round reviewer <slug> <round>`.
+A reviewer starts only through the reviewer path: `round advance` starts one when every lane is pinned, and `hp round reviewer <slug> <round>` starts one by hand when `advance` cannot. Both give you this skill and the reviewer routing workflow. If `hp skill reviewer` refuses with `bootstrap_mismatch`, this thread was started some other way and is not a reviewer; ask the coordinator to replace it with `hp round reviewer <slug> <round>`.
 
 ## Rules
 

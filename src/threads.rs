@@ -247,11 +247,6 @@ fn start_with_ticker(
         &crate::launch::ResolveInput {
             task: &args.task,
             workflow: role,
-            state: crate::launch::repository_state(
-                ctx,
-                args.repo.as_deref(),
-                args.base.as_deref(),
-            )?,
             source_truncation: source_truncation.as_ref(),
             ..Default::default()
         },
@@ -2338,7 +2333,7 @@ mod tests {
         std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
-            "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+            "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
         )
         .unwrap();
 
@@ -2496,7 +2491,7 @@ mod tests {
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
             format!(
-                "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
+                "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
             ),
         )
         .unwrap();
@@ -2737,7 +2732,7 @@ mod tests {
         );
     }
 
-    const LANE_CONFIG: &str = "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n[dispatch]\nmachine = \"oci\"\n";
+    const LANE_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"oci\"\n";
 
     fn start_args(repo: Option<String>, machine: Option<String>) -> StartArgs {
         StartArgs {
@@ -2882,12 +2877,14 @@ mod tests {
         let (fx, _remote) = box_fixture();
         write_config(&fx, LANE_CONFIG);
         let task = "Run the bounded coding task.";
-        let policy_path = fx.world.home.path().join("cfg/routing.json");
-        let mut policy: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&policy_path).unwrap()).unwrap();
-        policy["pins"][crate::thread::sha256_hex(task.as_bytes())] =
-            serde_json::json!("pi_opencode_deepseek");
-        std::fs::write(&policy_path, policy.to_string()).unwrap();
+        let config_path = fx.world.home.path().join("cfg/config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let hash = crate::thread::sha256_hex(task.as_bytes());
+        std::fs::write(
+            &config_path,
+            format!("{config}\n[routing.pins]\n\"{hash}\" = \"pi_opencode_deepseek\"\n"),
+        )
+        .unwrap();
         stub_box(&fx);
         let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
         args.task = task.into();
@@ -3185,7 +3182,7 @@ mod tests {
         let (fx, remote) = box_fixture();
         write_config(
             &fx,
-            "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n",
+            "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n",
         );
         stub_box(&fx);
         let ctx = fx.world.ctx();

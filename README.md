@@ -89,7 +89,7 @@ It runs the `herdr-ade` binary every turn, so you'll want to allow-list it in yo
 
 ### Does the plugin send my project to a hosted service?
 
-Project files and lane work stay on your machines. Task dispatch sends the full task brief and bounded repository facts to TypeSafe System One so Jev can score the work; the chosen agent CLI then uses its own service. Remote lanes use your own SSH machines.
+Project files and lane work stay on your machines. Dispatch reads the local routing table; only the selected agent CLI uses its configured service. Remote lanes use your own SSH machines.
 
 ### Will it touch my branches or worktrees on its own?
 
@@ -97,7 +97,7 @@ No. It never deletes a branch, merges or pushes on its own. An ADE lane is `git 
 
 ### What is `--plain`?
 
-A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the plugin's plain-language check (one sentence, known words). Model choice comes from the full task brief through Jev and the editable `routing.json` policy; `thread start` rejects model, recipe and role flags. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing) for setup and offline evaluation.
+A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the plugin's plain-language check (one sentence, known words). Recipe choice comes from the editable `[routing]` table in `config.toml`; `thread start` rejects model, recipe and role flags. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing).
 
 ### Where does my project live?
 

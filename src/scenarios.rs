@@ -30,20 +30,9 @@ impl World {
     pub fn new() -> World {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        let env = Env::for_test(home.path(), &[]);
         std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(home.path().join("cfg/config.toml"), "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n").unwrap();
-        let mut policy: serde_json::Value =
-            serde_json::from_str(include_str!("../config/routing.json")).unwrap();
-        policy["models"] = serde_json::json!({"test_claude": {
-            "tier": 1,
-            "coding_index": 77.2,
-            "price_per_million": 1.0,
-            "description": "Fixture coding model"
-        }});
-        policy["role_floors"] = serde_json::json!({});
-        policy["answer_floors"] = serde_json::json!([]);
-        std::fs::write(home.path().join("cfg/routing.json"), policy.to_string()).unwrap();
+        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n").unwrap();
         let world = World {
             env,
             root,
@@ -63,21 +52,6 @@ impl World {
         world
             .runner
             .on_fn(|cmd| cmd.program == "agy", |_| Ok(ok("OK\n")));
-        let mut answers = serde_json::Map::new();
-        answers.insert(
-            "required_index".into(),
-            serde_json::json!({"type":"score", "score":0.0, "confidence":0.98,
-            "probabilities":{"0":1.0,"1":0.0,"2":0.0,"3":0.0}}),
-        );
-        world.runner.on(
-            "/usr/bin/curl",
-            ok(&crate::jev::http_response(
-                &serde_json::json!({"model":"jev-test", "answers":answers,
-                "usage":{"input_tokens":100,"output_tokens":20}})
-                .to_string(),
-                200,
-            )),
-        );
         let agents = world.agents.clone();
         world.runner.on_fn(
             |cmd| {
@@ -1678,6 +1652,28 @@ fn open_leaves_a_matching_label_alone_and_a_failed_rename_does_not_block_it() {
     world.runner.on("workspace rename", fail(1, "boom"));
     open_alive(&world, &project).unwrap();
     assert_eq!(world.runner.count("workspace rename"), 1);
+}
+
+#[test]
+fn open_accepts_a_non_claude_coordinator_recipe() {
+    let world = World::new();
+    let config = world.home.path().join("cfg/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replacen(
+            "default = \"test_claude\"",
+            "default = \"pi_codex_sol_high\"",
+            1,
+        ),
+    )
+    .unwrap();
+    let project = world.project("demo", "a.sock");
+    world.runner.on(
+        "workspace get w1",
+        ok(r#"{"result":{"workspace":{"workspace_id":"w1","label":"Demo"}}}"#),
+    );
+    open_alive(&world, &project).unwrap();
 }
 
 #[test]

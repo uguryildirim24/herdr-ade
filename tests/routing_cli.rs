@@ -27,16 +27,13 @@ fn coordinator_cannot_select_a_role_recipe_or_model() {
 }
 
 #[test]
-fn workflow_help_describes_policy_floor() {
+fn workflow_help_describes_routing_match() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-ade"))
         .args(["thread", "start", "--help"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        help.contains("routing policy may set a model floor"),
-        "{help}"
-    );
+    assert!(help.contains("routing table may match it"), "{help}");
     assert!(!help.contains("never selects its model"));
 }
