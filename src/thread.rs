@@ -57,6 +57,12 @@ pub(crate) struct Thread {
     pub(crate) launch_attempts: u32,
     pub(crate) failure_event: String,
     pub(crate) last_failure: String,
+    /// Classification of the current failure evidence. Old records load as
+    /// unknown rather than guessing from prose.
+    #[serde(default)]
+    pub(crate) failure_class: crate::contracts::FailureClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_failure_kind: Option<String>,
     pub(crate) escalation_pending: bool,
     pub(crate) kind: Kind,
     pub(crate) repo: String,
@@ -216,8 +222,12 @@ pub(crate) fn update_checked(
 /// Record transitions, not polls: an unchanged blocked/error state is one
 /// occurrence even if the ticker sees it a hundred times.
 fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
-    if (after.status == Status::Failed && before.status != Status::Failed)
-        || (!after.error.is_empty() && after.error != before.error)
+    // The failure ledger is for harness defects, not provider outages, gone
+    // processes, failed work, or ordinary retries. Unknown startup breakage is
+    // the only thread transition that supplies evidence of a harness failure.
+    if after.status == Status::Failed
+        && before.status != Status::Failed
+        && after.failure_class == crate::contracts::FailureClass::Unknown
     {
         crate::ledger::observe(project, "thread-error", &after.id, &after.error);
         if after.launch_attempts == 0 && !after.launch.kind.is_empty() {
@@ -228,22 +238,6 @@ fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
                 &format!("launch_attempts = 0: {}", after.error),
             );
         }
-    }
-    if after.last_state != before.last_state
-        && matches!(after.last_state.as_str(), "error" | "blocked")
-    {
-        crate::ledger::observe(
-            project,
-            "thread-state",
-            &after.id,
-            &format!("{}: {}", after.last_state, after.error),
-        );
-    }
-    if after.attempt > before.attempt && before.attempt > 0 {
-        crate::ledger::observe(project, "retry", &after.id, "thread restart");
-    }
-    if after.launch_attempts > before.launch_attempts && before.launch_attempts > 0 {
-        crate::ledger::observe(project, "retry", &after.id, "agent launch");
     }
 }
 
@@ -497,6 +491,7 @@ pub(crate) fn brief_for(
 pub(crate) enum Group {
     ReadyForReview,
     WaitingOnYou,
+    Unknown,
     Working,
     Landing,
     Idle,
@@ -510,10 +505,11 @@ impl Group {
         match self {
             Group::ReadyForReview => 1,
             Group::WaitingOnYou => 2,
-            Group::Working => 3,
-            Group::Landing => 4,
-            Group::Idle => 5,
-            Group::Resolved => 6,
+            Group::Unknown => 3,
+            Group::Working => 4,
+            Group::Landing => 5,
+            Group::Idle => 6,
+            Group::Resolved => 7,
         }
     }
 
@@ -521,6 +517,7 @@ impl Group {
         match self {
             Group::ReadyForReview => "Ready for review",
             Group::WaitingOnYou => "Waiting on you",
+            Group::Unknown => "Unknown",
             Group::Working => "Working",
             Group::Landing => "Landing",
             Group::Idle => "Idle",
@@ -533,6 +530,7 @@ impl Group {
         match self {
             Group::ReadyForReview => "ready-for-review",
             Group::WaitingOnYou => "waiting-on-you",
+            Group::Unknown => "unknown",
             Group::Working => "working",
             Group::Landing => "landing",
             Group::Idle => "idle",
@@ -544,6 +542,7 @@ impl Group {
         [
             Group::ReadyForReview,
             Group::WaitingOnYou,
+            Group::Unknown,
             Group::Working,
             Group::Landing,
             Group::Idle,
@@ -553,9 +552,10 @@ impl Group {
         .find(|g| g.token() == token)
     }
 
-    pub(crate) const DISPLAY_ORDER: [Group; 6] = [
+    pub(crate) const DISPLAY_ORDER: [Group; 7] = [
         Group::ReadyForReview,
         Group::WaitingOnYou,
+        Group::Unknown,
         Group::Working,
         Group::Landing,
         Group::Idle,
@@ -590,6 +590,7 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
             Group::WaitingOnYou
         }
         Status::Starting => Group::Working,
+        Status::Open if thread.is_remote() && thread.last_state.is_empty() => Group::Unknown,
         Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
             Group::Working
         } else {
@@ -998,6 +999,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unpolled_remote_thread_is_unknown() {
+        let remote = Thread {
+            machine: "box".into(),
+            last_state: String::new(),
+            ..open_thread()
+        };
+        assert_eq!(recorded_group(&remote, now()), Group::Unknown);
+        assert_eq!(Group::Unknown.label(), "Unknown");
+    }
+
+    #[test]
     fn row3_waiting_on_you() {
         let failed = Thread {
             status: Status::Failed,
@@ -1161,7 +1173,7 @@ mod tests {
     #[test]
     fn display_order_and_rank_digits() {
         let ranks: Vec<u8> = Group::DISPLAY_ORDER.iter().map(|g| g.rank()).collect();
-        assert_eq!(ranks, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(Group::ReadyForReview.token(), "ready-for-review");
         assert_eq!(Group::WaitingOnYou.token(), "waiting-on-you");
         assert_eq!(Group::from_token("landing"), Some(Group::Landing));
@@ -1310,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_transitions_record_once_and_launch_retries_are_counted() {
+    fn only_unknown_harness_breakage_enters_the_failure_ledger() {
         let root = tempfile::tempdir().unwrap();
         let p = project::create(root.path(), "demo", "", vec![]).unwrap();
         let t = allocate(&p, |t| {
@@ -1327,7 +1339,7 @@ mod tests {
             .unwrap();
         }
         let entries = crate::ledger::list(&p).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.count == 1));
         assert!(entries.iter().any(|e| e.kind == "launch-not-attempted"));
         update(&p, &t.id, |t| {
@@ -1337,7 +1349,7 @@ mod tests {
         .unwrap();
         update(&p, &t.id, |t| t.launch_attempts += 1).unwrap();
         let entries = crate::ledger::list(&p).unwrap();
-        assert_eq!(entries.iter().filter(|e| e.kind == "retry").count(), 2);
+        assert!(!entries.iter().any(|e| e.kind == "retry"));
     }
 
     #[test]

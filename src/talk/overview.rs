@@ -108,6 +108,7 @@ pub(crate) struct Overview {
 fn state_word(group: Group) -> &'static str {
     match group {
         Group::WaitingOnYou => "needs you",
+        Group::Unknown => "unknown",
         Group::ReadyForReview | Group::Landing => "checking",
         _ => "working",
     }
@@ -364,7 +365,11 @@ impl Overview {
                 live.group(&t)
             };
             let (state, tone) = match group {
+                Group::WaitingOnYou if t.status == Status::Failed || !t.error.is_empty() => {
+                    (t.failure_class.plain(), Tone::Red)
+                }
                 Group::WaitingOnYou => ("needs you", Tone::Red),
+                Group::Unknown => ("unknown", Tone::Peach),
                 Group::ReadyForReview | Group::Landing => ("checking", Tone::Yellow),
                 _ => ("working", Tone::Yellow),
             };

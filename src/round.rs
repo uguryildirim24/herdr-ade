@@ -587,9 +587,9 @@ pub fn open_round_pinning(project: &Project, thread: &str) -> Result<Option<Stri
 
 pub fn require_resolvable(project: &Project, thread: &str) -> Result<()> {
     if let Some(round) = open_round_pinning(project, thread)? {
-        bail!(
+        return Err(crate::refusal::error(format!(
             "round_unmerged: `{thread}` is held by round `{round}`; run `round merge {round}` to completion before resolving it"
-        );
+        )));
     }
     Ok(())
 }
@@ -1510,7 +1510,6 @@ fn start_and_bind_reviewer(
     review_branch: &str,
     prefix: &str,
 ) -> Result<Option<String>> {
-    crate::ledger::retry_after_failure(project, "reviewer-start-failed", round);
     match start_reviewer(ctx, project, round, review_branch, prefix) {
         Ok(thread) => {
             crate::ledger::recovered(project, "reviewer-start-failed", round);
@@ -1747,7 +1746,14 @@ fn reviewer_start_failed(
     // next pass retries this same binding instead of starting a second live
     // reviewer beside it.
     if let Some(dead) = dead_reviewer {
-        crate::threads::fail_start(ctx, project, dead, reason)?;
+        crate::threads::fail_start(
+            ctx,
+            project,
+            dead,
+            reason,
+            crate::contracts::FailureClass::ProcessGone,
+            false,
+        )?;
     }
     let failures = {
         let _lock = project.lock()?;
@@ -2478,11 +2484,9 @@ pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<M
     match &result {
         Err(error) if crate::refusal::is(error) => {}
         Err(error) => {
-            crate::ledger::retry_after_failure(&project, "merge-refused", round);
             crate::ledger::observe(&project, "merge-refused", round, &format!("{error:#}"));
         }
         Ok(_) => {
-            crate::ledger::retry_after_failure(&project, "merge-refused", round);
             crate::ledger::recovered(&project, "merge-refused", round);
         }
     }
@@ -3398,7 +3402,10 @@ pub mod testkit {
                 n,
                 EventPayload {
                     done: None,
-                    waiting: Some(WaitingPayload { text: text.into() }),
+                    waiting: Some(WaitingPayload {
+                        text: text.into(),
+                        ..Default::default()
+                    }),
                     failed: None,
                 },
             )
@@ -4940,7 +4947,7 @@ mod tests {
             .unwrap();
         assert_eq!(start.subject, "r1");
         assert_eq!(start.count, 2);
-        assert!(failures.iter().any(|entry| entry.kind == "retry"));
+        assert!(!failures.iter().any(|entry| entry.kind == "retry"));
 
         // The next pass tries again, and a live project starts the reviewer.
         fx.project
