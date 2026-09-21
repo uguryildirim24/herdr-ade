@@ -1,6 +1,6 @@
 {
   "coordinator": {
-    "agent_name": null,
+    "agent_name": "hp-adeherdr-coordinator",
     "cwd": "/Users/rolfie/.herdr-ade/adeherdr",
     "kind": "claude",
     "pane_id": "w1G:p1",
@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0151.md",
+      "tasks/review-r65.md",
+      "tasks/t-0150.md",
+      "tasks/t-0149.md",
       "tasks/t-0148.md",
       "tasks/review-r64.md",
       "tasks/t-0147.md",
@@ -18,17 +22,14 @@
       "tasks/t-0146.md",
       "tasks/t-0145.md",
       "tasks/review-r62.md",
-      "tasks/t-0144.md",
-      "tasks/t-0143.md",
-      "tasks/t-0138.md",
-      "tasks/review-r60.md",
-      "tasks/t-0142.md"
+      "tasks/t-0144.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r65.md",
       "tasks/reviews/code-r64.md",
       "tasks/reviews/code-r63.md",
       "tasks/reviews/code-r62.md",
@@ -39,15 +40,18 @@
       "tasks/reviews/code-r56.md",
       "tasks/reviews/code-r55.md",
       "tasks/reviews/code-r54.md",
-      "tasks/reviews/code-r53.md",
-      "tasks/reviews/code-r52.md"
+      "tasks/reviews/code-r53.md"
     ]
   },
-  "generated": "2026-09-21T11:27:58-04:00",
+  "generated": "2026-09-21T11:48:33-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta",
+      "hp/adeherdr/t-0151-review-r65-this-round-stops-a-round-i-ga",
       "main",
+      "review/r65",
+      "hp/adeherdr/t-0150-an-abandoned-round-does-not-carry-its-la",
+      "hp/adeherdr/t-0149-every-command-reports-its-result-the-sam",
+      "hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta",
       "hp/adeherdr/t-0141-review-r59-this-round-fixes-your-talk-ta",
       "review/r64",
       "hp/adeherdr/t-0144-rounds-side-by-side-stop-sending-each-ot",
@@ -240,22 +244,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "cb6265f docs(review): round r64 verdict",
-      "98544db review(round): serialize manual reviewer starts",
-      "6dfaaab review(talk): allow later screen handoffs",
-      "d678dc2 review(doctor): finish merged coordinator checks",
-      "77826b5 Merge commit '4fb1c69914d04beb3f19decaa9741b1890168db6' into hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta",
-      "380df85 Merge commit '221e94fbc7304113385ad740b452278a96d293f0' into hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta"
+      "37bd2f2 docs(review): round r65 verdict",
+      "b7ba243 Merge commit '7096cd613801c190d755cf9a0791a8900835986b' into hp/adeherdr/t-0151-review-r65-this-round-stops-a-round-i-ga",
+      "308d78c docs(tasks): t-0151",
+      "bd99ca4 review(r65): brief for revision 1",
+      "7096cd6 fix(round): release abandoned members",
+      "32a8225 docs(tasks): t-0150"
     ],
-    "remote": "14 ahead, 0 behind origin/main",
+    "remote": "7 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "cb6265f",
+        "head": "37bd2f2",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r64 verdict"
+        "subject": "docs(review): round r65 verdict"
       },
       {
         "branch": "review/r1",
@@ -669,6 +673,13 @@
         "head": "1fa6855",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r64",
         "subject": "docs(tasks): t-0148"
+      },
+      {
+        "branch": "review/r65",
+        "dirty": 0,
+        "head": "308d78c",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r65",
+        "subject": "docs(tasks): t-0151"
       },
       {
         "branch": "review/r7",
@@ -1211,38 +1222,15 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r64",
-    "verdict": "cb6265f2504c262543d05e888943da94dba240e9"
+    "round": "r65",
+    "verdict": "37bd2f2b3df11bdd25af3377b470b0a72ceabdbe"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0148",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0148",
-      "pane_id": "w1G:p3B",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0148--/2026-09-21T15-17-38-263Z_01a0c48b-4b57-728b-90dd-f1c9e2eec68b.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:t37",
-      "tab_label": "t-0148",
-      "title": "π - t-0148",
-      "tokens": {
-        "done": "1",
-        "lane": "t-0148",
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "5",
-        "review": "idle",
-        "thread": "t-0148"
-      }
-    }
-  ],
+  "workers": [],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 3
+    "tabs": 2
   }
 }
