@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0153.md",
+      "tasks/review-r67.md",
+      "tasks/review-r66.md",
+      "tasks/t-0152.md",
       "tasks/t-0151.md",
       "tasks/review-r65.md",
       "tasks/t-0150.md",
@@ -18,17 +22,14 @@
       "tasks/t-0148.md",
       "tasks/review-r64.md",
       "tasks/t-0147.md",
-      "tasks/review-r63.md",
-      "tasks/t-0146.md",
-      "tasks/t-0145.md",
-      "tasks/review-r62.md",
-      "tasks/t-0144.md"
+      "tasks/review-r63.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r66.md",
       "tasks/reviews/code-r65.md",
       "tasks/reviews/code-r64.md",
       "tasks/reviews/code-r63.md",
@@ -39,18 +40,24 @@
       "tasks/reviews/code-r57.md",
       "tasks/reviews/code-r56.md",
       "tasks/reviews/code-r55.md",
-      "tasks/reviews/code-r54.md",
-      "tasks/reviews/code-r53.md"
+      "tasks/reviews/code-r54.md"
     ]
   },
-  "generated": "2026-09-21T11:48:33-04:00",
+  "generated": "2026-09-21T12:39:46-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0151-review-r65-this-round-stops-a-round-i-ga",
       "main",
+      "hp/adeherdr/t-0156-review-r67-this-round-makes-your-talk-ta",
+      "review/r67",
+      "hp/adeherdr/t-0155-review-r67-this-round-makes-your-talk-ta",
+      "hp/adeherdr/t-0153-review-r66-this-round-makes-every-comman",
+      "hp/adeherdr/t-0154-review-r67-this-round-makes-your-talk-ta",
+      "hp/adeherdr/t-0152-the-prompt-hook-records-only-rolf-s-word",
+      "review/r66",
+      "hp/adeherdr/t-0149-every-command-reports-its-result-the-sam",
+      "hp/adeherdr/t-0151-review-r65-this-round-stops-a-round-i-ga",
       "review/r65",
       "hp/adeherdr/t-0150-an-abandoned-round-does-not-carry-its-la",
-      "hp/adeherdr/t-0149-every-command-reports-its-result-the-sam",
       "hp/adeherdr/t-0148-review-r64-this-round-fixes-your-talk-ta",
       "hp/adeherdr/t-0141-review-r59-this-round-fixes-your-talk-ta",
       "review/r64",
@@ -244,22 +251,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "37bd2f2 docs(review): round r65 verdict",
-      "b7ba243 Merge commit '7096cd613801c190d755cf9a0791a8900835986b' into hp/adeherdr/t-0151-review-r65-this-round-stops-a-round-i-ga",
-      "308d78c docs(tasks): t-0151",
-      "bd99ca4 review(r65): brief for revision 1",
-      "7096cd6 fix(round): release abandoned members",
-      "32a8225 docs(tasks): t-0150"
+      "b1ab117 Merge commit 'ecd3eca71dfa35e772aabd548ce2ffda823b907d'",
+      "ecd3eca docs(review): round r66 verdict",
+      "04b1b3c review(cli): preserve structured command outcomes",
+      "ab20ab8 review(r67): brief for revision 1",
+      "4689d4a Merge t-0149 into review/r66",
+      "12b0db6 docs(tasks): t-0153"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "37bd2f2",
+        "head": "b1ab117",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r65 verdict"
+        "subject": "Merge commit 'ecd3eca71dfa35e772aabd548ce2ffda823b907d'"
       },
       {
         "branch": "review/r1",
@@ -680,6 +687,20 @@
         "head": "308d78c",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r65",
         "subject": "docs(tasks): t-0151"
+      },
+      {
+        "branch": "review/r66",
+        "dirty": 0,
+        "head": "12b0db6",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r66",
+        "subject": "docs(tasks): t-0153"
+      },
+      {
+        "branch": "review/r67",
+        "dirty": 0,
+        "head": "0759467",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r67",
+        "subject": "docs(tasks): t-0156"
       },
       {
         "branch": "review/r7",
@@ -1198,6 +1219,13 @@
         "head": "cb6265f",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0148",
         "subject": "docs(review): round r64 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0155-review-r67-this-round-makes-your-talk-ta",
+        "dirty": 0,
+        "head": "8e241ec",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0155",
+        "subject": "docs(tasks): t-0155"
       }
     ]
   },
@@ -1222,8 +1250,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r65",
-    "verdict": "37bd2f2b3df11bdd25af3377b470b0a72ceabdbe"
+    "round": "r66",
+    "verdict": "ecd3eca71dfa35e772aabd548ce2ffda823b907d"
   },
   "session": "default",
   "unlinked_agents": [],
