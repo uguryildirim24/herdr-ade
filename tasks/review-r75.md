@@ -69,3 +69,7 @@ Implemented and published typed failure handling on `hp/adeherdr/t-0172-d3-failu
 Commit: `05d5ec7777081054f135e48cf33c3f7fd446e5ea`
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `023f2cff00f4694db1dfc59cf8f555bc9541dcdb`.
