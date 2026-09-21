@@ -1,4 +1,4 @@
-//! Executable `kind = "pi"` model recipes. Routing rubrics live in routing.json.
+//! Executable `kind = "pi"` model recipes. Selection lives in `[routing]`.
 //!
 //! One pi row replaces its native twin in exactly the list the twin was in.
 //! Cursor is not replaced: `cursor_grok_xhigh` stays native while the port

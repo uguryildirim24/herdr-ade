@@ -40,7 +40,6 @@ mod harness;
 mod herdr;
 mod hook;
 mod inbox;
-mod jev;
 mod lane;
 mod launch;
 mod ledger;
@@ -49,8 +48,6 @@ mod ops;
 mod overview;
 mod paths;
 mod routing;
-#[cfg(test)]
-mod routing_tests;
 // Shared with the `herdr-pi` binary: setup, install and login run only there.
 #[allow(dead_code)]
 mod pi;

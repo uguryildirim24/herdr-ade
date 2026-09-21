@@ -569,7 +569,7 @@ fn report(
             &mut out,
             Some(true),
             "lane worker",
-            "RULES.md is local; dispatch recipes, Jev and saved-machine checks stay on the coordinator"
+            "RULES.md is local; routing recipes and saved-machine checks stay on the coordinator"
                 .into(),
         );
     } else {
@@ -1249,6 +1249,33 @@ mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
 
+    const ROUTING_CONFIG: &str = r#"[routing]
+default = "pi_codex_sol_high"
+retries = 1
+fallback = []
+
+[[routing.rules]]
+workflow = "coordinator"
+recipe = "claude_coordinator_opus"
+
+[[routing.rules]]
+product = "spec"
+recipe = "claude_fable_xhigh"
+
+[[routing.rules]]
+product = "web-research"
+recipe = "agy_gemini_flash"
+
+[[routing.rules]]
+requires_claude = true
+recipe = "claude_fable_xhigh"
+"#;
+
+    fn write_routing_config(config: &Path) {
+        std::fs::create_dir_all(config).unwrap();
+        std::fs::write(config.join("config.toml"), ROUTING_CONFIG).unwrap();
+    }
+
     fn runner_with_machine_list(version: &str, machines: &str) -> FakeRunner {
         let runner = FakeRunner::new();
         runner.on("herdr --version", ok(version));
@@ -1473,13 +1500,8 @@ mod tests {
     #[test]
     fn new_herdr_passes_and_warnings_do_not_fail() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let runner = runner_with_herdr("herdr 0.9.1\n");
         runner.on(
             "agent start --help",
@@ -1504,15 +1526,37 @@ mod tests {
     }
 
     #[test]
-    fn a_project_over_its_memory_budget_warns_and_does_not_fail() {
+    fn doctor_rejects_a_rule_with_an_unknown_recipe() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
         std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
+            config.join("config.toml"),
+            "[routing]\ndefault = \"pi_codex_sol_high\"\n\n[[routing.rules]]\nworkflow = \"reviewer\"\nrecipe = \"missing\"\n",
         )
         .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        let (text, healthy) = report(
+            &env,
+            &home.path().join("root"),
+            &config,
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy, "{text}");
+        assert!(text.contains("routing_recipe_unknown: missing"), "{text}");
+    }
+
+    #[test]
+    fn a_project_over_its_memory_budget_warns_and_does_not_fail() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         std::fs::create_dir_all(project.dir().join("memory")).unwrap();
@@ -1564,7 +1608,6 @@ mod tests {
         assert!(text.contains("[ok  ] lane worker:"), "{text}");
         assert!(!text.contains("routing_recipe_missing"), "{text}");
         assert!(!text.contains("[FAIL] recipes:"), "{text}");
-        assert!(!text.contains("[FAIL] Jev:"), "{text}");
         assert_eq!(
             runner.count("agent start --help"),
             1,
@@ -1576,13 +1619,8 @@ mod tests {
     #[test]
     fn a_coordinator_whose_name_does_not_resolve_fails_the_project_row() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let root = home.path().join("root");
         let project = opened_project(home.path(), &root, "w1:p1", "hp-demo-coordinator");
         let cwd = project.canonical_dir().to_string_lossy().into_owned();
@@ -1611,13 +1649,8 @@ mod tests {
     #[test]
     fn announced_items_unread_across_passes_fail_the_project_row() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let root = home.path().join("root");
         let project = opened_project(home.path(), &root, "w1:p1", "hp-demo-coordinator");
         let cwd = project.canonical_dir().to_string_lossy().into_owned();
@@ -1661,13 +1694,8 @@ mod tests {
     #[test]
     fn a_registered_machine_without_live_threads_is_checked() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let machines = r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#;
         let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
         runner.on(
@@ -1696,11 +1724,6 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("cfg");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
         let mut recipes = default_recipes();
         // Retiring native Claude rows and moving agy to pi must retire their
         // login checks too, regardless of the unchanged recipe names.
@@ -1716,10 +1739,13 @@ mod tests {
         );
         std::fs::write(
             config.join("config.toml"),
-            toml::to_string(&BTreeMap::from([("recipes", recipes)])).unwrap(),
+            format!(
+                "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\nfallback = []\n\n{}",
+                toml::to_string(&BTreeMap::from([("recipes", recipes)])).unwrap()
+            ),
         )
         .unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
+        let env = Env::for_test(home.path(), &[]);
         let runner = runner_with_machine_list(
             "herdr 0.9.1\n",
             r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#,
@@ -1749,7 +1775,7 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(
             config.join("config.toml"),
-            "[dispatch]\nmachine = \"dispatch-box\"\n",
+            "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\nfallback = []\n\n[dispatch]\nmachine = \"dispatch-box\"\n",
         )
         .unwrap();
         let project = project::create(
@@ -1776,13 +1802,8 @@ mod tests {
     #[test]
     fn an_unreachable_registered_machine_fails_instead_of_disappearing() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let machines = r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#;
         let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
         runner.on(
@@ -1807,6 +1828,7 @@ mod tests {
 
     fn default_recipes() -> BTreeMap<String, crate::contracts::Recipe> {
         let dir = tempfile::tempdir().unwrap();
+        write_routing_config(dir.path());
         crate::launch::parse_launch_config(dir.path())
             .unwrap()
             .recipes
@@ -2139,13 +2161,8 @@ mod tests {
     #[test]
     fn fork_0_9_0_with_parent_is_accepted() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("TYPESAFE_API_KEY", "fake-key")]);
-        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(
-            home.path().join("cfg/routing.json"),
-            include_str!("../config/routing.json"),
-        )
-        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        write_routing_config(&home.path().join("cfg"));
         let runner = runner_with_herdr("herdr 0.9.0\n");
         runner.on(
             "agent start --help",
