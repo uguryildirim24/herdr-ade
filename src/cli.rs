@@ -1452,6 +1452,13 @@ enum TaskCommand {
         id: String,
         text: String,
     },
+    /// Link a thread and its historical rounds to this task
+    Adopt {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        thread: String,
+    },
     /// Record installation or per-condition verification evidence
     Evidence {
         slug: String,
@@ -2069,6 +2076,17 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     Some("noted"),
                     &serde_json::json!({ "task": view }),
                     &format!("noted {}\n", view.record.id),
+                    "",
+                )
+            }
+            TaskCommand::Adopt { slug, id, thread } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::task::adopt(&project, &id, &thread)?;
+                let view = crate::task::view(&project, record);
+                crate::output::success(
+                    Some("adopted"),
+                    &serde_json::json!({ "task": view, "thread": thread }),
+                    &format!("{thread} adopted into {}\n", view.record.id),
                     "",
                 )
             }
