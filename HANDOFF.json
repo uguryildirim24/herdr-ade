@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0192.md",
+      "tasks/review-r81.md",
+      "tasks/review-r80.md",
       "tasks/t-0191.md",
       "tasks/t-0189.md",
       "tasks/review-r79.md",
@@ -19,16 +22,14 @@
       "tasks/review-r78.md",
       "tasks/t-0187.md",
       "tasks/t-0185.md",
-      "tasks/t-0186.md",
-      "tasks/review-r77.md",
-      "tasks/t-0184.md",
-      "tasks/t-0183.md"
+      "tasks/t-0186.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r80.md",
       "tasks/reviews/code-r79.md",
       "tasks/reviews/code-r78.md",
       "tasks/reviews/code-r77.md",
@@ -39,23 +40,26 @@
       "tasks/reviews/code-r72.md",
       "tasks/reviews/code-r71.md",
       "tasks/reviews/code-r70.md",
-      "tasks/reviews/code-r69.md",
-      "tasks/reviews/code-r68.md"
+      "tasks/reviews/code-r69.md"
     ]
   },
-  "generated": "2026-09-21T18:47:18-04:00",
+  "generated": "2026-09-21T19:24:08-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0191-review-r79-a-finished-lane-s-build-folde",
       "main",
-      "review/r79-2",
+      "hp/adeherdr/t-0192-review-r80-installing-and-checking-the-h",
+      "hp/adeherdr/t-0193-review-r81-a-new-kind-of-helper-plugs-in",
+      "review/r81",
+      "hp/adeherdr/t-0187-d6-adapters",
+      "review/r80",
       "hp/adeherdr/t-0190-d5b-install-proof",
+      "hp/adeherdr/t-0191-review-r79-a-finished-lane-s-build-folde",
+      "review/r79-2",
       "hp/adeherdr/t-0189-review-r79-a-finished-lane-s-build-folde",
       "hp/adeherdr/t-0188-review-r78-each-job-is-tied-to-your-word",
       "review/r79",
       "hp/adeherdr/t-0186-w4-remove-build-folders",
       "review/r78",
-      "hp/adeherdr/t-0187-d6-adapters",
       "hp/adeherdr/t-0184-d5-task-records",
       "hp/adeherdr/t-0185-review-r77-background-jobs-run-from-a-fo",
       "review/r77",
@@ -306,36 +310,36 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "8035351 docs(review): round r79 repair verdict",
-      "ebd209a review(doctor): preserve unknown disk and build ownership",
-      "ce99313 Merge commit 'c3daa1bea72619abe7369204f4f93f4ab12bf6df' into hp/adeherdr/t-0191-review-r79-a-finished-lane-s-build-folde",
-      "dce5e00 docs(tasks): t-0191",
-      "06562c9 review(r79): brief for revision 1",
-      "64c73b3 docs(tasks): t-0190"
+      "a93aaad Merge commit 'f4f3c7a513a741e27c40fe0e4bb4d25f7f0b4ff1'",
+      "f4f3c7a docs(review): round r80 verdict",
+      "f042697 review(harness): make install evidence fail closed",
+      "7cdd855 review(r81): brief for revision 1",
+      "f4a5430 merge: admit t-0190 into r80",
+      "2f35ee2 docs(tasks): t-0192"
     ],
-    "remote": "9 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "8035351",
+        "head": "a93aaad",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r79 repair verdict"
+        "subject": "Merge commit 'f4f3c7a513a741e27c40fe0e4bb4d25f7f0b4ff1'"
       },
       {
-        "branch": "review/r79",
+        "branch": "review/r80",
         "dirty": 0,
-        "head": "6a73245",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r79",
-        "subject": "docs(tasks): t-0189"
+        "head": "2f35ee2",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r80",
+        "subject": "docs(tasks): t-0192"
       },
       {
-        "branch": "review/r79-2",
+        "branch": "review/r81",
         "dirty": 0,
-        "head": "dce5e00",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r79-2",
-        "subject": "docs(tasks): t-0191"
+        "head": "c50c4ea",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r81",
+        "subject": "docs(tasks): t-0193"
       }
     ]
   },
@@ -347,21 +351,21 @@
       "workspace_id": "w1H"
     },
     {
-      "label": "Venator",
-      "status": "idle",
-      "workspace_id": "w1J"
+      "label": "flyonenomics",
+      "status": "unknown",
+      "workspace_id": "w1M"
     },
     {
-      "label": "Elicio",
+      "label": "PRL-8-53",
       "status": "idle",
-      "workspace_id": "w1K"
+      "workspace_id": "w1N"
     }
   ],
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r79",
-    "verdict": "8035351597d7828d747ac65f5fc0434ee643c44d"
+    "round": "r80",
+    "verdict": "f4f3c7a513a741e27c40fe0e4bb4d25f7f0b4ff1"
   },
   "session": "default",
   "unlinked_agents": [],
