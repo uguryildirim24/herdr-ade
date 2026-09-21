@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0182.md",
+      "tasks/t-0180.md",
+      "tasks/t-0177.md",
+      "tasks/review-r75.md",
       "tasks/t-0181.md",
       "tasks/review-r76.md",
-      "tasks/review-r75.md",
       "tasks/t-0178.md",
       "tasks/t-0176.md",
       "tasks/t-0179.md",
       "tasks/review-r74.md",
       "tasks/t-0175.md",
-      "tasks/review-r73.md",
-      "tasks/t-0174.md",
-      "tasks/t-0173.md",
-      "tasks/t-0172.md"
+      "tasks/review-r73.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r75.md",
       "tasks/reviews/code-r76.md",
       "tasks/reviews/code-r74.md",
       "tasks/reviews/code-r73.md",
@@ -39,18 +40,19 @@
       "tasks/reviews/code-r68.md",
       "tasks/reviews/code-r67.md",
       "tasks/reviews/code-r66.md",
-      "tasks/reviews/code-r65.md",
-      "tasks/reviews/code-r64.md"
+      "tasks/reviews/code-r65.md"
     ]
   },
-  "generated": "2026-09-21T16:52:40-04:00",
+  "generated": "2026-09-21T17:12:43-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0181-review-r76-doctor-leaves-a-live-lane-s-w",
+      "hp/adeherdr/t-0182-review-r75-each-failure-says-what-failed",
       "main",
+      "review/r75-3",
+      "hp/adeherdr/t-0180-review-r75-each-failure-says-what-failed",
+      "hp/adeherdr/t-0181-review-r76-doctor-leaves-a-live-lane-s-w",
       "review/r76",
       "hp/adeherdr/t-0179-w2-worktree-cleanup-fixes",
-      "hp/adeherdr/t-0180-review-r75-each-failure-says-what-failed",
       "review/r75-2",
       "hp/adeherdr/t-0177-review-r75-each-failure-says-what-failed",
       "hp/adeherdr/t-0178-review-r74-a-stuck-or-failed-job-can-be",
@@ -291,22 +293,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "9d887fa review(r76): approve scoped worktree cleanup",
-      "fff5829 review(worktrees): apply repository policy during cancellation",
-      "493da69 Merge pinned t-0179 into review r76",
-      "1e3d36e docs(tasks): t-0181",
-      "0308f18 review(r76): brief for revision 1",
-      "1094ced fix(worktrees): protect live lanes and scope disposable paths"
+      "f0100d1 review(r75): approve typed failures with r76 cleanup",
+      "8f57cbe review(cli): make failed work the usable default",
+      "98199b6 Merge reviewed r75 candidate for revision 1",
+      "437b5e1 docs(tasks): t-0182",
+      "d068ea4 review(r75): brief for revision 1",
+      "402ad49 review(core): preserve typed recovery across retry commands"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "12 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "9d887fa",
+        "head": "f0100d1",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r76): approve scoped worktree cleanup"
+        "subject": "review(r75): approve typed failures with r76 cleanup"
       },
       {
         "branch": "review/r75",
@@ -323,11 +325,11 @@
         "subject": "docs(tasks): t-0180"
       },
       {
-        "branch": "review/r76",
+        "branch": "review/r75-3",
         "dirty": 0,
-        "head": "1e3d36e",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r76",
-        "subject": "docs(tasks): t-0181"
+        "head": "437b5e1",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r75-3",
+        "subject": "docs(tasks): t-0182"
       }
     ]
   },
@@ -352,8 +354,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r76",
-    "verdict": "9d887faabb4a558f9aafe7dd75a6344fe512f20f"
+    "round": "r75",
+    "verdict": "f0100d1adf5a9be4f533625fcb4520272af79d82"
   },
   "session": "default",
   "unlinked_agents": [],
