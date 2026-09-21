@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0170.md",
+      "tasks/t-0168.md",
+      "tasks/review-r71.md",
       "tasks/t-0167.md",
       "tasks/review-r72.md",
-      "tasks/review-r71.md",
       "tasks/review-r70.md",
       "tasks/t-0166.md",
       "tasks/t-0165.md",
       "tasks/t-0164.md",
       "tasks/t-0163.md",
       "tasks/t-0162.md",
-      "tasks/t-0161.md",
-      "tasks/review-r69.md",
-      "tasks/t-0160.md"
+      "tasks/t-0161.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r71.md",
       "tasks/reviews/code-r70.md",
       "tasks/reviews/code-r69.md",
       "tasks/reviews/code-r68.md",
@@ -39,18 +40,19 @@
       "tasks/reviews/code-r63.md",
       "tasks/reviews/code-r62.md",
       "tasks/reviews/code-r60.md",
-      "tasks/reviews/code-r61.md",
-      "tasks/reviews/code-r58.md"
+      "tasks/reviews/code-r61.md"
     ]
   },
-  "generated": "2026-09-21T14:18:25-04:00",
+  "generated": "2026-09-21T14:41:21-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0170-review-r71-this-round-makes-every-comman",
       "main",
       "hp/adeherdr/t-0169-review-r72-this-round-removes-the-part-t",
+      "review/r71-2",
+      "hp/adeherdr/t-0168-review-r71-this-round-makes-every-comman",
       "hp/adeherdr/t-0167-review-r70-this-round-removes-a-finished",
       "review/r72",
-      "hp/adeherdr/t-0168-review-r71-this-round-makes-every-comman",
       "hp/adeherdr/t-0165-d1-remove-jev-simple-editable-routing",
       "review/r71",
       "hp/adeherdr/t-0166-d2-typed-results-rendered-once",
@@ -271,29 +273,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "eaa6efd Merge commit '9520390653f47fadaa229c3e12c14ae8ef516900'",
-      "9520390 review(r70): verdict",
-      "eb6aaf2 review(threads): remove clean abandoned worktrees safely",
-      "c9ddae3 review(r72): brief for revision 1",
-      "1720a46 review(r71): brief for revision 1",
-      "da87bac Merge t-0164 into review r70"
+      "668d59d review(herdr-ade): approve repaired r71 typed results",
+      "2c901ca review(herdr-ade): type integrated cleanup results",
+      "a15d8fe Merge earlier r71 candidate into repair review",
+      "9512387 docs(tasks): t-0170",
+      "5111744 review(r71): brief for revision 1",
+      "1ee48b3 checkpoint(r70): HANDOFF after merging the round"
     ],
-    "remote": "12 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "eaa6efd",
+        "head": "668d59d",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit '9520390653f47fadaa229c3e12c14ae8ef516900'"
-      },
-      {
-        "branch": "review/r70",
-        "dirty": 0,
-        "head": "6b03df0",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r70",
-        "subject": "docs(tasks): t-0167"
+        "subject": "review(herdr-ade): approve repaired r71 typed results"
       },
       {
         "branch": "review/r71",
@@ -301,6 +296,13 @@
         "head": "aac28db",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r71",
         "subject": "docs(tasks): t-0168"
+      },
+      {
+        "branch": "review/r71-2",
+        "dirty": 0,
+        "head": "9512387",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r71-2",
+        "subject": "docs(tasks): t-0170"
       },
       {
         "branch": "review/r72",
@@ -332,8 +334,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r70",
-    "verdict": "9520390653f47fadaa229c3e12c14ae8ef516900"
+    "round": "r71",
+    "verdict": "668d59da9d3c077f3579ee58069e8b45dcd765ec"
   },
   "session": "default",
   "unlinked_agents": [],
