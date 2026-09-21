@@ -26,6 +26,7 @@ use ratatui::{
 };
 use std::{
     io::{self, Write},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1460,32 +1461,24 @@ fn screen_should_reexec(installed: Option<&str>, attempted: Option<&str>) -> boo
     installed.is_some_and(|version| version != crate::VERSION && Some(version) != attempted)
 }
 
+fn screen_reexec_plan(ctx: &Ctx, attempted: Option<&str>) -> Option<(PathBuf, String)> {
+    let installed = ctx.env.home.join(".local/bin/herdr-ade");
+    let version = super::stale::installed_version(ctx)?;
+    screen_should_reexec(Some(&version), attempted).then_some((installed, version))
+}
+
 /// Hand over to the installed program when it is a different build. The
 /// terminal, screen and the composer draft are inherited by the new process.
 fn reexec_if_stale(ctx: &Ctx, draft: &str) {
-    let installed = ctx.env.home.join(".local/bin/herdr-ade");
-    let same = std::fs::canonicalize(&installed)
-        .ok()
-        .zip(std::env::current_exe().ok())
-        .is_some_and(|(a, b)| a == b);
-    if same {
-        return;
-    }
-    let version = super::stale::installed_version(ctx);
     let attempted = std::env::var("HERDR_TALK_REEXEC").ok();
-    if !screen_should_reexec(version.as_deref(), attempted.as_deref()) {
+    let Some((installed, version)) = screen_reexec_plan(ctx, attempted.as_deref()) else {
         return;
-    }
+    };
     use std::os::unix::process::CommandExt;
     let error = std::process::Command::new(&installed)
         .args(std::env::args_os().skip(1))
         .env("HERDR_TALK_DRAFT", draft)
-        .env(
-            "HERDR_TALK_REEXEC",
-            version
-                .as_deref()
-                .expect("a stale installed version exists"),
-        )
+        .env("HERDR_TALK_REEXEC", version)
         .exec();
     eprintln!("herdr-ade: could not restart the project screen: {error}");
 }
@@ -2082,5 +2075,28 @@ mod tests {
         assert!(screen_should_reexec(Some("0.1.0+new"), None));
         assert!(!screen_should_reexec(Some("0.1.0+new"), Some("0.1.0+new")));
         assert!(screen_should_reexec(Some("0.1.0+newer"), Some("0.1.0+new")));
+    }
+
+    #[test]
+    fn a_screen_running_at_the_installed_path_reexecs_a_different_build() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let installed = ctx.env.home.join(".local/bin/herdr-ade");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        let current = std::env::current_exe().unwrap();
+        std::os::unix::fs::symlink(&current, &installed).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&installed).unwrap(),
+            std::fs::canonicalize(&current).unwrap()
+        );
+
+        let needle = installed.to_string_lossy().into_owned();
+        fx.world.runner.on_fn(
+            move |cmd| cmd.program == needle,
+            |_| Ok(crate::runner::fake::ok("herdr-ade 0.1.0+new.1\n")),
+        );
+        let (target, version) = screen_reexec_plan(&ctx, None).expect("a hand-off plan");
+        assert_eq!(target, installed);
+        assert_eq!(version, "0.1.0+new.1");
     }
 }
