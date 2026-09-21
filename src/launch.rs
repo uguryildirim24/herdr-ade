@@ -257,12 +257,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
             None,
         )
     } else {
-        if previous_tier.is_some_and(|tier| {
-            !policy
-                .routes
-                .iter()
-                .any(|r| policy.models[&r.recipe].tier > tier)
-        }) {
+        if previous_tier.is_some_and(|tier| policy.models.values().all(|m| m.tier <= tier)) {
             bail!("escalation_exhausted: no stronger model remains");
         }
         let state = crate::routing::scrub(
@@ -301,12 +296,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
             Err(error) if error.is::<crate::jev::OversizedRequest>() => {
                 // Routes are validated in strictly increasing tier order. Keep
                 // exclusions, readiness and escalation bounds on their usual paths.
-                let mut id = policy
-                    .routes
-                    .last()
-                    .expect("validated routes")
-                    .recipe
-                    .clone();
+                let mut id = policy.strongest().to_string();
                 floors = policy.apply_floors(&mut id, input.workflow, None);
                 fallback =
                     Some(json!({"cause":"picker-input-too-large", "error":error.to_string()}));

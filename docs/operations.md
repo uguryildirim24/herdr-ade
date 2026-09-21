@@ -27,7 +27,7 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
   .state/                 status, coordinator pane, ticker state, lock
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
 ~/.config/herdr-ade/config.toml             executable model recipes, dispatch placement, machines and harness repositories; any coordinator may edit it
-~/.config/herdr-ade/routing.json             editable task-score rubric, weights, cutoffs, confidence floor and model cards
+~/.config/herdr-ade/routing.json             one index question, measured model cards, confidence floor and routing floors
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
@@ -112,22 +112,22 @@ A round is a set of lanes that are reviewed and merged together. `hp round advan
 
 The coordinator does not choose a model. `thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. `--workflow` selects instruction text and may trigger a policy floor. In particular, a hand-started `--workflow reviewer` receives the same configured floor as a reviewer started by `round advance`. The title is a display label, never classifier state. Repository facts include HEAD, tracked paths, status and recent changes. The serialized TypeSafe request is capped at 256 KiB: the complete task brief is kept, cheaper repository evidence is removed first, and visible truncation metadata is sent and logged. A brief that cannot fit is refused. Reviewer priming tasks are capped at 128 KiB and always name the committed review-brief path and every pinned commit range; whole source text is inlined only when it fits, because the reviewer can read the named inputs from its checkout.
 
-Install the tracked initial `config/routing.json` at `~/.config/herdr-ade/routing.json` before starting lanes. Its rubric and cutoffs are provisional until they are measured against real labelled cases. There is no embedded policy fallback or old-format reader. Keep executable rows in `config.toml`; remove every `[roles.*]` table. A custom model needs a complete executable recipe there and a description/tier card plus a route in `routing.json`. Configured recipe rows replace built-in rows completely, not field by field.
+Install the tracked `config/routing.json` at `~/.config/herdr-ade/routing.json` before starting lanes. There is no embedded policy fallback or old-format reader. Keep executable rows in `config.toml`; remove every `[roles.*]` table. A model card names its published Coding Index, blended price per million tokens and escalation tier. Configured recipe rows replace built-in rows completely, not field by field.
 
-The dispatch process (including a background ticker that starts reviews) must inherit `TYPESAFE_API_KEY`. The client posts to `https://api.typesafe.ai/v1/systemone` with `model: jev-latest` and three parallel Score questions: difficulty, ambiguity and blast radius. Criteria are ordered arrays. No model roster enters the prompt. Exact recipe/model ids are scrubbed; the brief is never reduced to a title or a 2,200-character excerpt. The key travels on curl's stdin, not argv, and is removed from its child environment. A non-success HTTP response reports its status and bounded, key-redacted body; timeouts and transport failures remain separate errors.
+The dispatch process (including a background ticker that starts reviews) must inherit `TYPESAFE_API_KEY`. The client posts to `https://api.typesafe.ai/v1/systemone` with `model: jev-latest` and one Score question: the Coding Index required by the work. Its ordered criteria have matching real-unit `index_values`. No model roster enters the prompt. Exact recipe/model ids are scrubbed; the brief is never reduced to a title or excerpt. The key travels on curl's stdin, not argv, and is removed from its child environment. A non-success HTTP response reports its status and bounded, key-redacted body; timeouts and transport failures remain separate errors.
 
-All question instructions, criteria, weights, cutoffs, confidence floor, borderline margin and model descriptions are editable JSON. Each score is divided by its highest level index; the weighted mean is compared with increasing `routes[].up_to` cutoffs. The minimum confidence across questions is used. A low-confidence result moves one route stronger; a score within the margin of a cutoff uses the stronger side. Neither condition blocks or asks permission. Explicit endpoint size refusals (HTTP 413, or HTTP 400/422 with a JSON `max_tokens_exceeded` code) select the highest route tier, with any higher role floor, and record `rule: "jev-size-fallback"` plus a redacted `fallback` cause instead of invented scores. Local request-size guards still refuse briefs that cannot fit; authentication, transport, other HTTP, config and malformed-response failures still refuse. The first policy is not calibrated; replacing the file needs no rebuild.
+The raw Score is interpolated between `index_values`. Dispatch chooses the lowest-price model whose published `coding_index` clears that requirement; fixed normalized cutoffs and a hand-ordered price ladder do not exist. A result below `confidence_floor` chooses the cheapest capable higher tier. Explicit endpoint size refusals select the highest tier, with any higher role floor, and record `rule: "jev-size-fallback"` plus a redacted cause instead of invented scores. Local request-size guards still refuse briefs that cannot fit; authentication, transport, other HTTP, config and malformed-response failures still refuse.
 
-Optional floors express non-compensating constraints without changing the weights. No floors ship by default. For example (use a question ID and zero-based criterion index from your own policy):
+Floors express non-compensating constraints. The shipped policy keeps the reviewer floor and the top-answer veto:
 
 ```json
 "role_floors": { "reviewer": "pi_codex_sol_high" },
 "answer_floors": [
-  { "question": "blast_radius", "min_score": 3, "recipe": "pi_codex_sol_high" }
+  { "question": "required_index", "min_score": 3, "recipe": "pi_codex_sol_high" }
 ]
 ```
 
-An answer floor triggers when that question's raw `score >= min_score`, before normalization or weighting; fractional thresholds are allowed within the question's criterion range. Every floor target needs a model card with a tier and an enabled recipe in the merged recipe map. After normal scoring, confidence and escalation upgrades, the strongest triggered floor raises the pick only if its tier is higher. Equal or higher picks keep their recipe. Floors can name cards outside the score routes; subsequent escalation still requires a strictly higher route tier. Unknown roles/questions, out-of-range thresholds, unknown recipes and disabled targets are refused. Floors do not override the fixed exclusions below.
+An answer floor compares the raw zero-based Score to `min_score`; fractional thresholds are allowed within the criterion range. Every floor target needs a measured model card and an enabled recipe. After index selection, confidence and escalation, the strongest triggered floor raises the pick only if its tier is higher. Unknown roles/questions, out-of-range thresholds, unknown recipes and disabled targets are refused. Floors do not override the fixed exclusions below.
 
 A raised pick records `rule: "jev-scores-floor"` and a `floors` array next to it. Each entry names the recipe, tier and cause (`kind: "role"` with `role`, or `kind: "answer"` with question, threshold and observed score). All triggered floors above the original pick are recorded, including a weaker floor dominated by another; already-satisfied floors do not claim an upgrade. Jev still scores reviews; a floor is not a pin.
 
@@ -138,27 +138,19 @@ Four exclusions are code rules and never call Jev:
 - `product = "spec"` uses Fable for specification writing. Pro through the relay remains available via a user pin.
 - Rolf's hand pin is `pins[SHA256(exact task-file bytes)] = recipe-id` in `routing.json`. There is no coordinator CLI pin.
 
-`ha failed "<failure and evidence>"` seals a lane-bound event locally or on the box. The ticker/courier consumes it once, assesses the same full task with the failure, and chooses a strictly stronger tier from the current route ladder. It preserves the dirty worktree, replaces only that lane's tab, increments its attempt and tells the replacement what failed. Three upgrades is the hard bound; no stronger route or a fixed exclusion produces a recorded refusal. `waiting` still means missing input, not a model failure. Transport/placement errors are visible and never spin through models indefinitely.
+`ha failed "<failure and evidence>"` seals a lane-bound event locally or on the box. The ticker/courier consumes it once, assesses the same full task with the failure, and chooses the cheapest capable model at a strictly stronger tier. It preserves the dirty worktree, replaces only that lane's tab, increments its attempt and tells the replacement what failed. Three upgrades is the hard bound; no stronger measured model or a fixed exclusion produces a recorded refusal. `waiting` still means missing input, not a model failure. Transport/placement errors are visible and never spin through models indefinitely.
 
 `<project>/.state/dispatch.jsonl` is the append-only dispatch ledger: rubric hash, recipe-policy hash, task hash, full score distributions/confidences, arithmetic result, upgrades and failure evidence. The original task file remains the source of brief bytes. Sealed failure events remain in `events/`; a `failure_event` marker and pending-placement state on the thread make replay safe.
 
 ### Measure and replay the policy
 
 ```sh
-ha routing-eval config/routing-cases.json
-# Save raw scores from a live evaluation for subsequent offline tuning:
-ha routing-eval labelled-cases.json > results.json
-jq '.cases | map({id, brief, state, workflow, expected, response})' results.json > replay.json
-ha routing-eval replay.json
+ha routing-eval <project>
 ```
 
-Cases carry `id`, the complete `brief`, repository `state`, `expected` recipe, optional `workflow` (default `lane`) and an optional raw TypeSafe `response`. Role and answer floors are applied during replay too. Saved responses are evaluated offline, so changing weights/cutoffs/model routes costs no inference. Omit `response` to collect fresh task scores with the configured questions (requires the API key). Output is JSON with each selected/expected model, outcome, assessment, and separate totals:
+The command makes no model call. It joins sealed completions and thread launches to `.state/dispatch.jsonl` and the carrying round. Each outcome says which model ran, whether the lane escalated, and whether its round merged without a REJECT. A model is observed good enough only when that exact run did not escalate and its round merged without a REJECT.
 
-- `over_routed`: easy work sent to a stronger/more expensive tier (money wasted).
-- `under_routed`: hard work sent to a weaker tier (a lane and review wasted).
-- `correct`, `same_tier_wrong` and `errors` are separate.
-
-The three shipped cases use **synthetic**, clearly labelled responses, including intentional mistakes to exercise both counters. They are a plumbing demonstration, not evidence that the rubric is accurate. Tier ordering is a policy assumption, not measured billing data. Capture real labelled briefs before tuning; reuse responses only while the question rubric and criteria still mean the same thing.
+Saved assessments are replayed through the current policy. When the current policy selects the model that actually ran, the observed outcome confirms it good or bad. A different selection is `untried`, not an invented label. `confidence_clear` reports how many saved assessments meet the current floor. Old dispatch and round records still load; records made before rejection counting or the current one-question rubric remain visible but may be `not-scored`.
 
 ## Safety settings
 

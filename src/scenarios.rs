@@ -34,9 +34,14 @@ impl World {
         std::fs::write(home.path().join("cfg/config.toml"), "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n").unwrap();
         let mut policy: serde_json::Value =
             serde_json::from_str(include_str!("../config/routing.json")).unwrap();
-        policy["models"] =
-            serde_json::json!({"test_claude": {"tier": 1, "description": "Fixture coding model"}});
-        policy["routes"] = serde_json::json!([{"up_to": 1.0, "recipe": "test_claude"}]);
+        policy["models"] = serde_json::json!({"test_claude": {
+            "tier": 1,
+            "coding_index": 77.2,
+            "price_per_million": 1.0,
+            "description": "Fixture coding model"
+        }});
+        policy["role_floors"] = serde_json::json!({});
+        policy["answer_floors"] = serde_json::json!([]);
         std::fs::write(home.path().join("cfg/routing.json"), policy.to_string()).unwrap();
         let world = World {
             env,
@@ -59,13 +64,11 @@ impl World {
             |_| Ok(ok("gemini-3.8-flash-high\n")),
         );
         let mut answers = serde_json::Map::new();
-        for id in ["difficulty", "ambiguity", "blast_radius"] {
-            answers.insert(
-                id.into(),
-                serde_json::json!({"type":"score", "score":0.0, "confidence":0.98,
-                "probabilities":{"0":1.0,"1":0.0,"2":0.0,"3":0.0}}),
-            );
-        }
+        answers.insert(
+            "required_index".into(),
+            serde_json::json!({"type":"score", "score":0.0, "confidence":0.98,
+            "probabilities":{"0":1.0,"1":0.0,"2":0.0,"3":0.0}}),
+        );
         world.runner.on(
             "/usr/bin/curl",
             ok(&crate::jev::http_response(
