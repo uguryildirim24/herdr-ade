@@ -444,16 +444,6 @@ impl<'a> Herdr<'a> {
         self.call(&["tab", "close", tab], CALL_TIMEOUT).map(|_| ())
     }
 
-    /// Never passes `--force`: herdr refuses a dirty worktree and that refusal
-    /// is reported unchanged.
-    pub(crate) fn worktree_remove(&self, workspace: &str) -> Result<(), HerdrError> {
-        self.call(
-            &["worktree", "remove", "--workspace", workspace],
-            Duration::from_secs(20),
-        )
-        .map(|_| ())
-    }
-
     /// A workspace's label, as the sidebar shows it.
     pub(crate) fn workspace_label(&self, workspace: &str) -> Result<String, HerdrError> {
         let result = self.call(&["workspace", "get", workspace], CALL_TIMEOUT)?;
