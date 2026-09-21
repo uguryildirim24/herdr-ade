@@ -2486,6 +2486,10 @@ fn harness_repo(home: &Path, name: &str, package: &str) -> String {
 }
 
 fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
+    world.runner.on(
+        "rev-parse HEAD",
+        ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"),
+    );
     let dir = world.home.path().join("cfg");
     std::fs::create_dir_all(&dir).unwrap();
     let rows: Vec<String> = repos
@@ -2611,8 +2615,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        3,
-        "one box build per repo plus the lane settings"
+        4,
+        "one box build per repo plus lane settings and the running-process check"
     );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
