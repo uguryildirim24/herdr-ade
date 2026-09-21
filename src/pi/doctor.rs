@@ -685,7 +685,18 @@ fn write_cached_probe(layout: &Layout, provider: &str, result: &Result<()>) {
         Ok(value) => value.as_secs(),
         Err(_) => return,
     };
-    let detail = result.as_ref().err().map(|error| format!("{error:#}"));
+    // Cache only the answer and a generated remedy. Provider output can
+    // contain account diagnostics and must not become a credential-adjacent
+    // file merely to avoid repeating a probe.
+    let detail = result.as_ref().err().map(|error| {
+        if format!("{error:#}").starts_with("missing sign-in:") {
+            format!("missing sign-in for {provider} (run `herdr-pi login {provider}`)")
+        } else {
+            format!(
+                "stored sign-in no longer works for {provider} (run `herdr-pi login {provider}`)"
+            )
+        }
+    });
     let bytes = match serde_json::to_vec(&serde_json::json!({
         "checked_unix": checked,
         "ok": result.is_ok(),
@@ -1264,6 +1275,8 @@ mod tests {
                 && login.detail.contains("subscription expired"),
             "{login:?}"
         );
+        let cache = std::fs::read_to_string(probe_cache_path(&layout, "kimi-coding")).unwrap();
+        assert!(!cache.contains("subscription expired"), "{cache}");
         let second = check_report(&env, &layout, &runner, "kimi-coding");
         assert!(!second.ok);
         assert_eq!(runner.count("auth check"), 1);
