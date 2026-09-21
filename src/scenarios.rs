@@ -534,6 +534,44 @@ fn resolve_keeps_a_workspace_that_holds_something_else() {
     assert_eq!(world.runner.count("tab close w2:t1"), 1);
 }
 
+#[test]
+fn resolve_keeps_the_project_workspace_when_its_coordinator_pane_is_gone() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    world.thread(&project, world.home.path(), |thread| {
+        thread.workspace_id = "w1".into();
+        thread.tab_id = "w1:t2".into();
+        thread.pane_id = "w1:p2".into();
+    });
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t2", "w1:p2", &cwd));
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+
+    assert_eq!(world.runner.count("workspace close w1"), 0);
+    assert_eq!(world.runner.count("tab close w1:t2"), 1);
+}
+
+#[test]
+fn resolve_never_closes_an_adopted_workspace() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    world.thread(&project, world.home.path(), |thread| {
+        thread.kind = Kind::Adopted;
+    });
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd)
+    );
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+
+    assert_eq!(world.runner.count("workspace close w2"), 0);
+    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+}
+
 /// A1 review H5: only `working` stopped a removal; an idle lane with no
 /// sealed `done` lost its worktree.
 #[test]
