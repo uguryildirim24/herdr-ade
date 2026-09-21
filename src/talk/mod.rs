@@ -14,6 +14,7 @@
 //! coordinator and off for other kinds until their hooks are verified;
 //! `talk = true | false` in `PROJECT.md` front matter overrides.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -218,12 +219,77 @@ struct PendingPromptRecord {
 /// A marker older than this belongs to a hook that never fired; it must not
 /// claim a later prompt with the same text.
 const PENDING_PROMPT_SECS: i64 = 120;
+const PASTE_OPEN: &str = "<pasted_content id=\"";
+const TASK_OPEN: &str = "<task-notification>";
+const TASK_CLOSE: &str = "</task-notification>";
+
+/// Removes Claude Code's wrapper only when the whole prompt is made of paste
+/// blocks. Native words before or after a block make this `None`, so a mixed
+/// prompt remains Rolf's request rather than consuming a harness marker.
+fn pasted_contents(text: &str) -> Option<String> {
+    let mut rest = text.trim();
+    let mut contents = Vec::new();
+    while let Some(after_open) = rest.strip_prefix(PASTE_OPEN) {
+        let (id, after_id) = after_open.split_once("\">")?;
+        if id.is_empty() || id.contains(['<', '>', '"']) {
+            return None;
+        }
+        let close = format!("</pasted_content id=\"{id}\">");
+        let (content, after_close) = after_id.split_once(&close)?;
+        contents.push(content.trim());
+        rest = after_close.trim_start();
+    }
+    if contents.is_empty() || !rest.is_empty() {
+        return None;
+    }
+    Some(contents.join("\n"))
+}
+
+fn marker_text(text: &str) -> Cow<'_, str> {
+    pasted_contents(text).map_or_else(|| Cow::Borrowed(text), Cow::Owned)
+}
+
+/// Claude Code submits background-task notices through the prompt hook even
+/// though nobody typed them. Mixed native text is deliberately not included.
+pub(crate) fn is_task_notification_prompt(text: &str) -> bool {
+    let mut rest = text.trim();
+    let mut found = false;
+    while let Some(after_open) = rest.strip_prefix(TASK_OPEN) {
+        let Some((_, after_close)) = after_open.split_once(TASK_CLOSE) else {
+            return false;
+        };
+        found = true;
+        rest = after_close.trim_start();
+    }
+    found && rest.is_empty()
+}
+
+/// Historical hook mistakes stay in the append-only journal but are omitted
+/// from the conversation. A pasted human message is retained; only known
+/// harness lines inside a pure paste wrapper are hidden.
+pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
+    if is_task_notification_prompt(text) {
+        return true;
+    }
+    let Some(text) = pasted_contents(text) else {
+        return false;
+    };
+    let text = text.trim();
+    text.starts_with("DONE t-")
+        || text.starts_with("WAITING t-")
+        || text.starts_with("BLOCKED t-")
+        || text.starts_with("GONE t-")
+        || text == crate::steps::NUDGE_TEXT
+        || (text.starts_with("You are the coordinator of the herdr project `")
+            && text.contains(" skill coordinator`")
+            && text.contains(" context "))
+}
 
 fn pending_prompt_path(project: &Project, pane: &str, text: &str) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(pane.as_bytes());
     hash.update(b"\n");
-    hash.update(text.trim_end().as_bytes());
+    hash.update(marker_text(text).trim_end().as_bytes());
     talk_dir(project)
         .join("prompts")
         .join(format!("{:x}.json", hash.finalize()))
@@ -404,7 +470,9 @@ pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, S
         .lines
         .iter()
         .filter_map(|line| match &line.entry {
-            Entry::Rolf { request, text, .. } => Some((request.clone(), text.clone())),
+            Entry::Rolf { request, text, .. } if !is_historical_system_prompt(text) => {
+                Some((request.clone(), text.clone()))
+            }
             _ => None,
         })
         .collect();
