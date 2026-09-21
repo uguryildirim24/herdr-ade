@@ -88,7 +88,7 @@ Keep the file short: it is printed every turn and costs tokens.
 - `hp thread list <slug>` and `hp thread show <slug> <id>` print records with live state. The home copy of a thread's report is `threads/<id>.md`; files it produced for the user are in `library/<id>/`.
 - A thread under "Waiting on you" that is blocked needs the user in that thread's pane. Tell the user which thread and where. Do not try to answer its permission prompt.
 - When the user has looked at a finished thread, run `hp thread ack <slug> <id>`.
-- `hp thread resolve <slug> <id>` makes the final copy, then closes the thread's pane and tab through Herdr so its idle agent stops using memory. A worktree whose commits landed, whose round closed, or whose reviewer produced a verdict is removed by default. Its branch stays. A dirty worktree stays and the result says why; `--keep-pane` keeps both pane and worktree.
+- `hp thread resolve <slug> <id>` makes the final copy, then closes the thread's pane and tab through Herdr so its idle agent stops using memory. A worktree whose commits landed, whose round closed, or whose reviewer produced a verdict is removed only when it has no changes or non-disposable ignored data. Uncommitted changes refuse resolution. Ignored data resolves the thread but keeps the worktree; the result names each folder and size. `[worktrees].disposable` in `config.toml` lists rebuildable ignored path names (for example `target`, `.target`, `zig-out`, `.zig-cache`, `node_modules`); an absent table keeps every ignored file, and a nested worktree is always kept. Its branch stays; `--keep-pane` keeps both pane and worktree.
 - `hp overview <slug>` prints all threads grouped by what needs the user.
 
 ## Memory

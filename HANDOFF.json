@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0175.md",
+      "tasks/review-r74.md",
+      "tasks/review-r73.md",
+      "tasks/t-0174.md",
+      "tasks/t-0173.md",
+      "tasks/t-0172.md",
       "tasks/t-0171.md",
       "tasks/t-0169.md",
       "tasks/review-r72.md",
       "tasks/t-0170.md",
       "tasks/t-0168.md",
-      "tasks/review-r71.md",
-      "tasks/t-0167.md",
-      "tasks/review-r70.md",
-      "tasks/t-0166.md",
-      "tasks/t-0165.md",
-      "tasks/t-0164.md",
-      "tasks/t-0163.md"
+      "tasks/review-r71.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r73.md",
       "tasks/reviews/code-r72.md",
       "tasks/reviews/code-r71.md",
       "tasks/reviews/code-r70.md",
@@ -39,15 +40,21 @@
       "tasks/reviews/code-r65.md",
       "tasks/reviews/code-r64.md",
       "tasks/reviews/code-r63.md",
-      "tasks/reviews/code-r62.md",
-      "tasks/reviews/code-r60.md"
+      "tasks/reviews/code-r62.md"
     ]
   },
-  "generated": "2026-09-21T14:56:32-04:00",
+  "generated": "2026-09-21T15:57:54-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0171-review-r72-this-round-removes-the-part-t",
       "main",
+      "hp/adeherdr/t-0175-review-r73-removing-a-finished-worktree",
+      "hp/adeherdr/t-0176-review-r74-a-stuck-or-failed-job-can-be",
+      "review/r74",
+      "hp/adeherdr/t-0173-d4-recovery-verbs",
+      "review/r73",
+      "hp/adeherdr/t-0174-w1-keep-ignored-data",
+      "hp/adeherdr/t-0172-d3-failure-classes",
+      "hp/adeherdr/t-0171-review-r72-this-round-removes-the-part-t",
       "review/r72-2",
       "hp/adeherdr/t-0170-review-r71-this-round-makes-every-comman",
       "hp/adeherdr/t-0169-review-r72-this-round-removes-the-part-t",
@@ -275,36 +282,36 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "9b7960a review(r72): approve repaired editable routing",
-      "34a3208 Merge earlier r72 candidate into repair review",
-      "bfa0f5b docs(tasks): t-0171",
-      "ae2382e review(r72): brief for revision 1",
-      "08071c3 checkpoint(r71): HANDOFF after merging the round",
-      "668d59d review(herdr-ade): approve repaired r71 typed results"
+      "c191592 Merge commit '75c2a2ccd41e43798b9892ae755c01bf98eaf9eb'",
+      "75c2a2c review(r73): approve ignored-data-safe worktree cleanup",
+      "736cf6a review(core): make ignored-data inspection collision safe",
+      "2544f24 review(r74): brief for revision 1",
+      "c7877a6 Merge pinned t-0174 into review r73",
+      "e7a3b8c docs(tasks): t-0175"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "12 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "9b7960a",
+        "head": "c191592",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r72): approve repaired editable routing"
+        "subject": "Merge commit '75c2a2ccd41e43798b9892ae755c01bf98eaf9eb'"
       },
       {
-        "branch": "review/r72",
+        "branch": "review/r73",
         "dirty": 0,
-        "head": "a5388d7",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r72",
-        "subject": "docs(tasks): t-0169"
+        "head": "e7a3b8c",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r73",
+        "subject": "docs(tasks): t-0175"
       },
       {
-        "branch": "review/r72-2",
+        "branch": "review/r74",
         "dirty": 0,
-        "head": "bfa0f5b",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r72-2",
-        "subject": "docs(tasks): t-0171"
+        "head": "d9c3d29",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r74",
+        "subject": "docs(tasks): t-0176"
       }
     ]
   },
@@ -329,8 +336,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r72",
-    "verdict": "9b7960a17aa5e6df64ce7e73d26e7bf42d6bbede"
+    "round": "r73",
+    "verdict": "75c2a2ccd41e43798b9892ae755c01bf98eaf9eb"
   },
   "session": "default",
   "unlinked_agents": [],

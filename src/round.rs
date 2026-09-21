@@ -1102,11 +1102,17 @@ fn cleanup_review_worktrees(ctx: &Ctx, record: &RoundRecord) -> Vec<String> {
     let mut lines = Vec::new();
     for (path, _) in worktrees.into_iter().filter(|(path, _)| belongs(path)) {
         let path_text = path.to_string_lossy().into_owned();
-        match crate::git::dirty_paths(ctx.runner, &record.repo, &path_text) {
-            Ok(dirty) if !dirty.is_empty() => lines.push(format!(
+        match crate::worktrees::inspect_local(ctx.runner, &record.repo, &path_text, &ctx.config_dir)
+        {
+            Ok(inspection) if !inspection.dirty.is_empty() => lines.push(format!(
                 "review worktree {} kept: worktree_dirty ({})",
                 path.display(),
-                dirty.join(", ")
+                inspection.dirty.join(", ")
+            )),
+            Ok(inspection) if !inspection.ignored_data.is_empty() => lines.push(format!(
+                "review worktree {} kept: ignored_data ({})",
+                path.display(),
+                crate::worktrees::describe_data(&inspection.ignored_data)
             )),
             Ok(_) => match crate::git::worktree_remove(ctx.runner, &record.repo, &path_text) {
                 Ok(()) => lines.push(format!(
@@ -4415,6 +4421,26 @@ mod tests {
         assert_eq!(r.expected_head.as_deref(), Some(b.as_str()));
         assert_eq!(r.frozen_revision, Some(r.manifest.revision));
         assert_eq!(r.manifest_hash, Some(manifest_hash(&r)));
+    }
+
+    #[test]
+    fn a_closed_round_keeps_a_review_worktree_with_ignored_data() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        let review_worktree = fx.repo.join(".worktrees/review-r1");
+        let exclude = fx.repo.join(".git/info/exclude");
+        let mut exclusions = std::fs::read_to_string(&exclude).unwrap_or_default();
+        exclusions.push_str("camber-runs/\n");
+        std::fs::write(exclude, exclusions).unwrap();
+        std::fs::create_dir_all(review_worktree.join("camber-runs")).unwrap();
+        std::fs::write(review_worktree.join("camber-runs/raw.bin"), vec![0; 2048]).unwrap();
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+
+        merge(&ctx, "demo", "r1", None).unwrap();
+
+        assert!(review_worktree.is_dir(), "ignored run data must be kept");
+        assert!(review_worktree.join("camber-runs/raw.bin").is_file());
     }
 
     #[test]

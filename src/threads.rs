@@ -1554,18 +1554,30 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     if record.kind == Kind::Worktree && !record.worktree_path.is_empty() {
         if pane == "cleanup_pending" {
             worktree = "kept".into();
-        } else if let Some(dirty) = dirty_worktree_reason(ctx, &project, &record)? {
-            worktree = "kept".into();
-            worktree_reason = Some(dirty);
         } else {
-            match remove_worktree(ctx, &project, &record) {
-                Ok(()) => {
-                    thread::update(&project, id, |t| t.worktree_path.clear())?;
-                    worktree = "removed".into();
-                }
-                Err(error) => {
-                    worktree = "kept".into();
-                    worktree_reason = Some(format!("{error:#}"));
+            let inspection = inspect_worktree_for_removal(ctx, &record)?;
+            let kept_reason = if !inspection.dirty.is_empty() {
+                Some(format!(
+                    "worktree_dirty: uncommitted changes in {}; not removing ({})",
+                    record.worktree_path,
+                    inspection.dirty.join(", ")
+                ))
+            } else {
+                inspection.ignored_reason(&record.worktree_path)
+            };
+            if let Some(reason) = kept_reason {
+                worktree = "kept".into();
+                worktree_reason = Some(reason);
+            } else {
+                match remove_worktree(ctx, &project, &record) {
+                    Ok(()) => {
+                        thread::update(&project, id, |t| t.worktree_path.clear())?;
+                        worktree = "removed".into();
+                    }
+                    Err(error) => {
+                        worktree = "kept".into();
+                        worktree_reason = Some(format!("{error:#}"));
+                    }
                 }
             }
         }
@@ -1798,10 +1810,16 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         if removal_refusal.is_none() {
             removal_refusal = finished_worktree_reason(ctx, &project, &record)?;
         }
-        if removal_refusal.is_none()
-            && let Some(reason) = dirty_worktree_reason(ctx, &project, &record)?
-        {
-            return Err(crate::refusal::error(reason));
+        if removal_refusal.is_none() {
+            let inspection = inspect_worktree_for_removal(ctx, &record)?;
+            if !inspection.dirty.is_empty() {
+                return Err(crate::refusal::error(format!(
+                    "worktree_dirty: uncommitted changes in {}; not removing ({})",
+                    record.worktree_path,
+                    inspection.dirty.join(", ")
+                )));
+            }
+            removal_refusal = inspection.ignored_reason(&record.worktree_path);
         }
         if removal_refusal.is_none() {
             removal_in_use_gate(ctx, &project, &record)?;
@@ -2101,50 +2119,30 @@ pub(crate) fn finished_worktree_reason(
     }
 }
 
-fn dirty_worktree_reason(ctx: &Ctx, project: &Project, record: &Thread) -> Result<Option<String>> {
-    let paths = if record.is_remote() {
-        let (settings, _) = project.read_project_md()?;
-        let (box_repo, _) = box_repo_row(&settings, &record.repo)?;
-        let profile = remote::machine_profile(
+pub(crate) fn inspect_worktree_for_removal(
+    ctx: &Ctx,
+    record: &Thread,
+) -> Result<crate::worktrees::Inspection> {
+    if !record.is_remote() {
+        return crate::worktrees::inspect_local(
             ctx.runner,
-            &ctx.env.herdr_bin(),
+            &record.repo,
+            &record.worktree_path,
             &ctx.config_dir,
-            record.machine_route(),
-        )?;
-        let script = format!(
-            "git -C {} status --porcelain --untracked-files=all",
-            remote::quote(&record.worktree_path)
         );
-        let out = remote::ssh(
-            ctx.runner,
-            &profile.target,
-            &script,
-            None,
-            Duration::from_secs(20),
-        )?;
-        if !out.success() {
-            bail!(
-                "worktree_status_failed: {} in {}: {}",
-                record.worktree_path,
-                box_repo,
-                out.error_text()
-            );
-        }
-        out.stdout
-            .lines()
-            .filter(|line| line.len() > 3)
-            .map(|line| line[3..].trim().trim_matches('"').to_string())
-            .collect()
-    } else {
-        crate::git::dirty_paths(ctx.runner, &record.repo, &record.worktree_path)?
-    };
-    Ok((!paths.is_empty()).then(|| {
-        format!(
-            "worktree_dirty: uncommitted changes in {}; not removing ({})",
-            record.worktree_path,
-            paths.join(", ")
-        )
-    }))
+    }
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        record.machine_route(),
+    )?;
+    crate::worktrees::inspect_remote(
+        ctx.runner,
+        &profile.target,
+        &record.worktree_path,
+        &ctx.config_dir,
+    )
 }
 
 /// Never forces. Git's refusal is reported unchanged.
