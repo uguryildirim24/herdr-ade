@@ -148,6 +148,16 @@ pub(crate) const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub(crate) struct Workspace {
     pub(crate) workspace_id: String,
+    #[serde(default)]
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub(crate) struct Tab {
+    pub(crate) tab_id: String,
+    pub(crate) workspace_id: String,
+    #[serde(default)]
+    pub(crate) label: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -266,6 +276,39 @@ pub(crate) struct Created {
     pub(crate) pane_id: String,
 }
 
+fn decode_call(label: &str, out: crate::runner::Output) -> Result<serde_json::Value, HerdrError> {
+    if out.timed_out {
+        return Err(HerdrError {
+            code: "timeout".into(),
+            message: format!("`herdr {label}` timed out"),
+        });
+    }
+    let reply = [&out.stdout, &out.stderr]
+        .into_iter()
+        .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
+    if let Some(reply) = reply {
+        if let Some(error) = reply.get("error") {
+            return Err(HerdrError {
+                code: error["code"].as_str().unwrap_or("failed").to_string(),
+                message: error["message"].as_str().unwrap_or("").to_string(),
+            });
+        }
+        if out.success() {
+            return Ok(reply
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+    }
+    if out.success() && out.stdout.trim().is_empty() && out.stderr.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    Err(HerdrError {
+        code: "failed".into(),
+        message: format!("`herdr {label}`: {}", out.error_text()),
+    })
+}
+
 impl<'a> Herdr<'a> {
     /// Runs one herdr command and returns the `result` object of its JSON reply.
     pub(crate) fn call(
@@ -278,40 +321,7 @@ impl<'a> Herdr<'a> {
             code: "unreachable".into(),
             message: format!("{e:#}"),
         })?;
-        if out.timed_out {
-            return Err(HerdrError {
-                code: "timeout".into(),
-                message: format!("`herdr {}` timed out", args.join(" ")),
-            });
-        }
-        // herdr prints one JSON object; on failure it carries `error`, and
-        // which stream it lands on is not something to depend on.
-        let reply = [&out.stdout, &out.stderr]
-            .into_iter()
-            .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
-        if let Some(reply) = reply {
-            if let Some(error) = reply.get("error") {
-                return Err(HerdrError {
-                    code: error["code"].as_str().unwrap_or("failed").to_string(),
-                    message: error["message"].as_str().unwrap_or("").to_string(),
-                });
-            }
-            if out.success() {
-                return Ok(reply
-                    .get("result")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null));
-            }
-        }
-        // `pane report-metadata`, `workspace report-metadata`, `pane run` and
-        // `send-keys` print nothing on success (SPEC-ADE item 71).
-        if out.success() && out.stdout.trim().is_empty() && out.stderr.trim().is_empty() {
-            return Ok(serde_json::Value::Null);
-        }
-        Err(HerdrError {
-            code: "failed".into(),
-            message: format!("`herdr {}`: {}", args.join(" "), out.error_text()),
-        })
+        decode_call(&args.join(" "), out)
     }
 
     fn call_as<T: serde::de::DeserializeOwned>(
@@ -328,6 +338,10 @@ impl<'a> Herdr<'a> {
 
     pub(crate) fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {
         self.call_as(&["workspace", "list"], "workspaces")
+    }
+
+    pub(crate) fn tab_list(&self) -> Result<Vec<Tab>, HerdrError> {
+        self.call_as(&["tab", "list"], "tabs")
     }
 
     pub(crate) fn pane_list(&self) -> Result<Vec<Pane>, HerdrError> {
@@ -505,8 +519,7 @@ impl<'a> Herdr<'a> {
             .map(|_| ())
     }
 
-    /// `agent start` with `--parent` and `ready_timeout_ms` (SPEC-ADE D2, D3).
-    pub(crate) fn agent_start_opts(&self, opts: &AgentStart<'_>) -> Result<Agent, HerdrError> {
+    fn agent_start_command(&self, opts: &AgentStart<'_>) -> (Vec<String>, Cmd) {
         let timeout_ms = opts.ready_timeout_ms.to_string();
         let mut args = vec![
             "agent".to_string(),
@@ -527,13 +540,48 @@ impl<'a> Herdr<'a> {
             args.push("--".into());
             args.extend(opts.agent_args.iter().cloned());
         }
-        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let wait = Duration::from_millis(opts.ready_timeout_ms) + Duration::from_secs(5);
-        let result = self.call(&borrowed, wait)?;
-        serde_json::from_value(result["agent"].clone()).map_err(|e| HerdrError {
-            code: "failed".into(),
-            message: format!("`herdr agent start` reply changed: {e}"),
-        })
+        let command = self.cmd(wait).args(args.iter().cloned());
+        (args, command)
+    }
+
+    /// `agent start` with `--parent` and `ready_timeout_ms` (SPEC-ADE D2, D3).
+    pub(crate) fn agent_start_opts(&self, opts: &AgentStart<'_>) -> Result<Agent, HerdrError> {
+        self.agent_start_many(std::slice::from_ref(opts))
+            .pop()
+            .expect("one start has one result")
+    }
+
+    /// Starts independent agents concurrently. Results keep input order, so
+    /// each durable thread record receives only its own launch outcome.
+    pub(crate) fn agent_start_many(
+        &self,
+        starts: &[AgentStart<'_>],
+    ) -> Vec<Result<Agent, HerdrError>> {
+        let prepared: Vec<_> = starts
+            .iter()
+            .map(|opts| self.agent_start_command(opts))
+            .collect();
+        let commands: Vec<Cmd> = prepared
+            .iter()
+            .map(|(_, command)| command.clone())
+            .collect();
+        self.runner
+            .run_parallel(&commands)
+            .into_iter()
+            .zip(prepared)
+            .map(|(output, (args, _))| {
+                let output = output.map_err(|error| HerdrError {
+                    code: "unreachable".into(),
+                    message: format!("{error:#}"),
+                })?;
+                let result = decode_call(&args.join(" "), output)?;
+                serde_json::from_value(result["agent"].clone()).map_err(|error| HerdrError {
+                    code: "failed".into(),
+                    message: format!("`herdr agent start` reply changed: {error}"),
+                })
+            })
+            .collect()
     }
 
     /// Submits a prompt. herdr's parser takes positionals first and options

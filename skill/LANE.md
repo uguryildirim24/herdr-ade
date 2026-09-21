@@ -7,6 +7,7 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 - The coordinator pushes the integration branch and `main`; a lane never pushes them. A cloud-box lane publishes only its own lane branch before `done` (see *On the cloud box*, below).
 - Keep agent-plane names and technical detail in reports. Messages meant for Rolf use the plugin's plain-language commands.
 - Do not edit project memory. Put durable lessons in your report for the coordinator to decide.
+- Never add a throwaway tab or pane to your lane workspace or to the watched session. Run visual checks and probes in the isolated session `herdr --session scratch-<lane id> ...` on your lane's machine. When done, run `herdr session stop scratch-<lane id>` and `herdr session delete scratch-<lane id>`; resolve also removes a leftover session.
 
 ## Pictures
 
