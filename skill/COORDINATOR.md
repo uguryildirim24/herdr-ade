@@ -58,7 +58,7 @@ Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is bl
 You do not pick a recipe on `thread start`. Write the full task with scope, constraints and gates. The editable `[routing]` table checks ordered rules against the workflow and optional task front matter, then uses its default. The launch record says which rule matched.
 
 - `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
-- Task front matter may say `product = "web-research"`, `product = "spec"`, or `requires_claude = true`. A coding task that reads a web page is still coding unless its product says otherwise.
+- Task front matter may say `product = "web-research"`, `product = "spec"`, or `capability = "<name>"`. The selected recipe must declare that capability. A coding task that reads a web page is still coding unless its product says otherwise.
 - `round advance` still starts the review. The reviewer gets a bounded task that names the committed review brief and every pinned commit range; large sources stay in the checkout for the reviewer to read.
 - A lane calls `ha failed "<failure and evidence>"` for failed work. The harness uses the routing rule's bounded retries and fallbacks. Provider and lost-connection failures retry only the same recipe; a gone process restarts; unknown evidence waits for you.
 - `thread retry` runs the same task as a new process under that typed recovery policy. Only Rolf may pin an exact task through `[routing.pins]`.

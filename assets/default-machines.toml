@@ -1,0 +1,23 @@
+# Current saved-machine path declaration. Additional machines are ordinary
+# `[machines.<id>]` rows in config.toml.
+[machines.oci]
+label = "oci"
+target = "oci-pi"
+session = "default"
+home = "/home/ubuntu"
+root = "/home/ubuntu/.herdr-ade"
+worktrees = "/home/ubuntu/projects"
+build = "/home/ubuntu/build/lanes"
+path = "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ade_bin = "/home/ubuntu/.local/bin/herdr-ade"
+pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
+
+[[machines.oci.repos]]
+path = "/Users/rolfie/projects/herdr"
+box_path = "/home/ubuntu/projects/herdr"
+publish_url = "https://github.com/uguryildirim24/herdr.git"
+
+[[machines.oci.repos]]
+path = "/Users/rolfie/projects/herdr-ade"
+box_path = "/home/ubuntu/projects/herdr-ade"
+publish_url = "https://github.com/uguryildirim24/herdr-ade.git"
