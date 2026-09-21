@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0185.md",
+      "tasks/t-0186.md",
+      "tasks/review-r77.md",
+      "tasks/t-0184.md",
+      "tasks/t-0183.md",
       "tasks/t-0182.md",
       "tasks/t-0180.md",
       "tasks/t-0177.md",
       "tasks/review-r75.md",
       "tasks/t-0181.md",
       "tasks/review-r76.md",
-      "tasks/t-0178.md",
-      "tasks/t-0176.md",
-      "tasks/t-0179.md",
-      "tasks/review-r74.md",
-      "tasks/t-0175.md",
-      "tasks/review-r73.md"
+      "tasks/t-0178.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r77.md",
       "tasks/reviews/code-r75.md",
       "tasks/reviews/code-r76.md",
       "tasks/reviews/code-r74.md",
@@ -39,15 +40,19 @@
       "tasks/reviews/code-r69.md",
       "tasks/reviews/code-r68.md",
       "tasks/reviews/code-r67.md",
-      "tasks/reviews/code-r66.md",
-      "tasks/reviews/code-r65.md"
+      "tasks/reviews/code-r66.md"
     ]
   },
-  "generated": "2026-09-21T17:12:43-04:00",
+  "generated": "2026-09-21T18:03:15-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0182-review-r75-each-failure-says-what-failed",
       "main",
+      "hp/adeherdr/t-0184-d5-task-records",
+      "hp/adeherdr/t-0185-review-r77-background-jobs-run-from-a-fo",
+      "hp/adeherdr/t-0186-w4-remove-build-folders",
+      "review/r77",
+      "hp/adeherdr/t-0183-w3-stable-folders",
+      "hp/adeherdr/t-0182-review-r75-each-failure-says-what-failed",
       "review/r75-3",
       "hp/adeherdr/t-0180-review-r75-each-failure-says-what-failed",
       "hp/adeherdr/t-0181-review-r76-doctor-leaves-a-live-lane-s-w",
@@ -293,43 +298,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "f0100d1 review(r75): approve typed failures with r76 cleanup",
-      "8f57cbe review(cli): make failed work the usable default",
-      "98199b6 Merge reviewed r75 candidate for revision 1",
-      "437b5e1 docs(tasks): t-0182",
-      "d068ea4 review(r75): brief for revision 1",
-      "402ad49 review(core): preserve typed recovery across retry commands"
+      "f59e11c Merge commit 'd75dba04cb198929b36ce4b4985cfd75d41ff6b2'",
+      "d75dba0 docs(review): round r77 verdict",
+      "289f66b review(runtime): keep timeouts unknown and root ticker loop",
+      "ae0db4b docs(tasks): t-0186",
+      "0813e5d review(r77): merge pinned t-0183",
+      "545e667 docs(tasks): t-0185"
     ],
-    "remote": "12 ahead, 0 behind origin/main",
+    "remote": "10 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "f0100d1",
+        "head": "f59e11c",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(r75): approve typed failures with r76 cleanup"
+        "subject": "Merge commit 'd75dba04cb198929b36ce4b4985cfd75d41ff6b2'"
       },
       {
-        "branch": "review/r75",
+        "branch": "review/r77",
         "dirty": 0,
-        "head": "9757d53",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r75",
-        "subject": "docs(tasks): t-0177"
-      },
-      {
-        "branch": "review/r75-2",
-        "dirty": 0,
-        "head": "653b0d5",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r75-2",
-        "subject": "docs(tasks): t-0180"
-      },
-      {
-        "branch": "review/r75-3",
-        "dirty": 0,
-        "head": "437b5e1",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r75-3",
-        "subject": "docs(tasks): t-0182"
+        "head": "545e667",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r77",
+        "subject": "docs(tasks): t-0185"
       }
     ]
   },
@@ -354,8 +345,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r75",
-    "verdict": "f0100d1adf5a9be4f533625fcb4520272af79d82"
+    "round": "r77",
+    "verdict": "d75dba04cb198929b36ce4b4985cfd75d41ff6b2"
   },
   "session": "default",
   "unlinked_agents": [],
