@@ -414,6 +414,9 @@ fn prompt_text(input: &serde_json::Value) -> Option<&str> {
 /// Records a prompt typed into the coordinator pane and returns the request id
 /// to print, or `None` when a harness line must not be recorded as Rolf's.
 fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<String>> {
+    if crate::talk::is_task_notification_prompt(text) {
+        return Ok(None);
+    }
     match crate::talk::take_pending_prompt(project, pane, text) {
         Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
         Some(crate::talk::PendingPrompt::Automated) => Ok(None),
@@ -744,10 +747,15 @@ mod tests {
         install(&ctx, &project, "claude", "w1:p1").unwrap();
 
         crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap();
+        let wrapped_done = "\n\n<pasted_content id=\"2459\">\nDONE t-0001 report.md sha\n</pasted_content id=\"2459\">\n";
         assert_eq!(
-            handle_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap(),
+            handle_prompt(&project, "w1:p1", wrapped_done).unwrap(),
             None
         );
+        assert!(crate::talk::recent_requests(&project, 5).is_empty());
+
+        let task_notice = "<task-notification>\n<task-id>abc</task-id>\n<tool-use-id>tool</tool-use-id>\n<output-file>/tmp/task</output-file>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>";
+        assert_eq!(handle_prompt(&project, "w1:p1", task_notice).unwrap(), None);
         assert!(crate::talk::recent_requests(&project, 5).is_empty());
 
         let id = handle_prompt(&project, "w1:p1", "Spend five dollars on the check.")
@@ -775,6 +783,13 @@ mod tests {
             record.basis.as_deref(),
             Some(format!("request:{id}").as_str())
         );
+
+        crate::talk::mark_automated_prompt(&project, "w1:p1", "GONE t-0002").unwrap();
+        let mixed = "Keep working.\n<pasted_content id=\"2460\">\nGONE t-0002\n</pasted_content id=\"2460\">";
+        let mixed_id = handle_prompt(&project, "w1:p1", mixed)
+            .unwrap()
+            .expect("native text mixed with a pasted harness line is Rolf's request");
+        assert!(crate::talk::recent_requests(&project, 5).contains(&(mixed_id, mixed.to_string())));
     }
 
     #[test]
