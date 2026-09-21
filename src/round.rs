@@ -1138,7 +1138,6 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
                     &format!("verdict:{verdict}"),
                     &verdict_summary(&round, &verdict),
                     (verdict == "MERGE").then(|| verdict_say(&record)),
-                    verdict == "REJECT",
                 )?;
                 continue;
             }
@@ -1159,7 +1158,6 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
                             "Round {round}: the reviewer thread {reviewer} is gone; restore its recorded review workflow with `{prefix} thread restart {slug} {reviewer}` (reopen it first if resolved)"
                         ),
                         None,
-                        false,
                     )?;
                 }
                 ReviewerState::Alive => {}
@@ -1621,7 +1619,6 @@ fn reviewer_start_failed(
             "Round {round}: the reviewer did not start ({reason}); it is retried on the next pass, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
         ),
         None,
-        false,
     )?;
     Ok(failures)
 }
@@ -1642,7 +1639,6 @@ fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &
             project.slug
         ),
         None,
-        false,
     )
 }
 
@@ -1661,7 +1657,6 @@ fn announce_once(
     token: &str,
     summary: &str,
     say_what: Option<String>,
-    rejected: bool,
 ) -> Result<()> {
     {
         let _lock = project.lock()?;
@@ -1669,9 +1664,6 @@ fn announce_once(
         let already = record.announced.as_deref() == Some(token);
         record.announced = Some(token.to_string());
         record.attention = summary.to_string();
-        if rejected && !already {
-            *record.rejections.get_or_insert(0) += 1;
-        }
         save(project, &record)?;
         if already {
             return Ok(());
@@ -1732,6 +1724,13 @@ pub struct ReviewOutcome {
 pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
+    let before_refresh = load(&project, round)?;
+    require_mutable(&before_refresh)?;
+    let git = Git::new(ctx.runner, &before_refresh.repo);
+    // Accept a completed verdict against the manifest it reviewed before an
+    // explicit repair ingests newer lane completions. This also records each
+    // REJECT exactly once even when `round advance` did not observe it first.
+    let earlier_before_refresh = completed_review(&project, &before_refresh, &git);
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
@@ -1788,17 +1787,9 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let brief = compose_review_brief(&record, &hash, &reports, &prefix);
     let brief_path = review_brief_path(round);
 
-    let git = Git::new(ctx.runner, &record.repo);
     // A repair only supersedes a completed review. Without a sealed verdict,
     // a repeated manual command must not clear the live reviewer.
-    let earlier = completed_review(&project, &record, &git);
-    let earlier_reject = earlier.as_ref().is_some_and(|(_, verdict)| {
-        git.show_file(verdict, &verdict_path(round))
-            .ok()
-            .flatten()
-            .and_then(|text| parse_verdict(&text).ok())
-            .is_some_and(|parsed| parsed.verdict == "REJECT")
-    });
+    let earlier = earlier_before_refresh.or_else(|| completed_review(&project, &record, &git));
     let (b, review_branch, worktree, repair) = {
         let _repo = repo_lock(&git)?;
         let head = git
@@ -1975,9 +1966,6 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         // A new review revision is a fresh automatic-start cycle. Failures
         // from the superseded review must not consume this one's retry bound.
         current.reviewer_start_failures = 0;
-        if earlier_reject {
-            current.rejections = Some(current.rejections.unwrap_or(0).max(1));
-        }
         save(&project, &current)?;
     }
     let _ = crate::board::refresh(ctx, &project);
@@ -2172,6 +2160,10 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
     let pin = done_pin(&events, &record.round, reviewer, attempt)
         .context("verdict_missing: the reviewer has no sealed done event for this round and attempt; finish the review and run done with its verdict commit")?;
     validate_verdict_inner(git, record, &pin.sha, false)?;
+    let rejected = git
+        .show_file(&pin.sha, &verdict_path(&record.round))?
+        .and_then(|text| parse_verdict(&text).ok())
+        .is_some_and(|verdict| verdict.verdict == "REJECT");
     let _lock = project.lock()?;
     let mut current = load(project, &record.round)?;
     if current.reviewer != record.reviewer
@@ -2188,6 +2180,9 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
     }
     current.verdict = Some(pin.clone());
     current.phase = RoundPhase::VerdictIn;
+    if rejected {
+        *current.rejections.get_or_insert(0) += 1;
+    }
     save(project, &current)?;
     Ok(pin.sha)
 }
