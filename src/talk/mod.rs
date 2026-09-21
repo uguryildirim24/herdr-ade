@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::contracts::{HumanMessage, Recipient, TalkInbound, TalkRequestState};
 use crate::herdr::Herdr;
@@ -197,6 +198,96 @@ pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Resu
     Ok(Some(seq))
 }
 
+// -------------------------------------------------- coordinator-pane prompts
+
+/// What a prompt typed into the coordinator pane is: the delivery of a
+/// talk-tab message already recorded under a request id, or a harness line
+/// (priming, nudge, event) that is not Rolf's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingPrompt {
+    Delivery(String),
+    Automated,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingPromptRecord {
+    delivery: Option<String>,
+    at: i64,
+}
+
+/// A marker older than this belongs to a hook that never fired; it must not
+/// claim a later prompt with the same text.
+const PENDING_PROMPT_SECS: i64 = 120;
+
+fn pending_prompt_path(project: &Project, pane: &str, text: &str) -> PathBuf {
+    let mut hash = Sha256::new();
+    hash.update(pane.as_bytes());
+    hash.update(b"\n");
+    hash.update(text.trim_end().as_bytes());
+    talk_dir(project)
+        .join("prompts")
+        .join(format!("{:x}.json", hash.finalize()))
+}
+
+/// Records the next prompt this coordinator pane will receive so the
+/// prompt-submit hook can classify it. Only written when a hook is bound, so
+/// a kind without one leaves no files behind.
+fn mark_pending_prompt(
+    project: &Project,
+    pane: &str,
+    text: &str,
+    delivery: Option<&str>,
+) -> Result<()> {
+    if !crate::hook::captures(project, pane) {
+        return Ok(());
+    }
+    let path = pending_prompt_path(project, pane, text);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    project::write_json(
+        &path,
+        &PendingPromptRecord {
+            delivery: delivery.map(str::to_string),
+            at: jiff::Timestamp::now().as_second(),
+        },
+    )
+}
+
+/// Marks the prompt a talk delivery is about to type, so the hook cites the
+/// request `submit` already recorded instead of writing a second one.
+pub(crate) fn mark_talk_delivery(
+    project: &Project,
+    pane: &str,
+    request: &str,
+    text: &str,
+) -> Result<()> {
+    mark_pending_prompt(project, pane, text, Some(request))
+}
+
+/// Marks a harness line so the hook never records it as a request from Rolf.
+pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
+    mark_pending_prompt(project, pane, text, None)
+}
+
+/// Reads and removes the marker for this pane and exact prompt.
+pub(crate) fn take_pending_prompt(
+    project: &Project,
+    pane: &str,
+    text: &str,
+) -> Option<PendingPrompt> {
+    let path = pending_prompt_path(project, pane, text);
+    let record: PendingPromptRecord = project::read_json(&path)?;
+    let _ = std::fs::remove_file(&path);
+    if jiff::Timestamp::now().as_second() - record.at > PENDING_PROMPT_SECS {
+        return None;
+    }
+    Some(match record.delivery {
+        Some(request) => PendingPrompt::Delivery(request),
+        None => PendingPrompt::Automated,
+    })
+}
+
 // ------------------------------------------------------------- settings
 
 /// `talk` in `PROJECT.md` front matter, else on for a `claude` coordinator.
@@ -305,6 +396,24 @@ pub(crate) fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
         .collect()
 }
 
+/// The most recent messages Rolf sent, oldest first, with the request id to
+/// cite. The coordinator digest prints them so an id is always findable.
+pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, String)> {
+    let journal = read(project);
+    let mut found: Vec<(String, String)> = journal
+        .lines
+        .iter()
+        .filter_map(|line| match &line.entry {
+            Entry::Rolf { request, text, .. } => Some((request.clone(), text.clone())),
+            _ => None,
+        })
+        .collect();
+    if found.len() > limit {
+        found.drain(..found.len() - limit);
+    }
+    found
+}
+
 fn notice(ctx: &Ctx, project: &Project, id: &str) {
     let _ = crate::ask::publish(ctx, project, &HumanMessage::Notice { id: id.to_string() });
 }
@@ -381,6 +490,7 @@ fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkReque
         // Uncertain is journalled before the line is typed: a crash after
         // typing leaves a request that is never sent again (D18).
         mark(TalkRequestState::Uncertain)?;
+        mark_talk_delivery(project, &pane, &inbound.request, &text)?;
         let state = match h.agent_prompt(&pane, &text) {
             Ok(()) => TalkRequestState::Submitted,
             Err(e) if matches!(e.code.as_str(), "timeout" | "unreachable" | "failed") => {
@@ -406,6 +516,30 @@ fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkReque
     Ok(out)
 }
 
+/// Records a message Rolf typed straight into the coordinator pane, verbatim,
+/// under a new request id the coordinator can cite.
+pub(crate) fn record_pane_request(project: &Project, text: &str) -> Result<String> {
+    let request = fresh_request();
+    append(
+        project,
+        None,
+        Entry::Rolf {
+            request: request.clone(),
+            text: text.to_string(),
+            answer: None,
+        },
+    )?;
+    Ok(request)
+}
+
+fn fresh_request() -> String {
+    format!(
+        "q-{}-{}",
+        jiff::Timestamp::now().as_millisecond(),
+        std::process::id()
+    )
+}
+
 /// Rolf typed a line: journal the intent first, then hand it to the writer.
 fn submit(ctx: &Ctx, project: &Project, text: &str) -> Result<(String, TalkRequestState)> {
     submit_with_answer(ctx, project, text, None)
@@ -417,11 +551,7 @@ fn submit_with_answer(
     text: &str,
     answer: Option<AnswerRef>,
 ) -> Result<(String, TalkRequestState)> {
-    let request = format!(
-        "q-{}-{}",
-        jiff::Timestamp::now().as_millisecond(),
-        std::process::id()
-    );
+    let request = fresh_request();
     append(
         project,
         None,

@@ -129,7 +129,7 @@ Rolf reads you in the `talk` tab when the project has it on (`hp context` prints
   ````
 
   A reply without a block, or with a block that fails the check, is sent back to you to rewrite. A question typed in prose never reaches Rolf's talk tab.
-- Lines Rolf types in talk reach you as ordinary messages. The plugin serializes its own writers; text Rolf types straight into your pane is outside that guarantee.
+- Lines Rolf types in talk reach you as ordinary messages. Every message Rolf sends you, in talk or straight into your pane, carries a request id (`q-...`). The prompt-submit hook prints it with the message; `hp context` lists the latest ones under "Latest messages from Rolf". To cite one, use `--basis request:<id>`. The plugin serializes its own writers; text Rolf types straight into your pane is outside that guarantee.
 
 ### Plans and choices
 
@@ -138,7 +138,7 @@ The project screen reads two records you keep. The plan card (`hp plan`) is the 
 - `hp plan set --kind <kind> --does "<sentence>" --expect <revision>`; `hp plan step add|edit|link|unlink|remove|move`; `hp plan show`; `hp plan sync`. The plugin refreshes step states on its own at checkpoints, merges, and thread or round changes; `sync` is the manual form.
 - `hp ask withdraw <id> "<reason>"` takes back an open question, including an older duplicate; its record stays. An answered question cannot be withdrawn.
 - `hp decide overturn <id> "<reason>"` overturns a choice without erasing it. The screen marks it overturned, and context keeps the reason visible: act on it rather than repeating the choice. The command records the shell's `USER` as the actor.
-- `hp decide "<one plain line>" --class routine` for everything ordinary. Only a choice that changes what Rolf gets (`what-you-get`), costs money (`money`) or is hard to undo (`undo`) needs `--basis` naming the permission it rests on, and those are the ones to ask about first.
+- `hp decide "<one plain line>" --class routine` for everything ordinary. Only a choice that changes what Rolf gets (`what-you-get`), costs money (`money`) or is hard to undo (`undo`) needs `--basis request:<id>` pointing at the message it rests on (or `--basis ask:<id>@<revision>` for an answered ask); find the id in the prompt the hook prints or in `hp context`'s "Latest messages from Rolf". Those are the ones to ask about first, and a choice with no message behind it asks rather than cites.
 - Ask Rolf only when a choice would change what he gets, add a cost outside his permission, or be hard to undo. For everything else, choose, record one plain sentence with `ha decide`, and keep working. Do not turn ordinary implementation choices into questions. Keep at most three asks open: when another is needed, reask the newest open ask as one clear merged question, keeping the earlier need rather than silently replacing it. Preserve the two older asks and use the existing revision checks. If the choices cannot be merged honestly within the card's limit, pause that new consequential branch until a slot opens; never act without permission to avoid the limit. At each checkpoint and round merge, review the plan's goal, result and steps, refresh it, and report changes in plain words. Treat a request to change a recorded choice like any other message, and distinguish choosing the change from finishing it.
 
 ## Rounds
