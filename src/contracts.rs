@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One executable `[recipes.<id>]` row. Capability descriptions and routing
-/// thresholds live in routing.json. Placement belongs to `[dispatch]`.
+/// One executable `[recipes.<id>]` row. Selection lives in `[routing]` and
+/// placement belongs to `[dispatch]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Recipe {
@@ -165,8 +165,11 @@ pub(crate) struct Launch {
     #[serde(default)]
     pub(crate) skill_hash: String,
     pub(crate) recipe_id: String,
-    pub(crate) strength: u32,
+    /// Number of bounded recovery selections after the first launch.
     pub(crate) escalations: u32,
+    /// `pin`, `default`, or the ordered `rule[n]` that selected this recipe.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) routing_rule: String,
     pub(crate) reason: String,
     /// The compact `<job> runs on <plain>` sentence for the board's
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
@@ -932,13 +935,61 @@ mod tests {
             brief_hash: String::new(),
             skill_hash: "aa".into(),
             recipe_id: "agy_gemini_flash".into(),
-            strength: 0,
             escalations: 0,
+            routing_rule: "default".into(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
             source_truncation: None,
             machine: "oci".into(),
         });
+    }
+
+    #[test]
+    fn historical_records_with_removed_routing_fields_still_load() {
+        let json: Launch = serde_json::from_value(serde_json::json!({
+            "recipe_id": "old",
+            "strength": 3,
+            "assessment": {"score": 1},
+            "decision": {"recipe": "old"},
+            "low_confidence": true,
+            "routing_hash": "aa"
+        }))
+        .unwrap();
+        assert_eq!(json.recipe_id, "old");
+
+        let toml: Launch = toml::from_str(
+            r#"recipe_id = "old"
+strength = 3
+assessment = { score = 1 }
+decision = { recipe = "old" }
+low_confidence = true
+routing_hash = "aa"
+"#,
+        )
+        .unwrap();
+        assert_eq!(toml.recipe_id, "old");
+
+        let dispatch: serde_json::Value = serde_json::from_str(
+            r#"{"kind":"pick","assessment":{"score":1},"decision":{"recipe":"old"},"low_confidence":true,"routing_hash":"aa"}"#,
+        )
+        .unwrap();
+        assert_eq!(dispatch["decision"]["recipe"], "old");
+
+        let round: RoundRecord = toml::from_str(
+            r#"round = "r1"
+branch = "main"
+plain = "This round checks old records."
+policy_hash = "old"
+routing_hash = "aa"
+assessment = { score = 1 }
+
+[manifest]
+revision = 1
+members = []
+"#,
+        )
+        .unwrap();
+        assert_eq!(round.round, "r1");
     }
 
     #[test]

@@ -192,10 +192,10 @@ fn parse_project_md(text: &str) -> Result<(Settings, String)> {
         toml::from_str(front).context("PROJECT.md front matter does not parse")?;
     if value
         .as_table()
-        .is_some_and(|table| table.contains_key("jev") || table.contains_key("roles"))
+        .is_some_and(|table| table.contains_key("roles"))
     {
         bail!(
-            "roles_removed: remove roles and jev from PROJECT.md; routing.json owns dispatch policy"
+            "roles_removed: remove roles from PROJECT.md; recipes and routing live in config.toml"
         );
     }
     let settings: Settings = value
@@ -562,11 +562,10 @@ fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety
     Ok(safety)
 }
 
-/// SHA-256 of executable settings, routing policy and standing rules.
+/// SHA-256 of executable settings and standing rules.
 pub(crate) fn policy_hash(config_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(std::fs::read(config_dir.join("config.toml")).unwrap_or_default());
-    hasher.update(std::fs::read(config_dir.join("routing.json")).unwrap_or_default());
     hasher.update(std::fs::read(config_dir.join("RULES.md")).unwrap_or_default());
     hasher
         .finalize()
@@ -1051,14 +1050,13 @@ mod tests {
 
     #[test]
     fn project_model_overrides_are_refused() {
-        for front in ["[roles.lane]\nkind = \"claude\"", "jev = true"] {
-            assert!(
-                parse_project_md(&format!("+++\n{front}\n+++\n"))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("roles_removed")
-            );
-        }
+        let front = "[roles.lane]\nkind = \"claude\"";
+        assert!(
+            parse_project_md(&format!("+++\n{front}\n+++\n"))
+                .unwrap_err()
+                .to_string()
+                .contains("roles_removed")
+        );
     }
 
     #[test]
