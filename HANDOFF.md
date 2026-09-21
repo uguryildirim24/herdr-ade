@@ -14,13 +14,11 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-20T09:41:43-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-21T08:36:25-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
-Workspace `w1G` (Adeherdr), 2 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `UNNAMED`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
+Workspace `w1G` (Adeherdr), 2 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
 Coordinator session id `936438b4-6acf-4417-9513-2bb938fe60e0`.
-
-The coordinator has no agent name, so workers cannot `herdr agent prompt` it. Name it: `herdr agent rename "$HERDR_PANE_ID" coordinator`.
 
 ### Workers nested under the coordinator
 
@@ -30,11 +28,11 @@ Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done),
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (14 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (23 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | c51d3a6 | 0 | docs(review): round r54 verdict |
+| `/Users/rolfie/projects/herdr-ade` | `main` | 25ef979 | 0 | review(r55): verdict |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r1` | `review/r1` | fc61993 | 0 | docs(tasks): t-0004 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r10` | `review/r10` | f9ae7d2 | 0 | docs(tasks): t-0024 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r11` | `review/r11` | 2c59e5d | 0 | docs(tasks): t-0025 |
@@ -80,6 +78,7 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (14 ahead, 0 
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r52` | `review/r52` | a485e93 | 0 | docs(tasks): t-0113 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r53` | `review/r53` | a53ce28 | 0 | docs(tasks): t-0115 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r54` | `review/r54` | 79f3ae4 | 0 | docs(tasks): t-0117 |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r55` | `review/r55` | 579c6a8 | 0 | docs(tasks): t-0122 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r6` | `review/r6` | 910649d | 0 | docs(tasks): t-0014 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r7` | `review/r7` | 7cb564e | 0 | docs(tasks): t-0015 |
 | `/Users/rolfie/projects/herdr-ade/.worktrees/review-r9` | `review/r9` | ef62484 | 0 | docs(tasks): t-0022 |
@@ -152,19 +151,19 @@ Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (14 ahead, 0 
 Last commits on the integration branch:
 
 ```
-c51d3a6 docs(review): round r54 verdict
-47a113e Merge commit 'ce295b5ada5566f3dfa13239da8f30457a2184ff' into hp/adeherdr/t-0117-review-r54-this-round-checks-that-the-si
-79f3ae4 docs(tasks): t-0117
-11b613c review(r54): brief for revision 1
-3099de5 checkpoint(r53): HANDOFF after merging the round
-13023d9 Merge commit '876d122d824f4fcf3123516e079384fb463c110f'
+25ef979 review(r55): verdict
+eb67e96 Merge commit '1d912780b37a66452c423d25a8d6236d3b87b247' into hp/adeherdr/t-0122-review-r55-this-round-lets-a-job-say-whi
+579c6a8 docs(tasks): t-0122
+83e2f94 review(r55): brief for revision 1
+7908a9f docs(tasks): t-0121
+1d91278 feat(routing): apply role and answer floors to scored dispatch
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0117.md`, `tasks/review-r54.md`, `tasks/t-0115.md`, `tasks/t-0116.md`, `tasks/review-r53.md`, `tasks/t-0114.md`, `tasks/t-0113.md`, `tasks/review-r52.md`, `tasks/t-0111.md`, `tasks/t-0112.md`, `tasks/review-r51.md`, `tasks/t-0110.md`
-- verdicts: `tasks/reviews/code-r54.md`, `tasks/reviews/code-r53.md`, `tasks/reviews/code-r52.md`, `tasks/reviews/code-r51.md`, `tasks/reviews/code-r50.md`, `tasks/reviews/code-r49.md`, `tasks/reviews/code-r48.md`, `tasks/reviews/code-r47.md`, `tasks/reviews/code-r46.md`, `tasks/reviews/code-r45.md`, `tasks/reviews/code-r43.md`, `tasks/reviews/code-r42.md`
+- briefs: `tasks/t-0122.md`, `tasks/review-r55.md`, `tasks/t-0121.md`, `tasks/t-0120.md`, `tasks/t-0119.md`, `tasks/t-0117.md`, `tasks/review-r54.md`, `tasks/t-0115.md`, `tasks/t-0116.md`, `tasks/review-r53.md`, `tasks/t-0114.md`, `tasks/t-0113.md`
+- verdicts: `tasks/reviews/code-r55.md`, `tasks/reviews/code-r54.md`, `tasks/reviews/code-r53.md`, `tasks/reviews/code-r52.md`, `tasks/reviews/code-r51.md`, `tasks/reviews/code-r50.md`, `tasks/reviews/code-r49.md`, `tasks/reviews/code-r48.md`, `tasks/reviews/code-r47.md`, `tasks/reviews/code-r46.md`, `tasks/reviews/code-r45.md`, `tasks/reviews/code-r43.md`
 
 ### Pickup
 
@@ -176,5 +175,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 936438b4-6acf-4417-9513-2bb938fe60e0
 ```
 
-Round `r54` was merged into `main` at verdict commit `c51d3a62c4c2cfa299b16b6c0062444bca9cccbc`; this checkpoint is its child.
+Round `r55` was merged into `main` at verdict commit `25ef97999a8f908e33f9e84a3b57ff6cf8ed467b`; this checkpoint is its child.
 
