@@ -253,6 +253,10 @@ fn report(
                     if reachable { "" } else { "; not reachable" }
                 ),
             );
+            if reachable {
+                let herdr = Herdr::new(&bin, &found.socket, runner);
+                check_workspace_leaks(&mut out, &mut check, root, "local", "this Mac", &herdr);
+            }
         }
         Err(error) => check(&mut out, Some(false), "session", format!("{error:#}")),
     }
@@ -447,6 +451,15 @@ fn report(
                         {
                             check(&mut out, ok, &label, detail);
                         }
+                        let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
+                        check_workspace_leaks(
+                            &mut out,
+                            &mut check,
+                            root,
+                            &profile.id,
+                            &format!("machine {}", profile.label),
+                            &herdr,
+                        );
                     }
                     Err(error) => check(
                         &mut out,
@@ -461,6 +474,88 @@ fn report(
     }
 
     (out, healthy)
+}
+
+fn check_workspace_leaks(
+    out: &mut String,
+    check: &mut impl FnMut(&mut String, Option<bool>, &str, String),
+    root: &Path,
+    machine: &str,
+    display: &str,
+    herdr: &Herdr<'_>,
+) {
+    let workspaces = match herdr.workspace_list() {
+        Ok(workspaces) => workspaces,
+        Err(error) => {
+            check(
+                out,
+                Some(false),
+                &format!("{display} workspaces"),
+                format!("could not list workspaces: {error}"),
+            );
+            return;
+        }
+    };
+    let agents = match herdr.agent_list() {
+        Ok(agents) => agents,
+        Err(error) => {
+            check(
+                out,
+                Some(false),
+                &format!("{display} workspaces"),
+                format!("could not list agents: {error}"),
+            );
+            return;
+        }
+    };
+    let open: BTreeSet<String> = project::list_slugs(root)
+        .into_iter()
+        .filter_map(|slug| project::Project::load(root, &slug).ok())
+        .flat_map(|project| crate::thread::list(&project))
+        .filter(|thread| {
+            matches!(
+                thread.status,
+                crate::thread::Status::Starting | crate::thread::Status::Open
+            ) && if machine == "local" {
+                !thread.is_remote()
+            } else {
+                thread.is_remote() && thread.machine_route() == machine
+            }
+        })
+        .map(|thread| thread.workspace_id)
+        .filter(|workspace| !workspace.is_empty())
+        .collect();
+    let leaked: Vec<_> = workspaces
+        .iter()
+        .filter(|workspace| {
+            !open.contains(&workspace.workspace_id)
+                && !agents
+                    .iter()
+                    .any(|agent| agent.workspace_id == workspace.workspace_id)
+        })
+        .collect();
+    let ids = leaked
+        .iter()
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    check(
+        out,
+        Some(leaked.is_empty()),
+        &format!("{display} workspaces"),
+        if leaked.is_empty() {
+            format!(
+                "{} total; no unowned agentless workspaces",
+                workspaces.len()
+            )
+        } else {
+            format!(
+                "{} of {} hold no agent and belong to no open lane: {ids}",
+                leaked.len(),
+                workspaces.len()
+            )
+        },
+    );
 }
 
 fn machines_to_check(
@@ -889,11 +984,51 @@ mod tests {
             |_| Ok(fail(1, "not logged in")),
         );
         runner.on("machine list --json", ok(machines));
+        runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
         runner
     }
 
     fn runner_with_herdr(version: &str) -> FakeRunner {
         runner_with_machine_list(version, "[]")
+    }
+
+    #[test]
+    fn agentless_workspaces_without_an_open_lane_fail_the_doctor_row() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Open;
+            thread.machine = "oci".into();
+            thread.machine_id = "abc".into();
+            thread.workspace_id = "w3".into();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "workspace list",
+            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1"},{"workspace_id":"w2"},{"workspace_id":"w3"}]}}"#),
+        );
+        runner.on(
+            "agent list",
+            ok(r#"{"result":{"agents":[{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}]}}"#),
+        );
+        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
+        let mut text = String::new();
+        let mut healthy = true;
+        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
+            healthy &= ok != Some(false);
+            let _ = writeln!(out, "{label}: {detail}");
+        };
+
+        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+
+        assert!(!healthy);
+        assert!(
+            text.contains("1 of 3 hold no agent and belong to no open lane: w1"),
+            "{text}"
+        );
     }
 
     #[test]

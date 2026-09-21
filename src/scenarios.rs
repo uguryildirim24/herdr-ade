@@ -100,7 +100,8 @@ impl World {
             },
         );
         world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
-        // `thread resolve` closes the lane's tab through herdr.
+        // `thread resolve` closes a dedicated workspace or a shared tab.
+        world.runner.on("workspace close", ok(r#"{"result":{}}"#));
         world.runner.on("tab close", ok(r#"{"result":{}}"#));
         world
     }
@@ -494,7 +495,7 @@ fn resolve_closes_the_pane_unless_keep_pane() {
     .unwrap();
     assert_eq!(world.runner.count("tab close"), 0);
 
-    // A plain resolve closes the pane and its tab.
+    // A plain resolve closes the dedicated lane workspace.
     threads::resolve(
         &ctx,
         "demo",
@@ -506,11 +507,31 @@ fn resolve_closes_the_pane_unless_keep_pane() {
     )
     .unwrap();
     threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
-    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+    assert_eq!(world.runner.count("workspace close w2"), 1);
+    assert_eq!(world.runner.count("tab close w2:t1"), 0);
     assert_eq!(
         thread::load(&project, "t-0001").unwrap().status,
         Status::Resolved
     );
+}
+
+#[test]
+fn resolve_keeps_a_workspace_that_holds_something_else() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!(
+        "[{},{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd),
+        pane_json("w2", "w2:t2", "w2:p2", "/other")
+    );
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+
+    assert_eq!(world.runner.count("workspace close w2"), 0);
+    assert_eq!(world.runner.count("tab close w2:t1"), 1);
 }
 
 /// A1 review H5: only `working` stopped a removal; an idle lane with no

@@ -142,6 +142,11 @@ impl std::error::Error for HerdrError {}
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct Workspace {
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct Pane {
     pub pane_id: String,
     pub tab_id: String,
@@ -313,6 +318,10 @@ impl<'a> Herdr<'a> {
         })
     }
 
+    pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {
+        self.call_as(&["workspace", "list"], "workspaces")
+    }
+
     pub fn pane_list(&self) -> Result<Vec<Pane>, HerdrError> {
         self.call_as(&["pane", "list"], "panes")
     }
@@ -398,6 +407,11 @@ impl<'a> Herdr<'a> {
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = self.call(&borrowed, CALL_TIMEOUT)?;
         Self::created(&result)
+    }
+
+    pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
+        self.call(&["tab", "rename", tab, label], CALL_TIMEOUT)
+            .map(|_| ())
     }
 
     pub fn tab_close(&self, tab: &str) -> Result<(), HerdrError> {

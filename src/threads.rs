@@ -695,20 +695,11 @@ fn place_box_worktree(
         )?;
     }
 
-    // Step 4: route by the stable profile id. Reuse the recorded box workspace
-    // when the box still lists it, else create it with the box clone as cwd.
+    // Step 4: route by the stable profile id. `workspace create` already
+    // creates a first tab, so that pane is the lane instead of adding a
+    // second tab beside an unused shell. A restart always gets a fresh
+    // workspace; it never adopts whatever survived an earlier attempt.
     let herdr = view.herdr.on_machine(&profile.id);
-    let panes = herdr.pane_list().unwrap_or_default();
-    let workspace = if !record.workspace_id.is_empty()
-        && panes.iter().any(|p| p.workspace_id == record.workspace_id)
-    {
-        record.workspace_id.clone()
-    } else {
-        herdr
-            .workspace_create_env(Path::new(&box_repo), &label, false, &[])
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .workspace_id
-    };
     let spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
         args: record.launch.args.clone(),
@@ -725,13 +716,10 @@ fn place_box_worktree(
         &spec,
     );
     let created = herdr
-        .tab_create_env(
-            &workspace,
-            Path::new(&box_worktree),
-            &record.id,
-            false,
-            &env,
-        )
+        .workspace_create_env(Path::new(&box_worktree), &label, false, &env)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    herdr
+        .tab_rename(&created.tab_id, &record.id)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let cwd = herdr
         .pane_cwd(&created.pane_id)
@@ -1257,7 +1245,7 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
             if !thread::pane_matches(record, pane) {
                 bail!("escalation_identity_mismatch: old pane was reused");
             }
-            herdr.tab_close(&record.tab_id)?;
+            close_pane(ctx, project, record)?;
         }
     }
     if record.is_remote() {
@@ -1297,7 +1285,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     if record.is_remote() {
         // A box lane restarts from its brief: the same refusals, then the
         // exact start line again (SPEC-remote §6). The new attempt gets its
-        // own tab; the brief commit is reused, never rewritten.
+        // own workspace; the brief commit is reused, never rewritten.
         let _ = restart_plan(&record, &live, false, now)?;
         thread::update(&project, id, |t| {
             t.attempt = t.attempt.max(1).saturating_add(1);
@@ -1305,10 +1293,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
             t.launch.skill_hash = skill_hash.clone();
         })?;
         if !record.tab_id.is_empty() {
-            let _ = view
-                .herdr
-                .on_machine(record.machine_route())
-                .tab_close(&record.tab_id);
+            close_pane(ctx, &project, &record)?;
         }
         return place_and_brief(ctx, &project, &view, id, true);
     }
@@ -1520,9 +1505,10 @@ pub fn refresh_plan(ctx: &Ctx, project: &Project) {
     }
 }
 
-/// Close the thread's pane and its tab through herdr, the same closing
-/// `herdr tab close <tab>` does. A tab herdr no longer knows, or a session it
-/// cannot reach, has nothing to close and is not an error.
+/// Close the thread's pane and tab. A dedicated lane workspace is closed as
+/// one unit, but a workspace containing another pane, tab, or agent is shared
+/// and only this lane's tab is closed. A tab herdr no longer knows, or a
+/// session it cannot reach, has nothing to close and is not an error.
 pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
     if record.tab_id.is_empty() {
         return Ok(false);
@@ -1530,13 +1516,30 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     let Some(view) = session_view(ctx, project) else {
         return Ok(false);
     };
-    match view
-        .herdr
-        .on_machine(record.machine_route())
-        .tab_close(&record.tab_id)
-    {
+    let herdr = view.herdr.on_machine(record.machine_route());
+    let panes = herdr
+        .pane_list()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let agents = herdr
+        .agent_list()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let owns_pane = panes.iter().any(|pane| thread::pane_matches(record, pane));
+    let holds_something_else = panes
+        .iter()
+        .any(|pane| pane.workspace_id == record.workspace_id && pane.pane_id != record.pane_id)
+        || agents.iter().any(|agent| {
+            agent.workspace_id == record.workspace_id && !thread::agent_matches(record, agent)
+        });
+    let result = if owns_pane && !holds_something_else {
+        herdr.workspace_close(&record.workspace_id)
+    } else {
+        herdr.tab_close(&record.tab_id)
+    };
+    match result {
         Ok(()) => Ok(true),
-        Err(error) if error.code == "tab_not_found" => Ok(false),
+        Err(error) if matches!(error.code.as_str(), "tab_not_found" | "workspace_not_found") => {
+            Ok(false)
+        }
         Err(error) => Err(anyhow::anyhow!("{error}")),
     }
 }
@@ -2562,6 +2565,8 @@ mod tests {
             "workspace create",
             ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#),
         );
+        fx.world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+        // Local fallbacks still create a tab in the coordinator workspace.
         fx.world.runner.on(
             "tab create",
             ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/box/wt"}}}"#),
@@ -2659,6 +2664,32 @@ mod tests {
         assert!(
             say_lines(&fx.project).is_empty(),
             "a box start says nothing"
+        );
+        let calls = fx.world.runner.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.display().contains("workspace create"))
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|call| {
+            let line = call.display();
+            line.contains("workspace create")
+                && line.contains(&format!("HERDR_ADE_LAUNCH=demo/{}/1/", started.id))
+                && line.contains(&format!("--cwd {}", started.worktree_path))
+        }));
+        assert!(calls.iter().any(|call| {
+            call.display()
+                .contains(&format!("tab rename w1:t2 {}", started.id))
+        }));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.display().contains("tab create"))
+                .count(),
+            0,
+            "the workspace's first tab is the lane"
         );
     }
 
