@@ -186,7 +186,7 @@ enum Command {
     },
     /// Record a failed lane attempt and request bounded routing recovery
     Failed {
-        #[arg(long, value_enum, default_value = "work-failed")]
+        #[arg(long, value_enum, default_value = "work_failed")]
         class: crate::contracts::FailureClass,
         #[arg(long, requires = "class")]
         provider_kind: Option<String>,
@@ -2243,6 +2243,19 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_defaults_to_the_work_failed_class() {
+        let cli = Cli::try_parse_from(["herdr-ade", "failed", "the approach failed"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Failed {
+                class: crate::contracts::FailureClass::WorkFailed,
+                provider_kind: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn an_unhealthy_doctor_reports_without_recording_itself() {
