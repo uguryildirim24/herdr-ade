@@ -1,16 +1,21 @@
 //! `herdr-pi doctor` and `check <provider>` (SPEC-pi v2 §3.4, §3.9).
 //!
-//! One page, fail closed. Never opens a browser, never prints a secret, never
-//! contacts a provider: `pi auth check --no-refresh` with stdin closed and a
-//! short timeout. `npm root -g` runs inside `$SHELL -lic` like every other
-//! login-shell probe.
+//! One page, fail closed. Never opens a browser or prints a secret. Provider
+//! readiness makes one tiny, tool-free model call because a stored credential
+//! does not prove that the subscription still works. Results are cached for
+//! one ticker interval. `npm root -g` runs inside `$SHELL -lic` like every
+//! other login-shell probe.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::Value;
 
 use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, recipes, sh};
+
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const READINESS_CACHE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Level {
@@ -569,21 +574,26 @@ pub(crate) fn check_with(
 }
 
 fn auth_check(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> Result<()> {
+    if let Some(cached) = read_cached_probe(layout, provider) {
+        return cached;
+    }
+    let result = auth_check_uncached(runner, layout, provider);
+    write_cached_probe(layout, provider, &result);
+    result
+}
+
+fn auth_check_uncached(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> Result<()> {
+    // Let pi refresh an expired OAuth token. This is still only a credential
+    // check; the print-mode call below is what proves the provider will serve
+    // a model now.
     let output = runner.run(
         &sh::Cmd::new(layout.wrapper().display().to_string(), sh::SHORT)
-            .args([
-                "auth",
-                "check",
-                "--provider",
-                provider,
-                "--json",
-                "--no-refresh",
-            ])
+            .args(["auth", "check", "--provider", provider, "--json"])
             .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
     )?;
     let parsed: Value = serde_json::from_str(output.stdout.trim()).map_err(|_| {
         anyhow::anyhow!(
-            "auth check did not answer JSON (exit {}): {}",
+            "sign-in check did not answer JSON (exit {}): {}",
             output
                 .code
                 .map(|c| c.to_string())
@@ -592,14 +602,117 @@ fn auth_check(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> Resul
         )
     })?;
     let status = parsed.get("status").and_then(Value::as_str).unwrap_or("");
-    if status == "ready" && output.success() {
+    if status != "ready" || !output.success() {
+        let reason = parsed
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or(status);
+        anyhow::bail!("missing sign-in: {reason} (run `herdr-pi login {provider}`)");
+    }
+
+    let model = probe_model(provider)?;
+    let live = runner.run(
+        &sh::Cmd::new(layout.wrapper().display().to_string(), LIVE_PROBE_TIMEOUT)
+            .args([
+                "--provider",
+                provider,
+                "--model",
+                model,
+                "--thinking",
+                "off",
+                "--no-tools",
+                "--no-skills",
+                "--no-extensions",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files",
+                "--no-session",
+                "--system-prompt",
+                "Reply only OK.",
+                "--print",
+                "Reply OK.",
+            ])
+            .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
+    )?;
+    if live.success() {
         return Ok(());
     }
-    let reason = parsed
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or(status);
-    anyhow::bail!("missing login: {reason} (run `herdr-pi login {provider}`)")
+    let error_text = live.error_text();
+    let detail = error_text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("the provider refused the probe")
+        .trim();
+    anyhow::bail!(
+        "stored sign-in no longer works for {provider}: {detail} (run `herdr-pi login {provider}`)"
+    )
+}
+
+fn probe_model(provider: &str) -> Result<&'static str> {
+    match provider {
+        "openai-codex" => Ok("gpt-5.6-sol"),
+        "opencode-go" => Ok("deepseek-v4.1-flash"),
+        "kimi-coding" => Ok("k3"),
+        "pro" => Ok("pro"),
+        _ => anyhow::bail!("pi_args_forbidden: `{provider}` is not a pi provider"),
+    }
+}
+
+fn probe_cache_path(layout: &Layout, provider: &str) -> PathBuf {
+    layout.root.join(format!("readiness-{provider}.json"))
+}
+
+fn read_cached_probe(layout: &Layout, provider: &str) -> Option<Result<()>> {
+    let value: Value =
+        serde_json::from_slice(&std::fs::read(probe_cache_path(layout, provider)).ok()?).ok()?;
+    let checked = value.get("checked_unix")?.as_u64()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if now.saturating_sub(checked) > READINESS_CACHE_TTL.as_secs() {
+        return None;
+    }
+    if value.get("ok")?.as_bool()? {
+        Some(Ok(()))
+    } else {
+        Some(Err(anyhow::anyhow!("{}", value.get("detail")?.as_str()?)))
+    }
+}
+
+fn write_cached_probe(layout: &Layout, provider: &str, result: &Result<()>) {
+    if !layout.root.is_dir() {
+        return;
+    }
+    let checked = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(value) => value.as_secs(),
+        Err(_) => return,
+    };
+    // Cache only the answer and a generated remedy. Provider output can
+    // contain account diagnostics and must not become a credential-adjacent
+    // file merely to avoid repeating a probe.
+    let detail = result.as_ref().err().map(|error| {
+        if format!("{error:#}").starts_with("missing sign-in:") {
+            format!("missing sign-in for {provider} (run `herdr-pi login {provider}`)")
+        } else {
+            format!(
+                "stored sign-in no longer works for {provider} (run `herdr-pi login {provider}`)"
+            )
+        }
+    });
+    let bytes = match serde_json::to_vec(&serde_json::json!({
+        "checked_unix": checked,
+        "ok": result.is_ok(),
+        "detail": detail,
+    })) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let path = probe_cache_path(layout, provider);
+    let staged = layout
+        .root
+        .join(format!(".readiness-{provider}-{}", std::process::id()));
+    if std::fs::write(&staged, bytes).is_ok() {
+        let _ = std::fs::rename(&staged, path);
+    }
+    let _ = std::fs::remove_file(staged);
 }
 
 fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row {
@@ -798,6 +911,7 @@ mod tests {
         runner.on(&format!("{shell} -lic {probe}"), ok(&resolution));
         runner.on("herdr integration status", ok("pi: current\n"));
         runner.on("--version", ok("0.85.1\n"));
+        runner.on("--print Reply OK.", ok("OK\n"));
         runner
     }
 
@@ -962,6 +1076,7 @@ mod tests {
         assert_eq!(row.level, Level::Ok, "{row:?}");
         assert_eq!(row.detail, "not on this machine (no relay)");
         assert_eq!(runner.count("auth check"), 0);
+        assert_eq!(runner.count("--print"), 0);
     }
 
     #[test]
@@ -978,6 +1093,7 @@ mod tests {
         assert_eq!(row.level, Level::Ok, "{row:?}");
         assert_eq!(row.detail, "login ready");
 
+        std::fs::remove_file(probe_cache_path(&layout, "pro")).unwrap();
         let runner = scripted(&env);
         runner.on(
             "auth check --provider pro",
@@ -1125,6 +1241,46 @@ mod tests {
         assert!(check_provider_allowed("cursor").is_err());
         assert!(check_provider_allowed("moonshot").is_err());
         assert!(check_provider_allowed("kimi-coding").is_ok());
+    }
+
+    #[test]
+    fn a_stale_ready_credential_fails_when_the_model_call_is_refused_and_is_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = {
+            let custom = FakeRunner::new();
+            let shell = sh::shell();
+            let probe = path_probe(&shell);
+            let link = env.home.join(".local/bin/pi");
+            let resolution = if probe == "command -v pi" {
+                format!("{}\n", link.display())
+            } else {
+                format!("pi is {}\n", link.display())
+            };
+            custom.on(&format!("{shell} -lic {probe}"), ok(&resolution));
+            custom.on("herdr integration status", ok("pi: current\n"));
+            custom.on(
+                "auth check --provider kimi-coding",
+                ok(r#"{"status":"ready"}"#),
+            );
+            custom.on("--print Reply OK.", fail(1, "subscription expired"));
+            custom
+        };
+        let first = check_report(&env, &layout, &runner, "kimi-coding");
+        assert!(!first.ok);
+        let login = first.rows.iter().find(|row| row.label == "login").unwrap();
+        assert!(
+            login.detail.contains("stored sign-in no longer works")
+                && login.detail.contains("subscription expired"),
+            "{login:?}"
+        );
+        let cache = std::fs::read_to_string(probe_cache_path(&layout, "kimi-coding")).unwrap();
+        assert!(!cache.contains("subscription expired"), "{cache}");
+        let second = check_report(&env, &layout, &runner, "kimi-coding");
+        assert!(!second.ok);
+        assert_eq!(runner.count("auth check"), 1);
+        assert_eq!(runner.count("--print"), 1);
     }
 
     #[test]
