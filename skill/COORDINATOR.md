@@ -51,7 +51,7 @@ Leave out `--repo` for a task with no repository. A `lane` or `reviewer` on a re
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
-Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start failed. Never hand-assemble `herdr` commands for starting, restarting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
+Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is blocked, or is stuck. Use `thread cancel` to stop it, and `thread rebind` when its verified process is already live elsewhere. Never hand-assemble `herdr` commands for starting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
 
 ### Recipe choice
 
@@ -61,7 +61,7 @@ You do not pick a recipe on `thread start`. Write the full task with scope, cons
 - Task front matter may say `product = "web-research"`, `product = "spec"`, or `requires_claude = true`. A coding task that reads a web page is still coding unless its product says otherwise.
 - `round advance` still starts the review. The reviewer gets a bounded task that names the committed review brief and every pinned commit range; large sources stay in the checkout for the reviewer to read.
 - A lane calls `ha failed "<failure and evidence>"` for bounded recovery. The harness retries the same recipe, then follows that rule's ordered fallback list. Once exhausted, it leaves the failed lane waiting for you instead of guessing another recipe.
-- `thread restart` recovers the same launch. Only Rolf may pin an exact task through `[routing.pins]`.
+- `thread retry` runs the same task as a new process and counts against `[routing]` recovery. Only Rolf may pin an exact task through `[routing.pins]`.
 
 ### Harness evolves
 
@@ -148,11 +148,11 @@ The project screen reads two records you keep. The plan card (`hp plan`) is the 
 A round is a set of lanes that are reviewed and merged together (`hp round show <slug> <round>`).
 
 - `hp round open <slug> <round> --branch <integration branch> --plain "<sentence>"`, then `hp round admit <slug> <round> <thread>` per lane. A lane is complete when it runs `hp done`; its sealed sha is pinned automatically.
-- When every lane in a round is pinned, the harness starts the review on its own; the review does not wait for runs, only for pins. A herdr hook runs `hp round advance <slug>` when a lane's agent changes state, and the ticker runs the same pass as a safety net. It runs `round review` if needed, starts the reviewer thread, and binds it. You do not start reviewers by hand. To add focus to a running reviewer, use `hp thread prompt <slug> <id>`. `hp round review <slug> <round>` and `hp round reviewer <slug> <round>` stay as manual recovery commands; a gone reviewer is reported, and `hp round reviewer <slug> <round>` starts and binds its replacement with the reviewer skill and routing workflow. After a REJECT, `hp round review <slug> <round>` makes the next revision and the next `advance` starts its reviewer. Later lane tasks, review briefs, verdict files and HANDOFF checkpoints do not stale a review. If another round changes project files before this one merges, `round merge` makes the repair revision and starts its reviewer on its own.
+- When every lane in a round is pinned, the harness starts the review on its own; the review does not wait for runs, only for pins. A herdr hook runs `hp round advance <slug>` when a lane's agent changes state, and the ticker runs the same pass as a safety net. It runs `round review` if needed, starts the reviewer thread, and binds it. To add focus to a running reviewer, use `hp thread prompt <slug> <id>`. Recovery uses `round retry`, `round cancel`, `round rebind`, or `round adopt`; retry never creates a duplicate reviewer, and adopt validates an existing sealed verdict. After a REJECT, `hp round review <slug> <round>` makes the next revision and the next `advance` starts its reviewer. Later lane tasks, review briefs, verdict files and HANDOFF checkpoints do not stale a review. If another round changes project files before this one merges, `round merge` makes the repair revision and starts its reviewer on its own.
 - `hp round advance <slug>` records the verdict and next action on the round; `context` prints it directly. Without `--json`, it prints each reviewer it started, or `no reviewer started`; with `--json`, the reviewer and round pairs are in `data.started`. A MERGE verdict also gets one `say` line. It never merges.
 - Every command accepts `--json` and then returns one record with `outcome`, `command`, `message`, and useful ids in `data`. A refusal exits non-zero and puts its reason in `reason`; read these fields instead of matching the human sentence.
 - `hp round merge <slug> <round>` lands the round and writes the checkpoint. Merges on one integration branch take turns; run an interrupted owner's merge again before merging another round.
-- `hp round abandon <slug> <round> --reason "<why>"` deliberately ends a round that will not merge. The reason remains in the round record; a merge transaction that has begun cannot be abandoned.
+- `hp round cancel <slug> <round> --reason "<why>"` deliberately ends a round that will not merge, closes its processes, and removes clean worktrees. The reason remains in the round record; a merge transaction that has begun cannot be cancelled.
 - `hp dialogue start|critic|turn|commit` runs a spec dialogue; `hp checkpoint <slug>` writes `HANDOFF.md` and `HANDOFF.json` as one commit; `hp pickup <slug>` re-links live workers and prints start lines for gone ones.
 
 ## Never without the user asking in chat
