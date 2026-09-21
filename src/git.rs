@@ -96,6 +96,33 @@ pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Re
     Ok(())
 }
 
+/// Tracked and untracked changes in a worktree. Removal callers use this to
+/// return a stable refusal instead of depending on Git's version-specific
+/// `worktree remove` diagnostic.
+pub(crate) fn dirty_paths(runner: &dyn Runner, repo: &str, path: &str) -> Result<Vec<String>> {
+    let text = git(
+        runner,
+        repo,
+        &["-C", path, "status", "--porcelain", "--untracked-files=all"],
+        GIT_TIMEOUT,
+    )?;
+    Ok(text
+        .lines()
+        .filter(|line| line.len() > 3)
+        .map(|line| line[3..].trim().trim_matches('"').to_string())
+        .collect())
+}
+
+/// The branch checked out in the repository's main checkout.
+pub(crate) fn symbolic_head(runner: &dyn Runner, repo: &str) -> Result<String> {
+    git(
+        runner,
+        repo,
+        &["symbolic-ref", "--short", "HEAD"],
+        Duration::from_secs(5),
+    )
+}
+
 /// SHA of `refs/heads/<branch>`, or of any ref name passed in.
 pub(crate) fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
     git(runner, repo, &["rev-parse", rev], Duration::from_secs(5))
@@ -162,7 +189,7 @@ fn update_ref(runner: &dyn Runner, repo: &str, git_ref: &str, new: &str, old: &s
 }
 
 /// Porcelain worktree rows: `(path, branch)` where branch is `refs/heads/...` or empty.
-fn worktree_list(runner: &dyn Runner, repo: &str) -> Result<Vec<(PathBuf, String)>> {
+pub(crate) fn worktree_list(runner: &dyn Runner, repo: &str) -> Result<Vec<(PathBuf, String)>> {
     let text = git(
         runner,
         repo,

@@ -5,6 +5,9 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::contracts::{
+    AdmissionManifest, ManifestMember, MergeIntent, MergePhase, RoundPhase, RoundRecord,
+};
 use crate::coordinator;
 use crate::paths::{Ctx, Env};
 use crate::project::{self, Project};
@@ -194,6 +197,38 @@ impl World {
 
 pub fn pane_json(workspace: &str, tab: &str, pane: &str, cwd: &str) -> String {
     format!(r#"{{"pane_id":"{pane}","tab_id":"{tab}","workspace_id":"{workspace}","cwd":"{cwd}"}}"#)
+}
+
+fn record_closed_round(project: &Project, thread: &str, repo: &str) {
+    let dir = project.state_dir().join("rounds");
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = RoundRecord {
+        phase: RoundPhase::Merged,
+        merge: Some(MergeIntent {
+            op: "merge-r1".into(),
+            expected_old: "b".into(),
+            candidate: "c".into(),
+            verdict: "v".into(),
+            phase: MergePhase::Checkpointed,
+            merged: Some("v".into()),
+            checkpoint: None,
+            head: Some("h".into()),
+        }),
+        round: "r1".into(),
+        branch: "main".into(),
+        plain: "The work is merged.".into(),
+        policy_hash: "policy".into(),
+        manifest: AdmissionManifest {
+            revision: 1,
+            members: vec![ManifestMember {
+                thread: thread.into(),
+                pin: None,
+            }],
+        },
+        repo: repo.into(),
+        ..RoundRecord::default()
+    };
+    std::fs::write(dir.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
 }
 
 pub fn agent_json(
@@ -413,7 +448,7 @@ fn restart_defers_to_the_ticker_and_resets_launch_attempts() {
 }
 
 #[test]
-fn every_resolve_copies_first_and_remove_worktree_needs_a_complete_copy() {
+fn every_resolve_copies_first_and_a_partial_copy_keeps_the_worktree() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let t = world.thread(&project, world.home.path(), |_| {});
@@ -426,26 +461,12 @@ fn every_resolve_copies_first_and_remove_worktree_needs_a_complete_copy() {
     world.runner.on("worktree remove", ok(r#"{"result":{}}"#));
     let ctx = world.ctx();
 
-    // Partial copy: --remove-worktree refuses, the thread stays open, but the
+    // A partial copy resolves the thread but refuses automatic removal. The
     // report written since the last tick is already home.
-    let refused = threads::resolve(
-        &ctx,
-        "demo",
-        "t-0001",
-        &ResolveArgs {
-            remove_worktree: true,
-            ..ResolveArgs::default()
-        },
-    );
-    assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("--discard-uncopied")
-    );
+    threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
     assert_eq!(
         thread::load(&project, "t-0001").unwrap().status,
-        Status::Open
+        Status::Resolved
     );
     assert_eq!(
         std::fs::read_to_string(thread::home_report_path(&project, "t-0001")).unwrap(),
@@ -453,8 +474,6 @@ fn every_resolve_copies_first_and_remove_worktree_needs_a_complete_copy() {
     );
     assert_eq!(world.runner.count("worktree remove"), 0);
 
-    // A plain resolve accepts a partial copy.
-    threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
     let resolved = thread::load(&project, "t-0001").unwrap();
     assert_eq!(
         (resolved.status, resolved.resolved_reason.as_str()),
@@ -599,26 +618,95 @@ fn resolve_never_closes_an_adopted_workspace() {
 /// A1 review H5: only `working` stopped a removal; an idle lane with no
 /// sealed `done` lost its worktree.
 #[test]
-fn remove_worktree_needs_a_released_lane() {
+fn resolving_unlanded_work_keeps_its_worktree() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     world.thread(&project, world.home.path(), |_| {});
     world.runner.on("worktree remove", ok(""));
-    let e = threads::resolve(
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("worktree remove"), 0);
+    let resolved = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(resolved.status, Status::Resolved);
+    assert!(!resolved.worktree_path.is_empty());
+}
+
+#[test]
+fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let worktree = world.home.path().join("dirty-worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo");
+    world.runner.on(
+        "status --porcelain --untracked-files=all",
+        ok("?? scratch.txt\n"),
+    );
+
+    let error = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("worktree_dirty"), "{error}");
+    let kept = thread::load(&project, &t.id).unwrap();
+    assert_eq!(kept.status, Status::Open);
+    assert_eq!(kept.worktree_path, worktree.to_string_lossy());
+    assert_eq!(world.runner.count("worktree remove"), 0);
+}
+
+#[test]
+fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let t = world.thread(
+        &project,
+        Path::new("/home/ubuntu/projects/herdr-ade/.worktrees/t-0001"),
+        |thread| {
+            thread.repo = "/Users/rolfie/projects/herdr-ade".into();
+            thread.branch = "hp/demo/t-0001-task".into();
+            thread.machine = "oci".into();
+            thread.machine_id = "oci-id".into();
+        },
+    );
+    record_closed_round(&project, &t.id, &t.repo);
+    world.runner.on(
+        "machine list --json",
+        ok(r#"[{"id":"oci-id","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
+    );
+    world
+        .runner
+        .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+
+    threads::resolve(
         &world.ctx(),
         "demo",
-        "t-0001",
+        &t.id,
         &ResolveArgs {
-            remove_worktree: true,
+            skip_copy: true,
             ..ResolveArgs::default()
         },
     )
-    .unwrap_err();
-    assert!(format!("{e:#}").contains("worktree_not_released"), "{e:#}");
-    assert_eq!(world.runner.count("worktree remove"), 0);
-    assert_eq!(
-        thread::load(&project, "t-0001").unwrap().status,
-        Status::Open
+    .unwrap();
+
+    let calls = world.runner.calls.borrow();
+    let removal = calls
+        .iter()
+        .find(|call| call.program == "ssh" && call.display().contains("git worktree remove"))
+        .expect("box removal ssh call");
+    let command = removal.display();
+    assert!(
+        command.contains("cd /home/ubuntu/projects/herdr-ade"),
+        "{command}"
+    );
+    assert!(!command.contains("cd /Users/rolfie"), "{command}");
+    assert!(
+        thread::load(&project, &t.id)
+            .unwrap()
+            .worktree_path
+            .is_empty()
     );
 }
 
@@ -641,7 +729,7 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
     );
     let both = ResolveArgs {
         skip_copy: true,
-        remove_worktree: true,
+        discard_uncopied: true,
         ..ResolveArgs::default()
     };
     assert!(threads::resolve(&ctx, "demo", "t-0001", &both).is_err());

@@ -93,7 +93,7 @@ Project files and lane work stay on your machines. Task dispatch sends the full 
 
 ### Will it touch my branches or worktrees on its own?
 
-No. It never deletes a branch, merges or pushes on its own. An ADE lane is `git worktree add` into `<repo>/.worktrees/<id>` plus a tab in the coordinator workspace. `thread resolve --remove-worktree` runs `git worktree remove` without force, never `herdr worktree remove`, and only after the thread's report and files are copied home. Deleting a project moves its folder to a trash folder and leaves every worktree and branch alone.
+It never deletes a branch, merges or pushes on its own. An ADE lane is `git worktree add` into `<repo>/.worktrees/<id>` plus a tab in the coordinator workspace. `thread resolve` removes the worktree without force after its files are copied and its commits have landed or its round has closed; uncommitted changes keep the worktree with a reported reason. The branch is retained. Deleting a project moves its folder to a trash folder and leaves every worktree and branch alone.
 
 ### What is `--plain`?
 
