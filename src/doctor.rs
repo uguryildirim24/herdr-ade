@@ -98,14 +98,22 @@ fn native_probe(kind: &str) -> Option<NativeProbe> {
 
 fn probe_error(kind: &str, output: &crate::runner::Output) -> String {
     let detail = output.error_text();
+    if output.timed_out {
+        return format!("{kind} readiness probe timed out; provider status is unknown");
+    }
     if detail.is_empty() {
-        format!(
-            "{kind} could not reach its smallest model; its stored sign-in may no longer work (exit {:?})",
+        return format!(
+            "{kind} readiness probe failed with exit {:?}; provider status is unknown",
             output.code
+        );
+    }
+    if crate::pi::doctor::positive_sign_in_evidence(&detail) {
+        format!(
+            "{kind} provider rejected its smallest model; its stored sign-in may no longer work: {detail}"
         )
     } else {
         format!(
-            "{kind} could not reach its smallest model; its stored sign-in may no longer work: {detail}"
+            "{kind} readiness probe failed locally or returned an unrecognized response: {detail}"
         )
     }
 }
@@ -130,19 +138,51 @@ fn run_native_probe(
             value.get("ok").and_then(serde_json::Value::as_bool),
         )
         && now.saturating_sub(checked) <= crate::pi::doctor::READINESS_CACHE_TTL.as_secs()
+        && (ok
+            || value
+                .get("provider_failure")
+                .and_then(serde_json::Value::as_bool)
+                .is_some())
     {
+        let provider_failure = value
+            .get("provider_failure")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         return Ok(crate::runner::Output {
             code: Some(if ok { 0 } else { 1 }),
+            stderr: if ok {
+                String::new()
+            } else if provider_failure {
+                "authentication failed (cached provider refusal)".into()
+            } else {
+                value
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("readiness probe failed locally (cached)")
+                    .to_string()
+            },
             ..Default::default()
         });
     }
-    let output = ctx
-        .runner
-        .run(&Cmd::new(probe.program, timeout).args(probe.args.iter().copied()))?;
-    if ctx.root.is_dir() && std::fs::create_dir_all(&cache_dir).is_ok() {
+    let output = ctx.runner.run(
+        &Cmd::new(probe.program, timeout)
+            .args(probe.args.iter().copied())
+            .cwd(&ctx.root),
+    )?;
+    let provider_failure = !output.timed_out
+        && !output.success()
+        && crate::pi::doctor::positive_sign_in_evidence(&output.error_text());
+    // Unknown diagnostics may be local, or may be provider text we do not
+    // recognize. Do not persist either. A later check reruns and keeps the
+    // original text in its immediate result.
+    if (output.success() || provider_failure)
+        && ctx.root.is_dir()
+        && std::fs::create_dir_all(&cache_dir).is_ok()
+    {
         let value = serde_json::json!({
             "checked_unix": now,
             "ok": output.success(),
+            "provider_failure": provider_failure,
         });
         let staged = cache_dir.join(format!(".native-{}-{}", probe.kind, std::process::id()));
         if std::fs::write(&staged, value.to_string()).is_ok() {
@@ -227,7 +267,7 @@ pub(crate) fn recipe_ready_on_box(
     if launch.kind == "pi" {
         let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
             .context("pi_args_forbidden: a pi launch names no --provider")?;
-        return crate::pi_ade::check_on_machine(ctx.runner, &profile.target, &provider)
+        return crate::pi_ade::check_on_machine(ctx.runner, &ctx.root, &profile.target, &provider)
             .with_context(|| format!("provider {provider}"));
     }
     let probe = native_probe(&launch.kind).with_context(|| {
@@ -237,8 +277,9 @@ pub(crate) fn recipe_ready_on_box(
         )
     })?;
     let script = box_native_probe_script(probe, false);
+    let rooted = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
     let output = crate::remote::ssh(
-        ctx.runner,
+        &rooted,
         &profile.target,
         &script,
         None,
@@ -309,6 +350,8 @@ fn report_with_checks(
     session: &SessionFlags,
     runner: &dyn Runner,
 ) -> (String, bool, Vec<CheckResult>) {
+    let stable_runner = crate::runner::CwdRunner::new(runner, root);
+    let runner: &dyn Runner = &stable_runner;
     let mut out = String::new();
     let mut healthy = true;
     let mut checks = Vec::new();
@@ -509,17 +552,10 @@ fn report_with_checks(
 
     match crate::ticker::lock_state(root) {
         crate::ticker::LockState::Free => check(&mut out, None, "ticker", "not running".into()),
-        crate::ticker::LockState::Held(info) => check(
-            &mut out,
-            Some(true),
-            "ticker",
-            format!(
-                "running, version {} (this binary: {}), root {}",
-                info.version,
-                crate::VERSION,
-                info.root
-            ),
-        ),
+        crate::ticker::LockState::Held(info) => {
+            let (status, detail) = ticker_folder_check(&info);
+            check(&mut out, status, "ticker", detail);
+        }
     }
 
     for slug in project::list_slugs(root) {
@@ -741,6 +777,30 @@ fn report_with_checks(
     (out, healthy, checks)
 }
 
+fn ticker_folder_check(info: &crate::ticker::Info) -> (Option<bool>, String) {
+    let cwd = Path::new(&info.cwd);
+    let cwd_ok = !info.cwd.is_empty() && cwd.is_dir();
+    (
+        if cwd_ok { Some(true) } else { Some(false) },
+        format!(
+            "running, version {} (this binary: {}), root {}, folder {}{}",
+            info.version,
+            crate::VERSION,
+            info.root,
+            if info.cwd.is_empty() {
+                "not recorded"
+            } else {
+                &info.cwd
+            },
+            if cwd_ok {
+                ""
+            } else {
+                "; folder no longer exists"
+            }
+        ),
+    )
+}
+
 fn worktree_check_status(leftovers: &[String], errors: &[String]) -> Option<bool> {
     if !leftovers.is_empty() {
         Some(false)
@@ -804,27 +864,75 @@ fn finished_worktrees(
             }
         }
     }
+    // Existence on a box is one read-only fact call for every candidate. The
+    // shell always exits zero after printing each yes/no answer, so a healthy
+    // "gone" result cannot enter the command-failure ledger and a transport
+    // failure remains distinguishable from a negative answer.
+    let remote_exists = remote.map(|(_, target)| {
+        let script = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, (_, thread))| {
+                format!(
+                    "if [ -d {} ]; then printf '{}\\t1\\n'; else printf '{}\\t0\\n'; fi",
+                    crate::remote::quote(&thread.worktree_path),
+                    index,
+                    index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
+            Ok(output) if output.success() => {
+                let facts: BTreeMap<usize, bool> = output
+                    .stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let (index, exists) = line.split_once('\t')?;
+                        let exists = match exists {
+                            "0" => false,
+                            "1" => true,
+                            _ => return None,
+                        };
+                        Some((index.parse().ok()?, exists))
+                    })
+                    .collect();
+                let mut answers = Vec::with_capacity(candidates.len());
+                for (index, (_, thread)) in candidates.iter().enumerate() {
+                    match facts.get(&index) {
+                        Some(exists) => answers.push(*exists),
+                        None => {
+                            errors.push(format!(
+                                "{}: box worktree existence answer was missing",
+                                thread.worktree_path
+                            ));
+                            answers.push(false);
+                        }
+                    }
+                }
+                answers
+            }
+            Ok(output) => {
+                errors.push(format!("box worktree check: {}", output.error_text()));
+                vec![false; candidates.len()]
+            }
+            Err(error) => {
+                errors.push(format!("box worktree check: {error:#}"));
+                vec![false; candidates.len()]
+            }
+        }
+    });
+
     let mut leftovers = Vec::new();
     let mut data_kept = Vec::new();
-    for (project, thread) in candidates {
+    for (index, (project, thread)) in candidates.into_iter().enumerate() {
         let path = &thread.worktree_path;
-        let exists = if let Some((_, target)) = remote {
-            let script = format!("test -d {}", crate::remote::quote(path));
-            match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
-                Ok(output) if output.success() => true,
-                Ok(output) if output.code == Some(1) && output.stderr.trim().is_empty() => false,
-                Ok(output) => {
-                    errors.push(format!("{path}: {}", output.error_text()));
-                    false
-                }
-                Err(error) => {
-                    errors.push(format!("{path}: {error:#}"));
-                    false
-                }
-            }
-        } else {
-            Path::new(path).is_dir()
-        };
+        let exists = remote_exists
+            .as_ref()
+            .map_or_else(|| Path::new(path).is_dir(), |answers| answers[index]);
         if !exists {
             continue;
         }
@@ -1255,12 +1363,12 @@ fn box_rows(
             env_bool(&value, &["ok"]),
             format!("box {label} login {kind}"),
             if value == "ok" {
-            format!("{kind} reached its smallest model")
-        } else {
-            format!(
-                "{kind} could not reach its smallest model ({value}); its stored sign-in may no longer work"
-            )
-        },
+                format!("{kind} reached its smallest model")
+            } else {
+                format!(
+                    "{kind} readiness probe did not succeed ({value}); provider status is unknown"
+                )
+            },
         ));
     }
     // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
@@ -1575,6 +1683,48 @@ recipe = "claude_fable_xhigh"
         );
         assert!(!cached.contains("subscription expired"), "{cached}");
         assert_eq!(runner.count("claude"), 1);
+        let calls = runner.calls.borrow();
+        let probe = calls.iter().find(|call| call.program == "claude").unwrap();
+        assert_eq!(probe.cwd.as_deref(), Some(ctx.root.as_path()));
+    }
+
+    #[test]
+    fn a_timed_out_native_probe_is_unknown_and_is_not_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "claude",
+            |_| {
+                Ok(crate::runner::Output {
+                    stderr: "authentication failed before the probe stalled".into(),
+                    timed_out: true,
+                    ..Default::default()
+                })
+            },
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let launch = crate::contracts::Launch {
+            kind: "claude".into(),
+            ready_timeout_ms: 1_000,
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            let error = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
+            assert!(error.contains("timed out"), "{error}");
+            assert!(!error.contains("stored sign-in"), "{error}");
+        }
+        assert_eq!(runner.count("claude"), 2);
+        assert!(!ctx.root.join(".readiness/native-claude.json").exists());
     }
 
     #[test]
@@ -1804,6 +1954,91 @@ recipe = "claude_fable_xhigh"
         assert!(text.contains("[warn] project demo memory"), "{text}");
         assert!(text.contains("memory/state.md"), "{text}");
         assert!(text.contains("memory/archive/"), "{text}");
+    }
+
+    #[test]
+    fn doctor_flags_a_ticker_whose_recorded_folder_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("disposable-worktree");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+        let info = crate::ticker::Info {
+            version: crate::VERSION.into(),
+            pid: 42,
+            root: dir.path().display().to_string(),
+            cwd: folder.display().to_string(),
+            started: project::now(),
+            tools: Vec::new(),
+        };
+        let (status, detail) = ticker_folder_check(&info);
+        assert_eq!(status, Some(false));
+        assert!(detail.contains("folder no longer exists"), "{detail}");
+        assert!(
+            detail.contains(folder.to_string_lossy().as_ref()),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn resolved_box_worktree_absence_is_one_check_and_no_ledger_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let mut ids = Vec::new();
+        for number in 1..=2 {
+            let thread = crate::thread::allocate(&project, |thread| {
+                thread.kind = crate::thread::Kind::Worktree;
+                thread.status = crate::thread::Status::Resolved;
+                thread.machine = "oci".into();
+                thread.machine_id = "box-1".into();
+                thread.worktree_path = format!("/box/worktree-{number}");
+                thread.repo = "/repo".into();
+                thread.branch = format!("lane-{number}");
+            })
+            .unwrap();
+            ids.push(thread.id);
+        }
+        let rounds = project.state_dir().join("rounds");
+        std::fs::create_dir_all(&rounds).unwrap();
+        let record = crate::contracts::RoundRecord {
+            phase: crate::contracts::RoundPhase::Abandoned,
+            round: "r1".into(),
+            branch: "main".into(),
+            plain: "The work is closed.".into(),
+            policy_hash: "policy".into(),
+            manifest: crate::contracts::AdmissionManifest {
+                revision: 1,
+                members: ids
+                    .into_iter()
+                    .map(|thread| crate::contracts::ManifestMember { thread, pin: None })
+                    .collect(),
+            },
+            repo: "/repo".into(),
+            abandoned_reason: Some("not needed".into()),
+            ..crate::contracts::RoundRecord::default()
+        };
+        std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
+        let fake = FakeRunner::new();
+        fake.on("ssh", ok("0\t0\n1\t0\n"));
+        let recording = crate::ledger::RecordingRunner(&fake);
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &recording,
+            detached_ticker: false,
+        };
+        let _scope = crate::ledger::Scope::new(&[&project]);
+
+        let (leftovers, data, errors) = finished_worktrees(&ctx, Some(("box-1", "me@box")));
+
+        assert!(leftovers.is_empty());
+        assert!(data.is_empty());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(fake.count("ssh"), 1);
+        assert!(crate::ledger::list(&project).unwrap().is_empty());
+        assert!(!project.dir().join("ledger.jsonl").exists());
     }
 
     #[test]

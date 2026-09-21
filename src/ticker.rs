@@ -45,6 +45,9 @@ pub(crate) struct Info {
     pub(crate) version: String,
     pub(crate) pid: u32,
     pub(crate) root: String,
+    /// Stable working directory inherited by the loop itself. Child commands
+    /// are also given this directory explicitly.
+    pub(crate) cwd: String,
     pub(crate) started: String,
     /// Where the ticker resolves its tools from its own environment, which may
     /// differ from the user's shell.
@@ -138,14 +141,13 @@ unsafe extern "C" {
 
 /// `ticker run`, detached: null stdio and a new session, so it does not die
 /// with the process group of whatever started it (an agent's shell tool).
-fn spawn(root: &Path) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let binary = std::env::current_exe().context("could not find this binary's own path")?;
+fn spawn_command(binary: &Path, root: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .arg("--root")
         .arg(root)
         .args(["ticker", "run"])
+        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -160,6 +162,13 @@ fn spawn(root: &Path) -> Result<()> {
     ] {
         command.env_remove(key);
     }
+    command
+}
+
+fn spawn(root: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let binary = std::env::current_exe().context("could not find this binary's own path")?;
+    let mut command = spawn_command(&binary, root);
     // SAFETY: setsid is async-signal-safe and touches no memory.
     unsafe {
         command.pre_exec(|| {
@@ -256,10 +265,28 @@ impl Log {
 /// The loop. Exits when another ticker holds the lock, when the stop file
 /// appears, or when no project has had a reachable session for five minutes.
 pub(crate) fn run(ctx: &Ctx) -> Result<()> {
-    let root = &ctx.root;
-    if project::list_slugs(root).is_empty() {
+    if project::list_slugs(&ctx.root).is_empty() {
         return Ok(());
     }
+    // `ticker run` can also be invoked directly. Move the loop itself off the
+    // caller's possibly disposable worktree, then give every external command
+    // the same explicit projects root.
+    std::env::set_current_dir(&ctx.root).with_context(|| {
+        format!(
+            "could not move the ticker to the projects root {}",
+            ctx.root.display()
+        )
+    })?;
+    let runner = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
+    let stable = Ctx {
+        env: ctx.env,
+        root: ctx.root.clone(),
+        config_dir: ctx.config_dir.clone(),
+        runner: &runner,
+        detached_ticker: ctx.detached_ticker,
+    };
+    let ctx = &stable;
+    let root = &ctx.root;
     let mut lock = File::options()
         .create(true)
         .truncate(false)
@@ -274,6 +301,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         version: crate::VERSION.to_string(),
         pid: std::process::id(),
         root: root.display().to_string(),
+        cwd: root.display().to_string(),
         started: project::now(),
         tools: ["herdr", "git", "gh", "ssh", "scp", "rsync"]
             .iter()
@@ -721,18 +749,12 @@ fn launch_pass(
                 crate::threads::pi_ready(pass.ctx, &t.launch)
             };
             if let Err(error) = readiness {
+                let class = crate::pi_ade::failure_class(&error);
                 let message = format!("{error:#}");
                 errors.extend(
-                    threads::fail_start(
-                        pass.ctx,
-                        pass.project,
-                        &t.id,
-                        &message,
-                        crate::contracts::FailureClass::Provider,
-                        true,
-                    )
-                    .err()
-                    .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
+                    threads::fail_start(pass.ctx, pass.project, &t.id, &message, class, true)
+                        .err()
+                        .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
                 );
                 continue;
             }
@@ -1259,6 +1281,15 @@ mod tests {
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
+    }
+
+    #[test]
+    fn a_detached_ticker_uses_the_projects_root_not_the_callers_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("projects-root");
+        std::fs::create_dir(&root).unwrap();
+        let command = spawn_command(Path::new("/bin/true"), &root);
+        assert_eq!(command.get_current_dir(), Some(root.as_path()));
     }
 
     #[test]

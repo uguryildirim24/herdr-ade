@@ -7,6 +7,7 @@
 //! launch; `doctor` prints [`doctor_rows_with`]. Both take the ADE root.
 //! There is no per-tick pi work (SPEC-pi v2).
 
+use std::fmt;
 use std::path::Path;
 
 use anyhow::Result;
@@ -54,15 +55,54 @@ fn layout(root: &Path) -> Layout {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ReadinessError {
+    pub(crate) class: crate::contracts::FailureClass,
+    message: String,
+}
+
+impl fmt::Display for ReadinessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ReadinessError {}
+
+pub(crate) fn failure_class(error: &anyhow::Error) -> crate::contracts::FailureClass {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ReadinessError>())
+        .map_or(crate::contracts::FailureClass::Unknown, |error| error.class)
+}
+
+fn core_class(evidence: doctor::FailureEvidence) -> crate::contracts::FailureClass {
+    match evidence {
+        doctor::FailureEvidence::Provider => crate::contracts::FailureClass::Provider,
+        doctor::FailureEvidence::Unknown => crate::contracts::FailureClass::Unknown,
+    }
+}
+
 /// Readiness for one provider before a `kind = "pi"` launch (SPEC-pi §3.4):
-/// every failing row in one refusal. Runs through the plugin's runner.
+/// every failing row in one refusal. Runs through the plugin's runner from the
+/// stable projects root.
 pub(crate) fn check_with(
     runner: &dyn crate::runner::Runner,
     root: &Path,
     provider: &str,
 ) -> Result<CheckReport> {
     let env = Env::from_process()?;
-    doctor::check_with(&layout(root), &env, &Adapter(runner), provider)
+    let rooted = crate::runner::CwdRunner::new(runner, root);
+    let report = doctor::check_report(&env, &layout(root), &Adapter(&rooted), provider);
+    if report.ok {
+        Ok(report)
+    } else {
+        Err(ReadinessError {
+            class: core_class(report.failure_evidence()),
+            message: report.error_text(),
+        }
+        .into())
+    }
 }
 
 /// Box pi readiness (SPEC-remote §4.1, SPEC-pi §3.4, item 101): the check runs
@@ -70,6 +110,7 @@ pub(crate) fn check_with(
 /// counts, and the model is resolved from the box's shared store.
 pub(crate) fn check_on_machine(
     runner: &dyn crate::runner::Runner,
+    local_root: &Path,
     target: &str,
     provider: &str,
 ) -> Result<()> {
@@ -79,8 +120,9 @@ pub(crate) fn check_on_machine(
         bin = crate::remote::quote(crate::contracts::BOX_PI_BIN),
         provider = crate::remote::quote(provider),
     );
+    let rooted = crate::runner::CwdRunner::new(runner, local_root);
     let out = crate::remote::ssh(
-        runner,
+        &rooted,
         target,
         &script,
         None,
@@ -89,10 +131,43 @@ pub(crate) fn check_on_machine(
     if out.success() {
         return Ok(());
     }
-    anyhow::bail!(
-        "pi_not_ready on the box for `{provider}`: {}",
-        out.error_text()
-    )
+    let parsed = serde_json::from_str::<serde_json::Value>(&out.stdout).ok();
+    let evidence = !out.timed_out
+        && out.code != Some(255)
+        && parsed
+            .as_ref()
+            .and_then(|value| value.get("checks"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|checks| {
+                checks.iter().any(|check| {
+                    check.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                })
+            })
+            .is_some_and(|checks| {
+                checks
+                    .iter()
+                    .filter(|check| {
+                        check.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                    })
+                    .all(|check| {
+                        check
+                            .get("failure_class")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("provider")
+                    })
+            });
+    Err(ReadinessError {
+        class: if evidence {
+            crate::contracts::FailureClass::Provider
+        } else {
+            crate::contracts::FailureClass::Unknown
+        },
+        message: format!(
+            "pi_not_ready on the box for `{provider}`: {}",
+            out.error_text()
+        ),
+    }
+    .into())
 }
 
 /// The pi doctor rows through the plugin's runner, for `doctor`.
@@ -102,7 +177,8 @@ pub(crate) fn doctor_rows_with(
 ) -> Result<(Vec<doctor::Row>, bool)> {
     let env = Env::from_process()?;
     let providers = crate::pi::recipes::enabled_providers();
-    let rows = doctor::doctor_rows_with(&env, &layout(root), &Adapter(runner), &providers);
+    let rooted = crate::runner::CwdRunner::new(runner, root);
+    let rows = doctor::doctor_rows_with(&env, &layout(root), &Adapter(&rooted), &providers);
     let ok = doctor::healthy(&rows);
     Ok((rows, ok))
 }
@@ -141,11 +217,13 @@ mod tests {
     /// binary, and names the provider.
     #[test]
     fn the_box_readiness_check_calls_the_pi_binary_with_the_provider() {
+        let dir = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         runner.on("ssh", ok("{}"));
-        check_on_machine(&runner, "me@box", "opencode-go").unwrap();
+        check_on_machine(&runner, dir.path(), "me@box", "opencode-go").unwrap();
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].cwd.as_deref(), Some(dir.path()));
         assert_eq!(
             calls[0].args.last().unwrap(),
             "sh -c 'PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH\nHERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go'"
@@ -156,9 +234,10 @@ mod tests {
     /// A non-zero exit surfaces the box's own stderr, not a Mac-side guess.
     #[test]
     fn a_box_readiness_refusal_surfaces_the_box_stderr() {
+        let dir = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         runner.on("ssh", fail(1, "error: unrecognized subcommand 'check'\n"));
-        let error = check_on_machine(&runner, "me@box", "opencode-go")
+        let error = check_on_machine(&runner, dir.path(), "me@box", "opencode-go")
             .unwrap_err()
             .to_string();
         assert!(
@@ -168,6 +247,27 @@ mod tests {
         assert!(
             error.contains("error: unrecognized subcommand 'check'"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_box_check_stays_unknown_despite_partial_provider_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            crate::runner::Output {
+                code: Some(1),
+                stdout: r#"{"checks":[{"ok":false,"failure_class":"provider"}]}"#.into(),
+                timed_out: true,
+                ..Default::default()
+            },
+        );
+
+        let error = check_on_machine(&runner, dir.path(), "me@box", "opencode-go").unwrap_err();
+        assert_eq!(
+            failure_class(&error),
+            crate::contracts::FailureClass::Unknown
         );
     }
 }
