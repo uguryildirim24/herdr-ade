@@ -66,6 +66,7 @@ mod runner;
 mod scenarios;
 mod steps;
 mod talk;
+mod task;
 mod thread;
 mod threads;
 mod ticker;
