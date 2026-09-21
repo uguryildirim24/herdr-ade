@@ -537,7 +537,7 @@ fn report_with_checks(
         ),
         Err(error) => check(
             &mut out,
-            Some(false),
+            None,
             "machine local disk",
             format!("free space unknown: {error:#}"),
         ),
@@ -1021,12 +1021,24 @@ fn finished_worktrees(
 /// names come from the same helper that sets `CARGO_TARGET_DIR` at launch.
 fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String>, Vec<String>) {
     let mut active = BTreeSet::new();
+    let mut uncertain_projects = BTreeSet::new();
     let mut errors = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
-        let Ok(project) = project::Project::load(&ctx.root, &slug) else {
-            continue;
+        let project = match project::Project::load(&ctx.root, &slug) {
+            Ok(project) => project,
+            Err(error) => {
+                uncertain_projects.insert(slug.clone());
+                errors.push(format!("{slug}: build ownership unknown: {error:#}"));
+                continue;
+            }
         };
         let (threads, unreadable) = crate::thread::list_with_errors(&project);
+        if !unreadable.is_empty() {
+            // A record that cannot be read may describe an open remote thread.
+            // Do not call any folder for this project orphaned until its owner
+            // can be established.
+            uncertain_projects.insert(slug.clone());
+        }
         errors.extend(
             unreadable
                 .into_iter()
@@ -1088,7 +1100,12 @@ fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String
             errors.push(format!("build folder size unreadable: {line}"));
             continue;
         };
-        if !active.contains(name) {
+        let ownership_unknown = uncertain_projects.iter().any(|slug| {
+            name.strip_prefix(slug)
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .is_some_and(|id| crate::thread::validate_id(id).is_ok())
+        });
+        if !active.contains(name) && !ownership_unknown {
             leftovers.push(format!(
                 "{} ({})",
                 path,
@@ -1585,25 +1602,32 @@ fn box_rows(
             format!("herdr-pi check {provider}: {value}"),
         ));
     }
-    let nproc: u64 = fact("nproc").parse().unwrap_or(0);
+    let nproc = fact("nproc").parse::<u64>().ok();
     let mem_gb = fact("mem_avail_kb")
         .parse::<u64>()
-        .map(|kb| kb as f64 / 1_000_000.0)
-        .unwrap_or(0.0);
+        .ok()
+        .map(|kb| kb as f64 / 1_000_000.0);
     let disk_gb = fact("df_free")
         .parse::<u64>()
-        .map(|bytes| bytes as f64 / 1_000_000_000.0)
-        .unwrap_or(0.0);
-    let cpu_fit = nproc.saturating_sub(1);
-    let mem_fit = (mem_gb / 4.0) as u64;
-    let disk_fit = (disk_gb / 5.0) as u64;
-    let fits = cpu_fit.min(mem_fit).min(disk_fit);
-    let capacity_ok = disk_gb >= min_free_disk_gb;
+        .ok()
+        .map(|bytes| bytes as f64 / 1_000_000_000.0);
+    let fits = nproc.zip(mem_gb).zip(disk_gb).map(|((cpu, memory), disk)| {
+        cpu.saturating_sub(1)
+            .min((memory / 4.0) as u64)
+            .min((disk / 5.0) as u64)
+    });
     rows.push((
-        if capacity_ok { Some(true) } else { Some(false) },
+        disk_gb.map(|disk| disk >= min_free_disk_gb),
         format!("box {label} capacity"),
         format!(
-            "{nproc} OCPU, {mem_gb:.1} GB RAM free, {disk_gb:.1} GB disk free; about {fits} more lane(s) fit; refuses below {} GB free",
+            "{} OCPU, {} GB RAM free, {} GB disk free; {}; refuses below {} GB free",
+            nproc.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            mem_gb.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
+            disk_gb.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
+            fits.map_or_else(
+                || "additional lane capacity unknown".into(),
+                |value| format!("about {value} more lane(s) fit")
+            ),
             display_gb(min_free_disk_gb)
         ),
     ));
@@ -2546,7 +2570,7 @@ recipe = "claude_fable_xhigh"
         runner.on("ssh", ok(&facts));
         probe_fakes(&runner);
 
-        let (text, healthy) = report(
+        let (text, healthy, checks) = report_with_checks(
             &env,
             &home.path().join("root"),
             &home.path().join("cfg"),
@@ -2557,6 +2581,113 @@ recipe = "claude_fable_xhigh"
         assert!(!healthy, "{text}");
         assert!(text.contains("[FAIL] finished worktrees oci"), "{text}");
         assert!(text.contains("demo-t-0099 (2.5 GiB)"), "{text}");
+        assert!(checks.iter().any(|check| {
+            check.status == "failed"
+                && check.label == "finished worktrees oci"
+                && check.detail.contains("demo-t-0099 (2.5 GiB)")
+        }));
+    }
+
+    #[test]
+    fn open_box_threads_keep_their_build_folders_out_of_orphan_results() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Open;
+            thread.machine = "oci-id".into();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok(&format!(
+                "__HERDR_BUILDS__\n1\t/home/ubuntu/build/lanes/demo-{}\n__HERDR_BUILDS_DONE__\n",
+                thread.id
+            )),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        let (leftovers, errors) = finished_build_folders(&ctx, "oci-id", "me@box");
+
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn unreadable_thread_ownership_does_not_turn_a_build_folder_into_an_orphan() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        std::fs::write(project.dir().join("threads/t-0099.toml"), "status = [\n").unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok("__HERDR_BUILDS__\n1\t/home/ubuntu/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__\n"),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        let (leftovers, errors) = finished_build_folders(&ctx, "oci-id", "me@box");
+
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("build ownership unknown")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_local_free_space_is_typed_as_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(crate::harness::BOX_WORKER_MARKER),
+            "lane worker\n",
+        )
+        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("agent start --help", ok("--parent"));
+        runner.on("herdr --version", ok("herdr 0.9.1\n"));
+        runner.on("session list --json", ok(r#"{"sessions":[]}"#));
+        runner.on("git --version", ok("git version 2.50.0\n"));
+        runner.on("df -Pk /", fail(1, "df failed"));
+        runner.on("ssh -V", ok(""));
+        runner.on("rsync --version", ok("rsync 3\n"));
+        runner.on("gh --version", ok("gh version 2\n"));
+        runner.on("gh auth status", fail(1, "not logged in"));
+
+        let (text, healthy, checks) = report_with_checks(
+            &env,
+            &home.path().join("root"),
+            &config,
+            &SessionFlags::default(),
+            &runner,
+        );
+
+        assert!(healthy, "{text}");
+        assert!(checks.iter().any(|check| {
+            check.status == "warning"
+                && check.label == "machine local disk"
+                && check.detail.contains("free space unknown")
+        }));
     }
 
     #[test]
@@ -2975,6 +3106,16 @@ recipe = "claude_fable_xhigh"
         );
         probe_fakes(&runner);
         assert_eq!(find_row(&runner, "box oci capacity").0, Some(false));
+
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok(&box_facts().replace("df_free\t100000000000", "df_free\tunknown")),
+        );
+        probe_fakes(&runner);
+        let capacity = find_row(&runner, "box oci capacity");
+        assert_eq!(capacity.0, None);
+        assert!(capacity.2.contains("unknown GB disk free"), "{capacity:?}");
 
         let runner = FakeRunner::new();
         runner.on("ssh", fail(255, "ssh: connect timed out"));
