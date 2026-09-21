@@ -5,8 +5,10 @@
 //! project may start lanes and open rounds on a harness repository without
 //! listing it in `PROJECT.md`.
 
+use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,7 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const BOX_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_WAIT: Duration = Duration::from_secs(40);
 pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
 
 /// The `[harness]` table of `config.toml`.
@@ -115,8 +118,35 @@ pub(crate) struct InstalledRepo {
     pub(crate) path: String,
     pub(crate) kind: String,
     pub(crate) binaries: Vec<InstalledBinary>,
+    pub(crate) commit: String,
     pub(crate) box_path: Option<String>,
     pub(crate) box_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) box_commit: Option<String>,
+}
+
+/// One installed or long-running process checked after installation. `build`
+/// is absent only when the evidence cannot identify the running image.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProcessProof {
+    pub(crate) machine: String,
+    pub(crate) process: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) build: Option<String>,
+    pub(crate) state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct TaskInstallProof {
+    pub(crate) project: String,
+    pub(crate) task: String,
+    pub(crate) machine: String,
+    pub(crate) build: String,
+    pub(crate) running_processes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -125,6 +155,8 @@ pub(crate) struct InstallOutcome {
     pub(crate) box_target: Option<String>,
     pub(crate) box_settings_installed: bool,
     pub(crate) live_handoff_required: bool,
+    pub(crate) processes: Vec<ProcessProof>,
+    pub(crate) tasks: Vec<TaskInstallProof>,
     #[serde(skip)]
     warnings: Vec<String>,
 }
@@ -137,6 +169,22 @@ impl InstallOutcome {
             .flat_map(|repo| repo.binaries.iter())
             .map(|binary| format!("{}\n", binary.version))
             .collect::<String>();
+        for process in &self.processes {
+            match (&process.build, &process.reason) {
+                (Some(build), _) => message.push_str(&format!(
+                    "{} {}: {} ({})\n",
+                    process.machine, process.process, build, process.state
+                )),
+                (None, Some(reason)) => message.push_str(&format!(
+                    "{} {}: unknown ({reason})\n",
+                    process.machine, process.process
+                )),
+                (None, None) => message.push_str(&format!(
+                    "{} {}: unknown\n",
+                    process.machine, process.process
+                )),
+            }
+        }
         if self.live_handoff_required {
             message.push_str("the running server keeps its image; a live handoff is Rolf's call\n");
         }
@@ -296,7 +344,7 @@ fn box_zig_script(box_path: &str) -> String {
     )
 }
 
-fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> {
+fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<Option<String>> {
     let zig = if kind == Kind::Fork {
         format!("\n{}", box_zig_script(box_path))
     } else {
@@ -318,7 +366,8 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
          export PATH={build_path}\n\
          export DEVELOPER_DIR={DEVELOPER_DIR}{zig}\n\
          cargo build --release --locked\n\
-         mkdir -p $HOME/.local/bin{installs}",
+         mkdir -p $HOME/.local/bin{installs}\n\
+         printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$(git rev-parse HEAD)\"",
         path = remote::quote(box_path),
         build_path = BOX_BUILD_PATH,
     );
@@ -329,7 +378,12 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
             out.error_text()
         );
     }
-    Ok(())
+    Ok(out.stdout.lines().find_map(|line| {
+        line.strip_prefix("HERDR_ADE_INSTALLED_HEAD=")
+            .map(str::trim)
+            .filter(|head| !head.is_empty())
+            .map(str::to_string)
+    }))
 }
 
 /// Install only the policy a lane machine consumes. Dispatch recipes and the
@@ -409,24 +463,465 @@ impl Running {
     }
 }
 
-/// `ha harness install` builds and installs the plugin, then keeps running the
-/// image it started as. When the file just installed is this process's own
-/// executable and its bytes changed, the rest of this run would still use the
-/// old installer logic: stop and name the command that picks up the new binary.
-fn notice_stale_self(installed: &Path, running: &Running) -> Result<()> {
+fn replaced_self(installed: &Path, running: &Running) -> Result<bool> {
     let same = std::fs::canonicalize(installed).is_ok_and(|path| path == running.path);
     if !same {
-        return Ok(());
+        return Ok(false);
     }
     let bytes = std::fs::read(installed)
         .with_context(|| format!("could not read {}", installed.display()))?;
-    if crate::thread::sha256_hex(&bytes) == running.hash {
+    Ok(crate::thread::sha256_hex(&bytes) != running.hash)
+}
+
+/// Continue the same invocation in the image it just installed. The install
+/// lock is close-on-exec, so the new image starts the transaction again and
+/// completes it with its own code; no shell retry is involved.
+fn reexec_if_replaced(installed: &Path, running: &Running) -> Result<()> {
+    if !replaced_self(installed, running)? {
         return Ok(());
     }
-    Err(crate::refusal::error(format!(
-        "harness_install_stale_self: this run installed a newer {} but is still the old process; run `ha harness install` again",
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(installed)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    bail!(
+        "harness_reexec_failed: could not continue installation in {}: {error}",
         installed.display()
-    )))
+    )
+}
+
+fn repo_head(ctx: &Ctx, repo: &str) -> Result<String> {
+    let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
+        "-C",
+        repo,
+        "rev-parse",
+        "HEAD",
+    ]))?;
+    if !out.success() || out.stdout.trim().is_empty() {
+        bail!(
+            "harness_build_head: could not read HEAD in {repo}: {}",
+            out.error_text()
+        );
+    }
+    Ok(out.stdout.trim().to_string())
+}
+
+fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessProof> {
+    let mut proofs = Vec::new();
+    if let Some(version) = plugin_version {
+        proofs.push(ProcessProof {
+            machine: "local".into(),
+            process: "herdr-ade binary".into(),
+            pid: None,
+            build: Some(version.to_string()),
+            state: "installed".into(),
+            reason: None,
+        });
+    }
+
+    if !crate::project::list_slugs(&ctx.root).is_empty() {
+        let ticker = crate::ticker::start(ctx).and_then(|()| {
+            let deadline = Instant::now() + PROCESS_WAIT;
+            loop {
+                if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
+                    && info.version == crate::VERSION
+                {
+                    break Ok(info);
+                }
+                if Instant::now() >= deadline {
+                    break Err(anyhow::anyhow!(
+                        "ticker did not report build {}",
+                        crate::VERSION
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        proofs.push(match ticker {
+            Ok(info) => ProcessProof {
+                machine: "local".into(),
+                process: "ticker".into(),
+                pid: Some(info.pid),
+                build: Some(info.version),
+                state: "running".into(),
+                reason: None,
+            },
+            Err(error) => ProcessProof {
+                machine: "local".into(),
+                process: "ticker".into(),
+                pid: None,
+                build: None,
+                state: "unknown".into(),
+                reason: Some(format!("{error:#}")),
+            },
+        });
+    }
+    proofs.extend(talk_process_proofs(ctx, plugin_version));
+    proofs
+}
+
+fn same_executable_image(running_inode: u64, installed_inode: u64) -> bool {
+    running_inode == installed_inode
+}
+
+fn executable_inode(ctx: &Ctx, pid: u32) -> Result<u64> {
+    let out = ctx.runner.run(&Cmd::new("lsof", VERSION_TIMEOUT).args([
+        "-a".to_string(),
+        "-p".to_string(),
+        pid.to_string(),
+        "-d".to_string(),
+        "txt".to_string(),
+        "-Fpi".to_string(),
+    ]))?;
+    if !out.success() {
+        bail!("lsof failed: {}", out.error_text());
+    }
+    out.stdout
+        .lines()
+        .find_map(|line| line.strip_prefix('i')?.parse::<u64>().ok())
+        .context("lsof did not report the executable inode")
+}
+
+fn talk_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessProof> {
+    let installed = ctx.env.home.join(".local/bin/herdr-ade");
+    let installed_inode = std::fs::metadata(&installed)
+        .map(|metadata| metadata.ino())
+        .map_err(|error| error.to_string());
+    let mut proofs = Vec::new();
+    for slug in crate::project::list_slugs(&ctx.root) {
+        let Ok(project) = crate::project::Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        if !crate::talk::enabled(&project) {
+            continue;
+        }
+        let Some(coordinator) = project.coordinator() else {
+            continue;
+        };
+        let herdr = crate::herdr::Herdr::new(
+            ctx.env.herdr_bin(),
+            PathBuf::from(&coordinator.socket),
+            ctx.runner,
+        );
+        let tabs = match herdr.tab_list() {
+            Ok(tabs) => tabs,
+            Err(error) => {
+                proofs.push(ProcessProof {
+                    machine: "local".into(),
+                    process: format!("talk:{slug}"),
+                    pid: None,
+                    build: None,
+                    state: "unknown".into(),
+                    reason: Some(format!("could not list the talk tab: {error}")),
+                });
+                continue;
+            }
+        };
+        let talk_tabs: BTreeSet<String> = tabs
+            .into_iter()
+            .filter(|tab| tab.workspace_id == coordinator.workspace_id && tab.label == "talk")
+            .map(|tab| tab.tab_id)
+            .collect();
+        let panes = match herdr.pane_list() {
+            Ok(panes) => panes,
+            Err(error) => {
+                proofs.push(ProcessProof {
+                    machine: "local".into(),
+                    process: format!("talk:{slug}"),
+                    pid: None,
+                    build: None,
+                    state: "unknown".into(),
+                    reason: Some(format!("could not list the talk pane: {error}")),
+                });
+                continue;
+            }
+        };
+        for pane in panes
+            .into_iter()
+            .filter(|pane| talk_tabs.contains(&pane.tab_id))
+        {
+            let process = herdr.pane_process_info(&pane.pane_id);
+            let pid = process.ok().and_then(|info| {
+                info.foreground_processes
+                    .into_iter()
+                    .find(|process| {
+                        process.name.contains("herdr-ade")
+                            || process
+                                .argv0
+                                .as_deref()
+                                .is_some_and(|arg| arg.contains("herdr-ade"))
+                    })
+                    .map(|process| process.pid)
+            });
+            let Some(pid) = pid else {
+                proofs.push(ProcessProof {
+                    machine: "local".into(),
+                    process: format!("talk:{slug}"),
+                    pid: None,
+                    build: None,
+                    state: "unknown".into(),
+                    reason: Some("the talk pane did not report its herdr-ade process".into()),
+                });
+                continue;
+            };
+            let running_inode = executable_inode(ctx, pid);
+            proofs.push(
+                match (running_inode, installed_inode.clone(), plugin_version) {
+                    (Ok(running), Ok(installed), Some(version))
+                        if same_executable_image(running, installed) =>
+                    {
+                        ProcessProof {
+                            machine: "local".into(),
+                            process: format!("talk:{slug}"),
+                            pid: Some(pid),
+                            build: Some(version.to_string()),
+                            state: "running".into(),
+                            reason: None,
+                        }
+                    }
+                    (Ok(running), Ok(installed), _) => ProcessProof {
+                        machine: "local".into(),
+                        process: format!("talk:{slug}"),
+                        pid: Some(pid),
+                        build: None,
+                        state: "stale".into(),
+                        reason: Some(format!(
+                            "executable inode {running} does not match installed inode {installed}"
+                        )),
+                    },
+                    (Err(error), _, _) => ProcessProof {
+                        machine: "local".into(),
+                        process: format!("talk:{slug}"),
+                        pid: Some(pid),
+                        build: None,
+                        state: "unknown".into(),
+                        reason: Some(format!("{error:#}")),
+                    },
+                    (_, Err(error), _) => ProcessProof {
+                        machine: "local".into(),
+                        process: format!("talk:{slug}"),
+                        pid: Some(pid),
+                        build: None,
+                        state: "unknown".into(),
+                        reason: Some(format!("could not stat {}: {error}", installed.display())),
+                    },
+                },
+            );
+        }
+    }
+    proofs
+}
+
+fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
+    let script = format!(
+        "set -e\n\
+         bin=$HOME/.local/bin/herdr-ade\n\
+         version=\"$($bin --version)\"\n\
+         printf 'HERDR_ADE_BOX_BINARY=%s\\n' \"$version\"\n\
+         $bin --root $HOME/.herdr-ade ticker start\n\
+         expected={}\n\
+         n=0\n\
+         while [ $n -lt 80 ]; do\n\
+           if grep -F '\"version\": \"'$expected'\"' $HOME/.herdr-ade/.ticker.lock >/dev/null 2>&1; then\n\
+             pid=$(grep '\"pid\"' $HOME/.herdr-ade/.ticker.lock | tr -cd '0-9')\n\
+             printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$expected\"\n\
+             exit 0\n\
+           fi\n\
+           n=$((n+1)); sleep 0.5\n\
+         done\n\
+         printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker did not report the installed build\\n'",
+        remote::quote(crate::VERSION)
+    );
+    let out = match remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(140)) {
+        Ok(out) if out.success() => out,
+        Ok(out) => {
+            let reason = out.error_text();
+            return vec![ProcessProof {
+                machine: BOX_MACHINE.into(),
+                process: "box binary and ticker".into(),
+                pid: None,
+                build: None,
+                state: "unknown".into(),
+                reason: Some(reason),
+            }];
+        }
+        Err(error) => {
+            return vec![ProcessProof {
+                machine: BOX_MACHINE.into(),
+                process: "box binary and ticker".into(),
+                pid: None,
+                build: None,
+                state: "unknown".into(),
+                reason: Some(format!("{error:#}")),
+            }];
+        }
+    };
+    let mut proofs = Vec::new();
+    if let Some(version) = out
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_BINARY="))
+    {
+        let current = version.contains(crate::VERSION);
+        proofs.push(ProcessProof {
+            machine: BOX_MACHINE.into(),
+            process: "herdr-ade binary".into(),
+            pid: None,
+            build: Some(version.to_string()),
+            state: if current { "installed" } else { "stale" }.into(),
+            reason: (!current).then(|| {
+                format!(
+                    "the box binary does not report installed build {}",
+                    crate::VERSION
+                )
+            }),
+        });
+    } else {
+        proofs.push(ProcessProof {
+            machine: BOX_MACHINE.into(),
+            process: "herdr-ade binary".into(),
+            pid: None,
+            build: None,
+            state: "unknown".into(),
+            reason: Some("the box did not report its binary version".into()),
+        });
+    }
+    if let Some(value) = out
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER="))
+    {
+        let (pid, build) = value.split_once(':').unwrap_or(("", value));
+        proofs.push(ProcessProof {
+            machine: BOX_MACHINE.into(),
+            process: "ticker".into(),
+            pid: pid.parse().ok(),
+            build: Some(build.to_string()),
+            state: "running".into(),
+            reason: None,
+        });
+    } else {
+        proofs.push(ProcessProof {
+            machine: BOX_MACHINE.into(),
+            process: "ticker".into(),
+            pid: None,
+            build: None,
+            state: "unknown".into(),
+            reason: Some(
+                out.stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER_UNKNOWN="))
+                    .unwrap_or("the box did not report ticker evidence")
+                    .to_string(),
+            ),
+        });
+    }
+    proofs
+}
+
+#[derive(Debug, Clone)]
+struct InstalledBuild {
+    repo: String,
+    machine: String,
+    head: String,
+}
+
+fn round_in_build(ctx: &Ctx, repo: &str, round_head: &str, build_head: &str) -> Result<bool> {
+    let out = ctx.runner.run(
+        &Cmd::new("git", VERSION_TIMEOUT)
+            .args([
+                "-C",
+                repo,
+                "merge-base",
+                "--is-ancestor",
+                round_head,
+                build_head,
+            ])
+            .exit_meaning(crate::runner::ExitMeaning::Boolean),
+    )?;
+    out.boolean_answer().context("git ancestry check failed")
+}
+
+fn record_task_proofs(
+    ctx: &Ctx,
+    builds: &[InstalledBuild],
+    processes: &[ProcessProof],
+) -> Result<Vec<TaskInstallProof>> {
+    let processes_pass = !processes.is_empty()
+        && processes
+            .iter()
+            .all(|proof| proof.state == "running" || proof.state == "installed");
+    let process_lines: Vec<String> = processes
+        .iter()
+        .map(|proof| {
+            format!(
+                "{}:{}:{} ({})",
+                proof.machine,
+                proof.process,
+                proof.build.as_deref().unwrap_or("unknown"),
+                proof.state
+            )
+        })
+        .collect();
+    let mut recorded = Vec::new();
+    for slug in crate::project::list_slugs(&ctx.root) {
+        let project = crate::project::Project::load(&ctx.root, &slug)?;
+        for task in crate::task::list_with_errors(&project).0 {
+            if !crate::task::required_states(&project, &task)?
+                .iter()
+                .any(|state| state == "installed")
+            {
+                continue;
+            }
+            let rounds: Vec<_> = task
+                .rounds
+                .iter()
+                .filter_map(|id| crate::round::load(&project, id).ok())
+                .filter(|round| round.phase == crate::contracts::RoundPhase::Merged)
+                .collect();
+            let mut task_builds = Vec::new();
+            for build in builds {
+                let mut carried = false;
+                for round in &rounds {
+                    let same_repo = canonical_or(&round.repo) == canonical_or(&build.repo);
+                    let head = round.merge.as_ref().and_then(|merge| merge.head.as_deref());
+                    if same_repo
+                        && let Some(head) = head
+                        && round_in_build(ctx, &build.repo, head, &build.head)?
+                    {
+                        carried = true;
+                        break;
+                    }
+                }
+                if carried {
+                    crate::task::record_installed(&project, &task.id, &build.machine, &build.head)?;
+                    task_builds.push(build.clone());
+                    recorded.push(TaskInstallProof {
+                        project: slug.clone(),
+                        task: task.id.clone(),
+                        machine: build.machine.clone(),
+                        build: build.head.clone(),
+                        running_processes: processes_pass,
+                    });
+                }
+            }
+            if processes_pass && !task_builds.is_empty() {
+                let task_machines = task_builds
+                    .iter()
+                    .map(|build| build.machine.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                crate::task::record_running(
+                    &project,
+                    &task.id,
+                    task_machines,
+                    process_lines.clone(),
+                )?;
+            }
+        }
+    }
+    Ok(recorded)
 }
 
 /// `ha harness install`: build every harness repository after a merge and
@@ -450,22 +945,44 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
     .map(|profile| profile.target);
     let mut fork = false;
     let mut installed = Vec::new();
+    let mut builds = Vec::new();
     let mut warnings = Vec::new();
     for repo in &repos {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
+        let commit = repo_head(ctx, &repo.path)?;
         local_build(ctx, &repo.path, kind)?;
+        let after_build = repo_head(ctx, &repo.path)?;
+        if after_build != commit {
+            bail!(
+                "harness_build_changed: {} moved from {commit} to {after_build} while it was building",
+                repo.path
+            );
+        }
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin)?;
-            notice_stale_self(&ctx.env.home.join(".local/bin").join(bin), &running)?;
+            reexec_if_replaced(&ctx.env.home.join(".local/bin").join(bin), &running)?;
         }
+        builds.push(InstalledBuild {
+            repo: repo.path.clone(),
+            machine: "local".into(),
+            head: commit.clone(),
+        });
         let mut binaries = Vec::new();
         for bin in kind.binaries() {
             binaries.push(installed_version(ctx, bin)?);
         }
+        let mut box_commit = None;
         let box_installed = match (&box_target, &repo.box_path) {
             (Some(target), Some(box_path)) => {
-                box_build(ctx, target, box_path, kind)?;
+                box_commit = box_build(ctx, target, box_path, kind)?;
+                if let Some(head) = &box_commit {
+                    builds.push(InstalledBuild {
+                        repo: repo.path.clone(),
+                        machine: BOX_MACHINE.into(),
+                        head: head.clone(),
+                    });
+                }
                 true
             }
             (Some(_), None) => {
@@ -481,18 +998,32 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
             path: repo.path.clone(),
             kind: kind.name().into(),
             binaries,
+            commit,
             box_path: repo.box_path.clone(),
             box_installed,
+            box_commit,
         });
     }
     if let Some(target) = &box_target {
         box_settings(ctx, target)?;
     }
+    let plugin_version = installed
+        .iter()
+        .flat_map(|repo| &repo.binaries)
+        .find(|binary| binary.name == "herdr-ade")
+        .map(|binary| binary.version.clone());
+    let mut processes = local_process_proofs(ctx, plugin_version.as_deref());
+    if let Some(target) = &box_target {
+        processes.extend(box_process_proofs(ctx, target));
+    }
+    let tasks = record_task_proofs(ctx, &builds, &processes)?;
     Ok(InstallOutcome {
         repositories: installed,
         box_settings_installed: box_target.is_some(),
         box_target,
         live_handoff_required: fork,
+        processes,
+        tasks,
         warnings,
     })
 }
@@ -500,7 +1031,7 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok};
     use std::os::unix::fs::PermissionsExt;
 
     /// Write an executable `zig` that answers `zig version` with `version`.
@@ -627,7 +1158,34 @@ mod tests {
     }
 
     #[test]
-    fn the_installer_notices_it_replaced_its_own_binary() {
+    fn an_unreachable_box_has_unknown_process_state() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("ssh", fail(255, "connection refused"));
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        let proofs = box_process_proofs(&ctx, "box");
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].machine, BOX_MACHINE);
+        assert_eq!(proofs[0].state, "unknown");
+        assert_eq!(proofs[0].build, None);
+        assert!(
+            proofs[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("connection refused"))
+        );
+    }
+
+    #[test]
+    fn the_installer_reexecutes_when_it_replaced_its_own_binary() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("herdr-ade");
         std::fs::write(&exe, b"old image").unwrap();
@@ -636,21 +1194,126 @@ mod tests {
             hash: crate::thread::sha256_hex(b"old image"),
         };
 
-        // The installed bytes are unchanged: nothing to report.
-        notice_stale_self(&exe, &running).unwrap();
+        assert!(!replaced_self(&exe, &running).unwrap());
 
-        // The install replaced this process's own file: refuse to continue on
-        // the old image and name the command that runs the new one.
+        // The same invocation must continue in the new image rather than
+        // refusing and asking for a second shell command.
         std::fs::write(&exe, b"new image").unwrap();
-        let error = notice_stale_self(&exe, &running).unwrap_err();
-        assert!(crate::refusal::is(&error));
-        let message = error.to_string();
-        assert!(message.contains("harness_install_stale_self"), "{message}");
-        assert!(message.contains("ha harness install"), "{message}");
+        assert!(replaced_self(&exe, &running).unwrap());
 
         // A sibling binary is not this process.
         let sibling = dir.path().join("herdr-pi");
         std::fs::write(&sibling, b"new image").unwrap();
-        notice_stale_self(&sibling, &running).unwrap();
+        assert!(!replaced_self(&sibling, &running).unwrap());
+    }
+
+    #[test]
+    fn a_talk_screen_on_the_old_inode_is_reported_as_stale() {
+        assert!(same_executable_image(41, 41));
+        assert!(!same_executable_image(40, 41));
+    }
+
+    #[test]
+    fn install_evidence_lands_only_on_tasks_carried_by_the_build() {
+        use crate::contracts::{MergeIntent, MergePhase, RoundPhase, RoundRecord};
+
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (mut settings, body) = project.read_project_md().unwrap();
+        settings.task_states = crate::task::STATES
+            .iter()
+            .map(|state| state.to_string())
+            .collect();
+        std::fs::write(
+            project.project_md(),
+            format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        let task_dir = project.dir().join("tasks");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        for (id, round) in [("job-0001", "r1"), ("job-0002", "r2")] {
+            let task = crate::task::Task {
+                schema: 1,
+                id: id.into(),
+                title: format!("Install {id}."),
+                authority: vec!["request:q-1".into()],
+                acceptance: vec!["The installed build carries the change.".into()],
+                rounds: vec![round.into()],
+                repo: Some(repo.to_string_lossy().into_owned()),
+                created: crate::project::now(),
+                ..crate::task::Task::default()
+            };
+            std::fs::write(
+                task_dir.join(format!("{id}.toml")),
+                toml::to_string(&task).unwrap(),
+            )
+            .unwrap();
+        }
+        let rounds = project.state_dir().join("rounds");
+        std::fs::create_dir_all(&rounds).unwrap();
+        for (id, head) in [("r1", "yes-head"), ("r2", "no-head")] {
+            let round = RoundRecord {
+                phase: RoundPhase::Merged,
+                round: id.into(),
+                branch: "main".into(),
+                repo: repo.to_string_lossy().into_owned(),
+                merge: Some(MergeIntent {
+                    op: "op".into(),
+                    expected_old: "old".into(),
+                    candidate: "candidate".into(),
+                    verdict: "verdict".into(),
+                    phase: MergePhase::Checkpointed,
+                    merged: Some(head.into()),
+                    checkpoint: None,
+                    head: Some(head.into()),
+                }),
+                ..RoundRecord::default()
+            };
+            std::fs::write(
+                rounds.join(format!("{id}.toml")),
+                toml::to_string(&round).unwrap(),
+            )
+            .unwrap();
+        }
+        world.runner.on("yes-head installed-head", ok(""));
+        world.runner.on("no-head installed-head", fail(1, ""));
+        let proofs = record_task_proofs(
+            &world.ctx(),
+            &[
+                InstalledBuild {
+                    repo: repo.to_string_lossy().into_owned(),
+                    machine: "local".into(),
+                    head: "installed-head".into(),
+                },
+                InstalledBuild {
+                    repo: "/unrelated/repository".into(),
+                    machine: BOX_MACHINE.into(),
+                    head: "other-head".into(),
+                },
+            ],
+            &[ProcessProof {
+                machine: "local".into(),
+                process: "ticker".into(),
+                pid: Some(42),
+                build: Some("installed-head".into()),
+                state: "running".into(),
+                reason: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].task, "job-0001");
+        let carried = crate::task::load(&project, "job-0001").unwrap();
+        assert_eq!(carried.installed.len(), 1);
+        assert_eq!(carried.running[0].machines, ["local"]);
+        assert!(
+            crate::task::load(&project, "job-0002")
+                .unwrap()
+                .installed
+                .is_empty()
+        );
     }
 }

@@ -65,7 +65,7 @@ You do not pick a recipe on `thread start`. Write the full task with scope, cons
 
 ### Harness evolves
 
-Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file. A flaw in the harness that you hit is fixed in the harness through a lane and a round from your own project, never written into memory as a workaround; a lane may run on a harness repository even when your `PROJECT.md` does not list it, and after the merge that lands the fix run `ha harness install` to build and install the harness.
+Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file. A flaw in the harness that you hit is fixed in the harness through a lane and a round from your own project, never written into memory as a workaround; a lane may run on a harness repository even when your `PROJECT.md` does not list it. After the merge, run `ha harness install` once. It installs both machines, replaces their tickers, checks the running project screens and records installation proof on the tasks carried by that build.
 
 ## Tasks
 
@@ -73,7 +73,8 @@ A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance
 
 - Add work with `hp task add <slug> --title "<plain title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. Repeat `--request` and `--acceptance`; add `--repo` and `--plan-step` when they apply.
 - Start ordinary lanes with `--job <job-NNNN>`. To create and start in one command, omit `--job` and add `--request`, `--acceptance` and optional `--plan-step` to `thread start`.
-- Use `hp task list|show`, `hp task note`, and `hp task evidence --kind installed|verified --command "<command checked>"`. Verification also names each one-based `--acceptance` it checked.
+- Use `hp task list|show`, `hp task note`, and `hp task evidence --kind verified --command "<command checked>"`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
+- Use `hp task adopt <slug> <job-NNNN> --thread <t-NNNN>` to attach a lane and its rounds when that lane predates task records.
 - `context`, the plan card, generated `TASKS.md`, and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, and `unknown` are evidence words, not statuses you set.
 - A repository's `task_states` in `PROJECT.md` says which milestones apply. Do not record install evidence for a repository without an install state.
 

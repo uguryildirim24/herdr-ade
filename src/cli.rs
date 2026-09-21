@@ -1452,7 +1452,14 @@ enum TaskCommand {
         id: String,
         text: String,
     },
-    /// Record installation or per-condition verification evidence
+    /// Link a thread and its historical rounds to this task
+    Adopt {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        thread: String,
+    },
+    /// Record per-condition verification evidence
     Evidence {
         slug: String,
         id: String,
@@ -1612,7 +1619,11 @@ enum TickerCommand {
     /// Start the ticker if it is not running (does nothing when there are no projects)
     Start,
     /// Run the ticker loop in the foreground
-    Run,
+    Run {
+        /// Wait for the previous ticker during an internal zero-gap handoff
+        #[arg(long, hide = true)]
+        handoff: bool,
+    },
     /// Ask the running ticker to exit and wait for it
     Stop,
     /// Show the running ticker's version, root and tool resolution
@@ -2072,6 +2083,17 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     "",
                 )
             }
+            TaskCommand::Adopt { slug, id, thread } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::task::adopt(&project, &id, &thread)?;
+                let view = crate::task::view(&project, record);
+                crate::output::success(
+                    Some("adopted"),
+                    &serde_json::json!({ "task": view, "thread": thread }),
+                    &format!("{thread} adopted into {}\n", view.record.id),
+                    "",
+                )
+            }
             TaskCommand::Evidence {
                 slug,
                 id,
@@ -2426,7 +2448,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         },
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
-            TickerCommand::Run => ticker::run(&ctx),
+            TickerCommand::Run { handoff } => ticker::run(&ctx, handoff),
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },

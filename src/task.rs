@@ -30,6 +30,21 @@ pub(crate) struct Evidence {
     pub(crate) command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) acceptance: Vec<usize>,
+    /// Installation evidence is machine-specific. Historical and verification
+    /// evidence has no machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) machine: Option<String>,
+    /// The exact repository commit carried by that machine's build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) build: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunningEvidence {
+    pub(crate) at: String,
+    pub(crate) command: String,
+    pub(crate) machines: Vec<String>,
+    pub(crate) processes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +64,10 @@ pub(crate) struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) repo: Option<String>,
     pub(crate) installed: Vec<Evidence>,
+    /// A successful check that every running harness process uses an installed
+    /// image. This is deliberately separate from acceptance verification.
+    #[serde(default)]
+    pub(crate) running: Vec<RunningEvidence>,
     pub(crate) verified: Vec<Evidence>,
     pub(crate) created: String,
 }
@@ -67,6 +86,7 @@ impl Default for Task {
             plan_step: None,
             repo: None,
             installed: Vec::new(),
+            running: Vec::new(),
             verified: Vec::new(),
             created: String::new(),
         }
@@ -381,6 +401,49 @@ pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<
     load(project, &task.id)
 }
 
+/// Attach a historical thread and every round carrying it to a stable task.
+/// Unlike an ordinary start, adoption also establishes the task repository
+/// when the task did not have one yet.
+pub(crate) fn adopt(project: &Project, id: &str, thread_id: &str) -> Result<Task> {
+    let thread = crate::thread::load(project, thread_id)
+        .with_context(|| format!("task_adopt: no thread `{thread_id}`"))?;
+    let _lock = project.lock()?;
+    for task in list_with_errors(project).0 {
+        if task.attempts.iter().any(|attempt| attempt == thread_id) {
+            return Err(crate::refusal::error(format!(
+                "task_adopt_linked: `{thread_id}` already belongs to `{}`",
+                task.id
+            )));
+        }
+    }
+    let mut task = load(project, id)?;
+    if let Some(repo) = task.repo.as_deref() {
+        let expected = std::fs::canonicalize(repo).unwrap_or_else(|_| PathBuf::from(repo));
+        let actual =
+            std::fs::canonicalize(&thread.repo).unwrap_or_else(|_| PathBuf::from(&thread.repo));
+        if expected != actual {
+            return Err(crate::refusal::error(format!(
+                "task_adopt_repository: `{thread_id}` works in `{}`, not `{repo}`",
+                thread.repo
+            )));
+        }
+    }
+    if task.repo.is_none() && !thread.repo.is_empty() {
+        task.repo = Some(thread.repo.clone());
+    }
+    task.attempts.push(thread_id.to_string());
+    write(project, &task)?;
+    drop(_lock);
+    refresh_tasks_md(project)?;
+    for round in crate::round::list(project)
+        .into_iter()
+        .filter(|round| round.carries(thread_id))
+    {
+        link_round_for_thread(project, &round.round, thread_id)?;
+    }
+    load(project, &task.id)
+}
+
 pub(crate) fn link_round_for_thread(project: &Project, round: &str, thread: &str) -> Result<()> {
     if let Some(task) = list_with_errors(project)
         .0
@@ -428,6 +491,13 @@ pub(crate) fn required_states(project: &Project, task: &Task) -> Result<Vec<Stri
     Ok(states)
 }
 
+fn running_current(task: &Task) -> bool {
+    let latest_install = task.installed.iter().map(|evidence| &evidence.at).max();
+    let latest_running = task.running.iter().map(|evidence| &evidence.at).max();
+    latest_install
+        .is_none_or(|installed| latest_running.is_some_and(|running| running >= installed))
+}
+
 fn next_for(state: State, required: &[String], task: &Task) -> String {
     match state {
         State::Open => "start an attempt".into(),
@@ -446,6 +516,9 @@ fn next_for(state: State, required: &[String], task: &Task) -> String {
                 Some("reviewed") => "put the attempt in a review round".into(),
                 Some("merged") => "merge its reviewed round".into(),
                 Some("installed") => "record installation evidence".into(),
+                Some("verified") if !running_current(task) => {
+                    "check the running harness processes".into()
+                }
                 Some("verified") => {
                     let done: BTreeSet<usize> = task
                         .verified
@@ -621,7 +694,10 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         "reviewed" => reviewed,
         "merged" => merged,
         "installed" => !task.installed.is_empty(),
-        "verified" => all_verified,
+        "verified" => {
+            all_verified
+                && (!required.iter().any(|state| state == "installed") || running_current(&task))
+        }
         _ => false,
     };
     let mut state = State::Finished;
@@ -658,7 +734,6 @@ pub(crate) fn views(project: &Project) -> (Vec<View>, Vec<anyhow::Error>) {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum EvidenceKind {
-    Installed,
     Verified,
 }
 
@@ -676,19 +751,16 @@ pub(crate) fn record_evidence(
     }
     let before = view(project, load(project, id)?);
     let required = required_states(project, &before.record)?;
-    let word = match kind {
-        EvidenceKind::Installed => "installed",
-        EvidenceKind::Verified => "verified",
-    };
+    let word = "verified";
     if !required.iter().any(|state| state == word) {
         return Err(crate::refusal::error(format!(
             "task_evidence: `{word}` is not enabled for this task's repository"
         )));
     }
-    let prerequisite = match kind {
-        EvidenceKind::Installed => "merged",
-        EvidenceKind::Verified if required.iter().any(|state| state == "installed") => "installed",
-        EvidenceKind::Verified => "merged",
+    let prerequisite = if required.iter().any(|state| state == "installed") {
+        "installed"
+    } else {
+        "merged"
     };
     let reached = STATES
         .iter()
@@ -704,25 +776,24 @@ pub(crate) fn record_evidence(
             before.state.word()
         )));
     }
-    if matches!(kind, EvidenceKind::Verified) {
-        if acceptance.is_empty() {
-            return Err(crate::refusal::error(
-                "task_evidence: verification needs at least one --acceptance number",
-            ));
-        }
-        if acceptance
-            .iter()
-            .any(|index| *index == 0 || *index > before.record.acceptance.len())
-        {
-            return Err(crate::refusal::error(format!(
-                "task_evidence: an acceptance number is outside 1..={}",
-                before.record.acceptance.len()
-            )));
-        }
-    } else if !acceptance.is_empty() {
+    if required.iter().any(|state| state == "installed") && !running_current(&before.record) {
         return Err(crate::refusal::error(
-            "task_evidence: installation evidence does not take acceptance numbers",
+            "task_evidence: verification needs a successful running-processes check after installation",
         ));
+    }
+    if acceptance.is_empty() {
+        return Err(crate::refusal::error(
+            "task_evidence: verification needs at least one --acceptance number",
+        ));
+    }
+    if acceptance
+        .iter()
+        .any(|index| *index == 0 || *index > before.record.acceptance.len())
+    {
+        return Err(crate::refusal::error(format!(
+            "task_evidence: an acceptance number is outside 1..={}",
+            before.record.acceptance.len()
+        )));
     }
     let mut acceptance = acceptance;
     acceptance.sort_unstable();
@@ -732,11 +803,48 @@ pub(crate) fn record_evidence(
             at: project::now(),
             command: command.trim().to_string(),
             acceptance,
+            machine: None,
+            build: None,
         };
-        match kind {
-            EvidenceKind::Installed => task.installed.push(evidence),
-            EvidenceKind::Verified => task.verified.push(evidence),
-        }
+        let EvidenceKind::Verified = kind;
+        task.verified.push(evidence);
+        Ok(())
+    })
+}
+
+/// Record one machine's installed build without asking the coordinator to
+/// translate a successful install back into task state.
+pub(crate) fn record_installed(
+    project: &Project,
+    id: &str,
+    machine: &str,
+    build: &str,
+) -> Result<Task> {
+    update(project, id, |task| {
+        task.installed.push(Evidence {
+            at: project::now(),
+            command: "ha harness install".into(),
+            acceptance: Vec::new(),
+            machine: Some(machine.to_string()),
+            build: Some(build.to_string()),
+        });
+        Ok(())
+    })
+}
+
+pub(crate) fn record_running(
+    project: &Project,
+    id: &str,
+    machines: Vec<String>,
+    processes: Vec<String>,
+) -> Result<Task> {
+    update(project, id, |task| {
+        task.running.push(RunningEvidence {
+            at: project::now(),
+            command: "ha harness install".into(),
+            machines,
+            processes,
+        });
         Ok(())
     })
 }
@@ -870,6 +978,22 @@ pub(crate) fn render(view: &View) -> String {
     }
     if let Some(class) = view.failure_class {
         out.push_str(&format!("failure: {}\n", class.plain()));
+    }
+    for evidence in &view.record.installed {
+        if let (Some(machine), Some(build)) = (&evidence.machine, &evidence.build) {
+            out.push_str(&format!("installed: {machine} runs {build}\n"));
+        }
+    }
+    if running_current(&view.record) {
+        if let Some(evidence) = view.record.running.last() {
+            out.push_str(&format!(
+                "running processes: checked on {} ({})\n",
+                evidence.machines.join(", "),
+                evidence.processes.join(", ")
+            ));
+        }
+    } else if !view.record.installed.is_empty() {
+        out.push_str("running processes: unknown; verification is blocked\n");
     }
     out
 }
@@ -1052,14 +1176,10 @@ mod tests {
         assert_eq!(merged.next, "none");
         // This repository inherits a workflow with no install state.
         assert!(
-            record_evidence(
-                &fx.project,
-                "job-0001",
-                EvidenceKind::Installed,
-                "install",
-                vec![]
-            )
-            .is_err()
+            !required_states(&fx.project, &merged.record)
+                .unwrap()
+                .iter()
+                .any(|state| state == "installed")
         );
 
         let (mut settings, body) = fx.project.read_project_md().unwrap();
@@ -1070,15 +1190,21 @@ mod tests {
             format!("+++\n{front}+++\n\n{body}"),
         )
         .unwrap();
-        let installed = record_evidence(
+        let installed = record_installed(
             &fx.project,
             "job-0001",
-            EvidenceKind::Installed,
-            "ha harness install",
-            vec![],
+            "local",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .unwrap();
         assert_eq!(view(&fx.project, installed).state, State::Installed);
+        record_running(
+            &fx.project,
+            "job-0001",
+            vec!["local".into()],
+            vec!["local:ticker:running".into()],
+        )
+        .unwrap();
         let verified = record_evidence(
             &fx.project,
             "job-0001",
@@ -1109,6 +1235,60 @@ mod tests {
         refresh_tasks_md(&fx.project).unwrap();
         let generated = std::fs::read_to_string(fx.project.dir().join("TASKS.md")).unwrap();
         assert!(generated.contains("job-0001` Ship the checked change. — verified"));
+    }
+
+    #[test]
+    fn adopt_links_a_historical_thread_and_its_round_and_refuses_reuse() {
+        use crate::round::testkit::fixture;
+        let fx = fixture();
+        let mut task = record(&fx.project, "job-0001");
+        task.repo = Some(fx.repo.to_string_lossy().into_owned());
+        write(&fx.project, &task).unwrap();
+        let (lane, _sha) = fx.lane(1);
+        crate::thread::update(&fx.project, &lane, |thread| {
+            thread.repo = fx.repo.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        crate::round::open(
+            &fx.world.ctx(),
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The historical change is reviewed.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        crate::round::admit(&fx.world.ctx(), "demo", "r1", &lane).unwrap();
+
+        let adopted = adopt(&fx.project, "job-0001", &lane).unwrap();
+        assert_eq!(adopted.attempts.as_slice(), std::slice::from_ref(&lane));
+        assert_eq!(adopted.rounds, ["r1"]);
+
+        let mut second = record(&fx.project, "job-0002");
+        second.repo = Some(fx.repo.to_string_lossy().into_owned());
+        write(&fx.project, &second).unwrap();
+        let error = adopt(&fx.project, "job-0002", &lane).unwrap_err();
+        assert!(error.to_string().contains("task_adopt_linked"), "{error:#}");
+    }
+
+    #[test]
+    fn adopt_refuses_a_thread_from_another_repository() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let mut task = record(&project, "job-0001");
+        task.repo = Some("/expected/repository".into());
+        write(&project, &task).unwrap();
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.repo = "/other/repository".into();
+        })
+        .unwrap();
+        let error = adopt(&project, "job-0001", &thread.id).unwrap_err();
+        assert!(
+            error.to_string().contains("task_adopt_repository"),
+            "{error:#}"
+        );
     }
 
     #[test]

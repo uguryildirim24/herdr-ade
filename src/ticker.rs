@@ -22,6 +22,7 @@ use crate::{inbox, thread, threads};
 
 const TICK: Duration = crate::pi::doctor::READINESS_CACHE_TTL;
 const STOP_WAIT: Duration = Duration::from_secs(60);
+const HANDOFF_READY_WAIT: Duration = Duration::from_secs(10);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
@@ -35,6 +36,10 @@ fn stop_path(root: &Path) -> PathBuf {
 
 fn log_path(root: &Path) -> PathBuf {
     root.join(".ticker.log")
+}
+
+fn handoff_path(root: &Path) -> PathBuf {
+    root.join(".ticker.handoff")
 }
 
 /// What the lock holder writes into the lock file, for `ticker status` and
@@ -128,10 +133,7 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
             let _ = std::fs::remove_file(stop_path(root));
             spawn(root)
         }
-        StartAction::StopThenSpawn => {
-            stop(root)?;
-            spawn(root)
-        }
+        StartAction::StopThenSpawn => replace(root),
     }
 }
 
@@ -141,12 +143,13 @@ unsafe extern "C" {
 
 /// `ticker run`, detached: null stdio and a new session, so it does not die
 /// with the process group of whatever started it (an agent's shell tool).
-fn spawn_command(binary: &Path, root: &Path) -> Command {
+fn spawn_command(binary: &Path, root: &Path, handoff: bool) -> Command {
     let mut command = Command::new(binary);
+    command.arg("--root").arg(root).args(["ticker", "run"]);
+    if handoff {
+        command.arg("--handoff");
+    }
     command
-        .arg("--root")
-        .arg(root)
-        .args(["ticker", "run"])
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -165,10 +168,10 @@ fn spawn_command(binary: &Path, root: &Path) -> Command {
     command
 }
 
-fn spawn(root: &Path) -> Result<()> {
+fn detached_command(root: &Path, handoff: bool) -> Result<Command> {
     use std::os::unix::process::CommandExt;
     let binary = std::env::current_exe().context("could not find this binary's own path")?;
-    let mut command = spawn_command(&binary, root);
+    let mut command = spawn_command(&binary, root, handoff);
     // SAFETY: setsid is async-signal-safe and touches no memory.
     unsafe {
         command.pre_exec(|| {
@@ -176,8 +179,77 @@ fn spawn(root: &Path) -> Result<()> {
             Ok(())
         });
     }
-    command.spawn().context("could not start the ticker")?;
+    Ok(command)
+}
+
+fn spawn(root: &Path) -> Result<()> {
+    detached_command(root, false)?
+        .spawn()
+        .context("could not start the ticker")?;
     Ok(())
+}
+
+/// Start the replacement far enough to prove that it can initialize before
+/// asking the current ticker to leave. The initialized child waits for the
+/// parent's release marker, so there is always one viable ticker throughout
+/// the handoff.
+fn replace(root: &Path) -> Result<()> {
+    let ready = handoff_path(root);
+    let _ = std::fs::remove_file(&ready);
+    let mut child = detached_command(root, true)?
+        .spawn()
+        .context("could not start the replacement ticker")?;
+    let deadline = Instant::now() + HANDOFF_READY_WAIT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("could not inspect the replacement ticker")?
+        {
+            let _ = std::fs::remove_file(&ready);
+            bail!("replacement ticker exited before handoff readiness ({status})");
+        }
+        if std::fs::read(&ready).is_ok_and(|value| value == b"ready") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("replacement ticker did not become ready before the handoff");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if let Err(error) = stop(root) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&ready);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::write(&ready, b"go") {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&ready);
+        return Err(error).context("could not release the replacement ticker");
+    }
+    let deadline = Instant::now() + HANDOFF_READY_WAIT;
+    loop {
+        if matches!(lock_state(root), LockState::Held(ref info) if info.version == crate::VERSION) {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("could not inspect the replacement ticker")?
+        {
+            let _ = std::fs::remove_file(&ready);
+            bail!("replacement ticker exited during handoff ({status})");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&ready);
+            bail!("replacement ticker did not take the ticker lock");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Asks the running ticker to exit and waits for the lock to be released.
@@ -264,7 +336,7 @@ impl Log {
 
 /// The loop. Exits when another ticker holds the lock, when the stop file
 /// appears, or when no project has had a reachable session for five minutes.
-pub(crate) fn run(ctx: &Ctx) -> Result<()> {
+pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
     if project::list_slugs(&ctx.root).is_empty() {
         return Ok(());
     }
@@ -293,7 +365,25 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         .read(true)
         .write(true)
         .open(lock_path(root))?;
-    if lock.try_lock().is_err() {
+    if handoff {
+        let marker = handoff_path(root);
+        std::fs::write(&marker, b"ready")?;
+        let deadline = Instant::now() + STOP_WAIT + HANDOFF_READY_WAIT;
+        loop {
+            // The parent writes `go` only after the old ticker has released
+            // its lock. Until then this fully initialized child stays viable.
+            let released = std::fs::read(&marker).is_ok_and(|value| value == b"go");
+            if released && lock.try_lock().is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = std::fs::remove_file(&marker);
+                bail!("ticker handoff timed out waiting for the previous ticker");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::remove_file(&marker);
+    } else if lock.try_lock().is_err() {
         return Ok(());
     }
     let path_var = ctx.env.var("PATH").unwrap_or("").to_string();
@@ -1288,7 +1378,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("projects-root");
         std::fs::create_dir(&root).unwrap();
-        let command = spawn_command(Path::new("/bin/true"), &root);
+        let command = spawn_command(Path::new("/bin/true"), &root, false);
         assert_eq!(command.get_current_dir(), Some(root.as_path()));
     }
 
@@ -1360,12 +1450,12 @@ mod tests {
         };
         start(&ctx).unwrap();
         assert!(!missing.exists());
-        run(&ctx).unwrap();
+        run(&ctx, false).unwrap();
         assert!(!missing.exists());
 
         std::fs::create_dir(&missing).unwrap();
         start(&ctx).unwrap();
-        run(&ctx).unwrap();
+        run(&ctx, false).unwrap();
         assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
     }
 
