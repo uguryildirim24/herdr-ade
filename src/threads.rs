@@ -1555,7 +1555,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         if pane == "cleanup_pending" {
             worktree = "kept".into();
         } else {
-            let inspection = inspect_worktree_for_removal(ctx, &record)?;
+            let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
             let kept_reason = if !inspection.dirty.is_empty() {
                 Some(format!(
                     "worktree_dirty: uncommitted changes in {}; not removing ({})",
