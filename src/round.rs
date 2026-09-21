@@ -863,6 +863,7 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
         policy_hash,
         opened: project::now(),
         repo: repo_path.to_string_lossy().into_owned(),
+        rejections: Some(0),
         ..Default::default()
     };
     {
@@ -1137,6 +1138,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
                     &format!("verdict:{verdict}"),
                     &verdict_summary(&round, &verdict),
                     (verdict == "MERGE").then(|| verdict_say(&record)),
+                    verdict == "REJECT",
                 )?;
                 continue;
             }
@@ -1157,6 +1159,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<()> {
                             "Round {round}: the reviewer thread {reviewer} is gone; restore its recorded review workflow with `{prefix} thread restart {slug} {reviewer}` (reopen it first if resolved)"
                         ),
                         None,
+                        false,
                     )?;
                 }
                 ReviewerState::Alive => {}
@@ -1618,6 +1621,7 @@ fn reviewer_start_failed(
             "Round {round}: the reviewer did not start ({reason}); it is retried on the next pass, {failures} of {MAX_REVIEWER_START_FAILURES} failures"
         ),
         None,
+        false,
     )?;
     Ok(failures)
 }
@@ -1638,6 +1642,7 @@ fn reviewer_start_exhausted(ctx: &Ctx, project: &Project, round: &str, reason: &
             project.slug
         ),
         None,
+        false,
     )
 }
 
@@ -1656,6 +1661,7 @@ fn announce_once(
     token: &str,
     summary: &str,
     say_what: Option<String>,
+    rejected: bool,
 ) -> Result<()> {
     {
         let _lock = project.lock()?;
@@ -1663,6 +1669,9 @@ fn announce_once(
         let already = record.announced.as_deref() == Some(token);
         record.announced = Some(token.to_string());
         record.attention = summary.to_string();
+        if rejected && !already {
+            *record.rejections.get_or_insert(0) += 1;
+        }
         save(project, &record)?;
         if already {
             return Ok(());
@@ -1783,6 +1792,13 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     // A repair only supersedes a completed review. Without a sealed verdict,
     // a repeated manual command must not clear the live reviewer.
     let earlier = completed_review(&project, &record, &git);
+    let earlier_reject = earlier.as_ref().is_some_and(|(_, verdict)| {
+        git.show_file(verdict, &verdict_path(round))
+            .ok()
+            .flatten()
+            .and_then(|text| parse_verdict(&text).ok())
+            .is_some_and(|parsed| parsed.verdict == "REJECT")
+    });
     let (b, review_branch, worktree, repair) = {
         let _repo = repo_lock(&git)?;
         let head = git
@@ -1959,6 +1975,9 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         // A new review revision is a fresh automatic-start cycle. Failures
         // from the superseded review must not consume this one's retry bound.
         current.reviewer_start_failures = 0;
+        if earlier_reject {
+            current.rejections = Some(current.rejections.unwrap_or(0).max(1));
+        }
         save(&project, &current)?;
     }
     let _ = crate::board::refresh(ctx, &project);
@@ -4429,8 +4448,12 @@ mod tests {
         let policy_path = fx.world.ctx().config_dir.join("routing.json");
         let mut policy: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&policy_path).unwrap()).unwrap();
-        policy["models"]["test_strong"] =
-            serde_json::json!({"tier":2,"description":"careful helper"});
+        policy["models"]["test_strong"] = serde_json::json!({
+            "tier":2,
+            "coding_index":77.2,
+            "price_per_million":2.0,
+            "description":"careful helper"
+        });
         policy["role_floors"] = serde_json::json!({"reviewer":"test_strong"});
         let config_path = fx.world.ctx().config_dir.join("config.toml");
         let config = std::fs::read_to_string(&config_path).unwrap();
@@ -4626,6 +4649,7 @@ mod tests {
         assert_eq!(outcome.review_branch, "review/r1-2");
         let reviewed = load(&fx.project, "r1").unwrap();
         assert!(reviewed.reviewer.is_none());
+        assert_eq!(reviewed.rejections, Some(1));
         assert_eq!(
             reviewed.reviewer_start_failures, 0,
             "the new review gets a fresh start bound"
