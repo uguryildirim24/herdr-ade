@@ -492,14 +492,16 @@ pub(crate) struct CourierOutcome {
 /// the helper and the batched `scp`.
 const COURIER_HELPER: &str = r#"set -u
 root=__ROOT__
-herdr_bin="$HOME/.local/bin/herdr"
+PATH=__PATH__; export PATH
+herdr_bin=$(command -v herdr 2>/dev/null || true)
+ade_bin=__ADE_BIN__
 cursor=$(mktemp)
 trap 'rm -f "$cursor"' EXIT
 cat > "$cursor"
 printf 'boot\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
 printf 'free\t%s\n' "${avail:-0}"
-"$HOME/.local/bin/herdr-ade" --root "$HOME/.herdr-ade" recover >/dev/null 2>&1 || true
+"$ade_bin" --root "$root" recover >/dev/null 2>&1 || true
 if [ -x "$herdr_bin" ]; then
   a=$("$herdr_bin" --session __SESSION__ agent list 2>/dev/null | tr -d '\n')
   p=$("$herdr_bin" --session __SESSION__ pane list 2>/dev/null | tr -d '\n')
@@ -544,9 +546,11 @@ for f in "$root"/*/.state/bootstrap/*.json; do
 done
 "#;
 
-fn courier_helper(box_root: &str, session: &str) -> String {
+fn courier_helper(machine: &crate::remote::MachineDeclaration, session: &str) -> String {
     COURIER_HELPER
-        .replace("__ROOT__", &crate::remote::quote(box_root))
+        .replace("__ROOT__", &crate::remote::quote(&machine.root))
+        .replace("__PATH__", &crate::remote::quote(&machine.path))
+        .replace("__ADE_BIN__", &crate::remote::quote(&machine.ade_bin))
         .replace("__SESSION__", &crate::remote::quote(session))
 }
 
@@ -690,7 +694,7 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
     }
 
     let machine_paths = crate::remote::machine_declaration(&ctx.config_dir, machine)?;
-    let script = courier_helper(&machine_paths.root, &profile.session);
+    let script = courier_helper(&machine_paths, &profile.session);
     let out = crate::remote::ssh_courier(
         ctx.runner,
         &target,
@@ -1390,6 +1394,15 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn test_machine(root: &str) -> crate::remote::MachineDeclaration {
+        crate::remote::MachineDeclaration {
+            root: root.into(),
+            path: "/bin:/usr/bin".into(),
+            ade_bin: "/missing/herdr-ade".into(),
+            ..Default::default()
+        }
+    }
+
     /// A project with a ready coordinator in its bound pane, and the fake
     /// runner answering `agent prompt`.
     fn delivery_world() -> (World, Project) {
@@ -1567,7 +1580,7 @@ mod tests {
 
     #[test]
     fn courier_helper_survives_a_hostile_box_root() {
-        let script = courier_helper("/home/it's a $(box)", "default");
+        let script = courier_helper(&test_machine("/home/it's a $(box)"), "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
         // A throwaway HOME so the script's box recovery never touches the real
         // ADE root; the box binaries are absent there.
@@ -1593,7 +1606,7 @@ mod tests {
         let dir = root.join("demo/events");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
-        let script = courier_helper(&root.to_string_lossy(), "default");
+        let script = courier_helper(&test_machine(&root.to_string_lossy()), "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
         let run = |stdin: &str| {
             crate::runner::RealRunner

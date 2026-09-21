@@ -507,18 +507,6 @@ fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
     crate::ask::say(ctx, slug, what, None)
 }
 
-/// A `kind = "pi"` launch is refused unless its provider is ready (SPEC-pi
-/// §3.4, T11): never a lane that waits for a first prompt it cannot answer.
-pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
-    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-        .context("pi_args_forbidden: a pi launch names no --provider")?;
-    let model = crate::pi::launch::flag_value(&launch.args, "--model")
-        .context("pi_args_forbidden: a pi launch names no --model")?;
-    crate::pi_ade::check_with(ctx.runner, &ctx.root, &provider, &model)
-        .map(|_| ())
-        .with_context(|| format!("pi_not_ready: provider {provider}"))
-}
-
 /// Recipe readiness on a box is owned by the doctor probes.
 fn box_launch_ready(
     ctx: &Ctx,
@@ -529,9 +517,13 @@ fn box_launch_ready(
         .with_context(|| format!("recipe `{}` on `{}`", launch.recipe_id, profile.label))
 }
 
-/// Box pi readiness: the check runs on the box, never against the Mac login
-/// (SPEC-remote §4.1, SPEC-pi §3.4).
-pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch) -> Result<()> {
+/// Recipe readiness on a remote machine, measured there rather than against
+/// this machine's executable or login state.
+pub(crate) fn box_launch_ready_for(
+    ctx: &Ctx,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
     box_launch_ready(ctx, &profile, launch)
@@ -1268,9 +1260,7 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
         box_launch_ready(ctx, &profile, &record.launch)?;
         place_and_brief(ctx, project, &view, &record.id, true)?;
     } else {
-        if record.launch.kind == "pi" {
-            pi_ready(ctx, &record.launch)?;
-        }
+        crate::doctor::recipe_ready_local(ctx, &record.launch)?;
         if record.kind == Kind::Worktree && record.worktree_path.is_empty()
             || record.kind == Kind::Tab && record.pane_id.is_empty()
         {
@@ -1659,27 +1649,37 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
-    let state = prompt_state(&record, &agents)?;
+    let kind = if record.launch.kind.is_empty() {
+        &record.agent
+    } else {
+        &record.launch.kind
+    };
+    let resumable = crate::adapters::declaration(&ctx.config_dir, kind)
+        .is_ok_and(|adapter| adapter.blocked_error_resumable);
+    let state = prompt_state(&record, &agents, resumable)?;
     view.herdr
         .on_machine(record.machine_route())
         .agent_prompt(&record.pane_id, text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // A pi lane reports `blocked` for its own recorded error; a prompt
-    // resumes it, so that error is cleared.
-    if record.agent == "pi" && state == "blocked" && !record.error.is_empty() {
+    // A blocked lane with its own recorded error is resumed by this prompt.
+    if resumable && state == "blocked" && !record.error.is_empty() {
         thread::update(&project, id, |t| t.error.clear())?;
     }
     Ok(state)
 }
 
 /// The state a follow-up may be sent in, or the refusal.
-pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
+pub fn prompt_state(
+    record: &Thread,
+    agents: &[Agent],
+    blocked_error_resumable: bool,
+) -> Result<String> {
     let agent = agents
         .iter()
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread retry`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" if record.agent != "pi" || record.error.is_empty() => {
+        "blocked" if !blocked_error_resumable || record.error.is_empty() => {
             Err(crate::refusal::error(format!(
                 "agent_blocked: {} is waiting on the user in its pane ({})",
                 record.id, record.pane_id
@@ -2235,7 +2235,7 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         record.machine_route(),
     )?
     .target;
-    let machine = remote::machine_declaration(&ctx.config_dir, record.machine_route())?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &record.machine)?;
     let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
     let script = format!(
         "cd {} && git worktree remove {} && rm -rf -- {}",
@@ -2532,20 +2532,23 @@ mod tests {
             ..worktree_thread()
         };
         assert!(
-            prompt_state(&t, &[])
+            prompt_state(&t, &[], false)
                 .unwrap_err()
                 .to_string()
                 .contains("bare shell prompt")
         );
-        assert!(prompt_state(&t, &[agent("unknown")]).is_err());
+        assert!(prompt_state(&t, &[agent("unknown")], false).is_err());
         assert!(
-            prompt_state(&t, &[agent("blocked")])
+            prompt_state(&t, &[agent("blocked")], false)
                 .unwrap_err()
                 .to_string()
                 .contains("agent_blocked")
         );
-        assert_eq!(prompt_state(&t, &[agent("working")]).unwrap(), "working");
-        assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
+        assert_eq!(
+            prompt_state(&t, &[agent("working")], false).unwrap(),
+            "working"
+        );
+        assert_eq!(prompt_state(&t, &[agent("idle")], false).unwrap(), "idle");
     }
 
     #[test]

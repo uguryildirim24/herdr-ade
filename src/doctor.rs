@@ -177,7 +177,11 @@ fn native_probe_command(probe: &NativeProbe) -> String {
 
 /// A box-side real model call cached for one ticker interval. The cache holds
 /// only `ok`, `failed` or `missing`; provider output never lands on disk.
-fn box_native_probe_script(probe: &NativeProbe, fact: bool) -> String {
+fn box_native_probe_script(
+    probe: &NativeProbe,
+    fact: bool,
+    machine: &crate::remote::MachineDeclaration,
+) -> String {
     let command = native_probe_command(probe);
     let finish = if fact {
         format!("printf 'login_{}\\t%s\\n' \"$probe_status\"", probe.kind)
@@ -185,7 +189,8 @@ fn box_native_probe_script(probe: &NativeProbe, fact: bool) -> String {
         "[ \"$probe_status\" = ok ]".into()
     };
     format!(
-        "probe_dir=\"$HOME/.herdr-ade/.readiness\"\n\
+        "PATH={path}; export PATH\n\
+         probe_dir={root}/.readiness\n\
          probe_cache=\"$probe_dir/native-{cache_key}\"\n\
          probe_status=\n\
          probe_now=$(date +%s)\n\
@@ -200,6 +205,8 @@ fn box_native_probe_script(probe: &NativeProbe, fact: bool) -> String {
            mv -f \"$probe_cache.tmp.$$\" \"$probe_cache\"\n\
          fi\n\
          {finish}\n",
+        path = crate::remote::quote(&machine.path),
+        root = crate::remote::quote(&machine.root),
         cache_key = probe.cache_key,
         ttl = crate::pi::doctor::READINESS_CACHE_TTL.as_secs(),
         program = crate::remote::quote(&probe.program),
@@ -209,10 +216,16 @@ fn box_native_probe_script(probe: &NativeProbe, fact: bool) -> String {
 /// Whether the chosen recipe can run on this Mac. This is the same provider
 /// or login probe the doctor owns, not a placement-specific capability table.
 pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
-    if launch.kind == "pi" {
-        return crate::threads::pi_ready(ctx, launch);
-    }
     let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
+    if adapter.doctor.readiness == "pi" {
+        let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+            .context("pi_args_forbidden: a provider launch names no --provider")?;
+        let model = crate::pi::launch::flag_value(&launch.args, "--model")
+            .context("pi_args_forbidden: a provider launch names no --model")?;
+        return crate::pi_ade::check_with(ctx.runner, &ctx.root, &provider, &model)
+            .map(|_| ())
+            .with_context(|| format!("pi_not_ready: provider {provider}"));
+    }
     let recipe = crate::contracts::Recipe {
         kind: launch.kind.clone(),
         args: launch.args.clone(),
@@ -244,11 +257,12 @@ pub(crate) fn recipe_ready_on_box(
     profile: &crate::contracts::MachineProfile,
     launch: &crate::contracts::Launch,
 ) -> Result<()> {
-    if launch.kind == "pi" {
+    let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
+    if adapter.doctor.readiness == "pi" {
         let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-            .context("pi_args_forbidden: a pi launch names no --provider")?;
+            .context("pi_args_forbidden: a provider launch names no --provider")?;
         let model = crate::pi::launch::flag_value(&launch.args, "--model")
-            .context("pi_args_forbidden: a pi launch names no --model")?;
+            .context("pi_args_forbidden: a provider launch names no --model")?;
         let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
         return crate::pi_ade::check_on_machine(
             ctx.runner,
@@ -261,7 +275,6 @@ pub(crate) fn recipe_ready_on_box(
         )
         .with_context(|| format!("provider {provider}"));
     }
-    let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
     let recipe = crate::contracts::Recipe {
         kind: launch.kind.clone(),
         args: launch.args.clone(),
@@ -273,7 +286,8 @@ pub(crate) fn recipe_ready_on_box(
             launch.kind
         )
     })?;
-    let script = box_native_probe_script(&probe, false);
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let script = box_native_probe_script(&probe, false, &machine);
     let rooted = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
     let output = crate::remote::ssh(
         &rooted,
@@ -301,7 +315,12 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
                 .recipes
                 .iter()
                 .filter(|(id, recipe)| {
-                    routed.contains(id.as_str()) && recipe.enabled && recipe.kind == "pi"
+                    routed.contains(id.as_str())
+                        && recipe.enabled
+                        && config
+                            .adapters
+                            .get(&recipe.kind)
+                            .is_some_and(|adapter| adapter.doctor.readiness == "pi")
                 })
                 .filter_map(|(_, recipe)| {
                     crate::pi::launch::flag_value(&recipe.args, "--model")
@@ -795,7 +814,7 @@ fn report_with_checks(
                             let (mut leftovers, data_kept, mut errors) =
                                 finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
                             let (builds, build_errors) =
-                                finished_build_folders(&ctx, &profile.id, &profile.target);
+                                finished_build_folders(&ctx, &profile.label, &profile.target);
                             leftovers.extend(builds);
                             errors.extend(build_errors);
                             check(
@@ -1406,6 +1425,16 @@ fn box_rows(
             "has no SSH target".into(),
         )];
     }
+    let machine_paths = match crate::remote::machine_declaration(config_dir, label) {
+        Ok(machine) => machine,
+        Err(error) => {
+            return vec![(
+                Some(false),
+                format!("box {label}"),
+                format!("machine path declaration is missing: {error:#}"),
+            )];
+        }
+    };
     // The executable recipes own which checks exist. Native probe definitions
     // only describe how to check a runtime; they never select one to require.
     let mut natives = BTreeMap::new();
@@ -1419,7 +1448,15 @@ fn box_rows(
     for (id, recipe) in recipes.iter().filter(|(id, recipe)| {
         recipe.enabled && routed.as_ref().is_none_or(|ids| ids.contains(id.as_str()))
     }) {
-        if recipe.kind == "pi" {
+        let Some(adapter) = adapters.get(&recipe.kind) else {
+            rows.push((
+                Some(false),
+                format!("box {label} recipe {id}"),
+                format!("no adapter exists for agent kind `{}`", recipe.kind),
+            ));
+            continue;
+        };
+        if adapter.doctor.readiness == "pi" {
             match crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args) {
                 Ok(()) => {
                     let model =
@@ -1432,10 +1469,7 @@ fn box_rows(
                     format!("{error:#}"),
                 )),
             }
-        } else if let Some(probe) = adapters
-            .get(&recipe.kind)
-            .and_then(|adapter| native_probe(adapter, recipe))
-        {
+        } else if let Some(probe) = native_probe(adapter, recipe) {
             natives.insert(id.clone(), probe);
         } else {
             rows.push((
@@ -1450,27 +1484,29 @@ fn box_rows(
     }
     let mut repos: Vec<crate::project::Repo> =
         crate::harness::repos(config_dir).unwrap_or_default();
-    if let Ok(machine) = crate::remote::machine_declaration(config_dir, &profile.label) {
-        repos.extend(machine.repos);
-    }
-    let mut script = String::from(
+    repos.extend(machine_paths.repos.clone());
+    let mut script = format!(
         "set -u\n\
+         PATH={path}; export PATH\n\
          printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
          printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
-         printf 'server\\t%s\\n' \"$(\"$HOME/.local/bin/herdr\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
+         herdr_bin=$(command -v herdr 2>/dev/null || true)\n\
+         printf 'server\\t%s\\n' \"$(\"$herdr_bin\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
          printf 'tailscale\\t%s\\n' \"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"\n\
          printf 'nproc\\t%s\\n' \"$(nproc 2>/dev/null || echo 0)\"\n\
-         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
+         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{{print $2}}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
          printf 'df_free\\t%s\\n' \"$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\"\n\
          printf 'listeners\\t%s\\n' \"$(ss -tln 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')\"\n\
          printf 'git_name\\t%s\\n' \"$(git config --global user.name 2>/dev/null || true)\"\n\
          printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
          printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
-         printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
+         printf 'rules\\t%s\\n' \"$(sha256sum {home}/.config/herdr-ade/RULES.md 2>/dev/null | cut -d' ' -f1 || true)\"\n\
 ",
+        path = crate::remote::quote(&machine_paths.path),
+        home = crate::remote::quote(&machine_paths.home),
     );
     for probe in natives.values() {
-        script.push_str(&box_native_probe_script(probe, true));
+        script.push_str(&box_native_probe_script(probe, true, &machine_paths));
     }
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
@@ -1478,7 +1514,9 @@ fn box_rows(
         let provider = crate::remote::quote(provider);
         let model = crate::remote::quote(model);
         script.push_str(&format!(
-            "HERDR_ADE_ROOT=\"$HOME/.herdr-ade\" \"$HOME/.local/bin/herdr-pi\" check {provider} --model {model} >/dev/null 2>&1 && printf 'pi_%s/%s\\tok\\n' {provider} {model} || printf 'pi_%s/%s\\tfail\\n' {provider} {model}\n"
+            "HERDR_ADE_ROOT={root} {pi_bin} check {provider} --model {model} >/dev/null 2>&1 && printf 'pi_%s/%s\\tok\\n' {provider} {model} || printf 'pi_%s/%s\\tfail\\n' {provider} {model}\n",
+            root = crate::remote::quote(&machine_paths.root),
+            pi_bin = crate::remote::quote(&machine_paths.pi_bin),
         ));
     }
     for repo in &repos {
@@ -1526,7 +1564,7 @@ fn box_rows(
             None
         },
         format!("box {label} server"),
-        format!("{} ({})", fact("server"), "$HOME/.local/bin/herdr"),
+        format!("{} (from machine PATH)", fact("server")),
     ));
     let tailscale = fact("tailscale");
     rows.push((
@@ -1594,19 +1632,17 @@ fn box_rows(
         .into_iter()
         .chain(natives.values().map(|probe| probe.program.as_str()))
         .collect();
-    let machine_paths = crate::remote::machine_declaration(config_dir, &profile.label).ok();
     match box_pane_probe(
         runner,
         herdr_bin,
         profile,
-        machine_paths.as_ref(),
+        Some(&machine_paths),
         &required_tools,
     ) {
         Ok(answer) => {
             let (pi, tools) = parse_box_probe(&answer);
-            let wrapper = machine_paths
-                .as_ref()
-                .and_then(|machine| Path::new(&machine.pi_bin).parent())
+            let wrapper = Path::new(&machine_paths.pi_bin)
+                .parent()
                 .map(|dir| dir.join("pi").to_string_lossy().into_owned())
                 .unwrap_or_default();
             rows.push((
@@ -1965,6 +2001,46 @@ recipe = "claude_fable_xhigh"
         }
         assert_eq!(runner.count("claude"), 2);
         assert!(!ctx.root.join(".readiness/native-claude.json").exists());
+    }
+
+    #[test]
+    fn agy_probe_arguments_match_the_installed_cli() {
+        let config = tempfile::tempdir().unwrap();
+        let adapter = crate::adapters::declaration(config.path(), "agy").unwrap();
+        let recipe = crate::contracts::Recipe {
+            kind: "agy".into(),
+            args: vec![
+                "--model".into(),
+                "gemini-3.8-flash-high".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+            ..Default::default()
+        };
+        let probe = native_probe(&adapter, &recipe).unwrap();
+        assert_eq!(
+            probe.args,
+            [
+                "--model",
+                "gemini-3.8-flash-high",
+                "--dangerously-skip-permissions",
+                "-p",
+                "Reply only OK.",
+                "--print-timeout",
+                "60s",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_diagnostic_is_a_local_fault() {
+        let output = crate::runner::Output {
+            code: Some(1),
+            stderr: "flags provided but not defined: -max-turns".into(),
+            ..Default::default()
+        };
+        let error = probe_error("agy", &output);
+        assert!(error.contains("failed locally"), "{error}");
+        assert!(!error.contains("stored sign-in"), "{error}");
     }
 
     #[test]
@@ -2656,7 +2732,7 @@ recipe = "claude_fable_xhigh"
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         let thread = crate::thread::allocate(&project, |thread| {
             thread.status = crate::thread::Status::Open;
-            thread.machine = "oci-id".into();
+            thread.machine = "oci".into();
         })
         .unwrap();
         let runner = FakeRunner::new();
@@ -2675,7 +2751,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, errors) = finished_build_folders(&ctx, "oci-id", "me@box");
+        let (leftovers, errors) = finished_build_folders(&ctx, "oci", "me@box");
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(errors.is_empty(), "{errors:?}");
@@ -2701,7 +2777,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, errors) = finished_build_folders(&ctx, "oci-id", "me@box");
+        let (leftovers, errors) = finished_build_folders(&ctx, "oci", "me@box");
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(

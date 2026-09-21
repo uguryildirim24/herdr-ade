@@ -675,15 +675,10 @@ fn thread_pass(
 }
 
 fn agent_start_timeout(launch: &crate::contracts::Launch) -> u64 {
-    let configured = if launch.ready_timeout_ms == 0 {
+    if launch.ready_timeout_ms == 0 {
         crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
     } else {
         launch.ready_timeout_ms
-    };
-    if launch.kind == "pi" {
-        configured.max(thread::PI_START_TIMEOUT_MS)
-    } else {
-        configured
     }
 }
 
@@ -738,26 +733,32 @@ fn launch_pass(
         if one_at_a_time && !*may_start {
             continue;
         }
-        // A pi provider that stopped being ready (an expired login) fails
-        // the thread at once instead of launching into it (SPEC-pi §3.4). A
-        // box lane's readiness is read on the box, never from the Mac login
-        // (SPEC-remote §4.1).
-        if t.launch.kind == "pi" {
-            let readiness = if t.is_remote() {
-                crate::threads::box_pi_ready(pass.ctx, t.machine_route(), &t.launch)
-            } else {
-                crate::threads::pi_ready(pass.ctx, &t.launch)
-            };
-            if let Err(error) = readiness {
-                let class = crate::pi_ade::failure_class(&error);
-                let message = format!("{error:#}");
-                errors.extend(
-                    threads::fail_start(pass.ctx, pass.project, &t.id, &message, class, true)
-                        .err()
-                        .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
-                );
-                continue;
-            }
+        // Provider-bridge credentials can expire between placement and start.
+        // The adapter's readiness driver, not its agent-kind name, chooses the
+        // extra check; command probes were already run during placement.
+        let readiness = if t.launch.kind.is_empty() {
+            Ok(())
+        } else {
+            crate::adapters::declaration(&pass.ctx.config_dir, &t.launch.kind).and_then(|adapter| {
+                if adapter.doctor.readiness != "pi" {
+                    return Ok(());
+                }
+                if t.is_remote() {
+                    crate::threads::box_launch_ready_for(pass.ctx, t.machine_route(), &t.launch)
+                } else {
+                    crate::doctor::recipe_ready_local(pass.ctx, &t.launch)
+                }
+            })
+        };
+        if let Err(error) = readiness {
+            let class = crate::pi_ade::failure_class(&error);
+            let message = format!("{error:#}");
+            errors.extend(
+                threads::fail_start(pass.ctx, pass.project, &t.id, &message, class, true)
+                    .err()
+                    .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
+            );
+            continue;
         }
         match thread::update(pass.project, &t.id, |t| t.launch_attempts += 1) {
             Ok(_) => {
@@ -1199,19 +1200,13 @@ mod tests {
     }
 
     #[test]
-    fn pi_start_uses_the_cloud_outer_bound_without_changing_other_kinds() {
-        let pi = crate::contracts::Launch {
-            kind: "pi".into(),
+    fn every_adapter_uses_its_routed_start_timeout() {
+        let launch = crate::contracts::Launch {
+            kind: "made-up".into(),
             ready_timeout_ms: 90_000,
             ..crate::contracts::Launch::default()
         };
-        assert_eq!(agent_start_timeout(&pi), thread::PI_START_TIMEOUT_MS);
-        let claude = crate::contracts::Launch {
-            kind: "claude".into(),
-            ready_timeout_ms: 90_000,
-            ..crate::contracts::Launch::default()
-        };
-        assert_eq!(agent_start_timeout(&claude), 90_000);
+        assert_eq!(agent_start_timeout(&launch), 90_000);
     }
 
     #[test]

@@ -291,10 +291,22 @@ fn box_zig_script(box_path: &str) -> String {
     )
 }
 
+fn box_binary(machine: &crate::remote::MachineDeclaration, bin: &str) -> Result<String> {
+    match bin {
+        "herdr-ade" => Ok(machine.ade_bin.clone()),
+        "herdr-pi" => Ok(machine.pi_bin.clone()),
+        "herdr" => Path::new(&machine.ade_bin)
+            .parent()
+            .map(|dir| dir.join(bin).to_string_lossy().into_owned())
+            .context("machine ade_bin has no parent folder"),
+        _ => bail!("harness binary `{bin}` has no machine destination"),
+    }
+}
+
 fn box_build(
     ctx: &Ctx,
     target: &str,
-    machine_path: &str,
+    machine: &crate::remote::MachineDeclaration,
     box_path: &str,
     kind: Kind,
 ) -> Result<()> {
@@ -306,9 +318,13 @@ fn box_build(
     let mut installs = String::new();
     for bin in kind.binaries() {
         installs.push_str(&format!(
-            "\ncp target/release/{bin} $HOME/.local/bin/.{bin}.install.$$\n\
-             chmod 755 $HOME/.local/bin/.{bin}.install.$$\n\
-             mv -f $HOME/.local/bin/.{bin}.install.$$ $HOME/.local/bin/{bin}"
+            "\ninstall_to={to}\n\
+             install_tmp=\"${{install_to}}.install.$$\"\n\
+             mkdir -p \"$(dirname \"$install_to\")\"\n\
+             cp target/release/{bin} \"$install_tmp\"\n\
+             chmod 755 \"$install_tmp\"\n\
+             mv -f \"$install_tmp\" \"$install_to\"",
+            to = remote::quote(&box_binary(machine, bin)?),
         ));
     }
     let script = format!(
@@ -318,10 +334,9 @@ fn box_build(
          git merge --ff-only @{{u}}\n\
          export PATH={build_path}\n\
          export DEVELOPER_DIR={DEVELOPER_DIR}{zig}\n\
-         cargo build --release --locked\n\
-         mkdir -p $HOME/.local/bin{installs}",
+         cargo build --release --locked{installs}",
         path = remote::quote(box_path),
-        build_path = remote::quote(machine_path),
+        build_path = remote::quote(&machine.path),
     );
     let out = remote::ssh(ctx.runner, target, &script, None, BOX_BUILD_TIMEOUT)?;
     if !out.success() {
@@ -336,20 +351,25 @@ fn box_build(
 /// Install only the policy a lane machine consumes. Dispatch recipes and the
 /// routing rubric stay on the coordinator; copying them would give the box a
 /// second, stale source of model-selection policy.
-fn box_settings(ctx: &Ctx, target: &str) -> Result<()> {
+fn box_settings(
+    ctx: &Ctx,
+    target: &str,
+    machine: &crate::remote::MachineDeclaration,
+) -> Result<()> {
     let rules_path = ctx.config_dir.join("RULES.md");
     let rules = std::fs::read_to_string(&rules_path)
         .with_context(|| format!("harness_rules_missing: {}", rules_path.display()))?;
     let script = format!(
         "set -e\n\
-         dir=\"$HOME/.config/herdr-ade\"\n\
+         dir={config_dir}\n\
          mkdir -p \"$dir\"\n\
          tmp=\"$dir/.RULES.md.install.$$\"\n\
          cat > \"$tmp\"\n\
          chmod 600 \"$tmp\"\n\
          mv -f \"$tmp\" \"$dir/RULES.md\"\n\
          printf '%s\\n' 'lane worker; dispatch stays on the coordinator' > \"$dir/{BOX_WORKER_MARKER}\"\n\
-         chmod 600 \"$dir/{BOX_WORKER_MARKER}\""
+         chmod 600 \"$dir/{BOX_WORKER_MARKER}\"",
+        config_dir = remote::quote(&format!("{}/.config/herdr-ade", machine.home)),
     );
     let out = remote::ssh(ctx.runner, target, &script, Some(&rules), INSTALL_TIMEOUT)?;
     if !out.success() {
@@ -483,10 +503,9 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
                 box_build(
                     ctx,
                     target,
-                    &box_paths
+                    box_paths
                         .as_ref()
-                        .context("machine path declaration is missing")?
-                        .path,
+                        .context("machine path declaration is missing")?,
                     box_path,
                     kind,
                 )?;
@@ -509,8 +528,8 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
             box_installed,
         });
     }
-    if let Some(target) = &box_target {
-        box_settings(ctx, target)?;
+    if let (Some(target), Some(machine)) = (&box_target, &box_paths) {
+        box_settings(ctx, target, machine)?;
     }
     Ok(InstallOutcome {
         repositories: installed,
@@ -636,10 +655,16 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
+        let machine = crate::remote::MachineDeclaration {
+            path: "/bin:$HOME/.local/bin".into(),
+            ade_bin: "/srv/bin/herdr-ade".into(),
+            pi_bin: "/srv/bin/herdr-pi".into(),
+            ..Default::default()
+        };
         box_build(
             &ctx,
             "box",
-            "/bin:$HOME/.local/bin",
+            &machine,
             "/home/ubuntu/projects/herdr",
             Kind::Fork,
         )

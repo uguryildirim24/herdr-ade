@@ -2628,7 +2628,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
             && s.contains("git merge --ff-only")
             && s.contains("cargo build --release --locked")
             && s.contains("cp target/release/")
-            && s.contains("mv -f $HOME/.local/bin/.")),
+            && s.contains("install_to=/home/ubuntu/.local/bin/")
+            && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
         "{scripts:?}"
     );
     assert!(

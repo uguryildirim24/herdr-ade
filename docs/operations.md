@@ -131,7 +131,7 @@ A round is a set of lanes that are reviewed and merged together. `hp round advan
 
 ## Agent and machine adapters
 
-Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `talk`, `capabilities`, required flags and effort names, a doctor argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events, prompt event, final-message fields and block response. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
+Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `talk`, `capabilities`, required flags and effort names, a doctor readiness driver and argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events, prompt event, final-message fields and block response. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
 
 Machine facts live in `[machines.<name>]`: `target`, `session`, `home`, `root`, `worktrees`, `build`, `path`, `ade_bin`, `pi_bin`, and `repos`. Each repo row names `path`, `box_path`, and `publish_url`. Placement, lane environment, start lines, courier paths and cleanup resolve the selected machine row; another box does not add a code branch.
 
