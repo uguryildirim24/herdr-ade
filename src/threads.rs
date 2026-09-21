@@ -1517,6 +1517,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
             return Err(crate::refusal::error(reason));
         }
         if removal_refusal.is_none() {
+            removal_in_use_gate(ctx, &project, &record)?;
             // Stop the idle agent before removing its current directory. This
             // also makes the raw box-side `git worktree remove` independent of
             // Herdr workspace ownership.
@@ -1882,13 +1883,6 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
     if record.worktree_path.is_empty() {
         bail!("{} has no recorded worktree", record.id);
     }
-    let view = require_session(ctx, project)?;
-    let (agents, panes) = lists_for(&view, record)?;
-    let live = thread::live_state(record, &agents, &panes, jiff::Timestamp::now());
-    if live.agent_state.as_deref() == Some("working") {
-        bail!("{} is working; not removing the worktree", record.id);
-    }
-    removal_gate(project, &view.herdr, record, &panes)?;
     if let Err(error) = crate::git::worktree_remove(ctx.runner, &record.repo, &record.worktree_path)
     {
         let _ = thread::update(project, &record.id, |t| {
@@ -1896,69 +1890,21 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
         });
         return Err(error);
     }
-    let own_tab = panes
-        .iter()
-        .any(|p| p.tab_id == record.tab_id && p.pane_id == record.pane_id);
-    if own_tab && let Err(error) = view.herdr.tab_close(&record.tab_id) {
-        let _ = thread::update(project, &record.id, |t| {
-            t.partial = Some("tab_close".into());
-        });
-        return Err(anyhow::anyhow!("{error}"));
-    }
     Ok(())
 }
 
-/// The D4 gate before a lane's worktree goes: the lane released it (a sealed
-/// `done` for the current attempt whose artifact still hashes to its name,
-/// or the thread was resolved before), no program runs in it, and the tab
-/// that would close is the one the record created.
-fn removal_gate(
-    project: &Project,
-    herdr: &Herdr,
-    record: &Thread,
-    panes: &[crate::herdr::Pane],
-) -> Result<()> {
-    let attempt = record.attempt.max(1);
-    let done = crate::events::list(project)
-        .into_iter()
-        .filter(|e| e.thread == record.id && e.attempt == attempt)
-        .find_map(|e| e.payload.done);
-    match done {
-        Some(done) => {
-            let path = crate::round::artifacts_dir(project).join(&done.artifact);
-            let bytes = std::fs::read(&path).map_err(|e| {
-                anyhow::anyhow!("artifact_missing: {} ({e}); not removing", path.display())
-            })?;
-            if thread::sha256_hex(&bytes) != done.artifact {
-                bail!(
-                    "artifact_mismatch: {} does not hash to its name; not removing",
-                    path.display()
-                );
-            }
-        }
-        None if record.status == Status::Resolved => {}
-        None => bail!(
-            "worktree_not_released: {} has no sealed done for attempt {attempt}; not removing",
+/// The D4 in-use gate before the lane's own idle agent is stopped. Durable
+/// completion is checked separately by `finished_worktree_reason`; this gate
+/// only prevents closing active work or removing a checkout used elsewhere.
+fn removal_in_use_gate(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    let view = require_session(ctx, project)?;
+    let (agents, panes) = lists_for(&view, record)?;
+    let live = thread::live_state(record, &agents, &panes, jiff::Timestamp::now());
+    if live.agent_state.as_deref() == Some("working") {
+        bail!(
+            "worktree_in_use: {} is working; not removing the worktree",
             record.id
-        ),
-    }
-    for pane in panes
-        .iter()
-        .filter(|p| Path::new(&p.cwd).starts_with(&record.worktree_path))
-    {
-        let busy = herdr
-            .pane_process_info(&pane.pane_id)
-            .map_err(|e| anyhow::anyhow!("pane {}: {e}", pane.pane_id))?
-            .foreground_processes
-            .iter()
-            .any(|p| !matches!(p.name.as_str(), "zsh" | "-zsh" | "bash" | "sh" | "fish"));
-        if busy {
-            bail!(
-                "worktree_in_use: a program runs in {} (pane {}); not removing",
-                record.worktree_path,
-                pane.pane_id
-            );
-        }
+        );
     }
     if panes
         .iter()
@@ -1969,6 +1915,39 @@ fn removal_gate(
             record.tab_id,
             record.pane_id
         );
+    }
+
+    let herdr = view.herdr.on_machine(record.machine_route());
+    let own_agent = agents
+        .iter()
+        .any(|agent| thread::agent_matches(record, agent));
+    for pane in panes
+        .iter()
+        .filter(|pane| Path::new(&pane.cwd).starts_with(&record.worktree_path))
+    {
+        // The lane's own idle agent is about to be stopped. Any other
+        // non-shell process still makes removing the checkout unsafe.
+        if own_agent && thread::pane_matches(record, pane) {
+            continue;
+        }
+        let busy = herdr
+            .pane_process_info(&pane.pane_id)
+            .map_err(|error| anyhow::anyhow!("pane {}: {error}", pane.pane_id))?
+            .foreground_processes
+            .iter()
+            .any(|process| {
+                !matches!(
+                    process.name.as_str(),
+                    "zsh" | "-zsh" | "bash" | "sh" | "fish"
+                )
+            });
+        if busy {
+            bail!(
+                "worktree_in_use: a program runs in {} (pane {}); not removing",
+                record.worktree_path,
+                pane.pane_id
+            );
+        }
     }
     Ok(())
 }
