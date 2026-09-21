@@ -644,9 +644,6 @@ fn parse_box_list<T: serde::de::DeserializeOwned>(json: &str, field: &str) -> Re
 /// facts, so the caller can key lane state and push GONE after a reboot.
 pub(crate) fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
     let _scope = crate::ledger::Scope::new(projects);
-    for project in projects {
-        crate::ledger::retry_after_failure(project, "courier-failed", machine);
-    }
     let result = courier_inner(ctx, projects, machine);
     if let Err(error) = &result {
         for project in projects {
@@ -786,16 +783,10 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
                     Some(bytes)
                 };
                 events::import_box_event(project, &profile.id, &bytes, artifact.as_deref())?;
-                let imported = events::load(project, &env.event)?;
-                inbox::write_event(
-                    project,
-                    &imported,
-                    "courier-delivery",
-                    &format!(
-                        "received sealed event {} from machine `{machine}`",
-                        imported.id
-                    ),
-                )?;
+                // The sealed event is the durable coordinator-facing record.
+                // Delivery is handled by `deliver_events`; a second inbox copy
+                // only repeats an event the coordinator may already have acted on.
+                let _imported = events::load(project, &env.event)?;
                 state
                     .taken
                     .insert(env.event.clone(), env.event_hash.clone());
@@ -903,7 +894,9 @@ pub(crate) fn remote_attention(
         } else {
             state.blocked.remove(&lane.id);
         }
-        if live.pane_exists {
+        let process_present = live.pane_exists
+            && (live.agent_state.is_some() || lane.prompt_pending || lane.last_state.is_empty());
+        if process_present {
             state.missing.insert(lane.id.clone(), 0);
         } else {
             let count = state.missing.entry(lane.id.clone()).or_insert(0);
@@ -922,7 +915,20 @@ pub(crate) fn remote_attention(
                     state.blocked.insert(lane);
                 }
                 Signal::Gone(lane) => {
-                    state.gone.insert(lane);
+                    state.gone.insert(lane.clone());
+                    if let Some(record) = threads.iter().find(|record| record.id == lane) {
+                        let recover = !record.launch.recipe_id.is_empty();
+                        if let Err(error) = crate::threads::fail_start(
+                            ctx,
+                            project,
+                            &lane,
+                            "the pane or agent is gone without a report",
+                            crate::contracts::FailureClass::ProcessGone,
+                            recover,
+                        ) {
+                            errors.push(error.context(format!("{lane}: process recovery")));
+                        }
+                    }
                 }
             },
             // A suspended or busy writer has not consumed the transition. Do
@@ -1854,18 +1860,11 @@ mod tests {
         let before = runner.count("scp");
         courier(&ctx, &[&alpha, &beta, &gamma], "box").unwrap();
         assert_eq!(runner.count("scp"), before);
-        for project in [&alpha, &beta] {
-            let items = inbox::unhandled(project);
-            assert_eq!(
-                items.len(),
-                1,
-                "one courier delivery, including after retry"
-            );
-            assert_eq!(items[0].kind, "courier-delivery");
-            assert_eq!(items[0].event, "t-0001-1-1");
-            assert!(items[0].summary.contains("machine `box`"));
+        // The imported events are the durable records; courier delivery does
+        // not duplicate them in the inbox, including after a retry.
+        for project in [&alpha, &beta, &gamma] {
+            assert!(inbox::unhandled(project).is_empty());
         }
-        assert!(inbox::unhandled(&gamma).is_empty());
     }
 
     #[test]

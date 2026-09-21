@@ -214,7 +214,7 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     // ade_lanes: done and waiting from sealed events, working and stuck from
     // runtime state, as separate counts.
     let states = agent_states(ctx, project);
-    let (mut working, mut done, mut waiting, mut stuck) = (0, 0, 0, 0);
+    let (mut working, mut done, mut waiting, mut stuck, mut unknown) = (0, 0, 0, 0, 0);
     for t in thread::list(project) {
         if t.status == thread::Status::Resolved {
             continue;
@@ -232,7 +232,9 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
                     states.as_ref().and_then(|s| s.get(&t.pane_id).cloned())
                 };
                 let waiting_on_you = t.is_remote() && t.last_group == "waiting-on-you";
-                if t.status == thread::Status::Failed
+                if t.is_remote() && t.last_state.is_empty() {
+                    unknown += 1;
+                } else if t.status == thread::Status::Failed
                     || state.as_deref() == Some("blocked")
                     || waiting_on_you
                 {
@@ -245,7 +247,9 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     }
     out.push((
         "ade_lanes".to_string(),
-        format!("{working} working, {done} done, {waiting} waiting for you, {stuck} stuck"),
+        format!(
+            "{working} working, {done} done, {waiting} waiting for you, {stuck} stuck, {unknown} unknown"
+        ),
     ));
 
     // ade_needs_you: the compact line of the newest open ask, never from a

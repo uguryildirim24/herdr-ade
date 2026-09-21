@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 pub(crate) enum ExitMeaning {
     Required,
     Answer,
+    /// The command answered with its documented JSON result or refusal.
+    Structured,
     /// Zero means yes; one with empty stderr means no. Every other outcome
     /// is an error. Only for commands with this precise contract (git ancestry).
     Boolean,
@@ -23,6 +25,16 @@ impl ExitMeaning {
     pub(crate) fn answered(self, out: &Output) -> bool {
         out.success()
             || (self == Self::Answer && out.code.is_some() && !out.timed_out)
+            || (self == Self::Structured
+                && out.code.is_some()
+                && !out.timed_out
+                && [&out.stdout, &out.stderr].into_iter().any(|text| {
+                    serde_json::from_str::<serde_json::Value>(text.trim())
+                        .ok()
+                        .is_some_and(|reply| {
+                            reply.get("result").is_some() || reply.get("error").is_some()
+                        })
+                }))
             || (self == Self::Boolean && out.boolean_answer().is_some())
     }
 }

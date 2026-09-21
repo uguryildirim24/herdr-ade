@@ -128,6 +128,9 @@ pub(crate) struct Turn {
     pub(crate) finished_at: Option<String>,
     #[serde(default)]
     pub(crate) detail: Option<String>,
+    /// Typed failure class; absent on successful and historical turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_class: Option<String>,
     #[serde(default)]
     pub(crate) packet: Option<String>,
     /// The path the answer was actually written to (the `.<n>.md` fallback).
@@ -423,6 +426,7 @@ mod tests {
             started_at: now_rfc3339(),
             finished_at: None,
             detail: None,
+            failure_class: None,
             packet: Some("/p.md".into()),
             written: None,
         };
@@ -488,6 +492,7 @@ mod tests {
                 started_at: stamp.clone(),
                 finished_at: Some(stamp),
                 detail: None,
+                failure_class: None,
                 packet: None,
                 written: None,
             };

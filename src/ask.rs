@@ -377,7 +377,10 @@ fn check_structured(project: &Project, new: &NewAsk) -> Result<()> {
     if problems.is_empty() {
         Ok(())
     } else {
-        bail!("plain_refused:\n{}", problems.join("\n"))
+        Err(crate::refusal::error(format!(
+            "plain_refused:\n{}",
+            problems.join("\n")
+        )))
     }
 }
 
@@ -648,7 +651,9 @@ pub(crate) fn open_revision(
     }
     let checked = plain::check_ask(&record.question, &record.choices, g);
     if !checked.passed() {
-        bail!("plain_refused: the stored question no longer passes the check");
+        return Err(crate::refusal::error(
+            "plain_refused: the stored question no longer passes the check",
+        ));
     }
     Ok(record)
 }
@@ -681,7 +686,10 @@ pub(crate) fn publish_keyed(
         }
     }
     if !problems.is_empty() {
-        bail!("plain_refused:\n{}", problems.join("\n"));
+        return Err(crate::refusal::error(format!(
+            "plain_refused:\n{}",
+            problems.join("\n")
+        )));
     }
     match msg {
         HumanMessage::Say {
@@ -1045,10 +1053,9 @@ mod tests {
             "{e}"
         );
         let (id, _) = fx.lane(1);
-        let e = format!(
-            "{:#}",
-            say(&ctx, "demo", &format!("The lane {id} is done."), None).unwrap_err()
-        );
+        let error = say(&ctx, "demo", &format!("The lane {id} is done."), None).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        let e = format!("{error:#}");
         assert!(e.starts_with("plain_refused") && e.contains(&id), "{e}");
         let e = format!("{:#}", say(&ctx, "demo", "", None).unwrap_err());
         assert!(e.contains("plain_envelope"), "{e}");
@@ -1181,7 +1188,7 @@ mod tests {
         );
         assert_eq!(
             get("ade_lanes"),
-            "0 working, 1 done, 1 waiting for you, 0 stuck"
+            "0 working, 1 done, 1 waiting for you, 0 stuck, 0 unknown"
         );
         assert_eq!(
             get("ade_needs_you"),

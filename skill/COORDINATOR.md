@@ -60,8 +60,8 @@ You do not pick a recipe on `thread start`. Write the full task with scope, cons
 - `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
 - Task front matter may say `product = "web-research"`, `product = "spec"`, or `requires_claude = true`. A coding task that reads a web page is still coding unless its product says otherwise.
 - `round advance` still starts the review. The reviewer gets a bounded task that names the committed review brief and every pinned commit range; large sources stay in the checkout for the reviewer to read.
-- A lane calls `ha failed "<failure and evidence>"` for bounded recovery. The harness retries the same recipe, then follows that rule's ordered fallback list. Once exhausted, it leaves the failed lane waiting for you instead of guessing another recipe.
-- `thread retry` runs the same task as a new process and counts against `[routing]` recovery. Only Rolf may pin an exact task through `[routing.pins]`.
+- A lane calls `ha failed "<failure and evidence>"` for failed work. The harness uses the routing rule's bounded retries and fallbacks. Provider and lost-connection failures retry only the same recipe; a gone process restarts; unknown evidence waits for you.
+- `thread retry` runs the same task as a new process under that typed recovery policy. Only Rolf may pin an exact task through `[routing.pins]`.
 
 ### Harness evolves
 
