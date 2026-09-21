@@ -5,7 +5,7 @@
 //! reloads, and the session file restores provider, model and thinking level
 //! (`model_change`, `thinking_level_change`). `--approve` is never replayed.
 //!
-//! ADE's own thread restart is a new attempt: it reads the reported session
+//! ADE's own thread retry is a new attempt: it reads the reported session
 //! path from `pane get` and appends `--session <path>`, recording it as
 //! `launch.resume_session` — never inside the recipe's `args`.
 

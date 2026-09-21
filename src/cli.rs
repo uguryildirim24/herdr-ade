@@ -372,19 +372,37 @@ enum RoundCommand {
         round: String,
         thread: String,
     },
-    /// End a round that will not be merged and record why
-    Abandon {
+    /// Replace this round's reviewer attempt without starting a duplicate
+    Retry {
         slug: String,
         round: String,
         #[arg(long)]
         reason: String,
     },
+    /// Stop the round, its lanes and reviewer, and retry pending cleanup
+    Cancel {
+        slug: String,
+        round: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Bind an existing live reviewer thread to this round
+    Rebind {
+        slug: String,
+        round: String,
+        #[arg(long, value_name = "THREAD")]
+        thread: String,
+    },
+    /// Accept a lane's sealed work or a reviewer's valid sealed verdict
+    Adopt {
+        slug: String,
+        round: String,
+        #[arg(long, value_name = "THREAD")]
+        thread: String,
+    },
     /// Manual repair only: commit the review brief B, freeze the manifest,
     /// create the review branch. `round advance` does this on its own.
     Review { slug: String, round: String },
-    /// Manual repair only: start the reviewer for a frozen round and bind it.
-    /// `round advance` does this on its own.
-    Reviewer { slug: String, round: String },
     /// Merge on an exact MERGE verdict, then checkpoint; resumes after a crash
     Merge {
         slug: String,
@@ -662,14 +680,71 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 );
                 Ok(())
             }
-            RoundCommand::Abandon {
+            RoundCommand::Retry {
                 slug,
                 round: id,
                 reason,
             } => {
-                round::abandon(ctx, &slug, &id, &reason)?;
-                println!("abandoned {id}: {reason}");
-                Ok(())
+                let result = round::retry(ctx, &slug, &id, &reason)?;
+                crate::output::success(
+                    Some(&result.action),
+                    &result,
+                    &format!("{} {} with {}\n", result.action, id, result.thread),
+                    "",
+                )
+            }
+            RoundCommand::Cancel {
+                slug,
+                round: id,
+                reason,
+            } => {
+                let result = round::cancel(ctx, &slug, &id, &reason)?;
+                let pending = result
+                    .threads
+                    .iter()
+                    .filter(|thread| thread.state == "cleanup_pending")
+                    .count();
+                let message = if pending == 0 {
+                    format!("cancelled {id}: {}\n", result.reason)
+                } else {
+                    format!("cancelled {id}; cleanup pending for {pending} thread(s)\n")
+                };
+                crate::output::success(
+                    Some(if pending == 0 {
+                        "cancelled"
+                    } else {
+                        "cleanup_pending"
+                    }),
+                    &result,
+                    &message,
+                    "",
+                )
+            }
+            RoundCommand::Rebind {
+                slug,
+                round: id,
+                thread,
+            } => {
+                let result = round::rebind(ctx, &slug, &id, &thread)?;
+                crate::output::success(
+                    Some(&result.action),
+                    &result,
+                    &format!("{} is bound to {id}\n", result.thread),
+                    "",
+                )
+            }
+            RoundCommand::Adopt {
+                slug,
+                round: id,
+                thread,
+            } => {
+                let result = round::adopt(ctx, &slug, &id, &thread)?;
+                crate::output::success(
+                    Some(&result.action),
+                    &result,
+                    &format!("{}: {} into {id}\n", result.action, result.thread),
+                    "",
+                )
             }
             RoundCommand::Review { slug, round: id } => {
                 let o = round::review(ctx, &slug, &id)?;
@@ -687,22 +762,13 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     o.revision, o.manifest_hash
                 );
                 println!(
-                    "next: `round advance {slug}` starts and binds the reviewer after routing from its full brief and pinned changes; `round reviewer {slug} {id}` is the manual start"
+                    "next: `round advance {slug}` starts and binds the reviewer after routing from its full brief and pinned changes; `round retry {slug} {id} --reason <why>` is the recovery command"
                 );
                 if let (Some(c), Some(v)) = (&o.earlier_candidate, &o.earlier_verdict) {
                     println!(
                         "repair: merge the earlier candidate {c} (verdict {v}) over the new base instead of the pinned shas; `round advance {slug}` starts a reviewer with that task"
                     );
                 }
-                Ok(())
-            }
-            RoundCommand::Reviewer { slug, round: id } => {
-                let reviewer = round::start_reviewer_by_hand(ctx, &slug, &id)?;
-                crate::output::insert("reviewer", reviewer.id.clone());
-                println!(
-                    "{} reviews {id} (manual repair; `round advance` starts reviewers on its own)",
-                    reviewer.id
-                );
                 Ok(())
             }
             RoundCommand::Merge {
@@ -1367,8 +1433,27 @@ enum ThreadCommand {
         #[arg(long)]
         plain: Option<String>,
     },
-    /// Bring back a thread whose pane is gone or whose start failed
-    Restart { slug: String, id: String },
+    /// Replace a failed, blocked, or stuck attempt through bounded routing
+    Retry {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Stop a thread, close its pane and remove its clean worktree
+    Cancel {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Point this thread at the verified live process already doing its work
+    Rebind {
+        slug: String,
+        id: String,
+        #[arg(long, value_name = "PANE")]
+        pane: String,
+    },
     /// Send a follow-up to a thread's agent
     Prompt {
         slug: String,
@@ -1491,8 +1576,11 @@ fn machine_outcome(command: &str) -> String {
     let outcome = match command {
         "open" | "round open" => "opened",
         "context" | "round show" | "plan show" | "decide show" => "shown",
-        "thread start" | "thread restart" => "started",
-        "thread adopt" => "adopted",
+        "thread start" => "started",
+        "thread retry" | "round retry" => "retried",
+        "thread cancel" | "round cancel" => "cancelled",
+        "thread rebind" | "round rebind" => "rebound",
+        "thread adopt" | "round adopt" => "adopted",
         "thread prompt" => "prompted",
         "thread resolve" => "resolved",
         "thread ack" => "acknowledged",
@@ -1509,9 +1597,7 @@ fn machine_outcome(command: &str) -> String {
         "round advance" => "advanced",
         "round admit" => "admitted",
         "round remove" => "removed",
-        "round abandon" => "abandoned",
         "round review" => "review_prepared",
-        "round reviewer" => "reviewer_started",
         "round merge" => "merged",
         "round tick" => "ticked",
         "doctor" => "healthy",
@@ -1870,14 +1956,41 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 );
                 Ok(())
             }
-            ThreadCommand::Restart { slug, id } => {
-                let thread = threads::restart(&ctx, &slug, &id)?;
-                crate::output::insert("pane_id", thread.pane_id.clone());
-                println!(
-                    "{} is back in pane {}; the ticker launches its agent",
-                    thread.id, thread.pane_id
-                );
-                Ok(())
+            ThreadCommand::Retry { slug, id, reason } => {
+                let result = threads::retry(&ctx, &slug, &id, &reason)?;
+                crate::output::success(
+                    Some("retried"),
+                    &result,
+                    &format!(
+                        "{} attempt {} is in pane {}; the ticker launches its agent\n",
+                        result.thread, result.attempt, result.pane_id
+                    ),
+                    "",
+                )
+            }
+            ThreadCommand::Cancel { slug, id, reason } => {
+                let result = threads::cancel(&ctx, &slug, &id, &reason)?;
+                let message = if result.state == "cleanup_pending" {
+                    format!(
+                        "{} cancelled; pane cleanup is pending and will be retried\n",
+                        result.thread
+                    )
+                } else {
+                    format!(
+                        "{} cancelled; pane {} and worktree {}\n",
+                        result.thread, result.pane, result.worktree
+                    )
+                };
+                crate::output::success(Some(&result.state), &result, &message, "")
+            }
+            ThreadCommand::Rebind { slug, id, pane } => {
+                let result = threads::rebind(&ctx, &slug, &id, &pane)?;
+                crate::output::success(
+                    Some("rebound"),
+                    &result,
+                    &format!("{} is rebound to pane {}\n", result.thread, result.pane_id),
+                    "",
+                )
             }
             ThreadCommand::Prompt {
                 slug,
@@ -2144,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoning_a_closed_round_does_not_record_a_failure() {
+    fn repeating_round_cancel_does_not_record_a_failure() {
         let fx = crate::round::testkit::fixture();
         let ctx = fx.world.ctx();
         crate::round::open(
@@ -2158,17 +2271,10 @@ mod tests {
             },
         )
         .unwrap();
-        crate::round::abandon(&ctx, "demo", "r1", "no longer needed").unwrap();
-        let result = crate::round::abandon(&ctx, "demo", "r1", "again").map(|_| ());
-        assert!(crate::refusal::is(result.as_ref().unwrap_err()));
-        assert!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .starts_with("round_closed:")
-        );
-        record_command_outcome(Some(&fx.project), "ha round abandon", &result);
+        crate::round::cancel(&ctx, "demo", "r1", "no longer needed").unwrap();
+        let result = crate::round::cancel(&ctx, "demo", "r1", "again").map(|_| ());
+        assert!(result.is_ok());
+        record_command_outcome(Some(&fx.project), "ha round cancel", &result);
         assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
     }
 

@@ -980,7 +980,7 @@ pub(crate) fn session_notice(
                 "session",
                 "session",
                 &format!(
-                    "herdr session restarted; {open} threads need `thread restart`, and the coordinator needs `open`"
+                    "herdr session restarted; {open} threads need `thread retry`, and the coordinator needs `open`"
                 ),
                 "",
             )?;
