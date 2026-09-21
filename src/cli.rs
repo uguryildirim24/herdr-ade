@@ -178,10 +178,8 @@ enum Command {
     },
     /// Seal and deliver why this lane must wait
     Waiting { what: String },
-    /// Record a failed lane attempt and request automatic stronger-model dispatch
+    /// Record a failed lane attempt and request bounded routing recovery
     Failed { what: String },
-    /// Evaluate routing against completed work and its recorded outcomes
-    RoutingEval { project: String },
     /// Print a role skill and the runtime-only standing rules
     Skill {
         #[arg(default_value = "coordinator")]
@@ -1283,7 +1281,7 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
-        /// Instruction set for this lane; routing policy may set a model floor for it
+        /// Instruction set for this lane; the routing table may match it
         #[arg(long, value_name = "FLOW")]
         workflow: Option<String>,
         /// Birth sentence (SPEC-ADE D17 item 6)
@@ -1908,14 +1906,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
         Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
         Command::Failed { what } => crate::lane::failed(&ctx, &what),
-        Command::RoutingEval { project } => {
-            let project = crate::project::Project::load(&ctx.root, &project)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&crate::routing::evaluate(&ctx, &project)?)?
-            );
-            Ok(())
-        }
         Command::Skill { role } => crate::lane::skill(&ctx, &role),
         Command::Close { slug } => crate::coordinator::close(&ctx, &slug),
         Command::Plain { command } => match command {

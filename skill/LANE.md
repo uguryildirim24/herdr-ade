@@ -21,13 +21,13 @@ The command starts (or reuses) a picture lane on Codex's own backend, spends one
 
 ## If this attempt fails
 
-When your approach fails and a stronger model is needed, preserve the worktree and run:
+When your approach fails, preserve the worktree and run:
 
 ```text
 hp failed "<what failed, what you tried, and the evidence>"
 ```
 
-This seals a failure event. The harness scores the full brief again with that failure, records the upgrade, and starts a stronger model in the same worktree. No settings edit or permission step is needed. Do not keep editing after sealing it. The ladder stops after at most three upgrades or when no stronger model remains. Research, spec, Claude-required and user-pinned work keep their fixed model and report the refusal instead. Use `waiting` for missing input, not for a failed approach.
+This seals a failure event. The harness follows the matched routing rule: retry the same recipe, then try its ordered fallback recipes, while keeping the worktree. When that list is exhausted it leaves the lane waiting for the coordinator. No settings edit or permission step is needed. Do not keep editing after sealing it. Use `waiting` for missing input, not for a failed approach.
 
 ## Finish
 
