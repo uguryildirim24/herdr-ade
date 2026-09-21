@@ -25,10 +25,14 @@ pub(crate) struct Item {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Stale {
     pub(crate) items: Vec<Item>,
+    /// At least one check could not be read. Unknown is not the same as
+    /// current, so the screen says so instead of staying silent.
+    pub(crate) unknown: bool,
 }
 
-/// Compare what is running with what is installed. Best effort: an unreadable
-/// source produces no row.
+/// Compare what is running with what is installed. A check that can be read
+/// and is current says nothing; a check that cannot be read is recorded as
+/// unknown.
 pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     let mut stale = Stale::default();
 
@@ -68,21 +72,25 @@ pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     }
 
     // 3. The local herdr server image.
-    if server_stale(ctx.runner, &herdr_bin, None) {
-        stale.items.push(Item {
+    match server_stale(ctx.runner, &herdr_bin, None) {
+        Some(true) => stale.items.push(Item {
             what: "The local herdr server is still running an older program.".into(),
             remedy: "Hand the server over to the installed program: `herdr server restart`.".into(),
-        });
+        }),
+        None => stale.unknown = true,
+        Some(false) => {}
     }
 
     // 4. The box's herdr server image.
-    if let Some(target) = box_target(ctx, project)
-        && server_stale(ctx.runner, &herdr_bin, Some(&target))
-    {
-        stale.items.push(Item {
-            what: "The box's herdr server is still running an older program.".into(),
-            remedy: format!("Hand the box server over: `ssh {target} herdr server restart`."),
-        });
+    if let Some(target) = box_target(ctx, project) {
+        match server_stale(ctx.runner, &herdr_bin, Some(&target)) {
+            Some(true) => stale.items.push(Item {
+                what: "The box's herdr server is still running an older program.".into(),
+                remedy: format!("Hand the box server over: `ssh {target} herdr server restart`."),
+            }),
+            None => stale.unknown = true,
+            Some(false) => {}
+        }
     }
 
     // 5 and 6. A skill file that moved on since the agent was primed.
@@ -128,6 +136,12 @@ pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     }
 
     stale
+}
+
+/// The version reported by the installed plugin binary, if it can be read.
+/// The running screen compares this with its own `VERSION` before handing over.
+pub(crate) fn installed_version(ctx: &Ctx) -> Option<String> {
+    plugin_version(ctx.runner, &ctx.env.home.join(".local/bin/herdr-ade"))
 }
 
 fn plugin_version(runner: &dyn Runner, path: &Path) -> Option<String> {
@@ -212,12 +226,15 @@ fn json(runner: &dyn Runner, cmd: &Cmd) -> Option<Value> {
 }
 
 /// The server says whether its running image matches the installed binary.
-fn server_stale(runner: &dyn Runner, bin: &str, target: Option<&str>) -> bool {
+/// `None` means the check could not be read, which is not the same as current.
+/// A remote check asks the box for its own `herdr` on the box's `PATH`; the
+/// plugin's binary path is a Mac path and does not exist there.
+fn server_stale(runner: &dyn Runner, bin: &str, target: Option<&str>) -> Option<bool> {
     let output = match target {
         Some(target) => crate::remote::ssh(
             runner,
             target,
-            &format!("{bin} status server --json"),
+            "herdr status server --json",
             None,
             BOX_CHECK_TIMEOUT,
         )
@@ -225,17 +242,12 @@ fn server_stale(runner: &dyn Runner, bin: &str, target: Option<&str>) -> bool {
         None => runner
             .run(&Cmd::new(bin, CHECK_TIMEOUT).args(["status", "server", "--json"]))
             .ok(),
-    };
-    let Some(output) = output else {
-        return false;
-    };
+    }?;
     if !output.success() {
-        return false;
+        return None;
     }
-    let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else {
-        return false;
-    };
-    flag(&value, "server_binary_stale") || flag(&value, "restart_needed")
+    let value = serde_json::from_str::<Value>(&output.stdout).ok()?;
+    Some(flag(&value, "server_binary_stale") || flag(&value, "restart_needed"))
 }
 
 fn flag(value: &Value, key: &str) -> bool {
@@ -439,5 +451,31 @@ mod tests {
             ..thread::Thread::default()
         };
         assert!(brief_behind(&lane));
+    }
+
+    #[test]
+    fn the_box_server_check_asks_the_box_for_its_own_herdr() {
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on("herdr status server", ok(r#"{"server_binary_stale":true}"#));
+        let state = server_stale(&runner, "/home/agent/.local/bin/herdr", Some("remote-host"));
+        assert_eq!(state, Some(true));
+        let calls: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
+        assert!(
+            calls.iter().any(|c| c.contains("herdr status server")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("/home/agent")),
+            "the Mac path must not cross to the box: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_server_check_is_unknown_not_current() {
+        let runner = crate::runner::fake::FakeRunner::new();
+        // No rule: the check fails, and that is unknown, not fine.
+        assert_eq!(server_stale(&runner, "herdr", Some("remote-host")), None);
+        runner.on("status server", ok("not json"));
+        assert_eq!(server_stale(&runner, "herdr", None), None);
     }
 }
