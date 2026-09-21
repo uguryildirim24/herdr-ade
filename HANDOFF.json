@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0143.md",
+      "tasks/t-0138.md",
+      "tasks/review-r60.md",
+      "tasks/t-0142.md",
+      "tasks/review-r59.md",
       "tasks/t-0139.md",
       "tasks/review-r61.md",
-      "tasks/review-r60.md",
-      "tasks/review-r59.md",
       "tasks/t-0136.md",
       "tasks/review-r58.md",
       "tasks/t-0135.md",
       "tasks/t-0134.md",
-      "tasks/t-0133.md",
-      "tasks/t-0132.md",
-      "tasks/t-0131.md",
-      "tasks/t-0130.md"
+      "tasks/t-0133.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r60.md",
       "tasks/reviews/code-r61.md",
       "tasks/reviews/code-r58.md",
       "tasks/reviews/code-r57.md",
@@ -39,19 +40,24 @@
       "tasks/reviews/code-r52.md",
       "tasks/reviews/code-r51.md",
       "tasks/reviews/code-r50.md",
-      "tasks/reviews/code-r49.md",
-      "tasks/reviews/code-r48.md"
+      "tasks/reviews/code-r49.md"
     ]
   },
-  "generated": "2026-09-21T10:28:43-04:00",
+  "generated": "2026-09-21T10:45:20-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0139-review-r61-this-round-keeps-one-space-pe",
+      "hp/adeherdr/t-0143-review-r60-this-round-measures-the-part",
       "main",
+      "hp/adeherdr/t-0142-the-doctor-ignores-a-machine-s-own-home",
+      "review/r60-2",
+      "hp/adeherdr/t-0141-review-r59-this-round-fixes-your-talk-ta",
+      "review/r59-2",
+      "hp/adeherdr/t-0138-review-r60-this-round-measures-the-part",
+      "hp/adeherdr/t-0140-review-r59-this-round-fixes-your-talk-ta",
       "hp/adeherdr/t-0137-review-r59-this-round-fixes-your-talk-ta",
+      "hp/adeherdr/t-0139-review-r61-this-round-keeps-one-space-pe",
       "review/r61",
       "hp/adeherdr/t-0130-a-slow-start-is-not-a-dead-start",
-      "hp/adeherdr/t-0138-review-r60-this-round-measures-the-part",
       "review/r60",
       "review/r59",
       "hp/adeherdr/t-0133-the-box-has-its-settings-checks-ask-the",
@@ -225,22 +231,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "9ddb764 review(r61): verdict",
-      "a83b5f2 Merge commit '6d71bae0ba7d87eaa30a143a399b3fe81e9ea494' into hp/adeherdr/t-0139-review-r61-this-round-keeps-one-space-pe",
-      "84e6a49 docs(tasks): t-0139",
-      "4a6f2d8 review(r61): brief for revision 1",
-      "6d71bae fix: make remote starts durable and concurrent",
-      "78e6275 review(r60): brief for revision 2"
+      "0c4f85d review(r60): verdict",
+      "eb0448f review(doctor): keep cached failures plain",
+      "9faa08a Merge earlier r60 candidate",
+      "5778e55 docs(tasks): t-0143",
+      "38c5d8c review(r60): brief for revision 2",
+      "5c6fd5a docs(tasks): t-0142"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "15 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "9ddb764",
+        "head": "0c4f85d",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r61): verdict"
+        "subject": "review(r60): verdict"
       },
       {
         "branch": "review/r1",
@@ -593,6 +599,13 @@
         "subject": "docs(tasks): t-0137"
       },
       {
+        "branch": "review/r59-2",
+        "dirty": 0,
+        "head": "bdb6e42",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r59-2",
+        "subject": "docs(tasks): t-0141"
+      },
+      {
         "branch": "review/r6",
         "dirty": 0,
         "head": "910649d",
@@ -605,6 +618,13 @@
         "head": "a82178b",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r60",
         "subject": "docs(tasks): t-0138"
+      },
+      {
+        "branch": "review/r60-2",
+        "dirty": 0,
+        "head": "5778e55",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r60-2",
+        "subject": "docs(tasks): t-0143"
       },
       {
         "branch": "review/r61",
@@ -1081,6 +1101,20 @@
         "head": "1fdbb98",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0112",
         "subject": "checkpoint(r52): HANDOFF after merging the round"
+      },
+      {
+        "branch": "hp/adeherdr/t-0142-the-doctor-ignores-a-machine-s-own-home",
+        "dirty": 0,
+        "head": "74ce0d4",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0142",
+        "subject": "fix(doctor): ignore a machine's own home workspace"
+      },
+      {
+        "branch": "hp/adeherdr/t-0143-review-r60-this-round-measures-the-part",
+        "dirty": 0,
+        "head": "0c4f85d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0143",
+        "subject": "review(r60): verdict"
       }
     ]
   },
@@ -1105,15 +1139,60 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r61",
-    "verdict": "9ddb7644f8df655de1112b58aff92d84577f29fb"
+    "round": "r60",
+    "verdict": "0c4f85d56798f848235fb3311aaab139b1d0a558"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [],
+  "workers": [
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0142",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0142",
+      "pane_id": "w1G:p35",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0142--/2026-09-21T14-36-37-984Z_01a0c465-c0df-72b9-9525-22a8eba3794b.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t31",
+      "tab_label": "t-0142",
+      "title": "π - t-0142",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0142",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0142"
+      }
+    },
+    {
+      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0143",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0143",
+      "pane_id": "w1G:p36",
+      "pane_label": null,
+      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0143--/2026-09-21T14-37-32-770Z_01a0c466-96e2-74e3-936c-0f4cc00ccb6f.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t32",
+      "tab_label": "t-0143",
+      "title": "π - t-0143",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0143",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "3",
+        "review": "working",
+        "thread": "t-0143"
+      }
+    }
+  ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 2
+    "tabs": 4
   }
 }
