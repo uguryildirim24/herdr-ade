@@ -1,0 +1,974 @@
+//! Stable project tasks and their evidence-derived state.
+//!
+//! Task records contain intent and links, never a writable status. Every view
+//! calls [`view`] so TASKS.md, context, plans and the talk screen use the same
+//! projection.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::contracts::{FailureClass, RoundPhase};
+use crate::project::{self, Project, write_atomic};
+
+pub(crate) const STATES: [&str; 5] = ["finished", "reviewed", "merged", "installed", "verified"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DatedNote {
+    pub(crate) at: String,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Evidence {
+    pub(crate) at: String,
+    pub(crate) command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) acceptance: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct Task {
+    pub(crate) schema: u32,
+    pub(crate) id: String,
+    pub(crate) title: String,
+    /// `request:<id>` or `ask:<id>@<revision>`, all validated at creation.
+    pub(crate) authority: Vec<String>,
+    pub(crate) acceptance: Vec<String>,
+    pub(crate) notes: Vec<DatedNote>,
+    pub(crate) attempts: Vec<String>,
+    pub(crate) rounds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repo: Option<String>,
+    pub(crate) installed: Vec<Evidence>,
+    pub(crate) verified: Vec<Evidence>,
+    pub(crate) created: String,
+}
+
+impl Default for Task {
+    fn default() -> Self {
+        Self {
+            schema: 1,
+            id: String::new(),
+            title: String::new(),
+            authority: Vec::new(),
+            acceptance: Vec::new(),
+            notes: Vec::new(),
+            attempts: Vec::new(),
+            rounds: Vec::new(),
+            plan_step: None,
+            repo: None,
+            installed: Vec::new(),
+            verified: Vec::new(),
+            created: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum State {
+    Open,
+    Working,
+    Finished,
+    Reviewed,
+    Merged,
+    Installed,
+    Verified,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+impl State {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Working => "working",
+            Self::Finished => "finished",
+            Self::Reviewed => "reviewed",
+            Self::Merged => "merged",
+            Self::Installed => "installed",
+            Self::Verified => "verified",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct View {
+    pub(crate) record: Task,
+    pub(crate) state: State,
+    pub(crate) next: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_class: Option<FailureClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_kind: Option<String>,
+}
+
+impl View {
+    pub(crate) fn terminal(&self, project: &Project) -> bool {
+        if self.state == State::Cancelled {
+            return true;
+        }
+        required_states(project, &self.record)
+            .ok()
+            .and_then(|states| states.last().cloned())
+            .is_some_and(|last| last == self.state.word())
+    }
+}
+
+fn dir(project: &Project) -> PathBuf {
+    project.dir().join("tasks")
+}
+
+fn path(project: &Project, id: &str) -> PathBuf {
+    dir(project).join(format!("{id}.toml"))
+}
+
+pub(crate) fn validate_id(id: &str) -> Result<()> {
+    let digits = id.strip_prefix("job-").unwrap_or("");
+    if digits.len() < 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        bail!("task_id: `{id}` is not a task id (expected job-0001)");
+    }
+    Ok(())
+}
+
+pub(crate) fn load(project: &Project, id: &str) -> Result<Task> {
+    validate_id(id)?;
+    let file = path(project, id);
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::refusal::error(format!(
+                "task_unknown: no task `{id}` in `{}`",
+                project.slug
+            )));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", file.display()));
+        }
+    };
+    let task: Task = toml::from_str(&text)
+        .with_context(|| format!("task_unreadable: {} does not parse", file.display()))?;
+    validate_record(&task)?;
+    Ok(task)
+}
+
+fn validate_record(task: &Task) -> Result<()> {
+    if task.schema != 1 {
+        bail!("task_schema: expected 1, got {}", task.schema);
+    }
+    validate_id(&task.id)?;
+    if task.title.trim().is_empty() {
+        bail!("task_title: the title is empty");
+    }
+    if task.authority.is_empty() {
+        bail!("task_authority: at least one request or answered ask is required");
+    }
+    if task.acceptance.is_empty() || task.acceptance.iter().any(|line| line.trim().is_empty()) {
+        bail!("task_acceptance: at least one plain acceptance condition is required");
+    }
+    Ok(())
+}
+
+fn write(project: &Project, task: &Task) -> Result<()> {
+    validate_record(task)?;
+    write_atomic(&path(project, &task.id), toml::to_string(task)?.as_bytes())
+}
+
+pub(crate) fn list_with_errors(project: &Project) -> (Vec<Task>, Vec<anyhow::Error>) {
+    let entries = match std::fs::read_dir(dir(project)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => return (Vec::new(), vec![error.into()]),
+    };
+    let mut tasks = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(error.into());
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            errors.push(anyhow::anyhow!(
+                "task_unreadable: a task file name is not UTF-8"
+            ));
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".toml") else {
+            continue;
+        };
+        match load(project, id) {
+            Ok(task) => tasks.push(task),
+            Err(error) => errors.push(error),
+        }
+    }
+    tasks.sort_by(|a, b| a.id.cmp(&b.id));
+    (tasks, errors)
+}
+
+pub(crate) fn add(
+    project: &Project,
+    title: &str,
+    authority: Vec<String>,
+    acceptance: Vec<String>,
+    repo: Option<String>,
+    plan_step: Option<String>,
+) -> Result<Task> {
+    if title.trim().is_empty() {
+        return Err(crate::refusal::error(
+            "task_title: a plain title is required",
+        ));
+    }
+    if authority.is_empty() {
+        return Err(crate::refusal::error(
+            "task_authority: pass at least one --request request:<id> or ask:<id>@<revision>",
+        ));
+    }
+    if acceptance.is_empty() || acceptance.iter().any(|line| line.trim().is_empty()) {
+        return Err(crate::refusal::error(
+            "task_acceptance: pass at least one non-empty --acceptance sentence",
+        ));
+    }
+    let title = crate::glossary::check_record_sentence(project, "task title", title)?;
+    let mut checked_acceptance = Vec::new();
+    for (index, condition) in acceptance.iter().enumerate() {
+        checked_acceptance.push(crate::glossary::check_record_sentence(
+            project,
+            &format!("acceptance condition {}", index + 1),
+            condition,
+        )?);
+    }
+    for reference in &authority {
+        if let Err(error) = crate::decide::validate_basis(project, reference) {
+            return Err(crate::refusal::error(format!(
+                "task_authority: `{reference}` does not name existing authority: {error:#}"
+            )));
+        }
+    }
+    if let Some(step) = plan_step.as_deref() {
+        let plan = crate::plan::load(project)?
+            .ok_or_else(|| crate::refusal::error("task_plan: no plan is written down"))?;
+        if !plan.steps.iter().any(|candidate| candidate.id == step) {
+            return Err(crate::refusal::error(format!(
+                "task_plan: no plan step `{step}`"
+            )));
+        }
+    }
+    let repo = repo.map(|repo| {
+        std::fs::canonicalize(&repo)
+            .or_else(|_| std::path::absolute(&repo))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or(repo)
+    });
+    let _lock = project.lock()?;
+    std::fs::create_dir_all(dir(project))?;
+    let next = list_with_errors(project)
+        .0
+        .iter()
+        .filter_map(|task| task.id.strip_prefix("job-")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let task = Task {
+        id: format!("job-{next:04}"),
+        title,
+        authority,
+        acceptance: checked_acceptance,
+        plan_step,
+        repo,
+        created: project::now(),
+        ..Task::default()
+    };
+    write(project, &task)?;
+    drop(_lock);
+    refresh_tasks_md(project)?;
+    Ok(task)
+}
+
+fn update(
+    project: &Project,
+    id: &str,
+    change: impl FnOnce(&mut Task) -> Result<()>,
+) -> Result<Task> {
+    let _lock = project.lock()?;
+    let mut task = load(project, id)?;
+    change(&mut task)?;
+    write(project, &task)?;
+    drop(_lock);
+    refresh_tasks_md(project)?;
+    Ok(task)
+}
+
+pub(crate) fn note(project: &Project, id: &str, text: &str) -> Result<Task> {
+    if text.trim().is_empty() {
+        return Err(crate::refusal::error("task_note: a note is required"));
+    }
+    update(project, id, |task| {
+        task.notes.push(DatedNote {
+            at: project::now(),
+            text: text.trim().to_string(),
+        });
+        Ok(())
+    })
+}
+
+pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<Task> {
+    crate::thread::load(project, thread)
+        .with_context(|| format!("task_attempt: no thread `{thread}`"))?;
+    for other in list_with_errors(project).0 {
+        if other.id != id && other.attempts.iter().any(|attempt| attempt == thread) {
+            return Err(crate::refusal::error(format!(
+                "task_attempt: `{thread}` already belongs to `{}`",
+                other.id
+            )));
+        }
+    }
+    let task = update(project, id, |task| {
+        if !task.attempts.iter().any(|attempt| attempt == thread) {
+            task.attempts.push(thread.to_string());
+        }
+        Ok(())
+    })?;
+    for round in crate::round::list(project)
+        .into_iter()
+        .filter(|round| round.carries(thread))
+    {
+        link_round_for_thread(project, &round.round, thread)?;
+    }
+    load(project, &task.id)
+}
+
+pub(crate) fn link_round_for_thread(project: &Project, round: &str, thread: &str) -> Result<()> {
+    if let Some(task) = list_with_errors(project)
+        .0
+        .into_iter()
+        .find(|task| task.attempts.iter().any(|attempt| attempt == thread))
+    {
+        update(project, &task.id, |task| {
+            if !task.rounds.iter().any(|candidate| candidate == round) {
+                task.rounds.push(round.to_string());
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_states(states: &[String]) -> Result<()> {
+    if states.is_empty() || states.first().map(String::as_str) != Some("finished") {
+        bail!("task_states: the ordered list must start with `finished`");
+    }
+    let mut previous = None;
+    for state in states {
+        let index = STATES
+            .iter()
+            .position(|candidate| candidate == state)
+            .with_context(|| format!("task_states: `{state}` is not a task milestone"))?;
+        if previous.is_some_and(|old| index <= old) {
+            bail!("task_states: milestones must be unique and in evidence order");
+        }
+        previous = Some(index);
+    }
+    Ok(())
+}
+
+pub(crate) fn required_states(project: &Project, task: &Task) -> Result<Vec<String>> {
+    let settings = project.read_project_md()?.0;
+    let states = task
+        .repo
+        .as_deref()
+        .and_then(|repo| settings.repos.iter().find(|row| row.path == repo))
+        .filter(|row| !row.task_states.is_empty())
+        .map(|row| row.task_states.clone())
+        .unwrap_or(settings.task_states);
+    validate_states(&states)?;
+    Ok(states)
+}
+
+fn next_for(state: State, required: &[String], task: &Task) -> String {
+    match state {
+        State::Open => "start an attempt".into(),
+        State::Working => "finish the current attempt".into(),
+        State::Failed => "retry or cancel the current attempt".into(),
+        State::Cancelled => "none".into(),
+        State::Unknown => "repair the unreadable evidence".into(),
+        _ => {
+            let at = required
+                .iter()
+                .position(|candidate| *candidate == state.word());
+            match at
+                .and_then(|index| required.get(index + 1))
+                .map(String::as_str)
+            {
+                Some("reviewed") => "put the attempt in a review round".into(),
+                Some("merged") => "merge its reviewed round".into(),
+                Some("installed") => "record installation evidence".into(),
+                Some("verified") => {
+                    let done: BTreeSet<usize> = task
+                        .verified
+                        .iter()
+                        .flat_map(|evidence| evidence.acceptance.iter().copied())
+                        .collect();
+                    format!(
+                        "verify {} acceptance condition(s)",
+                        task.acceptance.len().saturating_sub(done.len())
+                    )
+                }
+                Some(other) => format!("record {other} evidence"),
+                None => "none".into(),
+            }
+        }
+    }
+}
+
+pub(crate) fn view(project: &Project, task: Task) -> View {
+    let required = match required_states(project, &task) {
+        Ok(required) => required,
+        Err(_) => {
+            return View {
+                record: task,
+                state: State::Unknown,
+                next: "repair the task state configuration".into(),
+                failure_class: None,
+                provider_kind: None,
+            };
+        }
+    };
+    if task.attempts.is_empty() {
+        return View {
+            record: task,
+            state: State::Open,
+            next: "start an attempt".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    let current = task.attempts.last().expect("attempt checked");
+    let thread = match crate::thread::load(project, current) {
+        Ok(thread) => thread,
+        Err(_) => {
+            return View {
+                record: task,
+                state: State::Unknown,
+                next: "repair the missing attempt record".into(),
+                failure_class: None,
+                provider_kind: None,
+            };
+        }
+    };
+    let event_dir = project.dir().join("events");
+    let events_readable = std::fs::read_dir(&event_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
+                .all(|entry| {
+                    std::fs::read_to_string(entry.path())
+                        .ok()
+                        .and_then(|text| toml::from_str::<crate::contracts::Event>(&text).ok())
+                        .is_some()
+                })
+        })
+        .unwrap_or_else(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if !events_readable {
+        return View {
+            record: task,
+            state: State::Unknown,
+            next: "repair the unreadable event evidence".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    let events = crate::events::list(project);
+    let event = crate::round::latest_event(&events, current, thread.attempt.max(1));
+    if thread.status == crate::thread::Status::Resolved && !thread.cancellation_reason.is_empty() {
+        return View {
+            record: task,
+            state: State::Cancelled,
+            next: "none".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    if let Some(failed) = event.and_then(|event| event.payload.failed.as_ref()) {
+        return View {
+            record: task,
+            state: State::Failed,
+            next: "retry or cancel the current attempt".into(),
+            failure_class: Some(failed.class),
+            provider_kind: failed.provider_kind.clone(),
+        };
+    }
+    if thread.status == crate::thread::Status::Failed {
+        return View {
+            record: task,
+            state: State::Failed,
+            next: "retry or cancel the current attempt".into(),
+            failure_class: Some(thread.failure_class),
+            provider_kind: thread.provider_failure_kind.clone(),
+        };
+    }
+    if event
+        .and_then(|event| event.payload.done.as_ref())
+        .is_none()
+    {
+        return View {
+            record: task,
+            state: State::Working,
+            next: "finish the current attempt".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+
+    let mut relevant = Vec::new();
+    for id in &task.rounds {
+        let round = match crate::round::load(project, id) {
+            Ok(round) => round,
+            Err(_) => {
+                return View {
+                    record: task,
+                    state: State::Unknown,
+                    next: "repair the unreadable round evidence".into(),
+                    failure_class: None,
+                    provider_kind: None,
+                };
+            }
+        };
+        if round
+            .manifest
+            .members
+            .iter()
+            .any(|member| member.thread == *current)
+        {
+            relevant.push(round);
+        }
+    }
+    if relevant.iter().any(|round| {
+        round.verdict.is_some()
+            && round.phase == RoundPhase::VerdictIn
+            && round.verdict_kind.is_none()
+    }) {
+        return View {
+            record: task,
+            state: State::Unknown,
+            next: "read the review verdict evidence".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    let reviewed = relevant.iter().any(|round| {
+        round.verdict_kind.as_deref() == Some("MERGE")
+            || matches!(
+                round.phase,
+                RoundPhase::Merging | RoundPhase::Checkpointing | RoundPhase::Merged
+            )
+    });
+    let merged = relevant
+        .iter()
+        .any(|round| round.phase == RoundPhase::Merged);
+    let verified: BTreeSet<usize> = task
+        .verified
+        .iter()
+        .flat_map(|evidence| evidence.acceptance.iter().copied())
+        .collect();
+    let all_verified = (1..=task.acceptance.len()).all(|index| verified.contains(&index));
+    let facts = |state: &str| match state {
+        "finished" => true,
+        "reviewed" => reviewed,
+        "merged" => merged,
+        "installed" => !task.installed.is_empty(),
+        "verified" => all_verified,
+        _ => false,
+    };
+    let mut state = State::Finished;
+    for milestone in &required {
+        if !facts(milestone) {
+            break;
+        }
+        state = match milestone.as_str() {
+            "finished" => State::Finished,
+            "reviewed" => State::Reviewed,
+            "merged" => State::Merged,
+            "installed" => State::Installed,
+            "verified" => State::Verified,
+            _ => State::Unknown,
+        };
+    }
+    let next = next_for(state, &required, &task);
+    View {
+        record: task,
+        state,
+        next,
+        failure_class: None,
+        provider_kind: None,
+    }
+}
+
+pub(crate) fn views(project: &Project) -> (Vec<View>, Vec<anyhow::Error>) {
+    let (tasks, errors) = list_with_errors(project);
+    (
+        tasks.into_iter().map(|task| view(project, task)).collect(),
+        errors,
+    )
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum EvidenceKind {
+    Installed,
+    Verified,
+}
+
+pub(crate) fn record_evidence(
+    project: &Project,
+    id: &str,
+    kind: EvidenceKind,
+    command: &str,
+    acceptance: Vec<usize>,
+) -> Result<Task> {
+    if command.trim().is_empty() {
+        return Err(crate::refusal::error(
+            "task_evidence: --command is required",
+        ));
+    }
+    let before = view(project, load(project, id)?);
+    let required = required_states(project, &before.record)?;
+    let word = match kind {
+        EvidenceKind::Installed => "installed",
+        EvidenceKind::Verified => "verified",
+    };
+    if !required.iter().any(|state| state == word) {
+        return Err(crate::refusal::error(format!(
+            "task_evidence: `{word}` is not enabled for this task's repository"
+        )));
+    }
+    let prerequisite = match kind {
+        EvidenceKind::Installed => "merged",
+        EvidenceKind::Verified if required.iter().any(|state| state == "installed") => "installed",
+        EvidenceKind::Verified => "merged",
+    };
+    let reached = STATES
+        .iter()
+        .position(|state| *state == before.state.word())
+        .unwrap_or(0);
+    let needed = STATES
+        .iter()
+        .position(|state| *state == prerequisite)
+        .unwrap_or(usize::MAX);
+    if reached < needed {
+        return Err(crate::refusal::error(format!(
+            "task_evidence: task is {}, but `{word}` needs it to be {prerequisite}",
+            before.state.word()
+        )));
+    }
+    if matches!(kind, EvidenceKind::Verified) {
+        if acceptance.is_empty() {
+            return Err(crate::refusal::error(
+                "task_evidence: verification needs at least one --acceptance number",
+            ));
+        }
+        if acceptance
+            .iter()
+            .any(|index| *index == 0 || *index > before.record.acceptance.len())
+        {
+            return Err(crate::refusal::error(format!(
+                "task_evidence: an acceptance number is outside 1..={}",
+                before.record.acceptance.len()
+            )));
+        }
+    } else if !acceptance.is_empty() {
+        return Err(crate::refusal::error(
+            "task_evidence: installation evidence does not take acceptance numbers",
+        ));
+    }
+    let mut acceptance = acceptance;
+    acceptance.sort_unstable();
+    acceptance.dedup();
+    update(project, id, |task| {
+        let evidence = Evidence {
+            at: project::now(),
+            command: command.trim().to_string(),
+            acceptance,
+        };
+        match kind {
+            EvidenceKind::Installed => task.installed.push(evidence),
+            EvidenceKind::Verified => task.verified.push(evidence),
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn refresh_tasks_md(project: &Project) -> Result<()> {
+    let (views, errors) = views(project);
+    let mut text =
+        String::from("# Tasks\n\n<!-- Generated from tasks/*.toml. Do not edit this file. -->\n");
+    for (heading, terminal) in [("Open", false), ("Complete", true)] {
+        text.push_str(&format!("\n## {heading}\n"));
+        let mut any = false;
+        for view in &views {
+            if view.terminal(project) != terminal {
+                continue;
+            }
+            any = true;
+            let mark = if terminal { "x" } else { " " };
+            text.push_str(&format!(
+                "- [{mark}] `{}` {} — {}; next: {}\n",
+                view.record.id,
+                view.record.title,
+                view.state.word(),
+                view.next
+            ));
+        }
+        if !any {
+            text.push('\n');
+        }
+    }
+    if !errors.is_empty() {
+        text.push_str("\n## Unknown\n");
+        for error in errors {
+            text.push_str(&format!("- [ ] unreadable task — unknown ({error:#})\n"));
+        }
+    }
+    write_atomic(&project.dir().join("TASKS.md"), text.as_bytes())
+}
+
+pub(crate) fn render(view: &View) -> String {
+    let mut out = format!(
+        "{} [{}] {}\nnext: {}\n",
+        view.record.id,
+        view.state.word(),
+        view.record.title,
+        view.next
+    );
+    out.push_str(&format!(
+        "authority: {}\n",
+        view.record.authority.join(", ")
+    ));
+    out.push_str("acceptance:\n");
+    for (index, condition) in view.record.acceptance.iter().enumerate() {
+        out.push_str(&format!("  {}. {}\n", index + 1, condition));
+    }
+    if let Some(class) = view.failure_class {
+        out.push_str(&format!("failure: {}\n", class.plain()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_do_not_overlap_lane_ids() {
+        assert!(validate_id("job-0001").is_ok());
+        assert!(validate_id("t-0001").is_err());
+    }
+
+    #[test]
+    fn state_lists_must_follow_evidence_order() {
+        assert!(validate_states(&["finished".into(), "merged".into(), "verified".into()]).is_ok());
+        assert!(
+            validate_states(&["finished".into(), "installed".into(), "merged".into()]).is_err()
+        );
+    }
+
+    fn record(project: &Project, id: &str) -> Task {
+        let task = Task {
+            id: id.into(),
+            title: "Ship the checked change.".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["The command reports the new result.".into()],
+            created: project::now(),
+            ..Task::default()
+        };
+        std::fs::create_dir_all(dir(project)).unwrap();
+        write(project, &task).unwrap();
+        task
+    }
+
+    #[test]
+    fn a_missing_request_is_refused() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let error = add(
+            &project,
+            "Ship the checked change.",
+            vec!["request:q-missing".into()],
+            vec!["The command reports the new result.".into()],
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no message `q-missing`"));
+        assert!(list_with_errors(&project).0.is_empty());
+    }
+
+    #[test]
+    fn one_record_drives_every_milestone_and_skips_install_when_not_configured() {
+        use crate::round::testkit::{commit_file, fixture, git};
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        crate::plan::set(&ctx, "demo", "command", "It reports the checked result.", 0).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Ship the checked change.", vec![], vec![], 1).unwrap();
+        let task = record(&fx.project, "job-0001");
+        update(&fx.project, "job-0001", |task| {
+            task.plan_step = Some("s-1".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(view(&fx.project, task).state, State::Open);
+
+        let (lane, sha) = fx.lane(1);
+        link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        assert_eq!(
+            view(&fx.project, load(&fx.project, "job-0001").unwrap()).state,
+            State::Working
+        );
+        assert!(
+            crate::plan::show(&ctx, "demo", false)
+                .unwrap()
+                .contains("running s-1")
+        );
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("job-0001 [working]"));
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        assert_eq!(
+            view(&fx.project, load(&fx.project, "job-0001").unwrap()).state,
+            State::Finished
+        );
+
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The checked change is ready.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        let review = crate::round::review(&ctx, "demo", "r1").unwrap();
+        git(&review.worktree, &["merge", "-q", "--no-edit", &sha]);
+        let candidate = git(&review.worktree, &["rev-parse", "HEAD"]);
+        let round = crate::round::load(&fx.project, "r1").unwrap();
+        let verdict_text = format!(
+            "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{candidate}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll gates pass.\n",
+            round.manifest_hash.unwrap(),
+            round.policy_hash
+        );
+        let verdict = commit_file(
+            &review.worktree,
+            &crate::round::verdict_path("r1"),
+            &verdict_text,
+            "verdict",
+        );
+        let reviewer = fx.thread("Reviewer");
+        fx.seal_done(&reviewer, 1, 1, &verdict, "# verdict\n");
+        crate::round::bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
+        crate::round::advance(&ctx, "demo").unwrap();
+        assert_eq!(
+            view(&fx.project, load(&fx.project, "job-0001").unwrap()).state,
+            State::Reviewed
+        );
+        crate::round::merge(&ctx, "demo", "r1", None).unwrap();
+        let merged = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(merged.state, State::Merged);
+        assert_eq!(merged.next, "none");
+        // This repository inherits a workflow with no install state.
+        assert!(
+            record_evidence(
+                &fx.project,
+                "job-0001",
+                EvidenceKind::Installed,
+                "install",
+                vec![]
+            )
+            .is_err()
+        );
+
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.task_states = STATES.iter().map(|state| state.to_string()).collect();
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+        let installed = record_evidence(
+            &fx.project,
+            "job-0001",
+            EvidenceKind::Installed,
+            "ha harness install",
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(view(&fx.project, installed).state, State::Installed);
+        let verified = record_evidence(
+            &fx.project,
+            "job-0001",
+            EvidenceKind::Verified,
+            "ha doctor",
+            vec![1],
+        )
+        .unwrap();
+        assert_eq!(view(&fx.project, verified).state, State::Verified);
+        assert!(
+            crate::plan::show(&ctx, "demo", false)
+                .unwrap()
+                .contains("done    s-1")
+        );
+        let overview = crate::talk::overview::Overview::load(
+            &fx.project,
+            &crate::talk::Journal::default(),
+            &crate::talk::view::Conversation::default(),
+            &crate::talk::overview::Live::default(),
+        );
+        assert!(
+            overview
+                .tasks
+                .iter()
+                .any(|row| row.prefix == "verified" && row.marker == "job-0001")
+        );
+
+        refresh_tasks_md(&fx.project).unwrap();
+        let generated = std::fs::read_to_string(fx.project.dir().join("TASKS.md")).unwrap();
+        assert!(generated.contains("job-0001` Ship the checked change. — verified"));
+    }
+
+    #[test]
+    fn provider_failure_keeps_its_class_and_is_not_finished() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        record(&project, "job-0001");
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Failed;
+            thread.attempt = 1;
+            thread.failure_class = FailureClass::Provider;
+            thread.provider_failure_kind = Some("pi".into());
+        })
+        .unwrap();
+        link_attempt(&project, "job-0001", &thread.id).unwrap();
+        let view = view(&project, load(&project, "job-0001").unwrap());
+        assert_eq!(view.state, State::Failed);
+        assert_eq!(view.failure_class, Some(FailureClass::Provider));
+        assert_eq!(view.provider_kind.as_deref(), Some("pi"));
+    }
+}

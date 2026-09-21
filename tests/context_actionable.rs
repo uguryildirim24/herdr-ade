@@ -142,38 +142,6 @@ fn terminal_preparation_does_not_hide_the_current_failure_or_change_records() {
 }
 
 #[test]
-fn unreadable_tasks_are_not_reported_as_an_empty_queue() {
-    let p = Project::new();
-    p.write("TASKS.md", [0xff]);
-    let text = p.context(true);
-    assert!(
-        text.contains("## Tasks (TASKS.md)\nconfig-error: TASKS.md is unreadable"),
-        "{text}"
-    );
-    assert!(!text.contains("## Tasks (TASKS.md)\n(none)"), "{text}");
-}
-
-#[test]
-fn unfinished_tasks_are_bounded_across_lists_and_finished_tasks_are_absent() {
-    let p = Project::new();
-    let mut tasks = String::from("# Tasks\n## Archive\n- [x] Dead work (me)\n## First\n");
-    for n in 1..=10 {
-        tasks.push_str(&format!("- [ ] Task {n} (me)\n"));
-    }
-    tasks.push_str("## Second\n");
-    for n in 11..=21 {
-        tasks.push_str(&format!("- [ ] Task {n} (agent → t-0001)\n"));
-    }
-    p.write("TASKS.md", tasks);
-    let text = p.context(true);
-    assert!(!text.contains("Archive"));
-    assert!(!text.contains("Dead work"));
-    assert!(text.contains("Task 20 (agent → t-0001)"));
-    assert!(!text.contains("Task 21"));
-    assert!(text.contains("1 more; read TASKS.md (digest limit 20)"));
-}
-
-#[test]
 fn round_and_preparation_lists_are_bounded() {
     let p = Project::new();
     for n in 1..=21 {

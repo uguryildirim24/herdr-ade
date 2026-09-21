@@ -105,6 +105,11 @@ enum Command {
         #[command(subcommand)]
         command: InboxCommand,
     },
+    /// Stable tasks and their evidence-derived state
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// Threads: the project's worker agents
     Thread {
         #[command(subcommand)]
@@ -1422,6 +1427,45 @@ enum InboxCommand {
 }
 
 #[derive(Subcommand)]
+enum TaskCommand {
+    /// Add a task tied to Rolf's request and plain acceptance conditions
+    Add {
+        slug: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "request", required = true)]
+        requests: Vec<String>,
+        #[arg(long = "acceptance", required = true)]
+        acceptance: Vec<String>,
+        #[arg(long, value_name = "PATH")]
+        repo: Option<String>,
+        #[arg(long, value_name = "STEP")]
+        plan_step: Option<String>,
+    },
+    /// Show one task and its derived state
+    Show { slug: String, id: String },
+    /// List tasks and their derived state
+    List { slug: String },
+    /// Add a dated note without changing state
+    Note {
+        slug: String,
+        id: String,
+        text: String,
+    },
+    /// Record installation or per-condition verification evidence
+    Evidence {
+        slug: String,
+        id: String,
+        #[arg(long, value_enum)]
+        kind: crate::task::EvidenceKind,
+        #[arg(long)]
+        command: String,
+        #[arg(long = "acceptance")]
+        acceptance: Vec<usize>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ThreadCommand {
     /// Start a thread: a worktree workspace for --repo, else a tab in the project workspace
     Start {
@@ -1444,6 +1488,18 @@ enum ThreadCommand {
         /// Birth sentence (SPEC-ADE D17 item 6)
         #[arg(long)]
         plain: Option<String>,
+        /// Existing stable task id. Ordinary lanes must name this or create one.
+        #[arg(long, value_name = "TASK", conflicts_with = "requests")]
+        job: Option<String>,
+        /// Authority for a task created with this lane
+        #[arg(long = "request", requires = "acceptance")]
+        requests: Vec<String>,
+        /// Acceptance conditions for a task created with this lane
+        #[arg(long = "acceptance", requires = "requests")]
+        acceptance: Vec<String>,
+        /// Plan step for a task created with this lane
+        #[arg(long, value_name = "STEP", requires = "requests")]
+        plan_step: Option<String>,
     },
     /// Replace a failed, blocked, or stuck attempt through bounded routing
     Retry {
@@ -1942,6 +1998,99 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 Ok(())
             }
         },
+        Command::Task { command } => match command {
+            TaskCommand::Add {
+                slug,
+                title,
+                requests,
+                acceptance,
+                repo,
+                plan_step,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let authority = requests
+                    .into_iter()
+                    .map(|reference| {
+                        if reference.starts_with("request:") || reference.starts_with("ask:") {
+                            reference
+                        } else {
+                            format!("request:{reference}")
+                        }
+                    })
+                    .collect();
+                let record =
+                    crate::task::add(&project, &title, authority, acceptance, repo, plan_step)?;
+                let view = crate::task::view(&project, record);
+                crate::output::success(
+                    Some("added"),
+                    &serde_json::json!({ "task": view }),
+                    &format!(
+                        "{} [{}] {}\n",
+                        view.record.id,
+                        view.state.word(),
+                        view.record.title
+                    ),
+                    "",
+                )
+            }
+            TaskCommand::Show { slug, id } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let view = crate::task::view(&project, crate::task::load(&project, &id)?);
+                crate::output::success(
+                    Some("shown"),
+                    &serde_json::json!({ "task": view }),
+                    &crate::task::render(&view),
+                    "",
+                )
+            }
+            TaskCommand::List { slug } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let (views, errors) = crate::task::views(&project);
+                if let Some(error) = errors.first() {
+                    return Err(anyhow::anyhow!("task_unreadable: {error:#}"));
+                }
+                let message = views
+                    .iter()
+                    .map(crate::task::render)
+                    .collect::<Vec<_>>()
+                    .join("");
+                crate::output::success(
+                    Some("listed"),
+                    &serde_json::json!({ "tasks": views }),
+                    &message,
+                    "",
+                )
+            }
+            TaskCommand::Note { slug, id, text } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::task::note(&project, &id, &text)?;
+                let view = crate::task::view(&project, record);
+                crate::output::success(
+                    Some("noted"),
+                    &serde_json::json!({ "task": view }),
+                    &format!("noted {}\n", view.record.id),
+                    "",
+                )
+            }
+            TaskCommand::Evidence {
+                slug,
+                id,
+                kind,
+                command,
+                acceptance,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record =
+                    crate::task::record_evidence(&project, &id, kind, &command, acceptance)?;
+                let view = crate::task::view(&project, record);
+                crate::output::success(
+                    Some(view.state.word()),
+                    &serde_json::json!({ "task": view }),
+                    &format!("{} is {}\n", view.record.id, view.state.word()),
+                    "",
+                )
+            }
+        },
         Command::Thread { command } => match command {
             ThreadCommand::Start {
                 slug,
@@ -1952,8 +2101,48 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 task_file,
                 workflow,
                 plain,
+                job,
+                requests,
+                acceptance,
+                plan_step,
             } => {
                 let task = read_text(&task_file)?;
+                let project = Project::load(&ctx.root, &slug)?;
+                let task_id = match job {
+                    Some(id) => {
+                        crate::task::load(&project, &id)?;
+                        id
+                    }
+                    None if workflow.as_deref() == Some("reviewer") => String::new(),
+                    None if requests.is_empty() => {
+                        return Err(crate::refusal::error(
+                            "task_missing: a lane must pass --job <task>, or create one with --request and --acceptance",
+                        ));
+                    }
+                    None => {
+                        let authority = requests
+                            .into_iter()
+                            .map(|reference| {
+                                if reference.starts_with("request:")
+                                    || reference.starts_with("ask:")
+                                {
+                                    reference
+                                } else {
+                                    format!("request:{reference}")
+                                }
+                            })
+                            .collect();
+                        crate::task::add(
+                            &project,
+                            &title,
+                            authority,
+                            acceptance,
+                            repo.clone(),
+                            plan_step,
+                        )?
+                        .id
+                    }
+                };
                 let thread = threads::start(
                     &ctx,
                     &slug,
@@ -1967,6 +2156,10 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         workflow,
                     },
                 )?;
+                if !task_id.is_empty() {
+                    crate::task::link_attempt(&project, &task_id, &thread.id)?;
+                    crate::output::insert("task", task_id);
+                }
                 crate::output::insert("id", thread.id.clone());
                 crate::output::insert("kind", serde_json::to_value(thread.kind)?);
                 crate::output::insert("branch", thread.branch.clone());

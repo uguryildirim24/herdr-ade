@@ -239,6 +239,7 @@ pub(crate) fn step_add(
             id,
             text: text.clone(),
             state: StepState::Left,
+            tasks: Vec::new(),
             threads: dedup(&threads),
             rounds: dedup(&rounds),
         });
@@ -369,7 +370,10 @@ fn find_step<'a>(plan: &'a mut Plan, id: &str) -> Result<&'a mut PlanStep> {
 /// false`; a normal call reports a goal that drifted from `PROJECT.md`.
 pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
-    let plan = load(&project)?;
+    let mut plan = load(&project)?;
+    if let Some(card) = &mut plan {
+        project_states(&project, card);
+    }
     if json {
         let view = match &plan {
             Some(plan) => {
@@ -414,6 +418,17 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
     }
     for step in &plan.steps {
         let mut refs = String::new();
+        let linked_tasks: Vec<String> = crate::task::list_with_errors(&project)
+            .0
+            .into_iter()
+            .filter(|task| {
+                task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
+            })
+            .map(|task| task.id)
+            .collect();
+        if !linked_tasks.is_empty() {
+            refs.push_str(&format!(" tasks {}", linked_tasks.join(", ")));
+        }
         if !step.threads.is_empty() {
             refs.push_str(&format!(" threads {}", step.threads.join(", ")));
         }
@@ -492,11 +507,27 @@ pub(crate) fn project_states(project: &Project, plan: &mut Plan) -> bool {
 /// `running` when any required work has started or partially landed, else
 /// `left`.
 fn derive_state(project: &Project, step: &PlanStep) -> StepState {
-    if step.threads.is_empty() && step.rounds.is_empty() {
+    let linked_tasks: Vec<_> = crate::task::list_with_errors(project)
+        .0
+        .into_iter()
+        .filter(|task| {
+            task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
+        })
+        .collect();
+    if linked_tasks.is_empty() && step.threads.is_empty() && step.rounds.is_empty() {
         return StepState::Left;
     }
     let mut all_satisfied = true;
     let mut any_started = false;
+    for task in linked_tasks {
+        let view = crate::task::view(project, task);
+        if !view.terminal(project) {
+            all_satisfied = false;
+        }
+        if view.state != crate::task::State::Open {
+            any_started = true;
+        }
+    }
     for id in &step.threads {
         let carrying = threads::carrying_rounds(project, id);
         let exists = thread::load(project, id).is_ok();
