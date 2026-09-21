@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0139.md",
+      "tasks/review-r61.md",
+      "tasks/review-r60.md",
+      "tasks/review-r59.md",
       "tasks/t-0136.md",
       "tasks/review-r58.md",
       "tasks/t-0135.md",
@@ -18,17 +22,14 @@
       "tasks/t-0133.md",
       "tasks/t-0132.md",
       "tasks/t-0131.md",
-      "tasks/t-0130.md",
-      "tasks/t-0129.md",
-      "tasks/t-0127.md",
-      "tasks/t-0128.md",
-      "tasks/review-r57.md"
+      "tasks/t-0130.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r61.md",
       "tasks/reviews/code-r58.md",
       "tasks/reviews/code-r57.md",
       "tasks/reviews/code-r56.md",
@@ -39,24 +40,29 @@
       "tasks/reviews/code-r51.md",
       "tasks/reviews/code-r50.md",
       "tasks/reviews/code-r49.md",
-      "tasks/reviews/code-r48.md",
-      "tasks/reviews/code-r47.md"
+      "tasks/reviews/code-r48.md"
     ]
   },
-  "generated": "2026-09-21T10:07:11-04:00",
+  "generated": "2026-09-21T10:28:43-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0139-review-r61-this-round-keeps-one-space-pe",
+      "main",
+      "hp/adeherdr/t-0137-review-r59-this-round-fixes-your-talk-ta",
+      "review/r61",
+      "hp/adeherdr/t-0130-a-slow-start-is-not-a-dead-start",
+      "hp/adeherdr/t-0138-review-r60-this-round-measures-the-part",
+      "review/r60",
+      "review/r59",
       "hp/adeherdr/t-0133-the-box-has-its-settings-checks-ask-the",
       "hp/adeherdr/t-0132-the-picker-is-measured-on-what-happened",
       "hp/adeherdr/t-0136-review-r58-this-round-lets-rounds-of-wor",
-      "main",
       "hp/adeherdr/t-0129-the-talk-tab-is-easy-to-read-and-always",
       "hp/adeherdr/t-0134-the-coordinator-can-always-be-woken",
       "hp/adeherdr/t-0135-a-choice-that-changes-what-rolf-gets-poi",
       "hp/adeherdr/t-0131-a-reviewer-always-starts-as-a-reviewer",
       "review/r58",
       "hp/adeherdr/t-0128-rounds-stop-waiting-for-each-other",
-      "hp/adeherdr/t-0130-a-slow-start-is-not-a-dead-start",
       "hp/adeherdr/t-0127-review-r57-this-round-stops-finished-job",
       "review/r57",
       "hp/adeherdr/t-0126-a-finished-lane-leaves-nothing-behind-on",
@@ -219,22 +225,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "8a70a29 review(r58): verdict",
-      "973426f review(rounds): preserve merge turns and repair recovery",
-      "ff20fd1 Merge commit 'df6f91abe5a284965fd45ae7045be29faba4acf8' into hp/adeherdr/t-0136-review-r58-this-round-lets-rounds-of-wor",
-      "dae2b2c docs(tasks): t-0136",
-      "e2986db review(r58): brief for revision 1",
-      "b8e0a09 docs(tasks): t-0135"
+      "9ddb764 review(r61): verdict",
+      "a83b5f2 Merge commit '6d71bae0ba7d87eaa30a143a399b3fe81e9ea494' into hp/adeherdr/t-0139-review-r61-this-round-keeps-one-space-pe",
+      "84e6a49 docs(tasks): t-0139",
+      "4a6f2d8 review(r61): brief for revision 1",
+      "6d71bae fix: make remote starts durable and concurrent",
+      "78e6275 review(r60): brief for revision 2"
     ],
-    "remote": "13 ahead, 0 behind origin/main",
+    "remote": "7 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "8a70a29",
+        "head": "9ddb764",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(r58): verdict"
+        "subject": "review(r61): verdict"
       },
       {
         "branch": "review/r1",
@@ -580,11 +586,32 @@
         "subject": "docs(tasks): t-0136"
       },
       {
+        "branch": "review/r59",
+        "dirty": 0,
+        "head": "cd12cd7",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r59",
+        "subject": "docs(tasks): t-0137"
+      },
+      {
         "branch": "review/r6",
         "dirty": 0,
         "head": "910649d",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r6",
         "subject": "docs(tasks): t-0014"
+      },
+      {
+        "branch": "review/r60",
+        "dirty": 0,
+        "head": "a82178b",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r60",
+        "subject": "docs(tasks): t-0138"
+      },
+      {
+        "branch": "review/r61",
+        "dirty": 0,
+        "head": "84e6a49",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r61",
+        "subject": "docs(tasks): t-0139"
       },
       {
         "branch": "review/r7",
@@ -1078,8 +1105,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r58",
-    "verdict": "8a70a297538bda56a2dbceb53e5ac8801ec005e3"
+    "round": "r61",
+    "verdict": "9ddb7644f8df655de1112b58aff92d84577f29fb"
   },
   "session": "default",
   "unlinked_agents": [],
