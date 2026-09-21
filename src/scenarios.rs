@@ -35,9 +35,14 @@ impl World {
         std::fs::write(home.path().join("cfg/config.toml"), "[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n").unwrap();
         let mut policy: serde_json::Value =
             serde_json::from_str(include_str!("../config/routing.json")).unwrap();
-        policy["models"] =
-            serde_json::json!({"test_claude": {"tier": 1, "description": "Fixture coding model"}});
-        policy["routes"] = serde_json::json!([{"up_to": 1.0, "recipe": "test_claude"}]);
+        policy["models"] = serde_json::json!({"test_claude": {
+            "tier": 1,
+            "coding_index": 77.2,
+            "price_per_million": 1.0,
+            "description": "Fixture coding model"
+        }});
+        policy["role_floors"] = serde_json::json!({});
+        policy["answer_floors"] = serde_json::json!([]);
         std::fs::write(home.path().join("cfg/routing.json"), policy.to_string()).unwrap();
         let world = World {
             env,
@@ -52,22 +57,18 @@ impl World {
             "agent start --help",
             ok("[possible values: pi, claude, cursor, agy]"),
         );
-        world.runner.on_fn(
-            |cmd| cmd.program == "claude" && cmd.args == ["auth", "status"],
-            |_| Ok(ok("logged in\n")),
-        );
-        world.runner.on_fn(
-            |cmd| cmd.program == "agy" && cmd.args == ["models"],
-            |_| Ok(ok("gemini-3.8-flash-high\n")),
-        );
+        world
+            .runner
+            .on_fn(|cmd| cmd.program == "claude", |_| Ok(ok("OK\n")));
+        world
+            .runner
+            .on_fn(|cmd| cmd.program == "agy", |_| Ok(ok("OK\n")));
         let mut answers = serde_json::Map::new();
-        for id in ["difficulty", "ambiguity", "blast_radius"] {
-            answers.insert(
-                id.into(),
-                serde_json::json!({"type":"score", "score":0.0, "confidence":0.98,
-                "probabilities":{"0":1.0,"1":0.0,"2":0.0,"3":0.0}}),
-            );
-        }
+        answers.insert(
+            "required_index".into(),
+            serde_json::json!({"type":"score", "score":0.0, "confidence":0.98,
+            "probabilities":{"0":1.0,"1":0.0,"2":0.0,"3":0.0}}),
+        );
         world.runner.on(
             "/usr/bin/curl",
             ok(&crate::jev::http_response(
@@ -1871,6 +1872,7 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
         format!("[harness]\nrepos = [\n{}\n]\n", rows.join("\n")),
     )
     .unwrap();
+    std::fs::write(dir.join("RULES.md"), "# Lane rules\n").unwrap();
 }
 
 #[test]
@@ -1982,7 +1984,11 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         ok(r#"[{"id":"oci","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
     );
     crate::harness::install(&with_box.ctx()).unwrap();
-    assert_eq!(with_box.runner.count("ssh"), 2, "one box build per repo");
+    assert_eq!(
+        with_box.runner.count("ssh"),
+        3,
+        "one box build per repo plus the lane settings"
+    );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
         .iter()
@@ -1990,13 +1996,25 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         .map(|c| c.args.last().cloned().unwrap_or_default())
         .collect();
     assert!(
-        scripts.iter().all(|s| s.contains("git fetch --quiet")
+        scripts[..2].iter().all(|s| s.contains("git fetch --quiet")
             && s.contains("git merge --ff-only")
             && s.contains("cargo build --release --locked")
             && s.contains("cp target/release/")
             && s.contains("mv -f $HOME/.local/bin/.")),
         "{scripts:?}"
     );
+    assert!(
+        scripts[2].contains("$dir/RULES.md")
+            && scripts[2].contains(crate::harness::BOX_WORKER_MARKER),
+        "{}",
+        scripts[2]
+    );
+    let settings = calls
+        .iter()
+        .filter(|call| call.program == "ssh")
+        .nth(2)
+        .unwrap();
+    assert_eq!(settings.stdin.as_deref(), Some("# Lane rules\n"));
     drop(calls);
 
     let without_box = World::new();

@@ -484,6 +484,10 @@ pub(crate) struct RoundRecord {
     /// bounded by `round::MAX_REVIEWER_START_FAILURES` (E3/D1).
     #[serde(default)]
     pub(crate) reviewer_start_failures: u32,
+    /// REJECT verdicts observed before the round eventually merged. `None`
+    /// means this historical round predates outcome tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rejections: Option<u32>,
     /// Human-supplied reason for deliberately ending an unmergeable round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) abandoned_reason: Option<String>,

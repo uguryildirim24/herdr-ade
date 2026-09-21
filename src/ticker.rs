@@ -20,7 +20,7 @@ use crate::project::{self, Project, Status};
 use crate::steps::{self, Memory};
 use crate::{inbox, thread, threads};
 
-const TICK: Duration = Duration::from_secs(15);
+const TICK: Duration = crate::pi::doctor::READINESS_CACHE_TTL;
 const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;

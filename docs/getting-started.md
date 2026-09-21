@@ -27,7 +27,7 @@ cp <plugin-root>/config/routing.json ~/.config/herdr-ade/routing.json
 herdr-ade doctor
 ```
 
-`routing.json` is required; there is no embedded fallback. It contains the scoring questions, model cards, cutoffs, and routes. Executable recipes and machine placement belong in `~/.config/herdr-ade/config.toml`.
+`routing.json` is required; there is no embedded fallback. It contains one real-unit Coding Index question, measured model cards, the confidence floor and routing floors. The picker chooses the lowest-price model that clears the requested index. Executable recipes and machine placement belong in `~/.config/herdr-ade/config.toml`.
 
 If you use pi recipes, run `herdr-pi setup`, complete each required login with `herdr-pi login`, then run `herdr-pi doctor`. A login is local to that machine; do not copy its credential store to another machine.
 

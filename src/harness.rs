@@ -25,6 +25,7 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const BOX_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
 
 /// The `[harness]` table of `config.toml`.
 #[derive(Debug, Default, Deserialize)]
@@ -273,6 +274,34 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<()> 
     Ok(())
 }
 
+/// Install only the policy a lane machine consumes. Dispatch recipes and the
+/// routing rubric stay on the coordinator; copying them would give the box a
+/// second, stale source of model-selection policy.
+fn box_settings(ctx: &Ctx, target: &str) -> Result<()> {
+    let rules_path = ctx.config_dir.join("RULES.md");
+    let rules = std::fs::read_to_string(&rules_path)
+        .with_context(|| format!("harness_rules_missing: {}", rules_path.display()))?;
+    let script = format!(
+        "set -e\n\
+         dir=\"$HOME/.config/herdr-ade\"\n\
+         mkdir -p \"$dir\"\n\
+         tmp=\"$dir/.RULES.md.install.$$\"\n\
+         cat > \"$tmp\"\n\
+         chmod 600 \"$tmp\"\n\
+         mv -f \"$tmp\" \"$dir/RULES.md\"\n\
+         printf '%s\\n' 'lane worker; dispatch stays on the coordinator' > \"$dir/{BOX_WORKER_MARKER}\"\n\
+         chmod 600 \"$dir/{BOX_WORKER_MARKER}\""
+    );
+    let out = remote::ssh(ctx.runner, target, &script, Some(&rules), INSTALL_TIMEOUT)?;
+    if !out.success() {
+        bail!(
+            "harness_box_settings_failed: install lane policy on {target}: {}",
+            out.error_text()
+        );
+    }
+    Ok(())
+}
+
 /// The machine-wide install lock: two projects never install at once.
 pub(crate) struct InstallLock {
     _file: std::fs::File,
@@ -380,6 +409,9 @@ pub(crate) fn install(ctx: &Ctx) -> Result<()> {
             }
             (None, _) => {}
         }
+    }
+    if let Some(target) = &box_target {
+        box_settings(ctx, target)?;
     }
     if fork {
         println!("the running server keeps its image; a live handoff is Rolf's call");
