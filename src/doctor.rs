@@ -84,7 +84,7 @@ fn probe_error(kind: &str, output: &crate::runner::Output) -> String {
     let detail = output.error_text();
     if detail.is_empty() {
         format!(
-            "{kind} could not reach its smallest model (exit {:?})",
+            "{kind} could not reach its smallest model; its stored sign-in may no longer work (exit {:?})",
             output.code
         )
     } else {
@@ -1205,6 +1205,45 @@ mod tests {
 
     fn runner_with_herdr(version: &str) -> FakeRunner {
         runner_with_machine_list(version, "[]")
+    }
+
+    #[test]
+    fn a_cached_native_failure_still_names_the_stored_sign_in_without_provider_output() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "claude",
+            |_| Ok(fail(1, "subscription expired")),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let launch = crate::contracts::Launch {
+            kind: "claude".into(),
+            ready_timeout_ms: 1_000,
+            ..Default::default()
+        };
+
+        let first = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
+        assert!(first.contains("subscription expired"), "{first}");
+        let cache =
+            std::fs::read_to_string(ctx.root.join(".readiness/native-claude.json")).unwrap();
+        assert!(!cache.contains("subscription expired"), "{cache}");
+
+        let cached = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
+        assert!(
+            cached.contains("stored sign-in may no longer work"),
+            "{cached}"
+        );
+        assert!(!cached.contains("subscription expired"), "{cached}");
+        assert_eq!(runner.count("claude"), 1);
     }
 
     #[test]
