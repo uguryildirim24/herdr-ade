@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0125.md",
+      "tasks/t-0124.md",
+      "tasks/t-0126.md",
+      "tasks/t-0123.md",
+      "tasks/review-r56.md",
       "tasks/t-0122.md",
       "tasks/review-r55.md",
       "tasks/t-0121.md",
       "tasks/t-0120.md",
       "tasks/t-0119.md",
       "tasks/t-0117.md",
-      "tasks/review-r54.md",
-      "tasks/t-0115.md",
-      "tasks/t-0116.md",
-      "tasks/review-r53.md",
-      "tasks/t-0114.md",
-      "tasks/t-0113.md"
+      "tasks/review-r54.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r56.md",
       "tasks/reviews/code-r55.md",
       "tasks/reviews/code-r54.md",
       "tasks/reviews/code-r53.md",
@@ -39,15 +40,19 @@
       "tasks/reviews/code-r48.md",
       "tasks/reviews/code-r47.md",
       "tasks/reviews/code-r46.md",
-      "tasks/reviews/code-r45.md",
-      "tasks/reviews/code-r43.md"
+      "tasks/reviews/code-r45.md"
     ]
   },
-  "generated": "2026-09-21T08:36:25-04:00",
+  "generated": "2026-09-21T09:07:18-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0122-review-r55-this-round-lets-a-job-say-whi",
       "main",
+      "hp/adeherdr/t-0126-a-finished-lane-leaves-nothing-behind-on",
+      "hp/adeherdr/t-0125-review-r56-this-round-takes-out-code-not",
+      "review/r56",
+      "hp/adeherdr/t-0124-review-r56-this-round-takes-out-code-not",
+      "hp/adeherdr/t-0123-a-finished-lane-leaves-nothing-behind-on",
+      "hp/adeherdr/t-0122-review-r55-this-round-lets-a-job-say-whi",
       "review/r55",
       "hp/adeherdr/t-0120-dead-code-in-the-plugin-s-rust-removed",
       "hp/adeherdr/t-0121-dead-tests-and-dead-surface-removed",
@@ -202,22 +207,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "25ef979 review(r55): verdict",
-      "eb67e96 Merge commit '1d912780b37a66452c423d25a8d6236d3b87b247' into hp/adeherdr/t-0122-review-r55-this-round-lets-a-job-say-whi",
-      "579c6a8 docs(tasks): t-0122",
-      "83e2f94 review(r55): brief for revision 1",
-      "7908a9f docs(tasks): t-0121",
-      "1d91278 feat(routing): apply role and answer floors to scored dispatch"
+      "2160a1a Merge commit '3397d76f8450a531bf71bd8dc6ca3af6cdfc3a0b'",
+      "3397d76 review(r56): verdict",
+      "e99b89c review(cli): repair thread resolve help",
+      "c179722 review(core): remove remaining dead closure",
+      "d9168ce Merge commit '819375cb841c5accb31c163da2bc2696c0c4d654' into hp/adeherdr/t-0125-review-r56-this-round-takes-out-code-not",
+      "837f510 Merge commit 'bfd8e2fd8f4ee2f7d1cf6db6a03aba1195318dae' into hp/adeherdr/t-0125-review-r56-this-round-takes-out-code-not"
     ],
-    "remote": "23 ahead, 0 behind origin/main",
+    "remote": "48 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "25ef979",
+        "head": "2160a1a",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r55): verdict"
+        "subject": "Merge commit '3397d76f8450a531bf71bd8dc6ca3af6cdfc3a0b'"
       },
       {
         "branch": "review/r1",
@@ -540,6 +545,13 @@
         "head": "579c6a8",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r55",
         "subject": "docs(tasks): t-0122"
+      },
+      {
+        "branch": "review/r56",
+        "dirty": 0,
+        "head": "f1451ac",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r56",
+        "subject": "docs(tasks): t-0125"
       },
       {
         "branch": "review/r6",
@@ -1023,7 +1035,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "done",
+      "status": "blocked",
       "workspace_id": "w1H"
     },
     {
@@ -1040,8 +1052,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r55",
-    "verdict": "25ef97999a8f908e33f9e84a3b57ff6cf8ed467b"
+    "round": "r56",
+    "verdict": "3397d76f8450a531bf71bd8dc6ca3af6cdfc3a0b"
   },
   "session": "default",
   "unlinked_agents": [],
