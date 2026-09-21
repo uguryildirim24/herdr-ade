@@ -1,3 +1,25 @@
+mod output;
+
+// Route command prose through one result renderer. The default renderer keeps
+// streaming the same bytes; `--json` collects them into the result record.
+macro_rules! print {
+    ($($arg:tt)*) => { $crate::output::write_stdout(format_args!($($arg)*)) };
+}
+macro_rules! println {
+    () => { $crate::output::write_stdout(format_args!("\n")) };
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout(format_args!($($arg)*));
+        $crate::output::write_stdout(format_args!("\n"));
+    }};
+}
+macro_rules! eprintln {
+    () => { $crate::output::write_stderr(format_args!("\n")) };
+    ($($arg:tt)*) => {{
+        $crate::output::write_stderr(format_args!($($arg)*));
+        $crate::output::write_stderr(format_args!("\n"));
+    }};
+}
+
 mod actions;
 mod adapters;
 mod adopt;
@@ -86,7 +108,7 @@ fn extend_path() {
 fn main() {
     extend_path();
     if let Err(error) = cli::run() {
-        eprintln!("herdr-ade: {error:#}");
+        let _ = output::finish_error(&format!("{error:#}"));
         std::process::exit(1);
     }
 }
