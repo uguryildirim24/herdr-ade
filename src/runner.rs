@@ -182,6 +182,47 @@ pub(crate) trait Runner {
     fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String>;
 }
 
+/// Gives every child an explicit stable working directory. Commands that
+/// already name a directory keep it (git and lane-specific commands depend on
+/// that); everything else is detached from the caller's possibly disposable
+/// worktree.
+pub(crate) struct CwdRunner<'a> {
+    inner: &'a dyn Runner,
+    cwd: PathBuf,
+}
+
+impl<'a> CwdRunner<'a> {
+    pub(crate) fn new(inner: &'a dyn Runner, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            inner,
+            cwd: cwd.into(),
+        }
+    }
+
+    fn rooted(&self, cmd: &Cmd) -> Cmd {
+        let mut cmd = cmd.clone();
+        if cmd.cwd.is_none() {
+            cmd.cwd = Some(self.cwd.clone());
+        }
+        cmd
+    }
+}
+
+impl Runner for CwdRunner<'_> {
+    fn run(&self, cmd: &Cmd) -> Result<Output> {
+        self.inner.run(&self.rooted(cmd))
+    }
+
+    fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
+        let commands: Vec<_> = commands.iter().map(|cmd| self.rooted(cmd)).collect();
+        self.inner.run_parallel(&commands)
+    }
+
+    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
+        self.inner.socket_request(socket, line, timeout)
+    }
+}
+
 pub(crate) struct RealRunner;
 
 const POLL: Duration = Duration::from_millis(20);
@@ -488,6 +529,27 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_cwd_is_added_without_overriding_an_explicit_directory() {
+        let fake = fake::FakeRunner::new();
+        fake.on("probe inherited", fake::ok(""));
+        fake.on("probe explicit", fake::ok(""));
+        let rooted = CwdRunner::new(&fake, "/stable");
+        rooted
+            .run(&Cmd::new("probe", Duration::from_secs(1)).arg("inherited"))
+            .unwrap();
+        rooted
+            .run(
+                &Cmd::new("probe", Duration::from_secs(1))
+                    .arg("explicit")
+                    .cwd("/named"),
+            )
+            .unwrap();
+        let calls = fake.calls.borrow();
+        assert_eq!(calls[0].cwd.as_deref(), Some(Path::new("/stable")));
+        assert_eq!(calls[1].cwd.as_deref(), Some(Path::new("/named")));
+    }
 
     #[test]
     fn captures_output_and_exit_code() {
