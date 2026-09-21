@@ -30,17 +30,11 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
     }
     let task = std::fs::read_to_string(thread::task_path(project, &record.id))
         .context("escalation_brief_missing")?;
-    let state = launch::repository_state(
-        ctx,
-        (!record.repo.is_empty()).then_some(record.repo.as_str()),
-        Some(&record.base),
-    )?;
     let selected = launch::resolve_launch(
         ctx,
         project,
         &launch::ResolveInput {
             task: &task,
-            state,
             workflow: &record.role,
             previous: Some(&record.launch),
             failure: Some(&failure.text),
@@ -73,12 +67,15 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
             })?;
         }
         Err(e) => {
-            // A refusal is durable and not retried every tick. In particular,
-            // bound/exclusion/key errors cannot spin or silently reuse a model.
+            // A refusal is durable and is never retried every tick. Exhausted
+            // recovery is normal: leave the failed lane in front of the
+            // coordinator instead of selecting another recipe.
+            let detail = format!("{e:#}");
+            let exhausted = detail.starts_with("recovery_exhausted:");
             launch::ledger(
                 project,
-                json!({"kind":"escalation-refused", "event":event.id,
-                "thread":record.id, "failure":failure.text, "error":format!("{e:#}")}),
+                json!({"kind": if exhausted { "recovery-exhausted" } else { "recovery-refused" },
+                "event":event.id, "thread":record.id, "failure":failure.text, "error":detail}),
             )?;
             thread::update_checked(project, &record.id, |t| {
                 if t.attempt != record.attempt || t.status == thread::Status::Resolved {
@@ -86,11 +83,23 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
                 }
                 t.failure_event = event.id.clone();
                 t.last_failure = failure.text.clone();
-                t.error = format!("{e:#}");
+                t.error = if exhausted {
+                    format!("WAITING: {detail}")
+                } else {
+                    detail.clone()
+                };
                 t.status = thread::Status::Failed;
                 t.prompt_pending = false;
                 Ok(())
             })?;
+            if exhausted {
+                events::append_delivery(
+                    project,
+                    &event.id,
+                    crate::contracts::DeliveryState::Handled,
+                )?;
+                return Ok(());
+            }
             return Err(e);
         }
     }

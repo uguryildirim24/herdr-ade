@@ -135,7 +135,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             crate::project::BODY_WARN_CHARS
         );
     }
-    // Coordinator is a fixed exclusion in the editable policy, never a Jev choice.
     let selected = crate::launch::resolve_launch(
         ctx,
         &project,
@@ -145,9 +144,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             ..Default::default()
         },
     )?;
-    if selected.kind != "claude" {
-        bail!("coordinator_kind: coordinator must use the Claude binary");
-    }
     let spec = crate::contracts::RoleSpec {
         kind: selected.kind,
         args: selected.args,
