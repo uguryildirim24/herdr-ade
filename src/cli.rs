@@ -1459,7 +1459,7 @@ enum TaskCommand {
         #[arg(long)]
         thread: String,
     },
-    /// Record installation or per-condition verification evidence
+    /// Record per-condition verification evidence
     Evidence {
         slug: String,
         id: String,
@@ -1619,7 +1619,11 @@ enum TickerCommand {
     /// Start the ticker if it is not running (does nothing when there are no projects)
     Start,
     /// Run the ticker loop in the foreground
-    Run,
+    Run {
+        /// Wait for the previous ticker during an internal zero-gap handoff
+        #[arg(long, hide = true)]
+        handoff: bool,
+    },
     /// Ask the running ticker to exit and wait for it
     Stop,
     /// Show the running ticker's version, root and tool resolution
@@ -2444,7 +2448,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         },
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
-            TickerCommand::Run => ticker::run(&ctx),
+            TickerCommand::Run { handoff } => ticker::run(&ctx, handoff),
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
