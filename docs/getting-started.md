@@ -68,7 +68,7 @@ herdr-ade ticker status
 ```
 
 - **The project session is unreachable:** run `open` inside Herdr or pass the right `--session` or `--socket`. Use `--rebind` only when the recorded session is gone.
-- **A lane did not start:** inspect `thread show`, then use `thread restart` for a failed start or gone pane. Placement and provider readiness failures are reported before a lane opens.
+- **A lane failed, blocked, or got stuck:** inspect `thread show`, then use `thread retry --reason "<why>"`. It replaces the process through bounded routing. Use `thread cancel` to stop it or `thread rebind` when its verified process is already live elsewhere.
 - **A provider is not ready:** use the provider's login flow on the same machine and rerun `doctor`.
 - **The coordinator needs its instructions again:** run `open <project> --reprime`.
 - **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and `doctor` lists what was kept; only configured rebuildable paths are discarded. Removal is not forced.

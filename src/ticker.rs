@@ -780,6 +780,10 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         coordinator::report_tokens(&herdr, slug, &record.pane_id);
     }
 
+    if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
+        first_error = first_error.or(Some(error.context("pending cancellation cleanup")));
+    }
+
     let local = open_threads(project, false);
     let pass = thread_pass(
         &LaunchPass {

@@ -863,7 +863,7 @@ mod tests {
         fx.seal_done(&lane, 1, 1, &sha, "# report\n");
         round::review(&ctx, "demo", "r1").unwrap();
         thread::update(&fx.project, &lane, |t| t.status = Status::Resolved).unwrap();
-        round::abandon(&ctx, "demo", "r1", "superseded").unwrap();
+        round::cancel(&ctx, "demo", "r1", "superseded").unwrap();
         let o = Overview::load(
             &fx.project,
             &Journal::default(),
