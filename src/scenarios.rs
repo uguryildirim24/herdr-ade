@@ -2287,21 +2287,6 @@ fn open_accepts_a_non_claude_coordinator_recipe() {
 }
 
 #[test]
-fn the_digest_prints_the_task_list_or_none() {
-    let world = World::new();
-    let project = world.project("demo", "a.sock");
-    let tasks = project.dir().join("TASKS.md");
-    std::fs::write(&tasks, "# Tasks\n\n## Backlog\n- [ ] Write the docs (me)\n").unwrap();
-    let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
-    let heading = digest.find("## Tasks (TASKS.md)").expect("tasks heading");
-    assert!(digest[heading..].contains("- [ ] Write the docs (me)"));
-
-    std::fs::remove_file(&tasks).unwrap();
-    let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
-    assert!(digest.contains("## Tasks (TASKS.md)\n(none)"));
-}
-
-#[test]
 fn the_digest_warns_when_memory_is_over_budget() {
     let world = World::new();
     let project = world.project("demo", "a.sock");

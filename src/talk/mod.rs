@@ -30,10 +30,9 @@ use crate::paths::Ctx;
 use crate::project::{self, Project};
 
 mod cost;
-mod overview;
+pub(crate) mod overview;
 pub(crate) mod screen;
 mod stale;
-pub(crate) mod tasks;
 mod theme;
 pub(crate) mod view;
 

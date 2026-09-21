@@ -500,6 +500,10 @@ pub(crate) struct RoundRecord {
     /// Accepted reviewer completion; later events cannot replace this pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verdict: Option<CompletionPin>,
+    /// The validated verdict word. Historical records without it remain
+    /// readable; a merged round itself proves a MERGE verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verdict_kind: Option<String>,
     pub(crate) round: String,
     pub(crate) branch: String,
     pub(crate) plain: String,
@@ -656,14 +660,18 @@ impl StepState {
     }
 }
 
-/// One ordered plan step (SPEC-talk §6.5). `threads` and `rounds` are required
-/// work, not related discussions.
+/// One ordered plan step (SPEC-talk §6.5). `tasks`, `threads` and `rounds` are
+/// required work, not related discussions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub(crate) struct PlanStep {
     pub(crate) id: String,
     pub(crate) text: String,
     pub(crate) state: StepState,
+    /// Stable task ids. New steps bind tasks; the other fields keep historical
+    /// cards readable without inventing task records.
+    #[serde(default)]
+    pub(crate) tasks: Vec<String>,
     pub(crate) threads: Vec<String>,
     pub(crate) rounds: Vec<String>,
 }
@@ -919,6 +927,7 @@ mod tests {
                     id: "s-1".into(),
                     text: "Choose what the screen will show.".into(),
                     state: StepState::Done,
+                    tasks: vec!["job-0001".into()],
                     threads: vec!["t-0041".into()],
                     rounds: vec![],
                 },
@@ -926,6 +935,7 @@ mod tests {
                     id: "s-2".into(),
                     text: "Show pretend trades.".into(),
                     state: StepState::Running,
+                    tasks: vec![],
                     threads: vec!["t-0043".into(), "t-0044".into()],
                     rounds: vec!["r1".into()],
                 },
