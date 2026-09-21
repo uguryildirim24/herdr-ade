@@ -1058,7 +1058,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
         eprintln!("note: the plan refresh failed: {e:#}");
     }
     let _ = crate::board::refresh(ctx, &project);
-    let review_worktrees = cleanup_review_worktrees(ctx, &record);
+    let review_worktrees = cleanup_review_worktrees(ctx, &project, &record);
     Ok(CancelOutcome {
         round: round.to_string(),
         phase: record.phase,
@@ -1074,7 +1074,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
 /// branches. Repairs use `review-rN-2`, `review-rN-3`, and so on, so cleanup
 /// discovers the actual registered worktrees rather than trusting only the
 /// latest branch on the round record.
-fn cleanup_review_worktrees(ctx: &Ctx, record: &RoundRecord) -> Vec<String> {
+fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) -> Vec<String> {
     if !record.phase.closed() || record.repo.is_empty() {
         return Vec::new();
     }
@@ -1099,11 +1099,14 @@ fn cleanup_review_worktrees(ctx: &Ctx, record: &RoundRecord) -> Vec<String> {
         Ok(rows) => rows,
         Err(error) => return vec![format!("review worktrees kept: {error:#}")],
     };
+    let disposable = match crate::worktrees::disposable(&ctx.config_dir, project, &record.repo) {
+        Ok(disposable) => disposable,
+        Err(error) => return vec![format!("review worktrees kept: {error:#}")],
+    };
     let mut lines = Vec::new();
     for (path, _) in worktrees.into_iter().filter(|(path, _)| belongs(path)) {
         let path_text = path.to_string_lossy().into_owned();
-        match crate::worktrees::inspect_local(ctx.runner, &record.repo, &path_text, &ctx.config_dir)
-        {
+        match crate::worktrees::inspect_local(ctx.runner, &record.repo, &path_text, &disposable) {
             Ok(inspection) if !inspection.dirty.is_empty() => lines.push(format!(
                 "review worktree {} kept: worktree_dirty ({})",
                 path.display(),
@@ -2839,7 +2842,7 @@ fn merge_inner(
         Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
     ) && let Ok(closed) = load(&project, round)
     {
-        for line in cleanup_review_worktrees(ctx, &closed) {
+        for line in cleanup_review_worktrees(ctx, &project, &closed) {
             println!("{line}");
         }
     }
