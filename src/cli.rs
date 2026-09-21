@@ -2060,7 +2060,18 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         },
         Command::Doctor { session } => {
-            if !doctor::run(&ctx, &session.into())? {
+            let result = doctor::run(&ctx, &session.into())?;
+            crate::output::success(
+                Some(if result.healthy {
+                    "healthy"
+                } else {
+                    "unhealthy"
+                }),
+                &result,
+                &result.message,
+                "",
+            )?;
+            if !result.healthy {
                 return Err(crate::refusal::error("some checks failed"));
             }
             Ok(())

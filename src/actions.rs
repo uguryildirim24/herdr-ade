@@ -165,9 +165,10 @@ pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
             )
         }
         "doctor" => {
-            let healthy = doctor::run(ctx, &SessionFlags::default())?;
+            let result = doctor::run(ctx, &SessionFlags::default())?;
+            print!("{}", result.message);
             let herdr = Herdr::new(ctx.env.herdr_bin(), socket(ctx)?, ctx.runner);
-            let body = if healthy {
+            let body = if result.healthy {
                 "All required checks passed. Details: herdr plugin log --plugin herdr-ade"
             } else {
                 "Some checks FAILED. Details: herdr plugin log --plugin herdr-ade"
