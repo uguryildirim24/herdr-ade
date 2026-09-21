@@ -713,48 +713,68 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 stop_after,
             } => {
                 let stop = stop_after.map(|s| s.parse()).transpose()?;
-                match round::merge(ctx, &slug, &id, stop)? {
+                let result = round::merge(ctx, &slug, &id, stop)?;
+                let record = round::load(&Project::load(&ctx.root, &slug)?, &id)?;
+                let install_required =
+                    matches!(
+                        &result,
+                        round::MergeOutcome::Checkpointed { .. } | round::MergeOutcome::NoOp { .. }
+                    ) && crate::harness::is_harness_repo(&ctx.config_dir, &record.repo);
+                let mut message = String::new();
+                if install_required {
+                    // Preserve the established ordering: merge used to print
+                    // this line before returning its outcome to the CLI.
+                    message.push_str("run ha harness install\n");
+                }
+                let outcome = match &result {
                     round::MergeOutcome::Checkpointed { head, lanes } => {
-                        crate::output::insert("head", head.clone());
-                        crate::output::insert("lanes", serde_json::to_value(&lanes)?);
-                        println!("merged and checkpointed: H {head}");
-                        for l in lanes {
-                            println!("  {l}");
+                        message.push_str(&format!("merged and checkpointed: H {head}\n"));
+                        for lane in lanes {
+                            message.push_str(&format!("  {lane}\n"));
                         }
+                        "merged"
                     }
                     round::MergeOutcome::NoOp { head } => {
-                        crate::output::set_outcome("already_checkpointed");
-                        crate::output::insert("head", head.clone());
-                        println!("already checkpointed at H {head}; nothing to do")
+                        message.push_str(&format!(
+                            "already checkpointed at H {head}; nothing to do\n"
+                        ));
+                        "already_checkpointed"
                     }
                     round::MergeOutcome::RepairReviewStarted {
                         review_branch,
-                        reviewer,
+                        reviewer: Some(reviewer),
                     } => {
-                        crate::output::insert("review_branch", review_branch.clone());
-                        match reviewer {
-                            Some(reviewer) => {
-                                crate::output::set_outcome("repair_review_started");
-                                crate::output::insert("reviewer", reviewer.clone());
-                                println!(
-                                    "integration base moved; started repair review {review_branch} with {reviewer}"
-                                )
-                            }
-                            None => {
-                                crate::output::set_outcome("repair_review_prepared");
-                                println!(
-                                    "integration base moved; prepared repair review {review_branch}; its reviewer start will retry automatically"
-                                )
-                            }
-                        }
+                        message.push_str(&format!(
+                            "integration base moved; started repair review {review_branch} with {reviewer}\n"
+                        ));
+                        "repair_review_started"
+                    }
+                    round::MergeOutcome::RepairReviewStarted {
+                        review_branch,
+                        reviewer: None,
+                    } => {
+                        message.push_str(&format!(
+                            "integration base moved; prepared repair review {review_branch}; its reviewer start will retry automatically\n"
+                        ));
+                        "repair_review_prepared"
                     }
                     round::MergeOutcome::Stopped { phase } => {
-                        crate::output::set_outcome("stopped");
-                        crate::output::insert("phase", format!("{phase:?}"));
-                        println!("stopped (test fault injection) at phase {phase:?}")
+                        message.push_str(&format!(
+                            "stopped (test fault injection) at phase {phase:?}\n"
+                        ));
+                        "stopped"
                     }
-                }
-                Ok(())
+                };
+                crate::output::success(
+                    Some(outcome),
+                    &serde_json::json!({
+                        "merge": result,
+                        "phase": record.phase,
+                        "harness_install_required": install_required,
+                    }),
+                    &message,
+                    "",
+                )
             }
             RoundCommand::Advance { slug } => match slug {
                 Some(slug) => {
@@ -782,7 +802,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             RoundCommand::Show { slug, round: id } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let record = round::load(&project, &id)?;
-                crate::output::insert("phase", serde_json::to_value(record.phase)?);
+                crate::output::insert("record", serde_json::to_value(&record)?);
                 print!("{}", round::show(ctx, &slug, &id)?);
                 Ok(())
             }
@@ -914,10 +934,16 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 project,
             }) => {
                 let slug = slug_of(project)?;
-                let a = ask::answer(ctx, &slug, &id, revision, choice, "command")?;
-                crate::output::insert("ask", id.clone());
-                println!("{id} revision {revision}: {} ({})", a.choice, a.text);
-                Ok(())
+                let answer = ask::answer(ctx, &slug, &id, revision, choice, "command")?;
+                crate::output::success(
+                    Some("answered"),
+                    &serde_json::json!({ "ask": id, "answer": answer }),
+                    &format!(
+                        "{} revision {}: {} ({})\n",
+                        answer.id, answer.revision, answer.choice, answer.text
+                    ),
+                    "",
+                )
             }
             None => {
                 let slug = slug_of(project)?;
@@ -982,10 +1008,18 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     let slug = slug_of(project)?;
                     let p = plan::step_add(ctx, &slug, &text, threads, rounds, expect)?;
                     let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
-                    crate::output::insert("revision", p.revision);
-                    crate::output::insert("step", id.clone());
-                    println!("plan revision {}: added {id}", p.revision);
-                    Ok(())
+                    crate::output::success(
+                        None,
+                        &serde_json::json!({
+                            "operation": "added",
+                            "revision": p.revision,
+                            "step": id,
+                            "record": p.steps.last(),
+                            "plan": p,
+                        }),
+                        &format!("plan revision {}: added {id}\n", p.revision),
+                        "",
+                    )
                 }
                 PlanStepCommand::Edit {
                     id,
@@ -995,9 +1029,18 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_edit(ctx, &slug, &id, &text, expect)?;
-                    crate::output::insert("revision", p.revision);
-                    println!("plan revision {}: edited {id}", p.revision);
-                    Ok(())
+                    crate::output::success(
+                        None,
+                        &serde_json::json!({
+                            "operation": "edited",
+                            "revision": p.revision,
+                            "step": id,
+                            "record": p.steps.iter().find(|step| step.id == id),
+                            "plan": p,
+                        }),
+                        &format!("plan revision {}: edited {id}\n", p.revision),
+                        "",
+                    )
                 }
                 PlanStepCommand::Link {
                     id,
@@ -1008,9 +1051,18 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_link(ctx, &slug, &id, threads, rounds, expect)?;
-                    crate::output::insert("revision", p.revision);
-                    println!("plan revision {}: linked {id}", p.revision);
-                    Ok(())
+                    crate::output::success(
+                        None,
+                        &serde_json::json!({
+                            "operation": "linked",
+                            "revision": p.revision,
+                            "step": id,
+                            "record": p.steps.iter().find(|step| step.id == id),
+                            "plan": p,
+                        }),
+                        &format!("plan revision {}: linked {id}\n", p.revision),
+                        "",
+                    )
                 }
                 PlanStepCommand::Unlink {
                     id,
@@ -1022,9 +1074,18 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_unlink(ctx, &slug, &id, threads, rounds, &why, expect)?;
-                    crate::output::insert("revision", p.revision);
-                    println!("plan revision {}: unlinked {id}", p.revision);
-                    Ok(())
+                    crate::output::success(
+                        None,
+                        &serde_json::json!({
+                            "operation": "unlinked",
+                            "revision": p.revision,
+                            "step": id,
+                            "record": p.steps.iter().find(|step| step.id == id),
+                            "plan": p,
+                        }),
+                        &format!("plan revision {}: unlinked {id}\n", p.revision),
+                        "",
+                    )
                 }
                 PlanStepCommand::Remove {
                     id,
@@ -1034,9 +1095,17 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_remove(ctx, &slug, &id, &why, expect)?;
-                    crate::output::insert("revision", p.revision);
-                    println!("plan revision {}: removed {id}", p.revision);
-                    Ok(())
+                    crate::output::success(
+                        None,
+                        &serde_json::json!({
+                            "operation": "removed",
+                            "revision": p.revision,
+                            "step": id,
+                            "plan": p,
+                        }),
+                        &format!("plan revision {}: removed {id}\n", p.revision),
+                        "",
+                    )
                 }
                 PlanStepCommand::Move {
                     id,
@@ -1046,9 +1115,19 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 } => {
                     let slug = slug_of(project)?;
                     let p = plan::step_move(ctx, &slug, &id, &before, expect)?;
-                    crate::output::insert("revision", p.revision);
-                    println!("plan revision {}: moved {id}", p.revision);
-                    Ok(())
+                    crate::output::success(
+                        None,
+                        &serde_json::json!({
+                            "operation": "moved",
+                            "revision": p.revision,
+                            "step": id,
+                            "before": before,
+                            "record": p.steps.iter().find(|step| step.id == id),
+                            "plan": p,
+                        }),
+                        &format!("plan revision {}: moved {id}\n", p.revision),
+                        "",
+                    )
                 }
             },
             PlanCommand::Sync { project } => {
@@ -1420,7 +1499,8 @@ fn machine_outcome(command: &str) -> String {
         "thread resolve" => "resolved",
         "thread ack" => "acknowledged",
         "thread list" | "decide list" | "ledger list" => "listed",
-        "thread show" => "shown",
+        "thread show" | "ledger show" | "ledger task" => "shown",
+        "ledger done" => "closed",
         "ask" => "asked",
         "ask answer" => "answered",
         "ask withdraw" => "withdrawn",
@@ -1661,11 +1741,36 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         println!("{}", crate::ledger::summary(&entry));
                     }
                 }
-                LedgerCommand::Show { id } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&crate::ledger::show(project, &id)?)?
-                ),
-                LedgerCommand::Done { id } => crate::ledger::done(project, &id)?,
+                LedgerCommand::Show { id } => {
+                    let record = crate::ledger::show(project, &id)?;
+                    let message = format!("{}\n", serde_json::to_string_pretty(&record)?);
+                    crate::output::success(
+                        Some("shown"),
+                        &serde_json::json!({ "record": record }),
+                        &message,
+                        "",
+                    )?;
+                }
+                LedgerCommand::Done { id } => {
+                    let closed = crate::ledger::done(project, &id)?;
+                    let (outcome, message) = if closed.changed {
+                        ("closed", format!("{} closed\n", closed.record.id))
+                    } else {
+                        (
+                            "already_closed",
+                            format!("{} was already closed\n", closed.record.id),
+                        )
+                    };
+                    crate::output::success(
+                        Some(outcome),
+                        &serde_json::json!({
+                            "record": closed.record,
+                            "changed": closed.changed,
+                        }),
+                        &message,
+                        "",
+                    )?;
+                }
                 LedgerCommand::Task { id } => print!(
                     "{}",
                     crate::ledger::task(&crate::ledger::show(project, &id)?)
@@ -1681,10 +1786,17 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 let binding = record
                     .as_ref()
                     .and_then(|record| pane.as_deref().map(|pane| (pane, record.attempt())));
-                let moved = inbox::done_bound(&project, &ids, all, binding)?;
-                crate::output::insert("moved", moved as u64);
-                println!("{moved} item(s) moved to inbox/done");
-                Ok(())
+                let result = inbox::done_bound(&project, &ids, all, binding)?;
+                crate::output::success(
+                    None,
+                    &serde_json::json!({
+                        "moved": result.moved,
+                        "moved_count": result.moved.len(),
+                        "missing": result.missing,
+                    }),
+                    &result.message(),
+                    &result.warnings(),
+                )
             }
         },
         Command::Machine { command } => match command {
@@ -1813,7 +1925,12 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 Ok(())
             }
             ThreadCommand::List { slug } => threads::print_list(&ctx, &slug),
-            ThreadCommand::Show { slug, id } => threads::print_show(&ctx, &slug, &id),
+            ThreadCommand::Show { slug, id } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::thread::load(&project, &id)?;
+                crate::output::insert("record", serde_json::to_value(record)?);
+                threads::print_show(&ctx, &slug, &id)
+            }
             ThreadCommand::Ack { slug, id } => threads::ack(&ctx, &slug, &id),
             ThreadCommand::Resolve {
                 slug,
@@ -1823,7 +1940,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 discard_uncopied,
                 keep_pane,
             } => {
-                threads::resolve(
+                let result = threads::resolve(
                     &ctx,
                     &slug,
                     &id,
@@ -1834,10 +1951,12 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         keep_pane,
                     },
                 )?;
-                if reopen {
-                    crate::output::set_outcome("reopened");
-                }
-                Ok(())
+                crate::output::success(
+                    Some(if reopen { "reopened" } else { "resolved" }),
+                    &serde_json::to_value(&result)?,
+                    &result.message(&slug),
+                    "",
+                )
             }
         },
         Command::Routine { command } => match command {
@@ -1959,7 +2078,15 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         | Command::Talk { .. }
         | Command::Board { .. }) => run_rounds(&ctx, command),
         Command::Harness { command } => match command {
-            HarnessCommand::Install => crate::harness::install(&ctx),
+            HarnessCommand::Install => {
+                let result = crate::harness::install(&ctx)?;
+                crate::output::success(
+                    Some("installed"),
+                    &serde_json::json!({ "install": result }),
+                    &result.message(),
+                    &result.warnings(),
+                )
+            }
         },
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),

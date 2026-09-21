@@ -69,6 +69,35 @@ pub fn insert(key: impl Into<String>, value: impl Into<serde_json::Value>) {
     });
 }
 
+/// Complete one command from its typed facts. The ordinary text and warnings
+/// are emitted here too, so JSON and human output are two renderings of the
+/// same result rather than independently assembled answers.
+pub fn success(
+    outcome: Option<&str>,
+    data: &impl Serialize,
+    message: &str,
+    warnings: &str,
+) -> anyhow::Result<()> {
+    let value = serde_json::to_value(data)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("command result data must be an object"))?;
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(outcome) = outcome {
+            state.outcome = outcome.to_string();
+        }
+        state.data.extend(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    });
+    write_stdout(format_args!("{message}"));
+    write_stderr(format_args!("{warnings}"));
+    Ok(())
+}
+
 pub fn write_stdout(args: std::fmt::Arguments<'_>) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();

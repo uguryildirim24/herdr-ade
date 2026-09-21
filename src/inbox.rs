@@ -270,12 +270,31 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 /// Handles event-linked items only when the caller is their bound coordinator.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DoneOutcome {
+    pub(crate) moved: Vec<String>,
+    pub(crate) missing: Vec<String>,
+}
+
+impl DoneOutcome {
+    pub(crate) fn message(&self) -> String {
+        format!("{} item(s) moved to inbox/done\n", self.moved.len())
+    }
+
+    pub(crate) fn warnings(&self) -> String {
+        self.missing
+            .iter()
+            .map(|id| format!("no unhandled item `{id}`\n"))
+            .collect()
+    }
+}
+
 pub(crate) fn done_bound(
     project: &Project,
     ids: &[String],
     all: bool,
     binding: Option<(&str, u32)>,
-) -> Result<usize> {
+) -> Result<DoneOutcome> {
     let ids: Vec<String> = if all {
         unhandled(project).into_iter().map(|i| i.id).collect()
     } else {
@@ -291,10 +310,11 @@ pub(crate) fn done_bound(
         .map(|record| (record.pane_id.clone(), record.attempt()));
     // Every item is checked before any moves: a refusal moves nothing.
     let mut checked = Vec::new();
+    let mut missing = Vec::new();
     for id in &ids {
         let from = dir.join(format!("{id}.md"));
         if !from.is_file() {
-            eprintln!("no unhandled item `{id}`");
+            missing.push(id.clone());
             continue;
         }
         let item = std::fs::read_to_string(&from)
@@ -327,7 +347,7 @@ pub(crate) fn done_bound(
             checked.push((from, id, item));
         }
     }
-    let mut moved = 0;
+    let mut moved = Vec::new();
     for (from, id, item) in checked {
         std::fs::rename(&from, dir.join("done").join(format!("{id}.md")))?;
         if let Some(item) = item
@@ -339,9 +359,9 @@ pub(crate) fn done_bound(
                 crate::contracts::DeliveryState::Handled,
             )?;
         }
-        moved += 1;
+        moved.push(id.clone());
     }
-    Ok(moved)
+    Ok(DoneOutcome { moved, missing })
 }
 
 #[cfg(test)]
@@ -370,8 +390,10 @@ mod tests {
         assert_eq!(seen(&project).len(), 1);
 
         assert_eq!(
-            done_bound(&project, &[items[0].id.clone()], false, None).unwrap(),
-            1
+            done_bound(&project, &[items[0].id.clone()], false, None)
+                .unwrap()
+                .moved,
+            [items[0].id.clone()]
         );
         assert_eq!(unhandled(&project).len(), 1);
         assert!(
@@ -380,7 +402,10 @@ mod tests {
                 .join(format!("{}.md", items[0].id))
                 .is_file()
         );
-        assert_eq!(done_bound(&project, &[], true, None).unwrap(), 1);
+        assert_eq!(
+            done_bound(&project, &[], true, None).unwrap().moved.len(),
+            1
+        );
         assert!(unhandled(&project).is_empty());
     }
 
@@ -398,7 +423,10 @@ mod tests {
         assert_eq!(items[1].summary, "second line");
         assert!(items.iter().all(|i| i.body.is_empty()));
         // A written item can be marked done by its id.
-        assert_eq!(done_bound(&project, &[a], false, None).unwrap(), 1);
+        assert_eq!(
+            done_bound(&project, &[a], false, None).unwrap().moved.len(),
+            1
+        );
     }
 
     #[test]
@@ -448,7 +476,10 @@ mod tests {
         }
         write(&project, "routine", "nightly", "due", "work").unwrap();
         assert_eq!(unhandled(&project).len(), 1);
-        assert_eq!(done_bound(&project, &[], true, None).unwrap(), 1);
+        assert_eq!(
+            done_bound(&project, &[], true, None).unwrap().moved.len(),
+            1
+        );
         assert!(unhandled(&project).is_empty());
     }
 
@@ -510,7 +541,10 @@ mod tests {
         );
         assert!(done_bound(&project, std::slice::from_ref(&item), false, None).is_err());
         assert_eq!(
-            done_bound(&project, &[item], false, Some(("w1:p1", 2))).unwrap(),
+            done_bound(&project, &[item], false, Some(("w1:p1", 2)))
+                .unwrap()
+                .moved
+                .len(),
             1
         );
         assert_eq!(
@@ -541,7 +575,10 @@ mod tests {
         assert!(done_bound(&project, &both, false, Some(("w1:p9", 1))).is_err());
         assert_eq!(unhandled(&project).len(), 2);
         assert_eq!(
-            done_bound(&project, &both, false, Some(("w1:p3", 3))).unwrap(),
+            done_bound(&project, &both, false, Some(("w1:p3", 3)))
+                .unwrap()
+                .moved
+                .len(),
             2
         );
     }
