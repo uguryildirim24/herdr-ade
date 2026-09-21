@@ -117,11 +117,6 @@ fn run_native_probe(
     {
         return Ok(crate::runner::Output {
             code: Some(if ok { 0 } else { 1 }),
-            stderr: value
-                .get("detail")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .into(),
             ..Default::default()
         });
     }
@@ -129,11 +124,9 @@ fn run_native_probe(
         .runner
         .run(&Cmd::new(probe.program, timeout).args(probe.args.iter().copied()))?;
     if ctx.root.is_dir() && std::fs::create_dir_all(&cache_dir).is_ok() {
-        let detail = output.error_text();
         let value = serde_json::json!({
             "checked_unix": now,
             "ok": output.success(),
-            "detail": detail.lines().next().unwrap_or_default(),
         });
         let staged = cache_dir.join(format!(".native-{}-{}", probe.kind, std::process::id()));
         if std::fs::write(&staged, value.to_string()).is_ok() {
