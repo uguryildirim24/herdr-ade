@@ -77,6 +77,356 @@ fn request(runner: &FakeRunner) -> Value {
     serde_json::from_str(&body).unwrap()
 }
 
+fn ledger_rows(project: &crate::project::Project) -> Vec<Value> {
+    std::fs::read_to_string(project.state_dir().join("dispatch.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn three_tier_floors(world: &World) {
+    edit_policy(world, |p| {
+        p["models"]["pi_codex_sol_high"] = json!({"tier":3,"description":"highest"});
+        p["routes"][1]["up_to"] = json!(0.8);
+        p["routes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"up_to":1.0,"recipe":"pi_codex_sol_high"}));
+        p["role_floors"] = json!({"reviewer":"test_strong"});
+        p["answer_floors"] =
+            json!([{ "question":"blast_radius", "min_score":3, "recipe":"test_strong" }]);
+    });
+}
+
+#[test]
+fn floors_raise_by_tier_without_lowering_or_pinning_and_escalate_above_the_floor() {
+    let (world, project) = setup();
+    three_tier_floors(&world);
+    let runner = runner(0.0, 1.0);
+    let ctx = Ctx {
+        runner: &runner,
+        ..world.ctx()
+    };
+    let input = ResolveInput {
+        task: "Review persistence.",
+        workflow: "reviewer",
+        ..Default::default()
+    };
+    let first = launch::resolve_launch(&ctx, &project, &input).unwrap();
+    assert_eq!(first.recipe_id, "test_strong");
+    assert_eq!(first.strength, 2);
+    let rows = ledger_rows(&project);
+    assert_eq!(rows[0]["rule"], "jev-scores-floor");
+    assert_eq!(
+        rows[0]["floors"][0]["cause"],
+        json!({"kind":"role","role":"reviewer"})
+    );
+    assert_eq!(rows[0]["floors"][0]["recipe"], "test_strong");
+    assert!(rows[0]["assessment"].is_object());
+    let next = launch::resolve_launch(
+        &ctx,
+        &project,
+        &ResolveInput {
+            previous: Some(&first),
+            failure: Some("missed a durable record"),
+            state: input.state.clone(),
+            ..input
+        },
+    )
+    .unwrap();
+    assert_eq!(next.recipe_id, "pi_codex_sol_high");
+    let error = launch::resolve_launch(
+        &ctx,
+        &project,
+        &ResolveInput {
+            previous: Some(&next),
+            failure: Some("still wrong"),
+            ..input
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("escalation_exhausted"));
+    assert_eq!(runner.count("/usr/bin/curl"), 2);
+
+    let p = policy(&world);
+    for (level, flow, expected) in [
+        (0.0, "lane", "test_claude"),
+        (2.0, "reviewer", "test_strong"),
+        (3.0, "reviewer", "pi_codex_sol_high"),
+    ] {
+        let a = jev::parse(&response(level, 1.0).to_string(), &p.questions).unwrap();
+        let d = p.select(&a, None, flow).unwrap();
+        assert_eq!(d.recipe, expected);
+        assert!(d.floors.is_empty());
+    }
+    // A floor may name a model card outside the score bands.
+    edit_policy(&world, |p| {
+        p["routes"].as_array_mut().unwrap().remove(1);
+        p["models"]["test_strong"]["tier"] = json!(2);
+    });
+    let p = policy(&world);
+    let a = jev::parse(&response(0.0, 1.0).to_string(), &p.questions).unwrap();
+    assert_eq!(
+        p.select(&a, None, "reviewer").unwrap().recipe,
+        "test_strong"
+    );
+}
+
+#[test]
+fn manual_thread_start_reviewer_uses_the_shared_role_floor() {
+    let (world, project) = setup();
+    three_tier_floors(&world);
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","cwd":"/wt"}}}"#));
+    let started = crate::threads::start(
+        &world.ctx(),
+        "demo",
+        crate::threads::StartArgs {
+            title: "Review a change".into(),
+            repo: None,
+            machine: None,
+            base: None,
+            task: "Check the saved records.".into(),
+            plain: "This check reads the work.".into(),
+            workflow: Some("reviewer".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(started.role, "reviewer");
+    assert_eq!(started.launch.recipe_id, "test_strong");
+    assert_eq!(world.runner.count("/usr/bin/curl"), 1);
+    assert_eq!(ledger_rows(&project)[0]["rule"], "jev-scores-floor");
+}
+
+#[test]
+fn answer_veto_uses_raw_score_and_logs_each_raising_cause() {
+    let (world, project) = setup();
+    three_tier_floors(&world);
+    for (score, flow, expected, causes) in [
+        (2.99, "lane", "test_claude", 0),
+        (3.0, "lane", "test_strong", 1),
+        (3.0, "reviewer", "test_strong", 2),
+    ] {
+        let mut answer = response(0.0, 1.0);
+        answer["answers"]["blast_radius"] = response(score, 1.0)["answers"]["blast_radius"].clone();
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on(
+            "/usr/bin/curl",
+            ok(&jev::http_response(&answer.to_string(), 200)),
+        );
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let selected = launch::resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                task: "Write validation records.",
+                workflow: flow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.recipe_id, expected);
+        let rows = ledger_rows(&project);
+        let row = rows.last().unwrap();
+        assert_eq!(row["floors"].as_array().unwrap().len(), causes);
+        if causes > 0 {
+            assert_eq!(row["rule"], "jev-scores-floor");
+            assert_eq!(
+                row["floors"].as_array().unwrap().last().unwrap()["cause"],
+                json!({"kind":"answer","question":"blast_radius","min_score":3.0,"score":3.0})
+            );
+        } else {
+            assert_eq!(row["rule"], "jev-scores");
+        }
+    }
+}
+
+#[test]
+fn strongest_floor_wins_and_equal_tier_does_not_replace_recipe() {
+    let (world, _) = setup();
+    three_tier_floors(&world);
+    edit_policy(&world, |p| {
+        p["answer_floors"][0]["recipe"] = json!("pi_codex_sol_high");
+        p["answer_floors"][0]["min_score"] = json!(0.0);
+    });
+    let p = policy(&world);
+    let a = jev::parse(&response(0.0, 1.0).to_string(), &p.questions).unwrap();
+    let d = p.select(&a, None, "reviewer").unwrap();
+    assert_eq!(d.recipe, "pi_codex_sol_high");
+    assert_eq!(d.floors.len(), 2);
+    edit_policy(&world, |p| {
+        p["answer_floors"] = json!([]);
+        p["models"]["test_strong"]["tier"] = json!(1);
+        p["routes"].as_array_mut().unwrap().remove(1);
+    });
+    let d = policy(&world).select(&a, None, "reviewer").unwrap();
+    assert_eq!(d.recipe, "test_claude");
+    assert!(d.floors.is_empty());
+}
+
+#[test]
+fn evaluator_replays_role_and_answer_floors() {
+    let (world, _) = setup();
+    three_tier_floors(&world);
+    let mut answer = response(0.0, 1.0);
+    answer["answers"]["blast_radius"] = response(3.0, 1.0)["answers"]["blast_radius"].clone();
+    let cases = world.home.path().join("floored-cases.json");
+    std::fs::write(&cases, json!([
+        {"id":"role","brief":"Review the work.","state":{},"workflow":"reviewer","expected":"test_strong","response":response(0.0,1.0)},
+        {"id":"answer","brief":"Write records.","state":{},"expected":"test_strong","response":answer}
+    ]).to_string()).unwrap();
+    let result = routing::evaluate(&world.ctx(), &cases).unwrap();
+    assert_eq!(result.correct, 2);
+    assert_eq!(result.cases[0]["workflow"], "reviewer");
+    assert_eq!(result.cases[1]["workflow"], "lane");
+    assert_eq!(world.runner.count("/usr/bin/curl"), 0);
+}
+
+#[test]
+fn invalid_floor_targets_and_conditions_are_refused() {
+    let (world, _) = setup();
+    let original: Value = serde_json::from_str(
+        &std::fs::read_to_string(world.ctx().config_dir.join("routing.json")).unwrap(),
+    )
+    .unwrap();
+    for floors in [
+        json!({"role_floors":{"typo":"test_strong"}}),
+        json!({"role_floors":{"reviewer":"missing"}}),
+        json!({"answer_floors":[{"question":"typo","min_score":3,"recipe":"test_strong"}]}),
+        json!({"answer_floors":[{"question":"blast_radius","min_score":4,"recipe":"test_strong"}]}),
+        json!({"answer_floors":[{"question":"blast_radius","min_score":-1,"recipe":"test_strong"}]}),
+    ] {
+        let mut p = original.clone();
+        p.as_object_mut()
+            .unwrap()
+            .extend(floors.as_object().unwrap().clone());
+        assert!(routing::Policy::parse(p.to_string().as_bytes()).is_err());
+    }
+    three_tier_floors(&world);
+    let p = policy(&world);
+    let mut recipes = launch::parse_launch_config(&world.ctx().config_dir)
+        .unwrap()
+        .recipes;
+    // Remove the floor target from routes to prove floors themselves are checked.
+    let mut p = p;
+    p.routes.remove(1);
+    recipes.get_mut("test_strong").unwrap().enabled = false;
+    assert!(
+        p.validate_recipes(&recipes)
+            .unwrap_err()
+            .to_string()
+            .contains("routing_recipe_disabled: test_strong")
+    );
+    p.role_floors.clear(); // Answer-only targets must be validated as well.
+    assert!(
+        p.validate_recipes(&recipes)
+            .unwrap_err()
+            .to_string()
+            .contains("routing_recipe_disabled: test_strong")
+    );
+    recipes.remove("test_strong");
+    assert!(
+        p.validate_recipes(&recipes)
+            .unwrap_err()
+            .to_string()
+            .contains("routing_recipe_missing: test_strong")
+    );
+}
+
+#[test]
+fn explicit_picker_size_refusals_fall_back_to_top_and_remain_auditable() {
+    for (status, body) in [
+        (
+            400,
+            r#"{"error":{"code":"max_tokens_exceeded"},"detail":"fake-key"}"#,
+        ),
+        (413, "too large"),
+    ] {
+        let (world, project) = setup();
+        three_tier_floors(&world);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on("/usr/bin/curl", ok(&jev::http_response(body, status)));
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let input = ResolveInput {
+            task: "Review many reports.",
+            workflow: "reviewer",
+            ..Default::default()
+        };
+        let selected = launch::resolve_launch(&ctx, &project, &input).unwrap();
+        assert_eq!(selected.recipe_id, "pi_codex_sol_high");
+        let rows = ledger_rows(&project);
+        assert_eq!(rows[0]["rule"], "jev-size-fallback");
+        assert_eq!(rows[0]["fallback"]["cause"], "picker-input-too-large");
+        assert!(rows[0]["assessment"].is_null());
+        assert!(rows[0]["decision"].is_null());
+        assert!(!rows[0].to_string().contains("fake-key"));
+        assert!(
+            launch::resolve_launch(
+                &ctx,
+                &project,
+                &ResolveInput {
+                    previous: Some(&selected),
+                    failure: Some("needs more"),
+                    ..input
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("escalation_exhausted")
+        );
+        assert_eq!(runner.count("/usr/bin/curl"), 1);
+    }
+}
+
+#[test]
+fn picker_auth_and_service_errors_never_use_size_fallback() {
+    for status in [401, 403, 429, 500, 503] {
+        let (world, project) = setup();
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on(
+            "/usr/bin/curl",
+            ok(&jev::http_response(
+                r#"{"code":"max_tokens_exceeded"}"#,
+                status,
+            )),
+        );
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let error = launch::resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                task: "Review changes.",
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(&format!("HTTP {status}")));
+        assert_eq!(ledger_rows(&project)[0]["kind"], "dispatch-refused");
+    }
+}
+
 #[test]
 fn full_brief_and_repository_not_title_reach_three_parallel_scores() {
     let (world, project) = setup();
@@ -120,6 +470,7 @@ fn full_brief_and_repository_not_title_reach_three_parallel_scores() {
 #[test]
 fn all_four_exclusions_bypass_inference_including_coordinator() {
     let (world, project) = setup();
+    three_tier_floors(&world);
     let runner = runner(3.0, 1.0);
     let ctx = Ctx {
         runner: &runner,
@@ -138,7 +489,7 @@ fn all_four_exclusions_bypass_inference_including_coordinator() {
         ),
         (
             "+++\nproduct = \"spec\"\n+++\nWrite a design specification.",
-            "lane",
+            "reviewer",
             "claude_fable_xhigh",
         ),
         (
@@ -265,11 +616,17 @@ fn policy_changes_reroute_saved_scores_without_changing_prompt_or_calling_jev() 
     let (world, _) = setup();
     let old = policy(&world);
     let assessment = jev::parse(&response(1.0, 1.0).to_string(), &old.questions).unwrap();
-    assert_eq!(old.select(&assessment, None).unwrap().recipe, "test_claude");
+    assert_eq!(
+        old.select(&assessment, None, "lane").unwrap().recipe,
+        "test_claude"
+    );
     edit_policy(&world, |p| p["routes"][0]["up_to"] = json!(0.2));
     let new = policy(&world);
     assert_eq!(new.questions, old.questions);
-    assert_eq!(new.select(&assessment, None).unwrap().recipe, "test_strong");
+    assert_eq!(
+        new.select(&assessment, None, "lane").unwrap().recipe,
+        "test_strong"
+    );
     assert_eq!(world.runner.count("/usr/bin/curl"), 0);
 }
 

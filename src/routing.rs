@@ -21,6 +21,35 @@ pub struct Route {
     pub up_to: f64,
     pub recipe: String,
 }
+/// A veto on the raw, zero-based Score answer (not its weighted contribution).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerFloor {
+    pub question: String,
+    pub min_score: f64,
+    pub recipe: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FloorCause {
+    Role {
+        role: String,
+    },
+    Answer {
+        question: String,
+        min_score: f64,
+        score: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedFloor {
+    pub recipe: String,
+    pub tier: u32,
+    pub cause: FloorCause,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -35,6 +64,10 @@ pub struct Policy {
     pub borderline_margin: f64,
     /// Hand-written by the user, never accepted by `thread start`.
     pub pins: BTreeMap<String, String>,
+    #[serde(default)]
+    pub role_floors: BTreeMap<String, String>,
+    #[serde(default)]
+    pub answer_floors: Vec<AnswerFloor>,
 }
 #[derive(Debug, Serialize)]
 pub struct Decision {
@@ -43,6 +76,7 @@ pub struct Decision {
     pub confidence: f64,
     pub upgraded: bool,
     pub upgrade_reason: String,
+    pub floors: Vec<AppliedFloor>,
 }
 impl Policy {
     pub fn read(path: &Path) -> Result<Self> {
@@ -114,7 +148,39 @@ impl Policy {
                 bail!("routing_policy_invalid: pins use task SHA-256 keys and recipe values");
             }
         }
+        for role in self.role_floors.keys() {
+            if !matches!(
+                role.as_str(),
+                "lane" | "reviewer" | "critic" | "drafter" | "research" | "planner" | "coordinator"
+            ) {
+                bail!("routing_policy_invalid: unknown floor role {role}");
+            }
+        }
+        for floor in &self.answer_floors {
+            let question = self
+                .questions
+                .get(&floor.question)
+                .context("routing_policy_invalid: answer floor has unknown question")?;
+            let top = question["criteria"]
+                .as_array()
+                .expect("validated criteria")
+                .len()
+                - 1;
+            if !floor.min_score.is_finite() || !(0.0..=top as f64).contains(&floor.min_score) {
+                bail!("routing_policy_invalid: answer floor min_score outside criteria range");
+            }
+        }
+        for id in self.floor_recipes() {
+            if !self.models.contains_key(id) {
+                bail!("routing_policy_invalid: floor {id} has no model card");
+            }
+        }
         Ok(())
+    }
+    fn floor_recipes(&self) -> impl Iterator<Item = &String> {
+        self.role_floors
+            .values()
+            .chain(self.answer_floors.iter().map(|f| &f.recipe))
     }
     pub fn validate_recipes(&self, recipes: &BTreeMap<String, Recipe>) -> Result<()> {
         for id in self.models.keys().chain(self.pins.values()) {
@@ -122,9 +188,17 @@ impl Policy {
                 bail!("routing_recipe_missing: {id}");
             }
         }
-        for route in &self.routes {
-            if !recipes[&route.recipe].enabled {
-                bail!("routing_recipe_disabled: {}", route.recipe);
+        for id in self
+            .routes
+            .iter()
+            .map(|r| &r.recipe)
+            .chain(self.floor_recipes())
+        {
+            let recipe = recipes
+                .get(id)
+                .with_context(|| format!("routing_recipe_missing: {id}"))?;
+            if !recipe.enabled {
+                bail!("routing_recipe_disabled: {id}");
             }
         }
         Ok(())
@@ -152,7 +226,12 @@ impl Policy {
     pub fn request(&self, state: Value) -> Value {
         json!({"model": self.model, "state": state, "questions": self.questions})
     }
-    pub fn select(&self, assessment: &Assessment, previous_tier: Option<u32>) -> Result<Decision> {
+    pub fn select(
+        &self,
+        assessment: &Assessment,
+        previous_tier: Option<u32>,
+        workflow: &str,
+    ) -> Result<Decision> {
         let mut score = 0.0;
         let mut confidence: f64 = 1.0;
         for (id, weight) in &self.weights {
@@ -195,13 +274,72 @@ impl Policy {
             index = index.max(stronger);
             reasons.push("failure");
         }
-        Ok(Decision {
+        let mut decision = Decision {
             recipe: self.routes[index].recipe.clone(),
             score,
             confidence,
             upgraded: index > base,
             upgrade_reason: reasons.join(","),
-        })
+            floors: Vec::new(),
+        };
+        decision.floors = self.apply_floors(&mut decision.recipe, workflow, Some(assessment));
+        if !decision.floors.is_empty() {
+            decision.upgraded = true;
+            if !decision.upgrade_reason.is_empty() {
+                decision.upgrade_reason.push(',');
+            }
+            decision.upgrade_reason.push_str("floor");
+        }
+        Ok(decision)
+    }
+
+    /// Record all triggered constraints that raise the original pick; the strongest
+    /// wins. Equal tiers keep the scorer's recipe, so floors never act as pins.
+    pub fn apply_floors(
+        &self,
+        recipe: &mut String,
+        workflow: &str,
+        assessment: Option<&Assessment>,
+    ) -> Vec<AppliedFloor> {
+        let original_tier = self.models[recipe.as_str()].tier;
+        let mut applied = Vec::new();
+        let mut consider = |id: &String, cause: FloorCause| {
+            let tier = self.models[id].tier;
+            if tier > original_tier {
+                applied.push(AppliedFloor {
+                    recipe: id.clone(),
+                    tier,
+                    cause,
+                });
+                if tier > self.models[recipe.as_str()].tier {
+                    *recipe = id.clone();
+                }
+            }
+        };
+        if let Some(id) = self.role_floors.get(workflow) {
+            consider(
+                id,
+                FloorCause::Role {
+                    role: workflow.into(),
+                },
+            );
+        }
+        if let Some(assessment) = assessment {
+            for floor in &self.answer_floors {
+                let score = assessment.scores[&floor.question].score;
+                if score >= floor.min_score {
+                    consider(
+                        &floor.recipe,
+                        FloorCause::Answer {
+                            question: floor.question.clone(),
+                            min_score: floor.min_score,
+                            score,
+                        },
+                    );
+                }
+            }
+        }
+        applied
     }
 }
 
@@ -266,6 +404,11 @@ pub struct Case {
     pub expected: String,
     /// Saved TypeSafe response enables tuning with no further inference call.
     pub response: Option<Value>,
+    #[serde(default = "default_workflow")]
+    pub workflow: String,
+}
+fn default_workflow() -> String {
+    "lane".into()
 }
 #[derive(Debug, Default, Serialize)]
 pub struct Evaluation {
@@ -283,7 +426,7 @@ pub fn evaluate(ctx: &crate::paths::Ctx, cases: &Path) -> Result<Evaluation> {
     let cases: Vec<Case> = serde_json::from_str(&std::fs::read_to_string(cases)?)?;
     let mut result = Evaluation::default();
     for case in cases {
-        let contract = crate::launch::work_contract(&case.brief, "lane")?;
+        let contract = crate::launch::work_contract(&case.brief, &case.workflow)?;
         let assessment = if policy.exclusion(&case.brief, &contract).is_some() {
             None
         } else {
@@ -304,7 +447,7 @@ pub fn evaluate(ctx: &crate::paths::Ctx, cases: &Path) -> Result<Evaluation> {
                 .exclusion(&case.brief, &contract)
                 .expect("exclusion checked")
                 .to_string()),
-            Some(Ok(a)) => policy.select(a, None).map(|d| d.recipe),
+            Some(Ok(a)) => policy.select(a, None, &case.workflow).map(|d| d.recipe),
             Some(Err(e)) => Err(anyhow::anyhow!("{e:#}")),
         };
         let (selected, outcome) = match got {
@@ -341,7 +484,7 @@ pub fn evaluate(ctx: &crate::paths::Ctx, cases: &Path) -> Result<Evaluation> {
             }
         };
         result.cases.push(
-            json!({"id": case.id, "brief": case.brief, "state": case.state,
+            json!({"id": case.id, "brief": case.brief, "state": case.state, "workflow": case.workflow,
             "expected": case.expected, "selected": selected, "outcome": outcome,
             "assessment": assessment.as_ref().and_then(|a| a.as_ref().ok()),
             "response": assessment.as_ref().and_then(|a| a.as_ref().ok()).map(|a| &a.response)}),
