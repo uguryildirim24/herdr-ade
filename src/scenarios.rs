@@ -55,14 +55,12 @@ impl World {
             "agent start --help",
             ok("[possible values: pi, claude, cursor, agy]"),
         );
-        world.runner.on_fn(
-            |cmd| cmd.program == "claude" && cmd.args == ["auth", "status"],
-            |_| Ok(ok("logged in\n")),
-        );
-        world.runner.on_fn(
-            |cmd| cmd.program == "agy" && cmd.args == ["models"],
-            |_| Ok(ok("gemini-3.8-flash-high\n")),
-        );
+        world
+            .runner
+            .on_fn(|cmd| cmd.program == "claude", |_| Ok(ok("OK\n")));
+        world
+            .runner
+            .on_fn(|cmd| cmd.program == "agy", |_| Ok(ok("OK\n")));
         let mut answers = serde_json::Map::new();
         answers.insert(
             "required_index".into(),
@@ -1851,6 +1849,7 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
         format!("[harness]\nrepos = [\n{}\n]\n", rows.join("\n")),
     )
     .unwrap();
+    std::fs::write(dir.join("RULES.md"), "# Lane rules\n").unwrap();
 }
 
 #[test]
@@ -1962,7 +1961,11 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         ok(r#"[{"id":"oci","label":"oci","target":"remote-host","session":"default","enabled":true}]"#),
     );
     crate::harness::install(&with_box.ctx()).unwrap();
-    assert_eq!(with_box.runner.count("ssh"), 2, "one box build per repo");
+    assert_eq!(
+        with_box.runner.count("ssh"),
+        3,
+        "one box build per repo plus the lane settings"
+    );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
         .iter()
@@ -1970,13 +1973,25 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         .map(|c| c.args.last().cloned().unwrap_or_default())
         .collect();
     assert!(
-        scripts.iter().all(|s| s.contains("git fetch --quiet")
+        scripts[..2].iter().all(|s| s.contains("git fetch --quiet")
             && s.contains("git merge --ff-only")
             && s.contains("cargo build --release --locked")
             && s.contains("cp target/release/")
             && s.contains("mv -f $HOME/.local/bin/.")),
         "{scripts:?}"
     );
+    assert!(
+        scripts[2].contains("$dir/RULES.md")
+            && scripts[2].contains(crate::harness::BOX_WORKER_MARKER),
+        "{}",
+        scripts[2]
+    );
+    let settings = calls
+        .iter()
+        .filter(|call| call.program == "ssh")
+        .nth(2)
+        .unwrap();
+    assert_eq!(settings.stdin.as_deref(), Some("# Lane rules\n"));
     drop(calls);
 
     let without_box = World::new();
