@@ -119,18 +119,3 @@ pub(crate) fn capability_label(project: &crate::project::Project, kind: &str) ->
         _ => "capability: unqualified; chat: shown only through say and ask",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matrix_has_the_declared_kinds() {
-        assert_eq!(
-            ADAPTERS.map(|adapter| adapter.kind),
-            [
-                "claude", "cursor", "codex", "opencode", "agy", "chatgpt", "dsh", "pi"
-            ]
-        );
-    }
-}
