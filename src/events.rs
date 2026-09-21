@@ -488,12 +488,22 @@ pub(crate) fn typed_line(event: &Event) -> Result<String> {
             done: None,
             waiting: Some(waiting),
             failed: None,
-        } => Ok(format!("WAITING {} {}", event.thread, waiting.text)),
+        } => Ok(format!(
+            "WAITING {} {}: {}",
+            event.thread,
+            waiting.class.plain(),
+            waiting.text
+        )),
         EventPayload {
             done: None,
             waiting: None,
             failed: Some(failure),
-        } => Ok(format!("FAILED {} {}", event.thread, failure.text)),
+        } => Ok(format!(
+            "FAILED {} {}: {}",
+            event.thread,
+            failure.class.plain(),
+            failure.text
+        )),
         _ => bail!(
             "event_payload_invalid: {} has no single tagged payload",
             event.id

@@ -597,7 +597,12 @@ fn digest_snapshot(
             let _ = writeln!(out, "  pane={} machine={}", t.pane_id, t.machine);
         }
         if !t.error.is_empty() {
-            let _ = writeln!(out, "  error: {}", t.error);
+            let kind = t
+                .provider_failure_kind
+                .as_deref()
+                .map(|kind| format!(" ({kind})"))
+                .unwrap_or_default();
+            let _ = writeln!(out, "  {}{kind}: {}", t.failure_class.plain(), t.error);
         }
         let completion = crate::round::latest_event(&events, &t.id, t.attempt.max(1));
         if let Some(event) = completion {
@@ -608,9 +613,31 @@ fn digest_snapshot(
                     done.sha, done.report_path, event.id
                 );
             } else if let Some(waiting) = &event.payload.waiting {
-                let _ = writeln!(out, "  waiting: {} event={}", waiting.text, event.id);
+                let kind = waiting
+                    .provider_kind
+                    .as_deref()
+                    .map(|kind| format!(" ({kind})"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "  waiting — {}{kind}: {} event={}",
+                    waiting.class.plain(),
+                    waiting.text,
+                    event.id
+                );
             } else if let Some(failed) = &event.payload.failed {
-                let _ = writeln!(out, "  failed: {} event={}", failed.text, event.id);
+                let kind = failed
+                    .provider_kind
+                    .as_deref()
+                    .map(|kind| format!(" ({kind})"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "  failed — {}{kind}: {} event={}",
+                    failed.class.plain(),
+                    failed.text,
+                    event.id
+                );
             }
             if event.payload.done.is_some()
                 || event.payload.waiting.is_some()

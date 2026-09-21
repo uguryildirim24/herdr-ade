@@ -10,6 +10,7 @@ struct State {
     json: bool,
     command: String,
     outcome: String,
+    failure_class: Option<String>,
     data: BTreeMap<String, serde_json::Value>,
     stdout: String,
     stderr: String,
@@ -25,6 +26,8 @@ struct ResultRecord {
     command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     message: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -45,6 +48,7 @@ pub fn begin(
             json,
             command,
             outcome,
+            failure_class: None,
             data,
             stdout: String::new(),
             stderr: String::new(),
@@ -61,6 +65,10 @@ pub fn structured() -> bool {
 
 pub fn set_outcome(outcome: impl Into<String>) {
     STATE.with(|state| state.borrow_mut().outcome = outcome.into());
+}
+
+pub fn set_failure_class(class: Option<&str>) {
+    STATE.with(|state| state.borrow_mut().failure_class = class.map(str::to_string));
 }
 
 pub fn insert(key: impl Into<String>, value: impl Into<serde_json::Value>) {
@@ -143,13 +151,10 @@ fn render(mut state: State, reason: Option<&str>) -> std::io::Result<()> {
     }
     if state.json {
         let record = ResultRecord {
-            outcome: if reason.is_some() {
-                "refused".into()
-            } else {
-                state.outcome
-            },
+            outcome: state.outcome,
             command: state.command,
             reason: reason.map(str::to_string),
+            failure_class: state.failure_class,
             message: state.stdout,
             data: state.data,
             warnings: state.stderr,

@@ -128,7 +128,10 @@ fn terminal_preparation_does_not_hide_the_current_failure_or_change_records() {
     let text = p.context(true);
     assert!(text.contains("## Open threads (1)"), "{text}");
     assert!(text.contains("- t-0001 ["), "{text}");
-    assert!(text.contains("error: Report could not be sealed"), "{text}");
+    assert!(
+        text.contains("failure unknown: Report could not be sealed"),
+        "{text}"
+    );
     assert!(!text.contains("Completion preparation"), "{text}");
     assert!(!text.contains("t-0001-1-1"), "{text}");
     assert_eq!(std::fs::read(&op_path).unwrap(), before);
