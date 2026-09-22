@@ -531,14 +531,14 @@ fn cancel_uses_the_repository_specific_disposable_list() {
 }
 
 #[test]
-fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
+fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().to_string_lossy().into_owned();
     world.thread(&project, world.home.path(), |t| {
         t.status = Status::Failed;
-        t.error = "no agent".into();
-        t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        t.error = "openai-codex unreachable: fetch failed".into();
+        t.failure_class = crate::contracts::FailureClass::Unknown;
         t.launch_attempts = 3;
         t.attempt = 1;
         t.launch.kind = "claude".into();
@@ -546,6 +546,8 @@ fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
         t.launch.brief_hash = "h1".into();
     });
     std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();
+    let pending = world.home.path().join("uncommitted-work.txt");
+    std::fs::write(&pending, "keep me").unwrap();
     *world.panes.borrow_mut() = format!(
         "[{},{}]",
         world.coordinator_pane(&project),
@@ -566,7 +568,7 @@ fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
         &world.ctx(),
         "demo",
         "t-0001",
-        "the previous agent stopped responding",
+        "the coordinator chose to retry after the network recovered",
     )
     .unwrap();
     let t = thread::load(&project, "t-0001").unwrap();
@@ -593,6 +595,19 @@ fn retry_defers_to_the_ticker_and_resets_launch_attempts() {
     // gets a new tab carrying its own launch line.
     assert_eq!(t.attempt, 2);
     assert_eq!(t.pane_id, "w1:p3");
+    assert_eq!(t.worktree_path, cwd);
+    assert_eq!(std::fs::read_to_string(pending).unwrap(), "keep me");
+    assert_eq!(t.launch.recipe_id, "test_claude");
+    assert_eq!(t.launch.same_recipe_retries, 1);
+    let dispatch = std::fs::read_to_string(project.state_dir().join("dispatch.jsonl")).unwrap();
+    let decision: serde_json::Value =
+        serde_json::from_str(dispatch.lines().last().unwrap()).unwrap();
+    assert_eq!(decision["kind"], "coordinator-retry");
+    assert_eq!(decision["class"], "unknown");
+    assert_eq!(
+        decision["failure"],
+        "the coordinator chose to retry after the network recovered"
+    );
     assert_eq!(world.runner.count("workspace close w2"), 1);
     let calls = world.runner.calls.borrow();
     assert!(calls.iter().any(|c| {
@@ -2261,6 +2276,66 @@ fn launch_without_a_routing_table_names_the_config_fix() {
 }
 
 #[test]
+fn typed_provider_errors_reach_escalation_and_retry_the_same_recipe() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    for (text, provider_kind) in [
+        ("openai-codex unreachable: fetch failed", "unreachable"),
+        (
+            "openai-codex error: Codex error: Our servers are currently overloaded. Please try again later.",
+            "error",
+        ),
+    ] {
+        let launch = crate::launch::resolve_launch(
+            &world.ctx(),
+            &project,
+            &crate::launch::ResolveInput {
+                task: "Do the work.",
+                workflow: "lane",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let lane = world.thread(&project, world.home.path(), |thread| {
+            thread.attempt = 1;
+            thread.launch = launch;
+        });
+        std::fs::write(thread::task_path(&project, &lane.id), "Do the work.").unwrap();
+        let event_id = format!("{}-1-1", lane.id);
+        let event = crate::contracts::Event {
+            id: event_id.clone(),
+            op: event_id,
+            thread: lane.id.clone(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient::default(),
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                failed: Some(crate::contracts::WaitingPayload {
+                    text: text.into(),
+                    class: crate::contracts::FailureClass::Provider,
+                    provider_kind: Some(provider_kind.into()),
+                }),
+                ..Default::default()
+            },
+        };
+
+        crate::escalation::consume(&world.ctx(), &project, &event).unwrap();
+
+        let retry = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(
+            retry.failure_class,
+            crate::contracts::FailureClass::Provider
+        );
+        assert_eq!(retry.provider_failure_kind.as_deref(), Some(provider_kind));
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.launch.recipe_id, "test_claude");
+        assert_eq!(retry.launch.same_recipe_retries, 1);
+        assert!(retry.escalation_pending);
+    }
+}
+
+#[test]
 fn provider_retries_do_not_consume_failed_work_retries_or_choose_a_fallback() {
     let world = World::new();
     let config = world.home.path().join("cfg/config.toml");
@@ -2744,8 +2819,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        4,
-        "one box build per repo plus lane settings and the running-process check"
+        5,
+        "one box build per repo plus lane settings, the pi guard, and the running-process check"
     );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
@@ -2775,6 +2850,12 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         .nth(2)
         .unwrap();
     assert_eq!(settings.stdin.as_deref(), Some("# Lane rules\n"));
+    assert!(
+        scripts[3].contains("HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade")
+            && scripts[3].contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard"),
+        "{}",
+        scripts[3]
+    );
     drop(calls);
 
     let without_box = World::new();

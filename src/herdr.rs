@@ -587,6 +587,15 @@ impl<'a> Herdr<'a> {
             .map(|_| ())
     }
 
+    /// Submit through the pane surface when an adapter has identified its own
+    /// recoverable error screen. `agent prompt` deliberately refuses every
+    /// blocked state, including this adapter-owned one.
+    pub(crate) fn pane_submit_text(&self, pane: &str, text: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "send-text", pane, text], CALL_TIMEOUT)?;
+        self.call(&["pane", "send-keys", pane, "Enter"], CALL_TIMEOUT)
+            .map(|_| ())
+    }
+
     pub(crate) fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
         self.call(&["agent", "focus", target], CALL_TIMEOUT)
             .map(|_| ())

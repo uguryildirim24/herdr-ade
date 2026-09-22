@@ -572,7 +572,7 @@ pub(crate) fn check_report_model(
     rows.push(wrapper_path_row(runner, env, layout));
 
     if install::guard_ok(layout) {
-        rows.push(Row::ok("guard", "present with marker"));
+        rows.push(Row::ok("guard", "current extension installed"));
     } else {
         rows.push(Row::fail(
             "guard",
