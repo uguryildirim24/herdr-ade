@@ -15,6 +15,51 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn decide_reports_its_classes_and_all_missing_class_requirements() {
+    let run = |args: &[&str]| Command::new(BIN).args(args).output().unwrap();
+
+    let help = run(&["decide", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    for (class, meaning) in [
+        ("what-you-get", "taste, direction, or the result"),
+        ("money", "spend money"),
+        ("undo", "cannot be undone"),
+        ("routine", "ordinary choice"),
+    ] {
+        let line = help.lines().find(|line| line.contains(class)).unwrap();
+        assert!(line.contains(meaning), "{line}");
+    }
+    assert!(
+        help.contains("what-you-get, money, undo, routine"),
+        "{help}"
+    );
+
+    let wrong = run(&["decide", "--class", "unknown"]);
+    assert!(!wrong.status.success());
+    let wrong = String::from_utf8(wrong.stderr).unwrap();
+    assert!(
+        wrong.contains("possible values: what-you-get, money, undo, routine"),
+        "{wrong}"
+    );
+
+    let no_class = run(&["decide"]);
+    assert!(!no_class.status.success());
+    let no_class = String::from_utf8(no_class.stderr).unwrap();
+    assert!(no_class.contains("a decision line"), "{no_class}");
+    assert!(
+        no_class.contains("what-you-get, money, undo, or routine"),
+        "{no_class}"
+    );
+
+    let no_basis = run(&["decide", "--class", "what-you-get"]);
+    assert!(!no_basis.status.success());
+    let no_basis = String::from_utf8(no_basis.stderr).unwrap();
+    assert!(no_basis.contains("a decision line"), "{no_basis}");
+    assert!(no_basis.contains("; --basis"), "{no_basis}");
+}
+
+#[test]
 fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
