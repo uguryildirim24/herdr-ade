@@ -6305,14 +6305,16 @@ mod tests {
             .0;
         assert!(digest.contains("is gone"), "{digest}");
 
-        // The same gone state is announced once.
+        // The same gone state is announced once. The generated page timestamp
+        // may advance, while the action suffix remains unchanged.
         advance(&ctx, "demo").unwrap();
         assert!(crate::inbox::unhandled(&fx.project).is_empty());
+        let repeated = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
         assert_eq!(
-            crate::coordinator::digest(&ctx, &fx.project, "ha")
-                .unwrap()
-                .0,
-            digest
+            repeated.split("\n## Current failures").nth(1),
+            digest.split("\n## Current failures").nth(1)
         );
 
         // A later live poll replaces the old announcement in the rendered

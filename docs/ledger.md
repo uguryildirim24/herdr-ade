@@ -76,12 +76,12 @@ Recording failures warn on stderr if the ledger cannot be written, without
 replacing the original operation's result. This records the harness's commands,
 not arbitrary tool commands run inside an agent's own session.
 
-`ha context` and the project screen show at most five open entries. Newly
-observed failures are current and sort before repeated failures whose state is
-now unknown; each row gives its last observation time. A successful retry of a
-stable check marks that check resolved even when its literal command changed;
-the command bytes remain in evidence. Reading context never resolves or erases
-a failure. Digest lines are capped at 220 characters. The screen uses plain descriptions
-and stable failure references, not raw command errors; existing row clipping
-is unchanged. `context --peek`, list, show, task and screen reads do not advance
-the context cursor. Full evidence is available through `ledger show` and `task`.
+`ha context` shows only failures observed since its previous receipt. The project
+screen can also retain repeated failures whose state is now unknown; each row
+gives its last observation time. A successful retry of a stable check marks
+that check resolved even when its literal command changed; the command bytes
+remain in evidence. Reading context never resolves or erases a failure. The
+screen uses plain descriptions and stable failure references, not raw command
+errors; existing row clipping is unchanged. `context --peek`, list, show, task
+and screen reads create no failure evidence and do not advance the context
+cursor. Full evidence is available through `ledger show` and `task`.
