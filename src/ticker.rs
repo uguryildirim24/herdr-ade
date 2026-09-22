@@ -713,7 +713,11 @@ fn thread_pass(
                 .as_deref()
                 .is_some_and(crate::herdr::ready_state)
         {
-            match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(prefix, slug, t)) {
+            match herdr.agent_prompt_wait_started(
+                &t.pane_id,
+                &thread::launch_prompt(prefix, slug, t),
+                agent_start_timeout(&t.launch),
+            ) {
                 Ok(()) => delivered = true,
                 Err(error) => {
                     pass.error = pass
