@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::contracts::{
-    AdmissionManifest, ManifestMember, MergeIntent, MergePhase, RoundPhase, RoundRecord,
+    AdmissionManifest, DonePayload, Event, EventPayload, ManifestMember, MergeIntent, MergePhase,
+    Recipient, RoundPhase, RoundRecord,
 };
 use crate::coordinator;
 use crate::paths::{Ctx, Env};
@@ -171,6 +172,36 @@ impl World {
 
 pub fn pane_json(workspace: &str, tab: &str, pane: &str, cwd: &str) -> String {
     format!(r#"{{"pane_id":"{pane}","tab_id":"{tab}","workspace_id":"{workspace}","cwd":"{cwd}"}}"#)
+}
+
+fn record_stored_report(project: &Project, thread_id: &str) {
+    let bytes = format!("report for {thread_id}\n").into_bytes();
+    let artifact = thread::sha256_hex(&bytes);
+    let artifact_path = crate::events::artifact_path(project, &artifact);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, bytes).unwrap();
+    let attempt = thread::load(project, thread_id).unwrap().attempt.max(1);
+    crate::events::seal_create_if_absent(
+        project,
+        &Event {
+            id: format!("{thread_id}-{attempt}-done"),
+            op: format!("{thread_id}-{attempt}-done"),
+            thread: thread_id.into(),
+            attempt,
+            round: Some("r1".into()),
+            recipient: Recipient::default(),
+            created: project::now(),
+            payload: EventPayload {
+                done: Some(DonePayload {
+                    sha: "lane-sha".into(),
+                    report_path: format!(".reports/{thread_id}.md"),
+                    artifact,
+                }),
+                ..EventPayload::default()
+            },
+        },
+    )
+    .unwrap();
 }
 
 fn record_closed_round(project: &Project, thread: &str, repo: &str, phase: RoundPhase) {
@@ -877,6 +908,31 @@ fn resolving_disposable_ignored_output_removes_the_worktree() {
 }
 
 #[test]
+fn resolving_a_lane_with_only_its_stored_report_removes_the_worktree() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let worktree = world.home.path().join("reported-worktree");
+    std::fs::create_dir_all(worktree.join(".reports")).unwrap();
+    std::fs::write(worktree.join(".reports/t-0001.md"), "lane report\n").unwrap();
+    let t = world.thread(&project, &worktree, |thread| {
+        thread.repo = "/repo".into();
+        thread.branch = "lane".into();
+    });
+    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    record_stored_report(&project, &t.id);
+    world.runner.on(
+        "status --porcelain --ignored --untracked-files=all",
+        ok("!! .reports/t-0001.md\n"),
+    );
+    world.runner.on("worktree remove", ok(""));
+
+    let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
+
+    assert_eq!(outcome.worktree, "removed");
+    assert_eq!(world.runner.count("worktree remove"), 1);
+}
+
+#[test]
 fn resolve_uses_the_repository_specific_disposable_list() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -1023,10 +1079,11 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         "{command}"
     );
     assert!(!command.contains("cd /home/agent"), "{command}");
-    assert!(
-        command.contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
-        "{command}"
-    );
+    assert!(!command.contains("rm -rf --"), "{command}");
+    assert!(calls.iter().any(|call| {
+        call.display()
+            .contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001")
+    }));
     let scratch = calls
         .iter()
         .find(|call| call.program == "ssh" && call.display().contains("scratch-t-0001"))
@@ -1046,7 +1103,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
 }
 
 #[test]
-fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
+fn cancelling_other_ignored_data_keeps_a_box_worktree_but_removes_its_build() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let t = world.thread(
@@ -1060,6 +1117,7 @@ fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
         },
     );
     record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
+    record_stored_report(&project, &t.id);
     world.runner.on(
         "machine list --json",
         ok(r#"[{"id":"oci-id","label":"oci","target":"remote-host","session":"default","enabled":true}]"#),
@@ -1071,7 +1129,9 @@ fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
             if line.contains("__HERDR_WORKTREE_PRESENT__") {
                 Ok(ok("__HERDR_WORKTREE_PRESENT__\n"))
             } else if line.contains("status --porcelain --ignored --untracked-files=all") {
-                Ok(ok("!! runs/raw.bin\0\0__HERDR_NESTED_WORKTREES__\0"))
+                Ok(ok(
+                    "!! .reports/t-0001.md\0!! runs/raw.bin\0\0__HERDR_NESTED_WORKTREES__\0",
+                ))
             } else if line.contains("du -sk") {
                 Ok(ok(
                     "4096\t/home/ubuntu/projects/herdr-ade/.worktrees/t-0001/runs\n",
@@ -1082,26 +1142,24 @@ fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
         },
     );
 
-    let outcome = threads::resolve(
-        &world.ctx(),
-        "demo",
-        &t.id,
-        &ResolveArgs {
-            skip_copy: true,
-            ..ResolveArgs::default()
-        },
-    )
-    .unwrap();
+    let outcome =
+        threads::cancel(&world.ctx(), "demo", &t.id, "the work is no longer needed").unwrap();
 
     assert_eq!(outcome.worktree, "kept");
     let reason = outcome.worktree_reason.unwrap();
     assert!(reason.starts_with("ignored_data:") && reason.contains("runs"));
+    assert!(!reason.contains(".reports"), "{reason}");
     assert_eq!(
         thread::load(&project, &t.id).unwrap().status,
         Status::Resolved
     );
     assert_eq!(world.runner.count("git worktree remove"), 0);
-    assert_eq!(world.runner.count("rm -rf -- /home/ubuntu/build/lanes"), 0);
+    assert_eq!(
+        world
+            .runner
+            .count("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
+        1
+    );
 }
 
 #[test]
