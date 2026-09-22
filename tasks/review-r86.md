@@ -75,3 +75,7 @@ The Pro lane runs only on the Mac, so I did not perform the live Codex check on 
 `edbde22` — `fix(pro): defer rollout discovery to first turn`
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `586ff25ac505d25f4d36ee5c9cbc22beab02fed4`.
