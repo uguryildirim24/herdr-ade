@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0209.md",
+      "tasks/t-0208.md",
+      "tasks/review-r86.md",
       "tasks/t-0207.md",
       "tasks/t-0199.md",
       "tasks/t-0197.md",
-      "tasks/review-r86.md",
       "tasks/review-r82.md",
       "tasks/t-0206.md",
       "tasks/t-0205.md",
       "tasks/review-r85.md",
       "tasks/t-0204.md",
-      "tasks/t-0203.md",
-      "tasks/review-r84.md",
-      "tasks/t-0201.md"
+      "tasks/t-0203.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r86.md",
       "tasks/reviews/code-r82.md",
       "tasks/reviews/code-r85.md",
       "tasks/reviews/code-r84.md",
@@ -39,16 +40,17 @@
       "tasks/reviews/code-r78.md",
       "tasks/reviews/code-r77.md",
       "tasks/reviews/code-r75.md",
-      "tasks/reviews/code-r76.md",
-      "tasks/reviews/code-r74.md"
+      "tasks/reviews/code-r76.md"
     ]
   },
-  "generated": "2026-09-21T22:12:17-04:00",
+  "generated": "2026-09-21T22:28:00-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0209-review-r86-a-new-web-helper-lane-starts",
       "main",
-      "hp/adeherdr/t-0207-review-r82-projects-can-run-any-number-o",
+      "review/r86-2",
       "hp/adeherdr/t-0208-review-r86-a-new-web-helper-lane-starts",
+      "hp/adeherdr/t-0207-review-r82-projects-can-run-any-number-o",
       "review/r86",
       "review/r82-3",
       "hp/adeherdr/t-0206-w10-recipes-visible",
@@ -334,43 +336,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "5dae023 Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'",
-      "20d6a83 review(r82): approve repaired candidate",
-      "2090d04 review(r82): merge earlier reviewed candidate",
-      "898af0e review(r86): brief for revision 1",
-      "c0b5e92 docs(tasks): t-0207",
-      "7d04e23 review(r82): brief for revision 1"
+      "c50263a review(r86): approve repaired candidate",
+      "274f2e3 review(r86): merge earlier reviewed candidate",
+      "4579086 docs(tasks): t-0209",
+      "fcedf25 review(r86): brief for revision 1",
+      "586ff25 checkpoint(r82): HANDOFF after merging the round",
+      "5dae023 Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'"
     ],
-    "remote": "12 ahead, 0 behind origin/main",
+    "remote": "7 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "5dae023",
+        "head": "c50263a",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'"
-      },
-      {
-        "branch": "review/r82",
-        "dirty": 0,
-        "head": "8ba36e1",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r82",
-        "subject": "docs(tasks): t-0197"
-      },
-      {
-        "branch": "review/r82-2",
-        "dirty": 0,
-        "head": "dda99f9",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r82-2",
-        "subject": "docs(tasks): t-0199"
-      },
-      {
-        "branch": "review/r82-3",
-        "dirty": 0,
-        "head": "c0b5e92",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r82-3",
-        "subject": "docs(tasks): t-0207"
+        "subject": "review(r86): approve repaired candidate"
       },
       {
         "branch": "review/r86",
@@ -378,6 +359,13 @@
         "head": "25dae55",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r86",
         "subject": "docs(tasks): t-0208"
+      },
+      {
+        "branch": "review/r86-2",
+        "dirty": 0,
+        "head": "4579086",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r86-2",
+        "subject": "docs(tasks): t-0209"
       }
     ]
   },
@@ -390,15 +378,15 @@
     },
     {
       "label": "PRL-8-53",
-      "status": "working",
+      "status": "done",
       "workspace_id": "w1N"
     }
   ],
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r82",
-    "verdict": "20d6a83f2c15328dfa44fea2696ada04a26dac19"
+    "round": "r86",
+    "verdict": "c50263a557b9926499fcd27a83bd9e27993e8300"
   },
   "session": "default",
   "unlinked_agents": [],
