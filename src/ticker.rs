@@ -1047,7 +1047,8 @@ fn nudge_idle_coordinator(
         return Ok(());
     }
     let text = format!(
-        "[herdr-ade ticker: automated, not the user, approves nothing] Continue open work: {}.",
+        "{} Continue open work: {}.",
+        steps::TICKER_PROMPT_PREFIX,
         next.join("; ")
     );
     let _writer = crate::talk::writer_lock(project)?;
