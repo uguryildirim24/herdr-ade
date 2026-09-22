@@ -40,7 +40,7 @@ pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     //    one. The running process reports its own build id.
     let installed_plugin = ctx.env.home.join(".local/bin/herdr-ade");
     if let Some(version) = plugin_version(ctx.runner, &installed_plugin)
-        && version.as_str() != crate::VERSION
+        && !crate::build::same_commit(&version, crate::VERSION)
     {
         stale.items.push(Item {
             what: "This project screen is older than the installed program.".into(),
