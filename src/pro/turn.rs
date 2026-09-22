@@ -765,6 +765,24 @@ fn task_complete_error(event: &Value) -> Option<&str> {
         .filter(|message| !message.trim().is_empty())
 }
 
+fn event_timestamp(event: &Value) -> Option<jiff::Timestamp> {
+    event.get("timestamp")?.as_str()?.parse().ok()
+}
+
+/// Codex 0.155.1 writes an empty packet-load task immediately before the
+/// answer task. Its rollout timestamps distinguish that pair even when the
+/// answer task starts after the collector's trailing-event settle poll.
+fn short_empty_task(started_at: Option<jiff::Timestamp>, completion: &Value, answer: &str) -> bool {
+    if !answer.trim().is_empty() || task_complete_error(completion).is_some() {
+        return false;
+    }
+    let Some((started_at, completed_at)) = started_at.zip(event_timestamp(completion)) else {
+        return false;
+    };
+    let elapsed_millis = completed_at.as_millisecond() - started_at.as_millisecond();
+    (0..=POLL.as_millis() as i64).contains(&elapsed_millis)
+}
+
 /// True when this event is the `<user_shell_command>` item for `packet`.
 fn is_shell_command(event: &Value, packet: &str) -> bool {
     if event["type"] != "response_item" || event["payload"]["type"] != "message" {
@@ -824,6 +842,8 @@ fn wait_for_completion_with_settle(
     fn observe(
         incoming: Vec<Value>,
         turn_id: &mut Option<String>,
+        started_at: &mut Option<jiff::Timestamp>,
+        skipped_packet_pair: &mut bool,
         events: &mut Vec<Value>,
         completed: &mut Option<(String, String)>,
     ) {
@@ -834,6 +854,7 @@ fn wait_for_completion_with_settle(
                 // prompt's result.
                 if turn_id.is_none() || completed.is_some() {
                     *turn_id = Some(id);
+                    *started_at = event_timestamp(&event);
                     events.clear();
                     *completed = None;
                 }
@@ -847,6 +868,13 @@ fn wait_for_completion_with_settle(
                 && let Some((id, answer)) = task_complete(&event)
                 && Some(&id) == turn_id.as_ref()
             {
+                if !*skipped_packet_pair && short_empty_task(*started_at, &event, &answer) {
+                    *skipped_packet_pair = true;
+                    *turn_id = None;
+                    *started_at = None;
+                    events.clear();
+                    continue;
+                }
                 *completed = Some((id, answer));
             }
         }
@@ -854,12 +882,16 @@ fn wait_for_completion_with_settle(
 
     let deadline = Instant::now() + timeout;
     let mut turn_id: Option<String> = None;
+    let mut started_at: Option<jiff::Timestamp> = None;
+    let mut skipped_packet_pair = false;
     let mut events: Vec<Value> = Vec::new();
     let mut completed: Option<(String, String)> = None;
     loop {
         observe(
             reader.new_events()?,
             &mut turn_id,
+            &mut started_at,
+            &mut skipped_packet_pair,
             &mut events,
             &mut completed,
         );
@@ -873,6 +905,8 @@ fn wait_for_completion_with_settle(
             observe(
                 reader.new_events()?,
                 &mut turn_id,
+                &mut started_at,
+                &mut skipped_packet_pair,
                 &mut events,
                 &mut completed,
             );
@@ -1155,16 +1189,52 @@ mod tests {
 
     #[test]
     fn task_complete_error_fixture_skips_the_packet_load_and_keeps_the_failure() {
-        let completion = completion_from_fixture(include_str!(
-            "../../tests/fixtures/pro/task-complete-error.jsonl"
-        ));
+        use std::io::Write;
+
+        let fixture = include_str!("../../tests/fixtures/pro/task-complete-error.jsonl");
+        let lines = fixture.lines().collect::<Vec<_>>();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        let trailing_path = path.clone();
+        let trailing = format!("{}\n{}\n", lines[2], lines[3]);
+        let writer = std::thread::spawn(move || {
+            // The real task starts after the old single settle poll. The
+            // packet pair must still not become the answer completion.
+            std::thread::sleep(POLL + Duration::from_millis(100));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(trailing_path)
+                .unwrap();
+            file.write_all(trailing.as_bytes()).unwrap();
+        });
+        let mut reader = RolloutReader::at_start(path);
+        let completion = wait_for_completion(&mut reader, Duration::from_secs(3)).unwrap();
+        writer.join().unwrap();
+
         assert_eq!(completion.turn_id, "01a0c751-47a5-real-turn");
+        let stopped = "stream disconnected before completion: ChatGPT displayed 'Stopped thinking'";
         assert_eq!(
             classify(&completion),
-            Outcome::ProviderFailed(
-                "stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"
-                    .into()
-            )
+            Outcome::ProviderFailed(stopped.into())
+        );
+
+        let page_error = Completion {
+            turn_id: "turn-page-error".into(),
+            answer: String::new(),
+            events: vec![json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-page-error",
+                    "last_agent_message": null,
+                    "error": {"message": "ChatGPT displayed an error for this response"}
+                }
+            })],
+        };
+        assert_eq!(
+            classify(&page_error),
+            Outcome::ProviderFailed("ChatGPT displayed an error for this response".into())
         );
 
         let rate_limited = Completion {
