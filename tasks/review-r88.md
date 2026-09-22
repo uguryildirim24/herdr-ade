@@ -66,3 +66,7 @@ Gates passed with the required `PATH` and `DEVELOPER_DIR`:
 No live Pro run was attempted because this lane is on `oci` and Pro runs only on the Mac; the coordinator can verify after install as requested.
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `a6d9dc8b271d2c768aad6a228679f3df99566ad3`.
