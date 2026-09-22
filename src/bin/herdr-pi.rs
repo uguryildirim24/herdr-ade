@@ -38,6 +38,9 @@ enum Command {
     },
     /// Check the setup; exit 1 when any check fails
     Doctor,
+    /// Refresh the plugin-owned extension after a harness install
+    #[command(hide = true)]
+    RefreshGuard,
     /// Read-only readiness for one provider (JSON); exit 1 when not ready
     Check {
         /// The pi provider id.
@@ -91,6 +94,10 @@ fn run(cli: &Cli) -> Result<bool> {
                 println!("herdr-pi: some checks failed");
             }
             Ok(healthy)
+        }
+        Command::RefreshGuard => {
+            pi::install::write_guard(&layout)?;
+            Ok(true)
         }
         Command::Check { provider, model } => {
             let report =

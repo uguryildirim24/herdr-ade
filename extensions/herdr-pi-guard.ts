@@ -1,6 +1,6 @@
-// herdr-pi-guard:version=2
+// herdr-pi-guard:version=3
 // Plugin-owned pi extension (SPEC-pi v2 §3.7, §3.10). Written by
-// `herdr-pi setup`; doctor checks the marker on the first line.
+// setup and every harness install; doctor compares the complete file.
 //
 // A provider error does not reach the model, so the model cannot report it.
 // This extension is the deterministic reporter: a settled
