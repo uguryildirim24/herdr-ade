@@ -11,6 +11,7 @@ build = "/home/ubuntu/build/lanes"
 path = "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 ade_bin = "/home/ubuntu/.local/bin/herdr-ade"
 pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
+kinds = ["pi"]
 
 [[machines.oci.repos]]
 path = "/home/agent/projects/herdr"

@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn install_resolves_a_saved_machine_declaration_by_its_label() {
+    fn install_resolves_a_saved_machine_declaration_and_its_kinds_by_label() {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = FakeRunner::new();
@@ -1183,6 +1183,9 @@ mod tests {
         assert_eq!(declaration.id, "oci");
         assert_eq!(declaration.label, "oci");
         assert_eq!(declaration.build, "/home/ubuntu/build/lanes");
+        assert!(declaration.runs_kind("pi"));
+        assert!(!declaration.runs_kind("claude"));
+        assert!(!declaration.runs_kind("agy"));
     }
 
     #[test]
