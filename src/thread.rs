@@ -1661,10 +1661,13 @@ mod tests {
         let rules_end = lane.find("## Pictures").expect("the pictures heading");
         let standing = &lane[..rules_end];
         assert!(
-            standing.contains("The coordinator pushes the integration branch"),
+            standing.contains("`round merge` pushes the integration branch"),
             "{standing}"
         );
-        assert!(standing.contains("a lane never pushes them"), "{standing}");
+        assert!(
+            standing.contains("a lane never pushes it or `main`"),
+            "{standing}"
+        );
         let box_section = lane.find("## On the cloud box").expect("the box heading");
         assert!(
             lane[box_section..].contains("push the lane branch to the URL-matched remote"),
