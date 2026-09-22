@@ -161,12 +161,15 @@ enum Command {
     Archive { slug: String },
     /// Make an archived project active again
     Unarchive { slug: String },
-    /// Move a project folder to the trash (no worktree, branch or PR is touched)
+    /// Delete a project everywhere; use `archive` to keep a reversible copy
     Delete {
         slug: String,
-        /// Delete even though coordinator or thread panes are alive
+        /// Also permanently delete project-owned GitHub repositories
         #[arg(long)]
-        force: bool,
+        github: bool,
+        /// Show the exact owned-resource scope without changing anything
+        #[arg(long)]
+        preview: bool,
     },
     /// Continue the current workspace's agent pane as a new project
     AdoptWorkspace {
@@ -2612,7 +2615,11 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         }
         Command::Archive { slug } => lifecycle::set_status(&ctx, &slug, Status::Archived),
         Command::Unarchive { slug } => lifecycle::set_status(&ctx, &slug, Status::Active),
-        Command::Delete { slug, force } => lifecycle::delete(&ctx, &slug, force),
+        Command::Delete {
+            slug,
+            github,
+            preview,
+        } => lifecycle::delete(&ctx, &slug, github, preview),
         Command::AdoptWorkspace {
             name,
             goal,

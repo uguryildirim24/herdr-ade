@@ -387,12 +387,9 @@ fn path_like_names_and_slugs_are_refused() {
             .success()
     );
     assert!(
-        !hp(
-            home.path(),
-            &["--root", root_arg, "delete", "../x", "--force"]
-        )
-        .status
-        .success()
+        !hp(home.path(), &["--root", root_arg, "delete", "../x"])
+            .status
+            .success()
     );
     assert!(!root.exists());
     assert!(!home.path().join("x").exists());
