@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-22T01:10:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-stopped"}}
+{"timestamp":"2026-09-22T01:15:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-stopped","last_agent_message":""}}
+{"timestamp":"2026-09-22T01:15:00Z","type":"event_msg","payload":{"type":"stream_error","message":"stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"}}
