@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
-      "tasks/t-0296.md",
+      "tasks/t-0301.md",
+      "tasks/t-0297.md",
       "tasks/review-r111.md",
+      "tasks/t-0300.md",
+      "tasks/t-0299.md",
+      "tasks/t-0298.md",
+      "tasks/t-0296.md",
       "tasks/review-r110.md",
       "tasks/t-0295.md",
       "tasks/t-0294.md",
       "tasks/t-0293.md",
-      "tasks/t-0292.md",
-      "tasks/t-0291.md",
-      "tasks/t-0290.md",
-      "tasks/t-0289.md",
-      "tasks/t-0285.md",
-      "tasks/t-0288.md"
+      "tasks/t-0292.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r111.md",
       "tasks/reviews/code-r110.md",
       "tasks/reviews/code-r109.md",
       "tasks/reviews/code-r108.md",
@@ -39,16 +40,20 @@
       "tasks/reviews/code-r100.md",
       "tasks/reviews/code-r103.md",
       "tasks/reviews/code-r102.md",
-      "tasks/reviews/code-r98.md",
-      "tasks/reviews/code-r99.md"
+      "tasks/reviews/code-r98.md"
     ]
   },
-  "generated": "2026-09-22T14:18:24-04:00",
+  "generated": "2026-09-22T14:57:21-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0300-w47-one-project-page",
+      "hp/adeherdr/t-0298-w45-one-way-to-publish-to-rolf",
+      "hp/adeherdr/t-0301-review-r111-single-commands-and-less-noi",
       "main",
-      "hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match",
+      "hp/adeherdr/t-0299-w46-rounds-in-single-commands-with-gates",
+      "review/r111-2",
       "hp/adeherdr/t-0297-review-r111-single-commands-and-less-noi",
+      "hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match",
       "review/r111",
       "hp/adeherdr/t-0292-w41-box-lanes-fresh-and-tidy",
       "hp/adeherdr/t-0294-w43-word-check-only-on-what-rolf-reads",
@@ -469,29 +474,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "0fc18e4 Merge commit 'ed62e579955dd260d548e57dac094b889ba5be1e'",
-      "ed62e57 review(ade): verdict r110",
-      "45d7fbd review(cleanup): reconcile closed round threads",
-      "bad0e84 review(r111): brief for revision 6",
-      "185febd Merge commit 'e14e3e90f21b5bc7c471b277ca2e8513a54a9b93' into hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match",
-      "6e112e9 Merge commit '089ee408300f278f646a7a30ee6710c1ec544e36' into hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match"
+      "bf6e390 docs(review): round r111 repair verdict",
+      "a7334b3 review(lifecycle): refuse overlapping project records",
+      "c88153c review(lifecycle): keep deletion retryable through old-trash cleanup",
+      "f7ecfea review(r111): merge earlier reviewed candidate",
+      "6c7760a docs(tasks): t-0301",
+      "714d1f7 review(r111): brief for revision 6"
     ],
-    "remote": "21 ahead, 0 behind origin/main",
+    "remote": "24 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "0fc18e4",
+        "head": "bf6e390",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'ed62e579955dd260d548e57dac094b889ba5be1e'"
-      },
-      {
-        "branch": "review/r110",
-        "dirty": 0,
-        "head": "ef7d6fa",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r110",
-        "subject": "docs(tasks): t-0296"
+        "subject": "docs(review): round r111 repair verdict"
       },
       {
         "branch": "review/r111",
@@ -499,6 +497,13 @@
         "head": "c2801eb",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r111",
         "subject": "docs(tasks): t-0297"
+      },
+      {
+        "branch": "review/r111-2",
+        "dirty": 0,
+        "head": "6c7760a",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r111-2",
+        "subject": "docs(tasks): t-0301"
       }
     ]
   },
@@ -513,8 +518,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r110",
-    "verdict": "ed62e579955dd260d548e57dac094b889ba5be1e"
+    "round": "r111",
+    "verdict": "bf6e3907c802a6a19c42e07bd869446b2923be55"
   },
   "session": "default",
   "unlinked_agents": [],
