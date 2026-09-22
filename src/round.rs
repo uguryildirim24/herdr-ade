@@ -459,6 +459,9 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
     record.phase = phase_for_merge(intent);
     record.cleanup_pending = intent.phase == MergePhase::Checkpointed;
     record.merge = Some(intent.clone());
+    if intent.phase == MergePhase::Checkpointed {
+        record.announced = None;
+    }
     record.attention.clear();
     save(project, &record)
 }
@@ -2250,6 +2253,18 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
 /// Older records still load their stored line; only durable merge-repair and
 /// divergence facts continue to use it.
 pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundRecord) -> String {
+    // A closed round has no reviewer or verdict action. Keep only a durable
+    // post-merge failure, which uses a typed lower-case error prefix; old
+    // generated `Round ...` attention is stale announcement text.
+    if record.phase.closed() {
+        return if record.attention.starts_with("Round ") {
+            String::new()
+        } else {
+            record.attention.clone()
+        };
+    }
+    // Historical merged records retain verdict_kind as evidence; the closed
+    // phase boundary above keeps it from resurrecting the old merge prompt.
     let verdict = record.verdict_kind.as_deref().or_else(|| {
         record
             .announced
@@ -2413,6 +2428,12 @@ fn announce_once(
     {
         let _lock = project.lock()?;
         let mut record = load(project, round)?;
+        // `advance` and an explicit merge use different operation locks. If
+        // the merge closes the round after advance's list read, this boundary
+        // prevents the late announcement from putting action back on it.
+        if record.phase.closed() {
+            return Ok(());
+        }
         let already = record.announced.as_deref() == Some(token);
         record.announced = Some(token.to_string());
         // The summary is deliberately not persisted. Context derives reviewer
@@ -6144,6 +6165,33 @@ mod tests {
                 .0,
             digest
         );
+    }
+
+    #[test]
+    fn a_checkpointed_round_never_regains_merge_verdict_attention() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+
+        advance(&ctx, "demo").unwrap();
+        let announced = load(&fx.project, "r1").unwrap();
+        assert!(current_attention(&ctx, &fx.project, &announced).contains("run `round merge r1`"));
+
+        merge(&ctx, "demo", "r1", None).unwrap();
+        advance(&ctx, "demo").unwrap();
+
+        let merged = load(&fx.project, "r1").unwrap();
+        assert_eq!(merged.phase, RoundPhase::Merged);
+        assert!(merged.attention.is_empty(), "{merged:?}");
+        assert!(merged.announced.is_none(), "{merged:?}");
+        assert!(
+            current_attention(&ctx, &fx.project, &merged).is_empty(),
+            "{}",
+            current_attention(&ctx, &fx.project, &merged)
+        );
+        let shown = show(&ctx, "demo", "r1").unwrap();
+        assert!(!shown.contains("attention:"), "{shown}");
     }
 
     /// Automation may consume a verdict and announce it, but only a command
