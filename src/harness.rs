@@ -149,7 +149,6 @@ pub(crate) struct InstallOutcome {
     pub(crate) live_handoff_required: bool,
     pub(crate) processes: Vec<ProcessProof>,
     pub(crate) tasks: Vec<TaskInstallProof>,
-    pub(crate) conversions: Vec<String>,
     #[serde(skip)]
     pub(crate) warnings: Vec<String>,
 }
@@ -162,10 +161,6 @@ impl InstallOutcome {
             .flat_map(|repo| repo.binaries.iter())
             .map(|binary| format!("{}\n", binary.version))
             .collect::<String>();
-        for conversion in &self.conversions {
-            message.push_str(conversion);
-            message.push('\n');
-        }
         for process in &self.processes {
             match (&process.build, &process.reason) {
                 (Some(build), _) => message.push_str(&format!(
@@ -820,63 +815,6 @@ fn talk_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessPr
     proofs
 }
 
-fn convert_local_projects(ctx: &Ctx) -> Result<Vec<String>> {
-    crate::ticker::stop(&ctx.root)?;
-    let mut lines = Vec::new();
-    for slug in crate::project::list_slugs(&ctx.root) {
-        let project = crate::project::Project::load(&ctx.root, &slug)?;
-        let (_, moved) = crate::project::convert(&project)?;
-        if !moved.is_empty() {
-            lines.push(format!(
-                "local project {slug}: moved under .state: {}",
-                moved.join(", ")
-            ));
-        }
-    }
-    Ok(lines)
-}
-
-fn convert_box_projects(
-    ctx: &Ctx,
-    machine: &crate::remote::MachineDeclaration,
-) -> Result<Vec<String>> {
-    let script = format!(
-        "set -e\n\
-         export PATH={path}\n\
-         bin={bin}\n\
-         root={root}\n\
-         \"$bin\" --root \"$root\" ticker stop >/dev/null\n\
-         for project in \"$root\"/*; do\n\
-           [ -f \"$project/PROJECT.md\" ] || continue\n\
-           slug=${{project##*/}}\n\
-           \"$bin\" --root \"$root\" project convert \"$slug\"\n\
-         done",
-        path = remote::quote(&machine.path),
-        bin = remote::quote(&machine.ade_bin),
-        root = remote::quote(&machine.root),
-    );
-    let output = remote::ssh(
-        ctx.runner,
-        &machine.target,
-        &script,
-        None,
-        Duration::from_secs(140),
-    )?;
-    if !output.success() {
-        bail!(
-            "harness_box_convert_failed: could not convert projects on {}: {}",
-            machine.label,
-            output.error_text()
-        );
-    }
-    Ok(output
-        .stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| format!("{} project conversion: {line}", machine.id))
-        .collect())
-}
-
 fn box_process_script(
     machine: &crate::remote::MachineDeclaration,
     attempts: u32,
@@ -1221,8 +1159,6 @@ pub(crate) fn install_with_reexec(
     let mut kinds = Vec::new();
     let mut installed = Vec::new();
     let mut builds = Vec::new();
-    let mut conversions = Vec::new();
-    let mut local_projects_converted = false;
     for repo in &repos {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
@@ -1260,19 +1196,6 @@ pub(crate) fn install_with_reexec(
             box_installed: false,
             box_commit: None,
         });
-        if kind == Kind::Plugin && !local_projects_converted {
-            // In production, replacing herdr-ade re-executes above and never
-            // returns here in the old image. Convert as soon as the new image
-            // is installed, before a box outage or a later build can leave
-            // the new readers pointed at records that have not moved yet.
-            conversions.extend(convert_local_projects(ctx)?);
-            local_projects_converted = true;
-        }
-    }
-    // A custom harness list need not contain the plugin. The running image
-    // still knows this layout, so retain explicit conversion for that case.
-    if !local_projects_converted {
-        conversions.extend(convert_local_projects(ctx)?);
     }
     if kinds.contains(&Kind::Plugin) {
         crate::pi::install::write_guard(&crate::pi::Layout {
@@ -1308,10 +1231,7 @@ pub(crate) fn install_with_reexec(
                 }
                 installed_repo.box_installed = true;
                 installed_repo.box_commit = box_commit;
-                if kind == Kind::Plugin && !box_plugin_installed {
-                    // Do not let a later box build or settings step strand
-                    // old records behind the newly installed box reader.
-                    conversions.extend(convert_box_projects(ctx, machine)?);
+                if kind == Kind::Plugin {
                     box_plugin_installed = true;
                 }
             }
@@ -1345,7 +1265,6 @@ pub(crate) fn install_with_reexec(
         live_handoff_required: fork,
         processes,
         tasks,
-        conversions,
         warnings,
     })
 }
