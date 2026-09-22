@@ -579,12 +579,66 @@ impl<'a> Herdr<'a> {
             .collect()
     }
 
+    /// Waits for the same ready-for-input states used after `agent start`.
+    pub(crate) fn agent_wait_ready(
+        &self,
+        target: &str,
+        timeout_ms: u64,
+    ) -> Result<Agent, HerdrError> {
+        let timeout = timeout_ms.to_string();
+        let result = self.call(
+            &[
+                "agent",
+                "wait",
+                target,
+                "--until",
+                "idle",
+                "--until",
+                "done",
+                "--timeout",
+                &timeout,
+            ],
+            Duration::from_millis(timeout_ms) + Duration::from_secs(5),
+        )?;
+        serde_json::from_value(result["agent"].clone()).map_err(|error| HerdrError {
+            code: "failed".into(),
+            message: format!("`herdr agent wait` reply changed: {error}"),
+        })
+    }
+
     /// Submits a prompt. herdr's parser takes positionals first and options
     /// after them, and has no `--` separator here; text in the second
     /// position is accepted even when it starts with a dash (checked on 0.9.1).
     pub(crate) fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
         self.call(&["agent", "prompt", target, text], CALL_TIMEOUT)
             .map(|_| ())
+    }
+
+    /// Submits a first prompt and requires herdr to observe that it started.
+    pub(crate) fn agent_prompt_wait_started(
+        &self,
+        target: &str,
+        text: &str,
+        timeout_ms: u64,
+    ) -> Result<(), HerdrError> {
+        let timeout = timeout_ms.to_string();
+        self.call(
+            &[
+                "agent",
+                "prompt",
+                target,
+                text,
+                "--wait",
+                "--until",
+                "working",
+                "--until",
+                "blocked",
+                "--timeout",
+                &timeout,
+            ],
+            Duration::from_millis(timeout_ms) + Duration::from_secs(5),
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {

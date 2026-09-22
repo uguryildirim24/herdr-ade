@@ -3081,7 +3081,7 @@ mod tests {
         let prompts: Vec<String> = calls
             .iter()
             .filter(|c| c.display().contains("agent prompt") && c.display().contains("w1:p2"))
-            .map(|c| c.args.last().cloned().unwrap_or_default())
+            .map(|c| c.args.get(3).cloned().unwrap_or_default())
             .collect();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(
