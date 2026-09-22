@@ -19,15 +19,9 @@ use super::{Env, Layout, MODEL, bridge, doctor, home};
 /// `agent start` waits this long for a ready agent; a trust or sign-in prompt
 /// shows as a blocked screen and the start times out.
 const READY_TIMEOUT_MS: u64 = 120_000;
-
-/// After the agent is ready, wait this long for Codex to write its session
-/// rollout. A trust prompt never creates one, so a missing rollout means the
-/// lane is not usable. The wait ends on an event; this is only the outer
-/// bound so nothing hangs forever.
-const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// The rollout poll interval.
-const ROLLOUT_POLL: Duration = Duration::from_millis(250);
+/// A new tab can exist before its shell accepts an agent. Retry only that
+/// reported race within the same outer bound as agent readiness.
+const SHELL_READY_POLL: Duration = Duration::from_millis(250);
 
 /// The exact trust prompt Codex shows for an untrusted directory (2026-09-19
 /// live run, Codex 0.155.1). It does not always read as `blocked`, so the
@@ -282,85 +276,37 @@ pub(crate) fn refresh_rollout(env: &Env, lane: &mut Lane) -> Option<PathBuf> {
     path
 }
 
-/// How the rollout wait ended. Every arm is an event, not a clock tick.
-enum RolloutWait {
-    /// Codex wrote the session rollout: the lane is usable.
-    Ready,
-    /// The pane shows Codex's trust prompt.
-    TrustPrompt,
-    /// Herdr reports the agent blocked; the reason is its last screen line.
-    Blocked(String),
-    /// Herdr no longer lists the lane's Codex agent.
-    Gone,
-    /// The outer bound passed with no rollout.
-    TimedOut,
-}
-
-/// The monotonic clock the rollout wait reads, so tests run in fake time.
-trait Clock {
-    fn now(&self) -> Instant;
-    fn sleep(&self, duration: Duration);
-}
-
-struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
-}
-
-/// Poll for the rollout after the agent is ready. A trust prompt never writes
-/// one, so this is the second half of "never report ready before the session
-/// exists". The wait ends on the rollout, the trust prompt, a blocked agent or
-/// a dead agent, not only when the bound passes.
-fn wait_for_rollout(
-    env: &Env,
-    lane: &mut Lane,
-    runner: &dyn Runner,
-    bin: &str,
-    timeout: Duration,
-    clock: &dyn Clock,
-) -> RolloutWait {
-    let deadline = clock.now() + timeout;
-    loop {
-        if refresh_rollout(env, lane).is_some() {
-            return RolloutWait::Ready;
-        }
-        if trust_prompt_showing(runner, bin, &lane.pane_id) {
-            return RolloutWait::TrustPrompt;
-        }
-        match herdr_cli::agent_find(runner, bin, &lane.name) {
-            Ok(Some(agent)) if agent.blocked() => {
-                return RolloutWait::Blocked(screen_reason(runner, bin, &lane.pane_id));
-            }
-            Ok(None) => return RolloutWait::Gone,
-            _ => {}
-        }
-        // The pane no longer running Codex is death, the same test `reconcile`
-        // uses. A failed call is not death; the bound still ends the wait.
-        let alive = herdr_cli::process_info(runner, bin, &lane.pane_id)
-            .map(|info| info.runs("codex"))
-            .unwrap_or(true);
-        if !alive {
-            return RolloutWait::Gone;
-        }
-        if clock.now() >= deadline {
-            return RolloutWait::TimedOut;
-        }
-        clock.sleep(ROLLOUT_POLL);
-    }
-}
-
 /// The trust prompt currently on the pane's screen.
 fn trust_prompt_showing(runner: &dyn Runner, bin: &str, pane: &str) -> bool {
     herdr_cli::pane_read(runner, bin, pane)
         .map(|text| text.contains(TRUST_PROMPT))
         .unwrap_or(false)
+}
+
+/// Start an agent once the new tab's shell accepts it. Herdr reports the
+/// short tab-creation race as `agent_pane_busy`; every other error is final.
+fn agent_start_when_shell_ready(
+    runner: &dyn Runner,
+    bin: &str,
+    spec: &herdr_cli::StartSpec<'_>,
+) -> Result<Agent> {
+    let deadline = Instant::now() + Duration::from_millis(READY_TIMEOUT_MS);
+    loop {
+        match herdr_cli::agent_start(runner, bin, spec) {
+            Ok(agent) => return Ok(agent),
+            Err(error) if format!("{error:#}").contains("agent_pane_busy") => {
+                if Instant::now() >= deadline {
+                    return Err(error).context(format!(
+                        "pane {} did not become an available shell within {}s",
+                        spec.pane,
+                        READY_TIMEOUT_MS / 1_000
+                    ));
+                }
+                std::thread::sleep(SHELL_READY_POLL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// `herdr-pro start`: doctor, one serialized Codex start, then record.
@@ -430,7 +376,7 @@ pub(crate) fn start(
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &cwd_text, &opts.name, &env_pairs)
         .context("could not create the lane tab")?;
     let started = jiff::Timestamp::now();
-    let agent = match herdr_cli::agent_start(
+    let agent = match agent_start_when_shell_ready(
         runner,
         &bin,
         &herdr_cli::StartSpec {
@@ -457,6 +403,14 @@ pub(crate) fn start(
             pane.pane_id
         );
     }
+    if !agent.ready() {
+        let status = &agent.agent_status;
+        close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
+        bail!(
+            "WAITING pro-bridge the lane is not ready in pane {}: agent status {status}",
+            pane.pane_id
+        );
+    }
     if trust_prompt_showing(runner, &bin, &pane.pane_id) {
         close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
         bail!(
@@ -471,7 +425,7 @@ pub(crate) fn start(
         .as_ref()
         .map(|s| s.id.clone())
         .filter(|id| !id.is_empty());
-    let mut lane = Lane {
+    let lane = Lane {
         name: opts.name.clone(),
         pane_id: pane.pane_id.clone(),
         tab_id: pane.tab_id.clone(),
@@ -486,44 +440,6 @@ pub(crate) fn start(
         stopped: false,
         last_turn: None,
     };
-    if opts.profile.is_none() {
-        let timeout = ROLLOUT_TIMEOUT;
-        match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
-            RolloutWait::Ready => {}
-            RolloutWait::TrustPrompt => {
-                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge `{}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory in {} once, then start again (never press through the prompt)",
-                    lane.cwd,
-                    pane.pane_id,
-                    env.lane_codex_home().join("config.toml").display()
-                );
-            }
-            RolloutWait::Blocked(reason) => {
-                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge the lane is blocked in pane {}: {reason}",
-                    pane.pane_id
-                );
-            }
-            RolloutWait::Gone => {
-                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge the lane's Codex agent died in pane {}",
-                    pane.pane_id
-                );
-            }
-            RolloutWait::TimedOut => {
-                let reason = screen_reason(runner, &bin, &pane.pane_id);
-                close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge the lane has no Codex rollout after {}s in pane {}: {reason}",
-                    timeout.as_secs(),
-                    pane.pane_id
-                );
-            }
-        }
-    }
     if let Err(error) = lane.write(layout) {
         close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
         return Err(error);
@@ -623,7 +539,7 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
     let env_pairs: Vec<String> = env.codex_home_env().into_iter().collect();
     let pane = herdr_cli::tab_create(runner, &bin, &workspace, &lane.cwd, name, &env_pairs)
         .context("could not create the resume tab")?;
-    let agent = match herdr_cli::agent_start(
+    let agent = match agent_start_when_shell_ready(
         runner,
         &bin,
         &herdr_cli::StartSpec {
@@ -650,6 +566,14 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
             pane.pane_id
         );
     }
+    if !agent.ready() {
+        let status = &agent.agent_status;
+        close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
+        bail!(
+            "WAITING pro-bridge the resumed lane is not ready in pane {}: agent status {status}",
+            pane.pane_id
+        );
+    }
     if trust_prompt_showing(runner, &bin, &pane.pane_id) {
         close_failed_start(runner, &bin, &pane.pane_id, &pane.tab_id)?;
         bail!(
@@ -662,45 +586,16 @@ pub(crate) fn resume(env: &Env, layout: &Layout, runner: &dyn Runner, name: &str
     lane.tab_id = pane.tab_id;
     lane.workspace_id = pane.workspace_id;
     lane.parent = parent;
+    if let Some(id) = agent
+        .agent_session
+        .as_ref()
+        .map(|session| session.id.clone())
+        .filter(|id| !id.is_empty())
+    {
+        lane.session_id = Some(id);
+    }
     lane.state = "ready".into();
     lane.stopped = false;
-    if lane.profile.is_none() {
-        let timeout = ROLLOUT_TIMEOUT;
-        match wait_for_rollout(env, &mut lane, runner, &bin, timeout, &SystemClock) {
-            RolloutWait::Ready => {}
-            RolloutWait::TrustPrompt => {
-                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge `{}` shows \"{TRUST_PROMPT}\" in pane {}; trust that exact directory once, then resume",
-                    lane.cwd,
-                    lane.pane_id
-                );
-            }
-            RolloutWait::Blocked(reason) => {
-                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge the resumed lane is blocked in pane {}: {reason}",
-                    lane.pane_id
-                );
-            }
-            RolloutWait::Gone => {
-                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge the resumed lane's Codex agent died in pane {}",
-                    lane.pane_id
-                );
-            }
-            RolloutWait::TimedOut => {
-                let reason = screen_reason(runner, &bin, &lane.pane_id);
-                close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
-                bail!(
-                    "WAITING pro-bridge the resumed lane has no Codex rollout after {}s in pane {}: {reason}",
-                    timeout.as_secs(),
-                    lane.pane_id
-                );
-            }
-        }
-    }
     if let Err(error) = lane.write(layout) {
         close_failed_start(runner, &bin, &lane.pane_id, &lane.tab_id)?;
         return Err(error);
@@ -857,21 +752,9 @@ mod tests {
     }
 
     #[test]
-    fn start_waits_for_the_rollout_before_ready() {
+    fn start_returns_ready_before_codex_writes_a_rollout() {
         let dir = tempfile::tempdir().unwrap();
         let (env, layout) = test_env(dir.path());
-        // The rollout exists before the lane starts, so the poll returns at
-        // once; matching is by session id.
-        let sessions = layout.codex_home().join("sessions/2026/09/19");
-        std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(
-            sessions.join("rollout-abc.jsonl"),
-            format!(
-                "{{\"timestamp\":\"2026-09-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"abc\",\"cwd\":\"{}\",\"timestamp\":\"2026-09-19T10:00:00Z\"}}}}\n",
-                dir.path().display()
-            ),
-        )
-        .unwrap();
         let runner = FakeRunner::new();
         runner.on(
             ":17841/healthz",
@@ -900,160 +783,61 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            lane.rollout
-                .as_deref()
-                .unwrap()
-                .ends_with("rollout-abc.jsonl")
-        );
+        assert_eq!(lane.state, "ready");
+        assert_eq!(lane.rollout, None);
         assert_eq!(lane.session_id.as_deref(), Some("abc"));
-    }
-
-    /// A fake clock: `now` never moves on its own and `sleep` jumps it
-    /// forward, so the wait can run in a second of real time with any bound.
-    struct FakeClock {
-        origin: Instant,
-        elapsed: std::cell::Cell<Duration>,
-    }
-
-    impl FakeClock {
-        fn new() -> Self {
-            FakeClock {
-                origin: Instant::now(),
-                elapsed: std::cell::Cell::new(Duration::ZERO),
-            }
-        }
-
-        fn elapsed(&self) -> Duration {
-            self.elapsed.get()
-        }
-    }
-
-    impl Clock for FakeClock {
-        fn now(&self) -> Instant {
-            self.origin + self.elapsed.get()
-        }
-
-        fn sleep(&self, duration: Duration) {
-            self.elapsed.set(self.elapsed.get() + duration);
-        }
-    }
-
-    /// A bridge lane record with the rollout still missing.
-    fn test_lane(dir: &Path) -> Lane {
-        Lane {
-            name: "pro".into(),
-            pane_id: "w1:p2".into(),
-            tab_id: "w1:t2".into(),
-            workspace_id: "w1".into(),
-            parent: None,
-            cwd: dir.display().to_string(),
-            profile: None,
-            session_id: None,
-            rollout: None,
-            started_at: "2026-09-19T09:00:00Z".into(),
-            state: "ready".into(),
-            stopped: false,
-            last_turn: None,
-        }
+        assert_eq!(Lane::read(&layout, "pro").unwrap(), lane);
     }
 
     #[test]
-    fn a_rollout_later_than_the_old_thirty_second_bound_succeeds() {
+    fn start_retries_while_the_new_tabs_shell_is_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let (env, _layout) = test_env(dir.path());
-        let mut lane = test_lane(dir.path());
-        let clock = FakeClock::new();
+        let (env, layout) = test_env(dir.path());
         let runner = FakeRunner::new();
-        runner.on("pane read", ok("codex> \n"));
-        // The rollout file appears on the 130th `agent list` poll, i.e. after
-        // 130 * 250 ms = 32.5 s of fake time: past the old 30 s bound.
-        let sessions = env.lane_codex_home().join("sessions/2026/09/19");
-        let cwd = lane.cwd.clone();
-        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        runner.on(
+            ":17841/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","accepting_turns":true}"#),
+        );
+        runner.on("codex login status", ok("Logged in\n"));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "tab create",
+            ok(r#"{"result":{"root_pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/w"}}}"#),
+        );
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let seen = calls.clone();
         runner.on_fn(
-            |cmd| cmd.display().contains("agent list"),
+            |cmd| cmd.display().contains("agent start"),
             move |_| {
                 seen.set(seen.get() + 1);
-                if seen.get() == 130 {
-                    std::fs::create_dir_all(&sessions).unwrap();
-                    std::fs::write(
-                        sessions.join("rollout-late.jsonl"),
-                        format!(
-                            "{{\"timestamp\":\"2026-09-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"late\",\"cwd\":\"{cwd}\",\"timestamp\":\"2026-09-19T10:00:00Z\"}}}}\n"
-                        ),
-                    )
-                    .unwrap();
+                if seen.get() == 1 {
+                    Ok(fail(
+                        1,
+                        "agent target pane w1:p2 is not an available shell (agent_pane_busy)",
+                    ))
+                } else {
+                    Ok(ok(r#"{"result":{"agent":{"pane_id":"w1:p2","name":"pro","agent":"codex","agent_status":"idle"}}}"#))
                 }
-                Ok(ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#))
             },
         );
-        let outcome = wait_for_rollout(
-            &env,
-            &mut lane,
-            &runner,
-            "/h/herdr",
-            ROLLOUT_TIMEOUT,
-            &clock,
-        );
-        assert!(
-            matches!(outcome, RolloutWait::Ready),
-            "the late rollout was not found"
-        );
-        assert!(
-            clock.elapsed() > Duration::from_secs(30),
-            "the wait ended before the old bound: {:?}",
-            clock.elapsed()
-        );
-        assert_eq!(lane.session_id.as_deref(), Some("late"));
-    }
-
-    #[test]
-    fn a_trust_prompt_during_the_wait_fails_closed_at_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let (env, _layout) = test_env(dir.path());
-        let mut lane = test_lane(dir.path());
-        let clock = FakeClock::new();
-        let runner = FakeRunner::new();
-        runner.on(
-            "pane read",
-            ok("Do you trust the contents of this directory?\n1. Yes, continue\n2. No, quit\n"),
-        );
-        runner.on(
-            "agent list",
-            ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#),
-        );
-        let outcome = wait_for_rollout(
-            &env,
-            &mut lane,
-            &runner,
-            "/h/herdr",
-            ROLLOUT_TIMEOUT,
-            &clock,
-        );
-        assert!(matches!(outcome, RolloutWait::TrustPrompt));
-        assert_eq!(clock.elapsed(), Duration::ZERO);
-        assert_eq!(runner.count("pane read"), 1);
-    }
-
-    #[test]
-    fn the_outer_bound_still_fails_without_a_rollout() {
-        assert_eq!(ROLLOUT_TIMEOUT, Duration::from_secs(600));
-        let dir = tempfile::tempdir().unwrap();
-        let (env, _layout) = test_env(dir.path());
-        let mut lane = test_lane(dir.path());
-        let clock = FakeClock::new();
-        let runner = FakeRunner::new();
         runner.on("pane read", ok("codex> \n"));
-        runner.on(
-            "agent list",
-            ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#),
-        );
-        let bound = Duration::from_secs(3);
-        let outcome = wait_for_rollout(&env, &mut lane, &runner, "/h/herdr", bound, &clock);
-        assert!(matches!(outcome, RolloutWait::TimedOut));
-        assert!(clock.elapsed() >= bound, "{:?}", clock.elapsed());
+
+        let lane = start(
+            &env,
+            &layout,
+            &runner,
+            &StartOptions {
+                name: "pro".into(),
+                cwd: Some(dir.path().display().to_string()),
+                profile: None,
+                images: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(lane.state, "ready");
+        assert_eq!(runner.count("agent start"), 2);
+        assert_eq!(runner.count("tab close"), 0);
     }
 
     #[test]
@@ -1067,34 +851,6 @@ mod tests {
         let error = close_failed_start(&runner, "/h/herdr", "w1:p2", "w1:t2").unwrap_err();
         assert!(error.to_string().contains("still runs Codex"), "{error}");
         assert!(error.to_string().contains("not gone"), "{error}");
-    }
-
-    #[test]
-    fn a_dead_agent_during_the_wait_fails_at_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let (env, _layout) = test_env(dir.path());
-        let mut lane = test_lane(dir.path());
-        let clock = FakeClock::new();
-        let runner = FakeRunner::new();
-        runner.on("pane read", ok("codex> \n"));
-        runner.on(
-            "agent list",
-            ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#),
-        );
-        runner.on(
-            "pane process-info",
-            ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"zsh"}]}}}"#),
-        );
-        let outcome = wait_for_rollout(
-            &env,
-            &mut lane,
-            &runner,
-            "/h/herdr",
-            ROLLOUT_TIMEOUT,
-            &clock,
-        );
-        assert!(matches!(outcome, RolloutWait::Gone));
-        assert_eq!(clock.elapsed(), Duration::ZERO);
     }
 
     #[test]
