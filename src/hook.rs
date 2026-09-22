@@ -87,11 +87,11 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     };
     let binary = std::env::current_exe().context("could not locate herdr-ade")?;
     let command = format!(
-        "{} --root {} plain hook --kind {} --project {} --binding {}",
+        "{} --root {} plain hook {} --kind {} --binding {}",
         quote(&binary.to_string_lossy()),
         quote(&ctx.root.to_string_lossy()),
-        quote(kind),
         quote(&project.slug),
+        quote(kind),
         quote(pane)
     );
     let _lock = project.lock()?;
@@ -155,11 +155,11 @@ fn event_phase<'a>(adapter: &'a crate::adapters::Adapter, event: &str) -> Option
 fn owned_hook(value: &serde_json::Value) -> bool {
     value["command"]
         .as_str()
-        .is_some_and(|command| command.contains(" plain hook --kind "))
+        .is_some_and(|command| command.contains(" plain hook "))
         || value["hooks"].as_array().into_iter().flatten().any(|hook| {
             hook["command"]
                 .as_str()
-                .is_some_and(|command| command.contains(" plain hook --kind "))
+                .is_some_and(|command| command.contains(" plain hook "))
         })
 }
 

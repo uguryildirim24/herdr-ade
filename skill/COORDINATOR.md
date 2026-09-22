@@ -58,7 +58,7 @@ You do not pick a model on your own. Write the full task with scope, constraints
 - `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
 - Task front matter may say `product = "web-research"`, `product = "spec"`, or `capability = "<name>"`. The selected recipe must declare that capability. A coding task that reads a web page is still coding unless its product says otherwise.
 - When Rolf names the model for one lane, use his exact words: `hp thread start ... --job <job-NNNN> --recipe <id> --basis "<Rolf's words>"`. The task must cite that Rolf request. The harness records the choice and refuses an invented or unattached quote.
-- If no recipe fits, add one `[recipes.<id>]` row to `~/.config/herdr-ade/config.toml`. Its capabilities must be capabilities its `[adapters.<kind>]` row declares; capabilities are tool features, not a model choice. Then run `hp doctor`, `hp say`, and `hp decide` (class `money` when it costs more, with `--basis` quoting Rolf's words).
+- If no recipe fits, add one `[recipes.<id>]` row to `~/.config/herdr-ade/config.toml`. Its capabilities must be capabilities its `[adapters.<kind>]` row declares; capabilities are tool features, not a model choice. Then run `hp doctor`, `hp say <slug>`, and `hp decide <slug>` (class `money` when it costs more, with `--basis` quoting Rolf's words).
 - Pro lanes run only on the Mac. Start one in the background because it can take minutes: `herdr-pro start --name <n> --cwd <dir> &`. Send its question with `herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]`. Never type into a Pro pane.
 - `round advance` still starts the review. The reviewer gets a bounded task that names the committed review brief and every pinned commit range; large sources stay in the checkout for the reviewer to read.
 - A lane calls `ha failed "<failure and evidence>"` for failed work. The harness uses the routing rule's bounded retries and fallbacks. Provider and lost-connection failures retry only the same recipe; a gone process restarts; unknown evidence waits for you.
@@ -66,7 +66,7 @@ You do not pick a model on your own. Write the full task with scope, constraints
 
 ### Harness evolves
 
-Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, run `hp doctor`, publish one `hp say` line naming the change in plain words, and record one `hp decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file.
+Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, run `hp doctor`, publish one `hp say <slug>` line naming the change in plain words, and record one `hp decide <slug>` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file.
 
 When the harness is broken, the answer is a harness fix through a lane and a round, followed by `ha harness install`. Never take a manual path around it: do not hand-start an agent and bind it with `thread adopt` after a failed start, type into a pane to force a state the harness awaits, or hand-make repositories or files for one project. Never give another coordinator a workaround. Tell it which fix is coming and to wait for the install. Tell Rolf plainly what is blocked and which fix unblocks it. A lane may work on a harness repository even when `PROJECT.md` does not list it. The install updates both machines and their tickers, checks the running project screens, and records installation proof for the tasks in that build.
 
@@ -74,7 +74,7 @@ When the harness is broken, the answer is a harness fix through a lane and a rou
 
 A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance conditions. Its state is derived from attempts, review rounds, merges and recorded install or verification evidence. Never edit `TASKS.md`; the harness generates it.
 
-- Add work with `hp task add <slug> --title "<plain title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. Repeat `--request` and `--acceptance`; add `--repo`, `--plan-step`, or `--replaces <older-id>` when they apply.
+- Add work with `hp task add <slug> --title "<plain title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. One condition may contain several short sentences, which are checked separately and kept as one condition. Repeat `--request` and `--acceptance`; add `--repo`, `--plan-step`, or `--replaces <older-id>` when they apply.
 - Start ordinary lanes with `--job <job-NNNN>`. To create and start in one command, omit `--job` and add `--request`, `--acceptance` and optional `--plan-step` to `thread start`.
 - Use `hp task list|show`, `hp task note <slug> <job-NNNN> "<note>" --request <request-id> [--replaces <note-id>]`, and `hp task evidence --kind verified --command "<command checked>"`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
 - Use `hp task adopt <slug> <job-NNNN> --thread <t-NNNN>` to attach a lane and its rounds when that lane predates task records.
@@ -110,9 +110,9 @@ When the user asks for scheduled or watched work, create or edit a file in `rout
 
 Rolf reads you in the `talk` tab when the project has it on (`hp context` prints the label). The talk tab shows only checked messages, never your prose. The text that reaches Rolf's board, notifications or talk tab as prose — `hp say`, `hp ask` and its choices — goes through one check: known words, short sentences, names only in the form `<recorded sentence> (<name>)`. The check proves the words are known, not that Rolf understands them. A `hp decide` line and a round or thread sentence keep the length limit, because they are rows on a screen, but they are the internal record of what happened and may name a file or other internal detail; plan sentences and `hp term add` sentences still take the full check.
 
-- `hp say --what "<one sentence: what happened>" [--means "<one sentence: what it means for you>"]` puts one line on the board and in talk.
-- `hp ask "<question>?" --choice "<a sentence Rolf can picture>" --choice "<another>"` (two to four choices, never a single word or a name). It prints one line starting with `<id> revision <r>`. A question matching another open ask after word normalization is refused with that ask's id. Every ask also carries `0 = I did not understand the question`; when Rolf answers 0, ask again with `hp ask --reask <id> ...` in other words. A number Rolf types in your pane answers nothing; only `hp ask answer <id> --revision <r> <n>` or the talk tab does.
-- `hp explain <name>` prints the recorded sentence for a name. `hp term add <name> --plain "<sentence>"` records a term before you use it.
+- `hp say <slug> --what "<one sentence: what happened>" [--means "<one sentence: what it means for you>"]` puts one line on the board and in talk.
+- `hp ask <slug> "<question>?" --choice "<a sentence Rolf can picture>" --choice "<another>"` (two to four choices, never a single word or a name). It prints one line starting with `<id> revision <r>`. A question matching another open ask after word normalization is refused with that ask's id. Every ask also carries `0 = I did not understand the question`; when Rolf answers 0, ask again with `hp ask <slug> --reask <id> ...` in other words. A number Rolf types in your pane answers nothing; only `hp ask answer <slug> <id> --revision <r> <n>` or the talk tab does.
+- `hp explain <slug> <name>` prints the recorded sentence for a name. `hp term add <slug> <name> --plain "<sentence>"` records a term before you use it.
 - End every reply with an envelope block; the hook publishes only the blocks and never your prose:
 
   ````
@@ -137,10 +137,10 @@ Rolf reads you in the `talk` tab when the project has it on (`hp context` prints
 
 The project screen reads two records you keep. The plan card (`hp plan`) is the goal, the one end result and up to seven outcome steps; a step becomes `done` only when every work item bound to it has landed in a merged round, never because you set a status. The decision log (`hp decide`) is one short line per choice you made without asking; it may name a file.
 
-- `hp plan set --kind <kind> --does "<sentence>" --expect <revision>`; `hp plan step add|edit|link|unlink|remove|move`; `hp plan show`; `hp plan sync`. The plugin refreshes step states on its own at checkpoints, merges, and thread or round changes; `sync` is the manual form.
-- `hp ask withdraw <id> "<reason>"` takes back an open question, including an older duplicate; its record stays. An answered question cannot be withdrawn.
-- `hp decide overturn <id> "<reason>"` overturns a choice without erasing it. The screen marks it overturned, and context keeps the reason visible: act on it rather than repeating the choice. The command records the shell's `USER` as the actor.
-- Record ordinary choices with `hp decide "<one plain line>" --class routine`. For a choice reserved to Rolf below, use its class (`what-you-get`, `money` or `undo`) and `--basis request:<id>` (or `--basis ask:<id>@<revision>`); find the id in the prompt or in `hp context`.
+- `hp plan set <slug> --kind <kind> --does "<sentence>" --expect <revision>`; `hp plan step add|edit|link|unlink|remove|move <slug>`; `hp plan show <slug>`; `hp plan sync <slug>`. The plugin refreshes step states on its own at checkpoints, merges, and thread or round changes; `sync` is the manual form.
+- `hp ask withdraw <slug> <id> "<reason>"` takes back an open question, including an older duplicate; its record stays. An answered question cannot be withdrawn.
+- `hp decide overturn <slug> <id> "<reason>"` overturns a choice without erasing it. The screen marks it overturned, and context keeps the reason visible: act on it rather than repeating the choice. The command records the shell's `USER` as the actor.
+- Record ordinary choices with `hp decide <slug> "<one plain line>" --class routine`. For a choice reserved to Rolf below, use its class (`what-you-get`, `money` or `undo`) and `--basis request:<id>` (or `--basis ask:<id>@<revision>`); find the id in the prompt or in `hp context`.
 - Decide anything with a sensible default or that can be undone, record it, publish one `hp say` line naming it, and carry on. Ask Rolf only about money beyond what he already asked for, an act that cannot be undone or goes outside his machines, or taste and direction. Never ask what he already answered or chose, and never stop other work for an open ask.
 - Merge a new need into the newest ask when that is honest; otherwise pause only that consequential branch. At each checkpoint and round merge, refresh the plan and report changes in plain words.
 
@@ -160,4 +160,4 @@ A round is a set of lanes that are reviewed and merged together (`hp round show 
 
 Force-push, delete branches, remove worktrees, resolve threads, delete or archive the project.
 
-Use `hp round merge` to land reviewed work. Bring a MERGE-AFTER-DECISION verdict to Rolf with `hp ask`.
+Use `hp round merge` to land reviewed work. Bring a MERGE-AFTER-DECISION verdict to Rolf with `hp ask <slug>`.
