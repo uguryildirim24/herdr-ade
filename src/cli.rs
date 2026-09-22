@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::coordinator::{self, OpenOptions};
 use crate::paths::{self, Ctx, Env, SessionFlags};
@@ -42,6 +42,29 @@ impl From<SessionArgs> for SessionFlags {
             session: args.session,
             socket: args.socket,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DecisionClass {
+    WhatYouGet,
+    Money,
+    Undo,
+    Routine,
+}
+
+impl DecisionClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WhatYouGet => "what-you-get",
+            Self::Money => "money",
+            Self::Undo => "undo",
+            Self::Routine => "routine",
+        }
+    }
+
+    fn needs_basis(self) -> bool {
+        !matches!(self, Self::Routine)
     }
 }
 
@@ -313,10 +336,16 @@ enum Command {
         #[command(subcommand)]
         command: Option<DecideCommand>,
         line: Option<String>,
-        #[arg(long, value_name = "CLASS")]
-        class: Option<String>,
+        #[arg(
+            long,
+            value_name = "CLASS",
+            value_enum,
+            long_help = "Choice class:\n  what-you-get  A choice about taste, direction, or the result Rolf gets; requires --basis.\n  money         A choice to spend money; requires --basis.\n  undo          A choice that cannot be undone; requires --basis.\n  routine       An ordinary choice with a sensible default or one that can be undone; no --basis required."
+        )]
+        class: Option<DecisionClass>,
         #[arg(long, value_name = "KEY")]
         key: Option<String>,
+        /// Permission reference required by what-you-get, money, and undo
         #[arg(long, value_name = "REFERENCE")]
         basis: Option<String>,
         #[arg(long, value_name = "DECISION_ID")]
@@ -1366,15 +1395,37 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     (Some(line), None) => (None, Some(line)),
                     pair => pair,
                 };
+                let mut missing = Vec::new();
+                if line.is_none() {
+                    missing.push("a decision line");
+                }
+                match class {
+                    None => missing.push(
+                        "--class (choose what-you-get, money, undo, or routine)",
+                    ),
+                    Some(class) if class.needs_basis() && basis.is_none() => missing.push(
+                        "--basis <request:<id>|ask:<id>@<revision>> with the permission this choice rests on",
+                    ),
+                    Some(_) => {}
+                }
+                if replaces.is_some() && request.is_none() {
+                    missing.push("--request <REQUEST_ID> with --replaces");
+                }
+                if !missing.is_empty() {
+                    return Err(crate::refusal::error(format!(
+                        "decision_requirements: missing {}",
+                        missing.join("; ")
+                    )));
+                }
                 let slug = slug_of(slug)?;
-                let line = line.context("a decision line is required")?;
-                let class = class.context("a decision needs --class")?;
+                let line = line.expect("checked above");
+                let class = class.expect("checked above").as_str();
                 let d = decide::decide(
                     ctx,
                     &slug,
                     decide::NewDecision {
                         line: &line,
-                        class: &class,
+                        class,
                         key: key.as_deref(),
                         basis: basis.as_deref(),
                         replaces: replaces.as_deref(),
