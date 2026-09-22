@@ -1,8 +1,8 @@
 use std::process::Command;
 
 #[test]
-fn coordinator_cannot_select_a_role_recipe_or_model() {
-    for flag in ["--role", "--recipe", "--model"] {
+fn coordinator_cannot_select_a_role_or_model() {
+    for flag in ["--role", "--model"] {
         let output = Command::new(env!("CARGO_BIN_EXE_herdr-ade"))
             .args([
                 "thread",
@@ -24,6 +24,28 @@ fn coordinator_cannot_select_a_role_recipe_or_model() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn an_exact_recipe_requires_rolfs_quoted_words() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-ade"))
+        .args([
+            "thread",
+            "start",
+            "demo",
+            "--title",
+            "work",
+            "--task-file",
+            "brief.md",
+            "--recipe",
+            "chosen",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("--basis"), "{error}");
+    assert!(!error.contains("unexpected argument '--recipe'"), "{error}");
 }
 
 #[test]

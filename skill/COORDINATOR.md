@@ -55,17 +55,20 @@ Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is bl
 
 ### Recipe choice
 
-You do not pick a recipe on `thread start`. Write the full task with scope, constraints and gates. The editable `[routing]` table checks ordered rules against the workflow and optional task front matter, then uses its default. The launch record says which rule matched.
+You do not pick a model on your own. Write the full task with scope, constraints and gates. The editable `[routing]` table checks ordered rules against the workflow and optional task front matter, then uses its default. `hp context` lists every recipe and its exact route.
 
-- `thread start` refuses `--role`, `--recipe` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
+- `thread start` refuses `--role` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
 - Task front matter may say `product = "web-research"`, `product = "spec"`, or `capability = "<name>"`. The selected recipe must declare that capability. A coding task that reads a web page is still coding unless its product says otherwise.
+- When Rolf names the model for one lane, use his exact words: `hp thread start ... --job <job-NNNN> --recipe <id> --basis "<Rolf's words>"`. The task must cite that Rolf request. The harness records the choice and refuses an invented or unattached quote.
+- If no recipe fits, add one `[recipes.<id>]` row to `~/.config/herdr-ade/config.toml`. Its capabilities must be capabilities its `[adapters.<kind>]` row declares; capabilities are tool features, not a model choice. Then run `hp doctor`, `hp say`, and `hp decide` (class `money` when it costs more, with `--basis` quoting Rolf's words).
+- Pro lanes run only on the Mac. Start one in the background because it can take minutes: `herdr-pro start --name <n> --cwd <dir> &`. Send its question with `herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]`. Never type into a Pro pane.
 - `round advance` still starts the review. The reviewer gets a bounded task that names the committed review brief and every pinned commit range; large sources stay in the checkout for the reviewer to read.
 - A lane calls `ha failed "<failure and evidence>"` for failed work. The harness uses the routing rule's bounded retries and fallbacks. Provider and lost-connection failures retry only the same recipe; a gone process restarts; unknown evidence waits for you.
 - `thread retry` runs the same task as a new process under that typed recovery policy. Only Rolf may pin an exact task through `[routing.pins]`.
 
 ### Harness evolves
 
-Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file.
+Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, run `hp doctor`, publish one `hp say` line naming the change in plain words, and record one `hp decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file.
 
 When the harness is broken, the answer is a harness fix through a lane and a round, followed by `ha harness install`. Never take a manual path around it: do not hand-start an agent and bind it with `thread adopt` after a failed start, type into a pane to force a state the harness awaits, or hand-make repositories or files for one project. Never give another coordinator a workaround. Tell it which fix is coming and to wait for the install. Tell Rolf plainly what is blocked and which fix unblocks it. A lane may work on a harness repository even when `PROJECT.md` does not list it. The install updates both machines and their tickers, checks the running project screens, and records installation proof for the tasks in that build.
 

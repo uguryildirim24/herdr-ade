@@ -26,7 +26,7 @@ $EDITOR ~/.config/herdr-ade/config.toml
 herdr-ade doctor
 ```
 
-Add the starting routing table shown in [Task-based routing](operations.md#task-based-routing) to `config.toml`. It defaults to `pi_codex_sol_high`, routes coordinator, spec, web-research and Claude-required work with ordered rules, and allows one retry with no fallback. Executable recipes and machine placement live in the same file.
+Add the starting routing table shown in [Task-based routing](operations.md#task-based-routing) to `config.toml`. It defaults to `pi_codex_sol_high`, routes coordinator, spec, web-research and Claude-required work with ordered rules, and allows one retry with no fallback. Executable recipes and machine placement live in the same file. `herdr-ade context <project>` lists every recipe, what it is for, its capabilities and the exact command or rule that reaches it.
 
 If you use pi recipes, run `herdr-pi setup`, complete each required login with `herdr-pi login`, then run `herdr-pi doctor`. A login is local to that machine; do not copy its credential store to another machine.
 

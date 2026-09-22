@@ -1728,6 +1728,9 @@ fn start_reviewer(
         task,
         plain: record.plain.clone(),
         workflow: Some("reviewer".into()),
+        recipe: None,
+        recipe_basis: None,
+        task_id: String::new(),
     };
     if omitted_sources.is_empty() {
         crate::threads::start_during_advance(ctx, &project.slug, args)

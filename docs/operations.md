@@ -137,9 +137,11 @@ Machine facts live in `[machines.<name>]`: `target`, `session`, `home`, `root`, 
 
 ## Task-based routing
 
-`thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. `--workflow` selects instruction text and is available to routing rules. Optional task front matter may set `product = "code"`, `"spec"` or `"web-research"`, and `capability = "<name>"`. The selected recipe must declare that capability. The title and body do not select a recipe.
+`thread start --task-file <full brief>` has no `--role` or `--model`; those arguments are refused. `--workflow` selects instruction text and is available to routing rules. Optional task front matter may set `product = "code"`, `"spec"` or `"web-research"`, and `capability = "<name>"`. The selected recipe must declare that capability. The title and body do not select a recipe.
 
-Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table.
+Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table and flags an enabled recipe with neither a route nor a command. `context` prints one line per recipe with its plain use, capabilities and exact route; disabled recipes have no route.
+
+A coordinator still never chooses a model. When Rolf names one for a single lane, the task must cite his request and the start uses `--recipe <id> --basis "<Rolf's exact words>"`. The launch record, context and decision log keep the recipe, quote and request. A non-default exact choice is recorded as a money decision rather than guessing prices in core logic. Pro is command-only and Mac-only: run `herdr-pro start --name <n> --cwd <dir> &`, then `herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]`; never type into its pane.
 
 The starting table is:
 
@@ -171,7 +173,7 @@ recipe = "claude_fable_xhigh"
 
 A rule may override the global recovery policy with `retries = N` and `fallback = ["recipe-a", "recipe-b"]`. `ha failed "<failure and evidence>"` reports failed work by default: it retries up to that bound, then tries each fallback once in order. `--class provider --provider-kind <kind>` and `--class lost_connection` use only bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. When recovery is exhausted, no other recipe is guessed.
 
-Each launch record and dispatch-ledger row says `pin`, `default` or `rule[n]`, so the reason for selection stays inspectable. Historical launch, dispatch and round records may still contain removed fields; serde ignores those fields when loading them.
+Each launch record and dispatch-ledger row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. An explicit row also carries `recipe_basis` and `recipe_request`. Historical launch, dispatch and round records without those fields still load.
 
 ## Safety settings
 

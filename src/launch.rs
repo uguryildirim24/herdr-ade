@@ -146,6 +146,149 @@ pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Resul
     Ok(())
 }
 
+/// One compact context row per configured recipe. A normal enabled recipe is
+/// always reachable through Rolf's one-off choice; the Pro relay has its own
+/// command because it is not an ADE thread.
+pub fn context_recipe_lines(config: &LaunchConfig, prefix: &str, slug: &str) -> Vec<String> {
+    config
+        .recipes
+        .iter()
+        .map(|(id, recipe)| {
+            let capabilities = if recipe.capabilities.is_empty() {
+                "none".to_string()
+            } else {
+                recipe.capabilities.join(",")
+            };
+            if !recipe.enabled {
+                return format!(
+                    "- {id} [disabled] {} — capabilities={capabilities}",
+                    recipe.plain
+                );
+            }
+            let mut reach = Vec::new();
+            if config.routing.default == *id {
+                reach.push("default".to_string());
+            }
+            for (index, rule) in config.routing.rules.iter().enumerate() {
+                if rule.recipe != *id {
+                    continue;
+                }
+                let mut trigger = Vec::new();
+                if let Some(workflow) = &rule.workflow {
+                    trigger.push(format!("--workflow {workflow}"));
+                }
+                let mut front = Vec::new();
+                if let Some(product) = &rule.product {
+                    front.push(format!("product = \"{product}\""));
+                }
+                if let Some(capability) = &rule.capability {
+                    front.push(format!("capability = \"{capability}\""));
+                }
+                if !front.is_empty() {
+                    trigger.push(format!("brief front matter: {}", front.join(", ")));
+                }
+                reach.push(format!("rule[{index}] {}", trigger.join("; ")));
+            }
+            if recipe.provider == "pro" {
+                reach.push("command 1 (background): herdr-pro start --name <n> --cwd <dir> & | command 2 (after ready): herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]".into());
+            } else {
+                reach.push(format!(
+                    "{prefix} thread start {slug} --title <title> --plain \"<sentence>\" [--repo <path>] --task-file <file> --job <job-NNNN> --recipe {id} --basis \"<Rolf's words>\""
+                ));
+            }
+            format!(
+                "- {id} [enabled] {} — capabilities={capabilities}; reach: {}",
+                recipe.plain,
+                reach.join(" | ")
+            )
+        })
+        .collect()
+}
+
+/// Validate and record Rolf's one-off recipe choice before a lane is created.
+/// The quote must occur verbatim in a request attached to the stable task.
+pub fn authorize_explicit_recipe(
+    ctx: &Ctx,
+    project: &Project,
+    task_id: &str,
+    task_text: &str,
+    workflow: &str,
+    recipe_id: &str,
+    basis: &str,
+) -> Result<String> {
+    let quote = basis.trim();
+    if quote.is_empty() {
+        return Err(crate::refusal::error(
+            "recipe_basis_missing: --recipe requires --basis with Rolf's exact words",
+        ));
+    }
+    if task_id.is_empty() {
+        return Err(crate::refusal::error(
+            "recipe_task_missing: --recipe requires --job or a task created with --request",
+        ));
+    }
+    let task = crate::task::load(project, task_id)?;
+    let request = task
+        .authority
+        .iter()
+        .filter_map(|authority| authority.strip_prefix("request:"))
+        .find(|request| {
+            crate::talk::request_text(project, request).is_some_and(|words| words.contains(quote))
+        })
+        .with_context(
+            || "recipe_authority: --basis must quote Rolf's words from a request on this task",
+        )?;
+    let config = parse_launch_config(&ctx.config_dir)?;
+    validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
+    let recipe = config
+        .recipes
+        .get(recipe_id)
+        .with_context(|| format!("routing_recipe_unknown: {recipe_id}"))?;
+    if !recipe.enabled {
+        bail!("routing_recipe_disabled: {recipe_id}");
+    }
+    if recipe.provider == "pro" {
+        return Err(crate::refusal::error(
+            "recipe_command_only: Pro lanes use `herdr-pro start` and `herdr-pro turn` on the Mac",
+        ));
+    }
+    let work = work_contract(task_text, workflow)?;
+    if let Some(capability) = &work.capability
+        && !recipe.capabilities.contains(capability)
+    {
+        bail!("routing_capability_missing: recipe `{recipe_id}` does not declare `{capability}`");
+    }
+    let line = format!(
+        "Rolf chose {} for one lane.",
+        recipe.plain.trim_end_matches('.')
+    );
+    let class = if recipe_id == config.routing.default {
+        "routine"
+    } else {
+        // An exact non-default model can cost more than the ordinary route.
+        // Treat the choice as money rather than guessing model prices in core.
+        "money"
+    };
+    let authority = format!("request:{request}");
+    let key = format!(
+        "one-off-recipe:{task_id}:{recipe_id}:{}",
+        crate::thread::sha256_hex(quote.as_bytes())
+    );
+    crate::decide::decide(
+        ctx,
+        &project.slug,
+        crate::decide::NewDecision {
+            line: &line,
+            class,
+            key: Some(&key),
+            basis: Some(&authority),
+            replaces: None,
+            request: None,
+        },
+    )?;
+    Ok(authority)
+}
+
 /// Optional task front matter describes the deliverable or a hard runtime
 /// requirement, not a model preference. URLs in the body never trigger a rule.
 #[derive(Debug, Default, Deserialize)]
@@ -184,6 +327,12 @@ pub struct ResolveInput<'a> {
     pub task: &'a str,
     /// Selects skill text and an ordered routing rule.
     pub workflow: &'a str,
+    /// One recipe Rolf named for this lane. Ordinary starts leave this empty.
+    pub recipe: Option<&'a str>,
+    /// Rolf's verbatim words and their task-bound request, validated before
+    /// dispatch and persisted on the launch record.
+    pub recipe_basis: Option<&'a str>,
+    pub recipe_request: Option<&'a str>,
     pub previous: Option<&'a Launch>,
     pub failure: Option<&'a str>,
     /// Evidence omitted by an upstream task builder, already disclosed in the
@@ -219,6 +368,26 @@ pub fn resolve_failure(
         FailureClass::Unknown => Err(crate::refusal::error(
             "recovery_unknown: waiting for the coordinator",
         )),
+        FailureClass::WorkFailed if previous.routing_rule == "explicit" => {
+            let config = parse_launch_config(&ctx.config_dir)?;
+            validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
+            let recovery = previous.escalations.saturating_add(1);
+            if recovery > config.routing.retries {
+                return Err(crate::refusal::error(format!(
+                    "recovery_exhausted: Rolf's one-off recipe allowed {} retries; waiting for the coordinator",
+                    config.routing.retries
+                )));
+            }
+            let mut same = previous.clone();
+            same.escalations = recovery;
+            ledger(
+                project,
+                json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
+                    "explicit_retry":recovery, "failure":input.failure,
+                    "policy_hash":config.policy_hash}),
+            )?;
+            Ok(same)
+        }
         FailureClass::WorkFailed => resolve_launch(ctx, project, input),
         FailureClass::Provider | FailureClass::LostConnection | FailureClass::ProcessGone => {
             let config = parse_launch_config(&ctx.config_dir)?;
@@ -263,11 +432,41 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     {
         bail!("recovery_failure_missing");
     }
-    let selected = config.routing.select(&hash, &work, recovery)?;
+    let selected = match input.recipe {
+        Some(recipe) => {
+            if input.previous.is_some() {
+                bail!(
+                    "recipe_override_recovery: a one-off recipe is chosen only when the lane starts"
+                );
+            }
+            if input
+                .recipe_basis
+                .is_none_or(|basis| basis.trim().is_empty())
+                || input
+                    .recipe_request
+                    .is_none_or(|request| !request.starts_with("request:"))
+            {
+                bail!(
+                    "recipe_authority_missing: a one-off recipe needs Rolf's quoted words and task request"
+                );
+            }
+            crate::routing::Selection {
+                recipe: recipe.to_string(),
+                rule: "explicit".into(),
+                pinned: true,
+            }
+        }
+        None => config.routing.select(&hash, &work, recovery)?,
+    };
     let recipe = config
         .recipes
         .get(&selected.recipe)
         .context("routing_recipe_unknown")?;
+    if recipe.provider == "pro" {
+        bail!(
+            "recipe_command_only: Pro lanes use `herdr-pro start` and `herdr-pro turn` on the Mac"
+        );
+    }
     if let Some(capability) = &work.capability
         && !recipe.capabilities.contains(capability)
     {
@@ -286,7 +485,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         project,
         json!({"kind": if recovery > 0 { "recovery" } else { "pick" },
         "brief_hash": hash, "recipe": selected.recipe, "rule": selected.rule,
-        "workflow": input.workflow,
+        "workflow": input.workflow, "basis": input.recipe_basis,
+        "request": input.recipe_request,
         "previous": input.previous.map(|previous| json!({"recipe":previous.recipe_id,"attempt":previous.attempt})),
         "failure": input.failure, "recovery": recovery,
         "source_truncation": input.source_truncation,
@@ -308,6 +508,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         recipe_id: selected.recipe,
         escalations: recovery,
         routing_rule: selected.rule,
+        recipe_basis: input.recipe_basis.unwrap_or_default().to_string(),
+        recipe_request: input.recipe_request.unwrap_or_default().to_string(),
         reason: if selected.pinned {
             pinned_reason(input.workflow, &recipe.plain)
         } else {
@@ -352,7 +554,8 @@ pub struct DoctorRow {
 }
 pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
     let config = parse_launch_config(&ctx.config_dir)?;
-    let valid = validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?);
+    let valid = validate_recipe_reachability(&config)
+        .and_then(|_| validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?));
     Ok(vec![DoctorRow {
         ok: Some(valid.is_ok()),
         label: "recipes and routing".into(),
@@ -361,11 +564,32 @@ pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
             .map(|error| format!("{error:#}"))
             .unwrap_or_else(|| {
                 format!(
-                    "{} recipes; editable routing table is valid",
+                    "{} recipes; editable routing table and recipe commands are valid",
                     config.recipes.len()
                 )
             }),
     }])
+}
+
+fn validate_recipe_reachability(config: &LaunchConfig) -> Result<()> {
+    for (id, recipe) in config.recipes.iter().filter(|(_, recipe)| recipe.enabled) {
+        let routed = config.routing.default == *id
+            || config.routing.rules.iter().any(|rule| rule.recipe == *id);
+        // Every declared adapter can be reached by Rolf's guarded one-off
+        // `thread start --recipe` command. Pro is the one command-only recipe:
+        // its provider declaration is the structural link doctor can verify.
+        let commanded = if recipe.provider == "pro" {
+            true
+        } else {
+            config.adapters.contains_key(&recipe.kind)
+        };
+        if !routed && !commanded {
+            bail!(
+                "recipe_unreachable: enabled recipe `{id}` has no default or rule and no command can reach it"
+            );
+        }
+    }
+    Ok(())
 }
 /// The kinds `herdr agent start` accepts, read from its `--help`.
 pub fn agent_kinds(env: &Env, runner: &dyn Runner) -> Result<BTreeSet<String>> {
@@ -450,6 +674,183 @@ pub fn compact_reason(role: &str, plain: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_names_every_recipe_and_each_exact_path() {
+        let ordinary = Recipe {
+            kind: "pi".into(),
+            plain: "the quick helper".into(),
+            capabilities: vec!["pictures".into()],
+            ..Recipe::default()
+        };
+        let disabled = Recipe {
+            enabled: false,
+            plain: "the sleeping helper".into(),
+            ..ordinary.clone()
+        };
+        let pro = Recipe {
+            provider: "pro".into(),
+            plain: "the paid helper".into(),
+            ..ordinary.clone()
+        };
+        let config = LaunchConfig {
+            recipes: BTreeMap::from([
+                ("ordinary".into(), ordinary),
+                ("paid".into(), pro),
+                ("sleeping".into(), disabled),
+            ]),
+            adapters: BTreeMap::new(),
+            dispatch: DispatchConfig::default(),
+            routing: crate::routing::Routing {
+                default: "ordinary".into(),
+                rules: vec![crate::routing::Rule {
+                    product: Some("web-research".into()),
+                    capability: Some("pictures".into()),
+                    recipe: "ordinary".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            doctor: DoctorConfig::default(),
+            policy_hash: String::new(),
+        };
+        validate_recipe_reachability(&config).unwrap();
+        let lines = context_recipe_lines(&config, "ha --root /r", "demo");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("capabilities=pictures"), "{:?}", lines);
+        assert!(lines[0].contains("reach: default"), "{:?}", lines);
+        assert!(
+            lines[0].contains(
+                "brief front matter: product = \"web-research\", capability = \"pictures\""
+            ),
+            "{:?}",
+            lines
+        );
+        assert!(
+            lines[0].contains("--recipe ordinary --basis \"<Rolf's words>\""),
+            "{:?}",
+            lines
+        );
+        assert!(lines[1].contains("herdr-pro start"), "{:?}", lines);
+        assert!(lines[2].contains("[disabled]"), "{:?}", lines);
+        assert!(!lines[2].contains("reach:"), "{:?}", lines);
+    }
+
+    #[test]
+    fn one_off_recipe_needs_and_records_words_from_the_tasks_request() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let config_dir = home.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r#"[routing]
+default = "usual"
+
+[recipes.usual]
+kind = "claude"
+args = ["--dangerously-skip-permissions"]
+plain = "the quick helper"
+
+[recipes.named]
+kind = "claude"
+args = ["--dangerously-skip-permissions"]
+plain = "the careful helper"
+"#,
+        )
+        .unwrap();
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let words = "start the careful helper at the same time";
+        let request = crate::talk::record_pane_request(&project, words).unwrap();
+        let task = crate::task::add(
+            &project,
+            "Try both helpers",
+            vec![format!("request:{request}")],
+            vec!["The helper starts.".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            crate::runner::fake::ok("[possible values: pi, claude, cursor, agy]"),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let authority = authorize_explicit_recipe(
+            &ctx,
+            &project,
+            &task.id,
+            "Do the work.",
+            "lane",
+            "named",
+            words,
+        )
+        .unwrap();
+        assert_eq!(authority, format!("request:{request}"));
+        let decision = crate::decide::current(&project).pop().unwrap();
+        assert_eq!(decision.class, "money");
+        assert_eq!(decision.basis.as_deref(), Some(authority.as_str()));
+        let launch = resolve_launch(
+            &ctx,
+            &project,
+            &ResolveInput {
+                task: "Do the work.",
+                workflow: "lane",
+                recipe: Some("named"),
+                recipe_basis: Some(words),
+                recipe_request: Some(&authority),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(launch.recipe_id, "named");
+        assert_eq!(launch.routing_rule, "explicit");
+        assert_eq!(launch.recipe_basis, words);
+        assert_eq!(launch.recipe_request, authority);
+        let error = authorize_explicit_recipe(
+            &ctx,
+            &project,
+            &task.id,
+            "Do the work.",
+            "lane",
+            "named",
+            "words Rolf did not use",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("recipe_authority"), "{error}");
+    }
+
+    #[test]
+    fn doctor_rejects_an_enabled_recipe_with_neither_route_nor_command() {
+        let config = LaunchConfig {
+            recipes: BTreeMap::from([(
+                "orphan".into(),
+                Recipe {
+                    kind: "undeclared".into(),
+                    enabled: true,
+                    ..Recipe::default()
+                },
+            )]),
+            adapters: BTreeMap::new(),
+            dispatch: DispatchConfig::default(),
+            routing: crate::routing::Routing::default(),
+            doctor: DoctorConfig::default(),
+            policy_hash: String::new(),
+        };
+        let error = validate_recipe_reachability(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recipe_unreachable"), "{error}");
+    }
 
     #[test]
     fn removed_claude_matcher_names_the_exact_config_replacement() {

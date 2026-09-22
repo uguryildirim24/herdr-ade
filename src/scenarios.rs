@@ -1151,6 +1151,9 @@ fn thread_start_is_refused_when_paused() {
         task: "t".into(),
         plain: "The lane does the work.".into(),
         workflow: None,
+        recipe: None,
+        recipe_basis: None,
+        task_id: String::new(),
     };
     let error = threads::start(&world.ctx(), "demo", args)
         .unwrap_err()
@@ -2153,6 +2156,9 @@ fn a_remote_thread_without_a_repo_is_refused() {
         task: "t".into(),
         plain: "The lane does the work.".into(),
         workflow: None,
+        recipe: None,
+        recipe_basis: None,
+        task_id: String::new(),
     };
     assert!(
         threads::start(&world.ctx(), "demo", args)
@@ -2267,6 +2273,7 @@ fn provider_retries_do_not_consume_failed_work_retries_or_choose_a_fallback() {
         previous,
         failure,
         source_truncation: None,
+        ..Default::default()
     };
     let first = crate::launch::resolve_launch(&world.ctx(), &project, &input(None, None)).unwrap();
     let provider = crate::launch::resolve_failure(
