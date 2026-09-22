@@ -613,23 +613,29 @@ fn classify(completion: &Completion) -> Outcome {
         .events
         .iter()
         .filter(|event| task_complete(event).is_none());
-    let route_stopped = completion.answer.trim() == "Stopped thinking"
-        || non_result_events.clone().any(|event| {
-            value_contains(event, "rate_limit_exceeded")
-                || value_contains(event, "Stopped thinking")
-        });
-    if route_stopped {
-        return Outcome::Cooldown("the route reported a rate limit or stopped thinking".into());
-    }
     if non_result_events
         .clone()
         .any(|event| value_contains(event, "chatgpt_session_expired"))
     {
         return Outcome::ProviderFailed("login: the ChatGPT session expired".into());
     }
-    let has_error = completion.events.iter().any(error_event);
-    if has_error {
-        return Outcome::ProviderFailed("the turn contained an error or stream_error event".into());
+    if non_result_events
+        .clone()
+        .any(|event| value_contains(event, "rate_limit_exceeded"))
+    {
+        return Outcome::Cooldown("the route reported a rate limit".into());
+    }
+    if let Some(reason) = non_result_events.clone().find_map(error_reason) {
+        return Outcome::ProviderFailed(reason);
+    }
+    if let Some(reason) = non_result_events
+        .clone()
+        .find_map(|event| value_text_containing(event, "Stopped thinking"))
+    {
+        return Outcome::ProviderFailed(reason.to_string());
+    }
+    if completion.answer.trim() == "Stopped thinking" {
+        return Outcome::ProviderFailed(completion.answer.trim().to_string());
     }
     if !completion.answer.trim().is_empty() {
         return Outcome::Delivered(completion.answer.clone());
@@ -646,6 +652,19 @@ fn value_contains(value: &Value, needle: &str) -> bool {
     }
 }
 
+fn value_text_containing<'a>(value: &'a Value, needle: &str) -> Option<&'a str> {
+    match value {
+        Value::String(text) => text.contains(needle).then_some(text),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| value_text_containing(value, needle)),
+        Value::Object(values) => values
+            .values()
+            .find_map(|value| value_text_containing(value, needle)),
+        _ => None,
+    }
+}
+
 fn error_event(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
@@ -654,6 +673,35 @@ fn error_event(event: &Value) -> bool {
         event.pointer("/payload/type").and_then(Value::as_str),
         Some("error" | "stream_error" | "response.failed")
     )
+}
+
+/// The provider's own line from an error event, rather than a reconstructed
+/// description of the event. Codex has emitted both top-level and payload
+/// forms across rollout versions.
+fn error_reason(event: &Value) -> Option<String> {
+    if !error_event(event) {
+        return None;
+    }
+    [
+        "/message",
+        "/payload/message",
+        "/error/message",
+        "/payload/error/message",
+        "/response/error/message",
+        "/payload/response/error/message",
+    ]
+    .into_iter()
+    .find_map(|pointer| event.pointer(pointer).and_then(Value::as_str))
+    .filter(|message| !message.trim().is_empty())
+    .map(str::to_string)
+    .or_else(|| {
+        ["/error", "/payload/error"]
+            .into_iter()
+            .find_map(|pointer| event.pointer(pointer).and_then(Value::as_str))
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_string)
+    })
+    .or_else(|| Some("the turn contained an error or stream_error event".into()))
 }
 
 /// The turn's result from the rollout.
@@ -736,6 +784,7 @@ fn wait_for_completion(reader: &mut RolloutReader, timeout: Duration) -> Result<
     let mut turn_id: Option<String> = None;
     let mut events: Vec<Value> = Vec::new();
     loop {
+        let mut completed: Option<(String, String)> = None;
         for event in reader.new_events()? {
             if turn_id.is_none() {
                 if let Some(id) = task_started_id(&event) {
@@ -744,15 +793,21 @@ fn wait_for_completion(reader: &mut RolloutReader, timeout: Duration) -> Result<
                 continue;
             }
             events.push(event.clone());
-            if let Some((id, answer)) = task_complete(&event)
+            if completed.is_none()
+                && let Some((id, answer)) = task_complete(&event)
                 && Some(&id) == turn_id.as_ref()
             {
-                return Ok(Completion {
-                    turn_id: id,
-                    answer,
-                    events,
-                });
+                completed = Some((id, answer));
             }
+        }
+        // Codex can flush a stream_error immediately after task_complete in
+        // the same rollout write. Process the whole batch before classifying.
+        if let Some((id, answer)) = completed {
+            return Ok(Completion {
+                turn_id: id,
+                answer,
+                events,
+            });
         }
         if Instant::now() >= deadline {
             bail!("no task_complete within {}s", timeout.as_secs());
@@ -998,15 +1053,66 @@ mod tests {
             events: vec![],
         };
         assert!(matches!(classify(&empty), Outcome::Unknown(_)));
+    }
 
-        let stopped = Completion {
-            turn_id: "t".into(),
-            answer: String::new(),
-            events: vec![
-                json!({"type":"stream_error","message":"stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"}),
-            ],
-        };
-        assert!(matches!(classify(&stopped), Outcome::Cooldown(_)));
+    fn completion_from_fixture(contents: &str) -> Completion {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, contents).unwrap();
+        let mut reader = RolloutReader::at_start(path);
+        wait_for_completion(&mut reader, Duration::from_secs(1)).unwrap()
+    }
+
+    #[test]
+    fn stopped_thinking_fixture_keeps_the_provider_error_line() {
+        let completion = completion_from_fixture(include_str!(
+            "../../tests/fixtures/pro/stopped-thinking.jsonl"
+        ));
+        assert_eq!(
+            classify(&completion),
+            Outcome::ProviderFailed(
+                "stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn displayed_error_fixture_keeps_the_provider_error_line() {
+        let completion = completion_from_fixture(include_str!(
+            "../../tests/fixtures/pro/displayed-error.jsonl"
+        ));
+        let reason = "stream disconnected before completion: ChatGPT displayed an error for this response. ChatGPT remained unavailable after several attempts";
+        assert_eq!(
+            classify(&completion),
+            Outcome::ProviderFailed(reason.into())
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pro"));
+        layout.ensure().unwrap();
+        write_ready_lane(dir.path(), &layout);
+        let mut record = turn("in_flight");
+        record.write(&layout).unwrap();
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+
+        finish_failed(
+            &env,
+            &layout,
+            &runner,
+            &mut record,
+            "provider",
+            reason,
+            true,
+        )
+        .unwrap();
+
+        let stored = Turn::read(&layout, "pro-01").unwrap();
+        assert_eq!(stored.failure_class.as_deref(), Some("provider"));
+        let expected_detail = format!("provider: {reason}");
+        assert_eq!(stored.detail.as_deref(), Some(expected_detail.as_str()));
     }
 
     #[test]
