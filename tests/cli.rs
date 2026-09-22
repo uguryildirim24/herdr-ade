@@ -303,7 +303,7 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
             .output()
             .unwrap()
     };
-    let out = ledger(&["list", "--json"]);
+    let out = ledger(&["list", "demo", "--json"]);
     assert!(
         out.status.success(),
         "{}",
@@ -315,14 +315,14 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
     assert_eq!(entries[0]["count"], 2);
     assert_eq!(entries[0]["kind"], "command-failed");
     let id = entries[0]["id"].as_str().unwrap();
-    let shown = ledger(&["show", id, "--json"]);
+    let shown = ledger(&["show", "demo", id, "--json"]);
     assert!(shown.status.success());
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(shown["outcome"], "shown");
     assert_eq!(shown["data"]["record"]["id"], id);
     assert_eq!(shown["data"]["record"]["count"], 2);
 
-    let out = ledger(&["task", id]);
+    let out = ledger(&["task", "demo", id]);
     assert!(out.status.success());
     let task = String::from_utf8(out.stdout).unwrap();
     assert!(task.starts_with("# Fix an observed harness failure:"));
@@ -335,7 +335,7 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
     ] {
         assert!(task.contains(text), "{task}");
     }
-    let closed = ledger(&["done", id, "--json"]);
+    let closed = ledger(&["done", "demo", id, "--json"]);
     assert!(closed.status.success());
     let closed: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
     assert_eq!(closed["outcome"], "closed");
@@ -344,10 +344,11 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
     assert_eq!(closed["data"]["changed"], true);
     assert_eq!(closed["message"], format!("{id} closed\n"));
 
-    let shown: serde_json::Value = serde_json::from_slice(&ledger(&["show", id]).stdout).unwrap();
+    let shown: serde_json::Value =
+        serde_json::from_slice(&ledger(&["show", "demo", id]).stdout).unwrap();
     assert_eq!(shown["closed"], true);
     let listed: serde_json::Value =
-        serde_json::from_slice(&ledger(&["list", "--json"]).stdout).unwrap();
+        serde_json::from_slice(&ledger(&["list", "demo", "--json"]).stdout).unwrap();
     let open = listed["data"]["result"].as_array().unwrap();
     assert!(open.iter().all(|entry| entry["id"] != id));
 }

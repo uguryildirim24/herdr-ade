@@ -376,7 +376,6 @@ mod tests {
             vec!["request:q-1".into()],
             vec!["The command reports the new result.".into()],
             None,
-            None,
             Some(new.id.clone()),
         )
         .unwrap();
