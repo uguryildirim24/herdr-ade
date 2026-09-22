@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0283.md",
+      "tasks/review-r108.md",
+      "tasks/t-0282.md",
+      "tasks/t-0281.md",
       "tasks/t-0280.md",
       "tasks/review-r107.md",
       "tasks/t-0279.md",
@@ -18,17 +22,14 @@
       "tasks/review-r106.md",
       "tasks/t-0277.md",
       "tasks/t-0276.md",
-      "tasks/t-0275.md",
-      "tasks/t-0274.md",
-      "tasks/review-r105.md",
-      "tasks/t-0273.md",
-      "tasks/t-0272.md"
+      "tasks/t-0275.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r108.md",
       "tasks/reviews/code-r107.md",
       "tasks/reviews/code-r106.md",
       "tasks/reviews/code-r105.md",
@@ -39,15 +40,18 @@
       "tasks/reviews/code-r98.md",
       "tasks/reviews/code-r99.md",
       "tasks/reviews/code-r97.md",
-      "tasks/reviews/code-r96.md",
-      "tasks/reviews/code-r92.md"
+      "tasks/reviews/code-r96.md"
     ]
   },
-  "generated": "2026-09-22T09:49:24-04:00",
+  "generated": "2026-09-22T11:23:45-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0280-review-r107-one-goal-a-newer-choice-repl",
+      "hp/adeherdr/t-0283-review-r108-only-rolf-s-own-messages-cou",
       "main",
+      "review/r108",
+      "hp/adeherdr/t-0282-w35-what-to-simplify-or-cut",
+      "hp/adeherdr/t-0281-w34-only-rolf-s-messages-are-his",
+      "hp/adeherdr/t-0280-review-r107-one-goal-a-newer-choice-repl",
       "review/r107",
       "hp/adeherdr/t-0279-w33-withdraw-one-condition",
       "hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
@@ -448,29 +452,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "6d1a972 review(r107): verdict",
-      "564d3d8 review(tasks): keep withdrawal and verification mutually exclusive",
-      "02ccb83 Merge commit '6ffad5b0e0f6b5da568dfcd17816f7e14bcbcecb' into hp/adeherdr/t-0280-review-r107-one-goal-a-newer-choice-repl",
-      "f002a67 docs(tasks): t-0280",
-      "baf70e7 review(r107): brief for revision 1",
-      "6ffad5b feat(tasks): withdraw replaced acceptance conditions"
+      "826f7ea docs(review): round r108 verdict",
+      "9b8f1aa review(talk): cover unmarked automated prompts",
+      "c887198 Merge commit '660cc11f66acf0aa5fba62f74110363255411420' into review/r108",
+      "a39fe0e docs(tasks): t-0283",
+      "936b42c review(r108): brief for revision 1",
+      "87e4929 docs(tasks): t-0282"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "6d1a972",
+        "head": "826f7ea",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(r107): verdict"
+        "subject": "docs(review): round r108 verdict"
       },
       {
-        "branch": "review/r107",
+        "branch": "review/r108",
         "dirty": 0,
-        "head": "f002a67",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r107",
-        "subject": "docs(tasks): t-0280"
+        "head": "a39fe0e",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r108",
+        "subject": "docs(tasks): t-0283"
       }
     ]
   },
@@ -478,7 +482,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "working",
+      "status": "done",
       "workspace_id": "w1H"
     },
     {
@@ -490,8 +494,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r107",
-    "verdict": "6d1a97260e3e9396066f893e667ff996603eaa7b"
+    "round": "r108",
+    "verdict": "826f7ea4431b1f6bf9e60cfd8bb0a9b5688409a9"
   },
   "session": "default",
   "unlinked_agents": [],
