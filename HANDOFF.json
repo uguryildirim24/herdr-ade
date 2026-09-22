@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
-      "tasks/t-0192.md",
+      "tasks/t-0196.md",
+      "tasks/t-0193.md",
+      "tasks/t-0198.md",
+      "tasks/review-r82.md",
       "tasks/review-r81.md",
+      "tasks/t-0195.md",
+      "tasks/t-0194.md",
+      "tasks/t-0192.md",
       "tasks/review-r80.md",
       "tasks/t-0191.md",
       "tasks/t-0189.md",
-      "tasks/review-r79.md",
-      "tasks/t-0190.md",
-      "tasks/t-0188.md",
-      "tasks/review-r78.md",
-      "tasks/t-0187.md",
-      "tasks/t-0185.md",
-      "tasks/t-0186.md"
+      "tasks/review-r79.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r81.md",
       "tasks/reviews/code-r80.md",
       "tasks/reviews/code-r79.md",
       "tasks/reviews/code-r78.md",
@@ -39,16 +40,22 @@
       "tasks/reviews/code-r73.md",
       "tasks/reviews/code-r72.md",
       "tasks/reviews/code-r71.md",
-      "tasks/reviews/code-r70.md",
-      "tasks/reviews/code-r69.md"
+      "tasks/reviews/code-r70.md"
     ]
   },
-  "generated": "2026-09-21T19:24:08-04:00",
+  "generated": "2026-09-21T20:11:42-04:00",
   "git": {
     "branches": [
       "main",
-      "hp/adeherdr/t-0192-review-r80-installing-and-checking-the-h",
+      "hp/adeherdr/t-0198-w7-pro-start-on-current-codex",
+      "hp/adeherdr/t-0195-w6-git-for-no-repo-lanes",
+      "hp/adeherdr/t-0196-review-r81-a-new-kind-of-helper-plugs-in",
+      "hp/adeherdr/t-0197-review-r82-projects-can-run-any-number-o",
+      "review/r82",
+      "review/r81-2",
+      "hp/adeherdr/t-0194-w5-remove-thread-cap",
       "hp/adeherdr/t-0193-review-r81-a-new-kind-of-helper-plugs-in",
+      "hp/adeherdr/t-0192-review-r80-installing-and-checking-the-h",
       "review/r81",
       "hp/adeherdr/t-0187-d6-adapters",
       "review/r80",
@@ -310,29 +317,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "a93aaad Merge commit 'f4f3c7a513a741e27c40fe0e4bb4d25f7f0b4ff1'",
-      "f4f3c7a docs(review): round r80 verdict",
-      "f042697 review(harness): make install evidence fail closed",
-      "7cdd855 review(r81): brief for revision 1",
-      "f4a5430 merge: admit t-0190 into r80",
-      "2f35ee2 docs(tasks): t-0192"
+      "41ba4b5 Merge commit 'f10a56605b7484b340a6bb42662dd598046a1d1f'",
+      "41b40ea docs(tasks): t-0198",
+      "f10a566 review(r81): approve repaired candidate",
+      "e3a9380 review(r81): merge earlier reviewed candidate",
+      "25f97dc review(r82): brief for revision 1",
+      "2070d5c docs(tasks): t-0196"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "13 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "a93aaad",
+        "head": "41ba4b5",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'f4f3c7a513a741e27c40fe0e4bb4d25f7f0b4ff1'"
-      },
-      {
-        "branch": "review/r80",
-        "dirty": 0,
-        "head": "2f35ee2",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r80",
-        "subject": "docs(tasks): t-0192"
+        "subject": "Merge commit 'f10a56605b7484b340a6bb42662dd598046a1d1f'"
       },
       {
         "branch": "review/r81",
@@ -340,6 +340,20 @@
         "head": "c50c4ea",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r81",
         "subject": "docs(tasks): t-0193"
+      },
+      {
+        "branch": "review/r81-2",
+        "dirty": 0,
+        "head": "2070d5c",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r81-2",
+        "subject": "docs(tasks): t-0196"
+      },
+      {
+        "branch": "review/r82",
+        "dirty": 0,
+        "head": "8ba36e1",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r82",
+        "subject": "docs(tasks): t-0197"
       }
     ]
   },
@@ -347,25 +361,20 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "done",
+      "status": "working",
       "workspace_id": "w1H"
     },
     {
-      "label": "flyonenomics",
-      "status": "unknown",
-      "workspace_id": "w1M"
-    },
-    {
       "label": "PRL-8-53",
-      "status": "idle",
+      "status": "working",
       "workspace_id": "w1N"
     }
   ],
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r80",
-    "verdict": "f4f3c7a513a741e27c40fe0e4bb4d25f7f0b4ff1"
+    "round": "r81",
+    "verdict": "f10a56605b7484b340a6bb42662dd598046a1d1f"
   },
   "session": "default",
   "unlinked_agents": [],
