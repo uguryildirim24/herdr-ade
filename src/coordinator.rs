@@ -481,8 +481,8 @@ fn digest_snapshot(
                 .unwrap_or(20);
             let _ = writeln!(
                 out,
-                "Settings: auto_resolve_days={} nudge={} idle_nudge_minutes={}",
-                settings.auto_resolve_days, settings.nudge, idle_nudge_minutes
+                "Settings: nudge={} idle_nudge_minutes={}",
+                settings.nudge, idle_nudge_minutes
             );
             if settings.repos.is_empty() {
                 let _ = writeln!(out, "Repos: (none)");

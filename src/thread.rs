@@ -100,9 +100,13 @@ pub(crate) struct Thread {
     /// Why recovery deliberately stopped this thread. Empty on historical and
     /// normally resolved records.
     pub(crate) cancellation_reason: String,
-    /// Cleanup still owes a pane/tab close because its session was unreachable.
-    /// A repeated `thread cancel` retries it instead of claiming it was done.
+    /// Cleanup still owes the same final-copy, pane/tab, and folder work that
+    /// `thread resolve` performs. The ticker retries it instead of making a
+    /// landed round wait on an external session.
     pub(crate) cleanup_pending: bool,
+    /// The resolved reason to record after automatic cleanup succeeds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) cleanup_reason: String,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub(crate) role: String,
     pub(crate) launch: crate::contracts::Launch,

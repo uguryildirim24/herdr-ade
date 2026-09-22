@@ -1484,6 +1484,7 @@ fn retry_with_ticker(
         t.error.clear();
         t.last_failure = reason.to_string();
         t.cleanup_pending = false;
+        t.cleanup_reason.clear();
         t.escalation_pending = true;
         Ok(())
     })?;
@@ -1615,6 +1616,7 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
         t.prompt_pending = false;
         t.error.clear();
         t.cleanup_pending = false;
+        t.cleanup_reason.clear();
         thread::bind_identity(t, &socket, agent, process.clone());
         Ok(())
     })?;
@@ -1662,6 +1664,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         t.cancellation_reason = recorded_reason.clone();
         t.prompt_pending = false;
         t.cleanup_pending = !t.tab_id.is_empty();
+        t.cleanup_reason = "cancelled".into();
     })?;
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &record);
@@ -1677,7 +1680,10 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         }
     };
     if close_error.is_none() {
-        thread::update(&project, id, |t| t.cleanup_pending = false)?;
+        thread::update(&project, id, |t| {
+            t.cleanup_pending = false;
+            t.cleanup_reason.clear();
+        })?;
     }
 
     let mut worktree = "not_applicable".to_string();
@@ -1736,21 +1742,101 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     })
 }
 
-/// Retry cleanup which a prior cancellation durably left pending. The ticker
-/// calls this only after it has reached the project session again.
+/// Resolve through the same path as `thread resolve`, but make external
+/// cleanup failure durable instead of failing the operation which ended the
+/// round. The ticker can then retry the whole final-copy and cleanup path.
+pub(crate) fn resolve_automatically(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    reason: &str,
+) -> ResolveOutcome {
+    // Record the terminal lifecycle before touching Herdr or a worktree. A
+    // process death at any later instruction leaves a ticker-visible retry.
+    let _ = thread::update(project, id, |t| {
+        t.status = Status::Resolved;
+        t.resolved_reason = "cleanup pending".into();
+        t.prompt_pending = false;
+        t.cleanup_pending = true;
+        t.cleanup_reason = reason.to_string();
+    });
+    let attempted = resolve(ctx, &project.slug, id, &ResolveArgs::default());
+    match attempted {
+        Ok(outcome) => {
+            let _ = thread::update(project, id, |t| {
+                t.resolved_reason = reason.to_string();
+                t.cleanup_pending = false;
+                t.cleanup_reason.clear();
+            });
+            outcome
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let before = thread::load(project, id).unwrap_or_default();
+            refresh_plan(ctx, project);
+            ResolveOutcome {
+                thread: id.to_string(),
+                state: "cleanup_pending".into(),
+                final_copy: "pending".into(),
+                copy_notes: vec![detail.clone()],
+                pane: "cleanup_pending".into(),
+                worktree: if before.worktree_path.is_empty() {
+                    "not_recorded"
+                } else {
+                    "kept"
+                }
+                .into(),
+                worktree_path: before.worktree_path,
+                worktree_reason: Some(detail),
+                branch: before.branch,
+            }
+        }
+    }
+}
+
+/// Retry every durable cleanup left by cancellation or automatic resolution.
 pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> {
     for record in thread::list(project)
         .into_iter()
         .filter(|record| record.cleanup_pending)
     {
-        let reason = if record.cancellation_reason.is_empty() {
-            "cancelled work"
+        if !record.cancellation_reason.is_empty() {
+            cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)?;
         } else {
-            &record.cancellation_reason
-        };
-        cancel(ctx, &project.slug, &record.id, reason)?;
+            let reason = if record.cleanup_reason.is_empty() {
+                "automatic"
+            } else {
+                &record.cleanup_reason
+            };
+            resolve_automatically(ctx, project, &record.id, reason);
+        }
     }
     Ok(())
+}
+
+/// A report-only code lane has nothing to review or land. Once its sealed
+/// report is available, close it immediately; changed lanes remain visible so
+/// the coordinator can put them in a round.
+pub(crate) fn resolve_report_only(ctx: &Ctx, project: &Project) {
+    let events = crate::events::list(project);
+    for record in thread::list(project) {
+        if record.status == Status::Resolved
+            || record.role == "reviewer"
+            || record.base.is_empty()
+            || !crate::threads::carrying_rounds(project, &record.id).is_empty()
+        {
+            continue;
+        }
+        let unchanged = events
+            .iter()
+            .filter(|event| event.thread == record.id && event.attempt == record.attempt.max(1))
+            .max_by(|left, right| (&left.created, &left.id).cmp(&(&right.created, &right.id)))
+            .and_then(|event| event.payload.done.as_ref())
+            .is_some_and(|done| done.sha == record.base);
+        if unchanged {
+            resolve_automatically(ctx, project, &record.id, "report-only");
+        }
+    }
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
@@ -2451,7 +2537,9 @@ pub(crate) fn finished_worktree_reason(
         if member && round.phase.closed() {
             return Ok(None);
         }
-        if round.reviewer.as_deref() == Some(record.id.as_str()) && round.verdict.is_some() {
+        if round.reviewer.as_deref() == Some(record.id.as_str())
+            && (round.verdict.is_some() || round.phase.closed())
+        {
             return Ok(None);
         }
     }
@@ -2752,7 +2840,7 @@ fn removal_in_use_gate(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
     let view = require_session(ctx, project)?;
     let (agents, panes) = lists_for(&view, record)?;
     let live = thread::live_state(record, &agents, &panes, jiff::Timestamp::now());
-    if live.agent_state.as_deref() == Some("working") {
+    if record.status != Status::Resolved && live.agent_state.as_deref() == Some("working") {
         bail!(
             "worktree_in_use: {} is working; not removing the worktree",
             record.id
@@ -2885,7 +2973,11 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
         return Row {
             thread: t.clone(),
             group: Group::Resolved,
-            note: t.resolved_reason.clone(),
+            note: if t.cleanup_pending {
+                "cleanup pending".into()
+            } else {
+                t.resolved_reason.clone()
+            },
         };
     }
     let Some(view) = view else {
