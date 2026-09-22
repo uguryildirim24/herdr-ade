@@ -545,7 +545,7 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
             let deadline = Instant::now() + PROCESS_WAIT;
             loop {
                 if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
-                    && info.version == crate::VERSION
+                    && crate::build::same_commit(&info.version, crate::VERSION)
                 {
                     break Ok(info);
                 }
@@ -742,21 +742,31 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
          version=\"$($bin --version)\"\n\
          printf 'HERDR_ADE_BOX_BINARY=%s\\n' \"$version\"\n\
          $bin --root \"$root\" ticker start\n\
-         expected={version}\n\
+         expected={expected}\n\
+         seen=\n\
+         pid=\n\
          n=0\n\
          while [ $n -lt 80 ]; do\n\
-           if grep -F '\"version\": \"'$expected'\"' \"$root/.ticker.lock\" >/dev/null 2>&1; then\n\
+           if [ -r \"$root/.ticker.lock\" ]; then\n\
+             seen=$(sed -n 's/.*\"version\": \"\\([^\"]*\\)\".*/\\1/p' \"$root/.ticker.lock\")\n\
              pid=$(grep '\"pid\"' \"$root/.ticker.lock\" | tr -cd '0-9')\n\
-             printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$expected\"\n\
-             exit 0\n\
+             if grep -F '\"version\": \"'$expected'.' \"$root/.ticker.lock\" >/dev/null 2>&1; then\n\
+               printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$seen\"\n\
+               exit 0\n\
+             fi\n\
            fi\n\
            n=$((n+1)); sleep 0.5\n\
          done\n\
-         printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker did not report the installed build\\n'",
+         if [ -n \"$seen\" ]; then\n\
+           printf 'HERDR_ADE_BOX_TICKER_STALE=%s:%s\\n' \"$pid\" \"$seen\"\n\
+         else\n\
+           printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker did not report a build\\n'\n\
+         fi",
         path = remote::quote(&machine.path),
         bin = remote::quote(&machine.ade_bin),
         root = remote::quote(&machine.root),
-        version = remote::quote(crate::VERSION),
+        expected =
+            remote::quote(crate::build::commit_version(crate::VERSION).unwrap_or(crate::VERSION)),
     );
     let target = &machine.target;
     let out = match remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(140)) {
@@ -789,7 +799,7 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
         .lines()
         .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_BINARY="))
     {
-        let current = version.contains(crate::VERSION);
+        let current = crate::build::same_commit(version, crate::VERSION);
         proofs.push(ProcessProof {
             machine: machine.id.clone(),
             process: "herdr-ade binary".into(),
@@ -819,13 +829,36 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
         .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER="))
     {
         let (pid, build) = value.split_once(':').unwrap_or(("", value));
+        let current = crate::build::same_commit(build, crate::VERSION);
         proofs.push(ProcessProof {
             machine: machine.id.clone(),
             process: "ticker".into(),
             pid: pid.parse().ok(),
             build: Some(build.to_string()),
-            state: "running".into(),
-            reason: None,
+            state: if current { "running" } else { "stale" }.into(),
+            reason: (!current).then(|| {
+                format!(
+                    "the box ticker does not report installed build {}",
+                    crate::VERSION
+                )
+            }),
+        });
+    } else if let Some(value) = out
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER_STALE="))
+    {
+        let (pid, build) = value.split_once(':').unwrap_or(("", value));
+        proofs.push(ProcessProof {
+            machine: machine.id.clone(),
+            process: "ticker".into(),
+            pid: pid.parse().ok(),
+            build: Some(build.to_string()),
+            state: "stale".into(),
+            reason: Some(format!(
+                "the box ticker does not report installed build {}",
+                crate::VERSION
+            )),
         });
     } else {
         proofs.push(ProcessProof {
@@ -1086,6 +1119,7 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
 mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
+    use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::PermissionsExt;
 
     /// Write an executable `zig` that answers `zig version` with `version`.
@@ -1284,6 +1318,66 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("connection refused"))
         );
+    }
+
+    #[test]
+    fn a_box_ticker_from_the_same_commit_passes_with_its_exact_build() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let commit = crate::build::commit_version(crate::VERSION).unwrap();
+        let box_build = format!("{commit}.9999999999");
+        let box_binary = format!("herdr-ade {box_build}");
+        let bin = root.path().join("herdr-ade");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{box_binary}'; fi\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).unwrap();
+        let box_root = root.path().join("ade-root");
+        std::fs::create_dir(&box_root).unwrap();
+        std::fs::write(
+            box_root.join(".ticker.lock"),
+            format!("{{\n  \"version\": \"{box_build}\",\n  \"pid\": 42\n}}"),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |cmd| {
+                RealRunner.run(&Cmd {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), cmd.args.last().unwrap().clone()],
+                    ..cmd.clone()
+                })
+            },
+        );
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let machine = crate::remote::MachineDeclaration {
+            id: "oci".into(),
+            target: "box".into(),
+            root: box_root.to_string_lossy().into_owned(),
+            path: "/usr/bin:/bin".into(),
+            ade_bin: bin.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let proofs = box_process_proofs(&ctx, &machine);
+
+        assert_eq!(proofs.len(), 2);
+        assert_eq!(proofs[0].state, "installed");
+        assert_eq!(proofs[0].build.as_deref(), Some(box_binary.as_str()));
+        assert_eq!(proofs[1].state, "running");
+        assert_eq!(proofs[1].pid, Some(42));
+        assert_eq!(proofs[1].build.as_deref(), Some(box_build.as_str()));
     }
 
     #[test]

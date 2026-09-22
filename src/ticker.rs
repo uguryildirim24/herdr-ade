@@ -93,7 +93,9 @@ pub(crate) enum StartAction {
 fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> StartAction {
     match lock {
         LockState::Free => StartAction::Spawn,
-        LockState::Held(info) if info.version == my_version && !stop_file_exists => {
+        LockState::Held(info)
+            if crate::build::same_commit(&info.version, my_version) && !stop_file_exists =>
+        {
             StartAction::Nothing
         }
         LockState::Held(_) => StartAction::StopThenSpawn,
@@ -232,7 +234,8 @@ fn replace(root: &Path) -> Result<()> {
     }
     let deadline = Instant::now() + HANDOFF_READY_WAIT;
     loop {
-        if matches!(lock_state(root), LockState::Held(ref info) if info.version == crate::VERSION) {
+        if matches!(lock_state(root), LockState::Held(ref info) if crate::build::same_commit(&info.version, crate::VERSION))
+        {
             return Ok(());
         }
         if let Some(status) = child
@@ -286,7 +289,7 @@ pub(crate) fn status(root: &Path) -> Result<()> {
             for (tool, path) in &info.tools {
                 println!("  {tool:<6} {path}");
             }
-            if info.version != crate::VERSION {
+            if !crate::build::same_commit(&info.version, crate::VERSION) {
                 println!(
                     "  note: this binary is {}; `ticker start` replaces the running one",
                     crate::VERSION
@@ -1398,22 +1401,26 @@ mod tests {
 
     #[test]
     fn start_decisions() {
+        let mine = "0.1.0+abcdef0.20";
         assert_eq!(
-            decide_start(&LockState::Free, "v1", false),
+            decide_start(&LockState::Free, mine, false),
             StartAction::Spawn
         );
         assert_eq!(
-            decide_start(&LockState::Free, "v1", true),
+            decide_start(&LockState::Free, mine, true),
             StartAction::Spawn
         );
-        assert_eq!(decide_start(&held("v1"), "v1", false), StartAction::Nothing);
         assert_eq!(
-            decide_start(&held("v0"), "v1", false),
+            decide_start(&held("0.1.0+abcdef0.10"), mine, false),
+            StartAction::Nothing
+        );
+        assert_eq!(
+            decide_start(&held("0.1.0+1234567.10"), mine, false),
             StartAction::StopThenSpawn
         );
         // A stop in progress: finish it, then spawn.
         assert_eq!(
-            decide_start(&held("v1"), "v1", true),
+            decide_start(&held("0.1.0+abcdef0.10"), mine, true),
             StartAction::StopThenSpawn
         );
     }
