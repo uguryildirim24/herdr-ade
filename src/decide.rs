@@ -257,13 +257,18 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
         bail!("decision_request: no message `{request}` in this project");
     }
     if let Some(replaces) = new.replaces {
-        let target = log
-            .records
-            .iter()
-            .find(|d| d.id == replaces)
-            .with_context(|| format!("decision_unknown: `{replaces}` is not in this log"))?;
-        if !log_current(&log, &target.id) {
-            bail!("decision_replaced: `{replaces}` already has a replacement");
+        if let Some(target) = log.records.iter().find(|d| d.id == replaces) {
+            if !log_current(&log, &target.id) {
+                bail!("decision_replaced: `{replaces}` already has a replacement");
+            }
+        } else {
+            if !crate::note::target_exists(&project, replaces) {
+                bail!("decision_unknown: `{replaces}` is not a note or decision");
+            }
+            let rows = crate::note::rows(&project);
+            if crate::note::replacement_map(&rows).contains_key(replaces) {
+                bail!("decision_replaced: `{replaces}` already has a replacement");
+            }
         }
     }
     let seq = log.records.iter().map(|d| d.seq).max().unwrap_or(0) + 1;
