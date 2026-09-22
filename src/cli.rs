@@ -1444,11 +1444,12 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             landed_round,
         } => {
             let slug = slug_of(slug)?;
-            match landed_round {
+            let id = match landed_round {
                 Some(round) => ask::say_landed(ctx, &slug, &what, means.as_deref(), &round)?,
                 None => ask::say(ctx, &slug, &what, means.as_deref())?,
-            }
-            println!("said");
+            };
+            crate::output::insert("say", id.clone());
+            println!("{id} said");
             Ok(())
         }
         Command::Explain { slug, name } => {

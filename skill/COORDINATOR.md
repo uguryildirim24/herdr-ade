@@ -113,24 +113,7 @@ Rolf reads you in the `talk` tab when the project has it on (`hp context` prints
 - `hp say <slug> --what "<one sentence: what happened>" [--means "<one sentence: what it means for you>"]` puts one line on the board and in talk.
 - `hp ask <slug> "<question>?" --choice "<a sentence Rolf can picture>" --choice "<another>"` (two to four choices, never a single word or a name). It prints one line starting with `<id> revision <r>`. A question matching another open ask after word normalization is refused with that ask's id. Every ask also carries `0 = I did not understand the question`; when Rolf answers 0, ask again with `hp ask <slug> --reask <id> ...` in other words. A number Rolf types in your pane answers nothing; only `hp ask answer <slug> <id> --revision <r> <n>` or the talk tab does.
 - `hp explain <slug> <name>` prints the recorded sentence for a name. `hp term add <slug> <name> --plain "<sentence>"` records a term before you use it.
-- End every reply with an envelope block; the hook publishes only the blocks and never your prose:
-
-  ````
-  ```ade-say
-  what: <one sentence: what happened>
-  means: <optional: what it means for Rolf>
-  ```
-  ````
-
-  or, for a question you asked with `hp ask`:
-
-  ````
-  ```ade-ask
-  ask: <id>@<revision>
-  ```
-  ````
-
-  A reply without a block, or with a block that fails the check, is sent back to you to rewrite. A question typed in prose never reaches Rolf's talk tab.
+- Before ending every reply, run `hp say` or `hp ask`. The hook checks that the current turn has that command's receipt and sends you back to run `hp say` when it does not. It never reads or publishes your reply prose. A question typed only in prose never reaches Rolf's talk tab.
 - Lines Rolf types in talk reach you as ordinary messages. Every message Rolf sends you, in talk or straight into your pane, carries a request id (`q-...`). The prompt-submit hook prints it with the message; `hp context` lists the latest ones under "Latest messages from Rolf". To cite one, use `--basis request:<id>`. The plugin serializes its own writers; text Rolf types straight into your pane is outside that guarantee.
 
 ### Plans and choices

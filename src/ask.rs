@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::contracts::{Ask, HumanMessage};
 use crate::glossary::{self, format_check};
@@ -152,8 +153,37 @@ fn answer_path(project: &Project, id: &str, revision: u32) -> PathBuf {
     ask_dir(project, id).join(format!("r{revision}.answer.toml"))
 }
 
-fn published_marker(project: &Project, id: &str, revision: u32) -> PathBuf {
-    ask_dir(project, id).join(format!("r{revision}.published"))
+fn publications_dir(project: &Project) -> PathBuf {
+    project.state_dir().join("plain").join("publications")
+}
+
+fn publication_path(project: &Project, key: &str) -> PathBuf {
+    publications_dir(project).join(format!("{:x}.json", Sha256::digest(key.as_bytes())))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Publication {
+    key: String,
+    message: HumanMessage,
+    journal: bool,
+    board: bool,
+    /// `None` when this message has no notification sink.
+    notified: Option<bool>,
+}
+
+struct PublicationLock {
+    _file: std::fs::File,
+}
+
+fn publication_lock(project: &Project) -> Result<PublicationLock> {
+    std::fs::create_dir_all(publications_dir(project))?;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(publications_dir(project).join(".lock"))?;
+    file.lock()?;
+    Ok(PublicationLock { _file: file })
 }
 
 fn validate_ask_id(id: &str) -> Result<()> {
@@ -513,15 +543,18 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
         write_atomic(&path, toml::to_string(&record)?.as_bytes())?;
         record
     };
-    if let Err(e) = publish(
-        ctx,
-        &project,
-        &HumanMessage::Ask {
-            id: record.id.clone(),
-            revision: record.revision,
-        },
-    ) {
-        eprintln!("note: the ask is recorded; publication will be retried by the ticker: {e:#}");
+    let message = HumanMessage::Ask {
+        id: record.id.clone(),
+        revision: record.revision,
+    };
+    match publish(ctx, &project, &message) {
+        Ok(_) => crate::hook::record_receipt(
+            &project,
+            &format!("ask:{}@{}", record.id, record.revision),
+        )?,
+        Err(e) => {
+            eprintln!("note: the ask is recorded; publication will be retried by the ticker: {e:#}")
+        }
     }
     Ok(record)
 }
@@ -608,19 +641,30 @@ pub(crate) fn not_understood_count(project: &Project) -> u64 {
     project::read_json::<u64>(&project.state_dir().join("not-understood.json")).unwrap_or(0)
 }
 
+fn next_say_id(project: &Project) -> Result<String> {
+    let _lock = project.lock()?;
+    let path = project.state_dir().join("say-counter.json");
+    let next = project::read_json::<u64>(&path).unwrap_or(0) + 1;
+    project::write_json(&path, &next)?;
+    Ok(format!("s-{next}"))
+}
+
 /// `ha say --what ... [--means ...]`.
-pub(crate) fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<()> {
+pub(crate) fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
+    let id = next_say_id(&project)?;
     publish(
         ctx,
         &project,
         &HumanMessage::Say {
+            id: id.clone(),
             what: what.trim().to_string(),
             means: means.map(|m| m.trim().to_string()),
             landed_round: None,
         },
-    )
-    .map(|_| ())
+    )?;
+    crate::hook::record_receipt(&project, &format!("say:{id}"))?;
+    Ok(id)
 }
 
 /// The landing line for a merged round (SPEC-talk §6.1). It publishes under
@@ -632,18 +676,21 @@ pub(crate) fn say_landed(
     what: &str,
     means: Option<&str>,
     round: &str,
-) -> Result<()> {
+) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
+    let id = format!("landed-{round}");
     publish(
         ctx,
         &project,
         &HumanMessage::Say {
+            id: id.clone(),
             what: what.trim().to_string(),
             means: means.map(|m| m.trim().to_string()),
             landed_round: Some(round.to_string()),
         },
-    )
-    .map(|_| ())
+    )?;
+    crate::hook::record_receipt(&project, &format!("say:{id}"))?;
+    Ok(id)
 }
 
 /// The last line of `what` that fits a board token: cut at a word boundary.
@@ -675,8 +722,8 @@ pub(crate) struct Published {
     pub(crate) notified: bool,
 }
 
-/// The stored ask an `ade-ask` envelope names: known, latest, unanswered
-/// and still passing the check. The hook corrects on the same refusal.
+/// Resolves one stored ask revision for publication: known, latest,
+/// unanswered, not withdrawn, and still passing the check.
 pub(crate) fn open_revision(
     project: &Project,
     id: &str,
@@ -704,18 +751,39 @@ pub(crate) fn open_revision(
     Ok(record)
 }
 
-pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
-    publish_keyed(ctx, project, msg, None)
+fn publication_key(message: &HumanMessage) -> Result<String> {
+    match message {
+        HumanMessage::Say { id, .. } if !id.trim().is_empty() => Ok(format!("say:{id}")),
+        HumanMessage::Ask { id, revision } => Ok(format!("ask:{id}@{revision}")),
+        HumanMessage::Say { .. } => bail!("say_id_missing: a say needs an id"),
+        HumanMessage::Notice { .. } => bail!("notice_key_missing: notices use their own publisher"),
+    }
 }
 
-/// The one publisher. `key` makes a publication idempotent (a duplicate hook
-/// run of the same reply appends once).
-pub(crate) fn publish_keyed(
-    ctx: &Ctx,
-    project: &Project,
-    msg: &HumanMessage,
-    key: Option<&str>,
-) -> Result<Published> {
+fn save_publication(project: &Project, publication: &Publication) -> Result<()> {
+    project::write_json(&publication_path(project, &publication.key), publication)
+}
+
+fn publication_complete(publication: &Publication) -> bool {
+    publication.journal && publication.board && publication.notified.unwrap_or(true)
+}
+
+fn journal_key(message: &HumanMessage, publication_key: &str) -> String {
+    match message {
+        HumanMessage::Say {
+            landed_round: Some(round),
+            ..
+        } => format!("landed:{round}"),
+        _ => publication_key.to_string(),
+    }
+}
+
+/// Publishes an authored say or ask under its canonical id. Each sink outcome
+/// is durable, so a retry runs only the sinks that have not yet succeeded.
+pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
+    if let HumanMessage::Notice { id } = msg {
+        return publish_notice_keyed(ctx, project, id, None);
+    }
     let g = glossary::registry(project);
     let mut problems = Vec::new();
     match msg {
@@ -725,11 +793,12 @@ pub(crate) fn publish_keyed(
                 problems.extend(say_problems("means", means, &g));
             }
         }
-        other => {
-            for v in plain::check_message(other, &g).violations {
-                problems.push(format!("{}: {}", v.rule.code(), v.fix));
+        HumanMessage::Ask { .. } => {
+            for violation in plain::check_message(msg, &g).violations {
+                problems.push(format!("{}: {}", violation.rule.code(), violation.fix));
             }
         }
+        HumanMessage::Notice { .. } => unreachable!(),
     }
     if !problems.is_empty() {
         return Err(crate::refusal::error(format!(
@@ -737,102 +806,142 @@ pub(crate) fn publish_keyed(
             problems.join("\n")
         )));
     }
-    match msg {
-        HumanMessage::Say {
-            what,
-            means,
-            landed_round,
-        } => {
+
+    let ask_record = match msg {
+        HumanMessage::Ask { id, revision } => Some(open_revision(project, id, *revision, &g)?),
+        HumanMessage::Say { landed_round, .. } => {
             if let Some(round) = landed_round {
                 let merged = crate::round::read_merge(project, round)?
-                    .is_some_and(|m| m.phase == crate::contracts::MergePhase::Checkpointed);
+                    .is_some_and(|merge| merge.phase == crate::contracts::MergePhase::Checkpointed);
                 if !merged {
                     bail!("landed_round_unmerged: `{round}` has not merged and checkpointed");
                 }
             }
-            let line = board_line(what, 80);
-            glossary::gate(project, &line).context("the board line failed the check")?;
-            // A landing line is idempotent under `landed:<round>` regardless
-            // of the caller's key.
-            let landed_key = landed_round.as_ref().map(|round| format!("landed:{round}"));
-            let seq = crate::talk::append(
-                project,
-                landed_key.as_deref().or(key),
-                crate::talk::Entry::Say {
-                    what: what.clone(),
-                    means: means.clone(),
-                    landed_round: landed_round.clone(),
-                },
-            )?;
-            if seq.is_none() {
-                return Ok(Published {
-                    seq,
-                    board: false,
-                    notified: false,
-                });
-            }
-            let board = crate::board::publish_value(ctx, project, "ade_last", &line).is_ok();
-            crate::board::remember_last(project, &line);
-            Ok(Published {
-                seq,
-                board,
-                notified: false,
-            })
+            None
         }
-        HumanMessage::Ask { id, revision } => {
-            // Keep publication atomic with answer and withdrawal. Without the
-            // ask-set lock, a publisher that passed open_revision just before
-            // a withdrawal could put the closed card back on the board.
-            let _set = ask_set_lock(project)?;
-            let record = open_revision(project, id, *revision, &g)?;
-            let compact = compact_line(&record);
-            glossary::gate(project, &compact)?;
-            let seq = crate::talk::append(
-                project,
-                Some(
-                    &key.map(str::to_string)
-                        .unwrap_or(format!("ask:{id}@{revision}")),
-                ),
-                crate::talk::Entry::Ask {
-                    id: id.clone(),
-                    revision: *revision,
-                },
-            )?;
-            let board =
-                crate::board::publish_value(ctx, project, "ade_needs_you", &compact).is_ok();
-            let mut body = String::new();
-            for (i, c) in record.choices.iter().enumerate() {
-                body.push_str(&format!("{}. {}\n", i + 1, c));
-            }
-            let notified = notify(ctx, project, &compact, &body);
-            if board && notified {
-                let _ = std::fs::write(published_marker(project, id, *revision), "");
-            }
-            Ok(Published {
-                seq,
-                board,
-                notified,
-            })
+        HumanMessage::Notice { .. } => unreachable!(),
+    };
+    let board_value = match (msg, ask_record.as_ref()) {
+        (HumanMessage::Say { what, .. }, _) => board_line(what, 80),
+        (HumanMessage::Ask { .. }, Some(record)) => compact_line(record),
+        _ => unreachable!(),
+    };
+    glossary::gate(project, &board_value).context("the board line failed the check")?;
+
+    // Ask closure and all publication retries serialize with one another.
+    let _ask_set = matches!(msg, HumanMessage::Ask { .. })
+        .then(|| ask_set_lock(project))
+        .transpose()?;
+    if let HumanMessage::Ask { id, revision } = msg {
+        // Recheck after taking the ask-set lock so answer or withdrawal cannot
+        // race the board and notification sinks.
+        open_revision(project, id, *revision, &g)?;
+    }
+    let _publication = publication_lock(project)?;
+    let key = publication_key(msg)?;
+    let journal_key = journal_key(msg, &key);
+    let path = publication_path(project, &key);
+    let mut state = project::read_json::<Publication>(&path).unwrap_or(Publication {
+        key: key.clone(),
+        message: msg.clone(),
+        journal: false,
+        board: false,
+        notified: matches!(msg, HumanMessage::Ask { .. }).then_some(false),
+    });
+    if state.key != key || state.message != *msg {
+        bail!("publication_collision: `{key}` already names another message");
+    }
+    if !path.exists() {
+        save_publication(project, &state)?;
+    }
+    if state.journal
+        && !crate::talk::read(project)
+            .lines
+            .iter()
+            .any(|line| line.key.as_deref() == Some(&journal_key))
+    {
+        state.journal = false;
+        save_publication(project, &state)?;
+    }
+
+    let mut seq = None;
+    if !state.journal {
+        let entry = match msg {
+            HumanMessage::Say {
+                what,
+                means,
+                landed_round,
+                ..
+            } => crate::talk::Entry::Say {
+                what: what.clone(),
+                means: means.clone(),
+                landed_round: landed_round.clone(),
+            },
+            HumanMessage::Ask { id, revision } => crate::talk::Entry::Ask {
+                id: id.clone(),
+                revision: *revision,
+            },
+            HumanMessage::Notice { .. } => unreachable!(),
+        };
+        seq = crate::talk::append(project, Some(&journal_key), entry)?;
+        state.journal = true;
+        save_publication(project, &state)?;
+    }
+    let board_key = if matches!(msg, HumanMessage::Ask { .. }) {
+        "ade_needs_you"
+    } else {
+        "ade_last"
+    };
+    if !state.board && crate::board::publish_value(ctx, project, board_key, &board_value).is_ok() {
+        state.board = true;
+        if matches!(msg, HumanMessage::Say { .. }) {
+            crate::board::remember_last(project, &board_value);
         }
-        HumanMessage::Notice { id } => {
-            let text = notice_text(id)
-                .with_context(|| format!("notice_unknown: `{id}` is not a fixed notice"))?;
-            glossary::gate(project, text)?;
-            let seq =
-                crate::talk::append(project, key, crate::talk::Entry::Notice { id: id.clone() })?;
-            let mut board = false;
-            if id == "plain_exhausted" {
-                let line = board_line(text, 80);
-                board = crate::board::publish_value(ctx, project, "ade_last", &line).is_ok();
-                crate::board::remember_last(project, &line);
-            }
-            Ok(Published {
-                seq,
-                board,
-                notified: false,
-            })
+        save_publication(project, &state)?;
+    }
+    if state.notified == Some(false) {
+        let record = ask_record.as_ref().expect("ask publication has a record");
+        let mut body = String::new();
+        for (index, choice) in record.choices.iter().enumerate() {
+            body.push_str(&format!("{}. {}\n", index + 1, choice));
+        }
+        if notify(ctx, project, &board_value, &body) {
+            state.notified = Some(true);
+            save_publication(project, &state)?;
         }
     }
+    Ok(Published {
+        seq,
+        board: state.board,
+        notified: state.notified.unwrap_or(false),
+    })
+}
+
+pub(crate) fn publish_notice_keyed(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    key: Option<&str>,
+) -> Result<Published> {
+    let text =
+        notice_text(id).with_context(|| format!("notice_unknown: `{id}` is not a fixed notice"))?;
+    glossary::gate(project, text)?;
+    let seq = crate::talk::append(
+        project,
+        key,
+        crate::talk::Entry::Notice { id: id.to_string() },
+    )?;
+    let mut board = false;
+    if id == "plain_exhausted" {
+        let line = board_line(text, 80);
+        board = crate::board::publish_value(ctx, project, "ade_last", &line).is_ok();
+        crate::board::remember_last(project, &line);
+    }
+    Ok(Published {
+        seq,
+        board,
+        notified: false,
+    })
 }
 
 /// A plugin notification whose title and body are checked texts.
@@ -853,21 +962,29 @@ fn notify(ctx: &Ctx, project: &Project, title: &str, body: &str) -> bool {
         .is_ok()
 }
 
-/// Resumes publication of every open latest revision that has no
-/// `published` marker (a crash between record and publication).
+/// Resumes each incomplete sink. Open asks are also visited so a crash after
+/// writing the ask record but before writing its publication record is safe.
 pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
-    for a in open_asks(project) {
-        if published_marker(project, &a.id, a.revision).exists() {
-            continue;
-        }
+    for ask in open_asks(project) {
         let _ = publish(
             ctx,
             project,
             &HumanMessage::Ask {
-                id: a.id.clone(),
-                revision: a.revision,
+                id: ask.id.clone(),
+                revision: ask.revision,
             },
         );
+    }
+    let Ok(entries) = std::fs::read_dir(publications_dir(project)) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let Some(state) = project::read_json::<Publication>(&entry.path()) else {
+            continue;
+        };
+        if !publication_complete(&state) {
+            let _ = publish(ctx, project, &state.message);
+        }
     }
     Ok(())
 }
@@ -938,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_records_first_then_board_line_notification_and_surface() {
+    fn one_ask_revision_is_published_once() {
         let fx = fixture();
         let a = ask(&fx.world.ctx(), "demo", keep_or_stop()).unwrap();
         assert_eq!((a.id.as_str(), a.revision), ("a-1", 1));
@@ -962,7 +1079,10 @@ mod tests {
         assert_eq!(journal_kinds(&fx.project), ["ask a-1@1"]);
         let shown = crate::talk::replay(&fx.world.ctx(), "demo").unwrap();
         assert!(shown.contains("  1. keep it running another hour\n  2. stop it now\n  0. I did not understand the question"), "{shown}");
-        assert!(published_marker(&fx.project, "a-1", 1).exists());
+        assert!(publication_complete(
+            &project::read_json::<Publication>(&publication_path(&fx.project, "ask:a-1@1"))
+                .unwrap()
+        ));
         let overview = crate::overview::render(&fx.project, &[]);
         assert!(
             overview.contains(&format!(
@@ -970,7 +1090,7 @@ mod tests {
             )),
             "{overview}"
         );
-        // A second publication of the same ask appends nothing.
+        // Every sink sees this ask revision once even when publication retries.
         publish(
             &fx.world.ctx(),
             &fx.project,
@@ -981,6 +1101,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(journal_kinds(&fx.project).len(), 1);
+        assert_eq!(
+            fx.world
+                .runner
+                .count(&format!("--token ade_needs_you={compact}")),
+            1
+        );
+        assert_eq!(
+            fx.world.runner.count(&format!(
+                "notification show {compact} --body 1. keep it running another hour"
+            )),
+            1
+        );
     }
 
     #[test]
@@ -990,37 +1122,23 @@ mod tests {
         // No notification rule: publication fails after the record exists.
         let a = ask(&world.ctx(), "demo", keep_or_stop()).unwrap();
         assert!(rev_path(&project, &a.id, 1).exists());
-        assert!(!published_marker(&project, &a.id, 1).exists());
+        let pending =
+            project::read_json::<Publication>(&publication_path(&project, "ask:a-1@1")).unwrap();
+        assert_eq!(pending.notified, Some(false));
         world.runner.on("notification show", ok(r#"{"result":{}}"#));
         world
             .runner
             .on("workspace report-metadata", ok(r#"{"result":{}}"#));
         tick(&world.ctx(), &project).unwrap();
-        assert!(published_marker(&project, &a.id, 1).exists());
+        assert!(publication_complete(
+            &project::read_json::<Publication>(&publication_path(&project, "ask:a-1@1")).unwrap()
+        ));
         assert_eq!(world.runner.count("notification show"), 2);
         assert_eq!(
             journal_kinds(&project),
             ["ask a-1@1"],
             "one journal line across both tries"
         );
-    }
-
-    /// Defect: the hook looked for `asks/<id>.toml`, so every `ade-ask`
-    /// envelope was corrected as an unknown ask.
-    #[test]
-    fn the_hook_accepts_an_envelope_for_a_recorded_ask() {
-        let fx = fixture();
-        ask(&fx.world.ctx(), "demo", keep_or_stop()).unwrap();
-        let envelope = |revision| HumanMessage::Ask {
-            id: "a-1".into(),
-            revision,
-        };
-        crate::hook::validate_message(&fx.project, &envelope(1)).unwrap();
-        let e = format!(
-            "{:#}",
-            crate::hook::validate_message(&fx.project, &envelope(2)).unwrap_err()
-        );
-        assert!(e.starts_with("ask_unknown"), "{e}");
     }
 
     #[test]
@@ -1124,18 +1242,24 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_keyed_publication_appends_once() {
+    fn a_say_id_publishes_each_sink_once() {
         let fx = fixture();
         let msg = HumanMessage::Say {
+            id: "s-7".into(),
             what: "The review is done.".into(),
             means: None,
             landed_round: None,
         };
-        let first = publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
-        let second =
-            publish_keyed(&fx.world.ctx(), &fx.project, &msg, Some("hook:turn-7")).unwrap();
+        let first = publish(&fx.world.ctx(), &fx.project, &msg).unwrap();
+        let second = publish(&fx.world.ctx(), &fx.project, &msg).unwrap();
         assert!(first.seq.is_some() && second.seq.is_none());
         assert_eq!(journal_kinds(&fx.project), ["say"]);
+        assert_eq!(
+            fx.world
+                .runner
+                .count("--token ade_last=The review is done."),
+            1
+        );
     }
 
     #[test]
@@ -1501,7 +1625,9 @@ mod tests {
             ask(&world.ctx(), "demo", distinct_ask(n)).unwrap();
         }
         assert_eq!(open_asks(&project).len(), 3);
-        assert!(!published_marker(&project, "a-1", 1).exists());
+        assert!(!publication_complete(
+            &project::read_json::<Publication>(&publication_path(&project, "ask:a-1@1")).unwrap()
+        ));
         let e = format!(
             "{:#}",
             ask(&world.ctx(), "demo", keep_or_stop()).unwrap_err()
