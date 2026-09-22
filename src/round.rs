@@ -893,7 +893,6 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
         save(&project, &record)?;
     }
     stamp_workspace(ctx, &project, &record);
-    let _ = crate::glossary::rewrite(&project);
     let _ = crate::board::refresh(ctx, &project);
     Ok(record)
 }
@@ -981,7 +980,6 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         record
     };
     crate::task::link_round_for_thread(&project, round, thread_id)?;
-    let _ = crate::glossary::rewrite(&project);
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
@@ -1669,7 +1667,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             outcome.started.push(ReviewerStarted { round, reviewer });
         }
     }
-    let _ = crate::task::refresh_tasks_md(&project);
+    let _ = crate::project::refresh_page(&project);
     Ok(outcome)
 }
 
@@ -2969,7 +2967,7 @@ fn merge_inner(
         if let Err(e) = crate::ask::say_landed(ctx, slug, &what, None, round) {
             eprintln!("note: the landing line could not be published: {e:#}");
         }
-        if let Err(e) = crate::task::refresh_tasks_md(&project) {
+        if let Err(e) = crate::project::refresh_page(&project) {
             eprintln!("note: the task list refresh failed: {e:#}");
         }
         if let Err(e) = crate::plan::refresh(ctx, &project) {

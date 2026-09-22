@@ -128,18 +128,12 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if project.status() == Status::Archived {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
     }
-    let (settings, body) = project.read_project_md()?;
-    if body.chars().count() > crate::project::BODY_WARN_CHARS {
-        eprintln!(
-            "warning: the instructions in PROJECT.md are over {} characters",
-            crate::project::BODY_WARN_CHARS
-        );
-    }
+    let (settings, _) = project.read_project_md()?;
     let selected = crate::launch::resolve_launch(
         ctx,
         &project,
         &crate::launch::ResolveInput {
-            task: &std::fs::read_to_string(project.dir().join("PROJECT.md"))?,
+            task: "Project coordinator.",
             workflow: "coordinator",
             ..Default::default()
         },
@@ -395,7 +389,7 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
 pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if !peek {
-        crate::task::refresh_tasks_md(&project)?;
+        crate::project::refresh_page(&project)?;
     }
     // A peek reads; it is not the coordinator's receipt (D14).
     if !peek {
@@ -568,12 +562,6 @@ fn digest_snapshot(
         out.push_str(&notes);
     }
 
-    let _ = writeln!(out, "\n## Memory index (MEMORY.md)");
-    let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
-    for line in index.trim().lines().take(DIGEST_ROWS) {
-        let _ = writeln!(out, "{line}");
-    }
-    overflow(&mut out, index.trim().lines().count(), "MEMORY.md");
     if let Some(warning) = crate::thread::memory_use(project).warning() {
         let _ = writeln!(out, "{warning}");
     }

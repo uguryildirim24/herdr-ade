@@ -79,7 +79,7 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
     })?;
-    let _ = crate::task::refresh_tasks_md(&binding.project);
+    let _ = crate::project::refresh_page(&binding.project);
     if binding.card.is_none() {
         steps::deliver_event(ctx, &binding.project, &event)?;
         ticker::start(ctx)?;
@@ -161,7 +161,7 @@ fn seal_message(
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
     })?;
-    let _ = crate::task::refresh_tasks_md(&binding.project);
+    let _ = crate::project::refresh_page(&binding.project);
     if binding.card.is_none() {
         // Failure is consumed by the next ticker pass, never synchronously:
         // the sealing lane gets to finish before its old tab is closed.

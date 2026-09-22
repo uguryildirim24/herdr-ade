@@ -79,6 +79,11 @@ enum Command {
         #[arg(long = "repo", value_name = "PATH[@MACHINE]")]
         repos: Vec<String>,
     },
+    /// Project page maintenance
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     /// List projects
     List {
         /// Include archived projects
@@ -1565,6 +1570,12 @@ enum InboxCommand {
 }
 
 #[derive(Subcommand)]
+enum ProjectCommand {
+    /// Move old project documents to history and write the current page
+    Convert { slug: String },
+}
+
+#[derive(Subcommand)]
 enum TaskCommand {
     /// Add a task tied to Rolf's request and plain acceptance conditions
     Add {
@@ -1587,18 +1598,6 @@ enum TaskCommand {
     Show { slug: String, id: String },
     /// List tasks and their derived state
     List { slug: String },
-    /// Add a dated note without changing state
-    Note {
-        slug: String,
-        id: String,
-        text: String,
-        /// Request id behind this note
-        #[arg(long)]
-        request: String,
-        /// Note or instruction this explicitly replaces
-        #[arg(long)]
-        replaces: Option<String>,
-    },
     /// Drop a task, or withdraw acceptance conditions replaced by a newer choice
     Drop {
         slug: String,
@@ -2035,6 +2034,21 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             );
             Ok(())
         }
+        Command::Project { command } => match command {
+            ProjectCommand::Convert { slug } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let (history, moved) = project::convert(&project)?;
+                crate::output::success(
+                    Some("converted"),
+                    &serde_json::json!({ "history": history, "moved": moved }),
+                    &format!(
+                        "converted `{slug}`; moved {} to {history}\n",
+                        moved.join(", ")
+                    ),
+                    "",
+                )
+            }
+        },
         Command::List { all } => {
             for slug in project::list_slugs(&ctx.root) {
                 let project = Project::load(&ctx.root, &slug)?;
@@ -2287,24 +2301,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     Some("listed"),
                     &serde_json::json!({ "tasks": views }),
                     &message,
-                    "",
-                )
-            }
-            TaskCommand::Note {
-                slug,
-                id,
-                text,
-                request,
-                replaces,
-            } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let record =
-                    crate::task::note(&project, &id, &text, &request, replaces.as_deref())?;
-                let view = crate::task::view(&project, record);
-                crate::output::success(
-                    Some("noted"),
-                    &serde_json::json!({ "task": view }),
-                    &format!("noted {}\n", view.record.id),
                     "",
                 )
             }

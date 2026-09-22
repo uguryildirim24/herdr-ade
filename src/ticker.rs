@@ -1872,7 +1872,10 @@ mod tests {
             .find(|call| call.display().contains("agent prompt"))
             .unwrap()
             .display();
-        assert!(prompt.contains("job-0001: start an attempt"), "{prompt}");
+        assert!(
+            prompt.contains("job-0001: verify 1 acceptance condition(s)"),
+            "{prompt}"
+        );
         let ledger = std::fs::read_to_string(f.project.dir().join("ledger.jsonl")).unwrap();
         assert!(ledger.contains("coordinator_nudge"), "{ledger}");
     }

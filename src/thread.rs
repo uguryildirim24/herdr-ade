@@ -426,17 +426,11 @@ fn render_brief_row(row: &crate::note::Row) -> String {
 }
 
 fn brief_carries_instruction(row: &crate::note::Row) -> bool {
-    row.kind == "standing instruction"
-        && (row.source == "PROJECT.md" || row.at.is_some() && row.request.is_some())
+    row.kind == "standing instruction" && row.at.is_some() && row.request.is_some()
 }
 
 fn brief_carries_memory(row: &crate::note::Row) -> bool {
-    row.kind == "task note"
-        || row.kind == "memory"
-            && row.at.is_some()
-            && row.request.is_some()
-            && row.source != "MEMORY.md"
-            && !row.source.starts_with("memory/")
+    row.kind == "task note" || row.kind == "memory" && row.at.is_some() && row.request.is_some()
 }
 
 fn memory_block(id: &str, text: &str) -> String {
@@ -445,8 +439,7 @@ fn memory_block(id: &str, text: &str) -> String {
 
 /// Measures the largest note payload a current brief would attempt to carry.
 /// Task scopes are measured separately because no brief receives notes for a
-/// different task. Legacy Markdown remains available to coordinator views but
-/// contributes no characters here.
+/// different task. Historical task notes remain scoped to their task.
 pub(crate) fn memory_use(project: &Project) -> MemoryUse {
     let rows = crate::note::active_rows(project);
     let mut scopes = std::collections::BTreeSet::from([None]);
@@ -1481,19 +1474,9 @@ mod tests {
     }
 
     #[test]
-    fn brief_carries_applicable_dated_notes_but_not_legacy_memory() {
+    fn brief_carries_applicable_dated_notes_and_not_the_project_page() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        std::fs::write(
-            project.dir().join("MEMORY.md"),
-            "# Legacy index marker\n- state\n",
-        )
-        .unwrap();
-        std::fs::write(
-            project.dir().join("memory/state.md"),
-            format!("Legacy state marker. {}", "x".repeat(MEMORY_CAP_CHARS)),
-        )
-        .unwrap();
         crate::talk::append(
             &project,
             None,
@@ -1555,20 +1538,11 @@ mod tests {
         crate::task::link_attempt(&project, &current.id, &thread.id).unwrap();
 
         let brief = brief_for(&project, &thread, "Do the task.", false).unwrap();
-        assert!(
-            brief.contains("Historical standing instructions may remain here"),
-            "{brief}"
-        );
+        assert!(!brief.contains("# Project\n"), "{brief}");
         assert!(brief.contains("Dated instruction marker."), "{brief}");
         assert!(brief.contains("Applicable dated marker."), "{brief}");
-        assert!(!brief.contains("Legacy index marker"), "{brief}");
-        assert!(!brief.contains("Legacy state marker"), "{brief}");
         assert!(!brief.contains("Other task marker"), "{brief}");
         assert!(memory_use(&project).warning().is_none());
-
-        let context = crate::note::render_context(&project);
-        assert!(context.contains("undated:MEMORY.md"), "{context}");
-        assert!(context.contains("undated:memory/state.md"), "{context}");
     }
 
     #[test]

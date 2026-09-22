@@ -479,7 +479,7 @@ pub(crate) struct RoundRecord {
     pub(crate) expected_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_hash: Option<String>,
-    /// When `ha round open` wrote the record; orders `GLOSSARY.md` (A3).
+    /// When `ha round open` wrote the record; orders name views (A3).
     #[serde(default)]
     pub(crate) opened: String,
     /// Repository the integration branch lives in, fixed at open (A3).

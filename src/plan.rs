@@ -179,10 +179,12 @@ fn with_plan<T>(
     project_states(project, &mut plan);
     validate(project, &plan)?;
     if plan == before {
+        crate::project::refresh_page(project)?;
         return Ok((plan, extra));
     }
     plan.revision += 1;
     write(project, &plan)?;
+    crate::project::refresh_page(project)?;
     Ok((plan, extra))
 }
 
@@ -462,12 +464,14 @@ pub(crate) fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
         return Ok(SyncOutcome::Missing);
     };
     if !project_states(&project, &mut plan) {
+        crate::project::refresh_page(&project)?;
         return Ok(SyncOutcome::Unchanged {
             revision: plan.revision,
         });
     }
     plan.revision += 1;
     write(&project, &plan)?;
+    crate::project::refresh_page(&project)?;
     Ok(SyncOutcome::Changed {
         revision: plan.revision,
     })
@@ -479,13 +483,16 @@ pub(crate) fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
 pub(crate) fn refresh(_ctx: &Ctx, project: &Project) -> Result<bool> {
     let _lock = plan_lock(project)?;
     let Some(mut plan) = load(project)? else {
+        crate::project::refresh_page(project)?;
         return Ok(false);
     };
     if !project_states(project, &mut plan) {
+        crate::project::refresh_page(project)?;
         return Ok(false);
     }
     plan.revision += 1;
     write(project, &plan)?;
+    crate::project::refresh_page(project)?;
     Ok(true)
 }
 

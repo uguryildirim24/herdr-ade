@@ -297,6 +297,7 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
 /// Publishes every row that passes; a row that fails keeps its previous
 /// value (re-sent with a fresh TTL). Returns the refused rows.
 pub(crate) fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
+    crate::project::refresh_page(project)?;
     if workspace_herdr(ctx, project).is_none() {
         return Ok(Vec::new());
     }
