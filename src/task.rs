@@ -358,9 +358,7 @@ pub(crate) fn add(
     replaces: Option<String>,
 ) -> Result<Task> {
     if title.trim().is_empty() {
-        return Err(crate::refusal::error(
-            "task_title: a plain title is required",
-        ));
+        return Err(crate::refusal::error("task_title: a title is required"));
     }
     if authority.is_empty() {
         return Err(crate::refusal::error(
@@ -372,15 +370,11 @@ pub(crate) fn add(
             "task_acceptance: pass at least one non-empty --acceptance condition",
         ));
     }
-    let title = crate::glossary::check_record_sentence(project, "task title", title)?;
-    let mut checked_acceptance = Vec::new();
-    for (index, condition) in acceptance.iter().enumerate() {
-        checked_acceptance.push(crate::glossary::check_acceptance_condition(
-            project,
-            index + 1,
-            condition,
-        )?);
-    }
+    let title = crate::glossary::check_internal_sentence("task title", title)?;
+    let checked_acceptance = acceptance
+        .iter()
+        .map(|condition| condition.trim().to_string())
+        .collect();
     for reference in &authority {
         if let Err(error) = crate::decide::validate_basis(project, reference) {
             return Err(crate::refusal::error(format!(
@@ -1456,10 +1450,10 @@ created = "2026-09-21T00:00:00Z"
     }
 
     #[test]
-    fn acceptance_conditions_are_checked_one_sentence_at_a_time() {
+    fn acceptance_conditions_keep_long_technical_evidence() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
-        let condition = "Two strong helpers read the failed checks. Each answers the same eight questions. Each writes a review file in the code folder.";
+        let condition = "README, docs and skill files stay aligned. Each t-0284 check records r109 and src/plain.rs. Each writes a review file in the code folder.";
 
         crate::talk::append(
             &project,
@@ -1473,7 +1467,7 @@ created = "2026-09-21T00:00:00Z"
         .unwrap();
         let task = add(
             &project,
-            "Check each acceptance sentence.",
+            "Check README and SPEC-ADE for t-0284.",
             vec!["request:q-1".into()],
             vec![condition.into()],
             None,
@@ -1483,15 +1477,18 @@ created = "2026-09-21T00:00:00Z"
         .unwrap();
 
         assert_eq!(task.acceptance, [condition]);
-        let long = "The first check passes. This sentence has far too many words because it keeps adding needless detail about every little part of the result and then adds even more words today. The last check passes.";
-        let error = crate::glossary::check_acceptance_condition(&project, 2, long).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(
-            message.contains(
-                "acceptance condition 2, sentence 2 `This sentence has far too many words"
-            )
-        );
-        assert!(message.contains("Each condition can also go in its own `--acceptance`."));
+        let long = "The first check passes. This sentence has far too many words for the audience prose check because it keeps exact technical evidence about README, t-0284, r109 and src/plain.rs without losing any detail. The last check passes.";
+        let second = add(
+            &project,
+            "Keep exact evidence in SPEC-ADE.",
+            vec!["request:q-1".into()],
+            vec![long.into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.acceptance, [long]);
     }
 
     #[test]

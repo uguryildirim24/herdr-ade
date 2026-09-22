@@ -846,7 +846,7 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
             "plain_missing: `round open` needs --plain \"<one sentence that says what this round does>\""
         );
     };
-    crate::glossary::check_record_birth(&project, &plain)?;
+    crate::glossary::check_internal_birth(&plain)?;
     let repo = match args.repo {
         Some(repo) => repo,
         None => project_repo(&project)?,
@@ -1637,7 +1637,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                     )?;
                     continue;
                 }
-                ReviewerState::Alive => continue,
+                ReviewerState::Alive => {
+                    crate::ledger::recovered(&project, "round-reviewer-attention", &round);
+                    continue;
+                }
             }
         }
         // No reviewer is bound. This is the one path that starts a review;
@@ -2093,7 +2096,10 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     {
         return ReviewerState::Gone;
     }
-    if row.note == "session unreachable" || row.note.starts_with("not polled yet,") {
+    if row.note == "session unreachable"
+        || row.note.starts_with("first check pending")
+        || row.note.starts_with("first check failed")
+    {
         return ReviewerState::Unknown(row.note.clone());
     }
     let record = &row.thread;
@@ -2118,6 +2124,68 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
         return ReviewerState::Unstarted("no agent appeared in the reviewer's pane".to_string());
     }
     ReviewerState::Alive
+}
+
+/// The round line shown now. Reviewer attention is derived from the latest
+/// thread poll, never from the announcement text saved by an earlier pass.
+/// Older records still load their stored line; only durable merge-repair and
+/// divergence facts continue to use it.
+pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundRecord) -> String {
+    let verdict = record.verdict_kind.as_deref().or_else(|| {
+        record
+            .announced
+            .as_deref()
+            .and_then(|token| token.strip_prefix("verdict:"))
+    });
+    if let Some(verdict) = verdict {
+        return verdict_summary(&record.round, verdict);
+    }
+    if let Some(reviewer) = record.reviewer.as_deref() {
+        let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+        return match reviewer_state(ctx, project, reviewer) {
+            ReviewerState::Alive => {
+                if record.attention.starts_with("Round ") {
+                    String::new()
+                } else {
+                    record.attention.clone()
+                }
+            }
+            ReviewerState::Gone => format!(
+                "Round {}: the reviewer thread {reviewer} is gone; replace its attempt with `{prefix} round retry {} {} --reason <why>`",
+                record.round, project.slug, record.round
+            ),
+            ReviewerState::Unknown(reason) => format!(
+                "Round {}: the reviewer state is unknown ({reason}); no replacement was started",
+                record.round
+            ),
+            ReviewerState::Unstarted(reason) => format!(
+                "Round {}: the reviewer did not start ({reason}); it will retry automatically",
+                record.round
+            ),
+        };
+    }
+    if record.announced.as_deref() == Some("reviewer-start-failed") {
+        return format!(
+            "Round {}: the reviewer did not start; it is retried on the next pass, {} of {} failures",
+            record.round, record.reviewer_start_failures, MAX_REVIEWER_START_FAILURES
+        );
+    }
+    if record.announced.as_deref() == Some("reviewer-start-exhausted") {
+        return format!(
+            "Round {}: the reviewer did not start after {} failures; use `round retry {} {} --reason <why>` or `round cancel {} {} --reason <why>`",
+            record.round,
+            MAX_REVIEWER_START_FAILURES,
+            project.slug,
+            record.round,
+            project.slug,
+            record.round
+        );
+    }
+    if record.attention.starts_with("Round ") {
+        String::new()
+    } else {
+        record.attention.clone()
+    }
 }
 
 /// The one place a reviewer start that did not take is recorded (E3/D1).
@@ -2228,11 +2296,16 @@ fn announce_once(
         let mut record = load(project, round)?;
         let already = record.announced.as_deref() == Some(token);
         record.announced = Some(token.to_string());
-        record.attention = summary.to_string();
+        // The summary is deliberately not persisted. Context derives reviewer
+        // attention from the latest poll, so recovery cannot leave a stale
+        // "gone" line after the reviewer is working again.
         save(project, &record)?;
         if already {
             return Ok(());
         }
+    }
+    if token.starts_with("reviewer-") {
+        crate::ledger::observe(project, "round-reviewer-attention", round, summary);
     }
     if let Some(what) = say_what {
         let _ = crate::ask::say(ctx, &project.slug, &what, None);
@@ -3615,8 +3688,9 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
     if let Some(reason) = &record.abandoned_reason {
         out.push_str(&format!("abandoned because: {reason}\n"));
     }
-    if !record.attention.is_empty() {
-        out.push_str(&format!("attention: {}\n", record.attention));
+    let attention = current_attention(ctx, &project, &record);
+    if !attention.is_empty() {
+        out.push_str(&format!("attention: {attention}\n"));
     }
     for m in &record.manifest.members {
         match &m.pin {
@@ -4402,7 +4476,7 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_without_plain_and_with_a_registry_name() {
+    fn open_requires_plain_but_allows_internal_details() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let args = |round: &str, plain: Option<&str>| OpenArgs {
@@ -4413,39 +4487,17 @@ mod tests {
         };
         assert!(err(open(&ctx, "demo", args("r1", None))).starts_with("plain_missing"));
         let (id, _) = fx.lane(1);
-        let e = err(open(
-            &ctx,
-            "demo",
-            args("r1", Some(&format!("The round finishes {id} today."))),
-        ));
-        assert!(e.contains("plain_birth_refused") && e.contains(&id), "{e}");
-        // The known-word rule is relaxed for a round sentence: the record may
-        // name a file. An identifier-shaped token is still refused.
-        let e = err(open(
-            &ctx,
-            "demo",
-            args("r1", Some("The round touches src/plain.rs.")),
-        ));
-        assert!(e.contains("plain_identifier"), "{e}");
-        open(
-            &ctx,
-            "demo",
-            args("r0", Some("The round lands config.toml.")),
-        )
-        .unwrap();
-        let mut old = load(&fx.project, "r0").unwrap();
-        old.phase = RoundPhase::Abandoned;
-        save(&fx.project, &old).unwrap();
-        open(&ctx, "demo", args("r1", Some(PLAIN))).unwrap();
+        let plain = format!("README, docs and src/plain.rs finish {id} in round r109.");
+        open(&ctx, "demo", args("r1", Some(&plain))).unwrap();
         let record = load(&fx.project, "r1").unwrap();
-        assert_eq!(record.plain, PLAIN);
+        assert_eq!(record.plain, plain);
         assert_eq!(record.manifest.revision, 0);
         assert!(fx.world.runner.count("workspace report-metadata w1 --source herdr-ade --token round=r1 --token branch=main") == 1);
         assert!(err(open(&ctx, "demo", args("r1", Some(PLAIN)))).starts_with("round_exists"));
     }
 
     #[test]
-    fn open_refuses_a_round_sentence_over_the_word_cap() {
+    fn open_keeps_a_long_technical_round_sentence() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let sentence = |n: usize| format!("{}.", vec!["the"; n].join(" "));
@@ -4455,12 +4507,9 @@ mod tests {
             plain: Some(plain),
             repo: Some(fx.repo.to_string_lossy().into_owned()),
         };
-        let e = err(open(&ctx, "demo", args(sentence(26), "r1")));
-        assert!(
-            e.contains("plain_long_sentence") && e.contains("26-word"),
-            "{e}"
-        );
-        open(&ctx, "demo", args(sentence(25), "r1")).unwrap();
+        let plain = sentence(26);
+        open(&ctx, "demo", args(plain.clone(), "r1")).unwrap();
+        assert_eq!(load(&fx.project, "r1").unwrap().plain, plain);
     }
 
     #[test]
@@ -5824,6 +5873,41 @@ mod tests {
                 .0,
             digest
         );
+
+        // A later live poll replaces the old announcement in the rendered
+        // attention line; the stored token is only de-duplication state.
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.status = thread::Status::Open;
+            thread.workspace_id = "w9".into();
+            thread.tab_id = "w9:t1".into();
+            thread.pane_id = "w9:p1".into();
+            thread.cwd = "/review".into();
+            thread.prompt_pending = false;
+        })
+        .unwrap();
+        let live = thread::load(&fx.project, &reviewer).unwrap();
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &live.workspace_id,
+                &live.tab_id,
+                &live.pane_id,
+                &live.cwd,
+                &live.agent_name,
+                "working",
+            )
+        );
+        let refreshed = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(
+            !refreshed.contains("  Round r1: the reviewer thread t-0003 is gone"),
+            "{refreshed}"
+        );
+        assert!(
+            refreshed.contains("round-reviewer-attention"),
+            "the incident remains in history: {refreshed}"
+        );
     }
 
     /// A manual repair gets a new B on the current integration base, and its
@@ -6142,7 +6226,10 @@ mod tests {
             crate::runner::fake::ok(r#"{"result":{}}"#),
         );
         let state = crate::threads::prompt(&ctx, "demo", &id, "carry on").unwrap();
-        assert_eq!(state, "blocked");
+        assert!(matches!(
+            state,
+            crate::threads::PromptOutcome::Sent { agent_state, .. } if agent_state == "blocked"
+        ));
         assert_eq!(fx.world.runner.count("agent prompt"), 0);
         assert_eq!(fx.world.runner.count("pane send-text"), 1);
         assert_eq!(fx.world.runner.count("pane send-keys"), 1);
