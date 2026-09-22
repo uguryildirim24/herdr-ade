@@ -265,10 +265,19 @@ fn path_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn roots(ignored: Vec<String>, nested: Vec<String>, disposable: &[String]) -> BTreeSet<String> {
+fn roots(
+    ignored: Vec<String>,
+    nested: Vec<String>,
+    disposable: &[String],
+    report_artifact_stored: bool,
+) -> BTreeSet<String> {
     let mut roots: BTreeSet<String> = ignored
         .into_iter()
-        .filter(|path| !disposable_path(path, disposable))
+        .filter(|path| {
+            !disposable_path(path, disposable)
+                && !(report_artifact_stored
+                    && (path == ".reports" || path.starts_with(".reports/")))
+        })
         .map(|path| data_root(&path))
         .collect();
     // A nested checkout is durable data even when an enclosing path was
@@ -289,11 +298,12 @@ pub(crate) fn inspect_local(
     repo: &str,
     path: &str,
     disposable: &[String],
+    report_artifact_stored: bool,
 ) -> Result<Inspection> {
     let text = crate::git::worktree_status_with_ignored(runner, repo, path)?;
     let (dirty, ignored) = parse_status(&text);
     let nested = nested_worktrees(Path::new(path))?;
-    let ignored_data = roots(ignored, nested, disposable)
+    let ignored_data = roots(ignored, nested, disposable, report_artifact_stored)
         .into_iter()
         .map(|relative| {
             let bytes = path_size(&Path::new(path).join(&relative))?;
@@ -315,6 +325,7 @@ pub(crate) fn inspect_remote(
     machine_path: &str,
     path: &str,
     disposable: &[String],
+    report_artifact_stored: bool,
 ) -> Result<Inspection> {
     const MARKER: &str = "__HERDR_NESTED_WORKTREES__";
     let quoted = crate::remote::quote(path);
@@ -343,7 +354,7 @@ pub(crate) fn inspect_remote(
         .map(str::to_string)
         .collect();
     let mut ignored_data = Vec::new();
-    for relative in roots(ignored, nested, disposable) {
+    for relative in roots(ignored, nested, disposable, report_artifact_stored) {
         let full = format!("{}/{}", path.trim_end_matches('/'), relative);
         let script = crate::remote::with_path(
             machine_path,
@@ -395,12 +406,21 @@ mod tests {
             &configured
         ));
 
-        assert!(roots(vec!["runs/pytest-x/output.bin".into()], vec![], &configured).is_empty());
+        assert!(
+            roots(
+                vec!["runs/pytest-x/output.bin".into()],
+                vec![],
+                &configured,
+                false
+            )
+            .is_empty()
+        );
         assert_eq!(
             roots(
                 vec!["runs/pytest-x/output.bin".into()],
                 vec!["runs/pytest-x/nested".into()],
-                &configured
+                &configured,
+                false
             ),
             BTreeSet::from(["runs/pytest-x/nested".to_string()]),
             "a wildcard must never make a nested checkout disposable"
@@ -412,9 +432,33 @@ mod tests {
                     "runs/seed-1/output.bin".into()
                 ],
                 vec![],
-                &configured
+                &configured,
+                false
             ),
             BTreeSet::from(["runs".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_artifact_backed_reports_folder_is_disposable_but_nested_work_stays() {
+        assert!(roots(vec![".reports/t-0001.md".into()], vec![], &[], true).is_empty());
+        assert_eq!(
+            roots(
+                vec![".reports/t-0001.md".into(), "runs/raw.bin".into()],
+                vec![],
+                &[],
+                true
+            ),
+            BTreeSet::from(["runs".to_string()])
+        );
+        assert_eq!(
+            roots(
+                vec![".reports/t-0001.md".into()],
+                vec![".reports/nested".into()],
+                &[],
+                true
+            ),
+            BTreeSet::from([".reports/nested".to_string()])
         );
     }
 
@@ -470,7 +514,8 @@ mod tests {
             ok("!! __HERDR_NESTED_WORKTREES__\0\0__HERDR_NESTED_WORKTREES__\0"),
         );
 
-        let inspection = inspect_remote(&runner, "box", "/custom/bin:/bin", "/wt", &[]).unwrap();
+        let inspection =
+            inspect_remote(&runner, "box", "/custom/bin:/bin", "/wt", &[], false).unwrap();
 
         assert_eq!(
             inspection.ignored_data,
