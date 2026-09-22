@@ -34,8 +34,8 @@ With `--json`, use `outcome`, `reason` and `data` to decide what happened. `mess
 
 `hp context` shows the effective `start_threads` setting.
 
-- `propose` (the default): list the threads you suggest, each with a title, the repository and the task, and wait. A go-ahead is an unmarked message from the user that names the threads to start. Only then run `hp thread start` for its task record.
-- `auto`: start them and say that you did.
+- `auto` (the default): start the threads the tasks need and say that you did.
+- `propose`: list the threads you suggest, each with a title, the repository and the task, and wait. A go-ahead is an unmarked message from Rolf that names the threads to start. Only then run `hp thread start` for its task record.
 
 Start a thread by passing the task on standard input:
 
@@ -136,7 +136,8 @@ The project screen reads two records you keep. The plan card (`hp plan`) is the 
 - `hp ask withdraw <id> "<reason>"` takes back an open question, including an older duplicate; its record stays. An answered question cannot be withdrawn.
 - `hp decide overturn <id> "<reason>"` overturns a choice without erasing it. The screen marks it overturned, and context keeps the reason visible: act on it rather than repeating the choice. The command records the shell's `USER` as the actor.
 - `hp decide "<one plain line>" --class routine` for everything ordinary. Only a choice that changes what Rolf gets (`what-you-get`), costs money (`money`) or is hard to undo (`undo`) needs `--basis request:<id>` pointing at the message it rests on (or `--basis ask:<id>@<revision>` for an answered ask); find the id in the prompt the hook prints or in `hp context`'s "Latest messages from Rolf". Those are the ones to ask about first, and a choice with no message behind it asks rather than cites.
-- Ask Rolf only when a choice would change what he gets, add a cost outside his permission, or be hard to undo. For everything else, choose, record one plain sentence with `ha decide`, and keep working. Do not turn ordinary implementation choices into questions. Keep at most three asks open: when another is needed, reask the newest open ask as one clear merged question, keeping the earlier need rather than silently replacing it. Preserve the two older asks and use the existing revision checks. If the choices cannot be merged honestly within the card's limit, pause that new consequential branch until a slot opens; never act without permission to avoid the limit. At each checkpoint and round merge, review the plan's goal, result and steps, refresh it, and report changes in plain words. Treat a request to change a recorded choice like any other message, and distinguish choosing the change from finishing it.
+- Decide anything with a sensible default or that can be undone. Record it with `ha decide`, using Rolf's goal and earlier words as the basis, publish one `ha say` line naming the choice, and carry on.
+- Ask Rolf only about money beyond what he already asked for, an act that cannot be undone or goes outside his machines, or taste and direction. Never ask what he already answered or chose. An open ask never stops other work. Keep at most three asks open; merge a new need into the newest ask when that is honest, otherwise pause only that consequential branch. At each checkpoint and round merge, refresh the plan and report changes in plain words.
 
 ## Rounds
 

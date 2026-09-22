@@ -496,6 +496,15 @@ pub(crate) fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
 
 /// The most recent messages Rolf sent, oldest first, with the request id to
 /// cite. The coordinator digest prints them so an id is always findable.
+pub(crate) fn has_waiting_request(project: &Project) -> bool {
+    requests(&read(project)).into_iter().any(|(request, _)| {
+        matches!(
+            request.state,
+            TalkRequestState::Queued | TalkRequestState::Submitted | TalkRequestState::Uncertain
+        )
+    })
+}
+
 pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, String)> {
     let journal = read(project);
     let mut found: Vec<(String, String)> = journal
