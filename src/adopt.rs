@@ -151,22 +151,49 @@ pub(crate) fn adopt(
             let _lock = project.lock()?;
             project::write_atomic(&thread::task_path(&project, &id), task.as_bytes())?;
         }
-        // Two adopted panes in one directory still get separate thread directories.
-        let dir = thread::thread_dir(&agent.cwd, slug, &id);
-        let with_dir = Thread {
-            thread_dir: dir.clone(),
-            ..created.clone()
-        };
         let prefix = crate::coordinator::current_prefix(&ctx.root)?;
-        let brief = thread::with_lane_skill(
-            &prefix,
-            &thread::brief_for(&project, &with_dir, &task, false)?,
-        );
-        std::fs::create_dir_all(Path::new(&dir).join("library"))
-            .with_context(|| format!("could not create {dir}"))?;
-        threads::exclude_from_git(ctx.runner, &agent.cwd)?;
-        project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
-        thread::update(&project, &id, |t| t.thread_dir = dir)?;
+        if created.repo.is_empty() {
+            // An adopted process cannot have its cwd replaced, but all of its
+            // durable work lives in the same project-owned git folder as a
+            // newly started no-repository thread. `done` stages this folder.
+            let folder = project.dir().join("threads").join(&id);
+            let with_dir = Thread {
+                worktree_path: folder.to_string_lossy().into_owned(),
+                thread_dir: folder.to_string_lossy().into_owned(),
+                ..created.clone()
+            };
+            let brief = thread::with_lane_skill(
+                &prefix,
+                &thread::brief_for(&project, &with_dir, &task, false)?,
+            );
+            let (folder, hash, base) =
+                threads::prepare_managed_git_folder(ctx.runner, &folder, &brief)?;
+            let folder = folder.to_string_lossy().into_owned();
+            thread::update(&project, &id, |t| {
+                t.worktree_path = folder.clone();
+                t.thread_dir = folder;
+                t.branch = "main".into();
+                t.base = base;
+                t.launch.brief_hash = hash;
+            })?;
+        } else {
+            // An adopted process already in a code repository keeps its
+            // per-thread report directory out of that repository.
+            let dir = thread::thread_dir(&agent.cwd, slug, &id);
+            let with_dir = Thread {
+                thread_dir: dir.clone(),
+                ..created.clone()
+            };
+            let brief = thread::with_lane_skill(
+                &prefix,
+                &thread::brief_for(&project, &with_dir, &task, false)?,
+            );
+            std::fs::create_dir_all(Path::new(&dir).join("library"))
+                .with_context(|| format!("could not create {dir}"))?;
+            threads::exclude_from_git(ctx.runner, &agent.cwd)?;
+            project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
+            thread::update(&project, &id, |t| t.thread_dir = dir)?;
+        }
         Ok(())
     })();
     if let Err(error) = briefed {
@@ -182,10 +209,11 @@ pub(crate) fn adopt(
     // delivery path sends the line later (also when the agent ends in `done`).
     // Passive adopt (SPEC-ADE D7) sends nothing.
     let _ = herdr.pane_set_parent(pane, &record.pane_id);
+    let placed = thread::load(&project, &id)?;
     let sent = !passive
         && agent.ready()
         && herdr
-            .agent_prompt(pane, &thread::launch_prompt("", slug, &created))
+            .agent_prompt(pane, &thread::launch_prompt("", slug, &placed))
             .is_ok();
     let adopted = thread::update(&project, &id, |t| {
         t.status = Status::Open;
@@ -292,7 +320,8 @@ pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{fail, ok};
+    use crate::runner::Runner;
+    use crate::runner::fake::ok;
     use crate::scenarios::{World, agent_json};
 
     fn lane() -> AdeAdopt {
@@ -313,14 +342,17 @@ mod tests {
             agent_json("w5", "w5:t1", "w5:p1", &cwd, name, state),
             agent_json("w5", "w5:t1", "w5:p2", &cwd, "", "idle")
         );
-        world.runner.on("git -C", fail(128, "not a git repository"));
+        world.runner.on_fn(
+            |cmd| cmd.program == "git",
+            |cmd| crate::runner::RealRunner.run(cmd),
+        );
         world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
         (world, project, cwd)
     }
 
     #[test]
     fn adopting_a_ready_agent_writes_a_brief_and_prompts_it() {
-        let (world, project, cwd) = world_with_agent("idle", "my-agent");
+        let (world, project, _cwd) = world_with_agent("idle", "my-agent");
         let t = adopt(
             &world.ctx(),
             "demo",
@@ -335,7 +367,14 @@ mod tests {
             (Kind::Adopted, Status::Open, false)
         );
         assert_eq!(t.agent_name, "my-agent");
-        assert_eq!(t.thread_dir, format!("{cwd}/.herdr-project/demo-t-0001"));
+        assert_eq!(
+            Path::new(&t.thread_dir),
+            std::fs::canonicalize(project.dir().join("threads/t-0001"))
+                .unwrap()
+                .as_path()
+        );
+        assert_eq!(t.worktree_path, t.thread_dir);
+        assert!(Path::new(&t.thread_dir).join(".git").is_dir());
         let brief = std::fs::read_to_string(format!("{}/brief.md", t.thread_dir)).unwrap();
         assert!(brief.contains("Finish the refactor."));
         assert_eq!(world.runner.count("agent prompt"), 1);
@@ -344,8 +383,10 @@ mod tests {
         // A second pane in the same directory gets its own thread directory.
         let second = adopt(&world.ctx(), "demo", "w5:p2", "Second", None, lane()).unwrap();
         assert_eq!(
-            second.thread_dir,
-            format!("{cwd}/.herdr-project/demo-t-0002")
+            Path::new(&second.thread_dir),
+            std::fs::canonicalize(project.dir().join("threads/t-0002"))
+                .unwrap()
+                .as_path()
         );
         assert!(second.agent_name.is_empty());
         assert_ne!(t.thread_dir, second.thread_dir);

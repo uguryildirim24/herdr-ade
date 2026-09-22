@@ -948,8 +948,9 @@ fn finished_worktrees(
         );
         for thread in threads {
             if thread.status != crate::thread::Status::Resolved
-                || thread.kind != crate::thread::Kind::Worktree
                 || thread.worktree_path.is_empty()
+                || (thread.kind != crate::thread::Kind::Worktree
+                    && !crate::threads::managed_git_folder(&project, &thread))
             {
                 continue;
             }
