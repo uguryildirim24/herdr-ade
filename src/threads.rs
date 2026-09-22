@@ -11,7 +11,7 @@ use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
-use crate::thread::{self, CopyOutcome, Group, Kind, Status, Thread};
+use crate::thread::{self, CopyOutcome, FollowUp, FollowUpState, Group, Kind, Status, Thread};
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -122,26 +122,15 @@ pub struct StartArgs {
     pub task_id: String,
 }
 
-/// Birth sentence: required, one sentence, R1–R5 except the known-word rule
-/// (SPEC-ADE D17 item 6). The sentence is a row on a screen, so it may name a
-/// file; `say`, `ask` and their choices keep the known-word rule.
+/// Internal birth sentence: required and structurally one sentence. Exact and
+/// long technical details are retained; the screen wraps or collapses them.
 pub fn check_birth_plain(text: &str) -> Result<()> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         bail!("plain_missing");
     }
-    let glossary = crate::plain::Glossary::default();
-    let result = crate::plain::check_record(trimmed, &glossary);
-    if !result.passed() {
-        let detail: Vec<String> = result
-            .violations
-            .iter()
-            .map(|v| format!("{}: {}", v.rule.code(), v.fix))
-            .collect();
-        bail!("{}", detail.join("; "));
-    }
     if crate::plain::sentence_count(trimmed) != 1 {
-        bail!("write one sentence of at most 25 words");
+        bail!("write one sentence");
     }
     Ok(())
 }
@@ -331,7 +320,15 @@ fn start_with_ticker(
     match place_and_brief(ctx, &project, &view, &id, false) {
         Ok(thread) => {
             refresh_plan(ctx, &project);
-            Ok(thread)
+            if thread.is_remote()
+                && let Err(error) =
+                    ticker::request_remote_poll(&ctx.root, &project, thread.machine_route())
+            {
+                eprintln!(
+                    "note: thread {id} is placed, but the ticker could not be woken for its first box poll: {error:#}"
+                );
+            }
+            Ok(thread::load(&project, &id).unwrap_or(thread))
         }
         Err(error) => {
             let message = format!("{error:#}");
@@ -1889,21 +1886,79 @@ pub(crate) fn resolve_report_only(ctx: &Ctx, project: &Project) {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "delivery")]
+pub enum PromptOutcome {
+    Queued { attempt: u32 },
+    Sent { attempt: u32, agent_state: String },
+}
+
+fn awaiting_follow_up(record: &Thread) -> bool {
+    let attempt = record.attempt.max(1);
+    record.follow_ups.iter().any(|follow_up| {
+        follow_up.attempt == attempt
+            && matches!(
+                follow_up.state,
+                FollowUpState::Queued | FollowUpState::Uncertain
+            )
+    })
+}
+
+fn awaiting_bootstrap(record: &Thread) -> bool {
+    record.kind != Kind::Adopted
+        && !record.launch.kind.is_empty()
+        && record.bootstrap != "acknowledged"
+}
+
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
-pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutcome> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
-    if text.trim().is_empty() {
+    let mut record = thread::load(&project, id)?;
+    let text = text.trim();
+    if text.is_empty() {
         bail!("the text is empty");
     }
-    if record.status == Status::Resolved {
-        return Err(crate::refusal::error(format!("{id} is resolved")));
+    match record.status {
+        Status::Resolved => return Err(crate::refusal::error(format!("{id} is resolved"))),
+        Status::Failed => return Err(crate::refusal::error(format!("{id} is gone"))),
+        Status::Starting | Status::Open => {}
     }
-    if record.prompt_pending {
-        return Err(crate::refusal::error(format!(
-            "{id} has not received its brief yet; try again once it has started"
-        )));
+    // The brief and every follow-up have one ordered delivery path. Once one
+    // message is queued, later messages join it until the ticker drains them.
+    if record.status == Status::Starting
+        || record.prompt_pending
+        || awaiting_bootstrap(&record)
+        || awaiting_follow_up(&record)
+    {
+        let mut queued = false;
+        record = thread::update_checked(&project, id, |thread| {
+            match thread.status {
+                Status::Resolved => {
+                    return Err(crate::refusal::error(format!("{id} is resolved")));
+                }
+                Status::Failed => return Err(crate::refusal::error(format!("{id} is gone"))),
+                Status::Starting | Status::Open => {}
+            }
+            if thread.status == Status::Starting
+                || thread.prompt_pending
+                || awaiting_bootstrap(thread)
+                || awaiting_follow_up(thread)
+            {
+                thread.follow_ups.push(FollowUp {
+                    attempt: thread.attempt.max(1),
+                    text: text.to_string(),
+                    state: FollowUpState::Queued,
+                });
+                queued = true;
+            }
+            Ok(())
+        })?;
+        if queued {
+            return Ok(PromptOutcome::Queued {
+                attempt: record.attempt.max(1),
+            });
+        }
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
@@ -1922,15 +1977,18 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     // no durable error still refuses in `prompt_state` above.
     if state == "blocked" {
         herdr
-            .pane_submit_text(&record.pane_id, text.trim())
+            .pane_submit_text(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         thread::update(&project, id, |t| t.error.clear())?;
     } else {
         herdr
-            .agent_prompt(&record.pane_id, text.trim())
+            .agent_prompt(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
-    Ok(state)
+    Ok(PromptOutcome::Sent {
+        attempt: record.attempt.max(1),
+        agent_state: state,
+    })
 }
 
 /// The state a follow-up may be sent in, or the refusal.
@@ -3039,16 +3097,58 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
         };
     };
     if t.is_remote() {
-        // Remote state is what the ticker last polled; the CLI makes no ssh call.
-        let state = if t.last_state.is_empty() {
-            "not polled yet"
+        // Remote state is what the ticker last observed; the CLI makes no SSH
+        // call and never turns an old state into an untimed current claim.
+        let source = if t.observation_source.is_empty() {
+            "courier"
         } else {
-            &t.last_state
+            &t.observation_source
+        };
+        let note = if t.last_observed.is_empty() {
+            if !t.last_state.is_empty() {
+                let next = if t.observation_error.is_empty() {
+                    "next check pending".to_string()
+                } else {
+                    format!(
+                        "latest check failed at {} by {source}: {}",
+                        t.observation_attempted, t.observation_error
+                    )
+                };
+                format!(
+                    "{}; last checked time and source unknown; {next}, on {}",
+                    t.last_state, t.machine
+                )
+            } else if t.observation_error.is_empty() {
+                format!("first check pending by {source}, on {}", t.machine)
+            } else {
+                format!(
+                    "first check failed at {} by {source}: {}, on {}",
+                    t.observation_attempted, t.observation_error, t.machine
+                )
+            }
+        } else {
+            let state = if t.last_state.is_empty() {
+                "no agent"
+            } else {
+                &t.last_state
+            };
+            let next = if t.observation_error.is_empty() {
+                "next check pending".to_string()
+            } else {
+                format!(
+                    "latest check failed at {}: {}",
+                    t.observation_attempted, t.observation_error
+                )
+            };
+            format!(
+                "{state}; last checked {} by {source}; {next}, on {}",
+                t.last_observed, t.machine
+            )
         };
         return Row {
             thread: t.clone(),
             group: recorded,
-            note: format!("{state}, on {}", t.machine),
+            note,
         };
     }
     let live = thread::live_state(t, &view.agents, &view.panes, now);
@@ -3262,6 +3362,23 @@ mod tests {
     }
 
     #[test]
+    fn a_follow_up_stays_queued_until_the_matching_bootstrap_receipt() {
+        let mut record = worktree_thread();
+        record.status = Status::Open;
+        record.prompt_pending = false;
+        record.launch.kind = "pi".into();
+        record.bootstrap.clear();
+        assert!(awaiting_bootstrap(&record));
+
+        record.bootstrap = "acknowledged".into();
+        assert!(!awaiting_bootstrap(&record));
+
+        record.kind = Kind::Adopted;
+        record.bootstrap.clear();
+        assert!(!awaiting_bootstrap(&record));
+    }
+
+    #[test]
     fn prompt_refusals_and_sending_while_working() {
         let t = Thread {
             agent_name: String::new(),
@@ -3325,15 +3442,13 @@ mod tests {
     }
 
     #[test]
-    fn birth_sentence_is_required_and_checked() {
+    fn birth_sentence_keeps_structure_and_exact_technical_details() {
         let err = check_birth_plain("").unwrap_err().to_string();
         assert!(err.contains("plain_missing"), "{err}");
-        // An identifier-shaped token is still refused; only the known-word
-        // rule is relaxed for a thread sentence.
-        assert!(check_birth_plain("It touches src/plain.rs there.").is_err());
-        // A file name the record needs is allowed.
-        check_birth_plain("It changes config.toml today.").unwrap();
+        check_birth_plain("README, docs and skill files change src/plain.rs for t-0284.").unwrap();
         check_birth_plain("The lane does the work.").unwrap();
+        let long = format!("{}.", vec!["README"; 26].join(" "));
+        check_birth_plain(&long).unwrap();
     }
 
     struct GitReal<'a> {

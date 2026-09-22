@@ -42,6 +42,10 @@ pub(crate) fn command_prefix(binary: &Path, root: &Path) -> String {
 }
 
 pub(crate) fn current_prefix(root: &Path) -> Result<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if home.is_some_and(|home| root == home.join(".herdr-ade")) {
+        return Ok("ha".into());
+    }
     let binary = std::env::current_exe().context("could not find this binary's own path")?;
     Ok(command_prefix(&binary, root))
 }
@@ -519,7 +523,7 @@ fn digest_snapshot(
     let _ = writeln!(out, "\n## Recipes");
     match crate::launch::parse_launch_config(&ctx.config_dir) {
         Ok(config) => {
-            for line in crate::launch::context_recipe_lines(&config, prefix, slug) {
+            for line in crate::launch::context_recipe_lines(&config) {
                 let _ = writeln!(out, "{line}");
             }
         }
@@ -806,9 +810,10 @@ fn digest_snapshot(
         if let Some(reviewer) = &round.reviewer {
             let _ = writeln!(out, "  reviewer: {reviewer}");
         }
+        let attention = crate::round::current_attention(ctx, project, round);
         if let Some(merge) = &round.merge {
-            if !round.attention.is_empty() {
-                let _ = writeln!(out, "  {}", round.attention);
+            if !attention.is_empty() {
+                let _ = writeln!(out, "  {attention}");
             }
             let _ = writeln!(
                 out,
@@ -821,10 +826,8 @@ fn digest_snapshot(
                 round.round
             );
         } else {
-            if !round.attention.is_empty() {
-                let _ = writeln!(out, "  {}", round.attention);
-            } else if let Some(announced) = &round.announced {
-                let _ = writeln!(out, "  {announced}");
+            if !attention.is_empty() {
+                let _ = writeln!(out, "  {attention}");
             }
             if round.reviewer_start_failures > 0 {
                 let _ = writeln!(

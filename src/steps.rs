@@ -45,6 +45,9 @@ pub(crate) struct State {
     pub(crate) session_item_written: bool,
     /// Last successful automated prompt to continue open work.
     pub(crate) idle_nudge_last: String,
+    /// Last next action announced for each task. An unchanged action is not
+    /// useful a second time, even after the coordinator reads context.
+    pub(crate) idle_nudge_next: BTreeMap<String, String>,
 }
 
 pub(crate) fn load_state(project: &Project) -> State {

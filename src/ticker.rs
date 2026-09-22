@@ -42,6 +42,43 @@ fn handoff_path(root: &Path) -> PathBuf {
     root.join(".ticker.handoff")
 }
 
+fn wake_path(root: &Path) -> PathBuf {
+    root.join(".ticker.wake")
+}
+
+fn poll_request_path(project: &Project) -> PathBuf {
+    project.state_dir().join("poll-now.json")
+}
+
+fn poll_requests(project: &Project) -> std::collections::BTreeSet<String> {
+    project::read_json(&poll_request_path(project)).unwrap_or_default()
+}
+
+/// Wakes the existing ticker and marks this machine due in its normal courier
+/// pass. Thread commands never open their own SSH polling path.
+pub(crate) fn request_remote_poll(root: &Path, project: &Project, machine: &str) -> Result<()> {
+    {
+        let _lock = project.lock()?;
+        let mut requests = poll_requests(project);
+        requests.insert(machine.to_string());
+        project::write_json(&poll_request_path(project), &requests)?;
+    }
+    project::write_atomic(&wake_path(root), b"poll\n")
+}
+
+fn clear_poll_request(project: &Project, machine: &str) {
+    let Ok(_lock) = project.lock() else {
+        return;
+    };
+    let mut requests = poll_requests(project);
+    requests.remove(machine);
+    if requests.is_empty() {
+        let _ = std::fs::remove_file(poll_request_path(project));
+    } else {
+        let _ = project::write_json(&poll_request_path(project), &requests);
+    }
+}
+
 /// What the lock holder writes into the lock file, for `ticker status` and
 /// `doctor`. The pid is for display only; nothing signals it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -466,6 +503,10 @@ pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
                 log.line("stop file found; exiting");
                 return Ok(());
             }
+            if wake_path(root).exists() {
+                let _ = std::fs::remove_file(wake_path(root));
+                break;
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
         if tick(ctx, &log, &mut memory) {
@@ -512,6 +553,21 @@ pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     !reachable.is_empty()
+}
+
+fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail: &str, log: &Log) {
+    let attempted = project::now();
+    for (project, threads) in entries {
+        for lane in threads {
+            if let Err(error) = thread::update(project, &lane.id, |record| {
+                record.observation_attempted = attempted.clone();
+                record.observation_source = "courier".into();
+                record.observation_error = crate::pr::sanitize(detail);
+            }) {
+                log.line(&format!("{error:#}"));
+            }
+        }
+    }
 }
 
 fn clear_lost_connections(entries: &[(Project, Vec<thread::Thread>)], log: &Log) {
@@ -566,7 +622,15 @@ fn machine_passes(
     }
     let mut errors = Vec::new();
     for (machine, entries) in by_machine {
-        if !memory.machine_is_due(&machine) {
+        let forced = entries
+            .iter()
+            .any(|(project, _)| poll_requests(project).contains(&machine));
+        if forced {
+            let tick = memory.tick;
+            let entry = memory.machines.entry(machine.clone()).or_default();
+            entry.last_poll_tick = tick;
+            entry.skip_until_tick = 0;
+        } else if !memory.machine_is_due(&machine) {
             continue;
         }
         let projects: Vec<&Project> = entries.iter().map(|(project, _)| project).collect();
@@ -576,13 +640,20 @@ fn machine_passes(
         {
             let detail = format!("{error:#}");
             errors.push(anyhow::anyhow!("{machine}: {detail}"));
+            record_failed_observation(&entries, &detail, log);
             // This is local configuration evidence, not evidence about the
             // connection. Leave no remote view for the slow pass and replace
             // any stale connection classification with unknown.
             clear_lost_connections(&entries, log);
+            for (project, _) in &entries {
+                clear_poll_request(project, &machine);
+            }
             continue;
         }
         let reason = outcome.as_ref().err().map(|e| format!("{e:#}"));
+        if let Some(reason) = &reason {
+            record_failed_observation(&entries, reason, log);
+        }
         let event = memory.record_machine(&machine, reason.as_deref(), now);
         // After the configured outage period, type one unreachable BLOCKED per
         // open box lane, then stay quiet until the machine answers again
@@ -618,6 +689,9 @@ fn machine_passes(
         };
         if let Err(error) = steps::write_machine_outage(first, &machine, event, memory) {
             errors.push(error.context("machine outage"));
+        }
+        for (project, _) in &entries {
+            clear_poll_request(project, &machine);
         }
         memory
             .machine_views
@@ -740,23 +814,121 @@ fn thread_pass(
             live.state_secs = live.state_secs.max(thread::BLOCKED_DEBOUNCE_SECS);
         }
 
+        let ready = live
+            .agent_state
+            .as_deref()
+            .is_some_and(crate::herdr::ready_state);
         let mut delivered = false;
-        if t.prompt_pending
-            && live
-                .agent_state
-                .as_deref()
-                .is_some_and(crate::herdr::ready_state)
-        {
+        if t.prompt_pending && ready {
             match herdr.agent_prompt_wait_started(
                 &t.pane_id,
                 &thread::launch_prompt(prefix, slug, t),
                 agent_start_timeout(&t.launch),
             ) {
-                Ok(()) => delivered = true,
+                Ok(()) => {
+                    delivered = true;
+                    thread::update(project, &t.id, |thread| thread.prompt_pending = false)?;
+                }
                 Err(error) => {
                     pass.error = pass
                         .error
                         .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+                }
+            }
+        } else if !t.prompt_pending && t.bootstrap == "acknowledged" && ready {
+            // The matching bootstrap receipt proves the lane consumed this
+            // attempt's brief. Mark each message uncertain before transport:
+            // a crash or ambiguous transport result must never resend it.
+            loop {
+                let current = thread::load(project, &t.id)?;
+                if current.status != thread::Status::Open
+                    || current.prompt_pending
+                    || current.bootstrap != "acknowledged"
+                {
+                    break;
+                }
+                let attempt = current.attempt.max(1);
+                let Some((index, follow_up)) = current
+                    .follow_ups
+                    .iter()
+                    .enumerate()
+                    .find(|(_, follow_up)| {
+                        follow_up.attempt == attempt
+                            && matches!(
+                                follow_up.state,
+                                thread::FollowUpState::Queued | thread::FollowUpState::Uncertain
+                            )
+                    })
+                    .map(|(index, follow_up)| (index, follow_up.clone()))
+                else {
+                    break;
+                };
+                if follow_up.state == thread::FollowUpState::Uncertain {
+                    break;
+                }
+                thread::update_checked(project, &t.id, |thread| {
+                    if thread.status != thread::Status::Open
+                        || thread.attempt.max(1) != attempt
+                        || thread.follow_ups.get(index) != Some(&follow_up)
+                    {
+                        anyhow::bail!("queued follow-up changed before delivery");
+                    }
+                    thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
+                    Ok(())
+                })?;
+                match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
+                    Ok(()) => {
+                        delivered = true;
+                        thread::update_checked(project, &t.id, |thread| {
+                            let Some(saved) = thread.follow_ups.get(index) else {
+                                anyhow::bail!("queued follow-up disappeared during delivery");
+                            };
+                            if saved.attempt != attempt
+                                || saved.text != follow_up.text
+                                || saved.state != thread::FollowUpState::Uncertain
+                            {
+                                anyhow::bail!("queued follow-up changed during delivery");
+                            }
+                            thread.follow_ups.remove(index);
+                            Ok(())
+                        })?;
+                    }
+                    Err(error)
+                        if !matches!(error.code.as_str(), "timeout" | "unreachable" | "failed") =>
+                    {
+                        // Herdr refused before typing (for example a newly
+                        // blocked approval prompt), so this remains retryable.
+                        thread::update_checked(project, &t.id, |thread| {
+                            if let Some(saved) = thread.follow_ups.get_mut(index)
+                                && saved.attempt == attempt
+                                && saved.text == follow_up.text
+                                && saved.state == thread::FollowUpState::Uncertain
+                            {
+                                saved.state = thread::FollowUpState::Queued;
+                            }
+                            Ok(())
+                        })?;
+                        pass.error = pass
+                            .error
+                            .or(Some(anyhow::anyhow!("{}: queued prompt: {error}", t.id)));
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = inbox::write(
+                            project,
+                            "prompt-uncertain",
+                            &t.id,
+                            &format!(
+                                "{} attempt {attempt} may have received a follow-up; check the lane before sending it again",
+                                t.id
+                            ),
+                            "",
+                        );
+                        pass.error = pass
+                            .error
+                            .or(Some(anyhow::anyhow!("{}: queued prompt: {error}", t.id)));
+                        break;
+                    }
                 }
             }
         }
@@ -768,11 +940,11 @@ fn thread_pass(
             Some(hashes) => hashes.get(&t.id).cloned(),
             None => thread::local_report_hash(t),
         };
-        let report_hash = fresh_hash.unwrap_or_else(|| t.report_hash.clone());
+        let current = thread::load(project, &t.id)?;
+        let report_hash = fresh_hash.unwrap_or_else(|| current.report_hash.clone());
         let after = thread::Thread {
-            prompt_pending: t.prompt_pending && !delivered,
             report_hash,
-            ..t.clone()
+            ..current
         };
         // In the tick that delivers a prompt the agent still reads as idle; it
         // has just been given work, so it is Working, not Idle.
@@ -784,7 +956,9 @@ fn thread_pass(
         let process_gone = !t.is_remote()
             && after.report_hash.is_empty()
             && (!live.pane_exists
-                || (live.agent_state.is_none() && !t.prompt_pending && !t.last_state.is_empty()));
+                || (live.agent_state.is_none()
+                    && !after.prompt_pending
+                    && !t.last_state.is_empty()));
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
             if let Err(error) = threads::fail_start(
@@ -801,14 +975,18 @@ fn thread_pass(
             }
             continue;
         }
-        if delivered || state != t.last_state || group.token() != t.last_group {
+        if t.is_remote() || delivered || state != t.last_state || group.token() != t.last_group {
             thread::update(project, &t.id, |t| {
-                if delivered {
-                    t.prompt_pending = false;
-                }
                 if state != t.last_state {
                     t.last_state = state.clone();
                     t.last_state_change = project::now();
+                }
+                if t.is_remote() {
+                    let observed = project::now();
+                    t.last_observed = observed.clone();
+                    t.observation_attempted = observed;
+                    t.observation_source = "courier".into();
+                    t.observation_error.clear();
                 }
                 if t.failure_class == crate::contracts::FailureClass::ProcessGone {
                     t.failure_class = crate::contracts::FailureClass::Unknown;
@@ -849,7 +1027,7 @@ fn launch_pass(
     may_start: &mut bool,
     one_at_a_time: bool,
     errors: &mut Vec<anyhow::Error>,
-) {
+) -> bool {
     let now = jiff::Timestamp::now();
     let mut pending = Vec::new();
     for t in pass.threads {
@@ -922,7 +1100,7 @@ fn launch_pass(
         }
     }
     let Some(first) = pending.first() else {
-        return;
+        return false;
     };
     let parent = pass
         .project
@@ -972,6 +1150,7 @@ fn launch_pass(
                 .map(|error| error.context(format!("{}: launch", t.id))),
         );
     }
+    true
 }
 
 fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
@@ -984,19 +1163,19 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .collect()
 }
 
-fn open_work_next_steps(project: &Project) -> Vec<String> {
+fn open_work_next_steps(project: &Project) -> BTreeMap<String, String> {
     let now = jiff::Timestamp::now();
     if thread::list(project)
         .iter()
         .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
     {
-        return Vec::new();
+        return BTreeMap::new();
     }
     crate::task::views(project)
         .0
         .into_iter()
         .filter(|view| !view.terminal(project) && !view.next.starts_with("wait for Rolf"))
-        .map(|view| format!("{}: {}", view.record.id, view.next))
+        .map(|view| (view.record.id, view.next))
         .collect()
 }
 
@@ -1033,7 +1212,12 @@ fn nudge_idle_coordinator(
     {
         return Ok(());
     }
-    let next = open_work_next_steps(project);
+    let current = open_work_next_steps(project);
+    let next: Vec<_> = current
+        .iter()
+        .filter(|(id, action)| state.idle_nudge_next.get(*id) != Some(*action))
+        .map(|(id, action)| format!("{id}: {action}"))
+        .collect();
     if next.is_empty() {
         return Ok(());
     }
@@ -1061,6 +1245,7 @@ fn nudge_idle_coordinator(
     let sent_at = project::now();
     herdr.agent_prompt(&coordinator.pane_id, &text)?;
     state.idle_nudge_last = sent_at;
+    state.idle_nudge_next = current;
     crate::ledger::coordinator_nudge(project, &next)
 }
 
@@ -1220,7 +1405,7 @@ fn remote_pass(
     };
     let state_pass = thread_pass(&state_input, &prefix, None).map_err(|e| format!("{e:#}"))?;
     errors.extend(state_pass.error);
-    launch_pass(
+    let launched = launch_pass(
         &LaunchPass {
             ctx,
             project,
@@ -1233,6 +1418,12 @@ fn remote_pass(
         false,
         errors,
     );
+    if launched {
+        errors.extend(request_remote_poll(&ctx.root, project, machine).err());
+    }
+    errors.extend(clean_managed_project_tabs(
+        project, machine, &remote, &agents, &panes,
+    ));
     // The D8 BLOCKED/GONE lines for this machine's box lanes (SPEC-remote §4.3).
     errors.extend(steps::remote_attention(
         ctx,
@@ -1247,6 +1438,48 @@ fn remote_pass(
         },
     ));
     Ok(())
+}
+
+/// Closes only a tab the ADE can prove it created and no process still owns.
+/// An unowned shell in a project-labelled workspace is advisory evidence, not
+/// authority to destroy someone else's foreground work.
+fn clean_managed_project_tabs(
+    project: &Project,
+    machine: &str,
+    herdr: &Herdr<'_>,
+    agents: &[Agent],
+    panes: &[Pane],
+) -> Vec<anyhow::Error> {
+    thread::list(project)
+        .into_iter()
+        .filter(|record| {
+            record.is_remote()
+                && record.machine_route() == machine
+                && record.kind != thread::Kind::Adopted
+                && !matches!(
+                    record.status,
+                    thread::Status::Starting | thread::Status::Open
+                )
+                && !agents.iter().any(|agent| agent.tab_id == record.tab_id)
+                && {
+                    let tab_panes: Vec<_> = panes
+                        .iter()
+                        .filter(|pane| pane.tab_id == record.tab_id)
+                        .collect();
+                    tab_panes.len() == 1 && thread::pane_matches(record, tab_panes[0])
+                }
+        })
+        .filter(|record| {
+            herdr.pane_process_info(&record.pane_id).is_ok_and(|info| {
+                info.pane_id == record.pane_id && info.foreground_processes.is_empty()
+            })
+        })
+        .filter_map(|record| {
+            herdr.tab_close(&record.tab_id).err().map(|error| {
+                anyhow::anyhow!("{machine}: close managed tab {}: {error}", record.tab_id)
+            })
+        })
+        .collect()
 }
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
@@ -1427,7 +1660,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
 mod tests {
     use super::*;
     use crate::paths::Env;
-    use crate::runner::fake::{FakeRunner, fail, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok, timeout};
 
     fn held(version: &str) -> LockState {
         LockState::Held(Info {
@@ -1513,6 +1746,62 @@ mod tests {
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
+    }
+
+    #[test]
+    fn a_new_box_lane_wakes_the_ticker_and_marks_its_machine_due() {
+        let fixture = fixture(false);
+
+        request_remote_poll(&fixture.root, &fixture.project, "machine-1").unwrap();
+
+        assert!(wake_path(&fixture.root).exists());
+        assert!(poll_requests(&fixture.project).contains("machine-1"));
+    }
+
+    #[test]
+    fn a_box_poll_closes_only_a_managed_tab_with_verified_empty_process_state() {
+        let fixture = fixture(false);
+        thread::allocate(&fixture.project, |record| {
+            record.status = thread::Status::Resolved;
+            record.machine = "oci".into();
+            record.machine_id = "machine-1".into();
+            record.workspace_id = "w2".into();
+            record.tab_id = "w2:t1".into();
+            record.pane_id = "w2:p1".into();
+            record.cwd = "/deleted-worktree".into();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "pane process-info --pane w2:p1",
+            ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#),
+        );
+        runner.on("tab close w2:t1", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "", &runner).on_machine("machine-1");
+        let panes = [Pane {
+            pane_id: "w2:p1".into(),
+            tab_id: "w2:t1".into(),
+            workspace_id: "w2".into(),
+            cwd: "/deleted-worktree".into(),
+        }];
+
+        let errors = clean_managed_project_tabs(&fixture.project, "machine-1", &herdr, &[], &panes);
+
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(runner.count("tab close w2:t1"), 1);
+        assert_eq!(runner.count("tab close w2:t2"), 0);
+
+        let mut shared_tab = panes.to_vec();
+        shared_tab.push(Pane {
+            pane_id: "w2:p2".into(),
+            tab_id: "w2:t1".into(),
+            workspace_id: "w2".into(),
+            cwd: "/someone-else".into(),
+        });
+        let errors =
+            clean_managed_project_tabs(&fixture.project, "machine-1", &herdr, &[], &shared_tab);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(runner.count("tab close w2:t1"), 1);
     }
 
     #[test]
@@ -1742,6 +2031,159 @@ mod tests {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
     }
 
+    #[test]
+    fn follow_ups_queued_during_start_arrive_after_the_brief_in_order() {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Open;
+            lane.prompt_pending = true;
+            lane.workspace_id = "w1".into();
+            lane.tab_id = "w1:t2".into();
+            lane.pane_id = "w1:p2".into();
+            lane.cwd = "/wt".into();
+            lane.agent = "claude".into();
+            lane.agent_name = "hp-demo-t-0001".into();
+        })
+        .unwrap();
+
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane.id, "check the first gate").unwrap(),
+            crate::threads::PromptOutcome::Queued { attempt: 1 }
+        ));
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane.id, "then check the second gate").unwrap(),
+            crate::threads::PromptOutcome::Queued { attempt: 1 }
+        ));
+        assert_eq!(runner.count("agent prompt"), 0);
+
+        let agent = Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            name: lane.agent_name.clone(),
+            agent: lane.agent.clone(),
+            agent_status: "idle".into(),
+            cwd: lane.cwd.clone(),
+            ..Agent::default()
+        };
+        let pane = Pane {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let run_pass = || {
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &f.project,
+                    herdr: &herdr,
+                    threads: &[thread::load(&f.project, &lane.id).unwrap()],
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+            )
+            .unwrap()
+        };
+        let pass = run_pass();
+        assert!(pass.error.is_none());
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(
+            thread::load(&f.project, &lane.id).unwrap().follow_ups.len(),
+            2
+        );
+
+        // Transporting the brief is not enough. The matching skill receipt is
+        // the ordering gate for follow-ups.
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.bootstrap = "acknowledged".into()
+        })
+        .unwrap();
+        let pass = run_pass();
+        assert!(pass.error.is_none());
+
+        let calls = runner.calls.borrow();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.display().contains("agent prompt"))
+            .map(|call| call.display())
+            .collect();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("skill lane"), "{}", prompts[0]);
+        assert!(
+            prompts[1].contains("check the first gate"),
+            "{}",
+            prompts[1]
+        );
+        assert!(
+            prompts[2].contains("then check the second gate"),
+            "{}",
+            prompts[2]
+        );
+        let saved = thread::load(&f.project, &lane.id).unwrap();
+        assert!(!saved.prompt_pending);
+        assert!(saved.follow_ups.is_empty());
+        drop(calls);
+
+        // Ambiguous transport is durable before the call and is never blindly
+        // retried on a later pass.
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.follow_ups.push(thread::FollowUp {
+                attempt: 1,
+                text: "an uncertain clarification".into(),
+                state: thread::FollowUpState::Queued,
+            });
+        })
+        .unwrap();
+        let uncertain_runner = FakeRunner::new();
+        uncertain_runner.on("agent prompt", timeout());
+        uncertain_runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        let uncertain_ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &uncertain_runner,
+            detached_ticker: false,
+        };
+        let uncertain_herdr = Herdr::new("herdr", "", &uncertain_runner);
+        let uncertain_pass = || {
+            thread_pass(
+                &LaunchPass {
+                    ctx: &uncertain_ctx,
+                    project: &f.project,
+                    herdr: &uncertain_herdr,
+                    threads: &[thread::load(&f.project, &lane.id).unwrap()],
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+            )
+            .unwrap()
+        };
+        assert!(uncertain_pass().error.is_some());
+        assert!(uncertain_pass().error.is_none());
+        assert_eq!(uncertain_runner.count("agent prompt"), 1);
+        assert_eq!(
+            thread::load(&f.project, &lane.id).unwrap().follow_ups[0].state,
+            thread::FollowUpState::Uncertain
+        );
+        assert_eq!(crate::inbox::unhandled(&f.project).len(), 1);
+    }
+
     fn write_task(project: &Project, attempts: Vec<String>) {
         let task = crate::task::Task {
             id: "job-0001".into(),
@@ -1866,6 +2308,16 @@ mod tests {
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 1);
+
+        // Reading context used to make the unchanged task eligible again once
+        // the time interval elapsed. Only a new or changed next action wakes it.
+        let mut state = steps::load_state(&f.project);
+        state.idle_nudge_last = "2026-01-01T00:00:00Z".into();
+        steps::save_state(&f.project, &state).unwrap();
+        crate::ledger::context_read(&f.project, &project::now()).unwrap();
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        assert_eq!(runner.count("agent prompt"), 1);
+
         let calls = runner.calls.borrow();
         let prompt = calls
             .iter()
@@ -1945,7 +2397,7 @@ mod tests {
 
         assert_eq!(
             open_work_next_steps(&f.project),
-            ["job-0001: verify 1 acceptance condition(s)"]
+            BTreeMap::from([("job-0001".into(), "verify 1 acceptance condition(s)".into())])
         );
         crate::task::withdraw_acceptance(
             &f.project,

@@ -161,12 +161,15 @@ enum Command {
     Archive { slug: String },
     /// Make an archived project active again
     Unarchive { slug: String },
-    /// Move a project folder to the trash (no worktree, branch or PR is touched)
+    /// Delete a project everywhere; use `archive` to keep a reversible copy
     Delete {
         slug: String,
-        /// Delete even though coordinator or thread panes are alive
+        /// Also permanently delete project-owned GitHub repositories
         #[arg(long)]
-        force: bool,
+        github: bool,
+        /// Show the exact owned-resource scope without changing anything
+        #[arg(long)]
+        preview: bool,
     },
     /// Continue the current workspace's agent pane as a new project
     AdoptWorkspace {
@@ -1566,7 +1569,7 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum TaskCommand {
-    /// Add a task tied to Rolf's request and plain acceptance conditions
+    /// Add a task tied to Rolf's request and exact acceptance conditions
     Add {
         slug: String,
         #[arg(long)]
@@ -2512,9 +2515,25 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 text_file,
             } => {
                 let text = read_text(&text_file)?;
-                let state = threads::prompt(&ctx, &slug, &id, &text)?;
-                crate::output::insert("agent_state", state.clone());
-                println!("sent to {id} (agent was {state})");
+                match threads::prompt(&ctx, &slug, &id, &text)? {
+                    threads::PromptOutcome::Queued { attempt } => {
+                        crate::output::set_outcome("queued");
+                        crate::output::insert("delivery", "queued");
+                        crate::output::insert("attempt", attempt);
+                        println!(
+                            "queued for {id} attempt {attempt}; it will be delivered after the brief"
+                        );
+                    }
+                    threads::PromptOutcome::Sent {
+                        attempt,
+                        agent_state,
+                    } => {
+                        crate::output::insert("delivery", "sent");
+                        crate::output::insert("attempt", attempt);
+                        crate::output::insert("agent_state", agent_state.clone());
+                        println!("sent to {id} (agent was {agent_state})");
+                    }
+                }
                 Ok(())
             }
             ThreadCommand::Adopt {
@@ -2608,7 +2627,11 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
         }
         Command::Archive { slug } => lifecycle::set_status(&ctx, &slug, Status::Archived),
         Command::Unarchive { slug } => lifecycle::set_status(&ctx, &slug, Status::Active),
-        Command::Delete { slug, force } => lifecycle::delete(&ctx, &slug, force),
+        Command::Delete {
+            slug,
+            github,
+            preview,
+        } => lifecycle::delete(&ctx, &slug, github, preview),
         Command::AdoptWorkspace {
             name,
             goal,

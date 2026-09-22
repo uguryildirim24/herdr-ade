@@ -1215,9 +1215,42 @@ fn check_workspace_leaks(
         .filter(|workspace| !workspace.is_empty())
         .collect();
     let default_shell = default_shell_workspaces(&workspaces, &agents);
+    let labels: BTreeSet<String> = project::list_slugs(root)
+        .into_iter()
+        .filter_map(|slug| project::Project::load(root, &slug).ok())
+        .filter_map(|project| {
+            project
+                .read_project_md()
+                .ok()
+                .map(|(settings, _)| project::display_name(&settings.name, &project.slug))
+        })
+        .collect();
+    let mut duplicate_labels = Vec::new();
+    let mut project_workspaces = BTreeSet::new();
+    for label in labels {
+        let matching: Vec<_> = workspaces
+            .iter()
+            .filter(|workspace| workspace.label == label)
+            .collect();
+        if matching.len() > 1 {
+            duplicate_labels.push(format!("{label} ({})", matching.len()));
+        }
+        project_workspaces.extend(
+            matching
+                .into_iter()
+                .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
+                .map(|workspace| workspace.workspace_id.clone()),
+        );
+    }
     let leaked: Vec<_> = workspaces
         .iter()
         .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
+        // A saved project's box workspace may intentionally hold a shell.
+        // Its individual unowned tabs are advisory below; duplicate project
+        // labels still fail because ownership is ambiguous.
+        .filter(|workspace| {
+            machine == "local" || !project_workspaces.contains(&workspace.workspace_id)
+        })
         .filter(|workspace| {
             !open.contains(&workspace.workspace_id)
                 && !agents
@@ -1263,33 +1296,6 @@ fn check_workspace_leaks(
             return;
         }
     };
-    let labels: BTreeSet<String> = project::list_slugs(root)
-        .into_iter()
-        .filter_map(|slug| project::Project::load(root, &slug).ok())
-        .filter_map(|project| {
-            project
-                .read_project_md()
-                .ok()
-                .map(|(settings, _)| project::display_name(&settings.name, &project.slug))
-        })
-        .collect();
-    let mut duplicate_labels = Vec::new();
-    let mut project_workspaces = BTreeSet::new();
-    for label in labels {
-        let matching: Vec<_> = workspaces
-            .iter()
-            .filter(|workspace| workspace.label == label)
-            .collect();
-        if matching.len() > 1 {
-            duplicate_labels.push(format!("{label} ({})", matching.len()));
-        }
-        project_workspaces.extend(
-            matching
-                .into_iter()
-                .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
-                .map(|workspace| workspace.workspace_id.clone()),
-        );
-    }
     let open_tabs: BTreeSet<_> = open_threads
         .iter()
         .map(|thread| thread.tab_id.clone())
@@ -1304,15 +1310,19 @@ fn check_workspace_leaks(
         })
         .map(|tab| tab.tab_id.as_str())
         .collect();
-    let healthy = duplicate_labels.is_empty() && orphan_tabs.is_empty();
-    let detail = if healthy {
+    let status = if duplicate_labels.is_empty() {
+        orphan_tabs.is_empty().then_some(true)
+    } else {
+        Some(false)
+    };
+    let detail = if duplicate_labels.is_empty() && orphan_tabs.is_empty() {
         format!(
             "{} project workspaces; every tab has an agent or an open lane",
             project_workspaces.len()
         )
     } else {
         format!(
-            "duplicate labels: {}; shell tabs with no open lane: {}",
+            "duplicate labels: {}; unowned shell tabs left open: {}",
             if duplicate_labels.is_empty() {
                 "none".to_string()
             } else {
@@ -1325,12 +1335,7 @@ fn check_workspace_leaks(
             }
         )
     };
-    check(
-        out,
-        Some(healthy),
-        &format!("{display} project tabs"),
-        detail,
-    );
+    check(out, status, &format!("{display} project tabs"), detail);
 }
 
 /// The machine's own home shell: the workspace the client hides while the
@@ -2170,9 +2175,43 @@ recipe = "claude_fable_xhigh"
         assert!(!healthy);
         assert!(text.contains("duplicate labels: Demo (2)"), "{text}");
         assert!(
-            text.contains("shell tabs with no open lane: w1:t1"),
+            text.contains("unowned shell tabs left open: w1:t1"),
             "{text}"
         );
+        assert_eq!(runner.count("tab close"), 0);
+    }
+
+    #[test]
+    fn an_unowned_shell_tab_is_advisory_and_left_open() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "workspace list",
+            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"Demo"}]}}"#),
+        );
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "tab list",
+            ok(r#"{"result":{"tabs":[{"workspace_id":"w1","tab_id":"w1:t1"}]}}"#),
+        );
+        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
+        let mut text = String::new();
+        let mut healthy = true;
+        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
+            healthy &= ok != Some(false);
+            let _ = writeln!(out, "{label}: {detail}");
+        };
+
+        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+
+        assert!(healthy, "{text}");
+        assert!(
+            text.contains("unowned shell tabs left open: w1:t1"),
+            "{text}"
+        );
+        assert_eq!(runner.count("tab close"), 0);
     }
 
     #[test]
