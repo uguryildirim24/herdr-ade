@@ -615,6 +615,15 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             provider_kind: failed.provider_kind.clone(),
         };
     }
+    if let Some(waiting) = event.and_then(|event| event.payload.waiting.as_ref()) {
+        return View {
+            record: task,
+            state: State::Working,
+            next: format!("wait for Rolf: {}", waiting.text.trim()),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
     if thread.status == crate::thread::Status::Failed {
         return View {
             record: task,
@@ -1289,6 +1298,20 @@ mod tests {
             error.to_string().contains("task_adopt_repository"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn waiting_attempt_says_that_its_next_step_is_rolf() {
+        use crate::round::testkit::fixture;
+        let fx = fixture();
+        record(&fx.project, "job-0001");
+        let (lane, _) = fx.lane(1);
+        link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        fx.seal_waiting(&lane, 1, 1, "Choose the final colour.");
+
+        let waiting = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(waiting.state, State::Working);
+        assert_eq!(waiting.next, "wait for Rolf: Choose the final colour.");
     }
 
     #[test]

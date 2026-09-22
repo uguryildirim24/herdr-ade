@@ -333,7 +333,7 @@ pub(crate) struct Safety {
 impl Default for Safety {
     fn default() -> Self {
         Safety {
-            start_threads: "propose".into(),
+            start_threads: "auto".into(),
             routine_commands: false,
         }
     }
@@ -578,6 +578,44 @@ fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety
         );
     }
     Ok(safety)
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct CoordinatorSettings {
+    pub(crate) idle_nudge_minutes: u64,
+}
+
+impl Default for CoordinatorSettings {
+    fn default() -> Self {
+        Self {
+            idle_nudge_minutes: 20,
+        }
+    }
+}
+
+/// Global coordinator behaviour from `[coordinator]` in `config.toml`.
+pub(crate) fn coordinator_settings(config_dir: &Path) -> Result<CoordinatorSettings> {
+    #[derive(Deserialize, Default)]
+    struct Config {
+        #[serde(default)]
+        coordinator: CoordinatorSettings,
+    }
+
+    let file = config_dir.join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Ok(CoordinatorSettings::default());
+    };
+    let settings: CoordinatorSettings = toml::from_str::<Config>(&text)
+        .with_context(|| format!("{} does not parse", file.display()))?
+        .coordinator;
+    if settings.idle_nudge_minutes == 0 {
+        bail!(
+            "{}: coordinator.idle_nudge_minutes must be at least 1",
+            file.display()
+        );
+    }
+    Ok(settings)
 }
 
 /// SHA-256 of executable settings and standing rules.
@@ -993,14 +1031,15 @@ mod tests {
         let config = tempfile::tempdir().unwrap();
         let here = Path::new("/projects/demo");
         assert_eq!(load_safety(config.path(), here).unwrap(), Safety::default());
+        assert_eq!(Safety::default().start_threads, "auto");
 
         std::fs::write(
             config.path().join("config.toml"),
-            "root = \"/projects\"\n\n[safety.\"/projects/demo\"]\nstart_threads = \"auto\"\n",
+            "root = \"/projects\"\n\n[safety.\"/projects/demo\"]\nstart_threads = \"propose\"\n",
         )
         .unwrap();
         let safety = load_safety(config.path(), here).unwrap();
-        assert_eq!(safety.start_threads, "auto");
+        assert_eq!(safety.start_threads, "propose");
         assert!(!safety.routine_commands);
         assert_eq!(
             load_safety(config.path(), Path::new("/projects/other")).unwrap(),
@@ -1013,6 +1052,35 @@ mod tests {
         )
         .unwrap();
         assert!(load_safety(config.path(), here).is_err());
+    }
+
+    #[test]
+    fn coordinator_idle_nudge_defaults_and_validates() {
+        let config = tempfile::tempdir().unwrap();
+        assert_eq!(
+            coordinator_settings(config.path()).unwrap(),
+            CoordinatorSettings::default()
+        );
+        assert_eq!(CoordinatorSettings::default().idle_nudge_minutes, 20);
+
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[coordinator]\nidle_nudge_minutes = 7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            coordinator_settings(config.path())
+                .unwrap()
+                .idle_nudge_minutes,
+            7
+        );
+
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[coordinator]\nidle_nudge_minutes = 0\n",
+        )
+        .unwrap();
+        assert!(coordinator_settings(config.path()).is_err());
     }
 
     #[test]
