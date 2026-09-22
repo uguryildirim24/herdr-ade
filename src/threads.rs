@@ -3627,7 +3627,12 @@ mod tests {
         assert_eq!(started.kind, Kind::Tab);
         assert!(started.machine.is_empty());
         let folder = Path::new(&started.worktree_path);
-        assert_eq!(folder, fx.project.dir().join("threads").join(&started.id));
+        assert_eq!(
+            folder,
+            std::fs::canonicalize(fx.project.dir().join("threads").join(&started.id))
+                .unwrap()
+                .as_path()
+        );
         assert!(folder.join(".git").is_dir());
         assert_eq!(
             git(folder, &["show", "--format=", "--name-only", "HEAD"]),

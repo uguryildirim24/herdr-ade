@@ -368,12 +368,10 @@ mod tests {
         );
         assert_eq!(t.agent_name, "my-agent");
         assert_eq!(
-            t.thread_dir,
-            project
-                .dir()
-                .join("threads/t-0001")
-                .to_string_lossy()
-                .as_ref()
+            Path::new(&t.thread_dir),
+            std::fs::canonicalize(project.dir().join("threads/t-0001"))
+                .unwrap()
+                .as_path()
         );
         assert_eq!(t.worktree_path, t.thread_dir);
         assert!(Path::new(&t.thread_dir).join(".git").is_dir());
@@ -385,12 +383,10 @@ mod tests {
         // A second pane in the same directory gets its own thread directory.
         let second = adopt(&world.ctx(), "demo", "w5:p2", "Second", None, lane()).unwrap();
         assert_eq!(
-            second.thread_dir,
-            project
-                .dir()
-                .join("threads/t-0002")
-                .to_string_lossy()
-                .as_ref()
+            Path::new(&second.thread_dir),
+            std::fs::canonicalize(project.dir().join("threads/t-0002"))
+                .unwrap()
+                .as_path()
         );
         assert!(second.agent_name.is_empty());
         assert_ne!(t.thread_dir, second.thread_dir);
