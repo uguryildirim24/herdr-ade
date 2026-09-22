@@ -25,6 +25,7 @@ mod adapters;
 mod adopt;
 mod ask;
 mod board;
+mod build;
 mod checkpoint;
 mod cli;
 mod contracts;
