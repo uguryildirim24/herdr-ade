@@ -2004,6 +2004,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
+        std::fs::create_dir(project.dir().join("tasks")).unwrap();
         let socket = home.path().join("herdr.sock");
         std::fs::write(&socket, b"").unwrap();
         let cwd = project.dir().to_string_lossy().into_owned();

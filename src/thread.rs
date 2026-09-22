@@ -199,6 +199,52 @@ pub(crate) fn home_report_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.md"))
 }
 
+fn regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// The one durable final report for this attempt, when its sealed
+/// content-addressed artifact is present and valid.
+pub(crate) fn sealed_report_path(project: &Project, thread: &Thread) -> Option<PathBuf> {
+    let attempt = thread.attempt.max(1);
+    let (path, hash) = crate::events::list(project)
+        .into_iter()
+        .filter(|event| event.thread == thread.id && event.attempt == attempt)
+        .filter_map(|event| {
+            let done = event.payload.done?;
+            Some((event.created, event.id, done.artifact))
+        })
+        .max_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)))
+        .map(|(_, _, hash)| (crate::events::artifact_path(project, &hash), hash))?;
+    (regular_file(&path) && std::fs::read(&path).is_ok_and(|bytes| sha256_hex(&bytes) == hash))
+        .then_some(path)
+}
+
+/// The sealed artifact, or an unmatched historical home copy kept readable
+/// without treating it as completion evidence.
+pub(crate) fn final_report_path(project: &Project, thread: &Thread) -> Option<PathBuf> {
+    sealed_report_path(project, thread).or_else(|| {
+        let historical = home_report_path(project, &thread.id);
+        regular_file(&historical).then_some(historical)
+    })
+}
+
+fn path_reference(project: &Project, path: PathBuf) -> String {
+    path.strip_prefix(project.dir())
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn sealed_report_reference(project: &Project, thread: &Thread) -> Option<String> {
+    sealed_report_path(project, thread).map(|path| path_reference(project, path))
+}
+
+pub(crate) fn report_reference(project: &Project, thread: &Thread) -> Option<String> {
+    let path = final_report_path(project, thread)?;
+    Some(path_reference(project, path))
+}
+
 pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
     validate_id(id)?;
     let path = record_path(project, id);
@@ -246,6 +292,11 @@ pub(crate) fn list(project: &Project) -> Vec<Thread> {
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
+    let dir = threads_dir(project);
+    if !dir.is_dir() {
+        // The caller holds the project lock. Do not recreate a deleted project.
+        std::fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    }
     write_atomic(
         &record_path(project, &thread.id),
         toml::to_string(thread)?.as_bytes(),
@@ -984,9 +1035,10 @@ pub(crate) struct Copied {
     pub(crate) report_hash: Option<String>,
 }
 
-/// Copies a local thread's report and, when `with_library`, its library home.
-/// Nothing that is a symbolic link is followed or copied. The caller must not
-/// hold the project lock: this runs `du` and `rsync`.
+/// Observes a local thread's report and, when `with_library`, copies its real
+/// deliverables home. The report itself is never copied: `ha done` stores its
+/// sealed artifact. Nothing that is a symbolic link is followed or copied. The
+/// caller must not hold the project lock: this runs `du` and `rsync`.
 pub(crate) fn copy_home_local(
     project: &Project,
     thread: &Thread,
@@ -1017,21 +1069,7 @@ pub(crate) fn copy_home_local(
     match std::fs::symlink_metadata(&report) {
         Err(_) => {}
         Ok(meta) if meta.is_file() => match std::fs::read(&report) {
-            Ok(bytes) => {
-                let hash = sha256_hex(&bytes);
-                if hash != thread.report_hash || !home_report_path(project, &thread.id).is_file() {
-                    let written = project.lock().and_then(|_lock| {
-                        write_atomic(&home_report_path(project, &thread.id), &bytes)
-                    });
-                    if let Err(error) = written {
-                        return Copied {
-                            outcome: CopyOutcome::Failed(format!("{error:#}")),
-                            report_hash: None,
-                        };
-                    }
-                }
-                report_hash = Some(hash);
-            }
+            Ok(bytes) => report_hash = Some(sha256_hex(&bytes)),
             Err(error) => {
                 return Copied {
                     outcome: CopyOutcome::Failed(format!(
@@ -1079,6 +1117,16 @@ pub(crate) fn copy_home_local(
     }
 }
 
+fn has_library_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        !is_symlink(&path) && (regular_file(&path) || (path.is_dir() && has_library_file(&path)))
+    })
+}
+
 fn copy_library_local(
     project: &Project,
     thread: &Thread,
@@ -1100,18 +1148,26 @@ fn copy_library_local(
             LIBRARY_CAP_KB / 1024
         )]);
     }
-    let mut notes = Vec::new();
-    symlinks_under(library, &mut notes);
-    let notes: Vec<String> = notes
-        .into_iter()
+    let mut links = Vec::new();
+    symlinks_under(library, &mut links);
+    let notes: Vec<String> = links
+        .iter()
         .map(|p| format!("{p} is a symbolic link; it was not copied"))
         .collect();
+    if !has_library_file(library) {
+        return Ok(notes);
+    }
 
-    let target = project.dir().join("library").join(&thread.id);
+    let library_home = project.dir().join("library");
+    let target = library_home.join(&thread.id);
     {
         let _lock = project.lock()?;
-        if !target.is_dir() {
+        if !library_home.is_dir() {
             // `create_dir`, not `create_dir_all`: never recreate a deleted project.
+            std::fs::create_dir(&library_home)
+                .with_context(|| format!("could not create {}", library_home.display()))?;
+        }
+        if !target.is_dir() {
             std::fs::create_dir(&target)
                 .with_context(|| format!("could not create {}", target.display()))?;
         }
@@ -1804,7 +1860,87 @@ mod tests {
     }
 
     #[test]
-    fn copies_report_and_library_and_skips_symlinks() {
+    fn empty_library_creates_no_home_folder_and_report_creates_no_copy() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let dir = work.path().join(".herdr-project/demo-t-0001");
+        let t = local_thread(&project, &dir);
+        std::fs::write(dir.join("report.md"), "report\n").unwrap();
+        let runner = FakeRunner::new();
+        runner.on("du -sk", ok("0\t/x\n"));
+
+        let copied = copy_home_local(&project, &t, true, &runner);
+
+        assert_eq!(copied.outcome, CopyOutcome::Complete);
+        assert_eq!(
+            copied.report_hash.as_deref(),
+            Some(sha256_hex(b"report\n").as_str())
+        );
+        assert!(!project.dir().join("library").exists());
+        assert!(!home_report_path(&project, &t.id).exists());
+        assert_eq!(runner.count("rsync"), 0);
+    }
+
+    #[test]
+    fn sealed_artifact_is_the_report_and_unmatched_history_stays_readable() {
+        use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let sealed = allocate(&project, |thread| thread.attempt = 1).unwrap();
+        let hash = crate::events::store_artifact(&project, b"sealed\n").unwrap();
+        crate::events::seal_create_if_absent(
+            &project,
+            &Event {
+                id: "done-1".into(),
+                op: "done-1".into(),
+                thread: sealed.id.clone(),
+                attempt: 1,
+                round: None,
+                recipient: Recipient::default(),
+                created: project::now(),
+                payload: EventPayload {
+                    done: Some(DonePayload {
+                        sha: "abc".into(),
+                        report_path: "old/location".into(),
+                        artifact: hash.clone(),
+                        attestation: None,
+                    }),
+                    ..EventPayload::default()
+                },
+            },
+        )
+        .unwrap();
+        std::fs::write(home_report_path(&project, &sealed.id), b"sealed\n").unwrap();
+        assert_eq!(
+            final_report_path(&project, &sealed),
+            Some(crate::events::artifact_path(&project, &hash))
+        );
+
+        let historical = allocate(&project, |_| {}).unwrap();
+        let historical_path = home_report_path(&project, &historical.id);
+        std::fs::write(&historical_path, b"historical only\n").unwrap();
+        assert_eq!(
+            final_report_path(&project, &historical),
+            Some(historical_path)
+        );
+
+        let draft = allocate(&project, |thread| {
+            thread.thread_dir = work_path(root.path(), "draft")
+        })
+        .unwrap();
+        std::fs::create_dir_all(&draft.thread_dir).unwrap();
+        std::fs::write(Path::new(&draft.thread_dir).join("report.md"), b"draft\n").unwrap();
+        assert_eq!(final_report_path(&project, &draft), None);
+    }
+
+    fn work_path(root: &Path, name: &str) -> String {
+        root.join(name).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn hashes_report_copies_real_library_and_skips_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -1819,10 +1955,7 @@ mod tests {
             copied.report_hash.as_deref(),
             Some(sha256_hex(b"## Report\nok\n").as_str())
         );
-        assert_eq!(
-            std::fs::read_to_string(home_report_path(&project, &t.id)).unwrap(),
-            "## Report\nok\n"
-        );
+        assert!(!home_report_path(&project, &t.id).exists());
         assert_eq!(
             std::fs::read_to_string(project.dir().join("library/t-0001/out.txt")).unwrap(),
             "data"
@@ -1883,7 +2016,7 @@ mod tests {
             matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes[0].contains("over the 50 MB cap"))
         );
         assert_eq!(runner.count("rsync"), 0);
-        assert!(home_report_path(&project, &t.id).is_file());
+        assert!(!home_report_path(&project, &t.id).exists());
     }
 
     #[test]
@@ -1894,6 +2027,7 @@ mod tests {
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
+        std::fs::write(dir.join("library/out.txt"), "deliverable").unwrap();
         let runner = FakeRunner::new();
         runner.on("du -sk", ok("4\t/x\n"));
         runner.on("rsync", fail(23, "rsync: write failed"));

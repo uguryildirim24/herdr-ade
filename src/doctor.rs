@@ -2549,6 +2549,7 @@ recipe = "claude_fable_xhigh"
         .unwrap();
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
+        std::fs::create_dir(project.dir().join("threads")).unwrap();
         std::fs::write(project.dir().join("threads/t-0001.toml"), "status = [\n").unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
 
@@ -2909,6 +2910,7 @@ recipe = "claude_fable_xhigh"
         let env = Env::for_test(home.path(), &[]);
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
+        std::fs::create_dir(project.dir().join("threads")).unwrap();
         std::fs::write(project.dir().join("threads/t-0099.toml"), "status = [\n").unwrap();
         let runner = FakeRunner::new();
         runner.on(

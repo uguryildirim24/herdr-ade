@@ -1138,9 +1138,14 @@ pub(crate) fn pull_requests(
         if t.status != Status::Open {
             continue;
         }
-        // The `PR:` line of the home copy of the report.
-        let report =
-            std::fs::read_to_string(thread::home_report_path(project, &t.id)).unwrap_or_default();
+        // During work the `PR:` line is in the lane's draft. After cleanup,
+        // read the one final artifact (or an unmatched historical home copy).
+        let draft = std::path::Path::new(&t.thread_dir).join("report.md");
+        let report = std::fs::read_to_string(&draft).unwrap_or_else(|_| {
+            thread::final_report_path(project, &t)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .unwrap_or_default()
+        });
         let (url, note) = match pr::pr_line(&report) {
             Ok(url) => (url.unwrap_or_default(), String::new()),
             Err(note) => (String::new(), note),
@@ -1527,7 +1532,7 @@ mod tests {
         assert!(inbox::unhandled(&project).is_empty());
         let digest = crate::coordinator::digest(&ctx, &project, "ha").unwrap().0;
         assert!(
-            digest.contains("done: abc report=.reports/lane.md"),
+            digest.contains("done: abc report=artifacts/def (missing)"),
             "{digest}"
         );
         assert!(!project.state_dir().join("inbox-counter.json").exists());

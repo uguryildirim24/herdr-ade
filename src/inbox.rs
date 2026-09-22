@@ -89,6 +89,10 @@ pub(crate) fn write(
         bail!("inbox_record_kind: `{kind}` belongs in its owning record");
     }
     let _lock = project.lock()?;
+    let inbox = inbox_dir(project);
+    if !inbox.is_dir() {
+        std::fs::create_dir(&inbox)?;
+    }
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     project::write_json(&counter_path, &n)?;
@@ -134,6 +138,10 @@ pub(crate) fn write_event(
         bail!("inbox_record_kind: `{kind}` belongs in its owning record");
     }
     let _lock = project.lock()?;
+    let inbox = inbox_dir(project);
+    if !inbox.is_dir() {
+        std::fs::create_dir(&inbox)?;
+    }
     let id = if kind == "recipient-changed" {
         format!("recipient-changed-{}", event.id)
     } else {
@@ -348,6 +356,9 @@ pub(crate) fn done_bound(
         }
     }
     let mut moved = Vec::new();
+    if !checked.is_empty() && !dir.join("done").is_dir() {
+        std::fs::create_dir(dir.join("done"))?;
+    }
     for (from, id, item) in checked {
         std::fs::rename(&from, dir.join("done").join(format!("{id}.md")))?;
         if let Some(item) = item
@@ -369,6 +380,7 @@ mod tests {
     use super::*;
 
     fn write_item(project: &Project, id: &str, body: &str) {
+        std::fs::create_dir_all(inbox_dir(project)).unwrap();
         let text = format!(
             "+++\nid = \"{id}\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"2026-09-17T00:00:00Z\"\nsummary = \"s\"\n+++\n{body}"
         );
@@ -455,6 +467,7 @@ mod tests {
     fn removed_kinds_are_dropped_on_read_not_migrated() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir(inbox_dir(&project)).unwrap();
         for kind in [
             "thread-state",
             "report-available",

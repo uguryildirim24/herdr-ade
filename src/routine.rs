@@ -544,6 +544,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir(project.dir().join("routines")).unwrap();
         std::fs::write(
             project.dir().join("routines/watch.md"),
             "+++\nschedule = \"every 1m\"\ncommand = \"echo hi\"\n+++\n",
@@ -562,6 +563,7 @@ mod tests {
     fn broken_files_are_reported_with_their_hash() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir(project.dir().join("routines")).unwrap();
         std::fs::write(
             project.dir().join("routines/good.md"),
             "+++\nschedule = \"every 1h\"\n+++\nP",

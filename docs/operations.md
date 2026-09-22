@@ -20,17 +20,19 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
   tasks/job-NNNN.toml     stable tasks: request, acceptance, links and evidence; the binary's
   routines/<name>.md      routines; the coordinator's
   scratch/                the coordinator's temporary files
-  threads/<id>.toml       thread record          threads/<id>.md   home copy of its report
+  threads/<id>.toml       thread record          artifacts/<hash>  sealed final report
   threads/<id>.task.md    the task as given      threads/<id>/     working folder of a tab thread
   inbox/, inbox/done/     messages with no thread or round home
-  library/<id>/           home copy of files a thread produced
+  library/<id>/           files a thread produced for Rolf
   .state/                 status, coordinator pane, ticker state, locks and converted history
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
 ~/.config/herdr-ade/config.toml             executable recipes, editable routing, dispatch placement, machines and harness repositories; any coordinator may edit it
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
-Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The lane is primed with `Run <prefix> skill <role>, then read tasks/<id>.md and do what it says.` The thread directory is `<worktree>/.herdr-project/<project>-<id>/`: `report.md` and `library/` (written by the agent); a tab thread with no repository gets its `brief.md` there instead. That folder, and `.worktrees/`, are added to `info/exclude`. Resolving removes a finished worktree with `git worktree remove` without `--force`, after a complete copy home. A remote lane's rebuildable Cargo folder is removed in the same operation. Uncommitted tracked or untracked changes refuse resolution. Ignored data keeps both the worktree and its build folder but does not stop resolution; the typed `ignored_data` reason names each folder and its size. The branch is always kept.
+Content folders in this tree are created on their first write; a new project has only `PROJECT.md` and `.state/`.
+
+Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The lane is primed with `Run <prefix> skill <role>, then read tasks/<id>.md and do what it says.` The thread directory is `<worktree>/.herdr-project/<project>-<id>/`: the agent writes `report.md` and creates `library/` only for real deliverables; a tab thread with no repository gets its `brief.md` there instead. That folder, and `.worktrees/`, are added to `info/exclude`. `done` seals the report once as `artifacts/<hash>`; thread and task views find it from the thread record. Unmatched historical `threads/<id>.md` reports remain readable. Resolving removes a finished worktree with `git worktree remove` without `--force`, after copying real deliverables. A remote lane's rebuildable Cargo folder is removed in the same operation. Uncommitted tracked or untracked changes refuse resolution. Ignored data keeps both the worktree and its build folder but does not stop resolution; the typed `ignored_data` reason names each folder and its size. The branch is always kept.
 
 Ignored files are disposable only when their path is covered by the editable global setting below or by `disposable` on that repository's row in `PROJECT.md`. A harness repository row in `config.toml` may carry the same list. Repository lists are added to the global list only for their own repository. With no matching setting, every ignored file is treated as data. A one-part name matches that path component anywhere in the worktree; a path containing `/` matches from the worktree root. `*` matches within one path part (`runs/pytest-*` covers `runs/pytest-cancel` but not `runs/seed-1`). A nested Git checkout is always data, even inside a disposable folder.
 
