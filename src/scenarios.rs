@@ -1012,6 +1012,10 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         .expect("box removal ssh call");
     let command = removal.display();
     assert!(
+        command.contains("PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
+        "{command}"
+    );
+    assert!(
         command.contains("cd /home/ubuntu/projects/herdr-ade"),
         "{command}"
     );
@@ -1020,6 +1024,16 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         command.contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
         "{command}"
     );
+    let scratch = calls
+        .iter()
+        .find(|call| call.program == "ssh" && call.display().contains("scratch-t-0001"))
+        .expect("scratch-session ssh call")
+        .display();
+    assert!(
+        scratch.contains("PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
+        "{scratch}"
+    );
+    assert!(scratch.contains("herdr session list --json"), "{scratch}");
     assert!(
         thread::load(&project, &t.id)
             .unwrap()
@@ -1945,6 +1959,28 @@ fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ti
         failing.runner.count("scp") + failing.runner.count("rsync"),
         0
     );
+}
+
+#[test]
+fn a_saved_machine_lookup_fault_never_becomes_a_lost_connection() {
+    let (world, project) = remote_world();
+    thread::update(&project, "t-0001", |t| t.machine_id = "1".into()).unwrap();
+    std::fs::write(
+        world.home.path().join("cfg/config.toml"),
+        "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+    )
+    .unwrap();
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    memory.outage_secs = 0;
+    memory.tick = 1;
+
+    let _ = ticker::tick_project_with(&ctx, &project, &mut memory);
+
+    let lane = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(lane.failure_class, crate::contracts::FailureClass::Unknown);
+    assert!(items_of(&project, "outage").is_empty());
+    assert_eq!(world.runner.count("ssh"), 0);
 }
 
 #[test]

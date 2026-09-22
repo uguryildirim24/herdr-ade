@@ -518,6 +518,14 @@ fn machine_passes(
         }
         let projects: Vec<&Project> = entries.iter().map(|(project, _)| project).collect();
         let outcome = steps::courier(ctx, &projects, &machine);
+        if let Err(error) = &outcome
+            && steps::courier_lookup_failed(error)
+        {
+            let detail = format!("{error:#}");
+            errors.push(anyhow::anyhow!("{machine}: {detail}"));
+            memory.machine_views.insert(machine, Err(detail));
+            continue;
+        }
         let reason = outcome.as_ref().err().map(|e| format!("{e:#}"));
         let event = memory.record_machine(&machine, reason.as_deref(), now);
         // After the configured outage period, type one unreachable BLOCKED per
