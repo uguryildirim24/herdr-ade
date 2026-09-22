@@ -11,6 +11,10 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0319.md",
+      "tasks/review-r117.md",
+      "tasks/review-r116.md",
+      "tasks/t-0317.md",
       "tasks/t-0316.md",
       "tasks/review-r115.md",
       "tasks/t-0314.md",
@@ -18,17 +22,14 @@
       "tasks/t-0312.md",
       "tasks/review-r114.md",
       "tasks/t-0310.md",
-      "tasks/t-0309.md",
-      "tasks/t-0308.md",
-      "tasks/t-0307.md",
-      "tasks/review-r113.md",
-      "tasks/t-0306.md"
+      "tasks/t-0309.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r116.md",
       "tasks/reviews/code-r115.md",
       "tasks/reviews/code-r114.md",
       "tasks/reviews/code-r113.md",
@@ -39,19 +40,25 @@
       "tasks/reviews/code-r108.md",
       "tasks/reviews/code-r107.md",
       "tasks/reviews/code-r106.md",
-      "tasks/reviews/code-r105.md",
-      "tasks/reviews/code-r104.md"
+      "tasks/reviews/code-r105.md"
     ]
   },
-  "generated": "2026-09-22T18:01:50-04:00",
+  "generated": "2026-09-22T18:38:11-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0316-review-r115-more-work-to-a-finished-lane",
       "main",
+      "hp/adeherdr/t-0319-review-r116-removing-or-admitting-a-lane",
+      "hp/adeherdr/t-0320-review-r117-machine-records-move-out-of",
+      "review/r117",
+      "review/r116-2",
+      "hp/adeherdr/t-0318-review-r116-removing-or-admitting-a-lane",
+      "hp/adeherdr/t-0314-w56-machine-records-move-under-state",
+      "hp/adeherdr/t-0317-w57-remove-or-admit-stops-the-replaced-r",
+      "review/r116",
       "hp/adeherdr/t-0315-review-r115-more-work-to-a-finished-lane",
+      "hp/adeherdr/t-0316-review-r115-more-work-to-a-finished-lane",
       "review/r115-2",
       "review/r115",
-      "hp/adeherdr/t-0314-w56-machine-records-move-under-state",
       "hp/adeherdr/t-0313-w55-more-work-to-a-finished-lane-holds-t",
       "hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record",
       "hp/adeherdr/t-0311-review-r114-a-merge-that-installs-record",
@@ -495,36 +502,43 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "9a0440f review(round): approve r115",
-      "068cca4 Merge pinned lane t-0313 into review r115",
-      "ae57b5d docs(tasks): t-0316",
-      "99e2573 review(r115): brief for revision 5",
-      "49575d9 review(r115): brief for revision 4",
-      "f9e8aa8 fix(round): resume reviews after follow-up completion"
+      "e8620ec Merge commit '450c34c5d1c274fd8acc1155caf190aeb70a6980'",
+      "450c34c review(round): approve r116",
+      "73fa92e Merge pinned lane t-0317 into review r116",
+      "2819ce3 review(r117): brief for revision 1",
+      "5ac462c docs(tasks): t-0319",
+      "3533d19 review(r116): brief for revision 2"
     ],
-    "remote": "9 ahead, 0 behind origin/main",
+    "remote": "11 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "9a0440f",
+        "head": "e8620ec",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(round): approve r115"
+        "subject": "Merge commit '450c34c5d1c274fd8acc1155caf190aeb70a6980'"
       },
       {
-        "branch": "review/r115",
+        "branch": "review/r116",
         "dirty": 0,
-        "head": "2455729",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r115",
-        "subject": "docs(tasks): t-0315"
+        "head": "359ca1d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r116",
+        "subject": "docs(tasks): t-0318"
       },
       {
-        "branch": "review/r115-2",
+        "branch": "review/r116-2",
         "dirty": 0,
-        "head": "ae57b5d",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r115-2",
-        "subject": "docs(tasks): t-0316"
+        "head": "5ac462c",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r116-2",
+        "subject": "docs(tasks): t-0319"
+      },
+      {
+        "branch": "review/r117",
+        "dirty": 0,
+        "head": "9d2a572",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r117",
+        "subject": "docs(tasks): t-0320"
       }
     ]
   },
@@ -539,8 +553,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r115",
-    "verdict": "9a0440f595c475d47c3da8afed5ca44f24488d46"
+    "round": "r116",
+    "verdict": "450c34c5d1c274fd8acc1155caf190aeb70a6980"
   },
   "session": "default",
   "unlinked_agents": [],
