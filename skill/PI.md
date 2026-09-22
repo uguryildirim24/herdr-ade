@@ -1,11 +1,11 @@
 # PI.md — running pi lanes
 
 A pi lane runs many model services through one program. The harness owns the
-install, the settings folder, and the logins. You start a pi lane like any
-other lane; the wrapper supplies the folder, so the start line carries no
-path and no secret.
+install, the settings folder, and the logins. Start a pi lane through
+`hp thread start` like any other lane. The wrapper supplies the folder, so
+the launch record carries no path and no secret.
 
-## Start line
+## Launch record
 
 ```
 herdr agent start <name> --kind pi --pane <pane> --parent <coordinator pane> \
@@ -61,21 +61,23 @@ extension or the guard is missing, or when the login is not ready.
 ## When a lane is stuck
 
 A provider limit, a dead login or an unreachable endpoint is not idle and not
-done. The guard reports the pane `blocked` and sends one
-`WAITING <lane> <provider> <class>: <what>` line to you. Classes: `limit`,
-`login`, `unreachable`, `error`.
+done. The guard reports the pane `blocked` and seals one typed provider-failure
+event. Its provider kind is `limit`, `login`, `unreachable` or `error`.
 
-- `limit`: wait. Do not re-prompt.
+The event starts bounded recovery automatically. Every provider failure starts
+the same task as a new process on the same recipe; it never selects a fallback.
+An explicit `hp thread retry <slug> <id> --reason "<evidence>"` does the same and
+consumes the next bounded retry. It refuses after the limit is exhausted and
+waits for the coordinator. Never re-prompt or type recovery into the pane.
+
+- `limit`: wait.
 - `login`: tell Rolf to run `herdr-pi login` again.
-- Recovery: type into the pane with
-  `herdr pane send-text <pane> "<your line>"` and then
-  `herdr pane send-keys <pane> enter`. A blocked pane refuses
-  `herdr agent prompt` (`agent_blocked`).
+- `unreachable` or `error`: let the bounded recovery run.
 - The guard never sends `DONE`. Only `hp done` does.
 
 If you see the trust question or the missing-folder question on screen, type
-nothing. That is not a lane: it is a broken start. A trusted folder runs
-repository code, so the settings file never trusts one.
+nothing. Report the broken start through thread recovery. A trusted folder
+runs repository code, so the settings file never trusts one.
 
 ## After a herdr restart
 
