@@ -260,6 +260,29 @@ pub(crate) fn validate_provider_column(provider: &str, args: &[String]) -> Resul
     Ok(())
 }
 
+/// Validate one row from the canonical TOML recipe catalog.
+pub(crate) fn validate_recipe(
+    id: &str,
+    provider: &str,
+    args: &[String],
+    env: &[String],
+) -> Result<String> {
+    validate_args(args)?;
+    validate_provider_column(provider, args)?;
+    let model = flag_value(args, "--model")
+        .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `{id}` has no --model"))?;
+    let thinking = flag_value(args, "--thinking")
+        .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `{id}` has no --thinking"))?;
+    validate_thinking(provider, &model, &thinking)?;
+    if args.len() != 7 {
+        bail!("pi_args_forbidden: `{id}` must carry exactly four flags");
+    }
+    if !env.is_empty() {
+        bail!("pi_env_forbidden: `{id}` must leave the pi environment empty");
+    }
+    Ok(model)
+}
+
 /// The value of `--flag value` or `--flag=value`.
 pub(crate) fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let mut iter = args.iter();

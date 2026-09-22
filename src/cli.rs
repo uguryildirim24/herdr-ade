@@ -1619,8 +1619,6 @@ enum TaskCommand {
     Evidence {
         slug: String,
         id: String,
-        #[arg(long, value_enum)]
-        kind: crate::task::EvidenceKind,
         #[arg(long)]
         command: String,
         #[arg(long = "acceptance")]
@@ -2365,13 +2363,11 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             TaskCommand::Evidence {
                 slug,
                 id,
-                kind,
                 command,
                 acceptance,
             } => {
                 let project = Project::load(&ctx.root, &slug)?;
-                let record =
-                    crate::task::record_evidence(&project, &id, kind, &command, acceptance)?;
+                let record = crate::task::record_evidence(&project, &id, &command, acceptance)?;
                 let view = crate::task::view(&project, record);
                 crate::output::success(
                     Some(view.state.word()),

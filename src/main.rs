@@ -28,6 +28,7 @@ mod board;
 mod build;
 mod checkpoint;
 mod cli;
+mod config;
 mod contracts;
 mod coordinator;
 mod decide;

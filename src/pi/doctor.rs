@@ -6,16 +6,160 @@
 //! one ticker interval. `npm root -g` runs inside `$SHELL -lic` like every
 //! other login-shell probe.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, recipes, sh};
+use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, sh};
 
 const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const READINESS_CACHE_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct ConfigRecipe {
+    kind: String,
+    provider: String,
+    args: Vec<String>,
+    env: Vec<String>,
+    enabled: bool,
+}
+
+impl Default for ConfigRecipe {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            provider: String::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ConfigRouting {
+    default: String,
+    fallback: Vec<String>,
+    pins: BTreeMap<String, String>,
+    rules: Vec<ConfigRule>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ConfigRule {
+    recipe: String,
+    fallback: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ConfigDoctorAdapter {
+    readiness: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ConfigAdapter {
+    doctor: ConfigDoctorAdapter,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RecipeConfig {
+    recipes: BTreeMap<String, ConfigRecipe>,
+    routing: ConfigRouting,
+    adapters: BTreeMap<String, ConfigAdapter>,
+}
+
+fn recipe_config(config_dir: &Path) -> Result<RecipeConfig> {
+    let defaults: RecipeConfig = toml::from_str(include_str!("../../assets/default-recipes.toml"))
+        .context("shipped recipe declarations do not parse")?;
+    let document = crate::config::Document::read(config_dir)?;
+    let configured: RecipeConfig = document.decode()?;
+    let mut recipes = defaults.recipes;
+    recipes.extend(configured.recipes);
+    Ok(RecipeConfig {
+        recipes,
+        routing: configured.routing,
+        adapters: configured.adapters,
+    })
+}
+
+fn validate_config_recipe(id: &str, recipe: &ConfigRecipe) -> Result<String> {
+    launch::validate_recipe(id, &recipe.provider, &recipe.args, &recipe.env)
+}
+
+fn uses_pi(config: &RecipeConfig, recipe: &ConfigRecipe) -> bool {
+    config
+        .adapters
+        .get(&recipe.kind)
+        .map(|adapter| adapter.doctor.readiness.as_str())
+        .unwrap_or(if recipe.kind == "pi" { "pi" } else { "command" })
+        == "pi"
+}
+
+fn routed_ids(routing: &ConfigRouting) -> BTreeSet<&str> {
+    let mut ids = BTreeSet::new();
+    ids.insert(routing.default.as_str());
+    ids.extend(routing.fallback.iter().map(String::as_str));
+    ids.extend(routing.pins.values().map(String::as_str));
+    for rule in &routing.rules {
+        ids.insert(rule.recipe.as_str());
+        if let Some(fallback) = &rule.fallback {
+            ids.extend(fallback.iter().map(String::as_str));
+        }
+    }
+    ids
+}
+
+/// Provider/model pairs used by enabled routes in the canonical recipe file.
+pub(crate) fn configured_routed_models(config_dir: &Path) -> Result<Vec<(String, String)>> {
+    let config = recipe_config(config_dir)?;
+    if config.routing.default.trim().is_empty() {
+        anyhow::bail!(
+            "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
+        );
+    }
+    let routed = routed_ids(&config.routing);
+    for id in &routed {
+        let recipe = config
+            .recipes
+            .get(*id)
+            .with_context(|| format!("routing_recipe_unknown: {id}"))?;
+        if !recipe.enabled {
+            anyhow::bail!("routing_recipe_disabled: {id}");
+        }
+    }
+    let mut models = BTreeSet::new();
+    for (id, recipe) in &config.recipes {
+        if routed.contains(id.as_str()) && recipe.enabled && uses_pi(&config, recipe) {
+            let model = validate_config_recipe(id, recipe)?;
+            models.insert((recipe.provider.clone(), model));
+        }
+    }
+    Ok(models.into_iter().collect())
+}
+
+pub(crate) fn configured_deepseek_models(config_dir: &Path) -> Result<Vec<String>> {
+    let config = recipe_config(config_dir)?;
+    let mut models = BTreeSet::new();
+    for (id, recipe) in &config.recipes {
+        if !uses_pi(&config, recipe) {
+            continue;
+        }
+        let model = validate_config_recipe(id, recipe)?;
+        if recipe.provider == provider::PROVIDER_ID && model.starts_with("deepseek") {
+            models.insert(model);
+        }
+    }
+    Ok(models.into_iter().collect())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Level {
@@ -95,8 +239,20 @@ pub(crate) fn healthy(rows: &[Row]) -> bool {
 pub(crate) fn doctor_rows() -> Result<(Vec<Row>, bool)> {
     let env = Env::from_process()?;
     let layout = Layout::from_env(&env)?;
-    let providers = recipes::enabled_providers();
-    let rows = doctor_rows_with(&env, &layout, &sh::RealRunner, &providers);
+    let rows = match configured_routed_models(&env.config_dir()) {
+        Ok(models) => {
+            let borrowed: Vec<(&str, &str)> = models
+                .iter()
+                .map(|(provider, model)| (provider.as_str(), model.as_str()))
+                .collect();
+            doctor_rows_with_models(&env, &layout, &sh::RealRunner, &borrowed)
+        }
+        Err(error) => {
+            let mut rows = doctor_rows_with(&env, &layout, &sh::RealRunner, &[]);
+            rows.push(Row::fail("recipes", format!("{error:#}")));
+            rows
+        }
+    };
     let ok = healthy(&rows);
     Ok((rows, ok))
 }
@@ -304,7 +460,9 @@ pub(crate) fn doctor_rows_with(
 
     // deepseek compaction: the shared models.json must lower the opencode-go
     // DeepSeek window so pi compacts near 372k tokens.
-    match provider::missing_overrides(&layout.models()) {
+    let deepseek_models = configured_deepseek_models(&env.config_dir());
+    match deepseek_models.and_then(|models| provider::missing_overrides(&layout.models(), &models))
+    {
         Ok(missing) if missing.is_empty() => rows.push(Row::ok(
             "deepseek compaction",
             format!("contextWindow {}", provider::DEEPSEEK_CONTEXT_WINDOW),
@@ -1113,7 +1271,8 @@ mod tests {
     fn installed_layout(dir: &Path) -> Layout {
         let layout = Layout::for_test(dir.join("pi"));
         folder::ensure(&layout).unwrap();
-        crate::pi::provider::write_overrides(&layout.models()).unwrap();
+        crate::pi::provider::write_overrides(&layout.models(), &["deepseek-v4.1-flash".into()])
+            .unwrap();
         install::write_guard(&layout).unwrap();
         crate::pi::launch::write_wrapper(&layout).unwrap();
         std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
@@ -1541,6 +1700,30 @@ mod tests {
         assert_eq!(json["ok"], Value::Bool(false));
         assert_eq!(json["provider"], "kimi-coding");
         assert!(report.failures().iter().any(|r| r.label == "login"));
+    }
+
+    #[test]
+    fn standalone_doctor_ignores_an_unrouted_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[routing]
+default = "pi_opencode_deepseek"
+
+[recipes.pi_kimi_k3]
+kind = "pi"
+provider = "kimi-coding"
+args = ["--provider", "kimi-coding", "--model", "k3", "--thinking", "high", "--no-skills"]
+plain = "the long task helper"
+"#,
+        )
+        .unwrap();
+        let models = configured_routed_models(dir.path()).unwrap();
+        assert_eq!(
+            models,
+            vec![("opencode-go".into(), "deepseek-v4.1-flash".into())]
+        );
     }
 
     #[test]

@@ -154,7 +154,6 @@ pub(crate) struct Repo {
 pub(crate) struct Settings {
     pub(crate) name: String,
     pub(crate) goal: String,
-    pub(crate) auto_resolve_days: u32,
     pub(crate) nudge: bool,
     /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
     /// default of item 24: on for a `claude` coordinator, off otherwise
@@ -179,7 +178,6 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             goal: String::new(),
-            auto_resolve_days: 7,
             // On by default: a coordinator that does not read its inbox is
             // unreachable. A project that wants the old notification-only
             // behaviour sets `nudge = false` in PROJECT.md. On herdr 0.9.1 a
@@ -555,19 +553,10 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// The effective safety settings: `[safety."<canonical project path>"]` in
 /// `<config_dir>/config.toml`, with defaults for an absent table or key.
 fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
-    #[derive(Deserialize, Default)]
-    struct Config {
-        #[serde(default)]
-        safety: std::collections::BTreeMap<String, Safety>,
-    }
+    let document = crate::config::Document::read(config_dir)?;
     let file = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(Safety::default());
-    };
-    let mut config: Config =
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
-    let safety = config
-        .safety
+    let mut configured: std::collections::BTreeMap<String, Safety> = document.section("safety")?;
+    let safety = configured
         .remove(&*canonical_project_dir.to_string_lossy())
         .unwrap_or_default();
     if !matches!(safety.start_threads.as_str(), "propose" | "auto") {
@@ -596,19 +585,9 @@ impl Default for CoordinatorSettings {
 
 /// Global coordinator behaviour from `[coordinator]` in `config.toml`.
 pub(crate) fn coordinator_settings(config_dir: &Path) -> Result<CoordinatorSettings> {
-    #[derive(Deserialize, Default)]
-    struct Config {
-        #[serde(default)]
-        coordinator: CoordinatorSettings,
-    }
-
+    let document = crate::config::Document::read(config_dir)?;
     let file = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(CoordinatorSettings::default());
-    };
-    let settings: CoordinatorSettings = toml::from_str::<Config>(&text)
-        .with_context(|| format!("{} does not parse", file.display()))?
-        .coordinator;
+    let settings: CoordinatorSettings = document.section("coordinator")?;
     if settings.idle_nudge_minutes == 0 {
         bail!(
             "{}: coordinator.idle_nudge_minutes must be at least 1",
@@ -974,7 +953,6 @@ mod tests {
         let (settings, body) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
-        assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert_eq!(
             settings.repos,

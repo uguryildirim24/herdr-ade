@@ -6,7 +6,8 @@
 //! answer from the Codex rollout and types the D7-shaped DONE line.
 //!
 //! Like `src/pi/`, this module compiles into two targets (the `herdr-ade`
-//! binary and the thin `herdr-pro` binary), so it uses no `crate::` paths.
+//! binary and the thin `herdr-pro` binary). Both roots include the shared
+//! config reader.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -109,6 +110,13 @@ impl Env {
 
     pub(crate) fn expand_tilde(&self, path: &str) -> PathBuf {
         sh::expand_tilde(path, &self.home)
+    }
+
+    pub(crate) fn config_dir(&self) -> PathBuf {
+        let xdg = self
+            .var("XDG_CONFIG_HOME")
+            .map(|value| self.expand_tilde(value));
+        crate::config::dir(&self.home, xdg.as_deref())
     }
 
     /// The herdr binary: `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
@@ -305,19 +313,9 @@ pub(crate) fn resolve_root(env: &Env) -> Result<PathBuf> {
 }
 
 fn config_root(env: &Env) -> Result<Option<String>> {
-    let config = env
-        .var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env.home.join(".config"));
-    let path = config.join("herdr-ade/config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
-    };
-    let table: toml::Table = text
-        .parse()
-        .with_context(|| format!("{} does not parse", path.display()))?;
-    Ok(table
-        .get("root")
+    let document = crate::config::Document::read(&env.config_dir())?;
+    Ok(document
+        .value("root")
         .and_then(toml::Value::as_str)
         .filter(|root| !root.is_empty())
         .map(str::to_string))

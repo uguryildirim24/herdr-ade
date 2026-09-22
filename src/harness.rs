@@ -32,8 +32,6 @@ pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
-    harness: HarnessConfig,
-    #[serde(default)]
     dispatch: crate::launch::DispatchConfig,
 }
 
@@ -45,14 +43,12 @@ struct HarnessConfig {
 
 /// The harness repositories from `config.toml`. An absent table is an empty list.
 pub(crate) fn repos(config_dir: &Path) -> Result<Vec<Repo>> {
-    let file = config_dir.join("config.toml");
-    let text = std::fs::read_to_string(&file).unwrap_or_default();
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let raw: RawConfig =
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
-    Ok(raw.harness.repos)
+    let document = crate::config::Document::read(config_dir)?;
+    repos_from(&document)
+}
+
+pub(crate) fn repos_from(document: &crate::config::Document) -> Result<Vec<Repo>> {
+    Ok(document.section::<HarnessConfig>("harness")?.repos)
 }
 
 /// A path's canonical form when it exists, else the path as given.
@@ -63,21 +59,23 @@ fn canonical_or(path: &str) -> PathBuf {
 /// True when `path` is one of the harness repositories.
 pub(crate) fn is_harness_repo(config_dir: &Path, path: &str) -> bool {
     let target = canonical_or(path);
-    repos(config_dir)
-        .unwrap_or_default()
-        .iter()
-        .any(|repo| canonical_or(&repo.path) == target)
+    repos(config_dir).is_ok_and(|repos| repos.iter().any(|repo| canonical_or(&repo.path) == target))
 }
 
 /// True when a project may start a lane or open a round on `path`: the path is
 /// one of its own listed repositories, or a harness repository.
-pub(crate) fn allowed_repo(settings: &Settings, config_dir: &Path, path: &str) -> bool {
+pub(crate) fn allowed_repo(settings: &Settings, config_dir: &Path, path: &str) -> Result<bool> {
     let target = canonical_or(path);
-    settings
+    if settings
         .repos
         .iter()
         .any(|repo| canonical_or(&repo.path) == target)
-        || is_harness_repo(config_dir, path)
+    {
+        return Ok(true);
+    }
+    Ok(repos(config_dir)?
+        .iter()
+        .any(|repo| canonical_or(&repo.path) == target))
 }
 
 /// The kind of build a harness repository needs.
@@ -1214,12 +1212,8 @@ pub(crate) fn install_with_reexec(
     // Machine resolution belongs to the installer image built above. If that
     // image replaced this process, `reexec` never returns and the new image
     // restarts the transaction before any box lookup or box command occurs.
-    let config_text =
-        std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap_or_default();
-    let dispatch = toml::from_str::<RawConfig>(&config_text)
-        .context("config.toml does not parse")?
-        .dispatch
-        .machine;
+    let document = crate::config::Document::read(&ctx.config_dir)?;
+    let dispatch = document.decode::<RawConfig>()?.dispatch.machine;
     let box_machine = install_box(ctx, &dispatch)?;
     let box_target = box_machine
         .as_ref()
@@ -1285,6 +1279,14 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_unreadable_config_is_not_an_empty_repository_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config.toml")).unwrap();
+        let error = repos(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("could not read"), "{error}");
+    }
 
     fn write_version_binary(path: &Path, version: &str, tag: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1734,12 +1736,18 @@ mod tests {
         let task_dir = project.dir().join("tasks");
         std::fs::create_dir_all(&task_dir).unwrap();
         for (id, round) in [("job-0001", "r1"), ("job-0002", "r2")] {
+            let attempt = crate::thread::allocate(&project, |thread| {
+                thread.repo = repo.to_string_lossy().into_owned();
+                thread.base = "base".into();
+            })
+            .unwrap();
             let task = crate::task::Task {
                 schema: 1,
                 id: id.into(),
                 title: format!("Install {id}."),
                 authority: vec!["request:q-1".into()],
                 acceptance: vec!["The installed build carries the change.".into()],
+                attempts: vec![attempt.id],
                 rounds: vec![round.into()],
                 repo: Some(repo.to_string_lossy().into_owned()),
                 created: crate::project::now(),
