@@ -1148,10 +1148,26 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
                     "review worktree {} removed; its branch was kept",
                     path.display()
                 )),
-                Err(error) => lines.push(format!(
-                    "review worktree {} kept: {error:#}",
-                    path.display()
-                )),
+                Err(remove_error) => match path.try_exists() {
+                    Ok(false) => match crate::git::worktree_prune(ctx.runner, &record.repo) {
+                        Ok(()) => lines.push(format!(
+                            "review worktree {} removed; its branch was kept",
+                            path.display()
+                        )),
+                        Err(error) => lines.push(format!(
+                            "review worktree {} kept: {error:#}",
+                            path.display()
+                        )),
+                    },
+                    Ok(true) => lines.push(format!(
+                        "review worktree {} kept: {remove_error:#}",
+                        path.display()
+                    )),
+                    Err(error) => lines.push(format!(
+                        "review worktree {} kept: {remove_error:#}; could not inspect it after removal failed: {error}",
+                        path.display()
+                    )),
+                },
             },
             Err(error) => lines.push(format!(
                 "review worktree {} kept: {error:#}",
