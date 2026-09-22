@@ -1397,7 +1397,7 @@ pub struct RetryOutcome {
 /// process. Its durable failure class decides whether recovery stays on the
 /// same recipe, advances failed-work fallback routing, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::start)
+    retry_with_ticker(ctx, slug, id, reason, ticker::start, true)
 }
 
 /// Round recovery already holds the advance lock, so it must not replace and
@@ -1408,7 +1408,7 @@ pub(crate) fn retry_during_advance(
     id: &str,
     reason: &str,
 ) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::ensure)
+    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, false)
 }
 
 fn retry_with_ticker(
@@ -1417,6 +1417,7 @@ fn retry_with_ticker(
     id: &str,
     reason: &str,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
+    coordinator_unknown: bool,
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -1447,23 +1448,24 @@ fn retry_with_ticker(
         std::fs::read_to_string(thread::task_path(&project, id)).context("retry_brief_missing")?;
     // Select before stopping anything: an exhausted policy leaves the current
     // process untouched.
-    let mut launch = crate::launch::resolve_failure(
-        ctx,
-        &project,
-        &crate::launch::ResolveInput {
-            task: &task,
-            workflow: if record.role.is_empty() {
-                "lane"
-            } else {
-                &record.role
-            },
-            previous: Some(&record.launch),
-            failure: Some(reason),
-            source_truncation: record.launch.source_truncation.as_ref(),
-            ..Default::default()
+    let input = crate::launch::ResolveInput {
+        task: &task,
+        workflow: if record.role.is_empty() {
+            "lane"
+        } else {
+            &record.role
         },
-        record.failure_class,
-    )?;
+        previous: Some(&record.launch),
+        failure: Some(reason),
+        source_truncation: record.launch.source_truncation.as_ref(),
+        ..Default::default()
+    };
+    let selected = if coordinator_unknown {
+        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)
+    } else {
+        crate::launch::resolve_failure(ctx, &project, &input, record.failure_class)
+    };
+    let mut launch = selected?;
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
@@ -1776,13 +1778,20 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     let resumable = crate::adapters::declaration(&ctx.config_dir, kind)
         .is_ok_and(|adapter| adapter.blocked_error_resumable);
     let state = prompt_state(&record, &agents, resumable)?;
-    view.herdr
-        .on_machine(record.machine_route())
-        .agent_prompt(&record.pane_id, text.trim())
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // A blocked lane with its own recorded error is resumed by this prompt.
-    if resumable && state == "blocked" && !record.error.is_empty() {
+    let herdr = view.herdr.on_machine(record.machine_route());
+    // Herdr rejects `agent prompt` for every blocked pane. An adapter-owned
+    // error screen is different from an approval dialog: submit through the
+    // pane so the adapter's input hook clears its block. A blocked lane with
+    // no durable error still refuses in `prompt_state` above.
+    if state == "blocked" {
+        herdr
+            .pane_submit_text(&record.pane_id, text.trim())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         thread::update(&project, id, |t| t.error.clear())?;
+    } else {
+        herdr
+            .agent_prompt(&record.pane_id, text.trim())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     Ok(state)
 }
