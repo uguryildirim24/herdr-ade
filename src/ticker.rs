@@ -1460,12 +1460,18 @@ fn clean_managed_project_tabs(
                     thread::Status::Starting | thread::Status::Open
                 )
                 && !agents.iter().any(|agent| agent.tab_id == record.tab_id)
-                && panes.iter().any(|pane| thread::pane_matches(record, pane))
+                && {
+                    let tab_panes: Vec<_> = panes
+                        .iter()
+                        .filter(|pane| pane.tab_id == record.tab_id)
+                        .collect();
+                    tab_panes.len() == 1 && thread::pane_matches(record, tab_panes[0])
+                }
         })
         .filter(|record| {
-            herdr
-                .pane_process_info(&record.pane_id)
-                .is_ok_and(|info| info.foreground_processes.is_empty())
+            herdr.pane_process_info(&record.pane_id).is_ok_and(|info| {
+                info.pane_id == record.pane_id && info.foreground_processes.is_empty()
+            })
         })
         .filter_map(|record| {
             herdr.tab_close(&record.tab_id).err().map(|error| {
@@ -1784,6 +1790,18 @@ mod tests {
         assert!(errors.is_empty(), "{errors:#?}");
         assert_eq!(runner.count("tab close w2:t1"), 1);
         assert_eq!(runner.count("tab close w2:t2"), 0);
+
+        let mut shared_tab = panes.to_vec();
+        shared_tab.push(Pane {
+            pane_id: "w2:p2".into(),
+            tab_id: "w2:t1".into(),
+            workspace_id: "w2".into(),
+            cwd: "/someone-else".into(),
+        });
+        let errors =
+            clean_managed_project_tabs(&fixture.project, "machine-1", &herdr, &[], &shared_tab);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(runner.count("tab close w2:t1"), 1);
     }
 
     #[test]
