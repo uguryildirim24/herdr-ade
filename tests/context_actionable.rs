@@ -64,7 +64,7 @@ fn page_body(page: &str) -> &str {
 fn context_starts_with_the_complete_project_page_without_duplicate_tours() {
     let p = Project::new();
     p.write(
-        "threads/t-0001.toml",
+        ".state/threads/t-0001.toml",
         "id = \"t-0001\"\ntitle = \"Needs help\"\nstatus = \"failed\"\nattempt = 1\nerror = \"compiler failure\"\n",
     );
     let text = p.context(false);
@@ -82,7 +82,7 @@ fn context_starts_with_the_complete_project_page_without_duplicate_tours() {
 fn context_shows_the_words_inside_a_pasted_message() {
     let p = Project::new();
     p.write(
-        "talk/journal.jsonl",
+        ".state/talk/journal.jsonl",
         concat!(
             "{\"seq\":1,\"at\":\"2026-09-22T00:00:00Z\",\"rolf\":{",
             "\"request\":\"q-paste\",",
@@ -104,13 +104,13 @@ fn action_rows_are_bounded_without_raw_storage_pointers() {
     for n in 1..=21 {
         let id = format!("t-{n:04}");
         p.write(
-            format!("threads/{id}.toml"),
+            format!(".state/threads/{id}.toml"),
             format!(
                 "id = \"{id}\"\ntitle = \"task {n}\"\nstatus = \"failed\"\nattempt = 1\nerror = \"failure {n}\"\n"
             ),
         );
         p.write(
-            format!("inbox/i-{n:04}.md"),
+            format!(".state/inbox/i-{n:04}.md"),
             format!("+++\nid = \"i-{n:04}\"\nkind = \"routine\"\nsubject = \"job\"\ncreated = \"x\"\nsummary = \"message-{n:04}\"\n+++\n"),
         );
     }

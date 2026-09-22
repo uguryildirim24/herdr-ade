@@ -599,11 +599,11 @@ mod tests {
     #[test]
     fn broken_journals_are_reported_not_overwritten() {
         let (_root, p) = fixture();
-        std::fs::write(p.dir().join("ledger.jsonl"), "{unfinished").unwrap();
+        std::fs::write(p.state_dir().join("ledger.jsonl"), "{unfinished").unwrap();
         assert!(list(&p).is_err());
         assert!(record(&p, "start", "r1", "failed").is_err());
         assert_eq!(
-            std::fs::read_to_string(p.dir().join("ledger.jsonl")).unwrap(),
+            std::fs::read_to_string(p.state_dir().join("ledger.jsonl")).unwrap(),
             "{unfinished"
         );
     }
@@ -622,7 +622,7 @@ mod tests {
             assert!(!runner.run(&cmd).unwrap().success());
         }
         assert!(list(&p).unwrap().is_empty());
-        assert!(!p.dir().join("ledger.jsonl").exists());
+        assert!(!p.state_dir().join("ledger.jsonl").exists());
     }
 
     #[test]

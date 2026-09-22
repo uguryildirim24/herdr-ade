@@ -829,7 +829,7 @@ mod tests {
             created: "2026-09-22T00:00:00Z".into(),
             ..crate::task::Task::default()
         };
-        let task_dir = fx.project.dir().join("tasks");
+        let task_dir = fx.project.state_dir().join("tasks");
         std::fs::create_dir_all(&task_dir).unwrap();
         std::fs::write(
             task_dir.join("job-0001.toml"),
