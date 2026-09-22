@@ -729,12 +729,10 @@ fn deliver_queued(ctx: &Ctx, project: &Project) -> Result<Vec<(String, TalkReque
         if inbound.recipient != current {
             // Never retargeted: the request stays queued for the old
             // incarnation and Rolf is told once.
-            let _ = crate::ask::publish_keyed(
+            let _ = crate::ask::publish_notice_keyed(
                 ctx,
                 project,
-                &HumanMessage::Notice {
-                    id: "recipient_changed".into(),
-                },
+                "recipient_changed",
                 Some(&format!("recipient_changed:{}", inbound.request)),
             );
             continue;
