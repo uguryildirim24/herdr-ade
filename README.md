@@ -89,7 +89,7 @@ It runs the `herdr-ade` binary every turn, so you'll want to allow-list it in yo
 
 ### Does the plugin send my project to a hosted service?
 
-Project files and lane work stay on your machines. Dispatch reads the local routing table; only the selected agent CLI uses its configured service. Remote lanes use your own SSH machines.
+Project files and lane work stay on your machines. Dispatch reads the local routing table; only the selected agent CLI uses its configured service. Remote lanes use your own SSH machines, and each `[machines.<name>]` declaration lists the adapter `kinds` it runs. The shipped `oci` machine runs `pi`; Claude and agy jobs stay on the Mac and need no box sign-in.
 
 ### Will it touch my branches or worktrees on its own?
 
