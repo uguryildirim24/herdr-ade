@@ -292,11 +292,8 @@ pub(crate) fn newest_open(project: &Project) -> Option<Ask> {
 fn normalized_question(text: &str) -> String {
     text.chars()
         .flat_map(char::to_lowercase)
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 /// Every stored revision, including answered history, oldest id first.
@@ -309,7 +306,11 @@ fn revisions(project: &Project) -> Vec<(Ask, Option<Answer>)> {
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|id| validate_ask_id(id).is_ok())
         .collect();
-    ids.sort();
+    ids.sort_by_key(|id| {
+        id.strip_prefix("a-")
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    });
     let mut out = Vec::new();
     for id in ids {
         for revision in 1..=latest_revision(project, &id) {
@@ -327,9 +328,7 @@ fn refuse_repeated_question(project: &Project, new: &NewAsk) -> Result<()> {
         let still_open = answer.is_none()
             && ask.revision == latest_revision(project, &ask.id)
             && !is_withdrawn(project, &ask.id, ask.revision);
-        Some(ask.id.as_str()) != new.reask.as_deref()
-            && (answer.is_some() || still_open)
-            && normalized_question(&ask.question) == wanted
+        (answer.is_some() || still_open) && normalized_question(&ask.question) == wanted
     }) {
         let answer = answer
             .map(|answer| answer.text)
@@ -1033,6 +1032,7 @@ mod tests {
             &ctx,
             "demo",
             NewAsk {
+                question: "Keep the experiment running two more hours or stop now?".into(),
                 reask: Some("a-1".into()),
                 ..keep_or_stop()
             },
@@ -1407,6 +1407,14 @@ mod tests {
     }
 
     #[test]
+    fn question_identity_ignores_case_spacing_and_punctuation() {
+        assert_eq!(
+            normalized_question("Can't stop -- now?"),
+            normalized_question("CANTSTOPNOW")
+        );
+    }
+
+    #[test]
     fn a_normalized_duplicate_names_the_existing_id_without_writing() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -1421,14 +1429,26 @@ mod tests {
             error,
             "ask_duplicate: `a-1` already asks this question; answer: still open"
         );
-        assert_eq!(open_asks(&fx.project), vec![a]);
+        assert_eq!(open_asks(&fx.project), vec![a.clone()]);
         assert_eq!(journal_kinds(&fx.project), before);
         assert!(!ask_dir(&fx.project, "a-2").exists());
         assert_eq!(
             project::read_json::<u64>(&fx.project.state_dir().join("ask-counter.json")).unwrap(),
             1
         );
-        // Re-asking oneself is allowed, but copying another open ask is not.
+        let same_id = ask(
+            &ctx,
+            "demo",
+            NewAsk {
+                reask: Some(a.id),
+                ..keep_or_stop()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(same_id.starts_with("ask_duplicate"), "{same_id}");
+
+        // A re-ask also cannot copy a different open question.
         let b = ask(&ctx, "demo", distinct_ask(2)).unwrap();
         assert!(
             ask(
