@@ -867,14 +867,20 @@ mod tests {
         );
         assert!(crate::talk::read(&project).lines.is_empty());
 
-        let mixed = format!("Please check this notice.\n{notice}\nThen tell me what it means.");
-        let mixed_id = handle_prompt(&project, "w1:p1", &mixed)
-            .unwrap()
-            .expect("Rolf's text around an idle notice remains his request");
-        assert_eq!(
-            crate::talk::recent_requests(&project, 5),
-            vec![(mixed_id, mixed)]
-        );
+        let mixed_prompts = [
+            format!("Please check this notice.\n{notice}"),
+            format!("{notice}\nThen tell me what it means."),
+            format!("{notice}\nThis part is from Rolf.\n{notice}"),
+        ];
+        for mixed in &mixed_prompts {
+            let mixed_id = handle_prompt(&project, "w1:p1", mixed)
+                .unwrap()
+                .expect("Rolf's text before, after, or between notices remains his request");
+            assert!(
+                crate::talk::recent_requests(&project, 5).contains(&(mixed_id, mixed.clone())),
+                "mixed prompt was not retained: {mixed}"
+            );
+        }
 
         crate::talk::append(
             &project,
@@ -886,7 +892,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(crate::talk::read(&project).lines.len(), 2);
+        assert_eq!(
+            crate::talk::read(&project).lines.len(),
+            mixed_prompts.len() + 1
+        );
         assert!(
             crate::talk::recent_requests(&project, 5)
                 .iter()
