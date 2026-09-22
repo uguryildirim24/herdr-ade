@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0227.md",
+      "tasks/review-r93.md",
+      "tasks/review-r92.md",
+      "tasks/review-r91.md",
+      "tasks/t-0226.md",
+      "tasks/t-0225.md",
+      "tasks/t-0224.md",
+      "tasks/t-0223.md",
+      "tasks/t-0222.md",
       "tasks/t-0221.md",
       "tasks/t-0219.md",
-      "tasks/t-0216.md",
-      "tasks/review-r90.md",
-      "tasks/t-0220.md",
-      "tasks/t-0217.md",
-      "tasks/t-0214.md",
-      "tasks/review-r88.md",
-      "tasks/t-0218.md",
-      "tasks/t-0215.md",
-      "tasks/review-r89.md",
-      "tasks/t-0212.md"
+      "tasks/t-0216.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r91.md",
       "tasks/reviews/code-r90.md",
       "tasks/reviews/code-r88.md",
       "tasks/reviews/code-r89.md",
@@ -39,15 +40,25 @@
       "tasks/reviews/code-r84.md",
       "tasks/reviews/code-r83.md",
       "tasks/reviews/code-r81.md",
-      "tasks/reviews/code-r80.md",
-      "tasks/reviews/code-r79.md"
+      "tasks/reviews/code-r80.md"
     ]
   },
-  "generated": "2026-09-21T23:47:22-04:00",
+  "generated": "2026-09-22T00:20:05-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0221-review-r90-every-coordinator-keeps-worki",
       "main",
+      "hp/adeherdr/t-0229-review-r93-jobs-for-the-two-sign-in-help",
+      "hp/adeherdr/t-0227-review-r91-an-install-with-a-broken-box",
+      "review/r93",
+      "hp/adeherdr/t-0228-review-r92-installing-twice-on-the-same",
+      "hp/adeherdr/t-0225-w17-gone-worktree-counts-as-removed",
+      "review/r92",
+      "hp/adeherdr/t-0223-w15-claude-and-agy-on-the-mac",
+      "review/r91",
+      "hp/adeherdr/t-0222-w14-install-twice-still-proves",
+      "hp/adeherdr/t-0224-w16-install-builds-itself-first",
+      "hp/adeherdr/t-0226-d7-newer-choices-win",
+      "hp/adeherdr/t-0221-review-r90-every-coordinator-keeps-worki",
       "review/r90-3",
       "hp/adeherdr/t-0219-review-r90-every-coordinator-keeps-worki",
       "hp/adeherdr/t-0220-review-r88-a-failed-answer-from-the-web",
@@ -357,43 +368,43 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "7f9bfa8 review(autonomy): verdict for r90 revision 3",
-      "e792f5e Merge commit '3dc1c87dface7381ea02daff5c8940bd8a119d9f' into hp/adeherdr/t-0221-review-r90-every-coordinator-keeps-worki",
-      "26d5081 docs(tasks): t-0221",
-      "8249438 review(r90): brief for revision 1",
-      "97140dd checkpoint(r88): HANDOFF after merging the round",
-      "e6ad477 review(r88): approve candidate on W11 base"
+      "4a772b4 Merge commit 'bc988eec744e8f53d2d31c63d81bd476285ce3ed'",
+      "bc988ee docs(review): round r91 verdict",
+      "1bdc76b review(r93): brief for revision 1",
+      "e37b427 review(r92): brief for revision 1",
+      "abb53f6 Merge commit 'ced57749e87035275d0c66dab9a9ee77529005ac' into review/r91",
+      "9d5509a docs(tasks): t-0227"
     ],
-    "remote": "10 ahead, 0 behind origin/main",
+    "remote": "13 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "7f9bfa8",
+        "head": "4a772b4",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(autonomy): verdict for r90 revision 3"
+        "subject": "Merge commit 'bc988eec744e8f53d2d31c63d81bd476285ce3ed'"
       },
       {
-        "branch": "review/r90",
+        "branch": "review/r91",
         "dirty": 0,
-        "head": "f3e6464",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90",
-        "subject": "docs(tasks): t-0216"
+        "head": "9d5509a",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r91",
+        "subject": "docs(tasks): t-0227"
       },
       {
-        "branch": "review/r90-2",
+        "branch": "review/r92",
         "dirty": 0,
-        "head": "bab4c62",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90-2",
-        "subject": "docs(tasks): t-0219"
+        "head": "f4cbd52",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r92",
+        "subject": "docs(tasks): t-0228"
       },
       {
-        "branch": "review/r90-3",
+        "branch": "review/r93",
         "dirty": 0,
-        "head": "26d5081",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90-3",
-        "subject": "docs(tasks): t-0221"
+        "head": "345f901",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r93",
+        "subject": "docs(tasks): t-0229"
       }
     ]
   },
@@ -413,8 +424,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r90",
-    "verdict": "7f9bfa8e806545d951a72bef886e61bcbe6e0e54"
+    "round": "r91",
+    "verdict": "bc988eec744e8f53d2d31c63d81bd476285ce3ed"
   },
   "session": "default",
   "unlinked_agents": [],
