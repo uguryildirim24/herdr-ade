@@ -97,6 +97,19 @@ pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Re
     Ok(())
 }
 
+/// Drops registrations whose checkout directory is already gone. Expiring
+/// immediately makes manual removal idempotent instead of retaining Git's
+/// default grace-period entry.
+pub(crate) fn worktree_prune(runner: &dyn Runner, repo: &str) -> Result<()> {
+    git(
+        runner,
+        repo,
+        &["worktree", "prune", "--expire=now"],
+        GIT_TIMEOUT,
+    )?;
+    Ok(())
+}
+
 /// Full removal status, including ignored files. This is only for worktree
 /// deletion safety: callers must classify `!!` rows against the editable
 /// disposable-path list before removing anything.

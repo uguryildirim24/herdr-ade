@@ -986,7 +986,10 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     world.runner.on_fn(
         |cmd| cmd.program == "ssh",
         |cmd| {
-            if cmd.display().contains("status --porcelain") {
+            let line = cmd.display();
+            if line.contains("__HERDR_WORKTREE_PRESENT__") {
+                Ok(ok("__HERDR_WORKTREE_PRESENT__\n"))
+            } else if line.contains("status --porcelain") {
                 Ok(ok("\0__HERDR_NESTED_WORKTREES__\0"))
             } else {
                 Ok(ok(""))
@@ -1065,7 +1068,9 @@ fn ignored_data_on_a_box_keeps_the_worktree_and_resolves_the_thread() {
         |cmd| cmd.program == "ssh",
         |cmd| {
             let line = cmd.display();
-            if line.contains("status --porcelain --ignored --untracked-files=all") {
+            if line.contains("__HERDR_WORKTREE_PRESENT__") {
+                Ok(ok("__HERDR_WORKTREE_PRESENT__\n"))
+            } else if line.contains("status --porcelain --ignored --untracked-files=all") {
                 Ok(ok("!! runs/raw.bin\0\0__HERDR_NESTED_WORKTREES__\0"))
             } else if line.contains("du -sk") {
                 Ok(ok(
