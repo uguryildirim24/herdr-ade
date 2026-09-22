@@ -1534,14 +1534,22 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
         .iter()
         .find(|agent| agent.pane_id == pane_id)
         .with_context(|| format!("rebind_no_agent: no live agent is in pane {pane_id}"))?;
+    let managed = managed_git_folder(&project, &record);
     let expected_cwd = if record.worktree_path.is_empty() {
         record.cwd.as_str()
     } else {
         record.worktree_path.as_str()
     };
-    if !expected_cwd.is_empty() && agent.cwd != expected_cwd {
+    let cwd_matches =
+        expected_cwd.is_empty() || agent.cwd == expected_cwd || managed && agent.cwd == record.cwd;
+    if !cwd_matches {
+        let expected = if managed && record.cwd != expected_cwd {
+            format!("{expected_cwd} or {}", record.cwd)
+        } else {
+            expected_cwd.to_string()
+        };
         bail!(
-            "rebind_identity_mismatch: pane {pane_id} runs in {}, expected {expected_cwd}",
+            "rebind_identity_mismatch: pane {pane_id} runs in {}, expected {expected}",
             agent.cwd
         );
     }
