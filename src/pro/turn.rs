@@ -267,8 +267,9 @@ fn collect_inner_with_clock(
 ) -> Result<()> {
     layout.ensure()?;
     // A retried collector waits for the first one and then observes its
-    // terminal record instead of prompting or delivering the turn twice.
-    let _collector_lock = state::FileLock::acquire(&layout.inflight_lock(tag))?;
+    // terminal record instead of prompting or delivering the turn twice. The
+    // mutex is separate from the in-flight marker, which is removed on exit.
+    let _collector_lock = state::FileLock::acquire(&layout.collector_lock(tag))?;
     let _guard = InflightGuard::new(layout, tag);
     let mut turn = Turn::read(layout, tag)?;
     if matches!(turn.state.as_str(), "delivered" | "failed") {

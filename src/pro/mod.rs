@@ -252,6 +252,12 @@ impl Layout {
         self.turns().join(format!("{tag}.toml"))
     }
 
+    /// Stable per-turn collector mutex. Unlike the in-flight marker, this path
+    /// is never unlinked while another collector may be waiting on its inode.
+    pub(crate) fn collector_lock(&self, tag: &str) -> PathBuf {
+        self.turns().join(format!("{tag}.collector.lock"))
+    }
+
     pub(crate) fn packet(&self, tag: &str) -> PathBuf {
         self.packets().join(format!("{tag}.md"))
     }
