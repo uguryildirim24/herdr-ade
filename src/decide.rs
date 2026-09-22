@@ -1,5 +1,5 @@
 //! The decided-for-you records (SPEC-talk §2.7 and §6.6): a decision history
-//! at `<project>/decisions.jsonl`, its validation, retry keys, authority
+//! at `<project>/.state/decisions.jsonl`, its validation, retry keys, authority
 //! references, current-choice folding and replacements.
 //!
 //! Plain-check before append, enforce the existing entry-size bound, write the
@@ -20,11 +20,11 @@ use crate::project::{self, Project};
 use crate::talk;
 
 pub(crate) fn decisions_path(project: &Project) -> PathBuf {
-    project.dir().join("decisions.jsonl")
+    project.record_file("decisions.jsonl")
 }
 
 fn lock_path(project: &Project) -> PathBuf {
-    project.dir().join(".decisions.lock")
+    project.state_dir().join("decisions.lock")
 }
 
 struct DecisionsLock {
@@ -306,10 +306,8 @@ fn append(project: &Project, record: &Decision) -> Result<()> {
             talk::MAX_ENTRY_BYTES
         );
     }
-    let mut file = File::options()
-        .create(true)
-        .append(true)
-        .open(decisions_path(project))?;
+    let path = project.record_file_for_write("decisions.jsonl")?;
+    let mut file = File::options().create(true).append(true).open(path)?;
     file.write_all(text.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;

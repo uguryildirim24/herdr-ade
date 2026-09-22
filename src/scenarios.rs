@@ -109,8 +109,9 @@ impl World {
         let project = project::create(&self.root, slug, "", vec![]).unwrap();
         // Scenario fixtures may write coordinator-owned files directly instead
         // of exercising their first-use commands.
-        for dir in ["tasks", "routines", "inbox", "inbox/done"] {
-            std::fs::create_dir_all(project.dir().join(dir)).unwrap();
+        std::fs::create_dir_all(project.dir().join("routines")).unwrap();
+        for dir in ["tasks", "inbox", "inbox/done"] {
+            std::fs::create_dir_all(project.state_dir().join(dir)).unwrap();
         }
         let socket = self.home.path().join(socket);
         std::fs::write(&socket, b"").unwrap();
@@ -438,7 +439,7 @@ fn an_adopted_no_repo_thread_rebinds_at_its_original_cwd() {
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().join("original");
     std::fs::create_dir_all(&cwd).unwrap();
-    let managed = project.dir().join("threads/t-0001");
+    let managed = project.state_dir().join("threads/t-0001");
     std::fs::create_dir_all(managed.join(".git")).unwrap();
     world.thread(&project, &cwd, |t| {
         t.kind = Kind::Adopted;
@@ -1625,7 +1626,7 @@ fn pr_metadata_is_in_the_digest_but_comment_bodies_are_not() {
     let digest = coordinator::digest(&ctx, &project, "ha").unwrap().0;
     assert!(digest.contains("new commenters: mallory"), "{digest}");
     assert!(!digest.contains("SECRET-BODY"));
-    let all = std::fs::read_dir(project.dir().join("inbox"))
+    let all = std::fs::read_dir(project.state_dir().join("inbox"))
         .unwrap()
         .flatten()
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
@@ -2888,8 +2889,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        5,
-        "one box build per repo plus lane settings, the pi guard, and the running-process check"
+        6,
+        "one box build per repo plus lane settings, the pi guard, project conversion, and the running-process check"
     );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
@@ -2936,6 +2937,11 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
             && scripts[3].contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard"),
         "{}",
         scripts[3]
+    );
+    assert!(
+        scripts[4].contains("ticker stop") && scripts[4].contains("project convert"),
+        "{}",
+        scripts[4]
     );
     drop(calls);
 

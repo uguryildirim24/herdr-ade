@@ -431,8 +431,21 @@ pub(crate) fn provision_card(
     path: &str,
     card: &str,
 ) -> Result<()> {
-    let lanes_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
-    let project_dir = lanes_dir.rsplit_once('/').map_or(lanes_dir, |(d, _)| d);
+    let lanes_dir = Path::new(path)
+        .parent()
+        .context("a box lane card path has no parent")?;
+    let state_or_project = lanes_dir
+        .parent()
+        .context("a box lanes folder has no project parent")?;
+    let project_dir =
+        if state_or_project.file_name().and_then(|name| name.to_str()) == Some(".state") {
+            state_or_project
+                .parent()
+                .context("a hidden box state folder has no project parent")?
+        } else {
+            state_or_project
+        };
+    let project_dir = project_dir.to_string_lossy();
     let project_md = format!("{project_dir}/PROJECT.md");
     let state_dir = format!("{project_dir}/.state");
     let script = format!(
@@ -572,7 +585,7 @@ mod tests {
     fn the_card_script_works_against_a_real_directory_with_a_hostile_path() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("it's a $(box)");
-        let card = dir.join("lanes/t-0001.toml");
+        let card = dir.join(".state/lanes/t-0001.toml");
         let card_s = card.to_string_lossy().into_owned();
         let runner = FakeRunner::new();
         runner.on_fn(

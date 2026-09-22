@@ -14,11 +14,11 @@ use crate::contracts::{DeliveryLine, DeliveryState, Event, EventPayload};
 use crate::project::{self, Project};
 
 fn events_dir(project: &Project) -> PathBuf {
-    project.dir().join("events")
+    project.record_dir("events")
 }
 
 fn deliveries_dir(project: &Project) -> PathBuf {
-    project.dir().join("deliveries")
+    project.record_dir("deliveries")
 }
 
 pub(crate) fn event_path(project: &Project, id: &str) -> Result<PathBuf> {
@@ -59,7 +59,7 @@ fn validate_machine(machine: &str) -> Result<()> {
 
 /// The Mac's content-addressed artifact folder (SPEC-remote §4.3).
 fn artifact_dir(project: &Project) -> PathBuf {
-    project.dir().join("artifacts")
+    project.state_dir().join("artifacts")
 }
 
 /// The Mac path of one artifact, named by its own hash.
@@ -85,7 +85,7 @@ pub(crate) struct ImportSource {
 }
 
 fn imports_dir(project: &Project) -> PathBuf {
-    project.dir().join("imports")
+    project.record_dir("imports")
 }
 
 fn import_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf> {
@@ -114,9 +114,8 @@ pub(crate) enum ImportOutcome {
 
 /// Imports one box envelope into the Mac's canonical ledger, create-only
 /// (SPEC-remote §4.3). The box's own bytes must hash to `event_hash`; the
-/// artifact must hash to the event's `artifact`. The local event keeps the
-/// same id and payload but its `report_path` is rewritten to the Mac artifact
-/// path, so the typed DONE line names a path the Mac owns. The same event id
+/// artifact must hash to the event's `artifact`. The sealed event bytes remain
+/// historical evidence; file lookup uses the artifact hash. The same event id
 /// with different bytes is corruption and refuses.
 pub(crate) fn import_box_event(
     project: &Project,
@@ -160,13 +159,7 @@ pub(crate) fn import_box_event(
         artifact_hash = done.artifact.clone();
     }
 
-    let mut local = event.clone();
-    if let Some(done) = local.payload.done.as_mut() {
-        done.report_path = artifact_path(project, &done.artifact)
-            .to_string_lossy()
-            .into_owned();
-    }
-    seal_create_if_absent(project, &local)
+    seal_create_if_absent(project, &event)
         .with_context(|| format!("could not import event {}", event.id))?;
 
     let source = ImportSource {
@@ -182,6 +175,7 @@ pub(crate) fn import_box_event(
 }
 
 fn write_import_create_only(project: &Project, source: &ImportSource) -> Result<()> {
+    project.record_dir_for_write("imports")?;
     let path = import_path(project, &source.machine, &source.event)?;
     let mut text = toml::to_string(source)?;
     if !text.ends_with('\n') {
@@ -311,7 +305,7 @@ pub(crate) fn bytes(event: &Event) -> Result<Vec<u8>> {
 /// Creates an immutable event. If another helper already created it, only
 /// exact byte equality is accepted.
 pub(crate) fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
-    std::fs::create_dir_all(events_dir(project))?;
+    project.record_dir_for_write("events")?;
     let path = event_path(project, &event.id)?;
     let expected = bytes(event)?;
     // Written whole beside the target, then linked into place: a reader never
@@ -360,7 +354,7 @@ pub(crate) struct Receipt {
 }
 
 fn receipts_dir(project: &Project) -> PathBuf {
-    project.dir().join("receipts")
+    project.record_dir("receipts")
 }
 
 pub(crate) fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
@@ -371,6 +365,7 @@ pub(crate) fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
 /// Writes the receipt create-only. A retry with the same bytes is a no-op;
 /// different bytes for a sealed event are corruption.
 pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
+    project.record_dir_for_write("receipts")?;
     let event_hash = hash_bytes(&bytes(event)?);
     let (artifact, artifact_hash) = match &event.payload.done {
         Some(done) => (done.artifact.clone(), done.artifact.clone()),
@@ -391,7 +386,6 @@ pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    std::fs::create_dir_all(receipts_dir(project))?;
     let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -447,7 +441,7 @@ pub(crate) fn append_delivery_locked(
     event: &str,
     state: DeliveryState,
 ) -> Result<()> {
-    std::fs::create_dir_all(deliveries_dir(project))?;
+    project.record_dir_for_write("deliveries")?;
     if state != DeliveryState::Submitted && states(project, event)?.contains(&state) {
         return Ok(());
     }
@@ -599,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn box_import_is_create_only_hash_checked_and_rewrites_the_report_path() {
+    fn box_import_is_create_only_hash_checked_and_preserves_the_report_path() {
         let (_root, project, _event) = fixture();
         let report = b"report body";
         let hash = format!("{:x}", Sha256::digest(report));
@@ -612,8 +606,7 @@ mod tests {
         );
         let imported = load(&project, &event.id).unwrap();
         let written = imported.payload.done.clone().unwrap().report_path;
-        assert!(written.ends_with(&hash), "{written}");
-        assert!(!written.contains(".reports"), "{written}");
+        assert_eq!(written, ".reports/t-0001.md");
         assert_eq!(
             std::fs::read(artifact_path(&project, &hash)).unwrap(),
             report

@@ -336,7 +336,8 @@ impl Overview {
                 out.sections[2].push(Row::text(CATCH_UP));
             }
         }
-        let (mut tasks, failed) = records::<thread::Thread>(&project.dir().join("threads"));
+        let (mut tasks, thread_errors) = thread::list_with_errors(project);
+        let failed = !thread_errors.is_empty();
         tasks.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
         let (rounds, rounds_failed) =
             records::<crate::contracts::RoundRecord>(&round::rounds_dir(project));

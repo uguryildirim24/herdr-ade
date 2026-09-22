@@ -2025,13 +2025,18 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             ProjectCommand::Convert { slug } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let (history, moved) = project::convert(&project)?;
+                let message = if moved.is_empty() {
+                    format!("`{slug}` is already converted\n")
+                } else {
+                    format!(
+                        "converted `{slug}`; moved under .state: {}\n",
+                        moved.join(", ")
+                    )
+                };
                 crate::output::success(
                     Some("converted"),
                     &serde_json::json!({ "history": history, "moved": moved }),
-                    &format!(
-                        "converted `{slug}`; moved {} to {history}\n",
-                        moved.join(", ")
-                    ),
+                    &message,
                     "",
                 )
             }

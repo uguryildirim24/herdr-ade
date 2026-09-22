@@ -57,7 +57,7 @@ pub(crate) struct Row {
 }
 
 fn path(project: &Project) -> PathBuf {
-    project.dir().join("notes.jsonl")
+    project.record_file("notes.jsonl")
 }
 
 pub(crate) struct ReplacementLock {
@@ -218,10 +218,8 @@ pub(crate) fn add(
         replaces: replaces.map(str::to_string),
         tasks,
     };
-    let mut file = File::options()
-        .create(true)
-        .append(true)
-        .open(path(project))?;
+    let path = project.record_file_for_write("notes.jsonl")?;
+    let mut file = File::options().create(true).append(true).open(path)?;
     writeln!(file, "{}", serde_json::to_string(&note)?)?;
     file.sync_all()?;
     drop(file);

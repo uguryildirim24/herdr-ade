@@ -131,8 +131,9 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
         "{}",
         String::from_utf8_lossy(&withdrawn.stderr)
     );
-    assert!(root.join("demo/asks/a-1/r1.toml").is_file());
-    let record = std::fs::read_to_string(root.join("demo/asks/a-1/r1.withdrawn.toml")).unwrap();
+    assert!(root.join("demo/.state/asks/a-1/r1.toml").is_file());
+    let record =
+        std::fs::read_to_string(root.join("demo/.state/asks/a-1/r1.withdrawn.toml")).unwrap();
     assert!(record.contains("by = \"rolf\""));
     assert!(run(&ask_args).status.success());
     assert!(
@@ -233,9 +234,9 @@ fn peek_records_nothing_and_context_records_seen_items() {
             .success()
     );
     let item = "+++\nid = \"20260917T000000Z-routine-r-1\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"x\"\nsummary = \"s\"\n+++\n";
-    std::fs::create_dir(root.join("demo/inbox")).unwrap();
+    std::fs::create_dir(root.join("demo/.state/inbox")).unwrap();
     std::fs::write(
-        root.join("demo/inbox/20260917T000000Z-routine-r-1.md"),
+        root.join("demo/.state/inbox/20260917T000000Z-routine-r-1.md"),
         item,
     )
     .unwrap();
@@ -283,14 +284,14 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
             .success()
         );
     }
-    assert!(!root.join("demo/ledger.jsonl").exists());
+    assert!(!root.join("demo/.state/ledger.jsonl").exists());
     let entry = |count| {
         format!(
             "{{\"record\":\"failure\",\"id\":\"f-0001\",\"at\":\"2026-09-22T00:00:00Z\",\"last_at\":\"2026-09-22T00:00:00Z\",\"kind\":\"command-failed\",\"subject\":\"ha thread start\",\"detail\":\"no thread\",\"count\":{count},\"closed\":false}}\n"
         )
     };
     std::fs::write(
-        root.join("demo/ledger.jsonl"),
+        root.join("demo/.state/ledger.jsonl"),
         format!("{}{}", entry(1), entry(2)),
     )
     .unwrap();

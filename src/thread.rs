@@ -183,8 +183,12 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn threads_dir(project: &Project) -> PathBuf {
-    project.dir().join("threads")
+pub(crate) fn threads_dir(project: &Project) -> PathBuf {
+    project.record_dir("threads")
+}
+
+pub(crate) fn threads_dir_for_write(project: &Project) -> Result<PathBuf> {
+    project.record_dir_for_write("threads")
 }
 
 fn record_path(project: &Project, id: &str) -> PathBuf {
@@ -193,6 +197,10 @@ fn record_path(project: &Project, id: &str) -> PathBuf {
 
 pub(crate) fn task_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.task.md"))
+}
+
+pub(crate) fn task_path_for_write(project: &Project, id: &str) -> Result<PathBuf> {
+    Ok(threads_dir_for_write(project)?.join(format!("{id}.task.md")))
 }
 
 pub(crate) fn home_report_path(project: &Project, id: &str) -> PathBuf {
@@ -292,13 +300,9 @@ pub(crate) fn list(project: &Project) -> Vec<Thread> {
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
-    let dir = threads_dir(project);
-    if !dir.is_dir() {
-        // The caller holds the project lock. Do not recreate a deleted project.
-        std::fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
+    let dir = threads_dir_for_write(project)?;
     write_atomic(
-        &record_path(project, &thread.id),
+        &dir.join(format!("{}.toml", thread.id)),
         toml::to_string(thread)?.as_bytes(),
     )
 }
@@ -1639,7 +1643,7 @@ mod tests {
             (t.title.as_str(), t.pane_id.as_str(), t.prompt_pending),
             ("Hello", "w1:p2", true)
         );
-        let leftovers = std::fs::read_dir(project.dir().join("threads"))
+        let leftovers = std::fs::read_dir(threads_dir(&project))
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
