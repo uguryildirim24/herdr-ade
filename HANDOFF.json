@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
-      "tasks/t-0250.md",
-      "tasks/t-0242.md",
+      "tasks/t-0254.md",
+      "tasks/t-0251.md",
+      "tasks/t-0244.md",
+      "tasks/t-0260.md",
       "tasks/review-r99.md",
+      "tasks/review-r100.md",
       "tasks/review-r98.md",
       "tasks/review-r97.md",
+      "tasks/t-0250.md",
+      "tasks/t-0242.md",
       "tasks/review-r96.md",
-      "tasks/t-0249.md",
-      "tasks/t-0243.md",
-      "tasks/t-0241.md",
-      "tasks/t-0236.md",
-      "tasks/t-0233.md",
-      "tasks/t-0228.md"
+      "tasks/t-0249.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r97.md",
       "tasks/reviews/code-r96.md",
       "tasks/reviews/code-r92.md",
       "tasks/reviews/code-r95.md",
@@ -39,18 +40,29 @@
       "tasks/reviews/code-r88.md",
       "tasks/reviews/code-r89.md",
       "tasks/reviews/code-r87.md",
-      "tasks/reviews/code-r86.md",
-      "tasks/reviews/code-r82.md"
+      "tasks/reviews/code-r86.md"
     ]
   },
-  "generated": "2026-09-22T01:51:51-04:00",
+  "generated": "2026-09-22T02:19:00-04:00",
   "git": {
     "branches": [
       "main",
+      "hp/adeherdr/t-0261-review-r99-every-install-shows-plainly-w",
+      "review/r99-2",
+      "hp/adeherdr/t-0260-w26-unknown-failure-recovery",
+      "hp/adeherdr/t-0259-review-r99-every-install-shows-plainly-w",
+      "hp/adeherdr/t-0258-review-r99-every-install-shows-plainly-w",
+      "hp/adeherdr/t-0257-review-r99-every-install-shows-plainly-w",
+      "hp/adeherdr/t-0254-review-r97-a-job-that-should-never-have",
+      "hp/adeherdr/t-0255-review-r98-finished-work-leaves-nothing",
+      "hp/adeherdr/t-0253-review-r99-every-install-shows-plainly-w",
+      "hp/adeherdr/t-0256-review-r100-helpers-get-their-first-mess",
+      "review/r100",
+      "review/r98-3",
+      "review/r97-3",
       "hp/adeherdr/t-0252-review-r98-finished-work-leaves-nothing",
       "hp/adeherdr/t-0251-review-r97-a-job-that-should-never-have",
       "hp/adeherdr/t-0250-review-r96-a-failed-answer-from-the-web",
-      "hp/adeherdr/t-0253-review-r99-every-install-shows-plainly-w",
       "review/r99",
       "hp/adeherdr/t-0247-w23-no-false-bridge-restart",
       "hp/adeherdr/t-0246-w22-adopt-waits-for-ready",
@@ -407,36 +419,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "fe5c038 Merge commit 'f52c92611a8dcdaeab1848a498d0f64c29f7b44b'",
-      "f52c926 review(pro): verdict for repaired r96",
-      "fe52091 review(r99): brief for revision 1",
-      "c25def4 Merge reviewed r96 candidate onto revised base",
-      "de79778 review(r98): brief for revision 1",
-      "1449ef5 review(r97): brief for revision 1"
+      "41aa603 Merge commit 'e3bad0ea6d7218f104eaa770832c7a1000c02f1b'",
+      "e3d9223 docs(tasks): t-0260",
+      "e3bad0e docs(review): round r97 repair verdict",
+      "3d6ec0c review(r99): brief for revision 1",
+      "ce57527 Merge commit 'f54303e3dd7d5f7f14261d5b87e24702499575ea' into hp/adeherdr/t-0254-review-r97-a-job-that-should-never-have",
+      "cddfe97 review(r100): brief for revision 2"
     ],
-    "remote": "13 ahead, 0 behind origin/main",
+    "remote": "14 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "fe5c038",
+        "head": "41aa603",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit 'f52c92611a8dcdaeab1848a498d0f64c29f7b44b'"
+        "subject": "Merge commit 'e3bad0ea6d7218f104eaa770832c7a1000c02f1b'"
       },
       {
-        "branch": "review/r96",
+        "branch": "review/r100",
         "dirty": 0,
-        "head": "eb52279",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r96",
-        "subject": "docs(tasks): t-0242"
-      },
-      {
-        "branch": "review/r96-2",
-        "dirty": 0,
-        "head": "9a56f88",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r96-2",
-        "subject": "docs(tasks): t-0250"
+        "head": "97f81cd",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r100",
+        "subject": "docs(tasks): t-0256"
       },
       {
         "branch": "review/r97",
@@ -453,6 +458,13 @@
         "subject": "docs(tasks): t-0251"
       },
       {
+        "branch": "review/r97-3",
+        "dirty": 0,
+        "head": "07a2a0d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r97-3",
+        "subject": "docs(tasks): t-0254"
+      },
+      {
         "branch": "review/r98",
         "dirty": 0,
         "head": "5e45996",
@@ -467,11 +479,25 @@
         "subject": "docs(tasks): t-0252"
       },
       {
+        "branch": "review/r98-3",
+        "dirty": 0,
+        "head": "d7ab258",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r98-3",
+        "subject": "docs(tasks): t-0255"
+      },
+      {
         "branch": "review/r99",
         "dirty": 0,
         "head": "72a6ea3",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r99",
         "subject": "docs(tasks): t-0253"
+      },
+      {
+        "branch": "review/r99-2",
+        "dirty": 0,
+        "head": "ecba0b8",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r99-2",
+        "subject": "docs(tasks): t-0261"
       }
     ]
   },
@@ -484,15 +510,15 @@
     },
     {
       "label": "PRL-8-53",
-      "status": "done",
+      "status": "blocked",
       "workspace_id": "w1N"
     }
   ],
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r96",
-    "verdict": "f52c92611a8dcdaeab1848a498d0f64c29f7b44b"
+    "round": "r97",
+    "verdict": "e3bad0ea6d7218f104eaa770832c7a1000c02f1b"
   },
   "session": "default",
   "unlinked_agents": [],
