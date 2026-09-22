@@ -1413,7 +1413,7 @@ fn machines_to_check(
             crate::thread::list(&project)
                 .into_iter()
                 .filter(|thread| thread.is_remote() && !thread.worktree_path.is_empty())
-                .map(|thread| thread.machine),
+                .map(|thread| thread.machine_route().to_string()),
         );
     }
     Ok(machines)

@@ -477,6 +477,22 @@ pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     !reachable.is_empty()
 }
 
+fn clear_lost_connections(entries: &[(Project, Vec<thread::Thread>)], log: &Log) {
+    for (project, threads) in entries {
+        for lane in threads {
+            if let Err(error) = thread::update(project, &lane.id, |record| {
+                if record.failure_class == crate::contracts::FailureClass::LostConnection {
+                    record.failure_class = crate::contracts::FailureClass::Unknown;
+                    record.last_failure.clear();
+                    record.error.clear();
+                }
+            }) {
+                log.line(&format!("{error:#}"));
+            }
+        }
+    }
+}
+
 /// One courier pass per saved machine that has lanes, once per fourth tick.
 /// The cadence lives per machine in `Memory`, not per project, and every
 /// project with lanes on that machine shares the one SSH trip.
@@ -523,7 +539,10 @@ fn machine_passes(
         {
             let detail = format!("{error:#}");
             errors.push(anyhow::anyhow!("{machine}: {detail}"));
-            memory.machine_views.insert(machine, Err(detail));
+            // This is local configuration evidence, not evidence about the
+            // connection. Leave no remote view for the slow pass and replace
+            // any stale connection classification with unknown.
+            clear_lost_connections(&entries, log);
             continue;
         }
         let reason = outcome.as_ref().err().map(|e| format!("{e:#}"));
@@ -550,20 +569,12 @@ fn machine_passes(
                     }
                 }
             }
-        } else if matches!(&event, Some(steps::OutageEvent::Recovered)) {
-            for (project, threads) in &entries {
-                for lane in threads {
-                    if let Err(error) = thread::update(project, &lane.id, |record| {
-                        if record.failure_class == crate::contracts::FailureClass::LostConnection {
-                            record.failure_class = crate::contracts::FailureClass::Unknown;
-                            record.last_failure.clear();
-                            record.error.clear();
-                        }
-                    }) {
-                        log.line(&format!("{error:#}"));
-                    }
-                }
-            }
+        }
+        // A successful courier is direct evidence that the connection works.
+        // Clear persisted lost-connection state even after a ticker restart,
+        // when the in-memory outage tracker cannot emit `Recovered`.
+        if outcome.is_ok() {
+            clear_lost_connections(&entries, log);
         }
         let Some((first, _)) = entries.first() else {
             continue;

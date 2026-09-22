@@ -412,7 +412,7 @@ fn resolve_placement(
                 Ok(profile) if profile.is_local() => crate::doctor::recipe_ready_local(ctx, launch)
                     .map(|_| None)
                     .map_err(|error| format!("{error:#}")),
-                Ok(profile) => box_repo_candidate(&ctx.config_dir, &candidate, repo, listed)
+                Ok(profile) => box_repo_candidate(&ctx.config_dir, &profile.label, repo, listed)
                     .map_err(|error| format!("{error:#}"))
                     .and_then(|_| {
                         if project::machine_held(&ctx.root, &profile.id) {
@@ -626,17 +626,17 @@ fn place_box_worktree(
     let runner = ctx.runner;
     let (settings, _) = project.read_project_md()?;
     let label = crate::project::display_name(&settings.name, &project.slug);
-    let (box_repo, publish_url) =
-        box_repo_row(&ctx.config_dir, &settings, &record.machine, &record.repo)?;
-    // Both clones must name the configured publish URL. The push still uses
-    // the URL itself; finding the matching remote only validates this clone.
-    let _ = remote::remote_for_url(runner, &record.repo, &publish_url)?;
     let profile = remote::machine_profile(
         runner,
         &ctx.env.herdr_bin(),
         &ctx.config_dir,
         record.machine_route(),
     )?;
+    let (box_repo, publish_url) =
+        box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+    // Both clones must name the configured publish URL. The push still uses
+    // the URL itself; finding the matching remote only validates this clone.
+    let _ = remote::remote_for_url(runner, &record.repo, &publish_url)?;
     let target = profile.target.clone();
     let box_worktree = format!("{box_repo}/.worktrees/{}", record.id);
     let branch = if record.branch.is_empty() {
@@ -700,7 +700,7 @@ fn place_box_worktree(
     // step 3).
     let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
 
-    let machine = crate::remote::machine_declaration(&ctx.config_dir, &record.machine)?;
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     if record.failure_event.is_empty() {
         remote::provision(
             runner,
@@ -2356,15 +2356,14 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         bail!("{} has no recorded worktree", record.id);
     }
     let (settings, _) = project.read_project_md()?;
-    let (box_repo, _) = box_repo_row(&ctx.config_dir, &settings, &record.machine, &record.repo)?;
-    let target = remote::machine_profile(
+    let profile = remote::machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
         &ctx.config_dir,
         record.machine_route(),
-    )?
-    .target;
-    let machine = remote::machine_declaration(&ctx.config_dir, &record.machine)?;
+    )?;
+    let (box_repo, _) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
     let script = remote::with_path(
         &machine.path,
@@ -2375,7 +2374,13 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
             remote::quote(&build)
         ),
     );
-    let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        Duration::from_secs(20),
+    )?;
     if !out.success() {
         bail!("{}", out.error_text());
     }
