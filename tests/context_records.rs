@@ -152,4 +152,13 @@ fn a_sealed_done_does_not_hide_a_different_report() {
         assert!(text.contains(&format!("done: sealed-sha report=artifacts/{sealed_hash}")));
         assert_eq!(text.contains("report draft:"), separate_report, "{text}");
     }
+
+    std::fs::write(
+        project.join("threads/t-0001.toml"),
+        "id = \"t-0001\"\nstatus = \"resolved\"\nattempt = 1\n",
+    )
+    .unwrap();
+    let text = context(home.path(), "w1:p1", true);
+    assert!(!text.contains("## Threads needing action"), "{text}");
+    assert!(!text.contains("done: sealed-sha"), "{text}");
 }
