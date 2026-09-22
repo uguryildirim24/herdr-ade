@@ -695,11 +695,11 @@ fn sentences(text: &str) -> Vec<(usize, usize)> {
 const VERB_LIST: &[&str] = &[
     "add", "allow", "answer", "ask", "be", "bind", "build", "choose", "close", "come", "comes",
     "continue", "decide", "did", "do", "does", "end", "fail", "follow", "follows", "get", "give",
-    "go", "goes", "has", "have", "help", "hold", "is", "keep", "land", "lands", "let", "look",
-    "make", "mean", "means", "merge", "need", "open", "pass", "print", "put", "read", "refuse",
-    "replace", "run", "running", "said", "say", "see", "send", "set", "show", "split", "start",
-    "stay", "stays", "stop", "take", "tell", "try", "type", "use", "wait", "want", "was", "were",
-    "work", "write", "wrote",
+    "go", "goes", "has", "have", "help", "hold", "is", "keep", "land", "lands", "leave", "let",
+    "look", "make", "mean", "means", "merge", "need", "open", "pass", "print", "put", "read",
+    "refuse", "replace", "run", "running", "said", "say", "see", "send", "set", "show", "split",
+    "start", "stay", "stays", "stop", "take", "tell", "try", "type", "use", "wait", "want", "was",
+    "were", "work", "write", "wrote",
 ];
 
 #[cfg(test)]
