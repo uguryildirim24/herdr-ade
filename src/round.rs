@@ -11,13 +11,14 @@
 //! taken, and git never runs under the project lock (D4).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::{
-    CheckpointIntent, CompletionPin, Event, ManifestMember, MergeIntent, MergePhase, ReviewIntent,
-    RoundPhase, RoundRecord,
+    CheckpointIntent, CompletionPin, Event, ManifestMember, MergeIntent, MergePhase, PinnedGate,
+    ReviewIntent, RoundPhase, RoundRecord,
 };
 use crate::paths::Ctx;
 use crate::project::{self, Project, write_atomic};
@@ -772,8 +773,19 @@ pub fn manifest_hash(record: &RoundRecord) -> String {
         "round={}\nbranch={}\nrevision={}\npolicy={}\n",
         record.round, record.branch, record.manifest.revision, record.policy_hash
     );
-    for gate in &record.gates {
-        text.push_str(&format!("gate={gate}\n"));
+    match &record.gates {
+        None => text.push_str("gates=unconfigured\n"),
+        Some(gates) => {
+            text.push_str("gates=configured\n");
+            for gate in gates {
+                text.push_str(&format!("gate={}\n", gate.command()));
+                if let Some(env) = gate.env() {
+                    for (key, value) in env {
+                        text.push_str(&format!("gate-env={key}={value}\n"));
+                    }
+                }
+            }
+        }
     }
     let mut members: Vec<&ManifestMember> = record.manifest.members.iter().collect();
     members.sort_by(|a, b| a.thread.cmp(&b.thread));
@@ -791,46 +803,62 @@ pub fn manifest_hash(record: &RoundRecord) -> String {
 
 // ------------------------------------------------------------------- policy
 
-/// The gate list from `PROJECT.md` (`gates = [...]` in the front matter) and
-/// the policy hash in effect: the front matter bytes plus `config.toml`
-/// (D6, D11).
-pub fn policy(project: &Project, config_dir: &Path) -> Result<(Vec<String>, String)> {
-    let text = std::fs::read_to_string(project.project_md())
-        .with_context(|| format!("could not read {}", project.project_md().display()))?;
-    let front = text
-        .strip_prefix("+++\n")
-        .and_then(|rest| rest.split_once("\n+++").map(|(f, _)| f))
-        .unwrap_or("");
-    let value: toml::Value =
-        toml::from_str(front).unwrap_or(toml::Value::Table(Default::default()));
-    let gates = value
-        .get("gates")
-        .and_then(toml::Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|g| g.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let config = std::fs::read(config_dir.join("config.toml")).unwrap_or_default();
-    let mut bytes = front.as_bytes().to_vec();
-    bytes.extend_from_slice(b"\n--config.toml--\n");
-    bytes.extend_from_slice(&config);
-    Ok((gates, sha256_hex(&bytes)))
-}
-
-fn project_repo(project: &Project) -> Result<String> {
+/// The selected repository row and its pinned policy. Project rows take
+/// precedence over harness rows when both name the same checkout.
+fn repo_row(project: &Project, config_dir: &Path, path: &Path) -> Result<crate::project::Repo> {
+    let target = std::fs::canonicalize(path)?;
     let (settings, _) = project.read_project_md()?;
     settings
         .repos
-        .iter()
-        .find(|r| r.machine.is_none())
-        .map(|r| r.path.clone())
-        .context("round_needs_repo: the project has no local repository; pass --repo")
+        .into_iter()
+        .chain(crate::harness::repos(config_dir)?)
+        .find(|row| {
+            std::fs::canonicalize(&row.path)
+                .is_ok_and(|candidate| candidate == target)
+        })
+        .with_context(|| {
+            format!(
+                "repo_not_listed: {} is not listed in `repos` in PROJECT.md and is not a harness repository",
+                target.display()
+            )
+        })
+}
+
+/// The gate policy pinned from one repository row. Hash only typed policy
+/// inputs; unrelated edits elsewhere in PROJECT.md do not change a round.
+pub fn policy(
+    project: &Project,
+    config_dir: &Path,
+    repo: &Path,
+) -> Result<(Option<Vec<PinnedGate>>, String, crate::project::Repo)> {
+    let row = repo_row(project, config_dir, repo)?;
+    let gates = row
+        .gates
+        .clone()
+        .map(|gates| gates.into_iter().map(PinnedGate::Typed).collect::<Vec<_>>());
+    let bytes = toml::to_string(&row)?;
+    Ok((gates, sha256_hex(bytes.as_bytes()), row))
+}
+
+fn next_round(project: &Project) -> String {
+    let used: std::collections::BTreeSet<u64> = std::fs::read_dir(rounds_dir(project))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
+        .filter_map(|id| round_number(&id).parse().ok())
+        .collect();
+    let mut n = 1;
+    while used.contains(&n) {
+        n += 1;
+    }
+    format!("r{n}")
 }
 
 // --------------------------------------------------------------------- open
 
+#[cfg(test)]
 pub struct OpenArgs {
     pub round: String,
     pub branch: String,
@@ -838,62 +866,165 @@ pub struct OpenArgs {
     pub repo: Option<String>,
 }
 
+/// Compatibility for internal callers that already selected all round inputs.
+#[cfg(test)]
 pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
+    open_with_lanes(
+        ctx,
+        slug,
+        (!args.round.is_empty()).then_some(args.round),
+        (!args.branch.is_empty()).then_some(args.branch),
+        args.plain,
+        args.repo,
+        Vec::new(),
+    )
+}
+
+/// Open and admit the initial lanes as one validated operation.
+pub fn open_with_lanes(
+    ctx: &Ctx,
+    slug: &str,
+    round: Option<String>,
+    branch: Option<String>,
+    plain: Option<String>,
+    repo: Option<String>,
+    threads: Vec<String>,
+) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
-    validate_round_id(&args.round)?;
-    let Some(plain) = args.plain.filter(|p| !p.trim().is_empty()) else {
+    let round = round.unwrap_or_else(|| next_round(&project));
+    validate_round_id(&round)?;
+    let Some(plain) = plain.filter(|p| !p.trim().is_empty()) else {
         bail!(
             "plain_missing: `round open` needs --plain \"<one sentence that says what this round does>\""
         );
     };
     crate::glossary::check_record_birth(&project, &plain)?;
-    let repo = match args.repo {
-        Some(repo) => repo,
-        None => project_repo(&project)?,
+
+    // Resolve and validate every lane before writing the round record.
+    let lanes: Vec<thread::Thread> = threads
+        .iter()
+        .map(|id| thread::load(&project, id))
+        .collect::<Result<_>>()?;
+    let mut lane_repos = std::collections::BTreeSet::new();
+    for lane in &lanes {
+        if lane.repo.is_empty() {
+            bail!("round_lane_repo_missing: `{}` has no repository", lane.id);
+        }
+        lane_repos.insert(std::fs::canonicalize(&lane.repo).with_context(|| {
+            format!(
+                "round_lane_repo_missing: `{}` repository {}",
+                lane.id, lane.repo
+            )
+        })?);
+    }
+    if lane_repos.len() > 1 {
+        bail!("round_mixed_repos: the supplied lanes belong to different repositories");
+    }
+
+    let (settings, _) = project.read_project_md()?;
+    let selected = if let Some(repo) = repo {
+        let selected = std::fs::canonicalize(&repo)
+            .with_context(|| format!("repository {repo} does not exist"))?;
+        if lane_repos
+            .iter()
+            .next()
+            .is_some_and(|lane| lane != &selected)
+        {
+            bail!("round_repo_mismatch: --repo does not match the supplied lanes");
+        }
+        selected
+    } else if let Some(inferred) = lane_repos.into_iter().next() {
+        inferred
+    } else {
+        let local: std::collections::BTreeSet<PathBuf> = settings
+            .repos
+            .iter()
+            .filter(|row| row.machine.is_none())
+            .filter_map(|row| std::fs::canonicalize(&row.path).ok())
+            .collect();
+        match local.len() {
+            1 => local.into_iter().next().unwrap(),
+            0 => bail!("round_needs_repo: the project has no local repository; pass --repo"),
+            _ => bail!(
+                "round_repo_ambiguous: the project has more than one local repository; pass --repo or supply lanes from one repository"
+            ),
+        }
     };
-    let repo_path = std::fs::canonicalize(&repo)
-        .with_context(|| format!("repository {repo} does not exist"))?;
-    if !crate::harness::allowed_repo(
-        &project.read_project_md()?.0,
-        &ctx.config_dir,
-        &repo_path.to_string_lossy(),
-    )? {
-        bail!(
-            "repo_not_listed: {} is not listed in `repos` in PROJECT.md and is not a harness repository",
-            repo_path.display()
-        );
-    }
-    let git = Git::new(ctx.runner, &repo_path);
+    let git = Git::new(ctx.runner, &selected);
     git.common_dir()
-        .with_context(|| format!("{} is not a git repository", repo_path.display()))?;
-    if git.branch_head(&args.branch)?.is_none() {
+        .with_context(|| format!("{} is not a git repository", selected.display()))?;
+    let (gates, policy_hash, row) = policy(&project, &ctx.config_dir, &selected)?;
+    let branch = match branch.or(row.branch.clone()) {
+        Some(branch) => branch,
+        None => git
+            .run(&["symbolic-ref", "--short", "HEAD"])
+            .with_context(|| {
+                format!(
+                    "round_branch_missing: {} has no checked-out integration branch",
+                    selected.display()
+                )
+            })?,
+    };
+    if git.branch_head(&branch)?.is_none() {
         bail!(
-            "branch_missing: `{}` does not exist in {}",
-            args.branch,
-            repo_path.display()
+            "branch_missing: `{branch}` does not exist in {}",
+            selected.display()
         );
     }
-    let (gates, policy_hash) = policy(&project, &ctx.config_dir)?;
+    let states = if row.task_states.is_empty() {
+        settings.task_states
+    } else {
+        row.task_states.clone()
+    };
+    let events = sealed_events(&project)?;
+    for lane in &lanes {
+        if let Some(pin) = member_pin(&project, &round, &lane.id, &events)?
+            && landed(&git, &branch, &pin.sha)?
+        {
+            return Err(already_landed_error(lane, &pin.sha, &branch));
+        }
+    }
     let record = RoundRecord {
-        round: args.round.clone(),
-        branch: args.branch.clone(),
+        round: round.clone(),
+        branch,
         plain: plain.trim().to_string(),
         gates,
         policy_hash,
         opened: project::now(),
-        repo: repo_path.to_string_lossy().into_owned(),
+        repo: selected.to_string_lossy().into_owned(),
+        push_remote: row.push_remote.clone(),
+        install_required: states.iter().any(|state| state == "installed"),
         rejections: Some(0),
+        manifest: crate::contracts::AdmissionManifest {
+            revision: threads.len() as u64,
+            members: threads
+                .iter()
+                .map(|thread| ManifestMember {
+                    thread: thread.clone(),
+                    pin: None,
+                })
+                .collect(),
+        },
         ..Default::default()
     };
     {
         let _lock = project.lock()?;
-        if round_path(&project, &args.round).exists() {
-            bail!("round_exists: `{}` is already open", args.round);
+        if round_path(&project, &round).exists() {
+            bail!("round_exists: `{round}` is already open");
         }
+        let mut record = record;
+        refresh_pins(&project, &mut record, &events)?;
         save(&project, &record)?;
     }
+    for id in &threads {
+        crate::task::link_round_for_thread(&project, &round, id)?;
+    }
+    let record = load(&project, &round)?;
     stamp_workspace(ctx, &project, &record);
     let _ = crate::glossary::rewrite(&project);
+    if let Err(error) = crate::plan::refresh(ctx, &project) {
+        eprintln!("note: the plan refresh failed: {error:#}");
+    }
     let _ = crate::board::refresh(ctx, &project);
     Ok(record)
 }
@@ -1592,7 +1723,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             // dead reviewer: a reviewer that sealed its verdict did its job.
             let state = reviewer_state(ctx, &project, &reviewer);
             let git = Git::new(ctx.runner, &record.repo);
-            if let Some(verdict) = read_verdict(&project, &record, &git) {
+            if let Some(verdict) = read_verdict_checked(&project, &record, &git)? {
                 announce_once(
                     ctx,
                     &project,
@@ -1929,12 +2060,7 @@ fn reviewer_task(
         ));
     }
     out.push_str("\n## Gates\n\n");
-    if record.gates.is_empty() {
-        out.push_str("- (none listed in PROJECT.md)\n");
-    }
-    for gate in &record.gates {
-        out.push_str(&format!("- `{gate}`\n"));
-    }
+    write_gates(&mut out, record);
     if let Some(earlier) = earlier_review(project, git, record)? {
         if Some(earlier.manifest_hash.as_str()) == record.manifest_hash.as_deref() {
             // The manifest did not move: this is a repair of a merge conflict.
@@ -2568,6 +2694,30 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     })
 }
 
+fn write_gates(out: &mut String, record: &RoundRecord) {
+    match &record.gates {
+        None => out.push_str("- Not configured for this repository.\n"),
+        Some(gates) if gates.is_empty() => {
+            out.push_str("- This repository is explicitly gate-free.\n")
+        }
+        Some(gates) => {
+            for gate in gates {
+                out.push_str(&format!("- `{}`", gate.command()));
+                if let Some(env) = gate.env().filter(|env| !env.is_empty()) {
+                    out.push_str(" with environment ");
+                    out.push_str(
+                        &env.iter()
+                            .map(|(key, value)| format!("`{key}={value}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                out.push('\n');
+            }
+        }
+    }
+}
+
 fn compose_review_brief(
     record: &RoundRecord,
     hash: &str,
@@ -2601,24 +2751,26 @@ fn compose_review_brief(
         ));
     }
     out.push_str("\n## Gates\n\n");
-    if record.gates.is_empty() {
-        out.push_str("- (none listed in PROJECT.md)\n");
-    }
-    for gate in &record.gates {
-        out.push_str(&format!("- `{gate}`\n"));
-    }
-    let gates_toml = toml::Value::Array(
-        record
-            .gates
-            .iter()
-            .map(|g| toml::Value::String(g.clone()))
-            .collect(),
-    );
+    write_gates(&mut out, record);
+    let gates_toml = record
+        .gates
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|gate| {
+            format!(
+                "{{ command = {}, exit = 0 }}",
+                toml::Value::String(gate.command().to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let gates_toml = format!("[{gates_toml}]");
     out.push_str(&format!(
         "\n## What to do\n\n\
 1. Merge the pinned lane shas above (the shas, not branch names) into your review branch.\n\
 2. Fix in place as `review(<pkg>):` commits.\n\
-3. Run every gate above.\n\
+3. Run every gate above with its pinned environment and keep the actual output in your report.\n\
 4. When the last code commit is the candidate C, write `{verdict}` with exactly this front matter,\n   \
 and commit that file alone as the verdict commit V (its only parent is C):\n\n\
 ```\n+++\nverdict = \"MERGE\"  # or \"MERGE-AFTER-DECISION\" or \"REJECT\"\nround = \"{r}\"\ncandidate = \"<C>\"\nmanifest_hash = \"{hash}\"\npolicy_hash = \"{policy}\"\ngates = {gates_toml}\n+++\n```\n\n\
@@ -2715,12 +2867,25 @@ enum FreshMergeOutcome {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum GateRun {
+    /// Historical verdicts paired with historical string gate records.
+    Legacy(String),
+    Typed {
+        command: String,
+        exit: i32,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 struct Verdict {
     verdict: String,
     round: String,
     candidate: String,
     manifest_hash: String,
     policy_hash: String,
+    #[serde(default)]
+    gates: Vec<GateRun>,
 }
 
 fn parse_verdict(text: &str) -> Result<Verdict> {
@@ -2881,6 +3046,23 @@ fn validate_verdict_inner(
             "verdict_manifest_mismatch: the verdict's manifest or policy hash is not this round's",
         ));
     }
+    let expected = record.gates.as_deref().unwrap_or_default();
+    let coverage_matches = expected.len() == verdict.gates.len()
+        && expected
+            .iter()
+            .zip(&verdict.gates)
+            .all(|(expected, actual)| match (expected, actual) {
+                (PinnedGate::Legacy(command), GateRun::Legacy(actual)) => command == actual,
+                (PinnedGate::Typed(expected), GateRun::Typed { command, exit }) => {
+                    expected.command == *command && *exit == 0
+                }
+                _ => false,
+            });
+    if !coverage_matches {
+        return Err(crate::refusal::error(
+            "verdict_gate_coverage: the verdict must declare every pinned gate exactly once, with its command and a zero exit",
+        ));
+    }
     if !git.is_ancestor(b, &c)? {
         return Err(crate::refusal::error(format!(
             "base_not_ancestor: the brief commit B {b} is not an ancestor of C {c}"
@@ -2904,15 +3086,37 @@ fn validate_verdict_inner(
     Ok(c)
 }
 
-/// The verdict recorded by the reviewer's sealed `done` sha, when it parses.
-/// Read-only: it never merges and never fails a round.
-pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Option<String> {
+/// Validate a sealed verdict when one exists. Unlike display reads, advance
+/// uses this result so malformed coverage is a refusal, not a missing verdict.
+fn read_verdict_checked(
+    project: &Project,
+    record: &RoundRecord,
+    git: &Git,
+) -> Result<Option<String>> {
     if record.manifest_hash.as_deref() != Some(manifest_hash(record).as_str()) {
-        return None;
+        return Ok(None);
     }
-    let v = verdict_commit(project, record, git).ok()?;
-    let text = git.show_file(&v, &verdict_path(&record.round)).ok()??;
-    parse_verdict(&text).ok().map(|v| v.verdict)
+    if record.verdict.is_none() && record.merge.is_none() {
+        let Some(reviewer) = record.reviewer.as_deref() else {
+            return Ok(None);
+        };
+        let attempt = thread_attempt(project, reviewer)?;
+        if done_pin(&sealed_events(project)?, &record.round, reviewer, attempt).is_none() {
+            return Ok(None);
+        }
+    }
+    let v = verdict_commit(project, record, git)?;
+    let text = git
+        .show_file(&v, &verdict_path(&record.round))?
+        .context("verdict_unreadable: the verdict file is absent")?;
+    Ok(Some(parse_verdict(&text)?.verdict))
+}
+
+/// The verdict recorded by the reviewer's sealed `done` sha, when it parses.
+/// Read-only callers treat invalid evidence as absent; `advance` does not.
+#[cfg(test)]
+pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Option<String> {
+    read_verdict_checked(project, record, git).ok().flatten()
 }
 
 /// `ha round merge` resumes the transaction in the owning round record.
@@ -2956,6 +3160,14 @@ fn merge_inner(
             }
         },
     };
+    if matches!(
+        &outcome,
+        Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
+    ) && let Err(error) = finish_publication(ctx, &project, round)
+    {
+        let _ = crate::board::refresh(ctx, &project);
+        return Err(error);
+    }
     // The durable completion boundary: the landing evidence and the shared
     // plan refresh. Both are retry-safe and never roll back the merge
     // (SPEC-talk §6.1, §6.5).
@@ -3013,6 +3225,63 @@ fn merge_inner(
         }
     }
     outcome
+}
+
+/// Finish post-merge effects in order. Each successful effect is durable, so
+/// retry starts at the first outstanding one and never merges or pushes twice.
+fn finish_publication(ctx: &Ctx, project: &Project, round: &str) -> Result<()> {
+    let record = load(project, round)?;
+    if record.push_remote.is_some() && !record.published {
+        let remote = record
+            .push_remote
+            .as_deref()
+            .context("round_publish_pending: the merged round has no allowed push remote")?;
+        let refspec = format!("refs/heads/{0}:refs/heads/{0}", record.branch);
+        let command = crate::runner::Cmd::new("git", Duration::from_secs(300))
+            .arg("-C")
+            .arg(&record.repo)
+            .args(["push", remote, &refspec]);
+        let failure = match ctx.runner.run(&command) {
+            Ok(output) if output.success() => None,
+            Ok(output) => Some(output.error_text()),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        if let Some(failure) = failure {
+            let message = format!(
+                "round_publish_pending: `{round}` is merged; push to `{remote}` failed: {failure}"
+            );
+            let _lock = project.lock()?;
+            let mut current = load(project, round)?;
+            current.attention = message.clone();
+            save(project, &current)?;
+            bail!(message);
+        }
+        let _lock = project.lock()?;
+        let mut current = load(project, round)?;
+        current.published = true;
+        current.attention.clear();
+        save(project, &current)?;
+    }
+
+    let record = load(project, round)?;
+    if record.install_required && !record.installed {
+        if let Err(error) = crate::harness::install(ctx) {
+            let message = format!(
+                "round_install_pending: `{round}` is merged and published; installation failed: {error:#}"
+            );
+            let _lock = project.lock()?;
+            let mut current = load(project, round)?;
+            current.attention = message.clone();
+            save(project, &current)?;
+            bail!(message);
+        }
+        let _lock = project.lock()?;
+        let mut current = load(project, round)?;
+        current.installed = true;
+        current.attention.clear();
+        save(project, &current)?;
+    }
+    Ok(())
 }
 
 fn fresh_merge(
@@ -3612,6 +3881,12 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
             .unwrap_or_default()
     );
     out.push_str(&format!("phase: {:?}\n", record.phase));
+    if record.phase == RoundPhase::Merged && record.push_remote.is_some() && !record.published {
+        out.push_str("publish: pending\n");
+    }
+    if record.phase == RoundPhase::Merged && record.install_required && !record.installed {
+        out.push_str("install: pending\n");
+    }
     if let Some(reason) = &record.abandoned_reason {
         out.push_str(&format!("abandoned because: {reason}\n"));
     }
@@ -3917,6 +4192,17 @@ mod tests {
 
     const PLAIN: &str = "The first round lands the shared types.";
 
+    fn update_repo(fx: &Fx, change: impl FnOnce(&mut crate::project::Repo)) {
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        change(&mut settings.repos[0]);
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+    }
+
     fn open_r1(fx: &Fx) {
         open(
             &fx.world.ctx(),
@@ -3929,6 +4215,101 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn repository_gates_distinguish_unconfigured_empty_and_pin_typed_environment() {
+        let fx = fixture();
+        open_r1(&fx);
+        assert_eq!(load(&fx.project, "r1").unwrap().gates, None);
+
+        update_repo(&fx, |repo| repo.gates = Some(Vec::new()));
+        open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(load(&fx.project, "r2").unwrap().gates, Some(Vec::new()));
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("RUSTFLAGS".into(), "-Dwarnings".into());
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![crate::project::Gate {
+                command: "cargo test".into(),
+                env: env.clone(),
+            }]);
+        });
+        open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r3".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+        update_repo(&fx, |repo| repo.gates = None);
+        let pinned = load(&fx.project, "r3").unwrap();
+        assert_eq!(pinned.gates.as_ref().unwrap()[0].command(), "cargo test");
+        assert_eq!(
+            pinned.gates.as_ref().unwrap()[0]
+                .env()
+                .unwrap()
+                .get("RUSTFLAGS")
+                .map(String::as_str),
+            Some("-Dwarnings")
+        );
+        let brief = compose_review_brief(&pinned, "manifest", &[], "ha");
+        assert!(brief.contains("`cargo test` with environment `RUSTFLAGS=-Dwarnings`"));
+        assert!(brief.contains("{ command = \"cargo test\", exit = 0 }"));
+    }
+
+    #[test]
+    fn open_infers_one_lane_repo_and_refuses_ambiguous_repo_before_writing() {
+        let fx = fixture();
+        let (lane, _) = fx.lane(1);
+        let other = fx.world.home.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git(&other, &["init", "-q", "-b", "trunk"]);
+        git(&other, &["config", "user.name", "Test"]);
+        git(&other, &["config", "user.email", "test@example.com"]);
+        commit_file(&other, "README.md", "other\n", "initial");
+        fx.world.add_repo(&fx.project, &other.to_string_lossy());
+
+        let opened = open_with_lanes(
+            &fx.world.ctx(),
+            "demo",
+            None,
+            None,
+            Some(PLAIN.into()),
+            None,
+            vec![lane.clone()],
+        )
+        .unwrap();
+        assert_eq!(opened.round, "r1");
+        assert_eq!(opened.repo, fx.repo.to_string_lossy());
+        assert_eq!(opened.branch, "main");
+        assert_eq!(opened.manifest.members[0].thread, lane);
+
+        let error = err(open_with_lanes(
+            &fx.world.ctx(),
+            "demo",
+            None,
+            None,
+            Some(PLAIN.into()),
+            None,
+            Vec::new(),
+        ));
+        assert!(error.starts_with("round_repo_ambiguous"), "{error}");
+        assert!(!round_path(&fx.project, "r2").exists());
     }
 
     #[test]
@@ -4709,6 +5090,71 @@ mod tests {
         let e = err(merge(&ctx, "demo", "r1", None));
         assert!(e.starts_with("review_stale"), "{e}");
         assert!(read_merge(&fx.project, "r1").unwrap().is_none());
+    }
+
+    #[test]
+    fn verdict_gate_coverage_must_match_the_pinned_commands_and_exit_zero() {
+        let fx = fixture();
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![crate::project::Gate {
+                command: "cargo test".into(),
+                env: Default::default(),
+            }]);
+        });
+        let (lanes, _) = reviewed(&fx);
+        let (_, v) = verdict(&fx, &lanes, |c, record| {
+            format!(
+                "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = [{{ command = \"cargo test\", exit = 1 }}]\n+++\n",
+                record.manifest_hash.as_deref().unwrap(),
+                record.policy_hash
+            )
+        });
+        let record = load(&fx.project, "r1").unwrap();
+        let git = Git::new(fx.world.ctx().runner, &fx.repo);
+        let error = err(validate_verdict(&git, &record, &v));
+        assert!(error.starts_with("verdict_gate_coverage"), "{error}");
+        let error = err(advance(&fx.world.ctx(), "demo"));
+        assert!(error.starts_with("verdict_gate_coverage"), "{error}");
+    }
+
+    #[test]
+    fn failed_push_leaves_merged_pending_and_retry_only_republishes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fx = fixture();
+        let remote = fx.world.home.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        git(
+            &fx.repo,
+            &["remote", "add", "publish", &remote.to_string_lossy()],
+        );
+        update_repo(&fx, |repo| repo.push_remote = Some("publish".into()));
+        let hook = remote.join("hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        let error = err(merge(&fx.world.ctx(), "demo", "r1", None));
+        assert!(error.starts_with("round_publish_pending"), "{error}");
+        let pending = load(&fx.project, "r1").unwrap();
+        assert_eq!(pending.phase, RoundPhase::Merged);
+        assert!(!pending.published);
+        let checkpoint = pending.merge.as_ref().unwrap().head.clone();
+        assert_eq!(fx.world.runner.count("push publish"), 1);
+
+        std::fs::remove_file(hook).unwrap();
+        assert!(matches!(
+            merge(&fx.world.ctx(), "demo", "r1", None).unwrap(),
+            MergeOutcome::NoOp { .. }
+        ));
+        let finished = load(&fx.project, "r1").unwrap();
+        assert!(finished.published);
+        assert_eq!(finished.merge.as_ref().unwrap().head, checkpoint);
+        assert_eq!(fx.world.runner.count("push publish"), 2);
     }
 
     #[test]

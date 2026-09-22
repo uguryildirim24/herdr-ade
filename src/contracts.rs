@@ -452,6 +452,31 @@ pub(crate) struct ReviewIntent {
     pub(crate) reuse_brief: Option<String>,
 }
 
+/// A gate pinned into a round. The string shape exists only so historical
+/// round records keep loading; newly opened rounds always store `Typed`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum PinnedGate {
+    Legacy(String),
+    Typed(crate::project::Gate),
+}
+
+impl PinnedGate {
+    pub(crate) fn command(&self) -> &str {
+        match self {
+            Self::Legacy(command) => command,
+            Self::Typed(gate) => &gate.command,
+        }
+    }
+
+    pub(crate) fn env(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Typed(gate) => Some(&gate.env),
+        }
+    }
+}
+
 /// `.state/rounds/r<n>.toml` owns the entire round transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct RoundRecord {
@@ -471,8 +496,10 @@ pub(crate) struct RoundRecord {
     pub(crate) round: String,
     pub(crate) branch: String,
     pub(crate) plain: String,
-    #[serde(default)]
-    pub(crate) gates: Vec<String>,
+    /// `None` means the selected repository had no gate policy. An empty
+    /// vector is an explicit gate-free policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gates: Option<Vec<PinnedGate>>,
     pub(crate) policy_hash: String,
     pub(crate) manifest: AdmissionManifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -513,6 +540,16 @@ pub(crate) struct RoundRecord {
     /// Human-supplied reason for deliberately ending an unmergeable round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) abandoned_reason: Option<String>,
+    /// Publication and installation policy pinned at open. Historical rounds
+    /// default to no post-merge effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) push_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) published: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) install_required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) installed: bool,
     /// The round closed before each member received its durable cleanup mark.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) cleanup_pending: bool,
@@ -1044,7 +1081,7 @@ members = []
             round: "r1".into(),
             branch: "main".into(),
             plain: "The first round lands the contracts.".into(),
-            gates: vec!["cargo test --locked".into()],
+            gates: Some(vec![PinnedGate::Legacy("cargo test --locked".into())]),
             policy_hash: "cc".into(),
             manifest: AdmissionManifest {
                 revision: 2,
