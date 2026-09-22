@@ -52,11 +52,7 @@ Tell the coordinator what you want. In the default `auto` mode it starts the lan
 - a tab under the coordinator workspace; and
 - the project's instructions and bounded memory.
 
-A lane reports through its file under `.herdr-project/`. The harness copies reports to the project record and groups each lane by what needs attention. Resolve a finished lane to close its tab and release the agent process:
-
-```bash
-herdr-ade thread resolve billing t-0001
-```
+A lane reports through its file under `.herdr-project/`. The harness copies reports to the project record and groups each lane by what needs attention. When a round merges or is cancelled, the harness closes every member lane and reviewer. A report-only lane closes as soon as its unchanged commit and report arrive. A changed lane stays visible until you put it in a round. `thread resolve` remains available for an exceptional manual close.
 
 A finished lane's worktree is removed automatically once its commits have landed or its round has closed, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored paths such as `target` and `node_modules` under global `[worktrees].disposable` in `config.toml`, or add `disposable` to one repository row in `PROJECT.md` (and to a harness repository row for harness-only output). Repository lists affect only that repository. `*` matches within one path part, so `runs/pytest-*` leaves other `runs/` output alone; with no matching list, all ignored files are kept. Nested worktrees are always kept. The branch is retained and removal is never forced.
 

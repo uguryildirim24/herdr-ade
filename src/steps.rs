@@ -1,5 +1,5 @@
 //! The ticker's per-project steps: delivery, messages, pull requests, routines
-//! and auto-resolve. Thread facts update their owning records; only messages
+//! and routines. Thread facts update their owning records; only messages
 //! without a thread or round home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
-use crate::thread::{self, CopyOutcome, Group, Status, Thread};
+use crate::thread::{self, CopyOutcome, Status, Thread};
 use crate::threads;
 use crate::{events, inbox, pr, routine};
 
@@ -331,7 +331,6 @@ pub(crate) struct MachineMemory {
 
 /// What the ticker process remembers between ticks (not persisted).
 pub(crate) struct Memory {
-    pub(crate) started: jiff::Timestamp,
     pub(crate) gh: Outage,
     pub(crate) outage_secs: i64,
     pub(crate) tick: u64,
@@ -346,7 +345,6 @@ pub(crate) struct Memory {
 impl Memory {
     pub(crate) fn new(ctx: &Ctx) -> Memory {
         Memory {
-            started: jiff::Timestamp::now(),
             gh: Outage::default(),
             // Overridable so an outage can be exercised without waiting ten minutes.
             outage_secs: ctx
@@ -1231,8 +1229,8 @@ pub(crate) fn pull_requests(
     errors
 }
 
-/// Auto-resolve and resolve-on-merge: the final copy first; if it fails the
-/// thread is not resolved and the next tick tries again.
+/// Resolve-on-pull-request-merge: the final copy first; if it fails the
+/// thread is not resolved and the next pull-request check tries again.
 fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) -> Result<bool> {
     crate::round::require_resolvable(project, &t.id)?;
     let copied = threads::final_copy(ctx, project, t);
@@ -1250,54 +1248,6 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
     threads::close_pane(ctx, project, &resolved)?;
     threads::remove_scratch_session(ctx, &resolved)?;
     Ok(true)
-}
-
-/// Step 4. Measured from the later of the last state change, the last report
-/// change and the time this ticker process started, so a ticker that was down
-/// for a week does not resolve everything at once.
-pub(crate) fn auto_resolve(
-    ctx: &Ctx,
-    project: &Project,
-    settings: &Settings,
-    memory: &Memory,
-    now: jiff::Timestamp,
-) -> Vec<anyhow::Error> {
-    let mut errors = Vec::new();
-    let limit = i64::from(settings.auto_resolve_days) * 86_400;
-    if limit == 0 {
-        return errors;
-    }
-    for t in thread::list(project) {
-        if t.status != Status::Open || t.last_group != Group::Idle.token() {
-            continue;
-        }
-        // The later of the three reference times is the smallest elapsed time.
-        // A thread with neither timestamp has no clock to measure from.
-        let elapsed = |stamp: &str| {
-            stamp
-                .parse::<jiff::Timestamp>()
-                .ok()
-                .map(|then| now.as_second() - then.as_second())
-        };
-        let since_ticker_start = now.as_second() - memory.started.as_second();
-        let Some(since_thread) = [
-            elapsed(&t.last_state_change),
-            elapsed(&t.last_report_change),
-        ]
-        .into_iter()
-        .flatten()
-        .min() else {
-            continue;
-        };
-        if since_thread.min(since_ticker_start) < limit {
-            continue;
-        }
-        match resolve_after_copy(ctx, project, &t, "auto") {
-            Ok(_) => {}
-            Err(error) => errors.push(error),
-        }
-    }
-    errors
 }
 
 /// Step 3, plus `config-error` items for files that do not parse.
