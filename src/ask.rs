@@ -440,18 +440,12 @@ fn check_structured(project: &Project, new: &NewAsk) -> Result<()> {
             problems.push(format!("choice {}: {}", i + 1, format_check(choice, &r)));
         }
     }
-    for v in plain::check_ask(&new.question, &new.choices, &g)
-        .violations
-        .iter()
-        .filter(|v| v.rule == plain::Rule::QuestionForm)
-    {
-        let span = [&new.question]
-            .into_iter()
-            .chain(new.choices.iter())
-            .find(|t| t.len() == v.span.end)
-            .map(String::as_str)
-            .unwrap_or("");
-        problems.push(format!("{}: \"{span}\": {}", v.rule.code(), v.fix));
+    for (text, violation) in plain::check_question_form(&new.question, &new.choices, &g) {
+        problems.push(format!(
+            "{}: \"{text}\": {}",
+            violation.rule.code(),
+            violation.fix
+        ));
     }
     for (field, value) in [("what", &new.what), ("means", &new.means)] {
         if let Some(value) = value {
@@ -1052,6 +1046,56 @@ mod tests {
         );
         assert!(open_asks(&fx.project).is_empty());
         assert!(!crate::talk::journal_path(&fx.project).exists());
+    }
+
+    #[test]
+    fn ordinary_make_and_leave_choices_pass_and_a_verbless_fragment_fails() {
+        let fx = fixture();
+        let question = "The tool update wants three changes to your project settings. May I make these changes?";
+        let accepted = match ask(
+            &fx.world.ctx(),
+            "demo",
+            NewAsk {
+                question: question.into(),
+                choices: vec![
+                    "I will make the three changes to your project settings.".into(),
+                    "I will leave your project settings exactly as they are.".into(),
+                ],
+                ..keep_or_stop()
+            },
+        ) {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains("plain_question_form: \"I will leave your project settings exactly as they are.\""),
+                    "{error}"
+                );
+                panic!("the ordinary leave choice was refused: {error}");
+            }
+        };
+        assert_eq!(accepted.choices.len(), 2);
+
+        let error = ask(
+            &fx.world.ctx(),
+            "demo",
+            NewAsk {
+                question: question.into(),
+                choices: vec![
+                    "I make changes to your setting.".into(),
+                    "Three changes to your settings.".into(),
+                ],
+                ..keep_or_stop()
+            },
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(
+                "plain_question_form: \"Three changes to your settings.\": each choice must be a sentence with a verb"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
