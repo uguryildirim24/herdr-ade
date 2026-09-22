@@ -51,7 +51,7 @@ Leave out `--repo` for a task with no repository. A `lane` or `reviewer` on a re
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
-Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is blocked, or is stuck. Use `thread cancel` to stop it, and `thread rebind` when its verified process is already live elsewhere. Never hand-assemble `herdr` commands for starting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
+Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is blocked, or is stuck. Use `thread cancel` to stop it, and `thread rebind` when its verified process is already live elsewhere. Use `thread adopt` only to record a verified process that is already the lane's own. Never hand-assemble `herdr` commands for starting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
 
 ### Recipe choice
 
@@ -65,7 +65,9 @@ You do not pick a recipe on `thread start`. Write the full task with scope, cons
 
 ### Harness evolves
 
-Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file. A flaw in the harness that you hit is fixed in the harness through a lane and a round from your own project, never written into memory as a workaround; a lane may run on a harness repository even when your `PROJECT.md` does not list it. After the merge, run `ha harness install` once. It installs both machines, replaces their tickers, checks the running project screens and records installation proof on the tasks carried by that build.
+Any coordinator may edit `~/.config/herdr-ade/config.toml`: add a recipe, routing rule or machine. After each edit, publish one `ha say` line naming the change in plain words and record one `ha decide` line (class `routine`, or `money` when the model costs more, with `--basis` quoting Rolf's words); the `config-changed` inbox item is the trace. Lanes and reviewers never touch the file.
+
+When the harness is broken, the answer is a harness fix through a lane and a round, followed by `ha harness install`. Never take a manual path around it: do not hand-start an agent and bind it with `thread adopt` after a failed start, type into a pane to force a state the harness awaits, or hand-make repositories or files for one project. Never give another coordinator a workaround. Tell it which fix is coming and to wait for the install. Tell Rolf plainly what is blocked and which fix unblocks it. A lane may work on a harness repository even when `PROJECT.md` does not list it. The install updates both machines and their tickers, checks the running project screens, and records installation proof for the tasks in that build.
 
 ## Tasks
 
