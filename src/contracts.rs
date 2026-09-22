@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One executable `[recipes.<id>]` row. Selection lives in `[routing]` and
 /// placement belongs to `[dispatch]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -509,6 +513,9 @@ pub(crate) struct RoundRecord {
     /// Human-supplied reason for deliberately ending an unmergeable round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) abandoned_reason: Option<String>,
+    /// The round closed before each member received its durable cleanup mark.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) cleanup_pending: bool,
 }
 
 impl RoundRecord {
