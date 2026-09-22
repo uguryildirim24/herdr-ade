@@ -94,7 +94,7 @@ pub(crate) struct Line {
 }
 
 pub(crate) fn talk_dir(project: &Project) -> PathBuf {
-    project.dir().join("talk")
+    project.record_dir("talk")
 }
 
 pub(crate) fn journal_path(project: &Project) -> PathBuf {
@@ -138,7 +138,7 @@ struct Locked {
 }
 
 fn lock_file(project: &Project, name: &str) -> Result<Locked> {
-    std::fs::create_dir_all(talk_dir(project))?;
+    project.record_dir_for_write("talk")?;
     let file = File::options()
         .create(true)
         .truncate(false)
@@ -414,6 +414,7 @@ fn mark_pending_prompt(
     if !crate::hook::captures(project, pane) {
         return Ok(());
     }
+    project.record_dir_for_write("talk")?;
     let path = pending_prompt_path(project, pane, text);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -589,7 +590,7 @@ pub(crate) fn writer_suspended(project: &Project) -> bool {
 }
 
 fn set_suspended(project: &Project, on: bool) -> Result<()> {
-    std::fs::create_dir_all(talk_dir(project))?;
+    project.record_dir_for_write("talk")?;
     project::write_atomic(
         &native_path(project),
         toml::to_string(&Native {
@@ -1002,7 +1003,7 @@ pub(crate) fn ensure_tab(ctx: &Ctx, project: &Project) -> Result<Option<SurfaceT
         Duration::from_secs(10),
     )
     .map_err(|e| anyhow::anyhow!("could not start the talk surface: {}", e.message))?;
-    std::fs::create_dir_all(talk_dir(project))?;
+    project.record_dir_for_write("talk")?;
     project::write_atomic(&surface_path(project), toml::to_string(&tab)?.as_bytes())?;
     Ok(Some(tab))
 }

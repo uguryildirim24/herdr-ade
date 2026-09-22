@@ -101,7 +101,7 @@ An internal birth sentence. `thread start --job` uses the stable task's title as
 
 ### Where does my project live?
 
-In `~/.herdr-ade/<name>/` by default: `PROJECT.md` is the one current page. Its front matter holds hand-editable settings; the binary rebuilds its short body from `notes.jsonl`, stable task records, plans, threads, rounds and decisions. Thread reports live under `threads/`, and files made for you under `library/`. The safety settings live outside the project in `~/.config/herdr-ade/config.toml`. [Operations](docs/operations.md#where-things-live) lists the records.
+In `~/.herdr-ade/<name>/` by default: `PROJECT.md` is the one current page. Its front matter holds hand-editable settings; the binary rebuilds its short body from machine records under `.state/`. Files made for you stay visible under `library/`. The safety settings live outside the project in `~/.config/herdr-ade/config.toml`. [Operations](docs/operations.md#where-things-live) lists the records.
 
 ### Do I have to start every thread through the coordinator?
 

@@ -97,18 +97,19 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     assert!(!receipt.exists(), "another pane never acknowledges");
     assert!(!failed_receipt.exists());
     context(home.path(), "w1:p1", false);
+    let deliveries = project.join(".state/deliveries");
     assert!(
-        std::fs::read_to_string(&failed_receipt)
+        std::fs::read_to_string(deliveries.join("t-0003-2-1.jsonl"))
             .unwrap()
             .contains("acknowledged")
     );
     assert!(
-        std::fs::read_to_string(&receipt)
+        std::fs::read_to_string(deliveries.join("t-0001-2-2.jsonl"))
             .unwrap()
             .contains("acknowledged")
     );
     for id in ["t-0001-1-1", "t-0001-2-1", "t-0002-2-1"] {
-        assert!(!project.join(format!("deliveries/{id}.jsonl")).exists());
+        assert!(!deliveries.join(format!("{id}.jsonl")).exists());
     }
     assert!(!project.join(".state/inbox-counter.json").exists());
 }

@@ -462,6 +462,91 @@ impl Project {
         self.dir().join(".state")
     }
 
+    /// A binary-owned record folder. New records live under the hidden state
+    /// folder. Until its kind is next written, a historical top-level folder
+    /// remains the readable location.
+    pub(crate) fn record_dir(&self, kind: &str) -> PathBuf {
+        let current = self.state_dir().join(kind);
+        if current.exists() {
+            current
+        } else {
+            self.dir().join(kind)
+        }
+    }
+
+    /// Makes one record kind current before writing it. A historical folder is
+    /// moved whole, so readers never have to combine two partial stores and
+    /// unrelated record kinds remain untouched.
+    pub(crate) fn record_dir_for_write(&self, kind: &str) -> Result<PathBuf> {
+        let current = self.state_dir().join(kind);
+        let historical = self.dir().join(kind);
+        if current.exists() {
+            if historical.exists() {
+                bail!(
+                    "record_layout_conflict: both {} and {} exist",
+                    current.display(),
+                    historical.display()
+                );
+            }
+            return Ok(current);
+        }
+        if historical.exists() {
+            if let Err(error) = std::fs::rename(&historical, &current)
+                && !(current.exists() && !historical.exists())
+            {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not move historical {} records to {}",
+                        kind,
+                        current.display()
+                    )
+                });
+            }
+        } else if let Err(error) = std::fs::create_dir(&current)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(error).with_context(|| format!("could not create {}", current.display()));
+        }
+        Ok(current)
+    }
+
+    /// A binary-owned single-file record, with the same historical read rule
+    /// as [`Project::record_dir`].
+    pub(crate) fn record_file(&self, name: &str) -> PathBuf {
+        let current = self.state_dir().join(name);
+        if current.exists() {
+            current
+        } else {
+            self.dir().join(name)
+        }
+    }
+
+    /// Moves one historical single-file record under `.state` before writing.
+    pub(crate) fn record_file_for_write(&self, name: &str) -> Result<PathBuf> {
+        let current = self.state_dir().join(name);
+        let historical = self.dir().join(name);
+        if current.exists() {
+            if historical.exists() {
+                bail!(
+                    "record_layout_conflict: both {} and {} exist",
+                    current.display(),
+                    historical.display()
+                );
+            }
+            return Ok(current);
+        }
+        if historical.exists() {
+            std::fs::rename(&historical, &current).with_context(|| {
+                format!(
+                    "could not move historical record {} to {}",
+                    historical.display(),
+                    current.display()
+                )
+            })?;
+        }
+        Ok(current)
+    }
+
     /// The canonical folder (symlinks resolved): the key of the project's
     /// `[safety]` table and of its routine approvals.
     pub(crate) fn canonical_dir(&self) -> PathBuf {
@@ -1054,8 +1139,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         }
     }
 
-    let history = latest_history(project)
-        .unwrap_or_else(|| "the project record files beside this page".into());
+    let history = latest_history(project).unwrap_or_else(|| "the hidden .state folder".into());
     out.push_str(&format!(
         "\n---\nView rebuilt at {}; history is kept in {}.\n",
         now(),
@@ -1396,6 +1480,40 @@ mod tests {
         assert!(body.starts_with("# Project"));
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
+    }
+
+    #[test]
+    fn record_kinds_move_under_state_independently_and_old_bytes_still_load() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let old_tasks = project.dir().join("tasks");
+        let old_events = project.dir().join("events");
+        std::fs::create_dir(&old_tasks).unwrap();
+        std::fs::create_dir(&old_events).unwrap();
+        std::fs::write(old_tasks.join("job-0001.toml"), b"old task\n").unwrap();
+        std::fs::write(old_events.join("event.toml"), b"old event\n").unwrap();
+
+        assert_eq!(project.record_dir("tasks"), old_tasks);
+        let tasks = project.record_dir_for_write("tasks").unwrap();
+        assert_eq!(tasks, project.state_dir().join("tasks"));
+        assert_eq!(
+            std::fs::read(tasks.join("job-0001.toml")).unwrap(),
+            b"old task\n"
+        );
+        assert!(!old_tasks.exists());
+        assert_eq!(project.record_dir("events"), old_events);
+        assert_eq!(
+            std::fs::read(old_events.join("event.toml")).unwrap(),
+            b"old event\n"
+        );
+
+        let old_notes = project.dir().join("notes.jsonl");
+        std::fs::write(&old_notes, b"old note\n").unwrap();
+        assert_eq!(project.record_file("notes.jsonl"), old_notes);
+        let notes = project.record_file_for_write("notes.jsonl").unwrap();
+        assert_eq!(notes, project.state_dir().join("notes.jsonl"));
+        assert_eq!(std::fs::read(notes).unwrap(), b"old note\n");
+        assert!(!old_notes.exists());
     }
 
     #[test]

@@ -216,35 +216,40 @@ fn current_lane(ctx: &Ctx) -> Result<Binding> {
     }
 }
 
-/// Box lanes on this machine: the lane card under `<root>/<slug>/lanes/`.
+/// Box lanes on this machine: the lane card under the project's hidden state.
 fn box_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
     let mut matches = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
-        let dir = ctx.root.join(&slug).join("lanes");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+        let project = Project::load(&ctx.root, &slug)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for dir in [
+            project.state_dir().join("lanes"),
+            project.dir().join("lanes"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            let Ok(card) = toml::from_str::<LaneCard>(&text) else {
-                continue;
-            };
-            if card.pane_id != pane {
-                continue;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(card) = toml::from_str::<LaneCard>(&text) else {
+                    continue;
+                };
+                if card.pane_id != pane || !seen.insert(card.thread.clone()) {
+                    continue;
+                }
+                validate_card(ctx, &card)?;
+                matches.push(Binding {
+                    project: project.clone(),
+                    thread: thread_from_card(&card),
+                    card: Some(card),
+                });
             }
-            let project = Project::load(&ctx.root, &slug)?;
-            validate_card(ctx, &card)?;
-            matches.push(Binding {
-                project,
-                thread: thread_from_card(&card),
-                card: Some(card),
-            });
         }
     }
     Ok(matches)

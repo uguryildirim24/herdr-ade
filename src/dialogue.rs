@@ -73,7 +73,7 @@ pub(crate) struct Dialogue {
 }
 
 fn dir(project: &Project) -> PathBuf {
-    project.dir().join("dialogues")
+    project.record_dir("dialogues")
 }
 
 fn path(project: &Project, topic: &str) -> PathBuf {
@@ -100,7 +100,7 @@ pub(crate) fn load(project: &Project, topic: &str) -> Result<Dialogue> {
 }
 
 fn save(project: &Project, d: &Dialogue) -> Result<()> {
-    std::fs::create_dir_all(dir(project))?;
+    project.record_dir_for_write("dialogues")?;
     write_atomic(&path(project, &d.topic), toml::to_string(d)?.as_bytes())
 }
 
