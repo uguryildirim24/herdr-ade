@@ -89,15 +89,8 @@ struct MachineConfig {
 fn configured_machine_declarations(
     config_dir: &Path,
 ) -> Result<BTreeMap<String, MachineDeclaration>> {
-    let path = config_dir.join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(toml::from_str::<MachineConfig>(&text)
-        .with_context(|| format!("{} does not parse", path.display()))?
-        .machines)
+    let document = crate::config::Document::read(config_dir)?;
+    document.section("machines")
 }
 
 pub(crate) fn machine_declarations(
@@ -246,13 +239,12 @@ pub(crate) fn box_repo_for(
     config_dir: &Path,
     machine: &str,
     mac_path: &str,
-) -> Option<crate::project::Repo> {
-    let mut rows = crate::harness::repos(config_dir).ok()?;
-    if let Ok(machine) = machine_declaration(config_dir, machine) {
-        rows.extend(machine.repos);
-    }
-    rows.into_iter()
-        .find(|row| row.path == mac_path && row.box_path.is_some() && row.publish_url.is_some())
+) -> Result<Option<crate::project::Repo>> {
+    let mut rows = crate::harness::repos(config_dir)?;
+    rows.extend(machine_declaration(config_dir, machine)?.repos);
+    Ok(rows
+        .into_iter()
+        .find(|row| row.path == mac_path && row.box_path.is_some() && row.publish_url.is_some()))
 }
 
 /// The URL-matched remote name in `repo`, never by remote name alone. The
@@ -672,7 +664,9 @@ publish_url = "https://example.test/repo.git"
         assert!(declaration.runs_kind("pi"));
         assert!(declaration.runs_kind("claude"));
         assert!(declaration.runs_kind("agy"));
-        let repo = box_repo_for(config.path(), "lab", "/local/repo").unwrap();
+        let repo = box_repo_for(config.path(), "lab", "/local/repo")
+            .unwrap()
+            .unwrap();
         assert_eq!(repo.box_path.as_deref(), Some("/srv/work/repo"));
     }
 
@@ -688,9 +682,15 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
 "#,
         )
         .unwrap();
-        let row = box_repo_for(config.path(), "oci", "/home/agent/projects/herdr").unwrap();
+        let row = box_repo_for(config.path(), "oci", "/home/agent/projects/herdr")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.box_path.as_deref(), Some("/srv/herdr"));
-        assert!(box_repo_for(config.path(), "oci", "/home/agent/projects/other").is_none());
+        assert!(
+            box_repo_for(config.path(), "oci", "/home/agent/projects/other")
+                .unwrap()
+                .is_none()
+        );
 
         let runner = FakeRunner::new();
         runner.on(

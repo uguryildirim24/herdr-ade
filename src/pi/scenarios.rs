@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use super::sh::fake::{FakeRunner, ok};
-use super::{Env, Layout, doctor, folder, install, launch, recipes, sh};
+use super::{Env, Layout, doctor, folder, install, launch, sh};
 
 /// A throwaway plugin root with the pinned files in place and the wrapper on
 /// the login PATH (a real symlink under the fixture HOME).
@@ -34,13 +34,8 @@ fn world(dir: &Path) -> (Env, Layout) {
 fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
     let dir = tempfile::tempdir().unwrap();
     let (_env, _layout) = world(dir.path());
-    let row = recipes::pi_recipes()
-        .into_iter()
-        .find(|r| r.id == "pi_kimi_k3")
-        .unwrap();
-
-    let start =
-        launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &row.args, None).unwrap();
+    let args = launch::start_args("kimi-coding", "k3", "high");
+    let start = launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &args, None).unwrap();
     let line = start.join(" ");
     assert_eq!(
         line,
@@ -53,7 +48,6 @@ fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
     for forbidden in ["--approve", "-na", "--no-approve", "--session"] {
         assert!(!start.iter().any(|a| a == forbidden), "{forbidden}");
     }
-    assert!(row.env.is_empty());
     // A trust dialog never appears because trust is settled by settings.
     assert!(folder::SETTINGS_JSON.contains("\"defaultProjectTrust\": \"never\""));
 }
@@ -62,10 +56,7 @@ fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
 fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
     let dir = tempfile::tempdir().unwrap();
     let (_env, _layout) = world(dir.path());
-    let row = recipes::pi_recipes()
-        .into_iter()
-        .find(|r| r.id == "pi_kimi_k3")
-        .unwrap();
+    let args = launch::start_args("kimi-coding", "k3", "high");
     let pane_get = r#"{"result":{"pane":{"agent_session":{"source":"herdr:pi","agent":"pi","kind":"path","value":"/state/pi/agent/sessions/--/lane.jsonl"}}}}"#;
     let session = super::resume::session_from_pane_get(pane_get)
         .unwrap()
@@ -73,8 +64,7 @@ fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
     let session = Path::new(&session);
 
     let restart =
-        launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &row.args, Some(session))
-            .unwrap();
+        launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &args, Some(session)).unwrap();
     assert_eq!(
         restart.iter().filter(|a| *a == "--session").count(),
         1,
@@ -87,8 +77,8 @@ fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
     );
     assert!(!restart.iter().any(|a| a == "-c" || a == "--continue"));
     assert!(!restart.iter().any(|a| a == "--approve"));
-    // The recipe itself is unchanged and still valid.
-    row.validate().unwrap();
+    // The configured recipe arguments stay valid across resume.
+    launch::validate_args(&args).unwrap();
 }
 
 /// Script the login shell's own probes, the same shell `doctor` runs. The

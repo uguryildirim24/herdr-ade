@@ -6,6 +6,9 @@
 //! never drives a login.
 
 #[allow(dead_code)]
+#[path = "../config.rs"]
+mod config;
+#[allow(dead_code)]
 #[path = "../pro/mod.rs"]
 mod pro;
 
