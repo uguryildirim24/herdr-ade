@@ -24,13 +24,13 @@ round = "<round>"
 candidate = "<the full sha of C>"
 manifest_hash = "<from the brief>"
 policy_hash = "<from the brief>"
-gates = ["<each gate you ran>"]
+gates = [{ command = "<the exact pinned command>", exit = 0 }]
 +++
 ```
 
 The body says why, per lane. `MERGE-AFTER-DECISION` names the decision Rolf must make; `REJECT` names what must change.
 
-`hp round merge` checks every field: V's only parent is C, C..V touches only the verdict file, the candidate is C, every pinned lane sha is an ancestor of C, B is an ancestor of C, and the hashes match the round. Anything else is refused and nothing merges.
+Give one gate row per pinned command, in the brief's order, with its actual exit status. Keep the command's actual output in your report. `hp round merge` checks exact gate coverage and zero exits as well as V's only parent, C..V's scope, the candidate, lane ancestry, B ancestry, and both hashes. Anything else is refused and nothing merges.
 
 ## Done
 

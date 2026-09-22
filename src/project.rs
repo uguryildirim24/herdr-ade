@@ -1,6 +1,7 @@
 //! Project folders under the root: slugs, settings, status, the per-project
 //! lock and the coordinator record.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -125,9 +126,28 @@ pub(crate) fn now() -> String {
         .unwrap_or_default()
 }
 
+/// One repository gate, including the exact environment needed to run it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct Gate {
+    pub(crate) command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub(crate) struct Repo {
     pub(crate) path: String,
+    /// The integration branch. When absent, the repository's checked-out
+    /// branch is used at round open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) branch: Option<String>,
+    /// The only remote to which a completed integration branch may be pushed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) push_remote: Option<String>,
+    /// `None` means gates are not configured; `Some([])` explicitly makes the
+    /// repository gate-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gates: Option<Vec<Gate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) machine: Option<String>,
     /// The box clone path for this repository (SPEC-remote §4.1). When
@@ -205,13 +225,15 @@ fn parse_project_md(text: &str) -> Result<(Settings, String)> {
     };
     let value: toml::Value =
         toml::from_str(front).context("PROJECT.md front matter does not parse")?;
-    if value
-        .as_table()
-        .is_some_and(|table| table.contains_key("roles"))
-    {
-        bail!(
-            "roles_removed: remove roles from PROJECT.md; recipes and routing live in config.toml"
-        );
+    if let Some(table) = value.as_table() {
+        if table.contains_key("roles") {
+            bail!(
+                "roles_removed: remove roles from PROJECT.md; recipes and routing live in config.toml"
+            );
+        }
+        if table.contains_key("gates") {
+            bail!("gates_removed: move gates into each repository row in PROJECT.md");
+        }
     }
     let settings: Settings = value
         .try_into()
@@ -233,6 +255,7 @@ pub(crate) fn removed_project_keys(front: &str) -> Vec<String> {
         "coordinator_agent_args",
         "thread_agent_args",
         "max_parallel_threads",
+        "gates",
     ]
     .into_iter()
     .filter(|key| table.contains_key(*key))
