@@ -79,6 +79,26 @@ fn context_starts_with_the_complete_project_page_without_duplicate_tours() {
 }
 
 #[test]
+fn context_shows_the_words_inside_a_pasted_message() {
+    let p = Project::new();
+    p.write(
+        "talk/journal.jsonl",
+        concat!(
+            "{\"seq\":1,\"at\":\"2026-09-22T00:00:00Z\",\"rolf\":{",
+            "\"request\":\"q-paste\",",
+            "\"text\":\"\\n<pasted_content id=\\\"2460\\\">\\nKeep these exact words.\\n</pasted_content id=\\\"2460\\\">\"}}\n"
+        ),
+    );
+
+    let text = p.context(true);
+    assert!(
+        text.contains("- q-paste: pasted text: Keep these exact words."),
+        "{text}"
+    );
+    assert!(!text.contains("<pasted_content id="), "{text}");
+}
+
+#[test]
 fn action_rows_are_bounded_without_raw_storage_pointers() {
     let p = Project::new();
     for n in 1..=21 {
