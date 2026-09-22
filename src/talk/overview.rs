@@ -662,6 +662,23 @@ fn cost_rows(cost: &Cost) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::round::testkit::fixture;
+
+    fn add_historical_thread_step(
+        fx: &crate::round::testkit::Fx,
+        text: &str,
+        threads: Vec<String>,
+        expect: u64,
+    ) {
+        let ctx = fx.world.ctx();
+        let mut card = plan::step_add(&ctx, "demo", text, vec![], expect).unwrap();
+        card.steps.last_mut().unwrap().threads = threads;
+        std::fs::write(
+            plan::plan_path(&fx.project),
+            toml::to_string(&card).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn failures_use_the_digest_selection_and_keep_raw_errors_off_the_screen() {
         let fx = fixture();
@@ -792,15 +809,7 @@ mod tests {
         })
         .unwrap();
         plan::set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
-        plan::step_add(
-            &ctx,
-            "demo",
-            "Build the first screen.",
-            vec![lane.clone()],
-            vec![],
-            1,
-        )
-        .unwrap();
+        add_historical_thread_step(&fx, "Build the first screen.", vec![lane.clone()], 1);
         round::open(
             &ctx,
             "demo",
@@ -978,15 +987,7 @@ mod tests {
             })
             .unwrap();
         }
-        plan::step_add(
-            &ctx,
-            "demo",
-            "Show pretend trades.",
-            vec!["t-0001".into()],
-            vec![],
-            1,
-        )
-        .unwrap();
+        add_historical_thread_step(&fx, "Show pretend trades.", vec!["t-0001".into()], 1);
         decide::decide(
             &ctx,
             "demo",

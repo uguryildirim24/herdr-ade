@@ -3057,6 +3057,7 @@ pub fn round_landed(project: &Project, round: &str) -> bool {
 
 /// A thread with its live state and group, for `thread list`, `thread show`
 /// and the overview.
+#[derive(Clone)]
 pub struct Row {
     pub thread: Thread,
     pub group: Group,

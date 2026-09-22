@@ -350,7 +350,6 @@ pub(crate) fn add(
     authority: Vec<String>,
     acceptance: Vec<String>,
     repo: Option<String>,
-    plan_step: Option<String>,
     replaces: Option<String>,
 ) -> Result<Task> {
     if title.trim().is_empty() {
@@ -395,15 +394,6 @@ pub(crate) fn add(
             )));
         }
     }
-    if let Some(step) = plan_step.as_deref() {
-        let plan = crate::plan::load(project)?
-            .ok_or_else(|| crate::refusal::error("task_plan: no plan is written down"))?;
-        if !plan.steps.iter().any(|candidate| candidate.id == step) {
-            return Err(crate::refusal::error(format!(
-                "task_plan: no plan step `{step}`"
-            )));
-        }
-    }
     let repo = repo.map(|repo| {
         std::fs::canonicalize(&repo)
             .or_else(|_| std::path::absolute(&repo))
@@ -418,7 +408,7 @@ pub(crate) fn add(
         authority,
         acceptance: checked_acceptance,
         replaces,
-        plan_step,
+        plan_step: None,
         repo,
         created: project::now(),
         ..Task::default()
@@ -1296,7 +1286,6 @@ created = "2026-09-21T00:00:00Z"
             vec![condition.into()],
             None,
             None,
-            None,
         )
         .unwrap();
 
@@ -1307,7 +1296,6 @@ created = "2026-09-21T00:00:00Z"
             "Keep exact evidence in SPEC-ADE.",
             vec!["request:q-1".into()],
             vec![long.into()],
-            None,
             None,
             None,
         )
@@ -1394,7 +1382,6 @@ created = "2026-09-21T00:00:00Z"
             "Ship the checked change.",
             vec!["request:q-1".into()],
             vec!["The command reports the new result.".into()],
-            None,
             None,
             None,
         )
@@ -1596,7 +1583,6 @@ created = "2026-09-21T00:00:00Z"
             vec!["The command reports the new result.".into()],
             None,
             None,
-            None,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("no message `q-missing`"));
@@ -1680,7 +1666,7 @@ created = "2026-09-21T00:00:00Z"
         let fx = fixture();
         let ctx = fx.world.ctx();
         crate::plan::set(&ctx, "demo", "command", "It reports the checked result.", 0).unwrap();
-        crate::plan::step_add(&ctx, "demo", "Ship the checked change.", vec![], vec![], 1).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Ship the checked change.", vec![], 1).unwrap();
         record(&fx.project, "job-0001");
         let task = update(&fx.project, "job-0001", |task| {
             task.repo = Some(fx.repo.to_string_lossy().into_owned());

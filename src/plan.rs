@@ -92,16 +92,10 @@ fn dedup(values: &[String]) -> Vec<String> {
     out
 }
 
-fn check_refs(project: &Project, threads: &[String], rounds: &[String]) -> Result<()> {
-    for id in threads {
-        thread::validate_id(id)?;
-        thread::load(project, id)
-            .with_context(|| format!("plan_ref: no thread `{id}` in this project"))?;
-    }
-    for id in rounds {
-        round::validate_round_id(id)?;
-        round::load(project, id)
-            .with_context(|| format!("plan_ref: no round `{id}` in this project"))?;
+fn check_task_refs(project: &Project, tasks: &[String]) -> Result<()> {
+    for id in tasks {
+        crate::task::load(project, id)
+            .with_context(|| format!("plan_ref: no task `{id}` in this project"))?;
     }
     Ok(())
 }
@@ -217,13 +211,12 @@ pub(crate) fn step_add(
     ctx: &Ctx,
     slug: &str,
     text: &str,
-    threads: Vec<String>,
-    rounds: Vec<String>,
+    tasks: Vec<String>,
     expect: u64,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let text = glossary::check_sentence(&project, "step", text)?;
-    check_refs(&project, &threads, &rounds)?;
+    check_task_refs(&project, &tasks)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         if plan.next_step == 0 {
             // An old card without `next_step`: never reuse a live id.
@@ -241,9 +234,9 @@ pub(crate) fn step_add(
             id,
             text: text.clone(),
             state: StepState::Left,
-            tasks: Vec::new(),
-            threads: dedup(&threads),
-            rounds: dedup(&rounds),
+            tasks: dedup(&tasks),
+            threads: Vec::new(),
+            rounds: Vec::new(),
         });
         Ok(())
     })?;
@@ -265,25 +258,19 @@ pub(crate) fn step_link(
     ctx: &Ctx,
     slug: &str,
     id: &str,
-    threads: Vec<String>,
-    rounds: Vec<String>,
+    tasks: Vec<String>,
     expect: u64,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    if threads.is_empty() && rounds.is_empty() {
-        bail!("plan_link: at least one --thread or --round is required");
+    if tasks.is_empty() {
+        bail!("plan_link: at least one --task is required");
     }
-    check_refs(&project, &threads, &rounds)?;
+    check_task_refs(&project, &tasks)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
-        for t in &threads {
-            if !step.threads.contains(t) {
-                step.threads.push(t.clone());
-            }
-        }
-        for r in &rounds {
-            if !step.rounds.contains(r) {
-                step.rounds.push(r.clone());
+        for task in &tasks {
+            if !step.tasks.contains(task) {
+                step.tasks.push(task.clone());
             }
         }
         Ok(())
@@ -295,20 +282,18 @@ pub(crate) fn step_unlink(
     ctx: &Ctx,
     slug: &str,
     id: &str,
-    threads: Vec<String>,
-    rounds: Vec<String>,
+    tasks: Vec<String>,
     why: &str,
     expect: u64,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    if threads.is_empty() && rounds.is_empty() {
-        bail!("plan_unlink: at least one --thread or --round is required");
+    if tasks.is_empty() {
+        bail!("plan_unlink: at least one --task is required");
     }
     glossary::check_sentence(&project, "why", why)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
-        step.threads.retain(|t| !threads.contains(t));
-        step.rounds.retain(|r| !rounds.contains(r));
+        step.tasks.retain(|task| !tasks.contains(task));
         Ok(())
     })?;
     Ok(plan)
@@ -586,7 +571,7 @@ mod tests {
     }
 
     fn add(fx: &Fx, text: &str, expect: u64) -> Plan {
-        step_add(&fx.world.ctx(), "demo", text, vec![], vec![], expect).unwrap()
+        step_add(&fx.world.ctx(), "demo", text, vec![], expect).unwrap()
     }
 
     fn open_r1(fx: &Fx, plain: &str) {
@@ -771,15 +756,7 @@ mod tests {
         }
         let e = format!(
             "{:#}",
-            step_add(
-                &fx.world.ctx(),
-                "demo",
-                "One too many.",
-                vec![],
-                vec![],
-                expect
-            )
-            .unwrap_err()
+            step_add(&fx.world.ctx(), "demo", "One too many.", vec![], expect).unwrap_err()
         );
         assert!(e.starts_with("plan_steps"), "{e}");
         let plan =
@@ -830,6 +807,66 @@ mod tests {
         load(&fx.project).unwrap().unwrap().steps[0].state
     }
 
+    fn link_historical_threads(fx: &Fx, threads: Vec<String>, expect: u64) -> Plan {
+        with_plan(&fx.project, expect, |plan| {
+            find_step(plan, "s-1")?.threads = threads;
+            Ok(())
+        })
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn new_links_use_tasks_and_one_task_can_belong_to_multiple_steps() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let task = crate::task::Task {
+            id: "job-0001".into(),
+            title: "Ship the checked change.".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["The change lands.".into()],
+            created: "2026-09-22T00:00:00Z".into(),
+            ..crate::task::Task::default()
+        };
+        let task_dir = fx.project.dir().join("tasks");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(
+            task_dir.join("job-0001.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+
+        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
+        let first = step_add(
+            &ctx,
+            "demo",
+            "Build the first part.",
+            vec![task.id.clone()],
+            1,
+        )
+        .unwrap();
+        let second = step_add(&ctx, "demo", "Build the second part.", vec![], 2).unwrap();
+        let linked = step_link(&ctx, "demo", "s-2", vec![task.id.clone()], 3).unwrap();
+        assert_eq!(first.steps[0].tasks[0], task.id);
+        assert_eq!(second.steps[1].tasks, Vec::<String>::new());
+        assert_eq!(linked.steps[0].tasks[0], task.id);
+        assert_eq!(linked.steps[1].tasks[0], task.id);
+        assert!(linked.steps.iter().all(|step| step.threads.is_empty()));
+        assert!(linked.steps.iter().all(|step| step.rounds.is_empty()));
+
+        let unlinked = step_unlink(
+            &ctx,
+            "demo",
+            "s-1",
+            vec![task.id.clone()],
+            "The second step owns it.",
+            4,
+        )
+        .unwrap();
+        assert!(unlinked.steps[0].tasks.is_empty());
+        assert_eq!(unlinked.steps[1].tasks, [task.id]);
+    }
+
     #[test]
     fn states_follow_required_work_and_reopen_on_rework() {
         let fx = fixture();
@@ -837,7 +874,7 @@ mod tests {
         set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
         let (lane, sha) = fx.lane(1);
         add(&fx, "Landed by the lane.", 1);
-        let linked = step_link(&ctx, "demo", "s-1", vec![lane.clone()], vec![], 2).unwrap();
+        let linked = link_historical_threads(&fx, vec![lane.clone()], 2);
         // Binding changes refresh the projection in the same committed plan.
         assert_eq!(linked.revision, 3);
         assert_eq!(linked.steps[0].state, StepState::Running);
@@ -892,7 +929,7 @@ mod tests {
         set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
         let (lane, sha) = fx.lane(1);
         add(&fx, "Land the lane once.", 1);
-        step_link(&ctx, "demo", "s-1", vec![lane.clone()], vec![], 2).unwrap();
+        link_historical_threads(&fx, vec![lane.clone()], 2);
 
         open_r1(&fx, "The first round tries to land the lane.");
         crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
@@ -926,7 +963,7 @@ mod tests {
         let (a, _) = fx.lane(1);
         let (b, _) = fx.lane(2);
         add(&fx, "Needs two lanes.", 1);
-        step_link(&ctx, "demo", "s-1", vec![a, b], vec![], 2).unwrap();
+        link_historical_threads(&fx, vec![a, b], 2);
         let _ = sync(&ctx, "demo").unwrap();
         assert_eq!(
             load(&fx.project).unwrap().unwrap().steps[0].state,

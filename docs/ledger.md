@@ -1,25 +1,24 @@
 # Harness failure ledger
 
-In a project's coordinator workspace or lane:
+Name the project on every ledger command:
 
 ```sh
-ha ledger list          # open failures, highest repeat count first
-ha ledger list --json
-ha ledger show f-0001   # full evidence, including closed failures
-ha ledger task f-0001   # task brief on stdout; does not start work
-ha ledger done f-0001   # close after the fix has been checked and landed
+ha ledger list demo          # open failures, highest repeat count first
+ha ledger list demo --json
+ha ledger show demo f-0001   # full evidence, including closed failures
+ha ledger task demo f-0001   # task brief on stdout; does not start work
+ha ledger done demo f-0001   # close after the fix has been checked and landed
 ```
 
 For example, from the coordinator workspace:
 
 ```sh
-ha ledger task f-0001 | ha thread start demo \
-  --title "Fix the failed work check" --repo /path/to/herdr-ade \
-  --plain "This work fixes the check that could not start." --task-file -
+ha task add demo --title "Fix the failed work check." --request q-123 \
+  --acceptance "The failed check passes." --repo /path/to/herdr-ade
+ha ledger task demo f-0001 | ha thread start demo --job job-0001 --task-file -
 ```
 
-The project resolves from the current workspace or lane launch binding. The
-ledger never creates a lane. It closes an observed failure automatically when
+The ledger never creates a lane. It closes an observed failure automatically when
 the same condition answers successfully; `ledger done` records a checked manual
 closure. A designed refusal
 (a safety or authority check that intentionally rejects the requested action,
