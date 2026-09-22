@@ -233,6 +233,7 @@ fn peek_records_nothing_and_context_records_seen_items() {
             .success()
     );
     let item = "+++\nid = \"20260917T000000Z-routine-r-1\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"x\"\nsummary = \"s\"\n+++\n";
+    std::fs::create_dir(root.join("demo/inbox")).unwrap();
     std::fs::write(
         root.join("demo/inbox/20260917T000000Z-routine-r-1.md"),
         item,

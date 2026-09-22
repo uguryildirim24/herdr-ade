@@ -107,6 +107,11 @@ impl World {
     /// A project that has been opened: coordinator in `w1:p1` of `socket`.
     pub fn project(&self, slug: &str, socket: &str) -> Project {
         let project = project::create(&self.root, slug, "", vec![]).unwrap();
+        // Scenario fixtures may write coordinator-owned files directly instead
+        // of exercising their first-use commands.
+        for dir in ["tasks", "routines", "inbox", "inbox/done"] {
+            std::fs::create_dir_all(project.dir().join(dir)).unwrap();
+        }
         let socket = self.home.path().join(socket);
         std::fs::write(&socket, b"").unwrap();
         let cwd = project.canonical_dir().to_string_lossy().into_owned();
@@ -376,7 +381,7 @@ fn starting_for_more_than_five_minutes_becomes_failed() {
 }
 
 #[test]
-fn the_ticker_copies_a_changed_report_home_once() {
+fn the_ticker_hashes_a_changed_report_without_copying_it() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let t = world.thread(&project, world.home.path(), |_| {});
@@ -391,10 +396,7 @@ fn the_ticker_copies_a_changed_report_home_once() {
     let after = thread::load(&project, "t-0001").unwrap();
     assert_eq!(after.report_hash, thread::sha256_hex(b"## Report\nv1\n"));
     assert!(!after.last_report_change.is_empty());
-    assert_eq!(
-        std::fs::read_to_string(thread::home_report_path(&project, "t-0001")).unwrap(),
-        "## Report\nv1\n"
-    );
+    assert!(!thread::home_report_path(&project, "t-0001").exists());
 
     let stamp = after.last_report_change.clone();
     ticker::tick_project(&ctx, &project).unwrap();
@@ -662,17 +664,14 @@ fn every_resolve_copies_first_and_a_partial_copy_keeps_the_worktree() {
     world.runner.on("worktree remove", ok(r#"{"result":{}}"#));
     let ctx = world.ctx();
 
-    // A partial copy resolves the thread but refuses automatic removal. The
-    // report written since the last tick is already home.
+    // A partial deliverable copy resolves the thread but refuses automatic
+    // removal. The unsealed report remains a draft in the lane folder.
     threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
     assert_eq!(
         thread::load(&project, "t-0001").unwrap().status,
         Status::Resolved
     );
-    assert_eq!(
-        std::fs::read_to_string(thread::home_report_path(&project, "t-0001")).unwrap(),
-        "late report"
-    );
+    assert!(!thread::home_report_path(&project, "t-0001").exists());
     assert_eq!(world.runner.count("worktree remove"), 0);
 
     let resolved = thread::load(&project, "t-0001").unwrap();
@@ -1184,6 +1183,7 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
     let project = world.project("demo", "a.sock");
     let t = world.thread(&project, world.home.path(), |_| {});
     std::fs::create_dir_all(Path::new(&t.thread_dir).join("library")).unwrap();
+    std::fs::write(Path::new(&t.thread_dir).join("library/out.txt"), "output").unwrap();
     world.runner.on("du -sk", ok("4\t/x\n"));
     world
         .runner
@@ -1218,7 +1218,7 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
 }
 
 #[test]
-fn a_no_change_lane_closes_after_its_report_is_copied_home() {
+fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().join("lane");
@@ -1234,6 +1234,7 @@ fn a_no_change_lane_closes_after_its_report_is_copied_home() {
         "report only\n",
     )
     .unwrap();
+    let artifact = crate::events::store_artifact(&project, b"report only\n").unwrap();
     let event = Event {
         id: "t-0001-1-done".into(),
         op: "t-0001-1-done".into(),
@@ -1246,7 +1247,7 @@ fn a_no_change_lane_closes_after_its_report_is_copied_home() {
             done: Some(DonePayload {
                 sha: "brief-sha".into(),
                 report_path: lane.report_path(),
-                artifact: "unused-for-local-lane".into(),
+                artifact: artifact.clone(),
                 attestation: None,
             }),
             ..EventPayload::default()
@@ -1275,9 +1276,10 @@ fn a_no_change_lane_closes_after_its_report_is_copied_home() {
     let closed = thread::load(&project, &lane.id).unwrap();
     assert_eq!(closed.status, Status::Resolved);
     assert_eq!(closed.resolved_reason, "report-only");
+    assert!(!thread::home_report_path(&project, &lane.id).exists());
     assert_eq!(
-        std::fs::read_to_string(thread::home_report_path(&project, &lane.id)).unwrap(),
-        "report only\n"
+        std::fs::read(crate::events::artifact_path(&project, &artifact)).unwrap(),
+        b"report only\n"
     );
     assert_eq!(world.runner.count("workspace close w2"), 1);
 }
@@ -1414,14 +1416,15 @@ fn a_finishing_thread_is_in_the_digest_without_writing_an_inbox_item() {
     let ctx = world.ctx();
     let mut memory = Memory::new(&ctx);
 
-    // Polls copy the report and update the record, never an inbox projection.
+    // Polls hash the draft and update the record, never an inbox projection.
     for _ in 0..4 {
         ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
     }
     assert!(inbox::unhandled(&project).is_empty());
     let digest = coordinator::digest(&ctx, &project, "ha").unwrap().0;
     assert!(digest.contains("Ready for review"), "{digest}");
-    assert!(digest.contains("threads/t-0001.md"));
+    assert!(digest.contains("report draft:"), "{digest}");
+    assert!(digest.contains("(not completion)"), "{digest}");
     let nudges = |w: &World| {
         w.runner
             .calls
