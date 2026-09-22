@@ -505,8 +505,12 @@ fn return_to_admitting(record: &mut RoundRecord) {
 /// more work. The completion which existed at send time becomes a barrier: the
 /// round cannot review again until the lane seals a later `done`. Any active
 /// reviewer is unbound durably before its process is stopped.
-pub(crate) fn hold_for_follow_up(ctx: &Ctx, project: &Project, thread_id: &str) -> Result<()> {
-    let events = sealed_events(project)?;
+pub(crate) fn hold_for_follow_up(
+    ctx: &Ctx,
+    project: &Project,
+    thread_id: &str,
+    events_before_send: &[Event],
+) -> Result<()> {
     let mut changed = false;
     for listed in checked_list(project)? {
         if listed.phase.closed()
@@ -535,20 +539,31 @@ pub(crate) fn hold_for_follow_up(ctx: &Ctx, project: &Project, thread_id: &str) 
             };
             require_editable(&record)?;
             let attempt = thread_attempt(project, thread_id)?;
-            let existing_barrier = record.manifest.members[index]
-                .awaiting_report_after
-                .as_deref();
-            let pin = match existing_barrier {
-                Some(after) => {
-                    done_pin_after(&events, &record.round, thread_id, attempt, Some(after))?
-                }
-                None => done_pin(&events, &record.round, thread_id, attempt),
+            let existing_barrier = record.manifest.members[index].awaiting_report_after.clone();
+            let next_pin = match existing_barrier.as_deref() {
+                Some(after) => done_pin_after(
+                    events_before_send,
+                    &record.round,
+                    thread_id,
+                    attempt,
+                    Some(after),
+                )?,
+                None => done_pin(events_before_send, &record.round, thread_id, attempt),
             };
-            let Some(pin) = pin else {
-                continue;
+            let next_barrier = match next_pin {
+                Some(pin) => Some(pin.event),
+                None if existing_barrier.is_some() => continue,
+                None => match record.manifest.members[index].pin.as_ref() {
+                    Some(pin) if pin.attempt != attempt => None,
+                    Some(pin) => bail!(
+                        "follow_up_barrier_missing: pinned event `{}` is absent",
+                        pin.event
+                    ),
+                    None => continue,
+                },
             };
             record.manifest.members[index].pin = None;
-            record.manifest.members[index].awaiting_report_after = Some(pin.event);
+            record.manifest.members[index].awaiting_report_after = next_barrier;
             record.manifest.revision += 1;
             let reviewer = record.reviewer.clone();
             return_to_admitting(&mut record);
@@ -780,11 +795,22 @@ fn done_pin_after(
         .map(|id| {
             events
                 .iter()
-                .find(|event| event.id == id && event.thread == thread && event.attempt == attempt)
+                .find(|event| event.id == id && event.thread == thread)
                 .with_context(|| format!("follow_up_barrier_missing: event `{id}` is absent"))
         })
         .transpose()?;
-    let barrier_sequence = barrier.and_then(event_sequence);
+    if let Some(barrier) = barrier
+        && barrier.attempt > attempt
+    {
+        bail!(
+            "follow_up_barrier_attempt: event `{}` belongs to attempt {}, ahead of current attempt {attempt}",
+            barrier.id,
+            barrier.attempt
+        );
+    }
+    let barrier_sequence = barrier
+        .filter(|barrier| barrier.attempt == attempt)
+        .and_then(event_sequence);
     let event = events
         .iter()
         .filter(|e| e.thread == thread && e.attempt == attempt)
@@ -792,6 +818,7 @@ fn done_pin_after(
         .filter(|e| e.payload.done.is_some())
         .filter(|e| match barrier {
             None => true,
+            Some(barrier) if barrier.attempt < attempt => true,
             Some(barrier) => match (barrier_sequence, event_sequence(e)) {
                 (Some(before), Some(candidate)) => candidate > before,
                 _ => (&e.created, &e.id) > (&barrier.created, &barrier.id),
@@ -850,9 +877,12 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
         // means the old completion still stands.
         if pin.is_none()
             && let Some(barrier) = barrier.as_deref()
+            && let attempt = thread_attempt(project, &member.thread)?
+            && events.iter().any(|event| {
+                event.id == barrier && event.thread == member.thread && event.attempt == attempt
+            })
             && !follow_up_still_running(project, &member.thread)?
         {
-            let attempt = thread_attempt(project, &member.thread)?;
             pin = events
                 .iter()
                 .find(|event| {
@@ -1384,7 +1414,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
             }
         }
     }
-    let record = {
+    let (record, superseded_reviewer) = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
@@ -1406,14 +1436,25 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         let previous_phase = record.phase;
         record.phase = RoundPhase::Admitting;
         refresh_pins(&project, &mut record, &events)?;
-        if record.manifest != before {
+        let superseded_reviewer = if record.manifest != before {
+            let reviewer = record.reviewer.clone();
             return_to_admitting(&mut record);
+            reviewer
         } else {
             record.phase = previous_phase;
-        }
+            None
+        };
         save(&project, &record)?;
-        record
+        (record, superseded_reviewer)
     };
+    if let Some(reviewer) = superseded_reviewer {
+        cancel_superseded_reviewer(
+            ctx,
+            &project,
+            &reviewer,
+            &format!("superseded when {thread_id} was admitted to {round}"),
+        )?;
+    }
     crate::task::link_round_for_thread(&project, round, thread_id)?;
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
@@ -1665,7 +1706,7 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
     thread::validate_id(thread_id)?;
-    let record = {
+    let (record, superseded_reviewer) = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
@@ -1675,10 +1716,19 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
             bail!("not_a_member: `{thread_id}` is not admitted to `{round}`");
         }
         record.manifest.revision += 1;
+        let reviewer = record.reviewer.clone();
         return_to_admitting(&mut record);
         save(&project, &record)?;
-        record
+        (record, reviewer)
     };
+    if let Some(reviewer) = superseded_reviewer {
+        cancel_superseded_reviewer(
+            ctx,
+            &project,
+            &reviewer,
+            &format!("superseded when {thread_id} was removed from {round}"),
+        )?;
+    }
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
@@ -1721,6 +1771,16 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
         if !reviewer_gone(ctx, &project, reviewer) {
             bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
         }
+    }
+    if record.phase != RoundPhase::UnderReview
+        || record.frozen_revision != Some(record.manifest.revision)
+    {
+        bail!(
+            "reviewer_stale: `{round}` is {:?} at manifest revision {}, but its frozen review is revision {}; the reviewer was not bound",
+            record.phase,
+            record.manifest.revision,
+            record.frozen_revision.unwrap_or(0)
+        );
     }
     record.verdict = None;
     record.verdict_kind = None;
@@ -2326,9 +2386,13 @@ fn start_and_bind_reviewer(
         );
     }
     if let Some(candidate) = unbound.first() {
-        bind_reviewer(ctx, slug, round, &candidate.id)?;
-        crate::ledger::recovered(project, "reviewer-start-failed", round);
-        return Ok(Some(candidate.id.clone()));
+        return match bind_reviewer(ctx, slug, round, &candidate.id) {
+            Ok(_) => {
+                crate::ledger::recovered(project, "reviewer-start-failed", round);
+                Ok(Some(candidate.id.clone()))
+            }
+            Err(error) => cancel_unbound_reviewer(ctx, project, slug, round, &candidate.id, error),
+        };
     }
     match start_reviewer(ctx, project, round, review_branch, prefix) {
         Ok(thread) => match bind_reviewer(ctx, slug, round, &thread.id) {
@@ -2336,23 +2400,32 @@ fn start_and_bind_reviewer(
                 crate::ledger::recovered(project, "reviewer-start-failed", round);
                 Ok(Some(thread.id))
             }
-            Err(error) => {
-                // Starting and binding is one recovery effect: never return
-                // with an unbound reviewer left alive beside a later retry.
-                let reason = format!("reviewer binding failed: {error:#}");
-                let cleanup = crate::threads::cancel(ctx, slug, &thread.id, &reason)?;
-                if cleanup.state == "cleanup_pending" {
-                    return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
-                }
-                reviewer_start_failed(ctx, project, round, &reason, None)?;
-                Ok(None)
-            }
+            Err(error) => cancel_unbound_reviewer(ctx, project, slug, round, &thread.id, error),
         },
         Err(error) => {
             reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
             Ok(None)
         }
     }
+}
+
+/// Starting and binding is one effect: a reviewer rejected by the final
+/// round-state check must not remain alive beside a later retry.
+fn cancel_unbound_reviewer(
+    ctx: &Ctx,
+    project: &Project,
+    slug: &str,
+    round: &str,
+    reviewer: &str,
+    error: anyhow::Error,
+) -> Result<Option<String>> {
+    let reason = format!("reviewer binding failed: {error:#}");
+    let cleanup = crate::threads::cancel(ctx, slug, reviewer, &reason)?;
+    if cleanup.state == "cleanup_pending" {
+        return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
+    }
+    reviewer_start_failed(ctx, project, round, &reason, None)?;
+    Ok(None)
 }
 
 fn reviewer_task(
@@ -5662,6 +5735,46 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_lane_stops_both_bound_and_in_flight_stale_reviewers() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let lanes = [fx.lane(1), fx.lane(2)];
+        for (lane, sha) in &lanes {
+            admit(&ctx, "demo", "r1", lane).unwrap();
+            fx.seal_done(lane, 1, 1, sha, "# report\n");
+        }
+        advance(&ctx, "demo").unwrap();
+        let before = load(&fx.project, "r1").unwrap();
+        let reviewer = before.reviewer.unwrap();
+        let review_branch = before.review_branch.unwrap();
+
+        let changed = remove(&ctx, "demo", "r1", &lanes[1].0).unwrap();
+
+        assert_eq!(changed.phase, RoundPhase::Admitting);
+        assert!(changed.reviewer.is_none());
+        assert_eq!(
+            thread::load(&fx.project, &reviewer).unwrap().status,
+            thread::Status::Resolved
+        );
+
+        // Simulate a reviewer start that began before the removal and reached
+        // its bind only after the round returned to admission.
+        assert!(
+            start_and_bind_reviewer(&ctx, &fx.project, "demo", "r1", &review_branch, "ha")
+                .unwrap()
+                .is_none()
+        );
+        let stale = thread::list(&fx.project)
+            .into_iter()
+            .find(|candidate| candidate.role == "reviewer" && candidate.id != reviewer)
+            .expect("the in-flight reviewer was placed");
+        assert_eq!(stale.status, thread::Status::Resolved);
+        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
+    }
+
+    #[test]
     fn verdict_gate_coverage_must_match_the_pinned_commands_and_exit_zero() {
         let fx = fixture();
         update_repo(&fx, |repo| {
@@ -6534,6 +6647,36 @@ mod tests {
         assert_eq!(
             load(&fx.project, "r1").unwrap().review_branch.as_deref(),
             Some("review/r1-2")
+        );
+    }
+
+    #[test]
+    fn a_done_sealed_while_a_follow_up_is_sent_counts_as_the_new_report() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (lane, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &lane).unwrap();
+        let first = fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
+        let before_send = sealed_events(&fx.project).unwrap();
+        let second = fx.seal_done(&lane, 1, 2, &sha, "# immediate report\n");
+
+        hold_for_follow_up(&ctx, &fx.project, &lane, &before_send).unwrap();
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().manifest.members[0]
+                .awaiting_report_after
+                .as_deref(),
+            Some(first.as_str())
+        );
+
+        advance(&ctx, "demo").unwrap();
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().manifest.members[0]
+                .pin
+                .as_ref()
+                .map(|pin| pin.event.as_str()),
+            Some(second.as_str())
         );
     }
 
