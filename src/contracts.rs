@@ -409,6 +409,10 @@ pub(crate) struct ManifestMember {
     pub(crate) thread: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pin: Option<CompletionPin>,
+    /// The completion which preceded a follow-up sent to this lane. While
+    /// present, only a later `done` may pin the member again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) awaiting_report_after: Option<String>,
 }
 
 /// Authoritative admitted set. Membership is never inferred from completions
@@ -1095,6 +1099,7 @@ members = []
                         sha: "abc".into(),
                         artifact: "deadbeef".into(),
                     }),
+                    awaiting_report_after: None,
                 }],
             },
             expected_head: Some("bbb".into()),
