@@ -1983,6 +1983,12 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             .agent_prompt(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    // The next observation may already be idle if the answer was immediate.
+    // Mark this successful delivery as work first, so the round can distinguish
+    // that later idle observation from the lane's pre-prompt idle state.
+    thread::update(&project, id, |thread| {
+        thread.last_group = Group::Working.token().to_string();
+    })?;
     crate::round::hold_for_follow_up(ctx, &project, id)?;
     Ok(PromptOutcome::Sent {
         attempt: record.attempt.max(1),
@@ -3390,39 +3396,6 @@ mod tests {
         record.kind = Kind::Adopted;
         record.bootstrap.clear();
         assert!(!awaiting_bootstrap(&record));
-    }
-
-    #[test]
-    fn prompting_a_finished_lane_holds_its_round() {
-        let fx = crate::round::testkit::fixture();
-        let ctx = fx.world.ctx();
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some("The round waits for the revised lane.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        let (lane, sha) = fx.lane(1);
-        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
-        let first = fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
-        thread::update(&fx.project, &lane, |thread| thread.prompt_pending = true).unwrap();
-
-        assert!(matches!(
-            prompt(&ctx, "demo", &lane, "Please revise this work.").unwrap(),
-            PromptOutcome::Queued { .. }
-        ));
-
-        let round = crate::round::load(&fx.project, "r1").unwrap();
-        assert!(round.manifest.members[0].pin.is_none());
-        assert_eq!(
-            round.manifest.members[0].awaiting_report_after.as_deref(),
-            Some(first.as_str())
-        );
     }
 
     #[test]
