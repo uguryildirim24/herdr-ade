@@ -785,9 +785,9 @@ const TASKS_TEMPLATE: &str = "# Tasks\n\n<!-- Generated from tasks/*.toml. Do no
 const INSTRUCTIONS_TEMPLATE: &str = "\
 # Instructions
 
-Standing instructions for this project. Every thread starts from this text and
-from the project's memory. Replace this paragraph with how you want work done:
-conventions, what to check before finishing, what never to do.
+Historical standing instructions may remain here and are shown as undated.
+Add new instructions with `herdr-ade note add --kind instruction` so each one
+records its day, request, task scope and explicit replacement.
 
 The settings above, between the `+++` lines, are yours to edit. `nudge = true`
 lets the ticker prompt the coordinator when something changed; it is on by

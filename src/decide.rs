@@ -79,9 +79,13 @@ fn replaced_ids(log: &Log) -> std::collections::BTreeSet<String> {
 }
 
 /// The latest state of each unreplaced choice, oldest change first, including
-/// overturned choices. The screen reads this rather than re-folding the log.
+/// overturned choices. Replacements from notes and tasks count too, so the
+/// screen cannot keep showing a choice superseded through another record kind.
 pub(crate) fn current(project: &Project) -> Vec<Decision> {
-    fold_current(&read(project))
+    let replaced = crate::note::replacement_map(&crate::note::rows(project));
+    let mut records = fold_current(&read(project));
+    records.retain(|decision| !replaced.contains_key(&decision.id));
+    records
 }
 
 fn fold_current(log: &Log) -> Vec<Decision> {
@@ -109,6 +113,7 @@ pub(crate) fn overturn(
     if reason.trim().is_empty() || by.trim().is_empty() {
         bail!("decision_overturn: a reason and actor are required");
     }
+    let _replacement_lock = crate::note::replacement_lock(&project)?;
     let _lock = decisions_lock(&project)?;
     let log = read(&project);
     if log.broken_tail {
@@ -124,7 +129,7 @@ pub(crate) fn overturn(
     if record.overturned.is_some() {
         bail!("decision_overturned: `{id}` is already overturned");
     }
-    if !log_current(&log, id) {
+    if !project_current(&project, &log, id) {
         bail!("decision_replaced: `{id}` already has a replacement");
     }
     record.seq = log.records.iter().map(|d| d.seq).max().unwrap_or(0) + 1;
@@ -220,6 +225,10 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
         Some(basis) => Some(validate_basis(&project, basis)?),
         None => None,
     };
+    let _replacement_lock = new
+        .replaces
+        .map(|_| crate::note::replacement_lock(&project))
+        .transpose()?;
     let _lock = decisions_lock(&project)?;
     let log = read(&project);
     if log.broken_tail {
@@ -257,13 +266,18 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
         bail!("decision_request: no message `{request}` in this project");
     }
     if let Some(replaces) = new.replaces {
-        let target = log
-            .records
-            .iter()
-            .find(|d| d.id == replaces)
-            .with_context(|| format!("decision_unknown: `{replaces}` is not in this log"))?;
-        if !log_current(&log, &target.id) {
-            bail!("decision_replaced: `{replaces}` already has a replacement");
+        if let Some(target) = log.records.iter().find(|d| d.id == replaces) {
+            if !project_current(&project, &log, &target.id) {
+                bail!("decision_replaced: `{replaces}` already has a replacement");
+            }
+        } else {
+            if !crate::note::target_exists(&project, replaces) {
+                bail!("decision_unknown: `{replaces}` is not a note or decision");
+            }
+            let rows = crate::note::rows(&project);
+            if crate::note::replacement_map(&rows).contains_key(replaces) {
+                bail!("decision_replaced: `{replaces}` already has a replacement");
+            }
         }
     }
     let seq = log.records.iter().map(|d| d.seq).max().unwrap_or(0) + 1;
@@ -314,6 +328,11 @@ fn log_current(log: &Log, id: &str) -> bool {
         && !replaced.contains(id)
 }
 
+fn project_current(project: &Project, log: &Log, id: &str) -> bool {
+    log_current(log, id)
+        && !crate::note::replacement_map(&crate::note::rows(project)).contains_key(id)
+}
+
 /// `ha decide list [--json]`: current choices, newest first.
 pub(crate) fn list(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
@@ -350,13 +369,13 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<String
         .with_context(|| format!("decision_unknown: `{id}` is not in this log"))?;
     if json {
         let mut value = serde_json::to_value(record)?;
-        value["current"] = serde_json::json!(log_current(&log, id));
+        value["current"] = serde_json::json!(project_current(&project, &log, id));
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
     }
     Ok(format!(
         "{}{}\n",
         status_line(record),
-        if log_current(&log, id) || record.overturned.is_some() {
+        if project_current(&project, &log, id) || record.overturned.is_some() {
             ""
         } else {
             "  (replaced)"

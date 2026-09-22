@@ -322,6 +322,11 @@ fn start_with_ticker(
         let _lock = project.lock()?;
         project::write_atomic(&thread::task_path(&project, &id), args.task.as_bytes())?;
     }
+    // Link before composing the brief so task-scoped notes are available to
+    // this first attempt, not only to retries.
+    if !args.task_id.is_empty() {
+        crate::task::link_attempt(&project, &args.task_id, &id)?;
+    }
 
     match place_and_brief(ctx, &project, &view, &id, false) {
         Ok(thread) => {
