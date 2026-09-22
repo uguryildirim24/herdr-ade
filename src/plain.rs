@@ -171,13 +171,13 @@ pub(crate) fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
     CheckResult { violations }
 }
 
-/// The number of non-empty sentences in `text`, for a record. A `.` between
-/// two letters or digits (`config.toml`, `1.2`) does not end a sentence; other
-/// terminators and newlines do. [`check_r5`] keeps its own split because
-/// Rolf's prose has no file names.
-pub(crate) fn sentence_count(text: &str) -> usize {
+/// The non-empty sentences in a record. A `.` between two letters or digits
+/// (`config.toml`, `1.2`) does not end a sentence; other terminators and
+/// newlines do. [`check_r5`] keeps its own split because Rolf's prose has no
+/// file names.
+pub(crate) fn record_sentences(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
-    let mut count = 0;
+    let mut sentences = Vec::new();
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
@@ -194,17 +194,23 @@ pub(crate) fn sentence_count(text: &str) -> usize {
             _ => false,
         };
         if ends {
-            if !text[start..i].trim().is_empty() {
-                count += 1;
+            let sentence = text[start..=i].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
             }
             start = i + 1;
         }
         i += 1;
     }
-    if !text[start..].trim().is_empty() {
-        count += 1;
+    let sentence = text[start..].trim();
+    if !sentence.is_empty() {
+        sentences.push(sentence);
     }
-    count
+    sentences
+}
+
+pub(crate) fn sentence_count(text: &str) -> usize {
+    record_sentences(text).len()
 }
 
 /// Check an `ha ask` question and its choices (R1 to R6).

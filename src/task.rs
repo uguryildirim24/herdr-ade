@@ -329,15 +329,15 @@ pub(crate) fn add(
     }
     if acceptance.is_empty() || acceptance.iter().any(|line| line.trim().is_empty()) {
         return Err(crate::refusal::error(
-            "task_acceptance: pass at least one non-empty --acceptance sentence",
+            "task_acceptance: pass at least one non-empty --acceptance condition",
         ));
     }
     let title = crate::glossary::check_record_sentence(project, "task title", title)?;
     let mut checked_acceptance = Vec::new();
     for (index, condition) in acceptance.iter().enumerate() {
-        checked_acceptance.push(crate::glossary::check_record_sentence(
+        checked_acceptance.push(crate::glossary::check_acceptance_condition(
             project,
-            &format!("acceptance condition {}", index + 1),
+            index + 1,
             condition,
         )?);
     }
@@ -1207,6 +1207,45 @@ created = "2026-09-21T00:00:00Z"
 
         assert!(task.running.is_empty());
         validate_record(&task).unwrap();
+    }
+
+    #[test]
+    fn acceptance_conditions_are_checked_one_sentence_at_a_time() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let condition = "Two strong helpers read the failed checks. Each answers the same eight questions. Each writes a review file in the code folder.";
+
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Check each sentence on its own.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let task = add(
+            &project,
+            "Check each acceptance sentence.",
+            vec!["request:q-1".into()],
+            vec![condition.into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(task.acceptance, [condition]);
+        let long = "The first check passes. This sentence has far too many words because it keeps adding needless detail about every little part of the result and then adds even more words today. The last check passes.";
+        let error = crate::glossary::check_acceptance_condition(&project, 2, long).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                "acceptance condition 2, sentence 2 `This sentence has far too many words"
+            )
+        );
+        assert!(message.contains("Each condition can also go in its own `--acceptance`."));
     }
 
     #[test]

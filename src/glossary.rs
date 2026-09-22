@@ -206,6 +206,33 @@ pub(crate) fn check_record_sentence(project: &Project, field: &str, text: &str) 
     Ok(trimmed.to_string())
 }
 
+/// One acceptance condition may contain several short sentences. It remains
+/// one condition in the task record; only checking is sentence by sentence.
+pub(crate) fn check_acceptance_condition(
+    project: &Project,
+    condition: usize,
+    text: &str,
+) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "plain_envelope: required field acceptance condition {condition} is missing or empty"
+        );
+    }
+    let registry = registry(project);
+    for (index, sentence) in plain::record_sentences(trimmed).into_iter().enumerate() {
+        let result = plain::check_record(sentence, &registry);
+        if !result.passed() {
+            return Err(crate::refusal::error(format!(
+                "plain_refused: acceptance condition {condition}, sentence {} `{sentence}`: {}. Each condition can also go in its own `--acceptance`.",
+                index + 1,
+                format_check(sentence, &result)
+            )));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Checks a text for Rolf's plane; the error carries the check's output.
 pub(crate) fn gate(project: &Project, text: &str) -> Result<()> {
     let result = plain::check(text, &registry(project));
