@@ -927,6 +927,9 @@ fn record_task_proofs(
     for slug in crate::project::list_slugs(&ctx.root) {
         let project = crate::project::Project::load(&ctx.root, &slug)?;
         for task in crate::task::list_with_errors(&project).0 {
+            if !task.dropped.is_empty() {
+                continue;
+            }
             if !crate::task::required_states(&project, &task)?
                 .iter()
                 .any(|state| state == "installed")
