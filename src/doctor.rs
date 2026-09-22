@@ -630,15 +630,15 @@ fn report_with_checks(
         if let Ok(text) = std::fs::read_to_string(project.project_md())
             && let Ok(front) = project::project_md_front(&text)
         {
-            let legacy = project::legacy_agent_keys(front);
-            if !legacy.is_empty() {
+            let removed = project::removed_project_keys(front);
+            if !removed.is_empty() {
                 check(
                     &mut out,
                     Some(false),
                     &label,
                     format!(
-                        "PROJECT.md still has {}; D2 removed these keys",
-                        legacy.join(", ")
+                        "PROJECT.md has removed settings: {}; delete these lines",
+                        removed.join(", ")
                     ),
                 );
                 continue;
@@ -2201,6 +2201,37 @@ recipe = "claude_fable_xhigh"
         assert!(text.contains("plugin:     herdr-ade"), "{text}");
         assert!(text.contains("crate:      herdr-ade"), "{text}");
         assert!(text.contains("prefix:"), "{text}");
+    }
+
+    #[test]
+    fn doctor_refuses_the_removed_parallel_thread_setting() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        write_routing_config(&config);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let text = std::fs::read_to_string(project.project_md()).unwrap();
+        std::fs::write(
+            project.project_md(),
+            text.replacen("+++\n", "+++\nmax_parallel_threads = 9\n", 1),
+        )
+        .unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent start --help",
+            ok("[possible values: pi, claude, agy]"),
+        );
+
+        let (text, healthy) = report(&env, &root, &config, &SessionFlags::default(), &runner);
+
+        assert!(!healthy, "{text}");
+        assert!(
+            text.contains(
+                "[FAIL] project demo: PROJECT.md has removed settings: max_parallel_threads; delete these lines"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
