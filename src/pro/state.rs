@@ -240,12 +240,17 @@ pub(crate) fn clear_cooldown(layout: &Layout) -> Result<()> {
     }
 }
 
-/// The bridge's last-seen identity; a changed pid means a daemon restart
-/// (spec §4, the breaker).
+/// The bridge's last-seen process identity and endpoint (spec §4, the
+/// breaker). Optional fields keep records written before an identity field was
+/// introduced readable; a successful observation fills them in.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BridgeState {
     #[serde(default)]
     pub(crate) pid: Option<u32>,
+    #[serde(default)]
+    pub(crate) process_start: Option<String>,
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
     #[serde(default)]
     pub(crate) version: Option<String>,
     #[serde(default)]
