@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0302.md",
+      "tasks/review-r112.md",
       "tasks/t-0301.md",
       "tasks/t-0297.md",
       "tasks/review-r111.md",
@@ -20,15 +22,14 @@
       "tasks/t-0296.md",
       "tasks/review-r110.md",
       "tasks/t-0295.md",
-      "tasks/t-0294.md",
-      "tasks/t-0293.md",
-      "tasks/t-0292.md"
+      "tasks/t-0294.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r112.md",
       "tasks/reviews/code-r111.md",
       "tasks/reviews/code-r110.md",
       "tasks/reviews/code-r109.md",
@@ -39,17 +40,18 @@
       "tasks/reviews/code-r104.md",
       "tasks/reviews/code-r100.md",
       "tasks/reviews/code-r103.md",
-      "tasks/reviews/code-r102.md",
-      "tasks/reviews/code-r98.md"
+      "tasks/reviews/code-r102.md"
     ]
   },
-  "generated": "2026-09-22T14:57:21-04:00",
+  "generated": "2026-09-22T15:13:40-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0302-review-r112-one-way-to-post-to-rolf-roun",
+      "main",
+      "review/r112",
       "hp/adeherdr/t-0300-w47-one-project-page",
       "hp/adeherdr/t-0298-w45-one-way-to-publish-to-rolf",
       "hp/adeherdr/t-0301-review-r111-single-commands-and-less-noi",
-      "main",
       "hp/adeherdr/t-0299-w46-rounds-in-single-commands-with-gates",
       "review/r111-2",
       "hp/adeherdr/t-0297-review-r111-single-commands-and-less-noi",
@@ -474,36 +476,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "bf6e390 docs(review): round r111 repair verdict",
-      "a7334b3 review(lifecycle): refuse overlapping project records",
-      "c88153c review(lifecycle): keep deletion retryable through old-trash cleanup",
-      "f7ecfea review(r111): merge earlier reviewed candidate",
-      "6c7760a docs(tasks): t-0301",
-      "714d1f7 review(r111): brief for revision 6"
+      "fa64600 docs(review): round r112 verdict",
+      "7fc8a88 Merge commit '656c9aa922740f9a8ecde961e69918bed021c3e9' into hp/adeherdr/t-0302-review-r112-one-way-to-post-to-rolf-roun",
+      "7e5002f Merge commit 'd4fc0d6798803befd4fefe77911da65114ff52e6' into hp/adeherdr/t-0302-review-r112-one-way-to-post-to-rolf-roun",
+      "0e57175 Merge commit 'a7d5bd52adb1a80f0d5f7de85112b96b436dbca3' into hp/adeherdr/t-0302-review-r112-one-way-to-post-to-rolf-roun",
+      "97fd90d docs(tasks): t-0302",
+      "9b15713 review(r112): brief for revision 3"
     ],
-    "remote": "24 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "bf6e390",
+        "head": "fa64600",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r111 repair verdict"
+        "subject": "docs(review): round r112 verdict"
       },
       {
-        "branch": "review/r111",
+        "branch": "review/r112",
         "dirty": 0,
-        "head": "c2801eb",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r111",
-        "subject": "docs(tasks): t-0297"
-      },
-      {
-        "branch": "review/r111-2",
-        "dirty": 0,
-        "head": "6c7760a",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r111-2",
-        "subject": "docs(tasks): t-0301"
+        "head": "97fd90d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r112",
+        "subject": "docs(tasks): t-0302"
       }
     ]
   },
@@ -518,8 +513,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r111",
-    "verdict": "bf6e3907c802a6a19c42e07bd869446b2923be55"
+    "round": "r112",
+    "verdict": "fa646001553559b63fba17dedc99ac7e1d325cb5"
   },
   "session": "default",
   "unlinked_agents": [],
