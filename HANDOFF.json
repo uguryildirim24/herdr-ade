@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0270.md",
+      "tasks/t-0256.md",
+      "tasks/review-r100.md",
       "tasks/t-0269.md",
       "tasks/review-r103.md",
       "tasks/t-0268.md",
@@ -19,16 +22,14 @@
       "tasks/t-0265.md",
       "tasks/t-0263.md",
       "tasks/t-0255.md",
-      "tasks/t-0252.md",
-      "tasks/t-0245.md",
-      "tasks/t-0266.md",
-      "tasks/review-r98.md"
+      "tasks/t-0252.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r100.md",
       "tasks/reviews/code-r103.md",
       "tasks/reviews/code-r102.md",
       "tasks/reviews/code-r98.md",
@@ -39,16 +40,17 @@
       "tasks/reviews/code-r95.md",
       "tasks/reviews/code-r93.md",
       "tasks/reviews/code-r94.md",
-      "tasks/reviews/code-r91.md",
-      "tasks/reviews/code-r90.md"
+      "tasks/reviews/code-r91.md"
     ]
   },
-  "generated": "2026-09-22T03:22:07-04:00",
+  "generated": "2026-09-22T03:35:42-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0270-review-r100-helpers-get-their-first-mess",
+      "main",
+      "review/r100-2",
       "hp/adeherdr/t-0256-review-r100-helpers-get-their-first-mess",
       "hp/adeherdr/t-0269-review-r103-one-install-always-moves-the",
-      "main",
       "review/r103",
       "hp/adeherdr/t-0268-review-r102-a-helper-that-lost-its-conne",
       "hp/adeherdr/t-0266-w27-ticker-stop-survives-a-long-pass",
@@ -432,22 +434,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "4f619d9 docs(review): round r103 verdict",
-      "da23480 Merge commit 'b9f92da8130db10323ce6c14f283432a911f1ef9' into hp/adeherdr/t-0269-review-r103-one-install-always-moves-the",
-      "ec1e920 docs(tasks): t-0269",
-      "9663d44 review(r103): brief for revision 1",
-      "b4fd82a checkpoint(r102): HANDOFF after merging the round",
-      "959bed0 docs(review): round r102 repair verdict"
+      "22e8b45 review(ade): repair verdict for round r100",
+      "8261bd5 Merge commit '62525575bd12bc368ac65db66f3ad99eb837c475' into hp/adeherdr/t-0270-review-r100-helpers-get-their-first-mess",
+      "0713f8c docs(tasks): t-0270",
+      "8cfbda7 review(r100): brief for revision 2",
+      "d67b3cb checkpoint(r103): HANDOFF after merging the round",
+      "4f619d9 docs(review): round r103 verdict"
     ],
-    "remote": "5 ahead, 0 behind origin/main",
+    "remote": "9 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "4f619d9",
+        "head": "22e8b45",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r103 verdict"
+        "subject": "review(ade): repair verdict for round r100"
       },
       {
         "branch": "review/r100",
@@ -457,11 +459,11 @@
         "subject": "docs(tasks): t-0256"
       },
       {
-        "branch": "review/r103",
+        "branch": "review/r100-2",
         "dirty": 0,
-        "head": "ec1e920",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r103",
-        "subject": "docs(tasks): t-0269"
+        "head": "0713f8c",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r100-2",
+        "subject": "docs(tasks): t-0270"
       }
     ]
   },
@@ -481,8 +483,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r103",
-    "verdict": "4f619d9193e31ca9d89ee3f79be9077b62df010b"
+    "round": "r100",
+    "verdict": "22e8b4547b5bbf9939e1c23dc5c875d7efa4b78f"
   },
   "session": "default",
   "unlinked_agents": [],
