@@ -3419,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pi_pick_still_uses_a_ready_box() {
+    fn pi_lanes_and_reviewers_still_use_a_ready_box() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, SHIPPED_MACHINE_CONFIG);
         let task = "Run the bounded coding task.";
@@ -3432,33 +3432,21 @@ mod tests {
         )
         .unwrap();
         stub_box(&fx);
-        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
-        args.task = task.into();
-        let started = start(&fx.world.ctx(), "demo", args).unwrap();
-        assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
-        assert_eq!(started.machine, "oci");
-        assert_eq!(started.machine_id, "oci-id");
+        for role in [None, Some("reviewer")] {
+            let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+            args.task = task.into();
+            args.workflow = role.map(str::to_string);
+            let started = start(&fx.world.ctx(), "demo", args).unwrap();
+            assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
+            assert_eq!(started.machine, "oci");
+            assert_eq!(started.machine_id, "oci-id");
+        }
     }
 
     #[test]
-    fn an_explicit_machine_that_cannot_run_the_pick_is_refused() {
+    fn an_explicit_machine_that_excludes_the_pick_is_refused_without_ssh() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, &lane_config());
-        fx.world.runner.on_fn(
-            |cmd| {
-                cmd.program == "ssh"
-                    && cmd
-                        .args
-                        .last()
-                        .is_some_and(|script| script.contains("command -v agy"))
-            },
-            |_| {
-                Ok(crate::runner::fake::fail(
-                    127,
-                    "agy is missing from the lane PATH",
-                ))
-            },
-        );
+        write_config(&fx, SHIPPED_MACHINE_CONFIG);
         stub_box(&fx);
         let mut args = start_args(
             Some(fx.repo.to_string_lossy().into_owned()),
@@ -3471,14 +3459,20 @@ mod tests {
         assert!(error.contains("recipe_unavailable"), "{error}");
         assert!(error.contains("agy_gemini_flash"), "{error}");
         assert!(error.contains("oci"), "{error}");
-        assert!(
-            error.contains("agy is missing from the lane PATH"),
-            "{error}"
-        );
+        assert!(error.contains("does not run adapter kind `agy`"), "{error}");
         assert!(thread::list(&fx.project).is_empty());
         let ledger =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
         assert!(ledger.contains("placement-refused"), "{ledger}");
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.program != "ssh"),
+            "an explicitly unsupported kind must not probe the box"
+        );
     }
 
     #[test]
