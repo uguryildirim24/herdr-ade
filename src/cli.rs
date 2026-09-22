@@ -1466,6 +1466,13 @@ enum TaskCommand {
         #[arg(long)]
         replaces: Option<String>,
     },
+    /// Drop a task whose premise was wrong or was withdrawn
+    Drop {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Link a thread and its historical rounds to this task
     Adopt {
         slug: String,
@@ -2149,6 +2156,17 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     Some("noted"),
                     &serde_json::json!({ "task": view }),
                     &format!("noted {}\n", view.record.id),
+                    "",
+                )
+            }
+            TaskCommand::Drop { slug, id, reason } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::task::drop_task(&project, &id, &reason)?;
+                let view = crate::task::view(&project, record);
+                crate::output::success(
+                    Some("dropped"),
+                    &serde_json::json!({ "task": view }),
+                    &format!("{} dropped: {}\n", view.record.id, reason.trim()),
                     "",
                 )
             }
