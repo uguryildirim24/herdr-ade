@@ -984,19 +984,19 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .collect()
 }
 
-fn open_work_next_steps(project: &Project) -> Vec<String> {
+fn open_work_next_steps(project: &Project) -> BTreeMap<String, String> {
     let now = jiff::Timestamp::now();
     if thread::list(project)
         .iter()
         .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
     {
-        return Vec::new();
+        return BTreeMap::new();
     }
     crate::task::views(project)
         .0
         .into_iter()
         .filter(|view| !view.terminal(project) && !view.next.starts_with("wait for Rolf"))
-        .map(|view| format!("{}: {}", view.record.id, view.next))
+        .map(|view| (view.record.id, view.next))
         .collect()
 }
 
@@ -1033,7 +1033,12 @@ fn nudge_idle_coordinator(
     {
         return Ok(());
     }
-    let next = open_work_next_steps(project);
+    let current = open_work_next_steps(project);
+    let next: Vec<_> = current
+        .iter()
+        .filter(|(id, action)| state.idle_nudge_next.get(*id) != Some(*action))
+        .map(|(id, action)| format!("{id}: {action}"))
+        .collect();
     if next.is_empty() {
         return Ok(());
     }
@@ -1061,6 +1066,7 @@ fn nudge_idle_coordinator(
     let sent_at = project::now();
     herdr.agent_prompt(&coordinator.pane_id, &text)?;
     state.idle_nudge_last = sent_at;
+    state.idle_nudge_next = current;
     crate::ledger::coordinator_nudge(project, &next)
 }
 
@@ -1866,6 +1872,16 @@ mod tests {
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 1);
+
+        // Reading context used to make the unchanged task eligible again once
+        // the time interval elapsed. Only a new or changed next action wakes it.
+        let mut state = steps::load_state(&f.project);
+        state.idle_nudge_last = "2026-01-01T00:00:00Z".into();
+        steps::save_state(&f.project, &state).unwrap();
+        crate::ledger::context_read(&f.project, &project::now()).unwrap();
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        assert_eq!(runner.count("agent prompt"), 1);
+
         let calls = runner.calls.borrow();
         let prompt = calls
             .iter()
@@ -1945,7 +1961,7 @@ mod tests {
 
         assert_eq!(
             open_work_next_steps(&f.project),
-            ["job-0001: verify 1 acceptance condition(s)"]
+            BTreeMap::from([("job-0001".into(), "verify 1 acceptance condition(s)".into())])
         );
         crate::task::withdraw_acceptance(
             &f.project,

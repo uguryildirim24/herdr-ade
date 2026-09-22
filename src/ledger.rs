@@ -277,7 +277,7 @@ pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
     let mut entries: Vec<_> = state
         .entries
         .into_values()
-        .filter(|e| !e.closed && (e.count > 1 || time_cmp(&e.last_at, &state.context_read).is_gt()))
+        .filter(|e| !e.closed && time_cmp(&e.last_at, &state.context_read).is_gt())
         .collect();
     worst_first(&mut entries);
     entries.truncate(5);
@@ -518,9 +518,9 @@ mod tests {
         assert!(text.lines().all(|l| l.chars().count() <= 222));
         assert!(recent(&p).unwrap()[0].subject == "r0");
         context_read(&p, &jiff::Timestamp::now().to_string()).unwrap();
-        assert_eq!(recent(&p).unwrap().len(), 1);
+        assert!(recent(&p).unwrap().is_empty());
         record(&p, "new", "r9", "new").unwrap();
-        assert_eq!(recent(&p).unwrap().len(), 2);
+        assert_eq!(recent(&p).unwrap().len(), 1);
     }
     #[test]
     fn recovery_closes_the_failure_without_a_retry_twin() {

@@ -146,10 +146,10 @@ pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Resul
     Ok(())
 }
 
-/// One compact context row per configured recipe. A normal enabled recipe is
-/// always reachable through Rolf's one-off choice; the Pro relay has its own
-/// command because it is not an ADE thread.
-pub fn context_recipe_lines(config: &LaunchConfig, prefix: &str, slug: &str) -> Vec<String> {
+/// One compact context row per configured recipe. Command syntax lives once in
+/// the coordinator skill; this view only says what the recipe is and what
+/// selects it.
+pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
     config
         .recipes
         .iter()
@@ -190,11 +190,9 @@ pub fn context_recipe_lines(config: &LaunchConfig, prefix: &str, slug: &str) -> 
                 reach.push(format!("rule[{index}] {}", trigger.join("; ")));
             }
             if recipe.provider == "pro" {
-                reach.push("command 1 (background): herdr-pro start --name <n> --cwd <dir> & | command 2 (after ready): herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]".into());
+                reach.push("Pro command on the Mac".into());
             } else {
-                reach.push(format!(
-                    "{prefix} thread start {slug} --title <title> --plain \"<sentence>\" [--repo <path>] --task-file <file> --job <job-NNNN> --recipe {id} --basis \"<Rolf's words>\""
-                ));
+                reach.push("Rolf's one-off choice".into());
             }
             format!(
                 "- {id} [enabled] {} — capabilities={capabilities}; reach: {}",
@@ -742,7 +740,7 @@ mod tests {
             policy_hash: String::new(),
         };
         validate_recipe_reachability(&config).unwrap();
-        let lines = context_recipe_lines(&config, "ha --root /r", "demo");
+        let lines = context_recipe_lines(&config);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("capabilities=pictures"), "{:?}", lines);
         assert!(lines[0].contains("reach: default"), "{:?}", lines);
@@ -753,12 +751,10 @@ mod tests {
             "{:?}",
             lines
         );
-        assert!(
-            lines[0].contains("--recipe ordinary --basis \"<Rolf's words>\""),
-            "{:?}",
-            lines
-        );
-        assert!(lines[1].contains("herdr-pro start"), "{:?}", lines);
+        assert!(lines[0].contains("Rolf's one-off choice"), "{:?}", lines);
+        assert!(lines[1].contains("Pro command on the Mac"), "{:?}", lines);
+        assert!(!lines.iter().any(|line| line.contains("thread start")));
+        assert!(!lines.iter().any(|line| line.contains("herdr-pro start")));
         assert!(lines[2].contains("[disabled]"), "{:?}", lines);
         assert!(!lines[2].contains("reach:"), "{:?}", lines);
     }
