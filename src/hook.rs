@@ -757,20 +757,28 @@ mod tests {
         );
         assert!(crate::talk::read(&project).lines.is_empty());
 
-        let ticker = format!(
-            "<pasted_content id=\"2458\">\n{} Continue open work: check the result.\n</pasted_content id=\"2458\">",
+        let raw_ticker = format!(
+            "{} Continue open work: check the result.",
             crate::steps::TICKER_PROMPT_PREFIX
         );
-        assert_eq!(handle_prompt(&project, "w1:p1", &ticker).unwrap(), None);
+        assert_eq!(handle_prompt(&project, "w1:p1", &raw_ticker).unwrap(), None);
+        let wrapped_ticker =
+            format!("<pasted_content id=\"2458\">\n{raw_ticker}\n</pasted_content id=\"2458\">");
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", &wrapped_ticker).unwrap(),
+            None
+        );
         assert!(crate::talk::read(&project).lines.is_empty());
 
-        crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap();
-        let wrapped_done = "\n\n<pasted_content id=\"2459\">\nDONE t-0001 report.md sha\n</pasted_content id=\"2459\">\n";
+        let wrapped_done = "\n\n<pasted_content id=\"2459\">\nDONE t-0001 /tmp/artifact 0123456789abcdef0123456789abcdef01234567\n</pasted_content id=\"2459\">\n";
         assert_eq!(
             handle_prompt(&project, "w1:p1", wrapped_done).unwrap(),
             None
         );
-        assert!(crate::talk::recent_requests(&project, 5).is_empty());
+        assert!(
+            crate::talk::read(&project).lines.is_empty(),
+            "an unmarked pasted DONE line must not be written to the journal"
+        );
 
         let task_notice = "<task-notification>\n<task-id>abc</task-id>\n<tool-use-id>tool</tool-use-id>\n<output-file>/tmp/task</output-file>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>";
         assert_eq!(handle_prompt(&project, "w1:p1", task_notice).unwrap(), None);
@@ -812,12 +820,24 @@ mod tests {
             Some(format!("request:{id}").as_str())
         );
 
+        let mixed_cross_session = "Keep working.\n<cross-session-message from=\"coordinator-2\" session_id=\"other\">\nAutomated text.\n</cross-session-message>\nThen check the result.";
+        let mixed_cross_session_id = handle_prompt(&project, "w1:p1", mixed_cross_session)
+            .unwrap()
+            .expect("native text around a cross-session wrapper is Rolf's request");
+        assert!(
+            crate::talk::recent_requests(&project, 5)
+                .contains(&(mixed_cross_session_id, mixed_cross_session.to_string()))
+        );
+
         crate::talk::mark_automated_prompt(&project, "w1:p1", "GONE t-0002").unwrap();
-        let mixed = "Keep working.\n<pasted_content id=\"2460\">\nGONE t-0002\n</pasted_content id=\"2460\">";
-        let mixed_id = handle_prompt(&project, "w1:p1", mixed)
+        let mixed_paste = "Keep working.\n<pasted_content id=\"2460\">\nGONE t-0002\n</pasted_content id=\"2460\">";
+        let mixed_paste_id = handle_prompt(&project, "w1:p1", mixed_paste)
             .unwrap()
             .expect("native text mixed with a pasted harness line is Rolf's request");
-        assert!(crate::talk::recent_requests(&project, 5).contains(&(mixed_id, mixed.to_string())));
+        assert!(
+            crate::talk::recent_requests(&project, 5)
+                .contains(&(mixed_paste_id, mixed_paste.to_string()))
+        );
     }
 
     #[test]
