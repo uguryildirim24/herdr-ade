@@ -135,7 +135,7 @@ pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
             ),
         },
         "focus" => match current_slug(ctx) {
-            Some(slug) => overview::focus(ctx, Some(&slug)),
+            Some(slug) => overview::focus(ctx, &slug),
             None => bail!(
                 "this workspace does not belong to a project; run `focus <slug>` from a terminal"
             ),
@@ -230,6 +230,7 @@ pub(crate) fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
             return overview::run(
                 ctx,
                 Some(handoff.slug.as_str()).filter(|s| !s.is_empty()),
+                false,
                 true,
             );
         }

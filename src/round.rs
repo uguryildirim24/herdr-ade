@@ -1802,10 +1802,8 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
     Ok(outcome)
 }
 
-/// The hook's entry point: advance the project whose coordinator or thread
-/// the event's pane belongs to, or every project when it belongs to none.
-/// A lane lives in its own workspace, so its thread record is the map from
-/// the envelope to the project.
+/// Advance the project whose coordinator or thread emitted a plugin event, or
+/// every project when Herdr supplied no project identity.
 pub fn advance_event(ctx: &Ctx) -> Result<AdvanceOutcome> {
     let event = ctx
         .env

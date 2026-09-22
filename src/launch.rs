@@ -783,7 +783,6 @@ plain = "the careful helper"
             vec!["The helper starts.".into()],
             None,
             None,
-            None,
         )
         .unwrap();
         let env = Env::for_test(home.path(), &[]);

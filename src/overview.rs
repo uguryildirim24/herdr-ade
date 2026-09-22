@@ -60,14 +60,6 @@ fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
     Ok(Resolved::All)
 }
 
-/// The slug to act on, for commands that cannot act on "all projects".
-pub(crate) fn require_slug(ctx: &Ctx, slug: Option<&str>) -> Result<String> {
-    match resolve_slug(ctx, slug)? {
-        Resolved::Slug(slug) => Ok(slug),
-        Resolved::All => bail!("no project resolves from the current herdr workspace; pass a slug"),
-    }
-}
-
 fn visible_slugs(ctx: &Ctx) -> Vec<String> {
     project::list_slugs(&ctx.root)
         .into_iter()
@@ -159,7 +151,14 @@ pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
     out
 }
 
-pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
+fn rows_for_overview(mut rows: Vec<Row>, include_history: bool) -> Vec<Row> {
+    if !include_history {
+        rows.retain(|row| row.group != Group::Resolved);
+    }
+    rows
+}
+
+pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, include_history: bool, wait: bool) -> Result<()> {
     let slugs = match resolve_slug(ctx, slug)? {
         Resolved::Slug(slug) => vec![slug],
         Resolved::All => visible_slugs(ctx),
@@ -172,7 +171,8 @@ pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
         if index > 0 {
             println!();
         }
-        print!("{}", render(&project, &threads::rows(ctx, &project)));
+        let rows = rows_for_overview(threads::rows(ctx, &project), include_history);
+        print!("{}", render(&project, &rows));
     }
     // Only a popup wants to be held open; an agent calling this never waits.
     if wait && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
@@ -185,14 +185,13 @@ pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
 }
 
 /// `focus`: show only this project's panes in the sidebar, by attention.
-pub(crate) fn focus(ctx: &Ctx, slug: Option<&str>) -> Result<()> {
-    let slug = require_slug(ctx, slug)?;
-    let project = Project::load(&ctx.root, &slug)?;
+pub(crate) fn focus(ctx: &Ctx, slug: &str) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
     let view = threads::session_view(ctx, &project).ok_or_else(|| {
         anyhow::anyhow!("the herdr session of `{slug}` is not reachable; run `open {slug}` first")
     })?;
     view.herdr
-        .agent_view_set_project(&slug)
+        .agent_view_set_project(slug)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!(
         "sidebar focused on `{slug}`; `unfocus` clears it (this replaced any view another tool had set)"
@@ -229,6 +228,16 @@ mod tests {
             group,
             note: note.into(),
         }
+    }
+
+    #[test]
+    fn resolved_history_is_hidden_by_default_and_available_on_request() {
+        let rows = vec![
+            row("t-0001", Group::Resolved, "manual"),
+            row("t-0002", Group::Working, "working"),
+        ];
+        assert_eq!(rows_for_overview(rows.clone(), false).len(), 1);
+        assert_eq!(rows_for_overview(rows, true).len(), 2);
     }
 
     #[test]
@@ -297,7 +306,7 @@ mod tests {
     fn focus_filters_on_the_project_token_and_sorts_by_rank_in_the_projects_socket() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
-        focus(&world.ctx(), Some("demo")).unwrap();
+        focus(&world.ctx(), "demo").unwrap();
         let requests = world.runner.socket_requests.borrow();
         assert_eq!(requests.len(), 1);
         assert_eq!(
