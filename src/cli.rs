@@ -111,13 +111,16 @@ enum Command {
     },
     /// Print threads grouped by what needs you
     Overview {
-        slug: Option<String>,
+        slug: String,
+        /// Include resolved thread history
+        #[arg(long)]
+        history: bool,
         /// Wait for Enter before exiting (only when on a terminal; used by the popup)
         #[arg(long)]
         wait: bool,
     },
     /// Show only one project's panes in the sidebar, sorted by attention
-    Focus { slug: Option<String> },
+    Focus { slug: String },
     /// Clear the sidebar view (herdr holds one, so this clears any tool's view)
     Unfocus {
         #[command(flatten)]
@@ -144,6 +147,9 @@ enum Command {
         command: NoteCommand,
     },
     /// Threads: the project's worker agents
+    #[command(
+        long_about = "Manage a project's worker agents.\n\nEveryday:\n  start, prompt, list, show\n\nRecovery:\n  retry replaces a failed or stuck attempt through bounded routing.\n  cancel stops an attempt. rebind attaches its verified live process.\n\nAdministration:\n  attest seals verified stored output. adopt records an existing pane.\n  ack records that a report was seen. resolve performs exceptional cleanup."
+    )]
     Thread {
         #[command(subcommand)]
         command: ThreadCommand,
@@ -202,6 +208,9 @@ enum Command {
     /// (run by the courier helper on the box)
     #[command(hide = true)]
     Recover,
+    /// Handle a plugin event using its Herdr identity envelope
+    #[command(hide = true)]
+    Event { id: String },
     /// Run inside a plugin popup pane
     #[command(hide = true)]
     Pane { id: String },
@@ -250,7 +259,10 @@ enum Command {
         #[command(flatten)]
         session: SessionArgs,
     },
-    /// Rounds: open, admit lanes, review, merge with its checkpoint (SPEC-ADE D6)
+    /// Rounds: open, review and merge related lanes
+    #[command(
+        long_about = "Review and land related lanes.\n\nEveryday:\n  open, show, advance, merge\n\nRecovery:\n  retry replaces an interrupted reviewer. cancel stops the round.\n  rebind attaches a verified live reviewer. adopt accepts verified sealed work.\n\nAdministration:\n  admit and remove change membership. review manually prepares a new review revision.\n  tick runs one background pass."
+    )]
     Round {
         #[command(subcommand)]
         command: RoundCommand,
@@ -307,7 +319,7 @@ enum Command {
         allow_missing_positional = true
     )]
     Ask {
-        /// Project slug; omit to use the current project
+        /// Project slug (required when creating a question)
         #[arg(value_name = "PROJECT")]
         slug: Option<String>,
         #[command(subcommand)]
@@ -338,7 +350,7 @@ enum Command {
         allow_missing_positional = true
     )]
     Decide {
-        /// Project slug; omit to use the current project
+        /// Project slug (required when recording a choice)
         #[arg(value_name = "PROJECT")]
         slug: Option<String>,
         #[command(subcommand)]
@@ -363,9 +375,9 @@ enum Command {
     },
     /// Tell Rolf one checked line on the board and the talk tab
     Say {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         #[arg(long)]
         what: String,
         #[arg(long)]
@@ -375,11 +387,10 @@ enum Command {
         landed_round: Option<String>,
     },
     /// Print a name's recorded sentence and where it was born
-    #[command(allow_missing_positional = true)]
     Explain {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         name: String,
     },
     /// Glossary terms
@@ -484,10 +495,7 @@ enum RoundCommand {
         stop_after: Option<String>,
     },
     /// Start the review and reviewer for every ready round; announce verdicts
-    Advance {
-        /// Project slug; omit to use the hook's workspace
-        slug: Option<String>,
-    },
+    Advance { slug: String },
     /// Show one round's record and merge phase; omit ROUND to list all rounds
     Show { slug: String, round: Option<String> },
     /// Run the ticker's pass for rounds, asks, talk and the board once
@@ -541,15 +549,15 @@ enum DialogueCommand {
 enum PlanCommand {
     /// Print the plan card; a missing card prints revision zero
     Show {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
     },
     /// Set the end-result kind and its one sentence
     Set {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         #[arg(long, value_name = "KIND")]
         kind: String,
         #[arg(long)]
@@ -564,77 +572,65 @@ enum PlanCommand {
     },
     /// Derive step states from the bound work and write only on change
     Sync {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
     },
 }
 
 #[derive(Subcommand)]
 enum PlanStepCommand {
-    /// Add a step, optionally bound to threads or rounds
-    #[command(allow_missing_positional = true)]
+    /// Add a step, optionally bound to stable tasks
     Add {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         text: String,
-        #[arg(long = "thread", value_name = "ID")]
-        threads: Vec<String>,
-        #[arg(long = "round", value_name = "ID")]
-        rounds: Vec<String>,
+        #[arg(long = "task", value_name = "ID")]
+        tasks: Vec<String>,
         #[arg(long)]
         expect: u64,
     },
     /// Replace one step's sentence
     Edit {
-        /// Project slug when TEXT is also present; otherwise the step id
-        #[arg(value_name = "PROJECT_OR_ID")]
-        project_or_id: String,
-        /// Step id when TEXT is present; otherwise the replacement text
-        #[arg(value_name = "ID_OR_TEXT")]
-        id_or_text: String,
-        /// Replacement text when the project slug is present
-        text: Option<String>,
+        /// Project slug
+        slug: String,
+        /// Step id
+        id: String,
+        /// Replacement text
+        text: String,
         #[arg(long)]
         expect: u64,
     },
     /// Add required work to a step
-    #[command(allow_missing_positional = true)]
     Link {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         id: String,
-        #[arg(long = "thread", value_name = "ID")]
-        threads: Vec<String>,
-        #[arg(long = "round", value_name = "ID")]
-        rounds: Vec<String>,
+        #[arg(long = "task", value_name = "ID", required = true)]
+        tasks: Vec<String>,
         #[arg(long)]
         expect: u64,
     },
     /// Remove required work from a step
-    #[command(allow_missing_positional = true)]
     Unlink {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         id: String,
-        #[arg(long = "thread", value_name = "ID")]
-        threads: Vec<String>,
-        #[arg(long = "round", value_name = "ID")]
-        rounds: Vec<String>,
+        #[arg(long = "task", value_name = "ID", required = true)]
+        tasks: Vec<String>,
         #[arg(long)]
         why: String,
         #[arg(long)]
         expect: u64,
     },
     /// Remove one step (identifiers are never reused)
-    #[command(allow_missing_positional = true)]
     Remove {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         id: String,
         #[arg(long)]
         why: String,
@@ -642,11 +638,10 @@ enum PlanStepCommand {
         expect: u64,
     },
     /// Change display order only
-    #[command(allow_missing_positional = true)]
     Move {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         id: String,
         #[arg(long, value_name = "ID")]
         before: String,
@@ -659,27 +654,24 @@ enum PlanStepCommand {
 enum DecideCommand {
     /// Overturn a decision, keeping its history
     Overturn {
-        /// Project slug when REASON is also present; otherwise the decision id
-        #[arg(value_name = "PROJECT_OR_ID")]
-        project_or_id: String,
-        /// Decision id when REASON is present; otherwise the reason
-        #[arg(value_name = "ID_OR_REASON")]
-        id_or_reason: String,
-        /// Reason when the project slug is present
-        reason: Option<String>,
+        /// Project slug
+        slug: String,
+        /// Decision id
+        id: String,
+        /// Reason for overturning it
+        reason: String,
     },
     /// List the current choices, newest first
     List {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
     },
     /// Show one decision and whether it is still current
-    #[command(allow_missing_positional = true)]
     Show {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         id: String,
     },
 }
@@ -688,37 +680,32 @@ enum DecideCommand {
 enum AskCommand {
     /// Withdraw an open question, keeping its history
     Withdraw {
-        /// Project slug when REASON is also present; otherwise the ask id
-        #[arg(value_name = "PROJECT_OR_ID")]
-        project_or_id: String,
-        /// Ask id when REASON is present; otherwise the reason
-        #[arg(value_name = "ID_OR_REASON")]
-        id_or_reason: String,
-        /// Reason when the project slug is present
-        reason: Option<String>,
+        /// Project slug
+        slug: String,
+        /// Ask id
+        id: String,
+        /// Reason for withdrawing it
+        reason: String,
     },
     /// Answer an ask by id and revision
     Answer {
-        /// Project slug when CHOICE is also present; otherwise the ask id
-        #[arg(value_name = "PROJECT_OR_ID")]
-        project_or_id: String,
-        /// Ask id when CHOICE is present; otherwise the choice
-        #[arg(value_name = "ID_OR_CHOICE")]
-        id_or_choice: String,
+        /// Project slug
+        slug: String,
+        /// Ask id
+        id: String,
         #[arg(long)]
         revision: u32,
-        choice: Option<u32>,
+        choice: u32,
     },
 }
 
 #[derive(Subcommand)]
 enum TermCommand {
     /// Add a term with its one sentence
-    #[command(allow_missing_positional = true)]
     Add {
-        /// Project slug; omit to use the current project
+        /// Project slug
         #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
+        slug: String,
         name: String,
         #[arg(long)]
         plain: Option<String>,
@@ -730,7 +717,6 @@ enum TermCommand {
 
 fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
     use crate::{ask, board, checkpoint, decide, dialogue, glossary, plan, round, talk};
-    let slug_of = |slug: Option<String>| overview::require_slug(ctx, slug.as_deref());
     match command {
         Command::Round { command } => match command {
             RoundCommand::Open {
@@ -935,29 +921,21 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     "",
                 )
             }
-            RoundCommand::Advance { slug } => match slug {
-                Some(slug) => {
-                    let outcome = round::advance(ctx, &slug)?;
-                    crate::output::insert("started", serde_json::to_value(&outcome.started)?);
-                    if outcome.started.is_empty() {
-                        println!("no reviewer started");
-                    } else {
-                        for started in outcome.started {
-                            println!(
-                                "started reviewer {} for {}",
-                                started.reviewer, started.round
-                            );
-                        }
+            RoundCommand::Advance { slug } => {
+                let outcome = round::advance(ctx, &slug)?;
+                crate::output::insert("started", serde_json::to_value(&outcome.started)?);
+                if outcome.started.is_empty() {
+                    println!("no reviewer started");
+                } else {
+                    for started in outcome.started {
+                        println!(
+                            "started reviewer {} for {}",
+                            started.reviewer, started.round
+                        );
                     }
-                    Ok(())
                 }
-                None => {
-                    let outcome = round::advance_event(ctx)?;
-                    crate::output::insert("started", serde_json::to_value(&outcome.started)?);
-                    println!("rounds advanced for the event's projects");
-                    Ok(())
-                }
-            },
+                Ok(())
+            }
             RoundCommand::Show { slug, round: id } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 if let Some(id) = id {
@@ -1079,16 +1057,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             round: r,
             reask,
         } => match command {
-            Some(AskCommand::Withdraw {
-                project_or_id,
-                id_or_reason,
-                reason,
-            }) => {
-                let (slug, id, reason) = match reason {
-                    Some(reason) => (Some(project_or_id), id_or_reason, reason),
-                    None => (None, project_or_id, id_or_reason),
-                };
-                let slug = slug_of(slug)?;
+            Some(AskCommand::Withdraw { slug, id, reason }) => {
                 let by = ctx
                     .env
                     .var("USER")
@@ -1099,22 +1068,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
             Some(AskCommand::Answer {
-                project_or_id,
-                id_or_choice,
+                slug,
+                id,
                 revision,
                 choice,
             }) => {
-                let (slug, id, choice) = match choice {
-                    Some(choice) => (Some(project_or_id), id_or_choice, choice),
-                    None => (
-                        None,
-                        project_or_id,
-                        id_or_choice
-                            .parse::<u32>()
-                            .context("choice must be a number")?,
-                    ),
-                };
-                let slug = slug_of(slug)?;
                 let answer = ask::answer(ctx, &slug, &id, revision, choice, "command")?;
                 crate::output::success(
                     Some("answered"),
@@ -1127,11 +1085,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 )
             }
             None => {
-                let (slug, question) = match (slug, question) {
-                    (Some(question), None) => (None, Some(question)),
-                    pair => pair,
-                };
-                let slug = slug_of(slug)?;
+                let slug = slug.context("a project slug is required")?;
                 let question = question.context("a question is required")?;
                 let a = ask::ask(
                     ctx,
@@ -1160,7 +1114,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
         },
         Command::Plan { command } => match command {
             PlanCommand::Show { slug } => {
-                let slug = slug_of(slug)?;
                 let text = plan::show(ctx, &slug, false)?;
                 if crate::output::structured() {
                     let value: serde_json::Value =
@@ -1176,7 +1129,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 does,
                 expect,
             } => {
-                let slug = slug_of(slug)?;
                 let p = plan::set(ctx, &slug, &kind, &does, expect)?;
                 crate::output::insert("revision", p.revision);
                 println!("plan revision {} set to `{}`", p.revision, p.kind);
@@ -1186,12 +1138,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 PlanStepCommand::Add {
                     slug,
                     text,
-                    threads,
-                    rounds,
+                    tasks,
                     expect,
                 } => {
-                    let slug = slug_of(slug)?;
-                    let p = plan::step_add(ctx, &slug, &text, threads, rounds, expect)?;
+                    let p = plan::step_add(ctx, &slug, &text, tasks, expect)?;
                     let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
                     crate::output::success(
                         None,
@@ -1207,16 +1157,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     )
                 }
                 PlanStepCommand::Edit {
-                    project_or_id,
-                    id_or_text,
+                    slug,
+                    id,
                     text,
                     expect,
                 } => {
-                    let (slug, id, text) = match text {
-                        Some(text) => (Some(project_or_id), id_or_text, text),
-                        None => (None, project_or_id, id_or_text),
-                    };
-                    let slug = slug_of(slug)?;
                     let p = plan::step_edit(ctx, &slug, &id, &text, expect)?;
                     crate::output::success(
                         None,
@@ -1234,12 +1179,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 PlanStepCommand::Link {
                     slug,
                     id,
-                    threads,
-                    rounds,
+                    tasks,
                     expect,
                 } => {
-                    let slug = slug_of(slug)?;
-                    let p = plan::step_link(ctx, &slug, &id, threads, rounds, expect)?;
+                    let p = plan::step_link(ctx, &slug, &id, tasks, expect)?;
                     crate::output::success(
                         None,
                         &serde_json::json!({
@@ -1256,13 +1199,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 PlanStepCommand::Unlink {
                     slug,
                     id,
-                    threads,
-                    rounds,
+                    tasks,
                     why,
                     expect,
                 } => {
-                    let slug = slug_of(slug)?;
-                    let p = plan::step_unlink(ctx, &slug, &id, threads, rounds, &why, expect)?;
+                    let p = plan::step_unlink(ctx, &slug, &id, tasks, &why, expect)?;
                     crate::output::success(
                         None,
                         &serde_json::json!({
@@ -1282,7 +1223,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     why,
                     expect,
                 } => {
-                    let slug = slug_of(slug)?;
                     let p = plan::step_remove(ctx, &slug, &id, &why, expect)?;
                     crate::output::success(
                         None,
@@ -1302,7 +1242,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     before,
                     expect,
                 } => {
-                    let slug = slug_of(slug)?;
                     let p = plan::step_move(ctx, &slug, &id, &before, expect)?;
                     crate::output::success(
                         None,
@@ -1320,7 +1259,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 }
             },
             PlanCommand::Sync { slug } => {
-                let slug = slug_of(slug)?;
                 match plan::sync(ctx, &slug)? {
                     plan::SyncOutcome::Missing => {
                         crate::output::set_outcome("plan_missing");
@@ -1349,16 +1287,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             replaces,
             request,
         } => match command {
-            Some(DecideCommand::Overturn {
-                project_or_id,
-                id_or_reason,
-                reason,
-            }) => {
-                let (slug, id, reason) = match reason {
-                    Some(reason) => (Some(project_or_id), id_or_reason, reason),
-                    None => (None, project_or_id, id_or_reason),
-                };
-                let slug = slug_of(slug)?;
+            Some(DecideCommand::Overturn { slug, id, reason }) => {
                 let by = ctx
                     .env
                     .var("USER")
@@ -1369,7 +1298,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
             Some(DecideCommand::List { slug }) => {
-                let slug = slug_of(slug)?;
                 let text = decide::list(ctx, &slug, false)?;
                 if crate::output::structured() {
                     let value: serde_json::Value =
@@ -1380,7 +1308,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
             Some(DecideCommand::Show { slug, id }) => {
-                let slug = slug_of(slug)?;
                 let text = decide::show(ctx, &slug, &id, false)?;
                 if crate::output::structured() {
                     let value: serde_json::Value =
@@ -1391,11 +1318,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
             None => {
-                let (slug, line) = match (slug, line) {
-                    (Some(line), None) => (None, Some(line)),
-                    pair => pair,
-                };
                 let mut missing = Vec::new();
+                if slug.is_none() {
+                    missing.push("a project slug");
+                }
                 if line.is_none() {
                     missing.push("a decision line");
                 }
@@ -1417,7 +1343,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         missing.join("; ")
                     )));
                 }
-                let slug = slug_of(slug)?;
+                let slug = slug.expect("checked above");
                 let line = line.expect("checked above");
                 let class = class.expect("checked above").as_str();
                 let d = decide::decide(
@@ -1443,7 +1369,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             means,
             landed_round,
         } => {
-            let slug = slug_of(slug)?;
             let id = match landed_round {
                 Some(round) => ask::say_landed(ctx, &slug, &what, means.as_deref(), &round)?,
                 None => ask::say(ctx, &slug, &what, means.as_deref())?,
@@ -1453,7 +1378,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             Ok(())
         }
         Command::Explain { slug, name } => {
-            let slug = slug_of(slug)?;
             print!("{}", glossary::explain(ctx, &slug, &name)?);
             Ok(())
         }
@@ -1464,7 +1388,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 plain,
                 path,
             } => {
-                let slug = slug_of(slug)?;
                 let t = glossary::add_term(ctx, &slug, &name, plain.as_deref(), path.as_deref())?;
                 println!("- {}: {}", t.name, t.sentence);
                 Ok(())
@@ -1544,13 +1467,13 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
 #[derive(Subcommand)]
 enum LedgerCommand {
     /// Open failures, worst repeat count first
-    List,
+    List { slug: String },
     /// Show a failure and its evidence
-    Show { id: String },
+    Show { slug: String, id: String },
     /// Close a failure
-    Done { id: String },
+    Done { slug: String, id: String },
     /// Print an actionable task brief to standard output
-    Task { id: String },
+    Task { slug: String, id: String },
 }
 
 #[derive(Subcommand)]
@@ -1584,8 +1507,6 @@ enum TaskCommand {
         acceptance: Vec<String>,
         #[arg(long, value_name = "PATH")]
         repo: Option<String>,
-        #[arg(long, value_name = "STEP")]
-        plan_step: Option<String>,
         /// Older note, instruction, decision or task this task replaces
         #[arg(long)]
         replaces: Option<String>,
@@ -1643,11 +1564,11 @@ enum NoteCommand {
 
 #[derive(Subcommand)]
 enum ThreadCommand {
-    /// Start a thread: a worktree workspace for --repo, else a tab in the project workspace
+    /// Start a thread from a stable task; explicit details override that task
     Start {
         slug: String,
         #[arg(long)]
-        title: String,
+        title: Option<String>,
         #[arg(long, value_name = "PATH")]
         repo: Option<String>,
         #[arg(long, value_name = "LABEL|ID|local")]
@@ -1667,7 +1588,7 @@ enum ThreadCommand {
         /// Verbatim words from Rolf's request for the exact recipe
         #[arg(long, requires = "recipe")]
         basis: Option<String>,
-        /// Birth sentence (SPEC-ADE D17 item 6)
+        /// Birth sentence; defaults to the stable task's title
         #[arg(long)]
         plain: Option<String>,
         /// Existing stable task id. Ordinary lanes must name this or create one.
@@ -1679,9 +1600,6 @@ enum ThreadCommand {
         /// Acceptance conditions for a task created with this lane
         #[arg(long = "acceptance", requires = "requests")]
         acceptance: Vec<String>,
-        /// Plan step for a task created with this lane
-        #[arg(long, value_name = "STEP", requires = "requests")]
-        plan_step: Option<String>,
     },
     /// Replace a failed, blocked, or stuck attempt through bounded routing
     Retry {
@@ -1760,6 +1678,28 @@ enum ThreadCommand {
         #[arg(long)]
         keep_pane: bool,
     },
+}
+
+fn start_details(
+    existing: Option<&crate::task::Task>,
+    title: Option<String>,
+    repo: Option<String>,
+    plain: Option<String>,
+) -> Result<(String, Option<String>, String)> {
+    let title = title
+        .or_else(|| existing.map(|task| task.title.clone()))
+        .ok_or_else(|| {
+            crate::refusal::error(
+                "task_title: --title is required when the lane does not name an existing --job",
+            )
+        })?;
+    let repo = repo.or_else(|| existing.and_then(|task| task.repo.clone()));
+    let plain = plain.unwrap_or_else(|| {
+        existing
+            .map(|task| task.title.clone())
+            .unwrap_or_else(|| title.clone())
+    });
+    Ok((title, repo, plain))
 }
 
 /// `-` is standard input; a relative path is relative to the caller's directory.
@@ -1977,7 +1917,7 @@ pub fn run() -> Result<()> {
         .and_then(|s| Project::load(&ctx.root, s).ok());
     let _scope = crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>());
     let subject = format!("ha {command_name}");
-    let result = dispatch(ctx, cli.command, observed_project.as_ref());
+    let result = dispatch(ctx, cli.command);
     record_command_outcome(observed_project.as_ref(), &subject, &result);
     if result.is_ok() {
         crate::output::finish_success()?;
@@ -2014,7 +1954,7 @@ fn record_command_outcome(project: Option<&Project>, subject: &str, result: &Res
     }
 }
 
-fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) -> Result<()> {
+fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
     match command {
         Command::New { name, goal, repos } => {
             let repos = repos
@@ -2094,16 +2034,18 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             },
         ),
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
-        Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
-        Command::Focus { slug } => overview::focus(&ctx, slug.as_deref()),
+        Command::Overview {
+            slug,
+            history,
+            wait,
+        } => overview::run(&ctx, Some(&slug), history, wait),
+        Command::Focus { slug } => overview::focus(&ctx, &slug),
         Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
         Command::Ledger { command } => {
-            let project = observed_project
-                .as_ref()
-                .context("no project resolves from this workspace or lane")?;
             match command {
-                LedgerCommand::List => {
-                    let entries = crate::ledger::list(project)?;
+                LedgerCommand::List { slug } => {
+                    let project = Project::load(&ctx.root, &slug)?;
+                    let entries = crate::ledger::list(&project)?;
                     if crate::output::structured() {
                         crate::output::insert("result", serde_json::to_value(&entries)?);
                     }
@@ -2111,8 +2053,9 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         println!("{}", crate::ledger::summary(&entry));
                     }
                 }
-                LedgerCommand::Show { id } => {
-                    let record = crate::ledger::show(project, &id)?;
+                LedgerCommand::Show { slug, id } => {
+                    let project = Project::load(&ctx.root, &slug)?;
+                    let record = crate::ledger::show(&project, &id)?;
                     let message = format!("{}\n", serde_json::to_string_pretty(&record)?);
                     crate::output::success(
                         Some("shown"),
@@ -2121,8 +2064,9 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         "",
                     )?;
                 }
-                LedgerCommand::Done { id } => {
-                    let closed = crate::ledger::done(project, &id)?;
+                LedgerCommand::Done { slug, id } => {
+                    let project = Project::load(&ctx.root, &slug)?;
+                    let closed = crate::ledger::done(&project, &id)?;
                     let (outcome, message) = if closed.changed {
                         ("closed", format!("{} closed\n", closed.record.id))
                     } else {
@@ -2141,10 +2085,13 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         "",
                     )?;
                 }
-                LedgerCommand::Task { id } => print!(
-                    "{}",
-                    crate::ledger::task(&crate::ledger::show(project, &id)?)
-                ),
+                LedgerCommand::Task { slug, id } => {
+                    let project = Project::load(&ctx.root, &slug)?;
+                    print!(
+                        "{}",
+                        crate::ledger::task(&crate::ledger::show(&project, &id)?)
+                    )
+                }
             }
             Ok(())
         }
@@ -2234,7 +2181,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 requests,
                 acceptance,
                 repo,
-                plan_step,
                 replaces,
             } => {
                 let project = Project::load(&ctx.root, &slug)?;
@@ -2248,9 +2194,8 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         }
                     })
                     .collect();
-                let record = crate::task::add(
-                    &project, &title, authority, acceptance, repo, plan_step, replaces,
-                )?;
+                let record =
+                    crate::task::add(&project, &title, authority, acceptance, repo, replaces)?;
                 let view = crate::task::view(&project, record);
                 crate::output::success(
                     Some("added"),
@@ -2384,15 +2329,16 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 job,
                 requests,
                 acceptance,
-                plan_step,
             } => {
                 let task = read_text(&task_file)?;
                 let project = Project::load(&ctx.root, &slug)?;
+                let existing = job
+                    .as_deref()
+                    .map(|id| crate::task::load(&project, id))
+                    .transpose()?;
+                let (title, repo, plain) = start_details(existing.as_ref(), title, repo, plain)?;
                 let task_id = match job {
-                    Some(id) => {
-                        crate::task::load(&project, &id)?;
-                        id
-                    }
+                    Some(id) => id,
                     None if workflow.as_deref() == Some("reviewer") => String::new(),
                     None if requests.is_empty() => {
                         return Err(crate::refusal::error(
@@ -2418,7 +2364,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                             authority,
                             acceptance,
                             repo.clone(),
-                            plan_step,
                             None,
                         )?
                         .id
@@ -2433,7 +2378,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         machine,
                         base,
                         task,
-                        plain: plain.unwrap_or_default(),
+                        plain,
                         workflow,
                         recipe,
                         recipe_basis: basis,
@@ -2699,6 +2644,14 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 phase,
             } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         },
+        Command::Event { id } => match id.as_str() {
+            "round-advance" => {
+                let outcome = crate::round::advance_event(&ctx)?;
+                crate::output::insert("started", serde_json::to_value(&outcome.started)?);
+                Ok(())
+            }
+            _ => bail!("unknown plugin event `{id}`"),
+        },
         Command::Doctor { session } => {
             let result = doctor::run(&ctx, &session.into())?;
             crate::output::success(
@@ -2766,6 +2719,52 @@ mod tests {
     }
 
     #[test]
+    fn thread_start_reuses_task_details_and_keeps_explicit_overrides() {
+        let task = crate::task::Task {
+            title: "Build the short guide.".into(),
+            repo: Some("/code/project".into()),
+            ..crate::task::Task::default()
+        };
+        assert_eq!(
+            start_details(Some(&task), None, None, None).unwrap(),
+            (
+                "Build the short guide.".into(),
+                Some("/code/project".into()),
+                "Build the short guide.".into(),
+            )
+        );
+        assert_eq!(
+            start_details(
+                Some(&task),
+                Some("Review the guide.".into()),
+                Some("/code/other".into()),
+                Some("Check the changed guide.".into()),
+            )
+            .unwrap(),
+            (
+                "Review the guide.".into(),
+                Some("/code/other".into()),
+                "Check the changed guide.".into(),
+            )
+        );
+        assert!(start_details(None, None, None, None).is_err());
+
+        assert!(
+            Cli::try_parse_from([
+                "herdr-ade",
+                "thread",
+                "start",
+                "demo",
+                "--job",
+                "job-0001",
+                "--task-file",
+                "brief.md",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn the_installed_hook_keeps_its_machine_interface() {
         let cli = Cli::try_parse_from([
             "ha",
@@ -2825,13 +2824,17 @@ mod tests {
                 "--expect",
                 "1",
             ],
-            &["plan", "step", "link", "demo", "s-1", "--expect", "1"],
+            &[
+                "plan", "step", "link", "demo", "s-1", "--task", "job-0001", "--expect", "1",
+            ],
             &[
                 "plan",
                 "step",
                 "unlink",
                 "demo",
                 "s-1",
+                "--task",
+                "job-0001",
                 "--why",
                 "No longer needed.",
                 "--expect",
@@ -2884,7 +2887,7 @@ mod tests {
             assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
         }
 
-        let omitted_cases: &[&[&str]] = &[
+        let refused_old_forms: &[&[&str]] = &[
             &["ask", "withdraw", "a-1", "No longer needed."],
             &["decide", "overturn", "d-1", "Use the other choice."],
             &[
@@ -2896,14 +2899,40 @@ mod tests {
                 "--expect",
                 "1",
             ],
+            &["plan", "show"],
+            &["overview"],
+            &["focus"],
+            &["say", "--what", "This was checked."],
+            &["ledger", "list"],
+            &["round", "advance"],
+            &[
+                "plan", "step", "link", "demo", "s-1", "--thread", "t-0001", "--expect", "1",
+            ],
+            &[
+                "task",
+                "add",
+                "demo",
+                "--title",
+                "Do it.",
+                "--request",
+                "q-1",
+                "--acceptance",
+                "It works.",
+                "--plan-step",
+                "s-1",
+            ],
         ];
-        for args in omitted_cases {
+        for args in refused_old_forms {
             let mut argv = vec!["herdr-ade"];
             argv.extend_from_slice(args);
-            assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
+            assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
         }
 
         assert!(Cli::try_parse_from(["herdr-ade", "plan", "show", "--project", "demo"]).is_err());
+        assert!(
+            Cli::try_parse_from(["herdr-ade", "event", "round-advance"]).is_ok(),
+            "the manifest's event-only command must remain valid"
+        );
     }
 
     #[test]
@@ -2921,7 +2950,6 @@ mod tests {
             Command::Doctor {
                 session: SessionArgs::default(),
             },
-            Some(&project),
         );
         let error = result.as_ref().unwrap_err();
         assert_eq!(error.to_string(), "some checks failed");

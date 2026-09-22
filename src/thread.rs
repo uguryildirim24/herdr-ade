@@ -1578,7 +1578,6 @@ mod tests {
             vec!["The command reports the new result.".into()],
             None,
             None,
-            None,
         )
         .unwrap();
         let other = crate::task::add(
@@ -1586,7 +1585,6 @@ mod tests {
             "Ship another checked change.",
             vec!["request:q-1".into()],
             vec!["The command reports another result.".into()],
-            None,
             None,
             None,
         )
