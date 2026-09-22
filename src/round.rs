@@ -1384,7 +1384,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
             }
         }
     }
-    let record = {
+    let (record, superseded_reviewer) = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
@@ -1406,14 +1406,25 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         let previous_phase = record.phase;
         record.phase = RoundPhase::Admitting;
         refresh_pins(&project, &mut record, &events)?;
-        if record.manifest != before {
+        let superseded_reviewer = if record.manifest != before {
+            let reviewer = record.reviewer.clone();
             return_to_admitting(&mut record);
+            reviewer
         } else {
             record.phase = previous_phase;
-        }
+            None
+        };
         save(&project, &record)?;
-        record
+        (record, superseded_reviewer)
     };
+    if let Some(reviewer) = superseded_reviewer {
+        cancel_superseded_reviewer(
+            ctx,
+            &project,
+            &reviewer,
+            &format!("superseded when {thread_id} was admitted to {round}"),
+        )?;
+    }
     crate::task::link_round_for_thread(&project, round, thread_id)?;
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
@@ -1665,7 +1676,7 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
     thread::validate_id(thread_id)?;
-    let record = {
+    let (record, superseded_reviewer) = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
@@ -1675,10 +1686,19 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
             bail!("not_a_member: `{thread_id}` is not admitted to `{round}`");
         }
         record.manifest.revision += 1;
+        let reviewer = record.reviewer.clone();
         return_to_admitting(&mut record);
         save(&project, &record)?;
-        record
+        (record, reviewer)
     };
+    if let Some(reviewer) = superseded_reviewer {
+        cancel_superseded_reviewer(
+            ctx,
+            &project,
+            &reviewer,
+            &format!("superseded when {thread_id} was removed from {round}"),
+        )?;
+    }
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
@@ -5659,6 +5679,53 @@ mod tests {
         let e = err(merge(&ctx, "demo", "r1", None));
         assert!(e.starts_with("review_stale"), "{e}");
         assert!(read_merge(&fx.project, "r1").unwrap().is_none());
+    }
+
+    #[test]
+    fn admitting_a_lane_stops_the_reviewer_it_supersedes() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (first, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &first).unwrap();
+        fx.seal_done(&first, 1, 1, &sha, "# report\n");
+        advance(&ctx, "demo").unwrap();
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let (late, _) = fx.lane(2);
+
+        let changed = admit(&ctx, "demo", "r1", &late).unwrap();
+
+        assert_eq!(changed.phase, RoundPhase::Admitting);
+        assert!(changed.reviewer.is_none());
+        assert_eq!(
+            thread::load(&fx.project, &reviewer).unwrap().status,
+            thread::Status::Resolved
+        );
+    }
+
+    #[test]
+    fn removing_a_lane_stops_the_reviewer_it_supersedes() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let lanes = [fx.lane(1), fx.lane(2)];
+        for (lane, sha) in &lanes {
+            admit(&ctx, "demo", "r1", lane).unwrap();
+            fx.seal_done(lane, 1, 1, sha, "# report\n");
+        }
+        advance(&ctx, "demo").unwrap();
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+
+        let changed = remove(&ctx, "demo", "r1", &lanes[1].0).unwrap();
+
+        assert_eq!(changed.phase, RoundPhase::Admitting);
+        assert!(changed.reviewer.is_none());
+        assert_eq!(
+            thread::load(&fx.project, &reviewer).unwrap().status,
+            thread::Status::Resolved
+        );
     }
 
     #[test]
