@@ -45,7 +45,7 @@ Edit the new `PROJECT.md` for standing instructions, repositories, and project s
 
 ## 4. Start work
 
-Tell the coordinator what you want. In the default `propose` mode it describes the lanes it would start and waits for your go-ahead. Each repository lane gets:
+Tell the coordinator what you want. In the default `auto` mode it starts the lanes the work needs and tells you what it started. Set a project's `start_threads` safety row to `propose` if you want it to describe lanes and wait for your go-ahead. Each repository lane gets:
 
 - a committed task file under `tasks/`;
 - a branch and worktree under `<repo>/.worktrees/`;

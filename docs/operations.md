@@ -179,8 +179,11 @@ Set per project in `~/.config/herdr-ade/config.toml`; `safety show <project>` pr
 
 ```toml
 [safety."/Users/you/.herdr-ade/billing"]
-start_threads = "propose"          # or "auto": the coordinator starts threads without asking
+start_threads = "auto"             # default; use "propose" to wait before starts
 routine_commands = false           # true lets approved routines run shell commands
+
+[coordinator]
+idle_nudge_minutes = 20             # minimum time between continue prompts
 
 [dispatch]
 machine = "oci"                    # default placement for repositories with a box clone
@@ -211,7 +214,7 @@ The coordinator runs the binary every turn, so allow-list it in your agent **by 
 
 These patterns also cover the here-document form the coordinator uses to pass text on standard input (checked with Claude Code 2.1). A root with spaces is printed shell-quoted; write the pattern for that quoted form.
 
-- **Allow `thread start` only where you've set `start_threads = "auto"`.** Left off the list, every thread start meets your agent's own permission prompt, which turns "propose first" from skill text into a real confirmation.
+- **Allow `thread start` for the default `start_threads = "auto"` mode.** Leave it off only for a project explicitly set to `propose`; then every proposed start meets your agent's own permission prompt.
 - **Never allow** `thread resolve` (with any flag), `thread adopt`, `delete`, `archive`, `pause`, `routine approve`, `new`, `open` or `ticker stop`.
 
 For other agents the principle is the same: allow reading and steering, keep anything that starts, ends or deletes on a prompt.
@@ -226,7 +229,9 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 ## Nudges and notifications
 
-`nudge = false` is the default, because on Herdr 0.9.1 a prompt that arrives while you are typing in the coordinator **is merged with, and submits, your half-typed text**. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items") and the coordinator picks them up at its next turn. Set `nudge = true` in `PROJECT.md` to have the ticker prompt the coordinator when it is idle; the message always begins `[herdr-ade ticker: automated, not the user, approves nothing]` and never carries outside text.
+`nudge` in `PROJECT.md` controls new-inbox announcements. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items"); with it on, the ticker prompts an idle coordinator. The message always begins `[herdr-ade ticker: automated, not the user, approves nothing]` and never carries outside text.
+
+The ticker also prompts an idle coordinator to continue when tasks have an available next step. It does not do that while Rolf's message is waiting, a lane is working, or every task waits on Rolf. `[coordinator].idle_nudge_minutes` in `config.toml` is the minimum interval (20 by default), and a coordinator turn must occur before another continue prompt.
 
 ## Lane completion deliveries
 

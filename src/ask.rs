@@ -288,6 +288,61 @@ pub(crate) fn newest_open(project: &Project) -> Option<Ask> {
     open_asks(project).pop()
 }
 
+/// Question identity ignores presentation: case, spacing and punctuation.
+fn normalized_question(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every stored revision, including answered history, oldest id first.
+fn revisions(project: &Project) -> Vec<(Ask, Option<Answer>)> {
+    let Ok(entries) = std::fs::read_dir(asks_dir(project)) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|id| validate_ask_id(id).is_ok())
+        .collect();
+    ids.sort();
+    let mut out = Vec::new();
+    for id in ids {
+        for revision in 1..=latest_revision(project, &id) {
+            if let Ok(Some(ask)) = load_revision(project, &id, revision) {
+                out.push((ask, answer_of(project, &id, revision)));
+            }
+        }
+    }
+    out
+}
+
+fn refuse_repeated_question(project: &Project, new: &NewAsk) -> Result<()> {
+    let wanted = normalized_question(&new.question);
+    if let Some((ask, answer)) = revisions(project).into_iter().find(|(ask, answer)| {
+        let still_open = answer.is_none()
+            && ask.revision == latest_revision(project, &ask.id)
+            && !is_withdrawn(project, &ask.id, ask.revision);
+        Some(ask.id.as_str()) != new.reask.as_deref()
+            && (answer.is_some() || still_open)
+            && normalized_question(&ask.question) == wanted
+    }) {
+        let answer = answer
+            .map(|answer| answer.text)
+            .unwrap_or_else(|| "still open".to_string());
+        bail!(
+            "ask_duplicate: `{}` already asks this question; answer: {}",
+            ask.id,
+            answer
+        );
+    }
+    Ok(())
+}
+
 /// The board's compact line: the leading clause of the question at a word
 /// boundary plus ` (<n> choices)`, at most 60 characters, never the choices.
 pub(crate) fn compact_line(ask: &Ask) -> String {
@@ -415,15 +470,7 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let record = {
         let _lock = project.lock()?;
         let _set = ask_set_lock(&project)?;
-        if let Some(existing) = open_asks(&project).iter().find(|a| {
-            Some(a.id.as_str()) != new.reask.as_deref()
-                && plain::normalized_words(&a.question) == plain::normalized_words(&new.question)
-        }) {
-            bail!(
-                "ask_duplicate: `{}` already asks this question",
-                existing.id
-            );
-        }
+        refuse_repeated_question(&project, &new)?;
         enforce_ask_cap(&project, new.reask.as_deref())?;
         let (id, revision) = match &new.reask {
             Some(id) => {
@@ -1366,11 +1413,14 @@ mod tests {
         let a = ask(&ctx, "demo", keep_or_stop()).unwrap();
         let before = journal_kinds(&fx.project);
         let duplicate = NewAsk {
-            question: "  Keep  the experiment running another hour or stop now?  ".into(),
+            question: "  Keep, the experiment running another hour; or stop now?  ".into(),
             ..keep_or_stop()
         };
         let error = ask(&ctx, "demo", duplicate).unwrap_err().to_string();
-        assert_eq!(error, "ask_duplicate: `a-1` already asks this question");
+        assert_eq!(
+            error,
+            "ask_duplicate: `a-1` already asks this question; answer: still open"
+        );
         assert_eq!(open_asks(&fx.project), vec![a]);
         assert_eq!(journal_kinds(&fx.project), before);
         assert!(!ask_dir(&fx.project, "a-2").exists());
@@ -1394,7 +1444,8 @@ mod tests {
             .starts_with("ask_duplicate")
         );
         answer(&ctx, "demo", "a-1", 1, 1, "rolf").unwrap();
-        ask(&ctx, "demo", keep_or_stop()).unwrap();
+        let error = ask(&ctx, "demo", keep_or_stop()).unwrap_err().to_string();
+        assert!(error.contains("`a-1`") && error.contains("keep it running another hour"));
     }
 
     #[test]

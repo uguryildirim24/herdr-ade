@@ -476,10 +476,13 @@ fn digest_snapshot(
                     &settings.goal
                 }
             );
+            let idle_nudge_minutes = crate::project::coordinator_settings(&ctx.config_dir)
+                .map(|settings| settings.idle_nudge_minutes)
+                .unwrap_or(20);
             let _ = writeln!(
                 out,
-                "Settings: auto_resolve_days={} nudge={}",
-                settings.auto_resolve_days, settings.nudge
+                "Settings: auto_resolve_days={} nudge={} idle_nudge_minutes={}",
+                settings.auto_resolve_days, settings.nudge, idle_nudge_minutes
             );
             if settings.repos.is_empty() {
                 let _ = writeln!(out, "Repos: (none)");
