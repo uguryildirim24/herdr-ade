@@ -1470,7 +1470,9 @@ fn box_rows(
         .map(|config| config.routing.recipe_ids());
     let adapters = crate::adapters::declarations(config_dir).unwrap_or_default();
     for (id, recipe) in recipes.iter().filter(|(id, recipe)| {
-        recipe.enabled && routed.as_ref().is_none_or(|ids| ids.contains(id.as_str()))
+        recipe.enabled
+            && routed.as_ref().is_none_or(|ids| ids.contains(id.as_str()))
+            && machine_paths.runs_kind(&recipe.kind)
     }) {
         let Some(adapter) = adapters.get(&recipe.kind) else {
             rows.push((
@@ -1873,6 +1875,23 @@ recipe = "claude_fable_xhigh"
     fn write_routing_config(config: &Path) {
         std::fs::create_dir_all(config).unwrap();
         std::fs::write(config.join("config.toml"), ROUTING_CONFIG).unwrap();
+    }
+
+    fn machine_config(kinds: &[&str]) -> tempfile::TempDir {
+        let config = tempfile::tempdir().unwrap();
+        let kinds = kinds
+            .iter()
+            .map(|kind| format!("\"{kind}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            config.path().join("config.toml"),
+            format!(
+                "[machines.oci]\nlabel = \"oci\"\ntarget = \"remote-host\"\nsession = \"default\"\nhome = \"/home/ubuntu\"\nroot = \"/home/ubuntu/.herdr-ade\"\nworktrees = \"/home/ubuntu/projects\"\nbuild = \"/home/ubuntu/build/lanes\"\npath = \"/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/ubuntu/.local/bin/herdr-ade\"\npi_bin = \"/home/ubuntu/.local/bin/herdr-pi\"\nkinds = [{kinds}]\n"
+            ),
+        )
+        .unwrap();
+        config
     }
 
     fn runner_with_machine_list(version: &str, machines: &str) -> FakeRunner {
@@ -3110,6 +3129,7 @@ recipe = "claude_fable_xhigh"
     #[test]
     fn each_native_recipe_requires_its_binary_and_login() {
         for kind in ["claude", "codex", "agy"] {
+            let config = machine_config(&[kind]);
             let runner = FakeRunner::new();
             runner.on(
                 "ssh",
@@ -3130,7 +3150,7 @@ recipe = "claude_fable_xhigh"
             let rows = box_rows(
                 &runner,
                 "herdr",
-                Path::new(""),
+                config.path(),
                 &box_profile(),
                 &recipes,
                 12.0,
@@ -3191,6 +3211,7 @@ recipe = "claude_fable_xhigh"
 
     #[test]
     fn box_readiness_fails_closed_for_unknown_kinds_and_mismatched_providers() {
+        let config = machine_config(&["unknown", "pi"]);
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
         probe_fakes(&runner);
@@ -3215,7 +3236,7 @@ recipe = "claude_fable_xhigh"
         let rows = box_rows(
             &runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &recipes,
             12.0,
@@ -3293,7 +3314,7 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn box_rows_read_the_box_and_gate_on_free_disk() {
+    fn box_rows_obey_machine_kinds_and_gate_on_free_disk() {
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
         probe_fakes(&runner);
@@ -3353,21 +3374,15 @@ recipe = "claude_fable_xhigh"
             .and_then(|call| call.args.last())
             .unwrap();
         assert!(script.starts_with("sh -c "), "{script}");
-        assert!(
-            ssh.contains("command -v claude")
-                && ssh.contains("claude-fable-5-1")
-                && ssh.contains("Reply only OK."),
-            "{ssh}"
-        );
+        assert!(!ssh.contains("command -v claude"), "{ssh}");
         assert!(!ssh.contains("command -v codex"), "{ssh}");
+        assert!(!ssh.contains("command -v agy"), "{ssh}");
+        assert!(
+            !rows.iter().any(|row| row.1.contains(" login ")),
+            "{rows:?}"
+        );
         assert!(
             ssh.contains("check openai-codex --model gpt-5.6-sol"),
-            "{ssh}"
-        );
-        assert!(
-            ssh.contains("command -v agy")
-                && ssh.contains("gemini-3.8-flash-high")
-                && ssh.contains("Reply only OK."),
             "{ssh}"
         );
         drop(calls);
@@ -3407,6 +3422,7 @@ recipe = "claude_fable_xhigh"
 
     #[test]
     fn box_rows_keep_the_real_lane_readiness_failures() {
+        let config = machine_config(&["pi", "claude", "agy"]);
         let runner = FakeRunner::new();
         let facts = box_facts()
             .replace("login_agy\tok", "login_agy\tmissing")
@@ -3425,7 +3441,7 @@ recipe = "claude_fable_xhigh"
         let rows = box_rows(
             &runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,
