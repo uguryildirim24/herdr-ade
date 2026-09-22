@@ -500,6 +500,91 @@ fn return_to_admitting(record: &mut RoundRecord) {
     record.reviewer_start_failures = 0;
 }
 
+/// Hold every open round containing a completed lane after that lane receives
+/// more work. The completion which existed at send time becomes a barrier: the
+/// round cannot review again until the lane seals a later `done`. Any active
+/// reviewer is unbound durably before its process is stopped.
+pub(crate) fn hold_for_follow_up(ctx: &Ctx, project: &Project, thread_id: &str) -> Result<()> {
+    let events = sealed_events(project)?;
+    let mut changed = false;
+    for listed in checked_list(project)? {
+        if listed.phase.closed()
+            || !listed
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.thread == thread_id)
+        {
+            continue;
+        }
+        let _operation = operation_lock(project, &listed.round)?;
+        let reviewer = {
+            let _lock = project.lock()?;
+            let mut record = load(project, &listed.round)?;
+            if record.phase.closed() {
+                continue;
+            }
+            let Some(index) = record
+                .manifest
+                .members
+                .iter()
+                .position(|member| member.thread == thread_id)
+            else {
+                continue;
+            };
+            require_editable(&record)?;
+            let attempt = thread_attempt(project, thread_id)?;
+            let existing_barrier = record.manifest.members[index]
+                .awaiting_report_after
+                .as_deref();
+            let pin = match existing_barrier {
+                Some(after) => {
+                    done_pin_after(&events, &record.round, thread_id, attempt, Some(after))?
+                }
+                None => done_pin(&events, &record.round, thread_id, attempt),
+            };
+            let Some(pin) = pin else {
+                continue;
+            };
+            record.manifest.members[index].pin = None;
+            record.manifest.members[index].awaiting_report_after = Some(pin.event);
+            record.manifest.revision += 1;
+            let reviewer = record.reviewer.clone();
+            return_to_admitting(&mut record);
+            save(project, &record)?;
+            changed = true;
+            reviewer
+        };
+        if let Some(reviewer) = reviewer
+            && thread::load(project, &reviewer)
+                .is_ok_and(|thread| thread.status != crate::thread::Status::Resolved)
+        {
+            let outcome = crate::threads::cancel(
+                ctx,
+                &project.slug,
+                &reviewer,
+                &format!("superseded when {thread_id} received more work"),
+            )?;
+            if outcome.state == "cleanup_pending" {
+                eprintln!(
+                    "reviewer cleanup pending for {reviewer}: {}",
+                    outcome
+                        .worktree_reason
+                        .as_deref()
+                        .unwrap_or("session unreachable")
+                );
+            }
+        }
+    }
+    if changed {
+        if let Err(error) = crate::plan::refresh(ctx, project) {
+            eprintln!("note: the plan refresh failed: {error:#}");
+        }
+        let _ = crate::board::refresh(ctx, project);
+    }
+    Ok(())
+}
+
 /// Safety callers must not use the display list, which skips broken records.
 pub fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
     if !rounds_dir(project).exists() {
@@ -663,22 +748,57 @@ pub fn latest_event<'e>(events: &'e [Event], thread: &str, attempt: u32) -> Opti
         .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
 }
 
-fn done_pin(events: &[Event], round: &str, thread: &str, attempt: u32) -> Option<CompletionPin> {
-    events
+fn event_sequence(event: &Event) -> Option<u32> {
+    event
+        .id
+        .strip_prefix(&format!("{}-{}-", event.thread, event.attempt))?
+        .parse()
+        .ok()
+}
+
+fn done_pin_after(
+    events: &[Event],
+    round: &str,
+    thread: &str,
+    attempt: u32,
+    after: Option<&str>,
+) -> Result<Option<CompletionPin>> {
+    let barrier = after
+        .map(|id| {
+            events
+                .iter()
+                .find(|event| event.id == id && event.thread == thread && event.attempt == attempt)
+                .with_context(|| format!("follow_up_barrier_missing: event `{id}` is absent"))
+        })
+        .transpose()?;
+    let barrier_sequence = barrier.and_then(event_sequence);
+    let event = events
         .iter()
         .filter(|e| e.thread == thread && e.attempt == attempt)
         .filter(|e| e.round.as_deref().is_none_or(|r| r == round))
         .filter(|e| e.payload.done.is_some())
-        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
-        .and_then(|e| {
-            let done = e.payload.done.as_ref()?;
-            Some(CompletionPin {
-                event: e.id.clone(),
-                attempt,
-                sha: done.sha.clone(),
-                artifact: done.artifact.clone(),
-            })
+        .filter(|e| match barrier {
+            None => true,
+            Some(barrier) => match (barrier_sequence, event_sequence(e)) {
+                (Some(before), Some(candidate)) => candidate > before,
+                _ => (&e.created, &e.id) > (&barrier.created, &barrier.id),
+            },
         })
+        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)));
+    Ok(event.and_then(|e| {
+        let done = e.payload.done.as_ref()?;
+        Some(CompletionPin {
+            event: e.id.clone(),
+            attempt,
+            sha: done.sha.clone(),
+            artifact: done.artifact.clone(),
+        })
+    }))
+}
+
+fn done_pin(events: &[Event], round: &str, thread: &str, attempt: u32) -> Option<CompletionPin> {
+    // With no barrier there is no fallible lookup.
+    done_pin_after(events, round, thread, attempt, None).expect("no follow-up barrier")
 }
 
 /// Ingest completions while admitting. Frozen pins are authoritative: a
@@ -687,7 +807,13 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
     let mut changed = false;
     let mut bump = false;
     for member in &mut record.manifest.members {
-        let pin = member_pin(project, &record.round, &member.thread, events)?;
+        let pin = member_pin_after(
+            project,
+            &record.round,
+            &member.thread,
+            events,
+            member.awaiting_report_after.as_deref(),
+        )?;
         if member.pin != pin {
             if record.phase != RoundPhase::Admitting {
                 bail!(
@@ -701,6 +827,9 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
                 bump = true;
             }
             member.pin = pin;
+            changed = true;
+        }
+        if member.pin.is_some() && member.awaiting_report_after.take().is_some() {
             changed = true;
         }
     }
@@ -719,8 +848,18 @@ fn member_pin(
     thread: &str,
     events: &[Event],
 ) -> Result<Option<CompletionPin>> {
+    member_pin_after(project, round, thread, events, None)
+}
+
+fn member_pin_after(
+    project: &Project,
+    round: &str,
+    thread: &str,
+    events: &[Event],
+    after: Option<&str>,
+) -> Result<Option<CompletionPin>> {
     let attempt = thread_attempt(project, thread)?;
-    Ok(done_pin(events, round, thread, attempt))
+    done_pin_after(events, round, thread, attempt, after)
 }
 
 /// True when `sha` is already reachable from the integration branch `branch`.
@@ -799,6 +938,9 @@ pub fn manifest_hash(record: &RoundRecord) -> String {
                 m.thread, p.event, p.attempt, p.sha, p.artifact
             )),
             None => text.push_str(&format!("member={} unpinned\n", m.thread)),
+        }
+        if let Some(event) = &m.awaiting_report_after {
+            text.push_str(&format!("member={} awaiting-after={}\n", m.thread, event));
         }
     }
     sha256_hex(text.as_bytes())
@@ -1107,6 +1249,7 @@ pub fn open_with_lanes(
                 .map(|thread| ManifestMember {
                     thread: thread.clone(),
                     pin: None,
+                    awaiting_report_after: None,
                 })
                 .collect(),
         },
@@ -1200,6 +1343,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
             record.manifest.members.push(ManifestMember {
                 thread: thread_id.to_string(),
                 pin: None,
+                awaiting_report_after: None,
             });
             record.manifest.revision += 1;
         }
@@ -1746,6 +1890,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
         current.manifest.members.push(ManifestMember {
             thread: id.to_string(),
             pin: Some(pin),
+            awaiting_report_after: None,
         });
     }
     current.manifest.revision += 1;
@@ -6292,6 +6437,70 @@ mod tests {
             .filter(|t| t.role == "reviewer")
             .count();
         assert_eq!(reviewers, 1, "one reviewer per round, ever");
+    }
+
+    #[test]
+    fn more_work_for_a_finished_lane_holds_review_until_its_next_report() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (lane, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &lane).unwrap();
+        let first = fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
+
+        hold_for_follow_up(&ctx, &fx.project, &lane).unwrap();
+
+        let held = load(&fx.project, "r1").unwrap();
+        assert_eq!(held.phase, RoundPhase::Admitting);
+        assert!(held.manifest.members[0].pin.is_none());
+        assert_eq!(
+            held.manifest.members[0].awaiting_report_after.as_deref(),
+            Some(first.as_str())
+        );
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+
+        fx.seal_done(&lane, 1, 2, &sha, "# second report\n");
+        let advanced = advance(&ctx, "demo").unwrap();
+        assert_eq!(advanced.started.len(), 1);
+        let reviewed = load(&fx.project, "r1").unwrap();
+        assert!(reviewed.manifest.members[0].pin.is_some());
+        assert!(reviewed.manifest.members[0].awaiting_report_after.is_none());
+    }
+
+    #[test]
+    fn more_work_stops_an_active_reviewer_and_the_next_report_starts_a_new_one() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (lane, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
+        advance(&ctx, "demo").unwrap();
+        let first_review = load(&fx.project, "r1").unwrap();
+        let first_reviewer = first_review.reviewer.unwrap();
+
+        hold_for_follow_up(&ctx, &fx.project, &lane).unwrap();
+
+        let held = load(&fx.project, "r1").unwrap();
+        assert_eq!(held.phase, RoundPhase::Admitting);
+        assert!(held.reviewer.is_none());
+        assert!(held.manifest.members[0].pin.is_none());
+        assert_eq!(
+            thread::load(&fx.project, &first_reviewer).unwrap().status,
+            thread::Status::Resolved
+        );
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+
+        fx.seal_done(&lane, 1, 2, &sha, "# second report\n");
+        let advanced = advance(&ctx, "demo").unwrap();
+        assert_eq!(advanced.started.len(), 1);
+        assert_ne!(advanced.started[0].reviewer, first_reviewer);
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().review_branch.as_deref(),
+            Some("review/r1-2")
+        );
     }
 
     /// A round whose every pinned lane already landed never starts a
