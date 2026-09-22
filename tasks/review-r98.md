@@ -64,3 +64,7 @@ Gates passed:
 Published branch `hp/adeherdr/t-0238-w20-report-never-keeps-a-worktree` to `origin`.
 ```
 
+
+## Repair revision
+
+This revision reviews the integration base `1449ef57a90b84409ef6b4f1d49e07b5f6c98686`.
