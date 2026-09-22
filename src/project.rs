@@ -799,16 +799,21 @@ fn markdown_item(id: &str, provenance: &str, text: &str) -> String {
     format!("- `{id}` ({provenance}): {text}\n")
 }
 
-fn notes_for_task(project: &Project, task: &str) -> Vec<crate::note::Row> {
-    let mut rows: Vec<_> = crate::note::active_rows(project)
-        .into_iter()
-        .filter(|row| {
-            matches!(row.kind.as_str(), "memory" | "standing instruction")
-                && row.tasks.iter().any(|candidate| candidate == task)
-        })
-        .collect();
-    crate::note::sort_newest_first(&mut rows);
-    rows
+fn note_provenance(row: &crate::note::Row) -> String {
+    let authority = row
+        .request
+        .as_ref()
+        .map(|request| format!("request:{request}"))
+        .unwrap_or_else(|| "historical".into());
+    if row.tasks.is_empty() {
+        authority
+    } else {
+        format!("{authority}; {}", row.tasks.join(", "))
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn latest_history(project: &Project) -> Option<String> {
@@ -934,44 +939,14 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     if open.is_empty() && errors.is_empty() {
         out.push_str("None.\n");
     }
-    for view in open {
+    for view in &open {
         out.push_str(&format!(
-            "### `{}` [{}] {}\n\nNext: {}\n\nAcceptance:\n",
+            "- `{}` [{}] {} — next: {}\n",
             view.record.id,
             view.state.word(),
-            view.record.title.trim(),
-            view.next
+            one_line(&view.record.title),
+            one_line(&view.next)
         ));
-        for (index, condition) in view.record.acceptance.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n", index + 1, condition.trim()));
-        }
-        let scoped: Vec<_> = notes_for_task(project, &view.record.id);
-        if !view.record.notes.is_empty() || !scoped.is_empty() {
-            out.push_str("\nNotes:\n");
-            for note in view.record.notes.iter().rev() {
-                out.push_str(&format!("- {}\n", note.text.trim()));
-            }
-            for row in scoped {
-                out.push_str(&markdown_item(
-                    &row.id,
-                    row.request.as_deref().unwrap_or("historical"),
-                    &row.text,
-                ));
-            }
-        }
-        for attempt in &view.record.attempts {
-            if let Ok(thread) = crate::thread::load(project, attempt)
-                && let Some(report) = crate::thread::report_reference(project, &thread)
-            {
-                let label = if crate::thread::sealed_report_path(project, &thread).is_some() {
-                    "Final report"
-                } else {
-                    "Historical report (not completion)"
-                };
-                out.push_str(&format!("\n{label} (`{attempt}`): `{report}`\n"));
-            }
-        }
-        out.push('\n');
     }
     for error in errors {
         out.push_str(&format!("- Unreadable task: {error:#}\n"));
@@ -979,38 +954,51 @@ fn page_body(project: &Project, settings: &Settings) -> String {
 
     let mut notes = crate::note::active_rows(project);
     crate::note::sort_newest_first(&mut notes);
+    let applies = |row: &&crate::note::Row| {
+        row.tasks.is_empty()
+            || row
+                .tasks
+                .iter()
+                .any(|task| open.iter().any(|view| view.record.id == *task))
+    };
+
+    out.push_str("\n## Task notes in force\n\n");
+    let task_notes: Vec<_> = notes
+        .iter()
+        .filter(|row| row.kind == "task note")
+        .filter(applies)
+        .collect();
+    if task_notes.is_empty() {
+        out.push_str("None.\n");
+    }
+    for row in task_notes {
+        out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
+    }
+
     out.push_str("\n## Standing instructions in force\n\n");
     let instructions: Vec<_> = notes
         .iter()
-        .filter(|row| row.kind == "standing instruction" && row.tasks.is_empty())
+        .filter(|row| row.kind == "standing instruction")
+        .filter(applies)
         .collect();
     if instructions.is_empty() {
         out.push_str("None.\n");
     }
     for row in instructions {
-        let provenance = row
-            .request
-            .as_ref()
-            .map(|request| format!("request:{request}"))
-            .unwrap_or_else(|| "historical".into());
-        out.push_str(&markdown_item(&row.id, &provenance, &row.text));
+        out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
     }
 
     out.push_str("\n## Facts in force\n\n");
     let facts: Vec<_> = notes
         .iter()
-        .filter(|row| row.kind == "memory" && row.tasks.is_empty())
+        .filter(|row| row.kind == "memory")
+        .filter(applies)
         .collect();
     if facts.is_empty() {
         out.push_str("None.\n");
     }
     for row in facts {
-        let provenance = row
-            .request
-            .as_ref()
-            .map(|request| format!("request:{request}"))
-            .unwrap_or_else(|| "historical".into());
-        out.push_str(&markdown_item(&row.id, &provenance, &row.text));
+        out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
     }
 
     out.push_str("\n## Recent decisions\n\n");
@@ -1408,6 +1396,56 @@ mod tests {
         assert!(body.starts_with("# Project"));
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
+    }
+
+    #[test]
+    fn project_page_keeps_each_open_task_to_one_line() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Keep the project page short.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let task = crate::task::add(
+            &project,
+            "Keep each open task on one line.",
+            vec!["request:q-1".into()],
+            vec!["The detailed acceptance condition stays in the task record.".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        crate::note::add(
+            &project,
+            crate::note::Kind::Instruction,
+            "Keep this task-specific instruction on the current page.",
+            "q-1",
+            None,
+            vec![task.id.clone()],
+        )
+        .unwrap();
+
+        let page = std::fs::read_to_string(project.project_md()).unwrap();
+        let open = page
+            .split_once("## Open tasks\n\n")
+            .unwrap()
+            .1
+            .split_once("\n## Task notes in force")
+            .unwrap()
+            .0;
+        assert_eq!(
+            open.lines().filter(|line| line.contains(&task.id)).count(),
+            1
+        );
+        assert!(open.contains(" — next: verify 1 acceptance condition(s)"));
+        assert!(!open.contains("detailed acceptance condition"));
+        assert!(page.contains("Keep this task-specific instruction on the current page."));
     }
 
     #[test]
