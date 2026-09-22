@@ -1822,6 +1822,142 @@ pub fn prompt_state(
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AttestOutcome {
+    pub thread: String,
+    pub event: String,
+    pub artifact: String,
+    pub sha: Option<String>,
+    pub coordinator: String,
+    pub reason: String,
+}
+
+/// Seal completion evidence from the final report copy of a resolved lane.
+pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOutcome> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(crate::refusal::error(
+            "attest_reason_missing: --reason is required",
+        ));
+    }
+    let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    if record.status != Status::Resolved {
+        return Err(crate::refusal::error(format!(
+            "attest_not_resolved: {id} is not resolved"
+        )));
+    }
+    if !record.cancellation_reason.is_empty() {
+        return Err(crate::refusal::error(format!(
+            "attest_cancelled: {id} was cancelled"
+        )));
+    }
+    let attempt = record.attempt.max(1);
+    if crate::events::list(&project)
+        .iter()
+        .any(|event| event.thread == id && event.attempt == attempt && event.payload.done.is_some())
+    {
+        return Err(crate::refusal::error(format!(
+            "attest_already_done: {id} already has sealed done evidence for attempt {attempt}"
+        )));
+    }
+
+    let report_path = thread::home_report_path(&project, id);
+    let regular = std::fs::symlink_metadata(&report_path).is_ok_and(|meta| meta.is_file());
+    if !regular {
+        return Err(crate::refusal::error(format!(
+            "attest_report_missing: {} is not a stored final copy",
+            report_path.display()
+        )));
+    }
+    let bytes = std::fs::read(&report_path)
+        .with_context(|| format!("could not read stored report {}", report_path.display()))?;
+    let actual_hash = thread::sha256_hex(&bytes);
+    if record.report_hash.is_empty() || actual_hash != record.report_hash {
+        return Err(crate::refusal::error(format!(
+            "attest_report_mismatch: stored report hashes to {actual_hash}, record names {}",
+            if record.report_hash.is_empty() {
+                "no hash"
+            } else {
+                &record.report_hash
+            }
+        )));
+    }
+
+    let git_folder = [&record.worktree_path, &record.cwd]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .find(|path| Path::new(path).join(".git").exists());
+    let sha = git_folder
+        .map(|folder| crate::git::rev_parse(ctx.runner, folder, "HEAD"))
+        .transpose()
+        .context("attest_git_head: could not read the lane folder's HEAD")?;
+    let coordinator = project
+        .coordinator()
+        .filter(|coordinator| !coordinator.pane_id.is_empty())
+        .ok_or_else(|| {
+            crate::refusal::error("attest_coordinator_missing: project has no coordinator binding")
+        })?;
+    let coordinator_name = if coordinator.agent_name.is_empty() {
+        coordinator.pane_id.clone()
+    } else {
+        coordinator.agent_name.clone()
+    };
+    let artifact = crate::events::store_artifact(&project, &bytes)?;
+    let event_id = format!("{id}-{attempt}-attest");
+    let event = crate::contracts::Event {
+        id: event_id.clone(),
+        op: event_id.clone(),
+        thread: id.to_string(),
+        attempt,
+        round: None,
+        recipient: crate::contracts::Recipient {
+            pane: coordinator.pane_id.clone(),
+            coordinator_attempt: coordinator.attempt(),
+        },
+        created: project::now(),
+        payload: crate::contracts::EventPayload {
+            done: Some(crate::contracts::DonePayload {
+                sha: sha.clone().unwrap_or_default(),
+                report_path: crate::events::artifact_path(&project, &artifact)
+                    .to_string_lossy()
+                    .into_owned(),
+                artifact: artifact.clone(),
+                attestation: Some(crate::contracts::Attestation {
+                    coordinator: coordinator_name.clone(),
+                    reason: reason.to_string(),
+                }),
+            }),
+            ..crate::contracts::EventPayload::default()
+        },
+    };
+    crate::events::seal_create_if_absent(&project, &event)?;
+    refresh_plan(ctx, &project);
+    Ok(AttestOutcome {
+        thread: id.to_string(),
+        event: event_id,
+        artifact,
+        sha,
+        coordinator: coordinator_name,
+        reason: reason.to_string(),
+    })
+}
+
+pub(crate) fn done_attestation(
+    project: &Project,
+    record: &Thread,
+) -> Option<crate::contracts::Attestation> {
+    crate::events::list(project)
+        .into_iter()
+        .filter(|event| event.thread == record.id && event.attempt == record.attempt.max(1))
+        .filter_map(|event| {
+            let attestation = event.payload.done?.attestation?;
+            Some((event.created, event.id, attestation))
+        })
+        .max_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)))
+        .map(|(_, _, attestation)| attestation)
+}
+
 pub fn ack(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::update(&project, id, |t| {
@@ -2816,6 +2952,12 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     println!("group = {:?}", row.group.label());
     println!("live = {:?}", row.note);
     print!("{}", toml::to_string(&record)?);
+    if let Some(attestation) = done_attestation(&project, &record) {
+        println!(
+            "attested = {:?}",
+            format!("{}: {}", attestation.coordinator, attestation.reason)
+        );
+    }
     let report = thread::home_report_path(&project, id);
     if report.is_file() {
         println!("# home copy of the report: {}", report.display());
@@ -2837,6 +2979,114 @@ mod tests {
             pane_id: "w2:p1".into(),
             ..Thread::default()
         }
+    }
+
+    #[test]
+    fn attest_refuses_every_unproven_or_ineligible_report() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let ctx = world.ctx();
+        let make = |status, cancellation: &str, report_hash: &str| {
+            thread::allocate(&project, |thread| {
+                thread.status = status;
+                thread.attempt = 1;
+                thread.cancellation_reason = cancellation.into();
+                thread.report_hash = report_hash.into();
+            })
+            .unwrap()
+        };
+
+        let open = make(Status::Open, "", "hash");
+        assert!(
+            attest(&ctx, "demo", &open.id, "checked")
+                .unwrap_err()
+                .to_string()
+                .contains("attest_not_resolved")
+        );
+
+        let cancelled = make(Status::Resolved, "stopped", "hash");
+        assert!(
+            attest(&ctx, "demo", &cancelled.id, "checked")
+                .unwrap_err()
+                .to_string()
+                .contains("attest_cancelled")
+        );
+
+        let completed = make(Status::Resolved, "", "hash");
+        let event = crate::contracts::Event {
+            id: format!("{}-1-1", completed.id),
+            op: format!("{}-1-1", completed.id),
+            thread: completed.id.clone(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient::default(),
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                done: Some(crate::contracts::DonePayload {
+                    sha: String::new(),
+                    report_path: "stored".into(),
+                    artifact: "hash".into(),
+                    attestation: None,
+                }),
+                ..crate::contracts::EventPayload::default()
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        assert!(
+            attest(&ctx, "demo", &completed.id, "checked")
+                .unwrap_err()
+                .to_string()
+                .contains("attest_already_done")
+        );
+
+        let missing = make(Status::Resolved, "", "hash");
+        assert!(
+            attest(&ctx, "demo", &missing.id, "checked")
+                .unwrap_err()
+                .to_string()
+                .contains("attest_report_missing")
+        );
+
+        let mismatch = make(Status::Resolved, "", "not-the-report-hash");
+        std::fs::write(thread::home_report_path(&project, &mismatch.id), b"report").unwrap();
+        assert!(
+            attest(&ctx, "demo", &mismatch.id, "checked")
+                .unwrap_err()
+                .to_string()
+                .contains("attest_report_mismatch")
+        );
+    }
+
+    #[test]
+    fn attest_uses_the_lane_folders_head_when_it_still_exists() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let folder = world.home.path().join("lane-folder");
+        std::fs::create_dir_all(folder.join(".git")).unwrap();
+        let report = b"finished report\n";
+        let hash = thread::sha256_hex(report);
+        let lane = thread::allocate(&project, |thread| {
+            thread.status = Status::Resolved;
+            thread.attempt = 1;
+            thread.worktree_path = folder.to_string_lossy().into_owned();
+            thread.report_hash = hash;
+        })
+        .unwrap();
+        std::fs::write(thread::home_report_path(&project, &lane.id), report).unwrap();
+        world
+            .runner
+            .on("rev-parse HEAD", crate::runner::fake::ok("abc\n"));
+
+        let outcome = attest(
+            &world.ctx(),
+            "demo",
+            &lane.id,
+            "The stored result was checked.",
+        )
+        .unwrap();
+        assert_eq!(outcome.sha.as_deref(), Some("abc"));
+        let event = crate::events::load(&project, &outcome.event).unwrap();
+        assert_eq!(event.payload.done.unwrap().sha, "abc");
     }
 
     #[test]

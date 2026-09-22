@@ -3795,6 +3795,7 @@ pub mod testkit {
                         sha: sha.into(),
                         report_path: format!(".reports/{id}.md"),
                         artifact,
+                        attestation: None,
                     }),
                     waiting: None,
                     failed: None,

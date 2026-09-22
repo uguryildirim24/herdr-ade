@@ -355,6 +355,7 @@ mod tests {
                     sha: "abc".into(),
                     report_path: ".reports/t-0001.md".into(),
                     artifact: "def".into(),
+                    attestation: None,
                 }),
                 waiting: None,
                 failed: None,

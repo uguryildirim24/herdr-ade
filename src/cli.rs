@@ -1709,6 +1709,13 @@ enum ThreadCommand {
         #[arg(long, value_name = "PANE")]
         pane: String,
     },
+    /// Seal completion from a resolved lane's verified stored report
+    Attest {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Send a follow-up to a thread's agent
     Prompt {
         slug: String,
@@ -1839,6 +1846,7 @@ fn machine_outcome(command: &str) -> String {
         "thread retry" | "round retry" => "retried",
         "thread cancel" | "round cancel" => "cancelled",
         "thread rebind" | "round rebind" => "rebound",
+        "thread attest" => "attested",
         "thread adopt" | "round adopt" => "adopted",
         "thread prompt" => "prompted",
         "thread resolve" => "resolved",
@@ -2249,10 +2257,18 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             TaskCommand::Show { slug, id } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let view = crate::task::view(&project, crate::task::load(&project, &id)?);
+                let attestation = crate::task::attestation(&project, &view.record);
+                let mut message = crate::task::render(&view);
+                if let Some(attestation) = &attestation {
+                    message.push_str(&format!(
+                        "attested: {}: {}\n",
+                        attestation.coordinator, attestation.reason
+                    ));
+                }
                 crate::output::success(
                     Some("shown"),
-                    &serde_json::json!({ "task": view }),
-                    &crate::task::render(&view),
+                    &serde_json::json!({ "task": view, "attestation": attestation }),
+                    &message,
                     "",
                 )
             }
@@ -2453,6 +2469,15 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     "",
                 )
             }
+            ThreadCommand::Attest { slug, id, reason } => {
+                let result = threads::attest(&ctx, &slug, &id, &reason)?;
+                crate::output::success(
+                    Some("attested"),
+                    &result,
+                    &format!("{} attested: {}\n", result.thread, result.reason),
+                    "",
+                )
+            }
             ThreadCommand::Prompt {
                 slug,
                 id,
@@ -2500,7 +2525,10 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
             ThreadCommand::Show { slug, id } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let record = crate::thread::load(&project, &id)?;
-                crate::output::insert("record", serde_json::to_value(record)?);
+                crate::output::insert("record", serde_json::to_value(&record)?);
+                if let Some(attestation) = threads::done_attestation(&project, &record) {
+                    crate::output::insert("attestation", serde_json::to_value(attestation)?);
+                }
                 threads::print_show(&ctx, &slug, &id)
             }
             ThreadCommand::Ack { slug, id } => threads::ack(&ctx, &slug, &id),

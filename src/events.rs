@@ -244,6 +244,13 @@ fn write_artifact_create_only(project: &Project, hash: &str, bytes: &[u8]) -> Re
     Ok(())
 }
 
+/// Store report bytes under their own hash and return that artifact name.
+pub(crate) fn store_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
+    let hash = hash_bytes(bytes);
+    write_artifact_create_only(project, &hash, bytes)?;
+    Ok(hash)
+}
+
 /// A box lane's Mac-side courier state, one file per (profile id, project)
 /// (SPEC-remote §4.3). `taken` is the cursor: box event id -> the hash of the
 /// box's bytes. `missing` counts consecutive successful passes with no pane
@@ -542,6 +549,7 @@ mod tests {
                     sha: "abc".into(),
                     report_path: ".reports/lane.md".into(),
                     artifact: "def".into(),
+                    attestation: None,
                 }),
                 waiting: None,
                 failed: None,
@@ -582,6 +590,7 @@ mod tests {
                     sha: "abc".into(),
                     report_path: ".reports/t-0001.md".into(),
                     artifact: artifact.into(),
+                    attestation: None,
                 }),
                 waiting: None,
                 failed: None,
