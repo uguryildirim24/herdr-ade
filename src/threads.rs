@@ -122,26 +122,15 @@ pub struct StartArgs {
     pub task_id: String,
 }
 
-/// Birth sentence: required, one sentence, R1–R5 except the known-word rule
-/// (SPEC-ADE D17 item 6). The sentence is a row on a screen, so it may name a
-/// file; `say`, `ask` and their choices keep the known-word rule.
+/// Internal birth sentence: required and structurally one sentence. Exact and
+/// long technical details are retained; the screen wraps or collapses them.
 pub fn check_birth_plain(text: &str) -> Result<()> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         bail!("plain_missing");
     }
-    let glossary = crate::plain::Glossary::default();
-    let result = crate::plain::check_record(trimmed, &glossary);
-    if !result.passed() {
-        let detail: Vec<String> = result
-            .violations
-            .iter()
-            .map(|v| format!("{}: {}", v.rule.code(), v.fix))
-            .collect();
-        bail!("{}", detail.join("; "));
-    }
     if crate::plain::sentence_count(trimmed) != 1 {
-        bail!("write one sentence of at most 25 words");
+        bail!("write one sentence");
     }
     Ok(())
 }
@@ -3183,15 +3172,13 @@ mod tests {
     }
 
     #[test]
-    fn birth_sentence_is_required_and_checked() {
+    fn birth_sentence_keeps_structure_and_exact_technical_details() {
         let err = check_birth_plain("").unwrap_err().to_string();
         assert!(err.contains("plain_missing"), "{err}");
-        // An identifier-shaped token is still refused; only the known-word
-        // rule is relaxed for a thread sentence.
-        assert!(check_birth_plain("It touches src/plain.rs there.").is_err());
-        // A file name the record needs is allowed.
-        check_birth_plain("It changes config.toml today.").unwrap();
+        check_birth_plain("README, docs and skill files change src/plain.rs for t-0284.").unwrap();
         check_birth_plain("The lane does the work.").unwrap();
+        let long = format!("{}.", vec!["README"; 26].join(" "));
+        check_birth_plain(&long).unwrap();
     }
 
     struct GitReal<'a> {

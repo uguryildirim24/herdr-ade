@@ -182,53 +182,17 @@ pub(crate) fn check_sentence(project: &Project, field: &str, text: &str) -> Resu
     Ok(trimmed.to_string())
 }
 
-/// One checked sentence for a coordinator record (`ha decide`). Keeps every
-/// rule [`check_sentence`] keeps except the known-word rule, so the line may
-/// name a file; the length limit still holds because the line is a row on a
-/// screen.
-pub(crate) fn check_record_sentence(project: &Project, field: &str, text: &str) -> Result<String> {
+/// One sentence for an internal record. Exact names, technical words and
+/// long accurate details are allowed; only the record's structure is checked.
+pub(crate) fn check_internal_sentence(field: &str, text: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         bail!("plain_envelope: required field {field} is missing or empty");
     }
-    let result = plain::check_record(trimmed, &registry(project));
-    if !result.passed() {
-        return Err(crate::refusal::error(format!(
-            "plain_refused: {field}: {}",
-            format_check(trimmed, &result)
-        )));
-    }
     if plain::sentence_count(trimmed) != 1 {
         return Err(crate::refusal::error(format!(
-            "plain_refused: {field}: write one sentence of at most 25 words"
+            "plain_refused: {field}: write one sentence"
         )));
-    }
-    Ok(trimmed.to_string())
-}
-
-/// One acceptance condition may contain several short sentences. It remains
-/// one condition in the task record; only checking is sentence by sentence.
-pub(crate) fn check_acceptance_condition(
-    project: &Project,
-    condition: usize,
-    text: &str,
-) -> Result<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        bail!(
-            "plain_envelope: required field acceptance condition {condition} is missing or empty"
-        );
-    }
-    let registry = registry(project);
-    for (index, sentence) in plain::record_sentences(trimmed).into_iter().enumerate() {
-        let result = plain::check_record(sentence, &registry);
-        if !result.passed() {
-            return Err(crate::refusal::error(format!(
-                "plain_refused: acceptance condition {condition}, sentence {} `{sentence}`: {}. Each condition can also go in its own `--acceptance`.",
-                index + 1,
-                format_check(sentence, &result)
-            )));
-        }
     }
     Ok(trimmed.to_string())
 }
@@ -236,25 +200,6 @@ pub(crate) fn check_acceptance_condition(
 /// Checks a text for Rolf's plane; the error carries the check's output.
 pub(crate) fn gate(project: &Project, text: &str) -> Result<()> {
     let result = plain::check(text, &registry(project));
-    if result.passed() {
-        Ok(())
-    } else {
-        Err(crate::refusal::error(format!(
-            "plain_refused:\n{}",
-            format_check(text, &result)
-        )))
-    }
-}
-
-/// The check a rendered overview row must pass: every plain rule except the
-/// sentence cap. The compact overview cuts a long sentence to one line and
-/// the full overview wraps it, so length alone never hides a record; jargon,
-/// names and identifiers still do.
-pub(crate) fn gate_row(project: &Project, text: &str) -> Result<()> {
-    let mut result = plain::check(text, &registry(project));
-    result
-        .violations
-        .retain(|v| v.rule != plain::Rule::LongSentence);
     if result.passed() {
         Ok(())
     } else {
@@ -300,21 +245,6 @@ fn is_name_char(b: u8) -> bool {
 /// The birth check (D17 item 6): one sentence, at most the word cap, every
 /// word admitted by R4, no registry name and no identifier-shaped token.
 pub(crate) fn check_birth(project: &Project, sentence: &str) -> Result<()> {
-    check_birth_with(project, sentence, plain::check)
-}
-
-/// The birth check for a coordinator record (`round open`): the same rules as
-/// [`check_birth`] except the known-word rule. The round sentence is a row on a
-/// screen and may name a file.
-pub(crate) fn check_record_birth(project: &Project, sentence: &str) -> Result<()> {
-    check_birth_with(project, sentence, plain::check_record)
-}
-
-fn check_birth_with(
-    project: &Project,
-    sentence: &str,
-    check: fn(&str, &Glossary) -> CheckResult,
-) -> Result<()> {
     let sentence = sentence.trim();
     if sentence.is_empty() {
         bail!("plain_missing: a name needs --plain \"<one sentence>\"");
@@ -331,9 +261,27 @@ fn check_birth_with(
             ));
         }
     }
-    let result = check(sentence, &glossary);
+    let result = plain::check(sentence, &glossary);
     if !result.passed() {
         problems.push(format_check(sentence, &result));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        bail!("plain_birth_refused:\n{}", problems.join("\n"))
+    }
+}
+
+/// A round's internal birth sentence keeps its one-sentence structure but has
+/// no audience-prose or screen-width restrictions.
+pub(crate) fn check_internal_birth(sentence: &str) -> Result<()> {
+    let sentence = sentence.trim();
+    if sentence.is_empty() {
+        bail!("plain_missing: a name needs --plain \"<one sentence>\"");
+    }
+    let mut problems = Vec::new();
+    if plain::sentence_count(sentence) != 1 {
+        problems.push("plain_birth: write exactly one sentence".to_string());
     }
     if problems.is_empty() {
         Ok(())

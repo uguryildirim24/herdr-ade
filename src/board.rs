@@ -2,8 +2,8 @@
 //! workspace tokens `ade_stage`, `ade_lanes`, `ade_needs_you`, `ade_last`,
 //! `ade_updated`, each from a binary-owned template, at most 80 characters,
 //! free of registry names, and published only when the check passes (gate B,
-//! D17 item 3). A value that fails is not published and the previous value
-//! stays: it is re-sent with a fresh TTL instead.
+//! D17 item 3). A value that fails is replaced by a checked unavailable notice;
+//! old truth is never republished with a fresh lifetime.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,6 +38,10 @@ pub(crate) struct BoardState {
     /// The last value published per key.
     #[serde(default)]
     pub(crate) values: BTreeMap<String, String>,
+    /// When each row last held a successfully checked observation. Historical
+    /// state without this map still loads and gets an unaged unavailable row.
+    #[serde(default)]
+    pub(crate) observed_at: BTreeMap<String, String>,
     /// The last `say` line or fixed notice for `ade_last`, and when.
     #[serde(default)]
     pub(crate) last_say: String,
@@ -127,13 +131,17 @@ fn send(ctx: &Ctx, project: &Project, pairs: &[(String, String)]) -> Result<()> 
     Ok(())
 }
 
-/// Publishes one value; a failing value is refused and the old one stays.
+/// Publishes one checked value and records when it was observed.
 pub(crate) fn publish_value(ctx: &Ctx, project: &Project, key: &str, value: &str) -> Result<()> {
     if !KEYS.contains(&key) {
         bail!("board_refused: `{key}` is not a board row");
     }
     check_value(project, value)?;
-    send(ctx, project, &[(key.to_string(), value.to_string())])
+    send(ctx, project, &[(key.to_string(), value.to_string())])?;
+    save_state(project, |s| {
+        s.observed_at.insert(key.to_string(), project::now());
+    });
+    Ok(())
 }
 
 /// Age as the checker admits it: `5m`, `2h`, `3d`.
@@ -294,28 +302,61 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     out
 }
 
-/// Publishes every row that passes; a row that fails keeps its previous
-/// value (re-sent with a fresh TTL). Returns the refused rows.
+fn unavailable_notice(observed_at: Option<&str>) -> String {
+    observed_at
+        .and_then(age)
+        .map(|age| format!("This board row is unavailable; last seen {age} ago."))
+        .unwrap_or_else(|| "This board row is unavailable.".to_string())
+}
+
+fn checked_value_or_notice(
+    project: &Project,
+    value: String,
+    observed_at: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match check_value(project, &value) {
+        Ok(()) => (Some(value), None),
+        Err(error) => {
+            let notice = unavailable_notice(observed_at);
+            let published = check_value(project, &notice).is_ok().then_some(notice);
+            (published, Some(format!("{error:#}")))
+        }
+    }
+}
+
+/// Publishes every checked row. A rejected row gets a checked unavailable
+/// notice carrying the age of its last good observation, never the old value.
 pub(crate) fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
     if workspace_herdr(ctx, project).is_none() {
         return Ok(Vec::new());
     }
-    let previous = state(project).values;
+    let previous = state(project);
     let mut pairs = Vec::new();
+    let mut good_keys = Vec::new();
     let mut refused = Vec::new();
     for (key, value) in compute(ctx, project) {
-        match check_value(project, &value) {
-            Ok(()) => pairs.push((key, value)),
-            Err(e) => {
-                refused.push((key.clone(), format!("{e:#}")));
-                if let Some(old) = previous.get(&key) {
-                    pairs.push((key, old.clone()));
-                }
-            }
+        let (published, rejection) = checked_value_or_notice(
+            project,
+            value,
+            previous.observed_at.get(&key).map(String::as_str),
+        );
+        if let Some(reason) = rejection {
+            refused.push((key.clone(), reason));
+        } else {
+            good_keys.push(key.clone());
+        }
+        if let Some(value) = published {
+            pairs.push((key, value));
         }
     }
     if !pairs.is_empty() {
         send(ctx, project, &pairs)?;
+        let observed = project::now();
+        save_state(project, |s| {
+            for key in good_keys {
+                s.observed_at.insert(key, observed.clone());
+            }
+        });
     }
     Ok(refused)
 }
@@ -326,6 +367,19 @@ mod tests {
     use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
     use crate::paths::{Ctx, Env};
     use crate::runner::fake::FakeRunner;
+
+    #[test]
+    fn old_state_loads_and_a_rejected_row_gets_a_checked_notice() {
+        let old = r#"{"values":{"ade_stage":"old"},"last_say":"","last_say_at":""}"#;
+        let state: BoardState = serde_json::from_str(old).unwrap();
+        assert!(state.observed_at.is_empty());
+
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
+        let (published, rejection) = checked_value_or_notice(&project, "README".into(), None);
+        assert!(rejection.unwrap().contains("plain_identifier"));
+        assert_eq!(published.unwrap(), "This board row is unavailable.");
+    }
 
     #[test]
     fn a_box_lane_is_counted_and_the_last_line_names_its_machine() {
