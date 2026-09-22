@@ -93,7 +93,7 @@ enum Kind {
 impl Kind {
     fn binaries(self) -> &'static [&'static str] {
         match self {
-            Kind::Plugin => &["herdr-ade", "herdr-pi"],
+            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-pro"],
             Kind::Fork => &["herdr"],
         }
     }
@@ -258,15 +258,36 @@ fn binary_version(ctx: &Ctx, path: &Path) -> Option<String> {
         .filter(|version| !version.is_empty())
 }
 
-fn local_install(ctx: &Ctx, repo: &str, bin: &str) -> Result<()> {
+fn install_record(dir: &Path, bin: &str) -> PathBuf {
+    dir.join(format!(".{bin}.installed-commit"))
+}
+
+fn record_installed_commit(dir: &Path, bin: &str, commit: &str) -> Result<()> {
+    let record = install_record(dir, bin);
+    let staged = dir.join(format!(".{bin}.installed-commit-{}", std::process::id()));
+    std::fs::write(&staged, format!("{commit}\n"))?;
+    std::fs::rename(&staged, &record)?;
+    Ok(())
+}
+
+fn local_install(ctx: &Ctx, repo: &str, bin: &str, commit: &str, source_clean: bool) -> Result<()> {
     let dir = ctx.env.home.join(".local/bin");
     std::fs::create_dir_all(&dir)?;
     let from = Path::new(repo).join("target/release").join(bin);
     let to = dir.join(bin);
-    let same_commit = binary_version(ctx, &from)
-        .zip(binary_version(ctx, &to))
-        .is_some_and(|(source, installed)| crate::build::same_commit(&source, &installed));
-    if same_commit {
+    let versions = binary_version(ctx, &from).zip(binary_version(ctx, &to));
+    let versions_name_commits = versions.as_ref().is_some_and(|(source, installed)| {
+        crate::build::commit_version(source).is_some()
+            && crate::build::commit_version(installed).is_some()
+    });
+    let reported_same = versions
+        .as_ref()
+        .is_some_and(|(source, installed)| crate::build::same_commit(source, installed));
+    let recorded_same = versions.is_some()
+        && std::fs::read_to_string(install_record(&dir, bin))
+            .is_ok_and(|installed| installed.trim() == commit);
+    if source_clean && (reported_same || (!versions_name_commits && recorded_same)) {
+        record_installed_commit(&dir, bin, commit)?;
         return Ok(());
     }
     let staged = dir.join(format!(".{bin}.install-{}", std::process::id()));
@@ -304,6 +325,11 @@ fn local_install(ctx: &Ctx, repo: &str, bin: &str) -> Result<()> {
             to.display(),
             moved.error_text()
         );
+    }
+    if source_clean {
+        record_installed_commit(&dir, bin, commit)?;
+    } else {
+        let _ = std::fs::remove_file(install_record(&dir, bin));
     }
     Ok(())
 }
@@ -359,6 +385,10 @@ fn box_binary(machine: &crate::remote::MachineDeclaration, bin: &str) -> Result<
     match bin {
         "herdr-ade" => Ok(machine.ade_bin.clone()),
         "herdr-pi" => Ok(machine.pi_bin.clone()),
+        "herdr-pro" => Path::new(&machine.ade_bin)
+            .parent()
+            .map(|dir| dir.join(bin).to_string_lossy().into_owned())
+            .context("machine ade_bin has no parent folder"),
         "herdr" => Path::new(&machine.ade_bin)
             .parent()
             .map(|dir| dir.join(bin).to_string_lossy().into_owned())
@@ -383,11 +413,23 @@ fn box_build(
     for bin in kind.binaries() {
         installs.push_str(&format!(
             "\ninstall_to={to}\n\
+             install_record=\"$(dirname \"$install_to\")/.{bin}.installed-commit\"\n\
              install_tmp=\"${{install_to}}.install.$$\"\n\
+             record_tmp=\"${{install_record}}.$$\"\n\
              mkdir -p \"$(dirname \"$install_to\")\"\n\
-             cp target/release/{bin} \"$install_tmp\"\n\
-             chmod 755 \"$install_tmp\"\n\
-             mv -f \"$install_tmp\" \"$install_to\"",
+             if [ -z \"$source_dirty\" ] && [ -x \"$install_to\" ] && [ \"$(cat \"$install_record\" 2>/dev/null || :)\" = \"$source_head\" ]; then\n\
+               :\n\
+             else\n\
+               cp target/release/{bin} \"$install_tmp\"\n\
+               chmod 755 \"$install_tmp\"\n\
+               mv -f \"$install_tmp\" \"$install_to\"\n\
+               if [ -z \"$source_dirty\" ]; then\n\
+                 printf '%s\\n' \"$source_head\" > \"$record_tmp\"\n\
+                 mv -f \"$record_tmp\" \"$install_record\"\n\
+               else\n\
+                 rm -f \"$install_record\"\n\
+               fi\n\
+             fi",
             to = remote::quote(&box_binary(machine, bin)?),
         ));
     }
@@ -396,10 +438,12 @@ fn box_build(
          cd {path}\n\
          git fetch --quiet\n\
          git merge --ff-only @{{u}}\n\
+         source_head=\"$(git rev-parse HEAD)\"\n\
+         source_dirty=\"$(git status --porcelain --untracked-files=normal)\"\n\
          export PATH={build_path}\n\
          export DEVELOPER_DIR={DEVELOPER_DIR}{zig}\n\
          cargo build --release --locked{installs}\n\
-         printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$(git rev-parse HEAD)\"",
+         printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$source_head\"",
         path = remote::quote(box_path),
         build_path = remote::quote(&machine.path),
     );
@@ -541,6 +585,23 @@ fn repo_head(ctx: &Ctx, repo: &str) -> Result<String> {
         );
     }
     Ok(out.stdout.trim().to_string())
+}
+
+fn repo_clean(ctx: &Ctx, repo: &str) -> Result<bool> {
+    let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
+        "-C",
+        repo,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    ]))?;
+    if !out.success() {
+        bail!(
+            "harness_build_status: could not inspect {repo}: {}",
+            out.error_text()
+        );
+    }
+    Ok(out.stdout.trim().is_empty())
 }
 
 fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessProof> {
@@ -1066,8 +1127,10 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
         let commit = repo_head(ctx, &repo.path)?;
+        let clean_before = repo_clean(ctx, &repo.path)?;
         local_build(ctx, &repo.path, kind)?;
         let after_build = repo_head(ctx, &repo.path)?;
+        let source_clean = clean_before && repo_clean(ctx, &repo.path)?;
         if after_build != commit {
             bail!(
                 "harness_build_changed: {} moved from {commit} to {after_build} while it was building",
@@ -1075,7 +1138,7 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
             );
         }
         for bin in kind.binaries() {
-            local_install(ctx, &repo.path, bin)?;
+            local_install(ctx, &repo.path, bin, &commit, source_clean)?;
             reexec_if_replaced(&ctx.env.home.join(".local/bin").join(bin), &running)?;
         }
         builds.push(InstalledBuild {
@@ -1152,6 +1215,14 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::PermissionsExt;
+
+    fn write_version_binary(path: &Path, version: &str, tag: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\n# {tag}\necho '{version}'\n")).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 
     /// Write an executable `zig` that answers `zig version` with `version`.
     fn fake_zig(path: &Path, version: &str) {
@@ -1456,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn installing_the_same_commit_keeps_the_installed_inode() {
+    fn installing_the_same_clean_commit_keeps_every_installed_inode() {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = RealRunner;
@@ -1469,26 +1540,75 @@ mod tests {
         };
         let repo = root.path().join("repo");
         let release = repo.join("target/release");
+        let installed_dir = root.path().join(".local/bin");
         std::fs::create_dir_all(&release).unwrap();
-        let source = release.join("herdr-ade");
-        std::fs::write(&source, "#!/bin/sh\necho 'herdr-ade 0.1.0+abc1234.200'\n").unwrap();
-        let installed = root.path().join(".local/bin/herdr-ade");
-        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        std::fs::write(
-            &installed,
-            "#!/bin/sh\necho 'herdr-ade 0.1.0+abc1234.100'\n",
-        )
-        .unwrap();
-        for path in [&source, &installed] {
-            let mut permissions = std::fs::metadata(path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).unwrap();
+        std::fs::create_dir_all(&installed_dir).unwrap();
+
+        for bin in ["herdr-ade", "herdr-pi", "herdr-pro"] {
+            let source = release.join(bin);
+            let installed = installed_dir.join(bin);
+            write_version_binary(&source, &format!("{bin} 0.1.0+abc1234.200"), "new stamp");
+            write_version_binary(&installed, &format!("{bin} 0.1.0+abc1234.100"), "old stamp");
+            let before = std::fs::metadata(&installed).unwrap().ino();
+
+            local_install(&ctx, repo.to_str().unwrap(), bin, "abc1234", true).unwrap();
+
+            assert_eq!(
+                std::fs::metadata(&installed).unwrap().ino(),
+                before,
+                "{bin}"
+            );
         }
+
+        let source = release.join("herdr");
+        let installed = installed_dir.join("herdr");
+        write_version_binary(&source, "herdr 0.9.1", "rebuilt fork");
+        write_version_binary(&installed, "herdr 0.9.1", "installed fork");
+        std::fs::write(install_record(&installed_dir, "herdr"), "abc1234\n").unwrap();
         let before = std::fs::metadata(&installed).unwrap().ino();
 
-        local_install(&ctx, repo.to_str().unwrap(), "herdr-ade").unwrap();
+        local_install(&ctx, repo.to_str().unwrap(), "herdr", "abc1234", true).unwrap();
 
         assert_eq!(std::fs::metadata(&installed).unwrap().ino(), before);
+    }
+
+    #[test]
+    fn a_dirty_or_different_commit_is_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = RealRunner;
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().join("root"),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let repo = root.path().join("repo");
+        let source = repo.join("target/release/herdr-ade");
+        let installed = root.path().join(".local/bin/herdr-ade");
+        write_version_binary(&source, "herdr-ade 0.1.0+abc1234.200", "dirty source");
+        write_version_binary(
+            &installed,
+            "herdr-ade 0.1.0+abc1234.100",
+            "installed clean source",
+        );
+
+        local_install(&ctx, repo.to_str().unwrap(), "herdr-ade", "abc1234", false).unwrap();
+        assert!(
+            std::fs::read_to_string(&installed)
+                .unwrap()
+                .contains("dirty source")
+        );
+        assert!(!install_record(installed.parent().unwrap(), "herdr-ade").exists());
+
+        write_version_binary(&source, "herdr-ade 0.1.0+def5678.300", "different commit");
+        local_install(&ctx, repo.to_str().unwrap(), "herdr-ade", "def5678", true).unwrap();
+        assert!(
+            std::fs::read_to_string(&installed)
+                .unwrap()
+                .contains("different commit")
+        );
     }
 
     #[test]

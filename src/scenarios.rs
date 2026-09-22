@@ -2605,6 +2605,7 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
         "rev-parse HEAD",
         ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"),
     );
+    world.runner.on("status --porcelain", ok(""));
     let dir = world.home.path().join("cfg");
     std::fs::create_dir_all(&dir).unwrap();
     let rows: Vec<String> = repos
@@ -2686,6 +2687,10 @@ fn harness_install_builds_and_installs_each_repo_kind() {
         "{installs:?}"
     );
     assert!(
+        installs.iter().any(|p| p.ends_with("herdr-pro")),
+        "{installs:?}"
+    );
+    assert!(
         installs.iter().any(|p| p.ends_with("herdr")),
         "{installs:?}"
     );
@@ -2694,7 +2699,7 @@ fn harness_install_builds_and_installs_each_repo_kind() {
             .iter()
             .filter(|c| c.display().contains("--version"))
             .count(),
-        9,
+        12,
         "each binary is compared before installation, then the installed version is recorded"
     );
     assert_eq!(
@@ -2747,6 +2752,7 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         scripts[..2].iter().all(|s| s.contains("git fetch --quiet")
             && s.contains("git merge --ff-only")
             && s.contains("cargo build --release --locked")
+            && s.contains("source_dirty=\"$(git status --porcelain")
             && s.contains("cp target/release/")
             && s.contains("install_to=/home/ubuntu/.local/bin/")
             && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
