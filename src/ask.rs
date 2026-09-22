@@ -1055,6 +1055,47 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_make_and_leave_choices_pass_and_a_verbless_fragment_fails() {
+        let fx = fixture();
+        let question = "The tool update wants three changes to your project settings. May I make these changes?";
+        let accepted = ask(
+            &fx.world.ctx(),
+            "demo",
+            NewAsk {
+                question: question.into(),
+                choices: vec![
+                    "I will make the three changes to your project settings.".into(),
+                    "I will leave your project settings exactly as they are.".into(),
+                ],
+                ..keep_or_stop()
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted.choices.len(), 2);
+
+        let error = ask(
+            &fx.world.ctx(),
+            "demo",
+            NewAsk {
+                question: question.into(),
+                choices: vec![
+                    "I will leave your project settings exactly as they are.".into(),
+                    "Three changes to your settings.".into(),
+                ],
+                ..keep_or_stop()
+            },
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(
+                "plain_question_form: \"Three changes to your settings.\": each choice must be a sentence with a verb"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn one_ask_revision_is_published_once() {
         let fx = fixture();
         let a = ask(&fx.world.ctx(), "demo", keep_or_stop()).unwrap();
