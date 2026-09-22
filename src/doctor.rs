@@ -849,10 +849,15 @@ fn report_with_checks(
 fn ticker_folder_check(info: &crate::ticker::Info) -> (Option<bool>, String) {
     let cwd = Path::new(&info.cwd);
     let cwd_ok = !info.cwd.is_empty() && cwd.is_dir();
+    let version_ok = crate::build::same_commit(&info.version, crate::VERSION);
     (
-        if cwd_ok { Some(true) } else { Some(false) },
+        if cwd_ok && version_ok {
+            Some(true)
+        } else {
+            Some(false)
+        },
         format!(
-            "running, version {} (this binary: {}), root {}, folder {}{}",
+            "running, version {} (this binary: {}), root {}, folder {}{}{}",
             info.version,
             crate::VERSION,
             info.root,
@@ -865,6 +870,11 @@ fn ticker_folder_check(info: &crate::ticker::Info) -> (Option<bool>, String) {
                 ""
             } else {
                 "; folder no longer exists"
+            },
+            if version_ok {
+                ""
+            } else {
+                "; ticker build is stale"
             }
         ),
     )
@@ -2315,6 +2325,25 @@ recipe = "claude_fable_xhigh"
         assert!(text.contains("[warn] project demo memory"), "{text}");
         assert!(text.contains("memory/state.md"), "{text}");
         assert!(text.contains("memory/archive/"), "{text}");
+    }
+
+    #[test]
+    fn doctor_accepts_a_ticker_with_the_same_commit_and_another_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let commit = crate::build::commit_version(crate::VERSION).unwrap();
+        let info = crate::ticker::Info {
+            version: format!("{commit}.9999999999"),
+            pid: 42,
+            root: dir.path().display().to_string(),
+            cwd: dir.path().display().to_string(),
+            started: project::now(),
+            tools: Vec::new(),
+        };
+
+        let (status, detail) = ticker_folder_check(&info);
+
+        assert_eq!(status, Some(true), "{detail}");
+        assert!(!detail.contains("stale"), "{detail}");
     }
 
     #[test]
