@@ -266,8 +266,14 @@ fn collect_inner_with_clock(
     clock: &dyn Clock,
 ) -> Result<()> {
     layout.ensure()?;
+    // A retried collector waits for the first one and then observes its
+    // terminal record instead of prompting or delivering the turn twice.
+    let _collector_lock = state::FileLock::acquire(&layout.inflight_lock(tag))?;
     let _guard = InflightGuard::new(layout, tag);
     let mut turn = Turn::read(layout, tag)?;
+    if matches!(turn.state.as_str(), "delivered" | "failed") {
+        return Ok(());
+    }
     let bin = env.herdr_bin();
     let packet = turn
         .packet
@@ -780,6 +786,14 @@ fn wait_for_shell_command(
 
 /// Wait for the `task_complete` of the turn started after the TURN prompt.
 fn wait_for_completion(reader: &mut RolloutReader, timeout: Duration) -> Result<Completion> {
+    wait_for_completion_with_settle(reader, timeout, || std::thread::sleep(POLL))
+}
+
+fn wait_for_completion_with_settle(
+    reader: &mut RolloutReader,
+    timeout: Duration,
+    settle: impl Fn(),
+) -> Result<Completion> {
     let deadline = Instant::now() + timeout;
     let mut turn_id: Option<String> = None;
     let mut events: Vec<Value> = Vec::new();
@@ -800,9 +814,12 @@ fn wait_for_completion(reader: &mut RolloutReader, timeout: Duration) -> Result<
                 completed = Some((id, answer));
             }
         }
-        // Codex can flush a stream_error immediately after task_complete in
-        // the same rollout write. Process the whole batch before classifying.
         if let Some((id, answer)) = completed {
+            // The rollout writer can append stream_error just after
+            // task_complete. Give it one ordinary poll interval, then keep
+            // every complete trailing event before classifying the turn.
+            settle();
+            events.extend(reader.new_events()?);
             return Ok(Completion {
                 turn_id: id,
                 answer,
@@ -1113,6 +1130,52 @@ mod tests {
         assert_eq!(stored.failure_class.as_deref(), Some("provider"));
         let expected_detail = format!("provider: {reason}");
         assert_eq!(stored.detail.as_deref(), Some(expected_detail.as_str()));
+        let waiting = format!("WAITING pro-01 pro provider (provider): {reason}");
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.last() == Some(&waiting)),
+            "the coordinator notice did not keep the provider's line"
+        );
+    }
+
+    #[test]
+    fn a_stream_error_appended_after_task_complete_is_kept() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn","last_agent_message":""}}),
+            ),
+        )
+        .unwrap();
+        let trailing_path = path.clone();
+        let mut reader = RolloutReader::at_start(path);
+        let completion =
+            wait_for_completion_with_settle(&mut reader, Duration::from_secs(1), move || {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&trailing_path)
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type":"stream_error","message":"the exact provider line"})
+                )
+                .unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            classify(&completion),
+            Outcome::ProviderFailed("the exact provider line".into())
+        );
     }
 
     #[test]
@@ -1416,6 +1479,29 @@ mod tests {
         let turn = prepare(&env, &layout, &runner, &options(2)).unwrap();
         assert_eq!(turn.state, "loading");
         assert!(!state::cooldown_active(&layout, jiff::Timestamp::now()));
+    }
+
+    #[test]
+    fn retrying_a_terminal_collector_does_not_prompt_or_deliver_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pro"));
+        layout.ensure().unwrap();
+        write_ready_lane(dir.path(), &layout);
+        let answer = dir.path().join("answer.md");
+        std::fs::write(&answer, "the answer").unwrap();
+        let mut record = turn("delivered");
+        record.out = answer.display().to_string();
+        record.written = Some(answer.display().to_string());
+        record.finished_at = Some(crate::pro::now_rfc3339());
+        record.write(&layout).unwrap();
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = FakeRunner::new();
+
+        collect_inner(&env, &layout, &runner, "pro-01").unwrap();
+
+        assert!(runner.calls.borrow().is_empty());
+        assert_eq!(std::fs::read_to_string(&answer).unwrap(), "the answer");
+        assert!(!dir.path().join("answer.1.md").exists());
     }
 
     #[test]
