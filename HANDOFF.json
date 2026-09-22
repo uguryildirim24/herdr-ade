@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0220.md",
+      "tasks/t-0217.md",
+      "tasks/t-0214.md",
+      "tasks/review-r88.md",
+      "tasks/review-r90.md",
       "tasks/t-0218.md",
       "tasks/t-0215.md",
       "tasks/review-r89.md",
-      "tasks/review-r88.md",
-      "tasks/review-r90.md",
       "tasks/t-0212.md",
       "tasks/t-0213.md",
       "tasks/review-r87.md",
-      "tasks/t-0211.md",
-      "tasks/t-0210.md",
-      "tasks/t-0209.md",
-      "tasks/t-0208.md"
+      "tasks/t-0211.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r88.md",
       "tasks/reviews/code-r89.md",
       "tasks/reviews/code-r87.md",
       "tasks/reviews/code-r86.md",
@@ -39,17 +40,20 @@
       "tasks/reviews/code-r81.md",
       "tasks/reviews/code-r80.md",
       "tasks/reviews/code-r79.md",
-      "tasks/reviews/code-r78.md",
-      "tasks/reviews/code-r77.md"
+      "tasks/reviews/code-r78.md"
     ]
   },
-  "generated": "2026-09-21T23:18:54-04:00",
+  "generated": "2026-09-21T23:35:49-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0219-review-r90-every-coordinator-keeps-worki",
+      "hp/adeherdr/t-0220-review-r88-a-failed-answer-from-the-web",
+      "main",
+      "review/r88-3",
+      "review/r90-2",
+      "hp/adeherdr/t-0216-review-r90-every-coordinator-keeps-worki",
       "hp/adeherdr/t-0217-review-r88-a-failed-answer-from-the-web",
       "hp/adeherdr/t-0218-review-r89-the-install-check-sees-the-sa",
-      "main",
-      "hp/adeherdr/t-0216-review-r90-every-coordinator-keeps-worki",
       "review/r89-2",
       "review/r88-2",
       "hp/adeherdr/t-0215-review-r89-the-install-check-sees-the-sa",
@@ -351,22 +355,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "da2a65d docs(review): round r89 revision 2 verdict",
-      "b513c49 Merge earlier r89 candidate onto revision 1",
-      "5d7ed9e docs(tasks): t-0218",
-      "3965846 review(r89): brief for revision 1",
-      "76d0785 review(r88): brief for revision 1",
-      "a6d9dc8 review(r90): brief for revision 1"
+      "e6ad477 review(r88): approve candidate on W11 base",
+      "89655af review(r88): merge earlier candidate onto revision 1",
+      "c4a5b5d docs(tasks): t-0220",
+      "fc2cb18 review(r88): brief for revision 1",
+      "b3cb4c4 review(r90): brief for revision 1",
+      "6b3b869 checkpoint(r89): HANDOFF after merging the round"
     ],
-    "remote": "9 ahead, 0 behind origin/main",
+    "remote": "12 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "da2a65d",
+        "head": "e6ad477",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r89 revision 2 verdict"
+        "subject": "review(r88): approve candidate on W11 base"
       },
       {
         "branch": "review/r88",
@@ -383,18 +387,11 @@
         "subject": "docs(tasks): t-0217"
       },
       {
-        "branch": "review/r89",
+        "branch": "review/r88-3",
         "dirty": 0,
-        "head": "af0a93a",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r89",
-        "subject": "docs(tasks): t-0215"
-      },
-      {
-        "branch": "review/r89-2",
-        "dirty": 0,
-        "head": "5d7ed9e",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r89-2",
-        "subject": "docs(tasks): t-0218"
+        "head": "c4a5b5d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r88-3",
+        "subject": "docs(tasks): t-0220"
       },
       {
         "branch": "review/r90",
@@ -402,6 +399,13 @@
         "head": "f3e6464",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90",
         "subject": "docs(tasks): t-0216"
+      },
+      {
+        "branch": "review/r90-2",
+        "dirty": 0,
+        "head": "bab4c62",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90-2",
+        "subject": "docs(tasks): t-0219"
       }
     ]
   },
@@ -421,8 +425,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r89",
-    "verdict": "da2a65dea1a5f03a1d88c4d818dd8321e617a806"
+    "round": "r88",
+    "verdict": "e6ad477cb929cf74ded077c6c8ba284644f7b6d8"
   },
   "session": "default",
   "unlinked_agents": [],
