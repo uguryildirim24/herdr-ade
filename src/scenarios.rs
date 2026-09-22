@@ -2213,10 +2213,15 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
     let mut memory = Memory::new(&ctx);
     memory.tick = 1;
     ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
-    assert_eq!(
-        thread::load(&project, "t-0001").unwrap().last_group,
-        "waiting-on-you"
-    );
+    let observed = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(observed.last_group, "waiting-on-you");
+    assert!(!observed.last_observed.is_empty());
+    assert_eq!(observed.observation_source, "courier");
+    let row = threads::rows(&ctx, &project)
+        .into_iter()
+        .find(|row| row.thread.id == "t-0001")
+        .unwrap();
+    assert!(row.note.contains("last checked"), "{}", row.note);
     assert!(items_of(&project, "thread-state").is_empty());
     let digest = coordinator::digest(&ctx, &project, "ha").unwrap().0;
     assert!(digest.contains("Waiting on you"), "{digest}");
