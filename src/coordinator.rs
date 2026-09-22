@@ -569,12 +569,12 @@ fn digest_snapshot(
     }
 
     let _ = writeln!(out, "\n## Memory index (MEMORY.md)");
-    let memory = crate::thread::memory_use(project);
-    for line in memory.index.trim().lines().take(DIGEST_ROWS) {
+    let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
+    for line in index.trim().lines().take(DIGEST_ROWS) {
         let _ = writeln!(out, "{line}");
     }
-    overflow(&mut out, memory.index.trim().lines().count(), "MEMORY.md");
-    if let Some(warning) = memory.warning() {
+    overflow(&mut out, index.trim().lines().count(), "MEMORY.md");
+    if let Some(warning) = crate::thread::memory_use(project).warning() {
         let _ = writeln!(out, "{warning}");
     }
 

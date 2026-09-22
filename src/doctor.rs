@@ -2321,11 +2321,23 @@ recipe = "claude_fable_xhigh"
         write_routing_config(&home.path().join("cfg"));
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
-        std::fs::create_dir_all(project.dir().join("memory")).unwrap();
-        std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n- state\n").unwrap();
-        std::fs::write(
-            project.dir().join("memory/state.md"),
-            "x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Keep helper briefs focused.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let note = crate::note::add(
+            &project,
+            crate::note::Kind::Memory,
+            &"x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
+            "q-1",
+            None,
+            vec![],
         )
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
@@ -2342,8 +2354,8 @@ recipe = "claude_fable_xhigh"
         );
         assert!(healthy, "{text}");
         assert!(text.contains("[warn] project demo memory"), "{text}");
-        assert!(text.contains("memory/state.md"), "{text}");
-        assert!(text.contains("memory/archive/"), "{text}");
+        assert!(text.contains(&note.id), "{text}");
+        assert!(text.contains("replace stale dated notes"), "{text}");
     }
 
     #[test]
