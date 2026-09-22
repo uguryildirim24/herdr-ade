@@ -1928,6 +1928,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         || awaiting_bootstrap(&record)
         || awaiting_follow_up(&record)
     {
+        let events_before_send = crate::round::sealed_events(&project)?;
         let mut queued = false;
         record = thread::update_checked(&project, id, |thread| {
             match thread.status {
@@ -1952,7 +1953,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             Ok(())
         })?;
         if queued {
-            crate::round::hold_for_follow_up(ctx, &project, id)?;
+            crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)?;
             return Ok(PromptOutcome::Queued {
                 attempt: record.attempt.max(1),
             });
@@ -1969,6 +1970,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         .is_ok_and(|adapter| adapter.blocked_error_resumable);
     let state = prompt_state(&record, &agents, resumable)?;
     let herdr = view.herdr.on_machine(record.machine_route());
+    let events_before_send = crate::round::sealed_events(&project)?;
     // Herdr rejects `agent prompt` for every blocked pane. An adapter-owned
     // error screen is different from an approval dialog: submit through the
     // pane so the adapter's input hook clears its block. A blocked lane with
@@ -1989,7 +1991,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     thread::update(&project, id, |thread| {
         thread.last_group = Group::Working.token().to_string();
     })?;
-    crate::round::hold_for_follow_up(ctx, &project, id)?;
+    crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)?;
     Ok(PromptOutcome::Sent {
         attempt: record.attempt.max(1),
         agent_state: state,
