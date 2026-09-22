@@ -67,4 +67,4 @@ Published branch `hp/adeherdr/t-0238-w20-report-never-keeps-a-worktree` to `orig
 
 ## Repair revision
 
-This revision reviews the integration base `30dbe1a704b0727404a1d54f08ede99857a33466`.
+This revision reviews the integration base `0482dd06b05c5160d51625fc2c8662a099abe841`.
