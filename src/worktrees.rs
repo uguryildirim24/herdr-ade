@@ -312,6 +312,7 @@ pub(crate) fn inspect_local(
 pub(crate) fn inspect_remote(
     runner: &dyn Runner,
     target: &str,
+    machine_path: &str,
     path: &str,
     disposable: &[String],
 ) -> Result<Inspection> {
@@ -319,8 +320,11 @@ pub(crate) fn inspect_remote(
     let quoted = crate::remote::quote(path);
     // NUL framing cannot collide with a status path: every porcelain record
     // starts with its two-byte status and a space, and paths cannot contain NUL.
-    let script = format!(
-        "cd {quoted} && git status --porcelain --ignored --untracked-files=all -z && printf '\\0{MARKER}\\0' && find . -mindepth 2 -name .git -print0"
+    let script = crate::remote::with_path(
+        machine_path,
+        &format!(
+            "cd {quoted} && git status --porcelain --ignored --untracked-files=all -z && printf '\\0{MARKER}\\0' && find . -mindepth 2 -name .git -print0"
+        ),
     );
     let out = crate::remote::ssh(runner, target, &script, None, CHECK_TIMEOUT)?;
     if !out.success() {
@@ -341,13 +345,11 @@ pub(crate) fn inspect_remote(
     let mut ignored_data = Vec::new();
     for relative in roots(ignored, nested, disposable) {
         let full = format!("{}/{}", path.trim_end_matches('/'), relative);
-        let out = crate::remote::ssh(
-            runner,
-            target,
+        let script = crate::remote::with_path(
+            machine_path,
             &format!("du -sk -- {}", crate::remote::quote(&full)),
-            None,
-            CHECK_TIMEOUT,
-        )?;
+        );
+        let out = crate::remote::ssh(runner, target, &script, None, CHECK_TIMEOUT)?;
         if !out.success() {
             bail!("could not measure {full}: {}", out.error_text());
         }
@@ -468,7 +470,7 @@ mod tests {
             ok("!! __HERDR_NESTED_WORKTREES__\0\0__HERDR_NESTED_WORKTREES__\0"),
         );
 
-        let inspection = inspect_remote(&runner, "box", "/wt", &[]).unwrap();
+        let inspection = inspect_remote(&runner, "box", "/custom/bin:/bin", "/wt", &[]).unwrap();
 
         assert_eq!(
             inspection.ignored_data,

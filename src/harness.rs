@@ -951,6 +951,26 @@ fn record_task_proofs(
     Ok(recorded)
 }
 
+fn install_box(
+    ctx: &Ctx,
+    dispatch: &str,
+) -> Result<Option<(crate::contracts::MachineProfile, remote::MachineDeclaration)>> {
+    if dispatch.is_empty() || dispatch == crate::contracts::MACHINE_LOCAL {
+        return Ok(None);
+    }
+    let Some(profile) = remote::optional_machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        dispatch,
+    )?
+    else {
+        return Ok(None);
+    };
+    let declaration = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    Ok(Some((profile, declaration)))
+}
+
 /// `ha harness install`: build every harness repository after a merge and
 /// install it into `~/.local/bin`, then the same on the saved box.
 pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
@@ -969,21 +989,11 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         .context("config.toml does not parse")?
         .dispatch
         .machine;
-    let box_profile = if dispatch.is_empty() || dispatch == crate::contracts::MACHINE_LOCAL {
-        None
-    } else {
-        remote::optional_machine_profile(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            &dispatch,
-        )?
-    };
-    let box_target = box_profile.as_ref().map(|profile| profile.target.clone());
-    let box_paths = box_profile
+    let box_machine = install_box(ctx, &dispatch)?;
+    let box_target = box_machine
         .as_ref()
-        .map(|profile| remote::machine_declaration(&ctx.config_dir, &profile.id))
-        .transpose()?;
+        .map(|(profile, _)| profile.target.clone());
+    let box_paths = box_machine.map(|(_, declaration)| declaration);
     let mut fork = false;
     let mut installed = Vec::new();
     let mut builds = Vec::new();
@@ -1100,6 +1110,33 @@ mod tests {
             .env("PATH", path)
             .output()
             .unwrap()
+    }
+
+    #[test]
+    fn install_resolves_a_saved_machine_declaration_by_its_label() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"7aaed4e8313e2440","label":"oci","target":"saved-box","session":"default","enabled":true}]"#),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().join("root"),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        let (profile, declaration) = install_box(&ctx, "oci").unwrap().unwrap();
+
+        assert_eq!(profile.id, "7aaed4e8313e2440");
+        assert_eq!(profile.label, "oci");
+        assert_eq!(profile.target, "saved-box");
+        assert_eq!(declaration.id, "oci");
+        assert_eq!(declaration.label, "oci");
+        assert_eq!(declaration.build, "/home/ubuntu/build/lanes");
     }
 
     #[test]

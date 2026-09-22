@@ -645,6 +645,23 @@ fn parse_box_list<T: serde::de::DeserializeOwned>(json: &str, field: &str) -> Re
         .map_err(|error| anyhow::anyhow!("the box herdr {field} reply changed: {error}"))
 }
 
+#[derive(Debug)]
+struct MachineLookupError(String);
+
+impl std::fmt::Display for MachineLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for MachineLookupError {}
+
+pub(crate) fn courier_lookup_failed(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<MachineLookupError>().is_some())
+}
+
 /// One courier pass for one saved machine, covering every project with lanes
 /// on it (SPEC-remote §4.3): one multiplexed helper call, the helper reads the
 /// box's own live lists, then one batched `scp` per project over that same
@@ -669,7 +686,8 @@ pub(crate) fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result
 
 fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
     let profile =
-        crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+        crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)
+            .map_err(|error| MachineLookupError(format!("machine lookup failed: {error:#}")))?;
     if profile.is_local() {
         bail!("courier called for the local machine");
     }
@@ -693,7 +711,8 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
         states.insert(project.slug.clone(), state);
     }
 
-    let machine_paths = crate::remote::machine_declaration(&ctx.config_dir, machine)?;
+    let machine_paths = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)
+        .map_err(|error| MachineLookupError(format!("machine declaration failed: {error:#}")))?;
     let script = courier_helper(&machine_paths, &profile.session);
     let out = crate::remote::ssh_courier(
         ctx.runner,
@@ -1860,7 +1879,7 @@ pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
         );
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let ctx = courier_ctx(root.path(), &env, &runner);
-        let outcome = courier(&ctx, &[&alpha, &beta, &gamma], "box").unwrap();
+        let outcome = courier(&ctx, &[&alpha, &beta, &gamma], "1").unwrap();
         assert_eq!(outcome.machine_id, "1");
         assert_eq!(outcome.boot_id, "boot-1");
         assert_eq!(events::list(&alpha).len(), 1);
@@ -1895,7 +1914,7 @@ pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
 
         // The cursor now skips the same envelopes: no second fetch.
         let before = runner.count("scp");
-        courier(&ctx, &[&alpha, &beta, &gamma], "box").unwrap();
+        courier(&ctx, &[&alpha, &beta, &gamma], "1").unwrap();
         assert_eq!(runner.count("scp"), before);
         // The imported events are the durable records; courier delivery does
         // not duplicate them in the inbox, including after a retry.
