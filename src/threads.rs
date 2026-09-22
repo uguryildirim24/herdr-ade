@@ -11,7 +11,7 @@ use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
-use crate::thread::{self, CopyOutcome, Group, Kind, Status, Thread};
+use crate::thread::{self, CopyOutcome, FollowUp, FollowUpState, Group, Kind, Status, Thread};
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1753,21 +1753,68 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "delivery")]
+pub enum PromptOutcome {
+    Queued { attempt: u32 },
+    Sent { attempt: u32, agent_state: String },
+}
+
+fn awaiting_follow_up(record: &Thread) -> bool {
+    let attempt = record.attempt.max(1);
+    record.follow_ups.iter().any(|follow_up| {
+        follow_up.attempt == attempt
+            && matches!(
+                follow_up.state,
+                FollowUpState::Queued | FollowUpState::Uncertain
+            )
+    })
+}
+
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
-pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutcome> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
-    if text.trim().is_empty() {
+    let mut record = thread::load(&project, id)?;
+    let text = text.trim();
+    if text.is_empty() {
         bail!("the text is empty");
     }
-    if record.status == Status::Resolved {
-        return Err(crate::refusal::error(format!("{id} is resolved")));
+    match record.status {
+        Status::Resolved => return Err(crate::refusal::error(format!("{id} is resolved"))),
+        Status::Failed => return Err(crate::refusal::error(format!("{id} is gone"))),
+        Status::Starting | Status::Open => {}
     }
-    if record.prompt_pending {
-        return Err(crate::refusal::error(format!(
-            "{id} has not received its brief yet; try again once it has started"
-        )));
+    // The brief and every follow-up have one ordered delivery path. Once one
+    // message is queued, later messages join it until the ticker drains them.
+    if record.status == Status::Starting || record.prompt_pending || awaiting_follow_up(&record) {
+        let mut queued = false;
+        record = thread::update_checked(&project, id, |thread| {
+            match thread.status {
+                Status::Resolved => {
+                    return Err(crate::refusal::error(format!("{id} is resolved")));
+                }
+                Status::Failed => return Err(crate::refusal::error(format!("{id} is gone"))),
+                Status::Starting | Status::Open => {}
+            }
+            if thread.status == Status::Starting
+                || thread.prompt_pending
+                || awaiting_follow_up(thread)
+            {
+                thread.follow_ups.push(FollowUp {
+                    attempt: thread.attempt.max(1),
+                    text: text.to_string(),
+                    state: FollowUpState::Queued,
+                });
+                queued = true;
+            }
+            Ok(())
+        })?;
+        if queued {
+            return Ok(PromptOutcome::Queued {
+                attempt: record.attempt.max(1),
+            });
+        }
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
@@ -1786,15 +1833,18 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     // no durable error still refuses in `prompt_state` above.
     if state == "blocked" {
         herdr
-            .pane_submit_text(&record.pane_id, text.trim())
+            .pane_submit_text(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         thread::update(&project, id, |t| t.error.clear())?;
     } else {
         herdr
-            .agent_prompt(&record.pane_id, text.trim())
+            .agent_prompt(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
-    Ok(state)
+    Ok(PromptOutcome::Sent {
+        attempt: record.attempt.max(1),
+        agent_state: state,
+    })
 }
 
 /// The state a follow-up may be sent in, or the refusal.

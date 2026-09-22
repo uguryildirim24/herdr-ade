@@ -34,6 +34,25 @@ pub(crate) enum Status {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
+pub(crate) enum FollowUpState {
+    #[default]
+    Queued,
+    Uncertain,
+    Superseded,
+    Cancelled,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub(crate) struct FollowUp {
+    pub(crate) attempt: u32,
+    pub(crate) text: String,
+    pub(crate) state: FollowUpState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Kind {
     #[default]
     Worktree,
@@ -51,6 +70,10 @@ pub(crate) struct Thread {
     pub(crate) status: Status,
     pub(crate) error: String,
     pub(crate) prompt_pending: bool,
+    /// Attempt-bound follow-ups accepted while the first brief is pending.
+    /// Terminal dispositions remain visible instead of crossing attempts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) follow_ups: Vec<FollowUp>,
     pub(crate) launch_attempts: u32,
     pub(crate) failure_event: String,
     pub(crate) last_failure: String,
@@ -240,6 +263,29 @@ pub(crate) fn update_checked(
     let mut thread = load(project, id)?;
     let before = thread.clone();
     change(&mut thread)?;
+    if thread.attempt != before.attempt {
+        // A receipt proves one exact attempt; a replacement must earn its own.
+        thread.bootstrap.clear();
+        for follow_up in &mut thread.follow_ups {
+            if follow_up.attempt == before.attempt.max(1)
+                && follow_up.state == FollowUpState::Queued
+            {
+                follow_up.state = FollowUpState::Superseded;
+            }
+        }
+    }
+    if thread.status == Status::Resolved && before.status != Status::Resolved {
+        let disposition = if thread.resolved_reason == "cancelled" {
+            FollowUpState::Cancelled
+        } else {
+            FollowUpState::Closed
+        };
+        for follow_up in &mut thread.follow_ups {
+            if follow_up.state == FollowUpState::Queued {
+                follow_up.state = disposition;
+            }
+        }
+    }
     thread.updated = project::now();
     write_record(project, &thread)?;
     observe_transition(project, &before, &thread);
@@ -1380,6 +1426,36 @@ mod tests {
         assert_eq!(ids.len(), 8);
         assert_eq!(ids[0], "t-0001");
         assert_eq!(ids[7], "t-0008");
+    }
+
+    #[test]
+    fn queued_follow_ups_record_attempt_end_dispositions() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let lane = allocate(&project, |lane| {
+            lane.attempt = 1;
+            lane.follow_ups.push(FollowUp {
+                attempt: 1,
+                text: "old attempt".into(),
+                state: FollowUpState::Queued,
+            });
+        })
+        .unwrap();
+        let superseded = update(&project, &lane.id, |lane| lane.attempt = 2).unwrap();
+        assert_eq!(superseded.follow_ups[0].state, FollowUpState::Superseded);
+
+        let cancelled = update(&project, &lane.id, |lane| {
+            lane.follow_ups.push(FollowUp {
+                attempt: 2,
+                text: "cancel this".into(),
+                state: FollowUpState::Queued,
+            });
+            lane.status = Status::Resolved;
+            lane.resolved_reason = "cancelled".into();
+        })
+        .unwrap();
+        assert_eq!(cancelled.follow_ups[0].state, FollowUpState::Superseded);
+        assert_eq!(cancelled.follow_ups[1].state, FollowUpState::Cancelled);
     }
 
     #[test]
