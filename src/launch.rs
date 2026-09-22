@@ -390,28 +390,55 @@ pub fn resolve_failure(
         }
         FailureClass::WorkFailed => resolve_launch(ctx, project, input),
         FailureClass::Provider | FailureClass::LostConnection | FailureClass::ProcessGone => {
-            let config = parse_launch_config(&ctx.config_dir)?;
-            validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
-            let work = work_contract(input.task, input.workflow)?;
-            let recovery = previous.same_recipe_retries.saturating_add(1);
-            let retries = config.routing.retry_limit(&work);
-            if recovery > retries {
-                return Err(crate::refusal::error(format!(
-                    "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
-                    class.plain()
-                )));
-            }
-            let mut same = previous.clone();
-            same.same_recipe_retries = recovery;
-            ledger(
-                project,
-                json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
-                    "same_recipe_retry":recovery, "failure":input.failure,
-                    "policy_hash":config.policy_hash}),
-            )?;
-            Ok(same)
+            same_recipe_retry(ctx, project, input, class, "recovery")
         }
     }
+}
+
+/// The coordinator may replace an unknown failed attempt after recording why.
+/// This is a bounded same-recipe retry; unknown evidence never selects a
+/// fallback recipe and automatic escalation still waits for this decision.
+pub fn resolve_coordinator_retry(
+    ctx: &Ctx,
+    project: &Project,
+    input: &ResolveInput<'_>,
+    class: crate::contracts::FailureClass,
+) -> Result<Launch> {
+    if class == crate::contracts::FailureClass::Unknown {
+        same_recipe_retry(ctx, project, input, class, "coordinator-retry")
+    } else {
+        resolve_failure(ctx, project, input, class)
+    }
+}
+
+fn same_recipe_retry(
+    ctx: &Ctx,
+    project: &Project,
+    input: &ResolveInput<'_>,
+    class: crate::contracts::FailureClass,
+    ledger_kind: &str,
+) -> Result<Launch> {
+    let previous = input.previous.context("recovery_previous_missing")?;
+    let config = parse_launch_config(&ctx.config_dir)?;
+    validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
+    let work = work_contract(input.task, input.workflow)?;
+    let recovery = previous.same_recipe_retries.saturating_add(1);
+    let retries = config.routing.retry_limit(&work);
+    if recovery > retries {
+        return Err(crate::refusal::error(format!(
+            "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
+            class.plain()
+        )));
+    }
+    let mut same = previous.clone();
+    same.same_recipe_retries = recovery;
+    ledger(
+        project,
+        json!({"kind":ledger_kind, "class":class, "recipe":same.recipe_id,
+            "same_recipe_retry":recovery, "failure":input.failure,
+            "policy_hash":config.policy_hash}),
+    )?;
+    Ok(same)
 }
 
 fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {

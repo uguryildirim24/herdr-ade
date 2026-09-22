@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{GUARD_MARKER, Layout, PI_PACKAGE, PI_VERSION, sh};
+use super::{Layout, PI_PACKAGE, PI_VERSION, sh};
 
 /// The `pro` provider writer, shared with `herdr-pro` by path (the file is
 /// self-contained, so both binaries can compile it).
@@ -20,7 +20,7 @@ mod provider;
 use super::provider as deepseek;
 
 /// The guard extension, plugin-owned, beside the herdr state hook
-/// (SPEC-pi v2 §3.3, §3.7). Doctor checks the marker.
+/// (SPEC-pi v2 §3.3, §3.7). Doctor compares the complete installed file.
 const GUARD_TS: &str = include_str!("../../extensions/herdr-pi-guard.ts");
 
 /// The exact `npm install` argv (SPEC-pi v2 §3.2). `--save-exact` is the pin;
@@ -100,11 +100,10 @@ pub(crate) fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
     Ok(layout.guard())
 }
 
-/// True when the guard is present with the plugin's marker (SPEC-pi v2 §3.9).
+/// True when the installed guard is the exact extension compiled into this
+/// binary (SPEC-pi v2 §3.9). A marker alone cannot detect changed behavior.
 pub(crate) fn guard_ok(layout: &Layout) -> bool {
-    std::fs::read_to_string(layout.guard())
-        .map(|text| text.contains(GUARD_MARKER))
-        .unwrap_or(false)
+    std::fs::read_to_string(layout.guard()).is_ok_and(|text| text == GUARD_TS)
 }
 
 /// The one line Rolf types after setup (SPEC-pi v2 §3.2). The wrapper itself
@@ -308,6 +307,29 @@ mod tests {
         assert_eq!(
             value["providers"]["pro"]["baseUrl"],
             "http://127.0.0.1:1234/v1"
+        );
+    }
+
+    #[test]
+    fn a_guard_with_the_current_marker_but_old_untyped_behavior_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pi"));
+        std::fs::create_dir_all(layout.extensions()).unwrap();
+        std::fs::write(
+            layout.guard(),
+            "// herdr-pi-guard:version=3\npi.exec(\"ha\", [\"waiting\", \"fetch failed\"]);\n",
+        )
+        .unwrap();
+
+        assert!(!guard_ok(&layout));
+        write_guard(&layout).unwrap();
+        assert!(guard_ok(&layout));
+        let installed = std::fs::read_to_string(layout.guard()).unwrap();
+        assert!(installed.contains("fetch failed"));
+        assert!(
+            installed.contains(
+                "[\"failed\", \"--class\", \"provider\", \"--provider-kind\", cls, text]"
+            )
         );
     }
 

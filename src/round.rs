@@ -6003,7 +6003,7 @@ mod tests {
             t.workspace_id = "w1".into();
             t.tab_id = "w1:t2".into();
             t.cwd = "/wt".into();
-            t.error = "the model errored".into();
+            t.error = "openai-codex unreachable: fetch failed".into();
         })
         .unwrap();
         let pane = thread::load(&fx.project, &id).unwrap().pane_id;
@@ -6011,11 +6011,19 @@ mod tests {
             "[{}]",
             crate::scenarios::agent_json("w1", "w1:t2", &pane, "/wt", "", "blocked")
         );
-        fx.world
-            .runner
-            .on("agent prompt", crate::runner::fake::ok(r#"{"result":{}}"#));
+        fx.world.runner.on(
+            "pane send-text",
+            crate::runner::fake::ok(r#"{"result":{}}"#),
+        );
+        fx.world.runner.on(
+            "pane send-keys",
+            crate::runner::fake::ok(r#"{"result":{}}"#),
+        );
         let state = crate::threads::prompt(&ctx, "demo", &id, "carry on").unwrap();
         assert_eq!(state, "blocked");
+        assert_eq!(fx.world.runner.count("agent prompt"), 0);
+        assert_eq!(fx.world.runner.count("pane send-text"), 1);
+        assert_eq!(fx.world.runner.count("pane send-keys"), 1);
         assert!(thread::load(&fx.project, &id).unwrap().error.is_empty());
         // A blocked pi lane without its own recorded error is waiting on the
         // person at the pane and is not prompted through that question.
