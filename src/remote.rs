@@ -65,7 +65,19 @@ pub(crate) struct MachineDeclaration {
     pub(crate) path: String,
     pub(crate) ade_bin: String,
     pub(crate) pi_bin: String,
+    /// Adapter kinds this machine is allowed to run. A missing list preserves
+    /// the unrestricted declaration used before this field existed; an empty
+    /// list means the machine runs no agent jobs.
+    pub(crate) kinds: Option<Vec<String>>,
     pub(crate) repos: Vec<crate::project::Repo>,
+}
+
+impl MachineDeclaration {
+    pub(crate) fn runs_kind(&self, kind: &str) -> bool {
+        self.kinds
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|allowed| allowed == kind))
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -656,6 +668,10 @@ publish_url = "https://example.test/repo.git"
         runner.on("machine list --json", ok("[]"));
         let profile = machine_profile(&runner, "herdr", config.path(), "lab").unwrap();
         assert_eq!(profile.target, "lab.example");
+        let declaration = machine_declaration(config.path(), "lab").unwrap();
+        assert!(declaration.runs_kind("pi"));
+        assert!(declaration.runs_kind("claude"));
+        assert!(declaration.runs_kind("agy"));
         let repo = box_repo_for(config.path(), "lab", "/local/repo").unwrap();
         assert_eq!(repo.box_path.as_deref(), Some("/srv/work/repo"));
     }
