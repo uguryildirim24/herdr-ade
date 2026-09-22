@@ -78,7 +78,8 @@ A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance
 - Start ordinary lanes with `--job <job-NNNN>`. To create and start in one command, omit `--job` and add `--request`, `--acceptance` and optional `--plan-step` to `thread start`.
 - Use `hp task list|show`, `hp task note <slug> <job-NNNN> "<note>" --request <request-id> [--replaces <note-id>]`, and `hp task evidence --kind verified --command "<command checked>"`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
 - Use `hp task adopt <slug> <job-NNNN> --thread <t-NNNN>` to attach a lane and its rounds when that lane predates task records.
-- `context`, the plan card, generated `TASKS.md`, and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, and `unknown` are evidence words, not statuses you set.
+- Use `hp task drop <slug> <job-NNNN> --reason "<why>"` only when its premise was wrong or Rolf withdrew it; say which in the reason.
+- `context`, the plan card, generated `TASKS.md`, and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, `dropped`, and `unknown` are evidence words, not statuses you set.
 - A repository's `task_states` in `PROJECT.md` says which milestones apply. Do not record install evidence for a repository without an install state.
 
 ## Watching threads

@@ -606,6 +606,27 @@ fn digest_snapshot(
         );
     }
     overflow(&mut out, open_tasks.len(), "tasks/");
+    let dropped_tasks: Vec<_> = task_views
+        .iter()
+        .filter(|view| view.state == crate::task::State::Dropped)
+        .collect();
+    if !dropped_tasks.is_empty() {
+        let _ = writeln!(out, "\n## Dropped tasks (terminal, not complete)");
+        for view in dropped_tasks.iter().take(DIGEST_ROWS) {
+            let reason = &view
+                .record
+                .dropped
+                .last()
+                .expect("dropped state has evidence")
+                .reason;
+            let _ = writeln!(
+                out,
+                "- {} [dropped] {} — dropped: {}",
+                view.record.id, view.record.title, reason
+            );
+        }
+        overflow(&mut out, dropped_tasks.len(), "tasks/");
+    }
 
     out.push_str(&crate::ledger::section(project)?);
 

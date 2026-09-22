@@ -536,14 +536,20 @@ fn task_rows(project: &Project) -> (Vec<Row>, usize) {
         rows.push(Row::text(TASKS_ERROR));
     }
     for view in &views {
+        let text = view.record.dropped.last().map_or_else(
+            || view.record.title.clone(),
+            |drop| format!("{} — dropped: {}", view.record.title, drop.reason),
+        );
         rows.push(tagged_with_marker(
             project,
             view.state.word(),
-            &view.record.title,
+            &text,
             &view.record.id,
             match view.state {
                 crate::task::State::Verified | crate::task::State::Merged => Tone::Green,
-                crate::task::State::Failed | crate::task::State::Cancelled => Tone::Red,
+                crate::task::State::Failed
+                | crate::task::State::Cancelled
+                | crate::task::State::Dropped => Tone::Red,
                 crate::task::State::Unknown => Tone::Peach,
                 _ => Tone::Yellow,
             },
