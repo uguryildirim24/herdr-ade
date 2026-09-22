@@ -75,6 +75,7 @@ pub(crate) struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) replaces: Option<String>,
     pub(crate) notes: Vec<DatedNote>,
+    #[serde(default)]
     pub(crate) dropped: Vec<DropEvidence>,
     pub(crate) attempts: Vec<String>,
     pub(crate) rounds: Vec<String>,
