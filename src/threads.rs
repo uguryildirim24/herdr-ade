@@ -331,7 +331,15 @@ fn start_with_ticker(
     match place_and_brief(ctx, &project, &view, &id, false) {
         Ok(thread) => {
             refresh_plan(ctx, &project);
-            Ok(thread)
+            if thread.is_remote()
+                && let Err(error) =
+                    ticker::request_remote_poll(&ctx.root, &project, thread.machine_route())
+            {
+                eprintln!(
+                    "note: thread {id} is placed, but the ticker could not be woken for its first box poll: {error:#}"
+                );
+            }
+            Ok(thread::load(&project, &id).unwrap_or(thread))
         }
         Err(error) => {
             let message = format!("{error:#}");
@@ -2897,16 +2905,58 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
         };
     };
     if t.is_remote() {
-        // Remote state is what the ticker last polled; the CLI makes no ssh call.
-        let state = if t.last_state.is_empty() {
-            "not polled yet"
+        // Remote state is what the ticker last observed; the CLI makes no SSH
+        // call and never turns an old state into an untimed current claim.
+        let source = if t.observation_source.is_empty() {
+            "courier"
         } else {
-            &t.last_state
+            &t.observation_source
+        };
+        let note = if t.last_observed.is_empty() {
+            if !t.last_state.is_empty() {
+                let next = if t.observation_error.is_empty() {
+                    "next check pending".to_string()
+                } else {
+                    format!(
+                        "latest check failed at {} by {source}: {}",
+                        t.observation_attempted, t.observation_error
+                    )
+                };
+                format!(
+                    "{}; last checked time and source unknown; {next}, on {}",
+                    t.last_state, t.machine
+                )
+            } else if t.observation_error.is_empty() {
+                format!("first check pending by {source}, on {}", t.machine)
+            } else {
+                format!(
+                    "first check failed at {} by {source}: {}, on {}",
+                    t.observation_attempted, t.observation_error, t.machine
+                )
+            }
+        } else {
+            let state = if t.last_state.is_empty() {
+                "no agent"
+            } else {
+                &t.last_state
+            };
+            let next = if t.observation_error.is_empty() {
+                "next check pending".to_string()
+            } else {
+                format!(
+                    "latest check failed at {}: {}",
+                    t.observation_attempted, t.observation_error
+                )
+            };
+            format!(
+                "{state}; last checked {} by {source}; {next}, on {}",
+                t.last_observed, t.machine
+            )
         };
         return Row {
             thread: t.clone(),
             group: recorded,
-            note: format!("{state}, on {}", t.machine),
+            note,
         };
     }
     let live = thread::live_state(t, &view.agents, &view.panes, now);
