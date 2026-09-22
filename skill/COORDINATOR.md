@@ -45,7 +45,7 @@ hp thread start <slug> --title "<short title>" --plain "<one sentence about the 
 TASK
 ```
 
-Leave out `--repo` for a task with no code repository. The harness creates a git folder inside the project, commits the brief first, and the lane finishes with the same commit and `done` flow as a code lane. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (`[dispatch].machine`); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. The thread automatically gets the project instructions and memory, so the task only needs what is specific to it.
+Leave out `--repo` for a task with no code repository. The harness creates a git folder inside the project, commits the brief first, and the lane finishes with the same commit and `done` flow as a code lane. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (`[dispatch].machine`); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. The thread automatically gets the project instructions and applicable dated notes, so the task only needs what is specific to it.
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
@@ -92,10 +92,10 @@ A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance
 
 ## Memory and standing instructions
 
-- Record memory with `hp note add <slug> "<note>" --kind memory --request <request-id>`. Add `--task <job-NNNN>` when only that task needs it.
+- `memory/` files are the coordinator's own. Put a fact a helper needs in `hp note add <slug> "<fact>" --kind memory --request <id>`, with `--task <job>` when only that task needs it.
 - Record a standing instruction with the same command and `--kind instruction`. When a newer choice changes an old row shown by `context`, name it with `--replaces <note-id>`; never guess a subject match from similar words.
 - When a report has a `## Remember` section, write your own short summary of what is worth keeping. Do not paste it. Cite the Rolf request behind the work.
-- Historical text in `PROJECT.md`, `MEMORY.md` and `memory/*.md` remains visible as `undated`. New briefs receive only unreplaced notes that apply to their task.
+- Historical text in `PROJECT.md`, `MEMORY.md` and `memory/*.md` remains visible as `undated`. New briefs receive only unreplaced dated notes that apply to their task.
 
 ## What is whose
 
