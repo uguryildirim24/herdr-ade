@@ -704,12 +704,27 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         };
     }
     let events = crate::events::list(project);
-    let event = crate::round::latest_event(&events, current, thread.attempt.max(1));
+    let attempt = thread.attempt.max(1);
+    let event = crate::round::latest_event(&events, current, attempt);
+    let done = events
+        .iter()
+        .filter(|event| event.thread == *current && event.attempt == attempt)
+        .filter(|event| event.payload.done.is_some())
+        .max_by(|left, right| (&left.created, &left.id).cmp(&(&right.created, &right.id)));
     if thread.status == crate::thread::Status::Resolved && !thread.cancellation_reason.is_empty() {
         return View {
             record: task,
             state: State::Cancelled,
             next: "none".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    if thread.status == crate::thread::Status::Resolved && done.is_none() {
+        return View {
+            record: task,
+            state: State::Unknown,
+            next: "the lane ended without `done`, so retry it or attest its stored report".into(),
             failure_class: None,
             provider_kind: None,
         };
@@ -741,10 +756,7 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             provider_kind: thread.provider_failure_kind.clone(),
         };
     }
-    if event
-        .and_then(|event| event.payload.done.as_ref())
-        .is_none()
-    {
+    if done.is_none() {
         return View {
             record: task,
             state: State::Working,
@@ -839,6 +851,20 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         failure_class: None,
         provider_kind: None,
     }
+}
+
+pub(crate) fn attestation(project: &Project, task: &Task) -> Option<crate::contracts::Attestation> {
+    let current = task.attempts.last()?;
+    let thread = crate::thread::load(project, current).ok()?;
+    crate::events::list(project)
+        .into_iter()
+        .filter(|event| event.thread == *current && event.attempt == thread.attempt.max(1))
+        .filter_map(|event| {
+            let attestation = event.payload.done?.attestation?;
+            Some((event.created, event.id, attestation))
+        })
+        .max_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)))
+        .map(|(_, _, attestation)| attestation)
 }
 
 pub(crate) fn views(project: &Project) -> (Vec<View>, Vec<anyhow::Error>) {
@@ -1627,6 +1653,68 @@ created = "2026-09-21T00:00:00Z"
             error.to_string().contains("task_adopt_repository"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn resolved_attempt_without_done_is_unknown_and_actionable() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        record(&project, "job-0001");
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.attempt = 1;
+        })
+        .unwrap();
+        link_attempt(&project, "job-0001", &thread.id).unwrap();
+
+        let unresolved = view(&project, load(&project, "job-0001").unwrap());
+        assert_eq!(unresolved.state, State::Unknown);
+        assert_eq!(
+            unresolved.next,
+            "the lane ended without `done`, so retry it or attest its stored report"
+        );
+    }
+
+    #[test]
+    fn attested_report_finishes_the_task_and_keeps_the_attestation() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        record(&project, "job-0001");
+        let report = b"stored final report\n";
+        let hash = crate::thread::sha256_hex(report);
+        let thread = crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.attempt = 1;
+            thread.report_hash = hash.clone();
+        })
+        .unwrap();
+        std::fs::write(
+            crate::thread::home_report_path(&project, &thread.id),
+            report,
+        )
+        .unwrap();
+        link_attempt(&project, "job-0001", &thread.id).unwrap();
+
+        let outcome = crate::threads::attest(
+            &world.ctx(),
+            "demo",
+            &thread.id,
+            "The final copy is the completed work.",
+        )
+        .unwrap();
+        assert_eq!(outcome.sha, None);
+        assert_eq!(
+            std::fs::read(crate::events::artifact_path(&project, &outcome.artifact)).unwrap(),
+            report
+        );
+        let sealed = crate::events::load(&project, &outcome.event).unwrap();
+        assert_eq!(sealed.payload.done.unwrap().sha, "");
+
+        let finished = view(&project, load(&project, "job-0001").unwrap());
+        assert_eq!(finished.state, State::Finished);
+        let attested = attestation(&project, &finished.record).unwrap();
+        assert_eq!(attested.coordinator, "hp-demo-coordinator");
+        assert_eq!(attested.reason, "The final copy is the completed work.");
     }
 
     #[test]
