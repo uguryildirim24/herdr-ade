@@ -1106,6 +1106,15 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
         Ok(disposable) => disposable,
         Err(error) => return vec![format!("review worktrees kept: {error:#}")],
     };
+    let report_artifact_stored = match record.reviewer.as_deref() {
+        Some(id) => match crate::thread::load(project, id)
+            .and_then(|thread| crate::threads::report_artifact_stored(project, &thread))
+        {
+            Ok(stored) => stored,
+            Err(error) => return vec![format!("review worktrees kept: {error:#}")],
+        },
+        None => false,
+    };
     let mut lines = Vec::new();
     for (path, _) in worktrees.into_iter().filter(|(path, _)| belongs(path)) {
         let path_text = path.to_string_lossy().into_owned();
@@ -1132,7 +1141,13 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
                 continue;
             }
         }
-        match crate::worktrees::inspect_local(ctx.runner, &record.repo, &path_text, &disposable) {
+        match crate::worktrees::inspect_local(
+            ctx.runner,
+            &record.repo,
+            &path_text,
+            &disposable,
+            report_artifact_stored,
+        ) {
             Ok(inspection) if !inspection.dirty.is_empty() => lines.push(format!(
                 "review worktree {} kept: worktree_dirty ({})",
                 path.display(),
@@ -4537,6 +4552,25 @@ mod tests {
 
         assert!(review_worktree.is_dir(), "ignored run data must be kept");
         assert!(review_worktree.join("camber-runs/raw.bin").is_file());
+    }
+
+    #[test]
+    fn a_closed_round_removes_a_review_worktree_with_only_its_stored_report() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        let review_worktree = fx.repo.join(".worktrees/review-r1");
+        let exclude = fx.repo.join(".git/info/exclude");
+        let mut exclusions = std::fs::read_to_string(&exclude).unwrap_or_default();
+        exclusions.push_str(".reports/\n");
+        std::fs::write(exclude, exclusions).unwrap();
+        std::fs::create_dir_all(review_worktree.join(".reports")).unwrap();
+        std::fs::write(review_worktree.join(".reports/reviewer.md"), "report\n").unwrap();
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+
+        merge(&ctx, "demo", "r1", None).unwrap();
+
+        assert!(!review_worktree.exists(), "stored report is harness output");
     }
 
     #[test]
