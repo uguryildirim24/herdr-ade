@@ -2,7 +2,7 @@
 
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>
 
-<p align="center">Herdr ADE lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself, by giving you one coordinator conversation that starts a separate agent for each task on its own branch, gives every one of them the same instructions and memory, and shows you which threads are ready for review, waiting on you, or still working.</p>
+<p align="center">Herdr ADE lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself, by giving you one coordinator conversation that starts a separate agent for each task on its own branch, gives it the current instructions and relevant memory, and shows you which threads are ready for review, waiting on you, or still working.</p>
 
 <p align="center"><img src="assets/herdr-ade-coordinator-threads.svg" width="88%" alt="Illustration: you tell a coordinator what you want, it starts three threads that each work on their own branch, and an overview groups them as ready for review, waiting on you, and working" /></p>
 
@@ -40,7 +40,7 @@ Each thread shows its project, its id and its group beside its session: `ready-f
 
 ### ⚡ Stop briefing every agent yourself
 
-Say what you want once. The coordinator starts the threads the work needs and tells you what it started. Each thread gets a brief with your standing instructions, the project's memory and its task. Lessons a thread reports under `## Remember` flow back into memory for the next one.
+Say what you want once. The coordinator starts the threads the work needs and tells you what it started. Each thread gets a brief with current standing instructions, memory that applies to its task, and the task itself. Notes carry their date and the request behind them; explicit replacements keep stale notes out of later briefs.
 
 ### 💬 Know when a thread needs an answer
 
@@ -101,7 +101,7 @@ A birth sentence. `thread start` and `thread adopt` require `--plain`. The sente
 
 ### Where does my project live?
 
-In `~/.herdr-ade/<name>/` by default: `PROJECT.md` for your settings and standing instructions, `MEMORY.md` and `memory/` for what the coordinator remembers, `tasks/` for stable task records, generated `TASKS.md` for their shared view, `threads/` for thread records and reports, and `library/` for files threads produced. The safety settings live outside it, in `~/.config/herdr-ade/config.toml`, where no agent works. [Operations](docs/operations.md#where-things-live) lists every file.
+In `~/.herdr-ade/<name>/` by default: `PROJECT.md` for your settings and historical standing instructions, `notes.jsonl` for dated memory and instructions, `MEMORY.md` and `memory/` for historical memory, `tasks/` for stable task records, generated `TASKS.md` for their shared view, `threads/` for thread records and reports, and `library/` for files threads produced. The safety settings live outside it, in `~/.config/herdr-ade/config.toml`, where no agent works. [Operations](docs/operations.md#where-things-live) lists every file.
 
 ### Do I have to start every thread through the coordinator?
 

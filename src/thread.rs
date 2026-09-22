@@ -405,31 +405,27 @@ impl MemoryUse {
     }
 }
 
-/// Reads the memory exactly as `brief_for` inlines it. Regular files only: a
-/// symbolic link in `memory/` is never followed.
+/// Measures current memory notes after explicit replacements are folded.
+/// Task-scoped rows all count here, making the warning an upper bound across
+/// briefs. Legacy symbolic links never become rows.
 pub(crate) fn memory_use(project: &Project) -> MemoryUse {
-    let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
-    let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.ends_with(".md") && !n.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    let files: Vec<(String, String)> = names
+    let mut index = String::new();
+    let mut files = Vec::new();
+    for row in crate::note::active_rows(project)
         .into_iter()
-        .filter_map(|name| {
-            let path = project.dir().join("memory").join(&name);
-            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-            regular
-                .then(|| std::fs::read_to_string(&path).ok())
-                .flatten()
-                .map(|text| (name, text))
-        })
-        .collect();
+        .filter(|row| row.kind == "memory" || row.kind == "task note")
+    {
+        if row.source == "MEMORY.md" {
+            index = row.text;
+        } else {
+            let name = row
+                .source
+                .strip_prefix("memory/")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}.md", row.id.replace(':', "-")));
+            files.push((name, row.text));
+        }
+    }
     let total_chars = index.chars().count()
         + files
             .iter()
@@ -500,12 +496,45 @@ pub(crate) fn brief_for(
     task: &str,
     restart: bool,
 ) -> Result<String> {
-    let (_, instructions) = project.read_project_md()?;
-    let memory = memory_use(project);
+    let task_id = crate::task::list_with_errors(project)
+        .0
+        .into_iter()
+        .find(|record| record.attempts.iter().any(|attempt| attempt == &thread.id))
+        .map(|record| record.id);
+    let mut active = crate::note::active_for(project, task_id.as_deref());
+    crate::note::sort_newest_first(&mut active);
+    let render = |row: &crate::note::Row| {
+        let provenance = match (&row.at, &row.request) {
+            (Some(at), Some(request)) => {
+                format!("{} · request:{}", &at[..at.len().min(10)], request)
+            }
+            _ => "undated".into(),
+        };
+        format!("<!-- {} · {} -->\n{}", row.id, provenance, row.text.trim())
+    };
+    let instructions = active
+        .iter()
+        .filter(|row| row.kind == "standing instruction")
+        .map(&render)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let memory_index = active
+        .iter()
+        .filter(|row| row.source == "MEMORY.md")
+        .map(&render)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let memory_files: Vec<(String, String)> = active
+        .iter()
+        .filter(|row| {
+            (row.kind == "memory" || row.kind == "task note") && row.source != "MEMORY.md"
+        })
+        .map(|row| (row.id.replace(':', "-"), render(row)))
+        .collect();
     Ok(compose_brief(&BriefInput {
         instructions: &instructions,
-        memory_index: &memory.index,
-        memory_files: &memory.files,
+        memory_index: &memory_index,
+        memory_files: &memory_files,
         task,
         restart,
         report_path: &thread.report_path(),
