@@ -84,7 +84,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `say <project> --what S [--means S] [--landed-round R]` | One checked line on the board and in talk, returning its say id. `--landed-round` marks it as landing evidence for a merged round. |
 | `talk <project> [--replay]` | The project screen, or a conversation-only text replay for copying. |
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
-| `round open <project> [<round>] [<thread>...] [--repo DIR] [--branch BRANCH] --plain S` | Open the next free round by default and admit the supplied lanes at once. Lanes infer their single repository; an open without lanes refuses an ambiguous project. |
+| `round open <project> [<round>] [<thread>...] [--repo DIR] [--branch BRANCH] --plain S` | Open one round past the highest number already used by a record, local review branch, or committed review file, and admit the supplied lanes at once. Lanes infer their single repository; an open without lanes refuses an ambiguous project. |
 | `round merge <project> <round>` | Merge, checkpoint, push to the repository's allowed remote, install when required, and close the round. Retry resumes a pending push or install without merging twice. |
 | `round show <project> [<round>]` | Show one round; without a round, list every round in the project. |
 | `harness install` | Standalone repair: build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. |

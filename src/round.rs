@@ -897,10 +897,23 @@ fn round_uses(
         ])?
         .lines()
     {
-        let Some(id) = name.strip_prefix("review/") else {
+        let Some(suffix) = name.strip_prefix("review/") else {
             continue;
         };
-        if validate_round_id(id).is_ok() {
+        // Repair reviews use `review/rN-2`, `review/rN-3`, and so on. The
+        // original branch is normally retained, but a surviving revision is
+        // still durable evidence that the round number has been used.
+        let id = if validate_round_id(suffix).is_ok() {
+            Some(suffix)
+        } else {
+            suffix.rsplit_once('-').and_then(|(id, revision)| {
+                (!revision.is_empty()
+                    && revision.chars().all(|c| c.is_ascii_digit())
+                    && validate_round_id(id).is_ok())
+                .then_some(id)
+            })
+        };
+        if let Some(id) = id {
             record_round_use(&mut uses, id, format!("local branch `{name}`"))?;
         }
     }
@@ -4561,6 +4574,37 @@ mod tests {
         let brief = compose_review_brief(&pinned, "manifest", &[], "ha");
         assert!(brief.contains("`cargo test` with environment `RUSTFLAGS=-Dwarnings`"));
         assert!(brief.contains("{ command = \"cargo test\", exit = 0 }"));
+    }
+
+    #[test]
+    fn a_surviving_repair_review_branch_reserves_its_round_number() {
+        let fx = fixture();
+        git(&fx.repo, &["branch", "review/r7-3", "main"]);
+
+        let opened = open_with_lanes(
+            &fx.world.ctx(),
+            "demo",
+            None,
+            None,
+            Some(PLAIN.into()),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(opened.round, "r8");
+
+        let error = err(open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r7".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        ));
+        assert!(error.contains("local branch `review/r7-3`"), "{error}");
+        assert!(!round_path(&fx.project, "r7").exists());
     }
 
     #[test]
