@@ -139,6 +139,7 @@ pub(crate) fn overturn(
         reason: reason.trim().to_string(),
     });
     append(&project, &record)?;
+    crate::project::refresh_page(&project)?;
     Ok(record)
 }
 
@@ -292,6 +293,7 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
         overturned: None,
     };
     append(&project, &record)?;
+    crate::project::refresh_page(&project)?;
     Ok(record)
 }
 

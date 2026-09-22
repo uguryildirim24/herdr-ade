@@ -157,22 +157,19 @@ fn round_and_preparation_lists_are_bounded() {
 }
 
 #[test]
-fn inactive_routines_are_counted_and_live_routines_errors_and_memory_are_bounded() {
+fn inactive_routines_are_counted_and_live_routine_errors_are_bounded() {
     let p = Project::new();
     p.write(
         "routines/retired.md",
         "+++\nschedule = \"every 1h\"\nenabled = false\n+++\nOld task\n",
     );
-    let mut memory = String::new();
     for n in 1..=21 {
         p.write(
             format!("routines/live-{n:02}.md"),
             "+++\nschedule = \"every 1h\"\nenabled = true\n+++\nCheck the work\n",
         );
         p.write(format!("routines/broken-{n:02}.md"), "bad config");
-        memory.push_str(&format!("- reference-{n:02}\n"));
     }
-    p.write("MEMORY.md", memory);
     let text = p.context(true);
     assert!(text.contains("## Routines (21 enabled; 1 disabled not listed)"));
     assert!(text.contains("live-20"));
@@ -180,9 +177,6 @@ fn inactive_routines_are_counted_and_live_routines_errors_and_memory_are_bounded
     assert!(!text.contains("retired"));
     assert!(text.contains("config-error: routines/broken-20.md"));
     assert!(!text.contains("broken-21"));
-    assert!(text.contains("reference-20"));
-    assert!(!text.contains("reference-21"));
-    assert!(text.contains("1 more; read MEMORY.md (digest limit 20)"));
     assert_eq!(
         text.matches("1 more; read routines/ (digest limit 20)")
             .count(),

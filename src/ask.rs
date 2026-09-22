@@ -1296,13 +1296,10 @@ mod tests {
             },
         )
         .unwrap();
-        let text = std::fs::read_to_string(glossary::glossary_path(&fx.project)).unwrap();
-        assert!(text.contains(
-            "- quotient: The smaller model that keeps the same answers. (tasks/spec.md)\n"
-        ));
-        assert!(
-            text.ends_with("- r1: The first round lands the shared types. (tasks/review-r1.md)\n"),
-            "newest last:\n{text}"
+        assert!(!fx.project.dir().join("GLOSSARY.md").exists());
+        assert_eq!(
+            glossary::explain(&ctx, "demo", "quotient").unwrap(),
+            "quotient: The smaller model that keeps the same answers.\n(tasks/spec.md)\n"
         );
         assert_eq!(
             glossary::explain(&ctx, "demo", "r1").unwrap(),
