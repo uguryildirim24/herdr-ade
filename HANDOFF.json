@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0323.md",
+      "tasks/review-r118.md",
+      "tasks/t-0322.md",
       "tasks/t-0321.md",
       "tasks/t-0320.md",
       "tasks/review-r117.md",
@@ -19,16 +22,14 @@
       "tasks/t-0317.md",
       "tasks/t-0316.md",
       "tasks/review-r115.md",
-      "tasks/t-0314.md",
-      "tasks/t-0313.md",
-      "tasks/t-0312.md",
-      "tasks/review-r114.md"
+      "tasks/t-0314.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r118.md",
       "tasks/reviews/code-r117.md",
       "tasks/reviews/code-r116.md",
       "tasks/reviews/code-r115.md",
@@ -39,15 +40,17 @@
       "tasks/reviews/code-r110.md",
       "tasks/reviews/code-r109.md",
       "tasks/reviews/code-r108.md",
-      "tasks/reviews/code-r107.md",
-      "tasks/reviews/code-r106.md"
+      "tasks/reviews/code-r107.md"
     ]
   },
-  "generated": "2026-09-22T19:00:38-04:00",
+  "generated": "2026-09-22T19:28:48-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0321-review-r117-machine-records-move-out-of",
+      "hp/adeherdr/t-0323-review-r118-the-finished-one-time-conver",
       "main",
+      "review/r118",
+      "hp/adeherdr/t-0322-w58-delete-the-finished-one-time-convers",
+      "hp/adeherdr/t-0321-review-r117-machine-records-move-out-of",
       "review/r117-2",
       "hp/adeherdr/t-0320-review-r117-machine-records-move-out-of",
       "hp/adeherdr/t-0319-review-r116-removing-or-admitting-a-lane",
@@ -504,36 +507,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "ce1023f review(round): approve r117 repair",
-      "c2b0e75 Merge commit '5fc03667c291b8e9b46985bf873b59b1440cb5eb' into hp/adeherdr/t-0321-review-r117-machine-records-move-out-of",
-      "2613f22 docs(tasks): t-0321",
-      "f0f3e14 review(r117): brief for revision 1",
-      "5fc0366 review(project): convert records before later install failures",
-      "751583d checkpoint(r116): HANDOFF after merging the round"
+      "69b8014 review(round): approve r118",
+      "a20714e merge: t-0322 into review r118",
+      "dc90a80 docs(tasks): t-0323",
+      "779767e review(r118): brief for revision 1",
+      "3bbe951 refactor(project): remove completed conversion path",
+      "3e44ec8 docs(tasks): t-0322"
     ],
-    "remote": "9 ahead, 0 behind origin/main",
+    "remote": "6 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "ce1023f",
+        "head": "69b8014",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(round): approve r117 repair"
+        "subject": "review(round): approve r118"
       },
       {
-        "branch": "review/r117",
+        "branch": "review/r118",
         "dirty": 0,
-        "head": "9d2a572",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r117",
-        "subject": "docs(tasks): t-0320"
-      },
-      {
-        "branch": "review/r117-2",
-        "dirty": 0,
-        "head": "2613f22",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r117-2",
-        "subject": "docs(tasks): t-0321"
+        "head": "dc90a80",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r118",
+        "subject": "docs(tasks): t-0323"
       }
     ]
   },
@@ -548,8 +544,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r117",
-    "verdict": "ce1023f9271aa5ff50b41f9231f3238a0656a69a"
+    "round": "r118",
+    "verdict": "69b8014a111969bc0db33299a980d2f9732a7c2a"
   },
   "session": "default",
   "unlinked_agents": [],
