@@ -67,7 +67,7 @@ Internal task, thread, round and decision records keep exact technical detail. A
 
 ## Authority and safety
 
-`hp thread show <slug> <id>` names the final report's artifact path. Historical reports without an artifact remain at `threads/<id>.md`; files produced for Rolf are in `library/<id>/`. These folders appear only when they contain something.
+`hp thread show <slug> <id>` names the final report's artifact path under `.state/`. Historical reports without an artifact remain readable from `.state/threads/<id>.md`; files produced for Rolf are in `library/<id>/`. These folders appear only when they contain something.
 
 Decide ordinary reversible matters, record them with `hp decide <slug> "<line>" --class routine`, say what changed, and continue. Ask Rolf only about:
 

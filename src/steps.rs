@@ -517,9 +517,9 @@ else
   printf 'panes\t-\n'
 fi
 [ -d "$root" ] || exit 0
-for dir in "$root"/*/events; do
+for dir in "$root"/*/.state/events; do
   [ -d "$dir" ] || continue
-  slug=${dir%/events}; slug=${slug##*/}
+  slug=${dir%/.state/events}; slug=${slug##*/}
   for f in "$dir"/*.toml; do
     [ -f "$f" ] || continue
     id=${f##*/}; id=${id%.toml}
@@ -529,11 +529,11 @@ for dir in "$root"/*/events; do
     h=$(sha256sum "$f" | cut -d' ' -f1)
     a=$(sed -n 's/^artifact = "\([^"]*\)"/\1/p' "$f" | head -n1)
     if [ -n "$a" ]; then
-      printf 'event\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$f" "$h" "$root/$slug/artifacts/$a" "$a"
+      printf 'event\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$f" "$h" "$root/$slug/.state/artifacts/$a" "$a"
     else
       printf 'event\t%s\t%s\t%s\t%s\t-\t-\n' "$slug" "$id" "$f" "$h"
     fi
-    rec="$root/$slug/receipts/$id.toml"
+    rec="$root/$slug/.state/receipts/$id.toml"
     if [ -f "$rec" ]; then
       eh=$(sed -n 's/^event_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
       ah=$(sed -n 's/^artifact_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
@@ -1532,7 +1532,7 @@ mod tests {
         assert!(inbox::unhandled(&project).is_empty());
         let digest = crate::coordinator::digest(&ctx, &project, "ha").unwrap().0;
         assert!(
-            digest.contains("done: abc report=artifacts/def (missing)"),
+            digest.contains("done: abc report=.state/artifacts/def (missing)"),
             "{digest}"
         );
         assert!(!project.state_dir().join("inbox-counter.json").exists());
@@ -1543,8 +1543,8 @@ mod tests {
         let text = "boot\tboot-1\nfree\t1234\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
                     receipt\tdemo\tt-0001-1-1\tabc\tdef\n\
                     bootstrap\tdemo\tt-0001\tabcd\tw1:p2\n\
-                    event\tdemo\tt-0001-1-1\t/r/demo/events/t-0001-1-1.toml\tabc\t/r/demo/artifacts/def\tdef\n\
-                    event\tdemo\tt-0002-1-1\t/r/demo/events/t-0002-1-1.toml\tabc\t-\t-\n";
+                    event\tdemo\tt-0001-1-1\t/r/demo/.state/events/t-0001-1-1.toml\tabc\t/r/demo/.state/artifacts/def\tdef\n\
+                    event\tdemo\tt-0002-1-1\t/r/demo/.state/events/t-0002-1-1.toml\tabc\t-\t-\n";
         let manifest = parse_courier_manifest(text).unwrap();
         assert_eq!(manifest.boot_id, "boot-1");
         assert_eq!(manifest.free_bytes, 1234);
@@ -1585,7 +1585,7 @@ mod tests {
     fn courier_helper_answers_only_after_the_taken_cursor() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("ade");
-        let dir = root.join("demo/events");
+        let dir = root.join("demo/.state/events");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
         let script = courier_helper(&test_machine(&root.to_string_lossy()), "default");
@@ -1817,10 +1817,10 @@ pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
         );
         let manifest = format!(
             "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
-             event\talpha\tt-0001-1-1\t/box/alpha/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/artifacts/{artifact_hash}\t{artifact_hash}\n\
+             event\talpha\tt-0001-1-1\t/box/alpha/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\talpha\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n\
              bootstrap\talpha\tt-0001\t\tw2:p1\n\
-             event\tbeta\tt-0001-1-1\t/box/beta/events/t-0001-1-1.toml\t{event_hash}\t/box/beta/artifacts/{artifact_hash}\t{artifact_hash}\n\
+             event\tbeta\tt-0001-1-1\t/box/beta/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/beta/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\tbeta\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n"
         );
         let manifest_for_ssh = manifest.clone();
@@ -1863,13 +1863,9 @@ pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
             "a project with no new envelope still heard from the box"
         );
         let imported = events::load(&alpha, "t-0001-1-1").unwrap();
-        assert!(
-            imported
-                .payload
-                .done
-                .unwrap()
-                .report_path
-                .contains(&artifact_hash)
+        assert_eq!(
+            imported.payload.done.unwrap().report_path,
+            ".reports/t-0001.md"
         );
         assert_eq!(
             thread::load(&alpha, "t-0001").unwrap().bootstrap,
@@ -1909,7 +1905,7 @@ pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
         );
         let manifest = format!(
             "boot\tboot-1\nfree\t100\nagents\t-\npanes\t-\n\
-             event\talpha\tt-0001-1-1\t/box/alpha/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/artifacts/{artifact_hash}\t{artifact_hash}\n\
+             event\talpha\tt-0001-1-1\t/box/alpha/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\talpha\tt-0001-1-1\tdeadbeef\t{artifact_hash}\n"
         );
         let manifest_for_ssh = manifest.clone();

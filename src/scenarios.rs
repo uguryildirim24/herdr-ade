@@ -109,8 +109,9 @@ impl World {
         let project = project::create(&self.root, slug, "", vec![]).unwrap();
         // Scenario fixtures may write coordinator-owned files directly instead
         // of exercising their first-use commands.
-        for dir in ["tasks", "routines", "inbox", "inbox/done"] {
-            std::fs::create_dir_all(project.dir().join(dir)).unwrap();
+        std::fs::create_dir_all(project.dir().join("routines")).unwrap();
+        for dir in ["tasks", "inbox", "inbox/done"] {
+            std::fs::create_dir_all(project.state_dir().join(dir)).unwrap();
         }
         let socket = self.home.path().join(socket);
         std::fs::write(&socket, b"").unwrap();
@@ -438,7 +439,7 @@ fn an_adopted_no_repo_thread_rebinds_at_its_original_cwd() {
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().join("original");
     std::fs::create_dir_all(&cwd).unwrap();
-    let managed = project.dir().join("threads/t-0001");
+    let managed = project.state_dir().join("threads/t-0001");
     std::fs::create_dir_all(managed.join(".git")).unwrap();
     world.thread(&project, &cwd, |t| {
         t.kind = Kind::Adopted;
@@ -1625,7 +1626,7 @@ fn pr_metadata_is_in_the_digest_but_comment_bodies_are_not() {
     let digest = coordinator::digest(&ctx, &project, "ha").unwrap().0;
     assert!(digest.contains("new commenters: mallory"), "{digest}");
     assert!(!digest.contains("SECRET-BODY"));
-    let all = std::fs::read_dir(project.dir().join("inbox"))
+    let all = std::fs::read_dir(project.state_dir().join("inbox"))
         .unwrap()
         .flatten()
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
@@ -2888,8 +2889,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        5,
-        "one box build per repo plus lane settings, the pi guard, and the running-process check"
+        6,
+        "one box build per repo plus lane settings, the pi guard, project conversion, and the running-process check"
     );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
@@ -2897,17 +2898,23 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         .filter(|c| c.program == "ssh")
         .map(|c| c.args.last().cloned().unwrap_or_default())
         .collect();
+    let build_scripts: Vec<_> = scripts
+        .iter()
+        .filter(|script| script.contains("git fetch --quiet"))
+        .collect();
+    assert_eq!(build_scripts.len(), 2, "{scripts:?}");
     assert!(
-        scripts[..2].iter().all(|s| s.contains("git fetch --quiet")
-            && s.contains("git merge --ff-only")
-            && s.contains("cargo build --release --locked")
-            && s.contains("source_dirty=\"$(git status --porcelain")
-            && s.contains("cp target/release/")
-            && s.contains("install_to=/home/ubuntu/.local/bin/")
-            && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
+        build_scripts
+            .iter()
+            .all(|s| s.contains("git merge --ff-only")
+                && s.contains("cargo build --release --locked")
+                && s.contains("source_dirty=\"$(git status --porcelain")
+                && s.contains("cp target/release/")
+                && s.contains("install_to=/home/ubuntu/.local/bin/")
+                && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
         "{scripts:?}"
     );
-    for script in &scripts[..2] {
+    for script in build_scripts {
         let refresh = script
             .find("git read-tree HEAD && git update-index -q --refresh")
             .expect("box build refreshes the sync-stale index");
@@ -2919,23 +2926,35 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
             "box index refresh must precede source inspection and build: {script}"
         );
     }
+    let conversion = scripts
+        .iter()
+        .position(|script| script.contains("ticker stop") && script.contains("project convert"))
+        .expect("box project conversion");
+    let later_build = scripts
+        .iter()
+        .rposition(|script| script.contains("cargo build --release --locked"))
+        .unwrap();
     assert!(
-        scripts[2].contains("$dir/RULES.md")
-            && scripts[2].contains(crate::harness::BOX_WORKER_MARKER),
-        "{}",
-        scripts[2]
+        conversion < later_build,
+        "box records must move immediately after installing the new plugin: {scripts:?}"
     );
     let settings = calls
         .iter()
-        .filter(|call| call.program == "ssh")
-        .nth(2)
+        .find(|call| {
+            call.program == "ssh"
+                && call
+                    .args
+                    .last()
+                    .is_some_and(|script| script.contains(crate::harness::BOX_WORKER_MARKER))
+        })
         .unwrap();
     assert_eq!(settings.stdin.as_deref(), Some("# Lane rules\n"));
     assert!(
-        scripts[3].contains("HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade")
-            && scripts[3].contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard"),
-        "{}",
-        scripts[3]
+        scripts.iter().any(
+            |script| script.contains("HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade")
+                && script.contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard")
+        ),
+        "{scripts:?}"
     );
     drop(calls);
 
@@ -2961,8 +2980,11 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
 }
 
 #[test]
-fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
+fn harness_install_builds_reexecs_and_converts_before_a_failed_box_lookup() {
     let world = World::new();
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    std::fs::remove_file(project.state_dir().join("records-converted")).unwrap();
+    std::fs::write(project.dir().join("ledger.jsonl"), "old record\n").unwrap();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
     write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
     world.runner.on("cargo build", ok(""));
@@ -2994,6 +3016,11 @@ fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
 
     assert!(error.contains("machine_list_failed"), "{error}");
     assert_eq!(world.runner.count("cargo build"), 1);
+    assert!(!project.dir().join("ledger.jsonl").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.state_dir().join("ledger.jsonl")).unwrap(),
+        "old record\n"
+    );
     assert!(
         reexecs
             .borrow()

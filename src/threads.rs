@@ -309,7 +309,10 @@ fn start_with_ticker(
     let id = record.id.clone();
     {
         let _lock = project.lock()?;
-        project::write_atomic(&thread::task_path(&project, &id), args.task.as_bytes())?;
+        project::write_atomic(
+            &thread::task_path_for_write(&project, &id)?,
+            args.task.as_bytes(),
+        )?;
     }
     // Link before composing the brief so task-scoped notes are available to
     // this first attempt, not only to retries.
@@ -867,7 +870,10 @@ fn place_box_worktree(
         start_line,
         created: crate::project::now(),
     };
-    let card_path = format!("{}/{}/lanes/{}.toml", machine.root, project.slug, record.id);
+    let card_path = format!(
+        "{}/{}/.state/lanes/{}.toml",
+        machine.root, project.slug, record.id
+    );
     remote::provision_card(
         runner,
         &target,
@@ -1094,7 +1100,7 @@ fn place_ade_tab(
         );
     }
     let folder = if record.worktree_path.is_empty() {
-        project.dir().join("threads").join(&record.id)
+        thread::threads_dir_for_write(project)?.join(&record.id)
     } else {
         Path::new(&record.worktree_path).to_path_buf()
     };
@@ -2919,16 +2925,22 @@ pub(crate) fn managed_git_folder(project: &Project, record: &Thread) -> bool {
     if !record.repo.is_empty() || record.worktree_path.is_empty() {
         return false;
     }
-    let expected = project.dir().join("threads").join(&record.id);
+    let expected = [
+        thread::threads_dir(project).join(&record.id),
+        project.dir().join("threads").join(&record.id),
+    ];
     let actual = Path::new(&record.worktree_path);
-    let canonical_same = match (
-        std::fs::canonicalize(&expected),
-        std::fs::canonicalize(actual),
-    ) {
-        (Ok(expected), Ok(actual)) => expected == actual,
-        _ => false,
-    };
-    (expected == actual || canonical_same) && (actual.join(".git").is_dir() || !actual.exists())
+    let owned = expected.iter().any(|expected| {
+        expected == actual
+            || match (
+                std::fs::canonicalize(expected),
+                std::fs::canonicalize(actual),
+            ) {
+                (Ok(expected), Ok(actual)) => expected == actual,
+                _ => false,
+            }
+    });
+    owned && (actual.join(".git").is_dir() || !actual.exists())
 }
 
 fn removable_folder(project: &Project, record: &Thread) -> bool {
@@ -3871,7 +3883,7 @@ mod tests {
             ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[{"pid":99,"name":"claude","argv0":"/bin/claude"}]}}}"#),
         );
         crate::ticker::tick_project(&world.ctx(), &project).unwrap();
-        let inbox = std::fs::read_dir(project.dir().join("inbox"))
+        let inbox = std::fs::read_dir(crate::inbox::inbox_dir(&project))
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().contains("lineage-mismatch"))
@@ -4500,7 +4512,7 @@ mod tests {
         let folder = Path::new(&started.worktree_path);
         assert_eq!(
             folder,
-            std::fs::canonicalize(fx.project.dir().join("threads").join(&started.id))
+            std::fs::canonicalize(thread::threads_dir(&fx.project).join(&started.id))
                 .unwrap()
                 .as_path()
         );
