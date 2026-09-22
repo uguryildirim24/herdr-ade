@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
-      "tasks/t-0230.md",
+      "tasks/t-0234.md",
+      "tasks/t-0231.md",
+      "tasks/t-0229.md",
+      "tasks/t-0237.md",
       "tasks/review-r92.md",
-      "tasks/review-r95.md",
+      "tasks/t-0235.md",
       "tasks/review-r93.md",
+      "tasks/t-0230.md",
+      "tasks/review-r95.md",
       "tasks/review-r94.md",
       "tasks/t-0227.md",
-      "tasks/review-r91.md",
-      "tasks/t-0226.md",
-      "tasks/t-0225.md",
-      "tasks/t-0224.md",
-      "tasks/t-0223.md",
-      "tasks/t-0222.md"
+      "tasks/review-r91.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r93.md",
       "tasks/reviews/code-r94.md",
       "tasks/reviews/code-r91.md",
       "tasks/reviews/code-r90.md",
@@ -39,18 +40,23 @@
       "tasks/reviews/code-r82.md",
       "tasks/reviews/code-r85.md",
       "tasks/reviews/code-r84.md",
-      "tasks/reviews/code-r83.md",
-      "tasks/reviews/code-r81.md"
+      "tasks/reviews/code-r83.md"
     ]
   },
-  "generated": "2026-09-22T00:37:21-04:00",
+  "generated": "2026-09-22T00:52:37-04:00",
   "git": {
     "branches": [
       "main",
-      "hp/adeherdr/t-0231-review-r93-jobs-for-the-two-sign-in-help",
-      "hp/adeherdr/t-0233-review-r92-installing-twice-on-the-same",
-      "review/r92-2",
+      "hp/adeherdr/t-0237-w19-briefs-off-main",
+      "hp/adeherdr/t-0234-review-r93-jobs-for-the-two-sign-in-help",
+      "hp/adeherdr/t-0236-review-r92-installing-twice-on-the-same",
+      "review/r92-3",
+      "hp/adeherdr/t-0235-w18-pro-error-inside-completion",
       "hp/adeherdr/t-0232-review-r95-rolf-s-newer-choices-always-c",
+      "hp/adeherdr/t-0233-review-r92-installing-twice-on-the-same",
+      "review/r93-3",
+      "hp/adeherdr/t-0231-review-r93-jobs-for-the-two-sign-in-help",
+      "review/r92-2",
       "hp/adeherdr/t-0230-review-r94-a-finished-folder-that-is-alr",
       "review/r95",
       "hp/adeherdr/t-0228-review-r92-installing-twice-on-the-same",
@@ -376,22 +382,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "ca71b8d Merge commit 'bb2f93b8e0768aa456c9538d5a8e3e75fc1c19e9'",
-      "194c4b2 review(r92): brief for revision 1",
-      "bb2f93b docs(review): round r94 verdict",
-      "a8066db review(r95): brief for revision 1",
-      "87de9e0 review(cleanup): tolerate removal races",
-      "0c656e2 review(r93): brief for revision 1"
+      "caac1b7 Merge commit 'b4d814010501d284e9bf68a950078999bd09fd67'",
+      "2fd101e docs(tasks): t-0237",
+      "b4d8140 review(dispatch): approve r93 after cleanup merge",
+      "50b68c7 review(r92): brief for revision 1",
+      "4e5a3d9 docs(tasks): t-0235",
+      "b2e16ec Merge commit 'f9b4efe00ab008a3f448f2bd9b9ef1ac776a4102' into hp/adeherdr/t-0234-review-r93-jobs-for-the-two-sign-in-help"
     ],
-    "remote": "10 ahead, 0 behind origin/main",
+    "remote": "15 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "ca71b8d",
+        "head": "caac1b7",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit 'bb2f93b8e0768aa456c9538d5a8e3e75fc1c19e9'"
+        "subject": "Merge commit 'b4d814010501d284e9bf68a950078999bd09fd67'"
       },
       {
         "branch": "review/r92",
@@ -408,6 +414,13 @@
         "subject": "docs(tasks): t-0233"
       },
       {
+        "branch": "review/r92-3",
+        "dirty": 0,
+        "head": "f8dd402",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r92-3",
+        "subject": "docs(tasks): t-0236"
+      },
+      {
         "branch": "review/r93",
         "dirty": 0,
         "head": "345f901",
@@ -422,11 +435,11 @@
         "subject": "docs(tasks): t-0231"
       },
       {
-        "branch": "review/r94",
+        "branch": "review/r93-3",
         "dirty": 0,
-        "head": "25519e9",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r94",
-        "subject": "docs(tasks): t-0230"
+        "head": "7dca92d",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r93-3",
+        "subject": "docs(tasks): t-0234"
       },
       {
         "branch": "review/r95",
@@ -453,8 +466,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r94",
-    "verdict": "bb2f93b8e0768aa456c9538d5a8e3e75fc1c19e9"
+    "round": "r93",
+    "verdict": "b4d814010501d284e9bf68a950078999bd09fd67"
   },
   "session": "default",
   "unlinked_agents": [],
