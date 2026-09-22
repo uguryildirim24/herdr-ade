@@ -24,11 +24,11 @@ use crate::threads;
 const MAX_STEPS: usize = 7;
 
 pub(crate) fn plan_path(project: &Project) -> PathBuf {
-    project.dir().join("plan.toml")
+    project.record_file("plan.toml")
 }
 
 fn lock_path(project: &Project) -> PathBuf {
-    project.dir().join(".plan.lock")
+    project.state_dir().join("plan.lock")
 }
 
 struct PlanLock {
@@ -66,8 +66,9 @@ pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
 /// parent directory flushed (SPEC-talk §6.5).
 fn write(project: &Project, plan: &Plan) -> Result<()> {
     let text = toml::to_string(plan)?;
-    write_atomic(&plan_path(project), text.as_bytes())?;
-    sync_dir(&project.dir())?;
+    let path = project.record_file_for_write("plan.toml")?;
+    write_atomic(&path, text.as_bytes())?;
+    sync_dir(project.state_dir().as_path())?;
     Ok(())
 }
 
@@ -828,7 +829,7 @@ mod tests {
             created: "2026-09-22T00:00:00Z".into(),
             ..crate::task::Task::default()
         };
-        let task_dir = fx.project.dir().join("tasks");
+        let task_dir = fx.project.state_dir().join("tasks");
         std::fs::create_dir_all(&task_dir).unwrap();
         std::fs::write(
             task_dir.join("job-0001.toml"),

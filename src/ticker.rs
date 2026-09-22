@@ -2004,7 +2004,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
-        std::fs::create_dir(project.dir().join("tasks")).unwrap();
+        std::fs::create_dir(project.state_dir().join("tasks")).unwrap();
         let socket = home.path().join("herdr.sock");
         std::fs::write(&socket, b"").unwrap();
         let cwd = project.dir().to_string_lossy().into_owned();
@@ -2196,7 +2196,7 @@ mod tests {
             ..crate::task::Task::default()
         };
         std::fs::write(
-            project.dir().join("tasks/job-0001.toml"),
+            project.state_dir().join("tasks/job-0001.toml"),
             toml::to_string(&task).unwrap(),
         )
         .unwrap();
@@ -2329,7 +2329,7 @@ mod tests {
             prompt.contains("job-0001: verify 1 acceptance condition(s)"),
             "{prompt}"
         );
-        let ledger = std::fs::read_to_string(f.project.dir().join("ledger.jsonl")).unwrap();
+        let ledger = std::fs::read_to_string(f.project.record_file("ledger.jsonl")).unwrap();
         assert!(ledger.contains("coordinator_nudge"), "{ledger}");
     }
 
@@ -2372,7 +2372,7 @@ mod tests {
             ..crate::task::Task::default()
         };
         std::fs::write(
-            f.project.dir().join("tasks/job-0001.toml"),
+            f.project.state_dir().join("tasks/job-0001.toml"),
             toml::to_string(&task).unwrap(),
         )
         .unwrap();

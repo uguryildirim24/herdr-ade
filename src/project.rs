@@ -462,6 +462,25 @@ impl Project {
         self.dir().join(".state")
     }
 
+    pub(crate) fn record_dir(&self, kind: &str) -> PathBuf {
+        self.state_dir().join(kind)
+    }
+
+    pub(crate) fn record_dir_for_write(&self, kind: &str) -> Result<PathBuf> {
+        let dir = self.record_dir(kind);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+        Ok(dir)
+    }
+
+    pub(crate) fn record_file(&self, name: &str) -> PathBuf {
+        self.state_dir().join(name)
+    }
+
+    pub(crate) fn record_file_for_write(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.record_file(name))
+    }
+
     /// The canonical folder (symlinks resolved): the key of the project's
     /// `[safety]` table and of its routine approvals.
     pub(crate) fn canonical_dir(&self) -> PathBuf {
@@ -1054,8 +1073,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         }
     }
 
-    let history = latest_history(project)
-        .unwrap_or_else(|| "the project record files beside this page".into());
+    let history = latest_history(project).unwrap_or_else(|| "the hidden .state folder".into());
     out.push_str(&format!(
         "\n---\nView rebuilt at {}; history is kept in {}.\n",
         now(),
@@ -1152,15 +1170,132 @@ fn move_history_file(
     Ok(())
 }
 
-/// Converts an old multi-document project once. Old bytes remain readable in
-/// a timestamped history folder but are never imported as current records.
+const RECORD_DIRS: &[&str] = &[
+    "asks",
+    "artifacts",
+    "dialogues",
+    "deliveries",
+    "events",
+    "imports",
+    "inbox",
+    "lanes",
+    "ops",
+    "receipts",
+    "talk",
+    "tasks",
+];
+const RECORD_FILES: &[(&str, &str)] = &[
+    (".decisions.lock", "decisions.lock"),
+    (".plan.lock", "plan.lock"),
+    ("decisions.jsonl", "decisions.jsonl"),
+    ("ledger.jsonl", "ledger.jsonl"),
+    ("notes.jsonl", "notes.jsonl"),
+    ("plan.toml", "plan.toml"),
+    ("terms.toml", "terms.toml"),
+];
+
+fn top_level_thread_records(project: &Project) -> Result<Vec<PathBuf>> {
+    let dir = project.dir().join("threads");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("could not inspect old thread records in {}", dir.display())
+            });
+        }
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            records.push(entry.path());
+        }
+    }
+    records.sort();
+    Ok(records)
+}
+
+fn preflight_machine_records(project: &Project) -> Result<()> {
+    let thread_records = top_level_thread_records(project)?;
+    for kind in RECORD_DIRS {
+        let old = project.dir().join(kind);
+        let new = project.state_dir().join(kind);
+        if old.exists() && new.exists() {
+            return Err(crate::refusal::error(format!(
+                "project_convert_conflict: both {} and {} exist",
+                old.display(),
+                new.display()
+            )));
+        }
+    }
+    if !thread_records.is_empty() && project.state_dir().join("threads").exists() {
+        return Err(crate::refusal::error(format!(
+            "project_convert_conflict: both {} and {} contain thread records",
+            project.dir().join("threads").display(),
+            project.state_dir().join("threads").display()
+        )));
+    }
+    for (old_name, new_name) in RECORD_FILES {
+        let old = project.dir().join(old_name);
+        let new = project.state_dir().join(new_name);
+        if old.exists() && new.exists() {
+            return Err(crate::refusal::error(format!(
+                "project_convert_conflict: both {} and {} exist",
+                old.display(),
+                new.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn convert_machine_records(project: &Project) -> Result<Vec<String>> {
+    preflight_machine_records(project)?;
+    let thread_records = top_level_thread_records(project)?;
+    let mut moved = Vec::new();
+    for kind in RECORD_DIRS {
+        let old = project.dir().join(kind);
+        if old.exists() {
+            std::fs::rename(&old, project.state_dir().join(kind))?;
+            moved.push(format!("{kind}/"));
+        }
+    }
+    if !thread_records.is_empty() {
+        let target = project.state_dir().join("threads");
+        std::fs::create_dir(&target)?;
+        for old in thread_records {
+            let name = old.file_name().context("thread record has no file name")?;
+            std::fs::rename(&old, target.join(name))?;
+            moved.push(format!("threads/{}", name.to_string_lossy()));
+        }
+        let old = project.dir().join("threads");
+        if std::fs::read_dir(&old)?.next().is_none() {
+            std::fs::remove_dir(old)?;
+        }
+    }
+    for (old_name, new_name) in RECORD_FILES {
+        let old = project.dir().join(old_name);
+        if old.exists() {
+            std::fs::rename(&old, project.state_dir().join(new_name))?;
+            moved.push((*old_name).to_string());
+        }
+    }
+    Ok(moved)
+}
+
+/// Converts old documents and top-level machine records explicitly. A second
+/// conversion is a no-op. Every old/new record conflict is found before any
+/// path is moved.
 pub(crate) fn convert(project: &Project) -> Result<(String, Vec<String>)> {
-    let _lock = page_lock(project)?;
-    let marker = project.state_dir().join("page-converted");
+    let _project_lock = project.lock()?;
+    let _page_lock = page_lock(project)?;
+    let marker = project.state_dir().join("records-converted");
+    let page_marker = project.state_dir().join("page-converted");
+    preflight_machine_records(project)?;
     if marker.exists() {
-        return Err(crate::refusal::error(
-            "project_convert_done: this project already has its one current page",
-        ));
+        let history = std::fs::read_to_string(page_marker).unwrap_or_default();
+        return Ok((history.trim().to_string(), Vec::new()));
     }
     if crate::round::list(project).into_iter().any(|round| {
         matches!(
@@ -1172,6 +1307,13 @@ pub(crate) fn convert(project: &Project) -> Result<(String, Vec<String>)> {
             "project_convert_round: finish the round that is being merged before converting",
         ));
     }
+    let mut moved = convert_machine_records(project)?;
+    if page_marker.exists() {
+        let history = std::fs::read_to_string(&page_marker).unwrap_or_default();
+        write_atomic(&marker, b"current\n")?;
+        return Ok((history.trim().to_string(), moved));
+    }
+
     let original = std::fs::read(project.project_md())?;
     let prefix = project_md_prefix(&original)?.to_vec();
     let body = original[prefix.len()..].to_vec();
@@ -1197,7 +1339,7 @@ pub(crate) fn convert(project: &Project) -> Result<(String, Vec<String>)> {
         move_history_file(project, &history, Path::new(relative), &mut files)?;
     }
     files.sort_by(|a, b| a.original.cmp(&b.original));
-    let moved: Vec<String> = files.iter().map(|file| file.original.clone()).collect();
+    moved.extend(files.iter().map(|file| file.original.clone()));
     write_atomic(
         &history.join("manifest.toml"),
         toml::to_string(&HistoryManifest {
@@ -1215,8 +1357,10 @@ pub(crate) fn convert(project: &Project) -> Result<(String, Vec<String>)> {
     page.push(b'\n');
     page.extend_from_slice(page_body(project, &settings).as_bytes());
     write_atomic(&project.project_md(), &page)?;
-    write_atomic(&marker, format!(".state/history/{created}/\n").as_bytes())?;
-    Ok((format!(".state/history/{created}/"), moved))
+    let history = format!(".state/history/{created}/");
+    write_atomic(&page_marker, format!("{history}\n").as_bytes())?;
+    write_atomic(&marker, b"current\n")?;
+    Ok((history, moved))
 }
 
 /// Creates the folder and skeleton files. The only code path that creates a
@@ -1262,6 +1406,8 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
         &project.state_dir().join("project.json"),
         &ProjectState::default(),
     )?;
+    write_atomic(&project.state_dir().join("page-converted"), b"current\n")?;
+    write_atomic(&project.state_dir().join("records-converted"), b"current\n")?;
     // PROJECT.md last: a folder without it is not a project, so a half-made
     // skeleton is never picked up by `list` or the ticker.
     write_atomic(
@@ -1477,9 +1623,11 @@ mod tests {
     }
 
     #[test]
-    fn convert_moves_old_documents_byte_for_byte_without_importing_them() {
+    fn convert_moves_the_old_layout_once_and_refuses_every_conflict_before_moving() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::remove_file(project.state_dir().join("page-converted")).unwrap();
+        std::fs::remove_file(project.state_dir().join("records-converted")).unwrap();
         let page = std::fs::read(project.project_md()).unwrap();
         let prefix = project_md_prefix(&page).unwrap().to_vec();
         let old_body = b"\n# Old instructions\n\nKeep this only in history.\n";
@@ -1496,6 +1644,48 @@ mod tests {
         )
         .unwrap();
 
+        for kind in RECORD_DIRS {
+            let dir = project.dir().join(kind);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("kept"), format!("{kind}\n")).unwrap();
+        }
+        let task = crate::task::Task {
+            id: "job-0001".into(),
+            title: "Old task".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["The task loads after conversion.".into()],
+            created: now(),
+            ..crate::task::Task::default()
+        };
+        std::fs::write(
+            project.dir().join("tasks/job-0001.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+        let live_lane = project.dir().join("threads/t-0001");
+        let thread = crate::thread::Thread {
+            id: "t-0001".into(),
+            title: "Old lane".into(),
+            cwd: live_lane.to_string_lossy().into_owned(),
+            ..crate::thread::Thread::default()
+        };
+        std::fs::create_dir(project.dir().join("threads")).unwrap();
+        std::fs::write(
+            project.dir().join("threads/t-0001.toml"),
+            toml::to_string(&thread).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(&live_lane).unwrap();
+        std::fs::write(live_lane.join("live"), b"live\n").unwrap();
+        for (old, _) in RECORD_FILES {
+            let bytes = if *old == "plan.toml" {
+                toml::to_string(&crate::contracts::Plan::default()).unwrap()
+            } else {
+                String::new()
+            };
+            std::fs::write(project.dir().join(old), bytes).unwrap();
+        }
+
         let (folder, moved) = convert(&project).unwrap();
         let history = project.dir().join(folder);
         assert_eq!(std::fs::read(history.join("PROJECT.md")).unwrap(), old_body);
@@ -1504,13 +1694,53 @@ mod tests {
             b"archived bytes\n"
         );
         assert!(history.join("manifest.toml").is_file());
-        assert!(moved.contains(&"PROJECT.md".to_string()));
-        for old in ["MEMORY.md", "memory", "TASKS.md", "GLOSSARY.md"] {
-            assert!(!project.dir().join(old).exists(), "{old}");
+        assert!(moved.contains(&"artifacts/".to_string()));
+        for kind in RECORD_DIRS {
+            assert!(!project.dir().join(kind).exists(), "{kind}");
+            assert_eq!(
+                std::fs::read_to_string(project.state_dir().join(kind).join("kept")).unwrap(),
+                format!("{kind}\n")
+            );
         }
-        let body = project.read_project_md().unwrap().1;
-        assert!(!body.contains("Keep this only in history"));
-        assert!(crate::note::active_rows(&project).is_empty());
+        assert_eq!(
+            crate::task::load(&project, "job-0001").unwrap().title,
+            "Old task"
+        );
+        let loaded_thread = crate::thread::load(&project, "t-0001").unwrap();
+        assert_eq!(loaded_thread.title, "Old lane");
+        assert_eq!(loaded_thread.cwd, live_lane.to_string_lossy());
+        assert!(live_lane.join("live").is_file());
+        assert_eq!(
+            std::fs::read(crate::events::artifact_path(&project, "kept")).unwrap(),
+            b"artifacts\n"
+        );
+        assert!(project.state_dir().join("threads/t-0001.toml").is_file());
+        for (old, new) in RECORD_FILES {
+            assert!(!project.dir().join(old).exists(), "{old}");
+            assert!(project.state_dir().join(new).is_file(), "{new}");
+        }
+        assert!(convert(&project).unwrap().1.is_empty());
+
+        let conflict = create(root.path(), "conflict", "", vec![]).unwrap();
+        std::fs::create_dir(conflict.dir().join("tasks")).unwrap();
+        std::fs::create_dir(conflict.state_dir().join("tasks")).unwrap();
+        std::fs::create_dir(conflict.dir().join("events")).unwrap();
+        std::fs::write(conflict.dir().join("events/untouched"), b"old\n").unwrap();
+        let error = convert(&conflict).unwrap_err().to_string();
+        assert!(error.contains("project_convert_conflict"), "{error}");
+        assert!(conflict.dir().join("events/untouched").is_file());
+        assert!(!conflict.state_dir().join("events").exists());
+
+        let malformed = create(root.path(), "malformed", "", vec![]).unwrap();
+        std::fs::remove_file(malformed.state_dir().join("records-converted")).unwrap();
+        std::fs::write(malformed.dir().join("threads"), b"not a record folder\n").unwrap();
+        let error = convert(&malformed).unwrap_err().to_string();
+        assert!(
+            error.contains("could not inspect old thread records"),
+            "{error}"
+        );
+        assert!(malformed.dir().join("threads").is_file());
+        assert!(!malformed.state_dir().join("records-converted").exists());
     }
 
     #[test]

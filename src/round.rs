@@ -738,7 +738,7 @@ fn thread_record(project: &Project, id: &str) -> Result<thread::Thread> {
 // ------------------------------------------------------------------- events
 
 pub fn events_dir(project: &Project) -> PathBuf {
-    project.dir().join("events")
+    project.record_dir("events")
 }
 
 /// Every sealed event. An unreadable event file fails closed: a decision
@@ -2447,7 +2447,11 @@ fn reviewer_task(
             .iter()
             .find(|event| event.id == pin.event)
             .and_then(|event| event.payload.done.as_ref())
-            .map(|done| done.report_path.clone())
+            .map(|done| {
+                crate::events::artifact_path(project, &done.artifact)
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .unwrap_or_default();
         out.push_str(&format!(
             "- {}: sha `{}`, report `{}`\n",
@@ -2859,10 +2863,6 @@ pub fn verdict_path(round: &str) -> String {
     format!("tasks/reviews/code-{round}.md")
 }
 
-pub fn artifacts_dir(project: &Project) -> PathBuf {
-    project.dir().join("artifacts")
-}
-
 /// A fence longer than any backtick run inside `body` (D10).
 pub fn fence_for(body: &str) -> String {
     let mut longest = 0;
@@ -2940,7 +2940,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let mut reports = Vec::new();
     for member in &record.manifest.members {
         let pin = member.pin.as_ref().context("round_not_complete")?;
-        let path = artifacts_dir(&project).join(&pin.artifact);
+        let path = crate::events::artifact_path(&project, &pin.artifact);
         let bytes = std::fs::read(&path)
             .map_err(|e| anyhow::anyhow!("artifact_missing: {} ({e})", path.display()))?;
         if sha256_hex(&bytes) != pin.artifact {
@@ -4707,7 +4707,7 @@ pub mod testkit {
         /// Writes the artifact and a sealed `done` event, as A2's seal would.
         pub fn seal_done(&self, id: &str, attempt: u32, n: u32, sha: &str, report: &str) -> String {
             let artifact = sha256_hex(report.as_bytes());
-            let dir = self.project.dir().join("artifacts");
+            let dir = self.project.state_dir().join("artifacts");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(&artifact), report).unwrap();
             self.seal(
@@ -4745,7 +4745,7 @@ pub mod testkit {
 
         fn seal(&self, id: &str, attempt: u32, n: u32, payload: EventPayload) -> String {
             let event_id = format!("{id}-{attempt}-{n}");
-            let dir = self.project.dir().join("events");
+            let dir = self.project.state_dir().join("events");
             std::fs::create_dir_all(&dir).unwrap();
             let event = Event {
                 id: event_id.clone(),
@@ -5287,7 +5287,7 @@ mod tests {
             assert!(repo.is_ancestor("main", &lane_sha).unwrap());
         }
         assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
-        assert!(!fx.project.dir().join("ledger.jsonl").exists());
+        assert!(!fx.project.state_dir().join("ledger.jsonl").exists());
         assert!(repo.branch_head("box-only").unwrap().is_none());
         assert!(repo.show_file("HEAD", "missing.md").unwrap().is_none());
         assert_eq!(
@@ -5869,6 +5869,7 @@ mod tests {
                 state: "running".into(),
                 reason: None,
             }],
+            conversions: vec!["local project demo: already converted".into()],
             tasks: vec![crate::harness::TaskInstallProof {
                 project: "demo".into(),
                 task: "job-0001".into(),
@@ -6597,7 +6598,15 @@ mod tests {
         for (id, sha) in &lanes {
             assert!(task.contains(id), "{task}");
             assert!(task.contains(sha), "{task}");
-            assert!(task.contains(&format!(".reports/{id}.md")), "{task}");
+            let event = crate::events::list(&fx.project)
+                .into_iter()
+                .find(|event| event.thread == *id)
+                .unwrap();
+            let artifact = event.payload.done.unwrap().artifact;
+            assert!(
+                task.contains(&format!(".state/artifacts/{artifact}")),
+                "{task}"
+            );
         }
 
         let advanced_again = advance(&ctx, "demo").unwrap();
@@ -6768,12 +6777,21 @@ mod tests {
         // The same verdict is never announced twice.
         advance(&ctx, "demo").unwrap();
         assert!(crate::inbox::unhandled(&fx.project).is_empty());
-        assert_eq!(
-            crate::coordinator::digest(&ctx, &fx.project, "ha")
-                .unwrap()
-                .0,
-            digest
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(
+            digest.contains("merge verdict; run `round merge r1`"),
+            "{digest}"
         );
+        let says = crate::talk::read(&fx.project)
+            .lines
+            .iter()
+            .filter(|line| {
+                matches!(&line.entry, crate::talk::Entry::Say { what, .. } if what.contains("merge verdict"))
+            })
+            .count();
+        assert_eq!(says, 1, "the verdict was not announced twice");
     }
 
     #[test]

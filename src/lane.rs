@@ -216,11 +216,12 @@ fn current_lane(ctx: &Ctx) -> Result<Binding> {
     }
 }
 
-/// Box lanes on this machine: the lane card under `<root>/<slug>/lanes/`.
+/// Box lanes on this machine: the lane card under the project's hidden state.
 fn box_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
     let mut matches = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
-        let dir = ctx.root.join(&slug).join("lanes");
+        let project = Project::load(&ctx.root, &slug)?;
+        let dir = project.record_dir("lanes");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -238,10 +239,9 @@ fn box_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
             if card.pane_id != pane {
                 continue;
             }
-            let project = Project::load(&ctx.root, &slug)?;
             validate_card(ctx, &card)?;
             matches.push(Binding {
-                project,
+                project: project.clone(),
                 thread: thread_from_card(&card),
                 card: Some(card),
             });

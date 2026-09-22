@@ -59,7 +59,7 @@ fn lock(project: &Project) -> Result<File> {
 }
 
 fn load(project: &Project) -> Result<State> {
-    let text = match std::fs::read_to_string(project.dir().join("ledger.jsonl")) {
+    let text = match std::fs::read_to_string(project.record_file("ledger.jsonl")) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
         Err(e) => return Err(e.into()),
@@ -109,13 +109,11 @@ fn load(project: &Project) -> Result<State> {
 fn append(project: &Project, line: &Line) -> Result<()> {
     let mut bytes = serde_json::to_vec(line)?;
     bytes.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(project.dir().join("ledger.jsonl"))?;
+    let path = project.record_file_for_write("ledger.jsonl")?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    File::open(project.dir())?.sync_all()?;
+    File::open(project.state_dir())?.sync_all()?;
     Ok(())
 }
 
@@ -503,14 +501,14 @@ mod tests {
     fn repeats_fold_close_and_reopen_without_rewriting_evidence() {
         let (_root, p) = fixture();
         let a = record(&p, "start", "r1", "bad\n  start").unwrap();
-        let before = std::fs::read(p.dir().join("ledger.jsonl")).unwrap();
+        let before = std::fs::read(p.record_file("ledger.jsonl")).unwrap();
         let b = record(&p, "start", "r1", "\x1b[31mbad start\x1b[0m").unwrap();
         assert_eq!(a.id, b.id);
         assert_eq!(b.count, 2);
         assert_eq!(b.at, a.at);
         assert_eq!(list(&p).unwrap().len(), 1);
         assert!(
-            std::fs::read(p.dir().join("ledger.jsonl"))
+            std::fs::read(p.record_file("ledger.jsonl"))
                 .unwrap()
                 .starts_with(&before)
         );
@@ -601,11 +599,11 @@ mod tests {
     #[test]
     fn broken_journals_are_reported_not_overwritten() {
         let (_root, p) = fixture();
-        std::fs::write(p.dir().join("ledger.jsonl"), "{unfinished").unwrap();
+        std::fs::write(p.state_dir().join("ledger.jsonl"), "{unfinished").unwrap();
         assert!(list(&p).is_err());
         assert!(record(&p, "start", "r1", "failed").is_err());
         assert_eq!(
-            std::fs::read_to_string(p.dir().join("ledger.jsonl")).unwrap(),
+            std::fs::read_to_string(p.state_dir().join("ledger.jsonl")).unwrap(),
             "{unfinished"
         );
     }
@@ -624,7 +622,7 @@ mod tests {
             assert!(!runner.run(&cmd).unwrap().success());
         }
         assert!(list(&p).unwrap().is_empty());
-        assert!(!p.dir().join("ledger.jsonl").exists());
+        assert!(!p.state_dir().join("ledger.jsonl").exists());
     }
 
     #[test]
