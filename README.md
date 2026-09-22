@@ -97,7 +97,7 @@ It never deletes a branch, merges or pushes on its own. An ADE lane is `git work
 
 ### What is `--plain`?
 
-A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the plugin's plain-language check (one sentence, known words). Recipe choice normally comes from the editable `[routing]` table in `config.toml`; `context` lists every recipe and its exact route. `thread start` rejects model and role flags. Only a model Rolf explicitly names may use `--recipe`, together with `--basis` quoting his request on the task. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing).
+A birth sentence. `thread start` and `thread adopt` require `--plain`. The sentence must pass the record check: one sentence with no identifier-shaped tokens; unlike prose sent to Rolf, it may use words outside the glossary. Recipe choice normally comes from the editable `[routing]` table in `config.toml`; `context` lists every recipe and its exact route. `thread start` rejects model and role flags. Only a model Rolf explicitly names may use `--recipe`, together with `--basis` quoting his request on the task. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing).
 
 ### Where does my project live?
 
