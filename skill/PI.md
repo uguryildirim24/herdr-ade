@@ -61,14 +61,18 @@ extension or the guard is missing, or when the login is not ready.
 ## When a lane is stuck
 
 A provider limit, a dead login or an unreachable endpoint is not idle and not
-done. The guard reports the pane `blocked` and sends one
-`WAITING <lane> <provider> <class>: <what>` line to you. Classes: `limit`,
-`login`, `unreachable`, `error`.
+done. The guard reports the pane `blocked` and seals one typed provider-failure
+event. Its provider kind is `limit`, `login`, `unreachable` or `error`.
 
-- `limit`: wait. Do not re-prompt.
+The event starts bounded recovery automatically. Every provider failure starts
+the same task as a new process on the same recipe; it never selects a fallback.
+An explicit `hp thread retry <slug> <id> --reason "<evidence>"` does the same and
+consumes the next bounded retry. It refuses after the limit is exhausted and
+waits for the coordinator. Never re-prompt or type recovery into the pane.
+
+- `limit`: wait.
 - `login`: tell Rolf to run `herdr-pi login` again.
-- `unreachable` or `error`: use `hp thread retry <slug> <id> --reason "<evidence>"`.
-  The recovery policy keeps provider failures on the same recipe.
+- `unreachable` or `error`: let the bounded recovery run.
 - The guard never sends `DONE`. Only `hp done` does.
 
 If you see the trust question or the missing-folder question on screen, type
