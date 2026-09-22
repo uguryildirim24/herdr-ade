@@ -1665,7 +1665,10 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     let mut worktree = "not_applicable".to_string();
     let mut worktree_reason = close_error;
     if removable_folder(&project, &record) {
-        if pane == "cleanup_pending" {
+        if !worktree_exists(ctx, &project, &record)? {
+            thread::update(&project, id, |t| t.worktree_path.clear())?;
+            worktree = "removed".into();
+        } else if pane == "cleanup_pending" {
             worktree = "kept".into();
         } else {
             let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
@@ -1899,6 +1902,9 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     }
     crate::round::require_resolvable(&project, id)?;
 
+    let removable = removable_folder(&project, &record);
+    let already_removed = removable && !worktree_exists(ctx, &project, &record)?;
+
     // Every path that resolves a thread performs a final copy first.
     let mut removal_refusal = None;
     let (final_copy, copy_notes) = if args.skip_copy {
@@ -1908,7 +1914,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         match copied.outcome {
             CopyOutcome::Complete => ("complete".to_string(), Vec::new()),
             CopyOutcome::Partial(notes) => {
-                if removable_folder(&project, &record) && !args.discard_uncopied {
+                if removable && !already_removed && !args.discard_uncopied {
                     removal_refusal = Some(
                         "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
                             .to_string(),
@@ -1926,7 +1932,10 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
 
     let mut pane_closed = false;
     let mut worktree_removed = false;
-    if removable_folder(&project, &record) {
+    if already_removed {
+        thread::update(&project, id, |t| t.worktree_path.clear())?;
+        worktree_removed = true;
+    } else if removable {
         if args.keep_pane {
             removal_refusal = Some(
                 "worktree_in_use: the worktree was kept because --keep-pane leaves its pane open"
@@ -2349,11 +2358,93 @@ pub(crate) fn inspect_worktree_for_removal(
     )
 }
 
+/// Whether the recorded checkout still exists. A missing checkout is the
+/// desired cleanup state, so its stale Git registration is pruned immediately.
+/// A box transport failure remains an error: absence is only accepted after a
+/// successful answer from that machine.
+fn worktree_exists(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
+    if !record.is_remote() {
+        return match std::fs::symlink_metadata(&record.worktree_path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !managed_git_folder(project, record) {
+                    crate::git::worktree_prune(ctx.runner, &record.repo)?;
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("could not inspect worktree {}", record.worktree_path)),
+        };
+    }
+
+    let (settings, _) = project.read_project_md()?;
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        record.machine_route(),
+    )?;
+    let (box_repo, _) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
+    let present = "__HERDR_WORKTREE_PRESENT__";
+    let removed = "__HERDR_WORKTREE_REMOVED__";
+    let script = remote::with_path(
+        &machine.path,
+        &format!(
+            "if [ -e {} ]; then printf '{present}\\n'; else printf '{removed}\\n'; fi",
+            remote::quote(&record.worktree_path),
+        ),
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        Duration::from_secs(20),
+    )?;
+    if !out.success() {
+        bail!("box worktree check failed: {}", out.error_text());
+    }
+    if out.stdout.lines().any(|line| line == present) {
+        return Ok(true);
+    }
+    if !out.stdout.lines().any(|line| line == removed) {
+        bail!("box worktree check returned no presence answer");
+    }
+    let cleanup = remote::with_path(
+        &machine.path,
+        &format!(
+            "cd {} && git worktree prune --expire=now && rm -rf -- {}",
+            remote::quote(&box_repo),
+            remote::quote(&build),
+        ),
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &cleanup,
+        None,
+        Duration::from_secs(20),
+    )?;
+    if !out.success() {
+        bail!("box worktree prune failed: {}", out.error_text());
+    }
+    Ok(false)
+}
+
 /// Never forces. Git's refusal is reported unchanged.
 fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if managed_git_folder(project, record) {
-        std::fs::remove_dir_all(&record.worktree_path)
-            .with_context(|| format!("could not remove managed folder {}", record.worktree_path))?;
+        match std::fs::remove_dir_all(&record.worktree_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not remove managed folder {}", record.worktree_path)
+                });
+            }
+        }
         return Ok(());
     }
     if !record.is_remote() {
@@ -2375,8 +2466,10 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     let script = remote::with_path(
         &machine.path,
         &format!(
-            "cd {} && git worktree remove {} && rm -rf -- {}",
+            "cd {} && if [ -e {} ]; then git worktree remove {} || {{ [ ! -e {} ] && git worktree prune --expire=now; }}; else git worktree prune --expire=now; fi && rm -rf -- {}",
             remote::quote(&box_repo),
+            remote::quote(&record.worktree_path),
+            remote::quote(&record.worktree_path),
             remote::quote(&record.worktree_path),
             remote::quote(&build)
         ),
@@ -2402,8 +2495,14 @@ pub(crate) fn managed_git_folder(project: &Project, record: &Thread) -> bool {
     }
     let expected = project.dir().join("threads").join(&record.id);
     let actual = Path::new(&record.worktree_path);
-    std::fs::canonicalize(&expected).ok() == std::fs::canonicalize(actual).ok()
-        && actual.join(".git").is_dir()
+    let canonical_same = match (
+        std::fs::canonicalize(&expected),
+        std::fs::canonicalize(actual),
+    ) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => false,
+    };
+    (expected == actual || canonical_same) && (actual.join(".git").is_dir() || !actual.exists())
 }
 
 fn removable_folder(project: &Project, record: &Thread) -> bool {
@@ -2417,6 +2516,9 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
     }
     if let Err(error) = crate::git::worktree_remove(ctx.runner, &record.repo, &record.worktree_path)
     {
+        if !worktree_exists(ctx, project, record)? {
+            return Ok(());
+        }
         let _ = thread::update(project, &record.id, |t| {
             t.partial = Some("worktree_remove".into());
         });
@@ -3637,6 +3739,124 @@ mod tests {
             started
                 .worktree_path
                 .starts_with(&fx.repo.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn cancel_and_resolve_record_an_already_gone_local_worktree_as_removed() {
+        use crate::round::testkit::{fixture, git};
+
+        let fx = fixture();
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let ctx = fx.world.ctx();
+        let prepare_gone = |number| {
+            let (id, _) = fx.lane(number);
+            let record = thread::update(&fx.project, &id, |t| {
+                t.repo = repo.clone();
+                t.thread_dir = t.worktree_path.clone();
+            })
+            .unwrap();
+            std::fs::remove_dir_all(&record.worktree_path).unwrap();
+            (id, record.worktree_path)
+        };
+
+        let (cancelled_id, cancelled_path) = prepare_gone(1);
+        let cancelled =
+            cancel(&ctx, "demo", &cancelled_id, "the work is no longer needed").unwrap();
+        assert_eq!(cancelled.worktree, "removed");
+        assert_eq!(cancelled.worktree_reason, None);
+        assert!(
+            thread::load(&fx.project, &cancelled_id)
+                .unwrap()
+                .worktree_path
+                .is_empty()
+        );
+
+        let (resolved_id, resolved_path) = prepare_gone(2);
+        let resolved = resolve(&ctx, "demo", &resolved_id, &ResolveArgs::default()).unwrap();
+        assert_eq!(resolved.worktree, "removed");
+        assert_eq!(resolved.worktree_path, resolved_path);
+        assert_eq!(resolved.worktree_reason, None);
+        assert!(
+            thread::load(&fx.project, &resolved_id)
+                .unwrap()
+                .worktree_path
+                .is_empty()
+        );
+
+        let registered = git(&fx.repo, &["worktree", "list", "--porcelain"]);
+        assert!(!registered.contains(&cancelled_path), "{registered}");
+        assert!(!registered.contains(&resolved_path), "{registered}");
+    }
+
+    #[test]
+    fn a_gone_box_worktree_is_removed_only_after_the_box_prunes_it() {
+        use crate::runner::fake::ok;
+
+        let fx = crate::round::testkit::fixture();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].box_path = Some("/box/repo".into());
+        settings.repos[0].publish_url = Some("https://example.invalid/repo.git".into());
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        fx.world.runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"box-id","label":"box","target":"box","session":"default","enabled":true}]"#),
+        );
+        fx.world.runner.on_fn(
+            |cmd| {
+                cmd.program == "ssh"
+                    && cmd
+                        .args
+                        .last()
+                        .is_some_and(|script| script.contains("__HERDR_WORKTREE_REMOVED__"))
+            },
+            |_| Ok(ok("__HERDR_WORKTREE_REMOVED__\n")),
+        );
+        fx.world
+            .runner
+            .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+
+        let remote_path = "/box/repo/.worktrees/t-0001";
+        let record = thread::allocate(&fx.project, |t| {
+            t.kind = Kind::Worktree;
+            t.status = Status::Open;
+            t.repo = fx.repo.to_string_lossy().into_owned();
+            t.machine = "box".into();
+            t.machine_id = "box-id".into();
+            t.worktree_path = remote_path.into();
+            t.thread_dir = format!("{remote_path}/.herdr-project/demo-t-0001");
+            t.branch = "lane/box".into();
+        })
+        .unwrap();
+
+        let outcome =
+            resolve(&fx.world.ctx(), "demo", &record.id, &ResolveArgs::default()).unwrap();
+        assert_eq!(outcome.worktree, "removed");
+        assert_eq!(outcome.worktree_path, remote_path);
+        assert!(
+            thread::load(&fx.project, &record.id)
+                .unwrap()
+                .worktree_path
+                .is_empty()
+        );
+        let calls = fx.world.runner.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.display().contains("__HERDR_WORKTREE_REMOVED__"))
+        );
+        let cleanup = calls
+            .iter()
+            .find(|call| call.display().contains("git worktree prune --expire=now"))
+            .expect("box cleanup");
+        let command = cleanup.display();
+        assert!(
+            command.contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
+            "{command}"
         );
     }
 
