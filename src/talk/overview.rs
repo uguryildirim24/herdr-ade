@@ -557,7 +557,7 @@ impl Overview {
 }
 
 /// One line per stable task. The marker is the same evidence-derived word
-/// shown by TASKS.md, context and the plan projection.
+/// shown by the project page, context and the plan projection.
 fn task_rows(project: &Project) -> (Vec<Row>, usize) {
     let (views, errors) = crate::task::views(project);
     let mut rows = Vec::new();
@@ -721,11 +721,6 @@ mod tests {
         live.poll(&fx.world.ctx(), &fx.project);
         assert!(!live.reachable);
         assert_eq!(live.state(&fx.project), "unreachable");
-        std::fs::write(
-            fx.project.dir().join("TASKS.md"),
-            "## Backlog\n- [ ] First thing (me)\n- [ ] Second thing (agent)\n",
-        )
-        .unwrap();
         let before = fx.world.runner.calls.borrow().len();
         let o = Overview::load(
             &fx.project,
@@ -733,8 +728,8 @@ mod tests {
             &Conversation::default(),
             &live,
         );
-        // The header counts the task list and the open questions, while the
-        // running rows keep their own state words.
+        // The header counts open tasks and questions, while running rows keep
+        // their own state words.
         assert_eq!(o.needs, 0);
         assert_eq!(o.active, 0);
         assert!(o.sections[3].iter().all(|r| {

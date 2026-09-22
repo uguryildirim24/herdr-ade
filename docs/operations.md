@@ -15,18 +15,16 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
 
 ```
 ~/.herdr-ade/<project>/
-  PROJECT.md              settings and historical standing instructions; yours
-  notes.jsonl             dated memory and instructions with request ids and replacements
-  MEMORY.md, memory/      historical memory, shown as undated until explicitly replaced
+  PROJECT.md              one current page: editable settings, then a binary-written view
+  notes.jsonl             dated facts and instructions with request ids and replacements
   tasks/job-NNNN.toml     stable tasks: request, acceptance, links and evidence; the binary's
-  TASKS.md                generated task view; never edit it (the first task archives any old hand-written list in memory/archive/)
   routines/<name>.md      routines; the coordinator's
   scratch/                the coordinator's temporary files
   threads/<id>.toml       thread record          threads/<id>.md   home copy of its report
   threads/<id>.task.md    the task as given      threads/<id>/     working folder of a tab thread
   inbox/, inbox/done/     messages with no thread or round home
   library/<id>/           home copy of files a thread produced
-  .state/                 status, coordinator pane, ticker state, lock
+  .state/                 status, coordinator pane, ticker state, locks and converted history
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
 ~/.config/herdr-ade/config.toml             executable recipes, editable routing, dispatch placement, machines and harness repositories; any coordinator may edit it
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
@@ -48,7 +46,7 @@ disposable = ["target", ".target", "zig-out", ".zig-cache", "node_modules"]
 min_free_disk_gb = 12
 ```
 
-`PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `task_states` (ordered task milestones; defaults to `finished`, `reviewed`, `merged`), `repos` (`path`, optional `machine`, `box_path`, `publish_url`, `disposable`, integration `branch`, allowed `push_remote`, repository `gates`, and a repository-specific `task_states` override), `talk` (default: on for a `claude` coordinator), `nudge` (`false`). Each gate is `{ command = "...", env = { NAME = "value" } }`; omitted `gates` means not configured while `gates = []` explicitly makes that repository gate-free. A project-wide `gates` key is removed. Projects have no thread-count limit. `max_parallel_threads`, `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. `[roles.*]` is gone from both files and is refused. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). The ordered `[routing]` table selects a recipe by workflow or task product.
+Only the front matter of `PROJECT.md` is hand-edited. Its body is rebuilt atomically from the records and shows the goal, what Rolf gets, waits, running work, plan, open tasks, current instructions and facts, recent decisions and recent completions. A rewrite compares the front matter again before replacing the page, so it will not overwrite a concurrent settings edit. `PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `task_states` (ordered task milestones; defaults to `finished`, `reviewed`, `merged`), `repos` (`path`, optional `machine`, `box_path`, `publish_url`, `disposable`, integration `branch`, allowed `push_remote`, repository `gates`, and a repository-specific `task_states` override), `talk` (default: on for a `claude` coordinator), `nudge` (`false`). Each gate is `{ command = "...", env = { NAME = "value" } }`; omitted `gates` means not configured while `gates = []` explicitly makes that repository gate-free. A project-wide `gates` key is removed. Projects have no thread-count limit. `max_parallel_threads`, `coordinator_agent`, `thread_agent` and the two `*_agent_args` keys are gone; `doctor` refuses a `PROJECT.md` that still has them. `[roles.*]` is gone from both files and is refused. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). The ordered `[routing]` table selects a recipe by workflow or task product.
 
 The birth sentence is required: `thread start` and `thread adopt` take `--plain`. As an internal record, a thread or round sentence keeps its one-sentence structure but has no vocabulary or length check. Technical views keep exact details and wrap or collapse long rows. The default workflow is `lane`. `--passive` on adopt sets the parent token and sends no primer.
 
@@ -62,13 +60,14 @@ Every command accepts the global `--json` flag. It returns one record with an
 
 | Command | What it does |
 | --- | --- |
-| `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder. |
+| `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder with its one current page. |
+| `project convert <project>` | Move retired project documents byte-for-byte into timestamped `.state/history/` with hashes, then write the current page. Refuses while a round is being merged. Record anything still true with `note add` first. |
 | `list [--all]` | Projects with status and thread counts by group. |
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
-| `task add`, `task show`, `task list`, `task note`, `task evidence`, `task drop` | Create and inspect stable tasks, add task notes with a request id and optional explicit replacement, and record installation or per-condition verification commands. Each `--acceptance` value stays one exact internal condition even when it contains several sentences. When a newer choice replaces one condition, withdraw it with `task drop --acceptance N --reason` and name that choice in the reason. State is derived from linked events and rounds. |
-| `note add` | Add dated project memory or a standing instruction with its request id; optionally scope it to tasks or explicitly replace an older row. |
+| `task add`, `task show`, `task list`, `task evidence`, `task drop` | Create and inspect stable tasks and record per-condition verification. Each `--acceptance` value stays one condition even when it contains several short sentences, which are checked separately. When a newer choice replaces one condition, withdraw it with `task drop --acceptance N --reason` and name that choice in the reason. State is derived from linked events and rounds. A task without a repository needs only `finished` and `verified`, and may go straight to verification without an attempt. |
+| `note add <project> <text> --kind memory\|instruction --request <id> [--task <job>] [--replaces <id>]` | The only fact and instruction writer. It may scope the row to a task or explicitly replace an older row. |
 | `thread start <project> --title T --plain S (--job TASK \| --request R --acceptance S...) [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | An ordinary lane names its task or creates it in the same command. Routing is resolved before any worktree or tab exists. Its selected recipe supplies kind and args. The brief `tasks/<id>.md` is committed on the integration branch, then the worktree and tab are created. `--plain` is required; returns before the agent is up. `[dispatch].machine` supplies default box placement for repositories with a box clone. |
 | `thread retry`, `thread cancel`, `thread rebind`, `thread adopt`, `thread prompt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
 | `thread attest <project> <id> --reason S` | Seal `done` from a resolved, uncancelled lane's stored final report after its bytes match the recorded hash; records the coordinator and reason. |

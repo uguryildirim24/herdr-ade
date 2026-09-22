@@ -1,5 +1,5 @@
-//! Names at birth, `GLOSSARY.md`, `ha explain` and `ha term` (SPEC-ADE D17
-//! item 6). The registry built here is passed to A0's checker as a value.
+//! Names at birth, `ha explain` and `ha term` (SPEC-ADE D17 item 6). The
+//! registry built here is passed to A0's checker as a value.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ pub(crate) struct Entry {
     pub(crate) name: String,
     pub(crate) sentence: String,
     pub(crate) path: String,
-    /// Birth time; `GLOSSARY.md` lists newest last.
+    /// Birth time; views list names in this order.
     pub(crate) born: String,
 }
 
@@ -40,10 +40,6 @@ struct TermsFile {
 
 fn terms_path(project: &Project) -> PathBuf {
     project.dir().join("terms.toml")
-}
-
-pub(crate) fn glossary_path(project: &Project) -> PathBuf {
-    project.dir().join("GLOSSARY.md")
 }
 
 pub(crate) fn terms(project: &Project) -> Vec<Term> {
@@ -290,35 +286,6 @@ pub(crate) fn check_internal_birth(sentence: &str) -> Result<()> {
     }
 }
 
-/// Rewrites `GLOSSARY.md` atomically from the records and the terms table,
-/// one line per name, newest last.
-pub(crate) fn rewrite(project: &Project) -> Result<()> {
-    let mut entries: Vec<Entry> = names(project)
-        .into_iter()
-        .filter(|e| !e.sentence.is_empty())
-        .collect();
-    for t in terms(project) {
-        entries.push(Entry {
-            path: if t.path.is_empty() {
-                "GLOSSARY.md".into()
-            } else {
-                t.path.clone()
-            },
-            name: t.name,
-            sentence: t.sentence,
-            born: t.added,
-        });
-    }
-    entries.sort_by(|a, b| (&a.born, &a.name).cmp(&(&b.born, &b.name)));
-    let mut text = String::from(
-        "# Glossary\n\nWritten by herdr-ade from the records and the terms table. Do not edit by hand;\nadd a term with `term add <name> --plain \"<sentence>\"`.\n\n",
-    );
-    for e in &entries {
-        text.push_str(&format!("- {}: {} ({})\n", e.name, e.sentence, e.path));
-    }
-    write_atomic(&glossary_path(project), text.as_bytes())
-}
-
 fn validate_term_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
@@ -372,7 +339,6 @@ pub(crate) fn add_term(
         file.term.push(term.clone());
         write_atomic(&terms_path(&project), toml::to_string(&file)?.as_bytes())?;
     }
-    rewrite(&project)?;
     Ok(term)
 }
 
@@ -390,7 +356,7 @@ pub(crate) fn explain(ctx: &Ctx, slug: &str, name: &str) -> Result<String> {
                     name: t.name,
                     sentence: t.sentence,
                     path: if t.path.is_empty() {
-                        "GLOSSARY.md".into()
+                        "terms.toml".into()
                     } else {
                         t.path
                     },

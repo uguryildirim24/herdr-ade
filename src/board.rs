@@ -327,6 +327,7 @@ fn checked_value_or_notice(
 /// Publishes every checked row. A rejected row gets a checked unavailable
 /// notice carrying the age of its last good observation, never the old value.
 pub(crate) fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
+    crate::project::refresh_page(project)?;
     if workspace_herdr(ctx, project).is_none() {
         return Ok(Vec::new());
     }
