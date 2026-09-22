@@ -2466,8 +2466,9 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     let script = remote::with_path(
         &machine.path,
         &format!(
-            "cd {} && if [ -e {} ]; then git worktree remove {}; else git worktree prune --expire=now; fi && rm -rf -- {}",
+            "cd {} && if [ -e {} ]; then git worktree remove {} || {{ [ ! -e {} ] && git worktree prune --expire=now; }}; else git worktree prune --expire=now; fi && rm -rf -- {}",
             remote::quote(&box_repo),
+            remote::quote(&record.worktree_path),
             remote::quote(&record.worktree_path),
             remote::quote(&record.worktree_path),
             remote::quote(&build)
