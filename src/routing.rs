@@ -105,6 +105,11 @@ impl Routing {
         if !recipe.enabled {
             bail!("routing_recipe_disabled: {id}");
         }
+        if recipe.provider == "pro" {
+            bail!(
+                "routing_recipe_command_only: {id} is reached with `herdr-pro start` and `herdr-pro turn`"
+            );
+        }
         Ok(())
     }
 

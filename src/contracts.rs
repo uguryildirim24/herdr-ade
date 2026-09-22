@@ -114,9 +114,16 @@ pub(crate) struct Launch {
     /// process failures.
     #[serde(default)]
     pub(crate) same_recipe_retries: u32,
-    /// `pin`, `default`, or the ordered `rule[n]` that selected this recipe.
+    /// `pin`, `default`, `explicit`, or the ordered `rule[n]` that selected this recipe.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) routing_rule: String,
+    /// Rolf's exact words authorizing a one-off recipe choice. Empty on routed
+    /// and historical launches.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) recipe_basis: String,
+    /// The request on the stable task that contains `recipe_basis`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) recipe_request: String,
     pub(crate) reason: String,
     /// The compact `<job> runs on <plain>` sentence for the board's
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
@@ -955,6 +962,8 @@ mod tests {
             escalations: 0,
             same_recipe_retries: 0,
             routing_rule: "default".into(),
+            recipe_basis: String::new(),
+            recipe_request: String::new(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
             source_truncation: None,
