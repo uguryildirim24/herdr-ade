@@ -248,11 +248,27 @@ fn local_build(ctx: &Ctx, repo: &str, kind: Kind) -> Result<()> {
     Ok(())
 }
 
+fn binary_version(ctx: &Ctx, path: &Path) -> Option<String> {
+    let out = ctx
+        .runner
+        .run(&Cmd::new(path.to_string_lossy().into_owned(), VERSION_TIMEOUT).arg("--version"))
+        .ok()?;
+    out.success()
+        .then(|| out.stdout.trim().to_string())
+        .filter(|version| !version.is_empty())
+}
+
 fn local_install(ctx: &Ctx, repo: &str, bin: &str) -> Result<()> {
     let dir = ctx.env.home.join(".local/bin");
     std::fs::create_dir_all(&dir)?;
     let from = Path::new(repo).join("target/release").join(bin);
     let to = dir.join(bin);
+    let same_commit = binary_version(ctx, &from)
+        .zip(binary_version(ctx, &to))
+        .is_some_and(|(source, installed)| crate::build::same_commit(&source, &installed));
+    if same_commit {
+        return Ok(());
+    }
     let staged = dir.join(format!(".{bin}.install-{}", std::process::id()));
     let copy = ctx.runner.run(
         &Cmd::new("cp", INSTALL_TIMEOUT)
@@ -733,8 +749,12 @@ fn talk_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessPr
     proofs
 }
 
-fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) -> Vec<ProcessProof> {
-    let script = format!(
+fn box_process_script(
+    machine: &crate::remote::MachineDeclaration,
+    attempts: u32,
+    delay_seconds: &str,
+) -> String {
+    format!(
         "set -e\n\
          export PATH={path}\n\
          bin={bin}\n\
@@ -746,28 +766,39 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
          seen=\n\
          pid=\n\
          n=0\n\
-         while [ $n -lt 80 ]; do\n\
+         while [ $n -lt {attempts} ]; do\n\
            if [ -r \"$root/.ticker.lock\" ]; then\n\
-             seen=$(sed -n 's/.*\"version\": \"\\([^\"]*\\)\".*/\\1/p' \"$root/.ticker.lock\")\n\
-             pid=$(grep '\"pid\"' \"$root/.ticker.lock\" | tr -cd '0-9')\n\
-             if grep -F '\"version\": \"'$expected'.' \"$root/.ticker.lock\" >/dev/null 2>&1; then\n\
-               printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$seen\"\n\
-               exit 0\n\
+             snapshot=$(cat \"$root/.ticker.lock\" 2>/dev/null) || snapshot=\n\
+             candidate_seen=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"version\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\n\
+             candidate_pid=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"pid\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')\n\
+             if [ -n \"$candidate_seen\" ] && [ -n \"$candidate_pid\" ]; then\n\
+               seen=$candidate_seen\n\
+               pid=$candidate_pid\n\
+               case \"$seen\" in\n\
+                 \"$expected\"|\"$expected\".*)\n\
+                   printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$seen\"\n\
+                   exit 0\n\
+                   ;;\n\
+               esac\n\
              fi\n\
            fi\n\
-           n=$((n+1)); sleep 0.5\n\
+           n=$((n+1)); sleep {delay_seconds}\n\
          done\n\
-         if [ -n \"$seen\" ]; then\n\
+         if [ -n \"$seen\" ] && [ -n \"$pid\" ]; then\n\
            printf 'HERDR_ADE_BOX_TICKER_STALE=%s:%s\\n' \"$pid\" \"$seen\"\n\
          else\n\
-           printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker did not report a build\\n'\n\
+           printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker lock did not contain a complete build record\\n'\n\
          fi",
         path = remote::quote(&machine.path),
         bin = remote::quote(&machine.ade_bin),
         root = remote::quote(&machine.root),
         expected =
             remote::quote(crate::build::commit_version(crate::VERSION).unwrap_or(crate::VERSION)),
-    );
+    )
+}
+
+fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) -> Vec<ProcessProof> {
+    let script = box_process_script(machine, 80, "0.5");
     let target = &machine.target;
     let out = match remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(140)) {
         Ok(out) if out.success() => out,
@@ -1378,6 +1409,86 @@ mod tests {
         assert_eq!(proofs[1].state, "running");
         assert_eq!(proofs[1].pid, Some(42));
         assert_eq!(proofs[1].build.as_deref(), Some(box_build.as_str()));
+    }
+
+    #[test]
+    fn an_incomplete_box_ticker_record_is_unknown_not_empty_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("herdr-ade");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade 0.1.0+old.1'; fi\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).unwrap();
+        let box_root = root.path().join("ade-root");
+        std::fs::create_dir(&box_root).unwrap();
+        std::fs::write(
+            box_root.join(".ticker.lock"),
+            "{\n  \"version\": \"0.1.0+old.1\"\n}",
+        )
+        .unwrap();
+        let machine = crate::remote::MachineDeclaration {
+            root: box_root.to_string_lossy().into_owned(),
+            path: "/usr/bin:/bin".into(),
+            ade_bin: bin.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let out = RealRunner
+            .run(
+                &Cmd::new("sh", VERSION_TIMEOUT)
+                    .args(["-c".into(), box_process_script(&machine, 2, "0.01")]),
+            )
+            .unwrap();
+
+        assert!(out.success(), "{}", out.error_text());
+        assert!(
+            out.stdout.contains(
+                "HERDR_ADE_BOX_TICKER_UNKNOWN=ticker lock did not contain a complete build record"
+            ),
+            "{}",
+            out.stdout
+        );
+        assert!(!out.stdout.contains("HERDR_ADE_BOX_TICKER_STALE="));
+    }
+
+    #[test]
+    fn installing_the_same_commit_keeps_the_installed_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = RealRunner;
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().join("root"),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let repo = root.path().join("repo");
+        let release = repo.join("target/release");
+        std::fs::create_dir_all(&release).unwrap();
+        let source = release.join("herdr-ade");
+        std::fs::write(&source, "#!/bin/sh\necho 'herdr-ade 0.1.0+abc1234.200'\n").unwrap();
+        let installed = root.path().join(".local/bin/herdr-ade");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(
+            &installed,
+            "#!/bin/sh\necho 'herdr-ade 0.1.0+abc1234.100'\n",
+        )
+        .unwrap();
+        for path in [&source, &installed] {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        let before = std::fs::metadata(&installed).unwrap().ino();
+
+        local_install(&ctx, repo.to_str().unwrap(), "herdr-ade").unwrap();
+
+        assert_eq!(std::fs::metadata(&installed).unwrap().ino(), before);
     }
 
     #[test]
