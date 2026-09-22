@@ -1734,12 +1734,18 @@ mod tests {
         let task_dir = project.dir().join("tasks");
         std::fs::create_dir_all(&task_dir).unwrap();
         for (id, round) in [("job-0001", "r1"), ("job-0002", "r2")] {
+            let attempt = crate::thread::allocate(&project, |thread| {
+                thread.repo = repo.to_string_lossy().into_owned();
+                thread.base = "base".into();
+            })
+            .unwrap();
             let task = crate::task::Task {
                 schema: 1,
                 id: id.into(),
                 title: format!("Install {id}."),
                 authority: vec!["request:q-1".into()],
                 acceptance: vec!["The installed build carries the change.".into()],
+                attempts: vec![attempt.id],
                 rounds: vec![round.into()],
                 repo: Some(repo.to_string_lossy().into_owned()),
                 created: crate::project::now(),

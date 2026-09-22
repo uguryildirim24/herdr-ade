@@ -687,9 +687,31 @@ fn validate_states(states: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn has_commit_changes(project: &Project, task: &Task) -> Result<bool> {
+    if task.attempts.is_empty() {
+        return Ok(false);
+    }
+    let events = crate::events::list(project);
+    for attempt in &task.attempts {
+        let thread = crate::thread::load(project, attempt)?;
+        let done: Vec<_> = events
+            .iter()
+            .filter(|event| event.thread == *attempt)
+            .filter_map(|event| event.payload.done.as_ref())
+            .collect();
+        // An unfinished attempt may still have commits which are not sealed in
+        // an event yet. Only completed attempts can prove that they stayed at
+        // their recorded base.
+        if done.is_empty() || done.iter().any(|evidence| evidence.sha != thread.base) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn required_states(project: &Project, task: &Task) -> Result<Vec<String>> {
     let settings = project.read_project_md()?.0;
-    let states = task
+    let mut states = task
         .repo
         .as_deref()
         .and_then(|repo| settings.repos.iter().find(|row| row.path == repo))
@@ -697,6 +719,9 @@ pub(crate) fn required_states(project: &Project, task: &Task) -> Result<Vec<Stri
         .map(|row| row.task_states.clone())
         .unwrap_or(settings.task_states);
     validate_states(&states)?;
+    if !has_commit_changes(project, task)? {
+        states.retain(|state| !matches!(state.as_str(), "reviewed" | "merged" | "installed"));
+    }
     Ok(states)
 }
 
@@ -782,10 +807,32 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         }
     };
     if task.attempts.is_empty() {
+        let verified: BTreeSet<usize> = task
+            .verified
+            .iter()
+            .flat_map(|evidence| evidence.acceptance.iter().copied())
+            .collect();
+        let withdrawn = withdrawn_acceptance(&task);
+        let all_verified = (1..=task.acceptance.len())
+            .filter(|index| !withdrawn.contains(index))
+            .all(|index| verified.contains(&index));
+        let state = if required.iter().any(|state| state == "verified") && all_verified {
+            State::Verified
+        } else {
+            State::Open
+        };
+        let next = if state == State::Open && required.iter().any(|state| state == "verified") {
+            format!(
+                "verify {} acceptance condition(s)",
+                live_unverified_count(&task)
+            )
+        } else {
+            next_for(state, &required, &task)
+        };
         return View {
             record: task,
-            state: State::Open,
-            next: "start an attempt".into(),
+            state,
+            next,
             failure_class: None,
             provider_kind: None,
         };
@@ -1001,15 +1048,9 @@ pub(crate) fn views(project: &Project) -> (Vec<View>, Vec<anyhow::Error>) {
     )
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub(crate) enum EvidenceKind {
-    Verified,
-}
-
 pub(crate) fn record_evidence(
     project: &Project,
     id: &str,
-    kind: EvidenceKind,
     command: &str,
     acceptance: Vec<usize>,
 ) -> Result<Task> {
@@ -1026,20 +1067,24 @@ pub(crate) fn record_evidence(
             "task_evidence: `{word}` is not enabled for this task's repository"
         )));
     }
-    let prerequisite = if required.iter().any(|state| state == "installed") {
-        "installed"
-    } else {
-        "merged"
-    };
+    let prerequisite = required
+        .iter()
+        .position(|state| state == word)
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| required.get(index))
+        .map(String::as_str)
+        .unwrap_or("finished");
     let reached = STATES
         .iter()
-        .position(|state| *state == before.state.word())
-        .unwrap_or(0);
+        .position(|state| *state == before.state.word());
     let needed = STATES
         .iter()
         .position(|state| *state == prerequisite)
         .unwrap_or(usize::MAX);
-    if reached < needed {
+    let no_attempt_needed = before.record.attempts.is_empty()
+        && !has_commit_changes(project, &before.record)?
+        && prerequisite == "finished";
+    if !reached.is_some_and(|reached| reached >= needed) && !no_attempt_needed {
         return Err(crate::refusal::error(format!(
             "task_evidence: task is {}, but `{word}` needs it to be {prerequisite}",
             before.state.word()
@@ -1081,7 +1126,6 @@ pub(crate) fn record_evidence(
             machine: None,
             build: None,
         };
-        let EvidenceKind::Verified = kind;
         task.verified.push(evidence);
         Ok(())
     })
@@ -1644,7 +1688,6 @@ created = "2026-09-21T00:00:00Z"
         let error = record_evidence(
             &fx.project,
             "job-0001",
-            EvidenceKind::Verified,
             "checked the replaced result",
             vec![2],
         )
@@ -1758,6 +1801,67 @@ created = "2026-09-21T00:00:00Z"
     }
 
     #[test]
+    fn tasks_without_commits_skip_code_milestones_but_changed_tasks_keep_them() {
+        use crate::round::testkit::{fixture, git};
+
+        let fx = fixture();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.task_states = STATES.iter().map(|state| state.to_string()).collect();
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+
+        let no_attempt = record(&fx.project, "job-0001");
+        let open = view(&fx.project, no_attempt);
+        assert_eq!(open.state, State::Open);
+        assert_eq!(open.next, "verify 1 acceptance condition(s)");
+        let verified =
+            record_evidence(&fx.project, "job-0001", "checked published result", vec![1]).unwrap();
+        assert_eq!(view(&fx.project, verified).state, State::Verified);
+
+        let base = git(&fx.repo, &["rev-parse", "main"]);
+        record(&fx.project, "job-0002");
+        let (unchanged_lane, _) = fx.lane(1);
+        let unchanged_thread = crate::thread::load(&fx.project, &unchanged_lane).unwrap();
+        git(
+            std::path::Path::new(&unchanged_thread.worktree_path),
+            &["reset", "--hard", &base],
+        );
+        crate::thread::update(&fx.project, &unchanged_lane, |thread| {
+            thread.base = base.clone();
+        })
+        .unwrap();
+        link_attempt(&fx.project, "job-0002", &unchanged_lane).unwrap();
+        fx.seal_done(&unchanged_lane, 1, 1, &base, "# review\n");
+        let unchanged = load(&fx.project, "job-0002").unwrap();
+        assert_eq!(
+            required_states(&fx.project, &unchanged).unwrap(),
+            ["finished", "verified"]
+        );
+        assert_eq!(view(&fx.project, unchanged).state, State::Finished);
+        let verified =
+            record_evidence(&fx.project, "job-0002", "checked report result", vec![1]).unwrap();
+        assert_eq!(view(&fx.project, verified).state, State::Verified);
+
+        record(&fx.project, "job-0003");
+        let (changed_lane, changed_sha) = fx.lane(2);
+        crate::thread::update(&fx.project, &changed_lane, |thread| {
+            thread.base = base.clone();
+        })
+        .unwrap();
+        link_attempt(&fx.project, "job-0003", &changed_lane).unwrap();
+        fx.seal_done(&changed_lane, 1, 1, &changed_sha, "# code\n");
+        let changed = load(&fx.project, "job-0003").unwrap();
+        assert_eq!(required_states(&fx.project, &changed).unwrap(), STATES);
+        assert_eq!(view(&fx.project, changed).state, State::Finished);
+        let error = record_evidence(&fx.project, "job-0003", "checked code", vec![1]).unwrap_err();
+        assert!(error.to_string().contains("needs it to be installed"));
+    }
+
+    #[test]
     fn one_record_drives_every_milestone_and_skips_install_when_not_configured() {
         use crate::round::testkit::{commit_file, fixture, git};
         let fx = fixture();
@@ -1863,14 +1967,7 @@ created = "2026-09-21T00:00:00Z"
             vec!["local:ticker:running".into()],
         )
         .unwrap();
-        let verified = record_evidence(
-            &fx.project,
-            "job-0001",
-            EvidenceKind::Verified,
-            "ha doctor",
-            vec![1],
-        )
-        .unwrap();
+        let verified = record_evidence(&fx.project, "job-0001", "ha doctor", vec![1]).unwrap();
         assert_eq!(view(&fx.project, verified).state, State::Verified);
         assert!(
             crate::plan::show(&ctx, "demo", false)
