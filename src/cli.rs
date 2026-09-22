@@ -2268,7 +2268,30 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 let project = Project::load(&ctx.root, &slug)?;
                 let view = crate::task::view(&project, crate::task::load(&project, &id)?);
                 let attestation = crate::task::attestation(&project, &view.record);
+                let reports: Vec<_> = view
+                    .record
+                    .attempts
+                    .iter()
+                    .filter_map(|id| {
+                        let thread = crate::thread::load(&project, id).ok()?;
+                        let path = crate::thread::report_reference(&project, &thread)?;
+                        let sealed = crate::thread::sealed_report_path(&project, &thread).is_some();
+                        Some(serde_json::json!({ "thread": id, "path": path, "sealed": sealed }))
+                    })
+                    .collect();
                 let mut message = crate::task::render(&view);
+                for report in &reports {
+                    message.push_str(&format!(
+                        "{} ({}): {}\n",
+                        if report["sealed"].as_bool().unwrap_or(false) {
+                            "final report"
+                        } else {
+                            "historical report (not completion)"
+                        },
+                        report["thread"].as_str().unwrap_or_default(),
+                        report["path"].as_str().unwrap_or_default()
+                    ));
+                }
                 if let Some(attestation) = &attestation {
                     message.push_str(&format!(
                         "attested: {}: {}\n",
@@ -2277,7 +2300,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 }
                 crate::output::success(
                     Some("shown"),
-                    &serde_json::json!({ "task": view, "attestation": attestation }),
+                    &serde_json::json!({ "task": view, "reports": reports, "attestation": attestation }),
                     &message,
                     "",
                 )

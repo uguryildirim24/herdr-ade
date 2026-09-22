@@ -188,8 +188,7 @@ pub(crate) fn adopt(
                 &prefix,
                 &thread::brief_for(&project, &with_dir, &task, false)?,
             );
-            std::fs::create_dir_all(Path::new(&dir).join("library"))
-                .with_context(|| format!("could not create {dir}"))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("could not create {dir}"))?;
             threads::exclude_from_git(ctx.runner, &agent.cwd)?;
             project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
             thread::update(&project, &id, |t| t.thread_dir = dir)?;
