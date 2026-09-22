@@ -845,7 +845,7 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
             "plain_missing: `round open` needs --plain \"<one sentence that says what this round does>\""
         );
     };
-    crate::glossary::check_record_birth(&project, &plain)?;
+    crate::glossary::check_internal_birth(&plain)?;
     let repo = match args.repo {
         Some(repo) => repo,
         None => project_repo(&project)?,
@@ -4412,7 +4412,7 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_without_plain_and_with_a_registry_name() {
+    fn open_requires_plain_but_allows_internal_details() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let args = |round: &str, plain: Option<&str>| OpenArgs {
@@ -4423,39 +4423,17 @@ mod tests {
         };
         assert!(err(open(&ctx, "demo", args("r1", None))).starts_with("plain_missing"));
         let (id, _) = fx.lane(1);
-        let e = err(open(
-            &ctx,
-            "demo",
-            args("r1", Some(&format!("The round finishes {id} today."))),
-        ));
-        assert!(e.contains("plain_birth_refused") && e.contains(&id), "{e}");
-        // The known-word rule is relaxed for a round sentence: the record may
-        // name a file. An identifier-shaped token is still refused.
-        let e = err(open(
-            &ctx,
-            "demo",
-            args("r1", Some("The round touches src/plain.rs.")),
-        ));
-        assert!(e.contains("plain_identifier"), "{e}");
-        open(
-            &ctx,
-            "demo",
-            args("r0", Some("The round lands config.toml.")),
-        )
-        .unwrap();
-        let mut old = load(&fx.project, "r0").unwrap();
-        old.phase = RoundPhase::Abandoned;
-        save(&fx.project, &old).unwrap();
-        open(&ctx, "demo", args("r1", Some(PLAIN))).unwrap();
+        let plain = format!("README, docs and src/plain.rs finish {id} in round r109.");
+        open(&ctx, "demo", args("r1", Some(&plain))).unwrap();
         let record = load(&fx.project, "r1").unwrap();
-        assert_eq!(record.plain, PLAIN);
+        assert_eq!(record.plain, plain);
         assert_eq!(record.manifest.revision, 0);
         assert!(fx.world.runner.count("workspace report-metadata w1 --source herdr-ade --token round=r1 --token branch=main") == 1);
         assert!(err(open(&ctx, "demo", args("r1", Some(PLAIN)))).starts_with("round_exists"));
     }
 
     #[test]
-    fn open_refuses_a_round_sentence_over_the_word_cap() {
+    fn open_keeps_a_long_technical_round_sentence() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let sentence = |n: usize| format!("{}.", vec!["the"; n].join(" "));
@@ -4465,12 +4443,9 @@ mod tests {
             plain: Some(plain),
             repo: Some(fx.repo.to_string_lossy().into_owned()),
         };
-        let e = err(open(&ctx, "demo", args(sentence(26), "r1")));
-        assert!(
-            e.contains("plain_long_sentence") && e.contains("26-word"),
-            "{e}"
-        );
-        open(&ctx, "demo", args(sentence(25), "r1")).unwrap();
+        let plain = sentence(26);
+        open(&ctx, "demo", args(plain.clone(), "r1")).unwrap();
+        assert_eq!(load(&fx.project, "r1").unwrap().plain, plain);
     }
 
     #[test]
