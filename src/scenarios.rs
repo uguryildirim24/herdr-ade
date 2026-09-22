@@ -2787,19 +2787,45 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
 }
 
 #[test]
-fn harness_install_does_not_treat_a_failed_machine_list_as_no_box() {
+fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
     let world = World::new();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
     write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
-    world
-        .runner
-        .on("machine list --json", fail(1, "machine list unavailable"));
+    world.runner.on("cargo build", ok(""));
+    world.runner.on("cp ", ok(""));
+    world.runner.on("mv -f", ok(""));
+    world.runner.on("--version", ok("installed version\n"));
 
-    let error = crate::harness::install(&world.ctx())
-        .unwrap_err()
-        .to_string();
+    let reexecs = Rc::new(RefCell::new(Vec::new()));
+    let seen = reexecs.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("machine list --json"),
+        move |_| {
+            assert!(
+                seen.borrow()
+                    .iter()
+                    .any(|path: &PathBuf| path.ends_with("herdr-ade")),
+                "box lookup ran before the freshly installed harness could re-exec"
+            );
+            Ok(fail(1, "machine list unavailable"))
+        },
+    );
+
+    let error = crate::harness::install_with_reexec(&world.ctx(), |installed| {
+        reexecs.borrow_mut().push(installed.to_path_buf());
+        Ok(())
+    })
+    .unwrap_err()
+    .to_string();
+
     assert!(error.contains("machine_list_failed"), "{error}");
-    assert_eq!(world.runner.count("cargo build"), 0);
+    assert_eq!(world.runner.count("cargo build"), 1);
+    assert!(
+        reexecs
+            .borrow()
+            .iter()
+            .any(|path| path.ends_with("herdr-ade"))
+    );
 }
 
 #[test]
