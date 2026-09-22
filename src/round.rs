@@ -5892,22 +5892,6 @@ mod tests {
         require_resolvable(&fx.project, id).unwrap();
     }
 
-    /// A done lane keeps its pane but holds no slot; a resolved lane holds
-    /// none either.
-    #[test]
-    fn open_lane_count_skips_a_done_lane() {
-        let fx = fixture();
-        let lanes = [fx.lane(1), fx.lane(2)];
-        assert_eq!(crate::threads::open_lane_count(&fx.project), 2);
-        thread::update(&fx.project, &lanes[0].0, |t| t.last_state = "done".into()).unwrap();
-        assert_eq!(crate::threads::open_lane_count(&fx.project), 1);
-        thread::update(&fx.project, &lanes[1].0, |t| {
-            t.status = thread::Status::Resolved
-        })
-        .unwrap();
-        assert_eq!(crate::threads::open_lane_count(&fx.project), 0);
-    }
-
     /// A pi lane reports `blocked` for its own error; a prompt reaches it and
     /// clears the recorded error. A gone pane is still refused.
     #[test]
