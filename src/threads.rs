@@ -1170,8 +1170,8 @@ fn place_ade_tab(
 }
 
 /// Makes the project-owned git folder used by a thread with no code
-/// repository. Its first commit contains only `brief.md`; the lane commits its
-/// report and library files in the same repository before calling `done`.
+/// repository. Its first commit contains only `brief.md`; the lane creates and
+/// commits report or deliverable files there before calling `done`.
 pub(crate) fn prepare_managed_git_folder(
     runner: &dyn Runner,
     folder: &Path,
@@ -1211,7 +1211,6 @@ pub(crate) fn prepare_managed_git_folder(
             );
         }
         let bytes = std::fs::read(&brief_path)?;
-        std::fs::create_dir_all(folder.join("library"))?;
         return Ok((folder, thread::sha256_hex(&bytes), head));
     }
 
@@ -1248,20 +1247,18 @@ pub(crate) fn prepare_managed_git_folder(
         GIT_TIMEOUT,
     )?;
     let head = git(runner, &folder_text, &["rev-parse", "HEAD"], GIT_TIMEOUT)?;
-    std::fs::create_dir_all(folder.join("library"))?;
     Ok((folder, thread::sha256_hex(brief.as_bytes()), head))
 }
 
-/// Creates the recorded thread directory with its library and keeps it out
-/// of git.
+/// Creates the recorded thread directory and keeps it out of git. Its report
+/// and library folders appear only when their writers use them.
 fn prepare_local_dir(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
     let dir = if placed.thread_dir.is_empty() {
         thread::thread_dir(&placed.cwd, &project.slug, &placed.id)
     } else {
         placed.thread_dir.clone()
     };
-    std::fs::create_dir_all(Path::new(&dir).join("library"))
-        .with_context(|| format!("could not create {dir}"))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {dir}"))?;
     if placed.kind != Kind::Tab && !managed_git_folder(project, placed) {
         exclude_from_git(ctx.runner, &placed.cwd)?;
     }
@@ -2026,7 +2023,7 @@ pub struct AttestOutcome {
     pub reason: String,
 }
 
-/// Seal completion evidence from the final report copy of a resolved lane.
+/// Seal completion evidence from a resolved lane's preserved report draft.
 pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOutcome> {
     let reason = reason.trim();
     if reason.is_empty() {
@@ -2056,16 +2053,21 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         )));
     }
 
-    let report_path = thread::home_report_path(&project, id);
-    let regular = std::fs::symlink_metadata(&report_path).is_ok_and(|meta| meta.is_file());
-    if !regular {
-        return Err(crate::refusal::error(format!(
-            "attest_report_missing: {} is not a stored final copy",
-            report_path.display()
-        )));
-    }
-    let bytes = std::fs::read(&report_path)
-        .with_context(|| format!("could not read stored report {}", report_path.display()))?;
+    let draft_path =
+        (!record.thread_dir.is_empty()).then(|| Path::new(&record.thread_dir).join("report.md"));
+    let historical_path = thread::home_report_path(&project, id);
+    let report_path = draft_path
+        .iter()
+        .chain(std::iter::once(&historical_path))
+        .find(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+        .ok_or_else(|| {
+            crate::refusal::error(format!(
+                "attest_report_missing: {} has no preserved report draft",
+                id
+            ))
+        })?;
+    let bytes = std::fs::read(report_path)
+        .with_context(|| format!("could not read report {}", report_path.display()))?;
     let actual_hash = thread::sha256_hex(&bytes);
     if record.report_hash.is_empty() || actual_hash != record.report_hash {
         return Err(crate::refusal::error(format!(
@@ -2557,9 +2559,9 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     }
 }
 
-/// The final report and library copy, storing the new report hash. A box
-/// lane's report and library arrive through the Mac courier (the second lane),
-/// never through a second copy path; until then the copy is partial.
+/// Finds the final report hash and copies real deliverables, without making a
+/// second report. A box lane's sealed artifact arrives through the Mac courier;
+/// until then the copy is partial.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
     let copied = if record.is_remote() {
         imported_report(project, record)
@@ -3201,9 +3203,18 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
             format!("{}: {}", attestation.coordinator, attestation.reason)
         );
     }
-    let report = thread::home_report_path(&project, id);
-    if report.is_file() {
-        println!("# home copy of the report: {}", report.display());
+    if let Some(report) = thread::sealed_report_path(&project, &record) {
+        println!("# final report: {}", report.display());
+    } else if let Some(report) = thread::final_report_path(&project, &record) {
+        println!("# historical report (not completion): {}", report.display());
+    } else {
+        let draft = Path::new(&record.thread_dir).join("report.md");
+        if std::fs::symlink_metadata(&draft).is_ok_and(|metadata| metadata.is_file()) {
+            println!(
+                "# unsealed report draft (not completion): {}",
+                draft.display()
+            );
+        }
     }
     Ok(())
 }
@@ -4489,6 +4500,7 @@ mod tests {
             "brief.md"
         );
         assert_eq!(started.thread_dir, started.worktree_path);
+        assert!(!folder.join("library").exists());
 
         std::fs::write(folder.join("report.md"), "no-repo result\n").unwrap();
         git(folder, &["add", "report.md"]);
@@ -4566,10 +4578,9 @@ mod tests {
         assert_eq!(outcome.final_copy, "complete");
         assert_eq!(outcome.worktree, "removed");
         assert!(!folder.exists());
-        assert_eq!(
-            std::fs::read_to_string(thread::home_report_path(&fx.project, &started.id)).unwrap(),
-            "no-repo result\n"
-        );
+        assert!(!thread::home_report_path(&fx.project, &started.id).exists());
+        let stored = thread::final_report_path(&fx.project, &started).unwrap();
+        assert_eq!(std::fs::read_to_string(stored).unwrap(), "no-repo result\n");
     }
 
     #[test]

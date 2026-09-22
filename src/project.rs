@@ -96,7 +96,7 @@ pub(crate) fn display_name(name: &str, slug: &str) -> String {
 }
 
 /// Writes through a temporary file in the same directory plus a rename. It never
-/// creates parent directories: only `new` creates a project's directories.
+/// creates parent directories; each optional store creates its folder on first use.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let dir = path.parent().context("path has no parent")?;
     let name = path.file_name().context("path has no file name")?;
@@ -959,6 +959,18 @@ fn page_body(project: &Project, settings: &Settings) -> String {
                 ));
             }
         }
+        for attempt in &view.record.attempts {
+            if let Ok(thread) = crate::thread::load(project, attempt)
+                && let Some(report) = crate::thread::report_reference(project, &thread)
+            {
+                let label = if crate::thread::sealed_report_path(project, &thread).is_some() {
+                    "Final report"
+                } else {
+                    "Historical report (not completion)"
+                };
+                out.push_str(&format!("\n{label} (`{attempt}`): `{report}`\n"));
+            }
+        }
         out.push('\n');
     }
     for error in errors {
@@ -1040,6 +1052,18 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             out.push_str(&format!(" — dropped: {}", evidence.reason.trim()));
         }
         out.push('\n');
+        for attempt in &view.record.attempts {
+            if let Ok(thread) = crate::thread::load(project, attempt)
+                && let Some(report) = crate::thread::report_reference(project, &thread)
+            {
+                let label = if crate::thread::sealed_report_path(project, &thread).is_some() {
+                    "Final report"
+                } else {
+                    "Historical report (not completion)"
+                };
+                out.push_str(&format!("  {label} (`{attempt}`): `{report}`\n"));
+            }
+        }
     }
 
     let history = latest_history(project)
@@ -1243,18 +1267,9 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
 
     std::fs::create_dir_all(root)?;
     std::fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
-    for sub in [
-        "tasks",
-        "scratch",
-        "routines",
-        "threads",
-        "inbox",
-        "inbox/done",
-        "library",
-        ".state",
-    ] {
-        std::fs::create_dir_all(dir.join(sub))?;
-    }
+    // `.state` is part of the project itself: its project record and lock are
+    // needed immediately. Every content folder is created by its first writer.
+    std::fs::create_dir(dir.join(".state"))?;
     write_json(
         &project.state_dir().join("project.json"),
         &ProjectState::default(),
@@ -1348,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn create_writes_the_skeleton_and_refuses_a_second_time() {
+    fn create_writes_only_the_required_skeleton_and_refuses_a_second_time() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().join("root");
         let project = create(
@@ -1362,16 +1377,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(project.slug, "demo");
-        for sub in [
-            "tasks",
-            "scratch",
-            "routines",
-            "threads",
-            "inbox/done",
-            "library",
-            ".state",
+        assert!(project.state_dir().is_dir());
+        for optional in [
+            "tasks", "scratch", "routines", "threads", "inbox", "library",
         ] {
-            assert!(project.dir().join(sub).is_dir(), "{sub}");
+            assert!(!project.dir().join(optional).exists(), "{optional}");
         }
         for old in ["MEMORY.md", "memory", "TASKS.md", "GLOSSARY.md"] {
             assert!(!project.dir().join(old).exists(), "{old}");

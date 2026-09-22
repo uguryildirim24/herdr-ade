@@ -575,10 +575,12 @@ fn digest_snapshot(
         let completion = crate::round::latest_event(&events, &t.id, t.attempt.max(1));
         if let Some(event) = completion {
             if let Some(done) = &event.payload.done {
+                let report = crate::thread::sealed_report_reference(project, t)
+                    .unwrap_or_else(|| format!("artifacts/{} (missing)", done.artifact));
                 let _ = writeln!(
                     out,
                     "  done: {} report={} event={}",
-                    done.sha, done.report_path, event.id
+                    done.sha, report, event.id
                 );
             } else if let Some(waiting) = &event.payload.waiting {
                 let kind = waiting
@@ -614,17 +616,20 @@ fn digest_snapshot(
                 shown_events.push(event.clone());
             }
         }
-        // Only suppress a copied report when the sealed evidence covers those
-        // exact bytes. A later report edit is not a new sealed completion.
+        // A report edited after `done` remains a draft, not new completion.
         let sealed_report = completion
             .and_then(|e| e.payload.done.as_ref())
-            .is_some_and(|done| done.artifact == t.report_hash);
+            .is_some_and(|done| done.artifact == t.report_hash)
+            && crate::thread::sealed_report_path(project, t).is_some();
         if !t.report_hash.is_empty() && !sealed_report {
-            let _ = writeln!(
-                out,
-                "  report: threads/{}.md (report bytes are not a completion)",
-                t.id
-            );
+            let draft = std::path::Path::new(&t.thread_dir).join("report.md");
+            let draft = std::fs::symlink_metadata(&draft)
+                .is_ok_and(|metadata| metadata.is_file())
+                .then(|| draft.to_string_lossy().into_owned())
+                .or_else(|| crate::thread::report_reference(project, t));
+            if let Some(draft) = draft {
+                let _ = writeln!(out, "  report draft: {draft} (not completion)");
+            }
         }
         overflow_count(&mut out, t.copy_notes.len());
         for note in t.copy_notes.iter().take(DIGEST_ROWS) {
