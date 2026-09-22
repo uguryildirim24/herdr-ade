@@ -40,6 +40,13 @@ pub(crate) struct DropEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AcceptanceWithdrawal {
+    pub(crate) acceptance: usize,
+    pub(crate) at: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Evidence {
     pub(crate) at: String,
     pub(crate) command: String,
@@ -77,6 +84,8 @@ pub(crate) struct Task {
     pub(crate) notes: Vec<DatedNote>,
     #[serde(default)]
     pub(crate) dropped: Vec<DropEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) withdrawn: Vec<AcceptanceWithdrawal>,
     pub(crate) attempts: Vec<String>,
     pub(crate) rounds: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +112,7 @@ impl Default for Task {
             replaces: None,
             notes: Vec::new(),
             dropped: Vec::new(),
+            withdrawn: Vec::new(),
             attempts: Vec::new(),
             rounds: Vec::new(),
             plan_step: None,
@@ -237,6 +247,28 @@ fn validate_record(task: &Task) -> Result<()> {
     }
     if task.acceptance.is_empty() || task.acceptance.iter().any(|line| line.trim().is_empty()) {
         bail!("task_acceptance: at least one plain acceptance condition is required");
+    }
+    let mut withdrawn = BTreeSet::new();
+    for evidence in &task.withdrawn {
+        if evidence.acceptance == 0 || evidence.acceptance > task.acceptance.len() {
+            bail!(
+                "task_withdrawn: acceptance {} is outside 1..={}",
+                evidence.acceptance,
+                task.acceptance.len()
+            );
+        }
+        if evidence.reason.trim().is_empty() {
+            bail!("task_withdrawn: a withdrawal reason is empty");
+        }
+        if !withdrawn.insert(evidence.acceptance) {
+            bail!(
+                "task_withdrawn: acceptance {} is withdrawn more than once",
+                evidence.acceptance
+            );
+        }
+    }
+    if withdrawn.len() == task.acceptance.len() {
+        bail!("task_withdrawn: every acceptance condition is withdrawn; drop the task instead");
     }
     Ok(())
 }
@@ -473,6 +505,77 @@ pub(crate) fn drop_task(project: &Project, id: &str, reason: &str) -> Result<Tas
     })
 }
 
+pub(crate) fn withdraw_acceptance(
+    project: &Project,
+    id: &str,
+    acceptance: Vec<usize>,
+    reason: &str,
+) -> Result<Task> {
+    if reason.trim().is_empty() {
+        return Err(crate::refusal::error("task_drop: --reason is required"));
+    }
+    update(project, id, |task| {
+        if !task.dropped.is_empty() {
+            return Err(crate::refusal::error(format!(
+                "task_drop_already: `{id}` is already dropped"
+            )));
+        }
+        let mut acceptance = acceptance;
+        acceptance.sort_unstable();
+        acceptance.dedup();
+        if acceptance
+            .iter()
+            .any(|index| *index == 0 || *index > task.acceptance.len())
+        {
+            return Err(crate::refusal::error(format!(
+                "task_drop_acceptance_range: an acceptance number is outside 1..={}",
+                task.acceptance.len()
+            )));
+        }
+        let already_withdrawn: BTreeSet<_> = task
+            .withdrawn
+            .iter()
+            .map(|evidence| evidence.acceptance)
+            .collect();
+        if let Some(index) = acceptance
+            .iter()
+            .find(|index| already_withdrawn.contains(index))
+        {
+            return Err(crate::refusal::error(format!(
+                "task_drop_acceptance_already: acceptance {index} is already withdrawn"
+            )));
+        }
+        let verified: BTreeSet<_> = task
+            .verified
+            .iter()
+            .flat_map(|evidence| evidence.acceptance.iter().copied())
+            .collect();
+        if let Some(index) = acceptance.iter().find(|index| verified.contains(index)) {
+            return Err(crate::refusal::error(format!(
+                "task_drop_acceptance_verified: acceptance {index} already has verification evidence"
+            )));
+        }
+        if already_withdrawn.len() + acceptance.len() == task.acceptance.len() {
+            return Err(crate::refusal::error(
+                "task_drop_acceptance_all: this would withdraw every acceptance condition; drop the task instead",
+            ));
+        }
+        let at = project::now();
+        let reason = reason.trim().to_string();
+        task.withdrawn.extend(
+            acceptance
+                .into_iter()
+                .map(|acceptance| AcceptanceWithdrawal {
+                    acceptance,
+                    at: at.clone(),
+                    reason: reason.clone(),
+                }),
+        );
+        task.withdrawn.sort_by_key(|evidence| evidence.acceptance);
+        Ok(())
+    })
+}
+
 pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<Task> {
     crate::thread::load(project, thread)
         .with_context(|| format!("task_attempt: no thread `{thread}`"))?;
@@ -596,6 +699,25 @@ fn running_current(task: &Task) -> bool {
         .is_none_or(|installed| latest_running.is_some_and(|running| running >= installed))
 }
 
+fn withdrawn_acceptance(task: &Task) -> BTreeSet<usize> {
+    task.withdrawn
+        .iter()
+        .map(|evidence| evidence.acceptance)
+        .collect()
+}
+
+fn live_unverified_count(task: &Task) -> usize {
+    let withdrawn = withdrawn_acceptance(task);
+    let verified: BTreeSet<_> = task
+        .verified
+        .iter()
+        .flat_map(|evidence| evidence.acceptance.iter().copied())
+        .collect();
+    (1..=task.acceptance.len())
+        .filter(|index| !withdrawn.contains(index) && !verified.contains(index))
+        .count()
+}
+
 fn next_for(state: State, required: &[String], task: &Task) -> String {
     match state {
         State::Open => "start an attempt".into(),
@@ -618,17 +740,10 @@ fn next_for(state: State, required: &[String], task: &Task) -> String {
                 Some("verified") if !running_current(task) => {
                     "check the running harness processes".into()
                 }
-                Some("verified") => {
-                    let done: BTreeSet<usize> = task
-                        .verified
-                        .iter()
-                        .flat_map(|evidence| evidence.acceptance.iter().copied())
-                        .collect();
-                    format!(
-                        "verify {} acceptance condition(s)",
-                        task.acceptance.len().saturating_sub(done.len())
-                    )
-                }
+                Some("verified") => format!(
+                    "verify {} acceptance condition(s)",
+                    live_unverified_count(task)
+                ),
                 Some(other) => format!("record {other} evidence"),
                 None => "none".into(),
             }
@@ -817,7 +932,10 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         .iter()
         .flat_map(|evidence| evidence.acceptance.iter().copied())
         .collect();
-    let all_verified = (1..=task.acceptance.len()).all(|index| verified.contains(&index));
+    let withdrawn = withdrawn_acceptance(&task);
+    let all_verified = (1..=task.acceptance.len())
+        .filter(|index| !withdrawn.contains(index))
+        .all(|index| verified.contains(&index));
     let facts = |state: &str| match state {
         "finished" => true,
         "reviewed" => reviewed,
@@ -941,6 +1059,12 @@ pub(crate) fn record_evidence(
     let mut acceptance = acceptance;
     acceptance.sort_unstable();
     acceptance.dedup();
+    let withdrawn = withdrawn_acceptance(&before.record);
+    if let Some(index) = acceptance.iter().find(|index| withdrawn.contains(index)) {
+        return Err(crate::refusal::error(format!(
+            "task_evidence_withdrawn: acceptance {index} is withdrawn"
+        )));
+    }
     update(project, id, |task| {
         let evidence = Evidence {
             at: project::now(),
@@ -1102,9 +1226,10 @@ pub(crate) fn refresh_tasks_md(project: &Project) -> Result<()> {
             } else {
                 let mark = if heading == "Complete" { "x" } else { " " };
                 text.push_str(&format!(
-                    "- [{mark}] `{}` {} — {}; next: {}\n",
+                    "- [{mark}] `{}` {}{} — {}; next: {}\n",
                     view.record.id,
                     view.record.title,
+                    withdrawal_summary(&view.record),
                     view.status(),
                     view.next
                 ));
@@ -1129,6 +1254,30 @@ pub(crate) fn refresh_tasks_md(project: &Project) -> Result<()> {
     write_atomic(&tasks_path, text.as_bytes())
 }
 
+fn date(timestamp: &str) -> &str {
+    &timestamp[..timestamp.len().min(10)]
+}
+
+pub(crate) fn withdrawal_summary(task: &Task) -> String {
+    if task.withdrawn.is_empty() {
+        return String::new();
+    }
+    let details = task
+        .withdrawn
+        .iter()
+        .map(|evidence| {
+            format!(
+                "Acceptance {} withdrawn {}: {}",
+                evidence.acceptance,
+                date(&evidence.at),
+                evidence.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(" — {details}")
+}
+
 pub(crate) fn render(view: &View) -> String {
     let mut out = format!(
         "{} [{}] {}\n",
@@ -1151,7 +1300,21 @@ pub(crate) fn render(view: &View) -> String {
     }
     out.push_str("acceptance:\n");
     for (index, condition) in view.record.acceptance.iter().enumerate() {
-        out.push_str(&format!("  {}. {}\n", index + 1, condition));
+        let number = index + 1;
+        if let Some(withdrawal) = view
+            .record
+            .withdrawn
+            .iter()
+            .find(|evidence| evidence.acceptance == number)
+        {
+            out.push_str(&format!(
+                "  {number}. [withdrawn {}: {}] {condition}\n",
+                date(&withdrawal.at),
+                withdrawal.reason
+            ));
+        } else {
+            out.push_str(&format!("  {number}. {condition}\n"));
+        }
     }
     if let Some(class) = view.failure_class {
         out.push_str(&format!("failure: {}\n", class.plain()));
@@ -1232,6 +1395,7 @@ created = "2026-09-21T00:00:00Z"
         let task: Task = toml::from_str(text).unwrap();
 
         assert!(task.running.is_empty());
+        assert!(task.withdrawn.is_empty());
         validate_record(&task).unwrap();
     }
 
@@ -1391,6 +1555,128 @@ created = "2026-09-21T00:00:00Z"
             .unwrap()
             .0;
         assert!(context.contains("dropped: The premise was wrong."));
+    }
+
+    #[test]
+    fn withdrawing_the_only_unverified_condition_completes_the_task_everywhere() {
+        use crate::round::testkit::fixture;
+
+        let fx = fixture();
+        let mut task = record(&fx.project, "job-0001");
+        task.acceptance = vec![
+            "The first result is checked.".into(),
+            "The replaced result is no longer required.".into(),
+            "The final result is checked.".into(),
+        ];
+        task.verified.push(Evidence {
+            at: project::now(),
+            command: "checked results one and three".into(),
+            acceptance: vec![1, 3],
+            machine: None,
+            build: None,
+        });
+        write(&fx.project, &task).unwrap();
+        let (lane, sha) = fx.lane(1);
+        link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.task_states = vec!["finished".into(), "verified".into()];
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{front}+++\n\n{body}"),
+        )
+        .unwrap();
+
+        let task = withdraw_acceptance(
+            &fx.project,
+            "job-0001",
+            vec![2, 2],
+            "The newer cleanup choice replaced it.",
+        )
+        .unwrap();
+        let withdrawn_date = date(&task.withdrawn[0].at).to_string();
+        let view = view(&fx.project, task);
+        assert_eq!(view.state, State::Verified);
+        assert_eq!(view.next, "none");
+        assert!(render(&view).contains(&format!(
+            "2. [withdrawn {withdrawn_date}: The newer cleanup choice replaced it.]"
+        )));
+
+        let summary = format!(
+            "Acceptance 2 withdrawn {withdrawn_date}: The newer cleanup choice replaced it."
+        );
+        let generated = std::fs::read_to_string(fx.project.dir().join("TASKS.md")).unwrap();
+        assert!(generated.contains(&summary));
+        let overview = crate::talk::overview::Overview::load(
+            &fx.project,
+            &crate::talk::Journal::default(),
+            &crate::talk::view::Conversation::default(),
+            &crate::talk::overview::Live::default(),
+        );
+        assert!(
+            overview
+                .tasks
+                .iter()
+                .any(|row| row.full_text().contains(&summary)),
+            "{:?}",
+            overview
+                .tasks
+                .iter()
+                .map(|row| row.full_text())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn acceptance_withdrawal_refuses_each_invalid_target() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let mut task = record(&project, "job-0001");
+        task.acceptance = vec!["First.".into(), "Second.".into(), "Third.".into()];
+        task.verified.push(Evidence {
+            at: project::now(),
+            command: "checked first".into(),
+            acceptance: vec![1],
+            machine: None,
+            build: None,
+        });
+        write(&project, &task).unwrap();
+
+        let no_reason = withdraw_acceptance(&project, "job-0001", vec![2], "").unwrap_err();
+        assert!(
+            no_reason
+                .to_string()
+                .contains("task_drop: --reason is required")
+        );
+        let verified = withdraw_acceptance(&project, "job-0001", vec![1], "Replaced.").unwrap_err();
+        assert!(
+            verified
+                .to_string()
+                .contains("task_drop_acceptance_verified")
+        );
+        let range = withdraw_acceptance(&project, "job-0001", vec![4], "Replaced.").unwrap_err();
+        assert!(range.to_string().contains("task_drop_acceptance_range"));
+        withdraw_acceptance(&project, "job-0001", vec![2], "Replaced.").unwrap();
+        let partly_withdrawn = load(&project, "job-0001").unwrap();
+        assert_eq!(live_unverified_count(&partly_withdrawn), 1);
+        assert_eq!(
+            next_for(
+                State::Merged,
+                &["finished".into(), "merged".into(), "verified".into()],
+                &partly_withdrawn
+            ),
+            "verify 1 acceptance condition(s)"
+        );
+        let already =
+            withdraw_acceptance(&project, "job-0001", vec![2], "Replaced again.").unwrap_err();
+        assert!(already.to_string().contains("task_drop_acceptance_already"));
+
+        record(&project, "job-0002");
+        let all = withdraw_acceptance(&project, "job-0002", vec![1], "Replaced.").unwrap_err();
+        assert!(all.to_string().contains("task_drop_acceptance_all"));
+        assert!(load(&project, "job-0002").unwrap().withdrawn.is_empty());
     }
 
     #[test]
