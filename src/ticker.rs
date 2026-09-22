@@ -1119,8 +1119,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     }
 
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
-        first_error = first_error.or(Some(error.context("pending cancellation cleanup")));
+        first_error = first_error.or(Some(error.context("pending thread cleanup")));
     }
+    crate::threads::resolve_report_only(ctx, project);
 
     let local = open_threads(project, false);
     let pass = thread_pass(
@@ -1249,7 +1250,7 @@ fn remote_pass(
 }
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
-/// routines, auto-resolve and housekeeping.
+/// routines and housekeeping.
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
@@ -1385,7 +1386,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {
-        Ok((settings, _)) => {
+        Ok((_settings, _)) => {
             let commands = project
                 .safety(&ctx.config_dir)
                 .map(|s| s.routine_commands)
@@ -1393,7 +1394,6 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             errors.extend(steps::routines(
                 ctx, project, &mut state, commands, None, &zoned,
             ));
-            errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
         }
         Err(error) => {
             let text = std::fs::read(project.project_md()).unwrap_or_default();
