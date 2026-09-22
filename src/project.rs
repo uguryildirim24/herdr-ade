@@ -1007,10 +1007,17 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         out.push_str("None.\n");
     }
     for decision in decisions.iter().rev().take(10) {
+        let text = match &decision.overturned {
+            Some(change) => format!(
+                "{} — overturned by {} at {}: {}",
+                decision.line, change.by, change.at, change.reason
+            ),
+            None => decision.line.clone(),
+        };
         out.push_str(&markdown_item(
             &decision.id,
             &decision.at[..decision.at.len().min(10)],
-            &decision.line,
+            &text,
         ));
     }
 
@@ -1022,11 +1029,17 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     }
     for view in finished.into_iter().take(10) {
         out.push_str(&format!(
-            "- `{}` [{}] {}\n",
+            "- `{}` [{}] {}",
             view.record.id,
             view.state.word(),
             view.record.title.trim()
         ));
+        if view.state == crate::task::State::Dropped
+            && let Some(evidence) = view.record.dropped.last()
+        {
+            out.push_str(&format!(" — dropped: {}", evidence.reason.trim()));
+        }
+        out.push('\n');
     }
 
     let history = latest_history(project)

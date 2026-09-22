@@ -54,7 +54,6 @@ pub(crate) struct Row {
     pub(crate) text: String,
     pub(crate) replaces: Option<String>,
     pub(crate) tasks: Vec<String>,
-    pub(crate) source: String,
 }
 
 fn path(project: &Project) -> PathBuf {
@@ -98,7 +97,6 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
             text: note.text,
             replaces: note.replaces,
             tasks: note.tasks,
-            source: "notes.jsonl".into(),
         })
         .collect();
     for decision in crate::decide::read(project).records {
@@ -117,7 +115,6 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
             text: decision.line,
             replaces: decision.replaces,
             tasks: Vec::new(),
-            source: "decisions.jsonl".into(),
         });
     }
     let tasks = crate::task::list_with_errors(project).0;
@@ -139,7 +136,6 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
                 text: task.title.clone(),
                 replaces: task.replaces.clone(),
                 tasks: vec![task.id.clone()],
-                source: format!("tasks/{}.toml", task.id),
             });
         }
         for (index, note) in task.notes.into_iter().enumerate() {
@@ -157,7 +153,6 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
                 text: note.text,
                 replaces: note.replaces,
                 tasks: vec![task.id.clone()],
-                source: format!("tasks/{}.toml", task.id),
             });
         }
     }
@@ -255,49 +250,6 @@ pub(crate) fn sort_newest_first(rows: &mut Vec<Row>) {
         let newer = rows.remove(new_index);
         rows.insert(old_index, newer);
     }
-}
-
-pub(crate) fn render_context(project: &Project) -> String {
-    let mut rows = rows(project);
-    let replacements = replacement_map(&rows);
-    sort_newest_first(&mut rows);
-    let total = rows.len();
-    let mut out = String::new();
-    for row in rows.into_iter().take(20) {
-        let provenance = match (&row.at, &row.request) {
-            (Some(at), Some(request)) => format!("{} request:{}", &at[..at.len().min(10)], request),
-            _ => "undated".into(),
-        };
-        let first = row
-            .text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default();
-        let short: String = first.chars().take(160).collect();
-        let scope = if row.tasks.is_empty() {
-            String::new()
-        } else {
-            format!(" tasks={}", row.tasks.join(","))
-        };
-        let relation = if let Some(newer) = replacements.get(&row.id) {
-            format!(" — replaced by {newer}")
-        } else if let Some(old) = &row.replaces {
-            format!(" — replaces {old}")
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "- {} [{}; {}; {}{}] {}{}\n",
-            row.id, provenance, row.kind, row.source, scope, short, relation
-        ));
-    }
-    if total > 20 {
-        out.push_str(&format!(
-            "… {} more; read notes.jsonl, decisions.jsonl and tasks/.\n",
-            total - 20
-        ));
-    }
-    out
 }
 
 pub(crate) fn active_rows(project: &Project) -> Vec<Row> {
@@ -401,7 +353,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!render_context(&fx.project).contains("undated:PROJECT.md"));
         let old = add(&fx.project, Kind::Memory, "Keep this.", "q-1", None, vec![]).unwrap();
         let new = add(
             &fx.project,
@@ -415,9 +366,9 @@ mod tests {
         let active = active_for(&fx.project, None);
         assert!(!active.iter().any(|row| row.id == old.id));
         assert!(active.iter().any(|row| row.id == new.id));
-        let context = render_context(&fx.project);
-        assert!(context.find(&new.id).unwrap() < context.find(&old.id).unwrap());
-        assert!(context.contains(&format!("replaced by {}", new.id)));
+        let page = std::fs::read_to_string(fx.project.project_md()).unwrap();
+        assert!(page.contains("Keep that instead."));
+        assert!(!page.contains("Keep this."));
 
         let task = crate::task::add(
             &fx.project,
@@ -429,12 +380,13 @@ mod tests {
             Some(new.id.clone()),
         )
         .unwrap();
-        let context = render_context(&fx.project);
-        assert!(context.contains(&format!("replaced by {}", task.id)));
         assert!(
             !active_for(&fx.project, None)
                 .iter()
                 .any(|row| row.id == new.id)
         );
+        let page = std::fs::read_to_string(fx.project.project_md()).unwrap();
+        assert!(!page.contains("Keep that instead."));
+        assert!(page.contains(&task.title));
     }
 }

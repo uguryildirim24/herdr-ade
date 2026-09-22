@@ -1704,7 +1704,7 @@ created = "2026-09-21T00:00:00Z"
         let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
             .unwrap()
             .0;
-        assert!(digest.contains("job-0001 [working]"));
+        assert!(digest.contains("`job-0001` [working]"));
         fx.seal_done(&lane, 1, 1, &sha, "# report\n");
         assert_eq!(
             view(&fx.project, load(&fx.project, "job-0001").unwrap()).state,

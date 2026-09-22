@@ -1938,6 +1938,34 @@ pub fn run() -> Result<()> {
         }
     }
     let mut command_name = command_path.join(" ");
+    let flag = |name: &str| leaf.try_get_one::<bool>(name).ok().flatten() == Some(&true);
+    let read_only = matches!(
+        command_name.as_str(),
+        "list"
+            | "overview"
+            | "ledger list"
+            | "ledger show"
+            | "ledger task"
+            | "task show"
+            | "task list"
+            | "thread list"
+            | "thread show"
+            | "routine list"
+            | "safety show"
+            | "doctor"
+            | "round show"
+            | "plan show"
+            | "decide list"
+            | "decide show"
+            | "explain"
+            | "ticker status"
+            | "plain check"
+    ) || command_name == "context" && flag("peek")
+        || command_name == "delete" && flag("preview")
+        || command_name == "checkpoint" && (flag("print") || flag("check"))
+        || command_name == "pickup" && flag("dry_run")
+        || command_name == "talk" && flag("replay")
+        || command_name == "board" && flag("print");
     // Identify the object of a refusal/retry, not just its verb. Do not copy
     // task text, prompts, flags or environment into the CLI-level subject.
     for key in ["round", "id", "name"] {
@@ -1949,12 +1977,18 @@ pub fn run() -> Result<()> {
     let env = Env::from_process()?;
     let config_dir = env.config_dir();
     let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
-    let runner = crate::ledger::RecordingRunner(&RealRunner);
+    let real_runner = RealRunner;
+    let recording_runner = crate::ledger::RecordingRunner(&real_runner);
+    let runner: &dyn crate::runner::Runner = if read_only {
+        &real_runner
+    } else {
+        &recording_runner
+    };
     let ctx = Ctx {
         env: &env,
         root,
         config_dir,
-        runner: &runner,
+        runner,
         detached_ticker: true,
     };
 
@@ -1975,10 +2009,29 @@ pub fn run() -> Result<()> {
     let observed_project = observed_slug
         .as_deref()
         .and_then(|s| Project::load(&ctx.root, s).ok());
-    let _scope = crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>());
+    let _scope = (!read_only)
+        .then(|| crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>()));
     let subject = format!("ha {command_name}");
     let result = dispatch(ctx, cli.command, observed_project.as_ref());
-    record_command_outcome(observed_project.as_ref(), &subject, &result);
+    if read_only {
+        match &result {
+            Err(error) if crate::refusal::is(error) => {
+                crate::output::set_outcome("refused");
+                crate::output::set_failure_class(None);
+            }
+            Err(_) if observed_project.is_some() => {
+                crate::output::set_outcome("failed");
+                crate::output::set_failure_class(Some("unknown"));
+            }
+            Err(_) => {
+                crate::output::set_outcome("refused");
+                crate::output::set_failure_class(None);
+            }
+            Ok(()) => {}
+        }
+    } else {
+        record_command_outcome(observed_project.as_ref(), &subject, &result);
+    }
     if result.is_ok() {
         crate::output::finish_success()?;
     }

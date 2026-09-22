@@ -166,11 +166,10 @@ fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().next(), Some("# Project"));
     let prefix = text
         .lines()
-        .next()
-        .unwrap()
-        .strip_prefix("Commands: ")
+        .find_map(|line| line.strip_prefix("Commands: "))
         .unwrap();
     // Fixed shape `<binary> --root <root>`, with the spaced root shell-quoted.
     assert_eq!(prefix, format!("{BIN} --root '{root_arg}'"));
@@ -208,7 +207,8 @@ fn context_uses_ha_for_the_default_root_and_keeps_recipe_commands_in_the_skill()
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text.lines().next(), Some("Commands: ha"));
+    assert_eq!(text.lines().next(), Some("# Project"));
+    assert!(text.contains("\nCommands: ha\n"), "{text}");
     let recipes = text
         .split("## Recipes\n")
         .nth(1)
@@ -271,6 +271,7 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
             .status
             .success()
     );
+    // Read-only failures are answers, not new ledger evidence.
     for _ in 0..2 {
         assert!(
             !hp(
@@ -281,6 +282,17 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
             .success()
         );
     }
+    assert!(!root.join("demo/ledger.jsonl").exists());
+    let entry = |count| {
+        format!(
+            "{{\"record\":\"failure\",\"id\":\"f-0001\",\"at\":\"2026-09-22T00:00:00Z\",\"last_at\":\"2026-09-22T00:00:00Z\",\"kind\":\"command-failed\",\"subject\":\"ha thread start\",\"detail\":\"no thread\",\"count\":{count},\"closed\":false}}\n"
+        )
+    };
+    std::fs::write(
+        root.join("demo/ledger.jsonl"),
+        format!("{}{}", entry(1), entry(2)),
+    )
+    .unwrap();
     let ledger = |args: &[&str]| {
         Command::new(BIN)
             .env_clear()
@@ -457,12 +469,7 @@ fn successful_commands_keep_human_text_and_return_one_machine_record() {
     assert_eq!(result["outcome"], "shown");
     assert_eq!(result["command"], "context");
     assert_eq!(result["data"]["slug"], "demo");
-    assert!(
-        result["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("Commands: ")
-    );
+    assert!(result["message"].as_str().unwrap().starts_with("# Project"));
 }
 
 #[test]
