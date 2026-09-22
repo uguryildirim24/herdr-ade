@@ -1715,6 +1715,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         }
     }
     if pane != "cleanup_pending" {
+        remove_finished_build_folder(ctx, &project, &record)?;
         remove_scratch_session(ctx, &record)?;
     }
     refresh_plan(ctx, &project);
@@ -1996,6 +1997,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     } else {
         close_pane(ctx, &project, &resolved)?
     };
+    remove_finished_build_folder(ctx, &project, &resolved)?;
     remove_scratch_session(ctx, &resolved)?;
     let pane = if args.keep_pane {
         "kept_open"
@@ -2334,11 +2336,35 @@ pub(crate) fn finished_worktree_reason(
     }
 }
 
+pub(crate) fn report_artifact_stored(project: &Project, record: &Thread) -> Result<bool> {
+    let attempt = record.attempt.max(1);
+    for event in crate::round::sealed_events(project)?
+        .into_iter()
+        .filter(|event| event.thread == record.id && event.attempt == attempt)
+    {
+        let Some(done) = event.payload.done else {
+            continue;
+        };
+        let path = crate::events::artifact_path(project, &done.artifact);
+        match std::fs::read(&path) {
+            Ok(bytes) if thread::sha256_hex(&bytes) == done.artifact => return Ok(true),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not read report artifact {}", path.display()));
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn inspect_worktree_for_removal(
     ctx: &Ctx,
     project: &Project,
     record: &Thread,
 ) -> Result<crate::worktrees::Inspection> {
+    let report_artifact_stored = report_artifact_stored(project, record)?;
     if managed_git_folder(project, record) {
         let disposable =
             crate::worktrees::disposable(&ctx.config_dir, project, &record.worktree_path)?;
@@ -2347,6 +2373,7 @@ pub(crate) fn inspect_worktree_for_removal(
             &record.worktree_path,
             &record.worktree_path,
             &disposable,
+            report_artifact_stored,
         );
     }
     let disposable = crate::worktrees::disposable(&ctx.config_dir, project, &record.repo)?;
@@ -2356,6 +2383,7 @@ pub(crate) fn inspect_worktree_for_removal(
             &record.repo,
             &record.worktree_path,
             &disposable,
+            report_artifact_stored,
         );
     }
     let profile = remote::machine_profile(
@@ -2371,6 +2399,7 @@ pub(crate) fn inspect_worktree_for_removal(
         &machine.path,
         &record.worktree_path,
         &disposable,
+        report_artifact_stored,
     )
 }
 
@@ -2402,7 +2431,6 @@ fn worktree_exists(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool
     )?;
     let (box_repo, _) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
     let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-    let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
     let present = "__HERDR_WORKTREE_PRESENT__";
     let removed = "__HERDR_WORKTREE_REMOVED__";
     let script = remote::with_path(
@@ -2431,9 +2459,8 @@ fn worktree_exists(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool
     let cleanup = remote::with_path(
         &machine.path,
         &format!(
-            "cd {} && git worktree prune --expire=now && rm -rf -- {}",
+            "cd {} && git worktree prune --expire=now",
             remote::quote(&box_repo),
-            remote::quote(&build),
         ),
     );
     let out = remote::ssh(
@@ -2478,16 +2505,14 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     )?;
     let (box_repo, _) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
     let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-    let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
     let script = remote::with_path(
         &machine.path,
         &format!(
-            "cd {} && if [ -e {} ]; then git worktree remove {} || {{ [ ! -e {} ] && git worktree prune --expire=now; }}; else git worktree prune --expire=now; fi && rm -rf -- {}",
+            "cd {} && if [ -e {} ]; then git worktree remove {} || {{ [ ! -e {} ] && git worktree prune --expire=now; }}; else git worktree prune --expire=now; fi",
             remote::quote(&box_repo),
             remote::quote(&record.worktree_path),
             remote::quote(&record.worktree_path),
             remote::quote(&record.worktree_path),
-            remote::quote(&build)
         ),
     );
     let out = remote::ssh(
@@ -2499,6 +2524,38 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     )?;
     if !out.success() {
         bail!("{}", out.error_text());
+    }
+    Ok(())
+}
+
+fn remove_finished_build_folder(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if !record.is_remote() {
+        return Ok(());
+    }
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        record.machine_route(),
+    )?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
+    let script = remote::with_path(
+        &machine.path,
+        &format!("rm -rf -- {}", remote::quote(&build)),
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        Duration::from_secs(20),
+    )?;
+    if !out.success() {
+        bail!(
+            "could not remove lane build folder {build}: {}",
+            out.error_text()
+        );
     }
     Ok(())
 }
@@ -3867,11 +3924,11 @@ mod tests {
             .iter()
             .find(|call| call.display().contains("git worktree prune --expire=now"))
             .expect("box cleanup");
-        let command = cleanup.display();
-        assert!(
-            command.contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
-            "{command}"
-        );
+        assert!(!cleanup.display().contains("rm -rf --"));
+        assert!(calls.iter().any(|call| {
+            call.display()
+                .contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001")
+        }));
     }
 
     #[test]
