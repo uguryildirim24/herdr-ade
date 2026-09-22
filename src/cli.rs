@@ -548,13 +548,15 @@ enum PlanStepCommand {
         expect: u64,
     },
     /// Replace one step's sentence
-    #[command(allow_missing_positional = true)]
     Edit {
-        /// Project slug; omit to use the current project
-        #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
-        id: String,
-        text: String,
+        /// Project slug when TEXT is also present; otherwise the step id
+        #[arg(value_name = "PROJECT_OR_ID")]
+        project_or_id: String,
+        /// Step id when TEXT is present; otherwise the replacement text
+        #[arg(value_name = "ID_OR_TEXT")]
+        id_or_text: String,
+        /// Replacement text when the project slug is present
+        text: Option<String>,
         #[arg(long)]
         expect: u64,
     },
@@ -617,13 +619,15 @@ enum PlanStepCommand {
 #[derive(Subcommand)]
 enum DecideCommand {
     /// Overturn a decision, keeping its history
-    #[command(allow_missing_positional = true)]
     Overturn {
-        /// Project slug; omit to use the current project
-        #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
-        id: String,
-        reason: String,
+        /// Project slug when REASON is also present; otherwise the decision id
+        #[arg(value_name = "PROJECT_OR_ID")]
+        project_or_id: String,
+        /// Decision id when REASON is present; otherwise the reason
+        #[arg(value_name = "ID_OR_REASON")]
+        id_or_reason: String,
+        /// Reason when the project slug is present
+        reason: Option<String>,
     },
     /// List the current choices, newest first
     List {
@@ -644,13 +648,15 @@ enum DecideCommand {
 #[derive(Subcommand)]
 enum AskCommand {
     /// Withdraw an open question, keeping its history
-    #[command(allow_missing_positional = true)]
     Withdraw {
-        /// Project slug; omit to use the current project
-        #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
-        id: String,
-        reason: String,
+        /// Project slug when REASON is also present; otherwise the ask id
+        #[arg(value_name = "PROJECT_OR_ID")]
+        project_or_id: String,
+        /// Ask id when REASON is present; otherwise the reason
+        #[arg(value_name = "ID_OR_REASON")]
+        id_or_reason: String,
+        /// Reason when the project slug is present
+        reason: Option<String>,
     },
     /// Answer an ask by id and revision
     Answer {
@@ -1044,7 +1050,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             round: r,
             reask,
         } => match command {
-            Some(AskCommand::Withdraw { slug, id, reason }) => {
+            Some(AskCommand::Withdraw {
+                project_or_id,
+                id_or_reason,
+                reason,
+            }) => {
+                let (slug, id, reason) = match reason {
+                    Some(reason) => (Some(project_or_id), id_or_reason, reason),
+                    None => (None, project_or_id, id_or_reason),
+                };
                 let slug = slug_of(slug)?;
                 let by = ctx
                     .env
@@ -1164,11 +1178,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     )
                 }
                 PlanStepCommand::Edit {
-                    slug,
-                    id,
+                    project_or_id,
+                    id_or_text,
                     text,
                     expect,
                 } => {
+                    let (slug, id, text) = match text {
+                        Some(text) => (Some(project_or_id), id_or_text, text),
+                        None => (None, project_or_id, id_or_text),
+                    };
                     let slug = slug_of(slug)?;
                     let p = plan::step_edit(ctx, &slug, &id, &text, expect)?;
                     crate::output::success(
@@ -1302,7 +1320,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             replaces,
             request,
         } => match command {
-            Some(DecideCommand::Overturn { slug, id, reason }) => {
+            Some(DecideCommand::Overturn {
+                project_or_id,
+                id_or_reason,
+                reason,
+            }) => {
+                let (slug, id, reason) = match reason {
+                    Some(reason) => (Some(project_or_id), id_or_reason, reason),
+                    None => (None, project_or_id, id_or_reason),
+                };
                 let slug = slug_of(slug)?;
                 let by = ctx
                     .env
@@ -2738,6 +2764,26 @@ mod tests {
             argv.extend_from_slice(args);
             assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
         }
+
+        let omitted_cases: &[&[&str]] = &[
+            &["ask", "withdraw", "a-1", "No longer needed."],
+            &["decide", "overturn", "d-1", "Use the other choice."],
+            &[
+                "plan",
+                "step",
+                "edit",
+                "s-1",
+                "Ship it now.",
+                "--expect",
+                "1",
+            ],
+        ];
+        for args in omitted_cases {
+            let mut argv = vec!["herdr-ade"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
+        }
+
         assert!(Cli::try_parse_from(["herdr-ade", "plan", "show", "--project", "demo"]).is_err());
     }
 
