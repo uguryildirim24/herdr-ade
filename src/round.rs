@@ -1602,7 +1602,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                     )?;
                     continue;
                 }
-                ReviewerState::Alive => continue,
+                ReviewerState::Alive => {
+                    crate::ledger::recovered(&project, "round-reviewer-attention", &round);
+                    continue;
+                }
             }
         }
         // No reviewer is bound. This is the one path that starts a review;
@@ -2058,7 +2061,10 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     {
         return ReviewerState::Gone;
     }
-    if row.note == "session unreachable" || row.note.starts_with("not polled yet,") {
+    if row.note == "session unreachable"
+        || row.note.starts_with("first check pending")
+        || row.note.starts_with("first check failed")
+    {
         return ReviewerState::Unknown(row.note.clone());
     }
     let record = &row.thread;
@@ -2083,6 +2089,68 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
         return ReviewerState::Unstarted("no agent appeared in the reviewer's pane".to_string());
     }
     ReviewerState::Alive
+}
+
+/// The round line shown now. Reviewer attention is derived from the latest
+/// thread poll, never from the announcement text saved by an earlier pass.
+/// Older records still load their stored line; only durable merge-repair and
+/// divergence facts continue to use it.
+pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundRecord) -> String {
+    let verdict = record.verdict_kind.as_deref().or_else(|| {
+        record
+            .announced
+            .as_deref()
+            .and_then(|token| token.strip_prefix("verdict:"))
+    });
+    if let Some(verdict) = verdict {
+        return verdict_summary(&record.round, verdict);
+    }
+    if let Some(reviewer) = record.reviewer.as_deref() {
+        let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
+        return match reviewer_state(ctx, project, reviewer) {
+            ReviewerState::Alive => {
+                if record.attention.starts_with("Round ") {
+                    String::new()
+                } else {
+                    record.attention.clone()
+                }
+            }
+            ReviewerState::Gone => format!(
+                "Round {}: the reviewer thread {reviewer} is gone; replace its attempt with `{prefix} round retry {} {} --reason <why>`",
+                record.round, project.slug, record.round
+            ),
+            ReviewerState::Unknown(reason) => format!(
+                "Round {}: the reviewer state is unknown ({reason}); no replacement was started",
+                record.round
+            ),
+            ReviewerState::Unstarted(reason) => format!(
+                "Round {}: the reviewer did not start ({reason}); it will retry automatically",
+                record.round
+            ),
+        };
+    }
+    if record.announced.as_deref() == Some("reviewer-start-failed") {
+        return format!(
+            "Round {}: the reviewer did not start; it is retried on the next pass, {} of {} failures",
+            record.round, record.reviewer_start_failures, MAX_REVIEWER_START_FAILURES
+        );
+    }
+    if record.announced.as_deref() == Some("reviewer-start-exhausted") {
+        return format!(
+            "Round {}: the reviewer did not start after {} failures; use `round retry {} {} --reason <why>` or `round cancel {} {} --reason <why>`",
+            record.round,
+            MAX_REVIEWER_START_FAILURES,
+            project.slug,
+            record.round,
+            project.slug,
+            record.round
+        );
+    }
+    if record.attention.starts_with("Round ") {
+        String::new()
+    } else {
+        record.attention.clone()
+    }
 }
 
 /// The one place a reviewer start that did not take is recorded (E3/D1).
@@ -2193,11 +2261,16 @@ fn announce_once(
         let mut record = load(project, round)?;
         let already = record.announced.as_deref() == Some(token);
         record.announced = Some(token.to_string());
-        record.attention = summary.to_string();
+        // The summary is deliberately not persisted. Context derives reviewer
+        // attention from the latest poll, so recovery cannot leave a stale
+        // "gone" line after the reviewer is working again.
         save(project, &record)?;
         if already {
             return Ok(());
         }
+    }
+    if token.starts_with("reviewer-") {
+        crate::ledger::observe(project, "round-reviewer-attention", round, summary);
     }
     if let Some(what) = say_what {
         let _ = crate::ask::say(ctx, &project.slug, &what, None);
@@ -3554,8 +3627,9 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
     if let Some(reason) = &record.abandoned_reason {
         out.push_str(&format!("abandoned because: {reason}\n"));
     }
-    if !record.attention.is_empty() {
-        out.push_str(&format!("attention: {}\n", record.attention));
+    let attention = current_attention(ctx, &project, &record);
+    if !attention.is_empty() {
+        out.push_str(&format!("attention: {attention}\n"));
     }
     for m in &record.manifest.members {
         match &m.pin {
@@ -5702,6 +5776,41 @@ mod tests {
                 .unwrap()
                 .0,
             digest
+        );
+
+        // A later live poll replaces the old announcement in the rendered
+        // attention line; the stored token is only de-duplication state.
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.status = thread::Status::Open;
+            thread.workspace_id = "w9".into();
+            thread.tab_id = "w9:t1".into();
+            thread.pane_id = "w9:p1".into();
+            thread.cwd = "/review".into();
+            thread.prompt_pending = false;
+        })
+        .unwrap();
+        let live = thread::load(&fx.project, &reviewer).unwrap();
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &live.workspace_id,
+                &live.tab_id,
+                &live.pane_id,
+                &live.cwd,
+                &live.agent_name,
+                "working",
+            )
+        );
+        let refreshed = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(
+            !refreshed.contains("  Round r1: the reviewer thread t-0003 is gone"),
+            "{refreshed}"
+        );
+        assert!(
+            refreshed.contains("round-reviewer-attention"),
+            "the incident remains in history: {refreshed}"
         );
     }
 
