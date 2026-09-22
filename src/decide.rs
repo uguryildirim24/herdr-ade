@@ -436,7 +436,8 @@ mod tests {
         );
         let (digest, _) = crate::coordinator::digest(&ctx, &fx.project, "ha").unwrap();
         assert!(digest.contains("overturned by rolf"));
-        assert!(digest.contains("do not repeat them"));
+        assert!(digest.contains("I want more detail."));
+        assert!(!digest.contains("## Overturned decisions"));
         assert!(
             overturn(&ctx, "demo", &original.id, "Again.", "rolf")
                 .unwrap_err()
