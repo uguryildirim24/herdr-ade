@@ -1958,6 +1958,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             Ok(())
         })?;
         if queued {
+            crate::round::hold_for_follow_up(ctx, &project, id)?;
             return Ok(PromptOutcome::Queued {
                 attempt: record.attempt.max(1),
             });
@@ -1988,6 +1989,13 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             .agent_prompt(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    // The next observation may already be idle if the answer was immediate.
+    // Mark this successful delivery as work first, so the round can distinguish
+    // that later idle observation from the lane's pre-prompt idle state.
+    thread::update(&project, id, |thread| {
+        thread.last_group = Group::Working.token().to_string();
+    })?;
+    crate::round::hold_for_follow_up(ctx, &project, id)?;
     Ok(PromptOutcome::Sent {
         attempt: record.attempt.max(1),
         agent_state: state,
