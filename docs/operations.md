@@ -85,7 +85,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `routine list`, `routine approve`, `safety show` | Routines and safety settings. |
 | `round show <project> [<round>]` | Show one round; without a round, list every round in the project. |
 | `harness install` | Build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. |
-| `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. `delete` moves the folder to `.trash/`. |
+| `pause`, `resume`, `archive`, `unarchive`, `delete [--preview] [--github]` | Project lifecycle. `delete` stops project-owned processes and sends owned local files to the macOS Trash; shared resources stay. GitHub deletion is explicit. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 
 Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a process gone with no report, or blocked for 30 seconds); **Unknown** for a box lane that has not been polled; **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. Threads idle for `auto_resolve_days` are resolved after a final copy home.

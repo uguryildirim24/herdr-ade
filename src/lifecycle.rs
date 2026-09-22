@@ -126,7 +126,19 @@ struct DeleteIntent {
     completed: BTreeSet<String>,
 }
 
+struct OtherProjectOwnership {
+    slug: String,
+    repos: Vec<Repo>,
+    threads: Vec<thread::Thread>,
+    paths: BTreeSet<PathBuf>,
+    pro_names: BTreeSet<String>,
+    coordinator_pane: Option<String>,
+}
+
 fn same_path(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
     let a = Path::new(a);
     let b = Path::new(b);
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -135,28 +147,112 @@ fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
-fn other_projects_using(ctx: &Ctx, slug: &str, repo: &Repo) -> Vec<String> {
-    let mut users = Vec::new();
+fn paths_overlap(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let a = std::fs::canonicalize(a).unwrap_or_else(|_| PathBuf::from(a));
+    let b = std::fs::canonicalize(b).unwrap_or_else(|_| PathBuf::from(b));
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
+fn readable_threads(project: &Project) -> Result<Vec<thread::Thread>> {
+    let (threads, errors) = thread::list_with_errors(project);
+    if errors.is_empty() {
+        Ok(threads)
+    } else {
+        bail!(
+            "cannot prove ownership while {} has unreadable thread records: {}",
+            project.slug,
+            errors
+                .iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
+
+fn pro_thread_names(threads: &[thread::Thread]) -> BTreeSet<String> {
+    threads
+        .iter()
+        .filter(|record| record.role == "pro" || record.launch.kind == "pro")
+        .flat_map(|record| [record.agent_name.clone(), record.agent.clone()])
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn owned_paths(project: &Project, threads: &[thread::Thread]) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::from([project.dir()]);
+    paths.extend(
+        threads
+            .iter()
+            .flat_map(|record| [&record.worktree_path, &record.cwd])
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+    );
+    paths
+}
+
+fn other_ownership(ctx: &Ctx, slug: &str) -> Result<Vec<OtherProjectOwnership>> {
+    let mut owners = Vec::new();
     for other_slug in crate::project::list_slugs(&ctx.root) {
         if other_slug == slug {
             continue;
         }
-        let Ok(other) = Project::load(&ctx.root, &other_slug) else {
-            continue;
-        };
-        let Ok((settings, _)) = other.read_project_md() else {
-            continue;
-        };
-        if settings.repos.iter().any(|candidate| {
-            same_path(&candidate.path, &repo.path)
-                || (repo.box_path.is_some()
-                    && candidate.machine == repo.machine
-                    && candidate.box_path == repo.box_path)
-        }) {
-            users.push(other_slug);
-        }
+        let project = Project::load(&ctx.root, &other_slug)?;
+        let (settings, _) = project.read_project_md()?;
+        let threads = readable_threads(&project)?;
+        owners.push(OtherProjectOwnership {
+            slug: other_slug,
+            repos: settings.repos,
+            paths: owned_paths(&project, &threads),
+            pro_names: pro_thread_names(&threads),
+            coordinator_pane: project.coordinator().map(|record| record.pane_id),
+            threads,
+        });
     }
-    users
+    Ok(owners)
+}
+
+fn other_projects_using_repo(others: &[OtherProjectOwnership], repo: &Repo) -> Vec<String> {
+    others
+        .iter()
+        .filter(|owner| {
+            owner.repos.iter().any(|candidate| {
+                paths_overlap(&candidate.path, &repo.path)
+                    || candidate
+                        .box_path
+                        .as_deref()
+                        .zip(repo.box_path.as_deref())
+                        .is_some_and(|(a, b)| paths_overlap(a, b))
+            }) || owner.threads.iter().any(|record| {
+                paths_overlap(&record.repo, &repo.path)
+                    || repo.box_path.as_deref().is_some_and(|box_path| {
+                        record.is_remote() && paths_overlap(&record.worktree_path, box_path)
+                    })
+            })
+        })
+        .map(|owner| owner.slug.clone())
+        .collect()
+}
+
+fn other_projects_using_path(others: &[OtherProjectOwnership], path: &Path) -> Vec<String> {
+    let path = path.to_string_lossy();
+    others
+        .iter()
+        .filter(|owner| {
+            owner
+                .repos
+                .iter()
+                .any(|repo| paths_overlap(&repo.path, &path))
+                || owner
+                    .paths
+                    .iter()
+                    .any(|candidate| paths_overlap(&candidate.to_string_lossy(), &path))
+        })
+        .map(|owner| owner.slug.clone())
+        .collect()
 }
 
 fn trash(ctx: &Ctx, path: &Path, what: &str) -> Result<()> {
@@ -177,6 +273,59 @@ fn trash(ctx: &Ctx, path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn old_copy_for_slug(name: &str, slug: &str) -> bool {
+    let Some(stamp) = name
+        .strip_prefix(slug)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let bytes = stamp.as_bytes();
+    bytes.len() == 16
+        && bytes[8] == b'T'
+        && bytes[15] == b'Z'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 15) || byte.is_ascii_digit())
+}
+
+fn clean_old_trash(ctx: &Ctx, slug: &str) -> Result<()> {
+    let holding = ctx.root.join(".trash");
+    let entries = match std::fs::read_dir(&holding) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries: Vec<_> = entries.collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut kept = false;
+    for entry in entries {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| old_copy_for_slug(name, slug))
+        {
+            trash(ctx, &entry.path(), "old copy of this project")?;
+        } else {
+            kept = true;
+            println!(
+                "kept another project's old copy: {}",
+                entry.path().display()
+            );
+        }
+    }
+    if kept {
+        println!(
+            "kept old trash holding folder because it still contains other project copies: {}",
+            holding.display()
+        );
+    } else {
+        trash(ctx, &holding, "empty old trash holding folder")?;
+    }
+    Ok(())
+}
+
 fn github_name(url: &str) -> Option<String> {
     let url = url.trim();
     let rest = url
@@ -194,6 +343,19 @@ fn github_name(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{repo}"))
+}
+
+fn github_names(repos: &[Repo], threads: &[thread::Thread]) -> BTreeSet<String> {
+    repos
+        .iter()
+        .filter_map(|repo| repo.publish_url.as_deref().and_then(github_name))
+        .chain(
+            threads
+                .iter()
+                .filter(|record| repos.iter().any(|repo| same_path(&record.repo, &repo.path)))
+                .filter_map(|record| github_name(&record.origin)),
+        )
+        .collect()
 }
 
 fn machines_for_repo(
@@ -299,11 +461,28 @@ fn prune_remote_worktrees(ctx: &Ctx, machine: &str, repo: &str) -> Result<()> {
     Ok(())
 }
 
+fn pro_lane_belongs<'a>(
+    lane: &ProLane,
+    project_paths: impl IntoIterator<Item = &'a PathBuf>,
+    thread_names: &BTreeSet<String>,
+    coordinator_pane: Option<&str>,
+) -> bool {
+    let cwd = Path::new(&lane.cwd);
+    thread_names.contains(&lane.name)
+        || lane
+            .parent
+            .as_deref()
+            .zip(coordinator_pane)
+            .is_some_and(|(parent, coordinator)| parent == coordinator)
+        || project_paths.into_iter().any(|base| cwd == base.as_path())
+}
+
 fn stop_pro_lanes(
     ctx: &Ctx,
     project_paths: &[PathBuf],
     thread_names: &BTreeSet<String>,
     coordinator_pane: Option<&str>,
+    others: &[OtherProjectOwnership],
 ) -> Result<()> {
     let root = ctx.root.join("pro-bridge");
     let lanes = root.join("lanes");
@@ -317,16 +496,29 @@ fn stop_pro_lanes(
             let Ok(lane) = toml::from_str::<ProLane>(&text) else {
                 continue;
             };
-            let cwd = Path::new(&lane.cwd);
-            let belongs = thread_names.contains(&lane.name)
-                || lane
-                    .parent
-                    .as_deref()
-                    .zip(coordinator_pane)
-                    .is_some_and(|(parent, coordinator)| parent == coordinator)
-                || project_paths.iter().any(|base| cwd == base);
-            if belongs {
+            if !pro_lane_belongs(&lane, project_paths, thread_names, coordinator_pane) {
+                continue;
+            }
+            let shared_with: Vec<_> = others
+                .iter()
+                .filter(|owner| {
+                    pro_lane_belongs(
+                        &lane,
+                        &owner.paths,
+                        &owner.pro_names,
+                        owner.coordinator_pane.as_deref(),
+                    )
+                })
+                .map(|owner| owner.slug.as_str())
+                .collect();
+            if shared_with.is_empty() {
                 names.insert(lane.name);
+            } else {
+                println!(
+                    "kept shared Pro lane {} (also owned by {})",
+                    lane.name,
+                    shared_with.join(", ")
+                );
             }
         }
     }
@@ -418,29 +610,19 @@ fn close_tab(herdr: &Herdr<'_>, tab: &str, label: &str) -> Result<()> {
 pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let (settings, _) = project.read_project_md()?;
-    let threads = thread::list(&project);
+    let threads = readable_threads(&project)?;
+    let others = other_ownership(ctx, slug)?;
     let coordinator = project.coordinator();
 
-    let mut project_paths = vec![project.dir()];
-    project_paths.extend(
-        threads
-            .iter()
-            .filter(|thread| !thread.worktree_path.is_empty())
-            .map(|thread| PathBuf::from(&thread.worktree_path)),
-    );
-    let pro_names: BTreeSet<String> = threads
-        .iter()
-        .filter(|thread| thread.role == "pro" || thread.launch.kind == "pro")
-        .flat_map(|thread| [thread.agent_name.clone(), thread.agent.clone()])
-        .filter(|name| !name.is_empty())
-        .collect();
+    let project_paths: Vec<_> = owned_paths(&project, &threads).into_iter().collect();
+    let pro_names = pro_thread_names(&threads);
 
     if preview {
         println!("Archive keeps `{slug}` and its files available for unarchive.");
         println!("Delete removes these explicitly recorded resources:");
         println!("  project record: {}", project.dir().display());
         for repo in &settings.repos {
-            let shared = other_projects_using(ctx, slug, repo);
+            let shared = other_projects_using_repo(&others, repo);
             if shared.is_empty() {
                 println!("  owned repo: {}", repo.path);
                 if let Some(box_path) = &repo.box_path {
@@ -558,11 +740,12 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         &project_paths,
         &pro_names,
         coordinator.as_ref().map(|record| record.pane_id.as_str()),
+        &others,
     )?;
 
     let mut owned_repos = Vec::new();
     for repo in &settings.repos {
-        let users = other_projects_using(ctx, slug, repo);
+        let users = other_projects_using_repo(&others, repo);
         if users.is_empty() {
             owned_repos.push(repo.clone());
         } else {
@@ -586,6 +769,15 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         if covered_by_owned_repo {
             continue;
         }
+        let users = other_projects_using_path(&others, path);
+        if !users.is_empty() {
+            println!(
+                "kept shared project worktree {} (also owned by {})",
+                path.display(),
+                users.join(", ")
+            );
+            continue;
+        }
         if record.is_remote() {
             remote_remove(
                 ctx,
@@ -606,19 +798,17 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         }
     }
 
-    let mut github = BTreeSet::new();
-    for repo in &owned_repos {
-        if let Some(url) = repo.publish_url.as_deref().and_then(github_name) {
-            github.insert(url);
-        }
-        for record in threads
-            .iter()
-            .filter(|thread| same_path(&thread.repo, &repo.path))
-        {
-            if let Some(name) = github_name(&record.origin) {
-                github.insert(name);
-            }
-        }
+    let github_candidates = github_names(&owned_repos, &threads);
+    let other_github: BTreeSet<_> = others
+        .iter()
+        .flat_map(|owner| github_names(&owner.repos, &owner.threads))
+        .collect();
+    let github: BTreeSet<_> = github_candidates
+        .difference(&other_github)
+        .cloned()
+        .collect();
+    for name in github_candidates.intersection(&other_github) {
+        println!("kept shared GitHub repo: {name}");
     }
     if delete_github {
         for name in &github {
@@ -642,7 +832,8 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         }
         // Historical repository rows may have no publish URL. `gh` resolves
         // the repository from its checkout, before that checkout is trashed.
-        if github.is_empty() {
+        // Do not use that fallback when a known identity was kept as shared.
+        if github_candidates.is_empty() {
             for repo in &owned_repos {
                 if !Path::new(&repo.path).exists() {
                     continue;
@@ -696,13 +887,7 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         }
     }
 
-    let mut session_cwds: BTreeSet<PathBuf> = project_paths.into_iter().collect();
-    session_cwds.extend(
-        threads
-            .iter()
-            .filter(|thread| !thread.cwd.is_empty())
-            .map(|thread| PathBuf::from(&thread.cwd)),
-    );
+    let session_cwds: BTreeSet<PathBuf> = project_paths.into_iter().collect();
     let pi_names: BTreeSet<String> = session_cwds
         .iter()
         .map(|path| pi_session_name(path))
@@ -711,10 +896,29 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         .iter()
         .map(|path| claude_session_name(path))
         .collect();
-    for (base, exact_names) in [
-        (ctx.root.join("pi/agent/sessions"), pi_names),
-        (ctx.env.home.join(".claude/projects"), claude_names),
+    let other_pi_names: BTreeSet<String> = others
+        .iter()
+        .flat_map(|owner| owner.paths.iter().map(|path| pi_session_name(path)))
+        .collect();
+    let other_claude_names: BTreeSet<String> = others
+        .iter()
+        .flat_map(|owner| owner.paths.iter().map(|path| claude_session_name(path)))
+        .collect();
+    for (base, exact_names, shared_names) in [
+        (ctx.root.join("pi/agent/sessions"), pi_names, other_pi_names),
+        (
+            ctx.env.home.join(".claude/projects"),
+            claude_names,
+            other_claude_names,
+        ),
     ] {
+        for shared in exact_names.intersection(&shared_names) {
+            println!(
+                "kept shared agent session logs: {}",
+                base.join(shared).display()
+            );
+        }
+        let exact_names: BTreeSet<_> = exact_names.difference(&shared_names).cloned().collect();
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 if exact_names.contains(entry.file_name().to_string_lossy().as_ref()) {
@@ -732,10 +936,10 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         trash(ctx, &project.dir(), "project record")?;
     }
 
-    // Older versions parked deleted projects here. Nothing reads that holding
-    // folder now; preserve its contents in the system Trash and remove the
-    // redundant second trash location.
-    trash(ctx, &ctx.root.join(".trash"), "old trash holding folder")?;
+    // Older versions parked deleted projects here. Remove this slug's copies,
+    // but keep and name every other project's retained copy; the redundant
+    // holding folder goes only when no retained copy still needs it.
+    clean_old_trash(ctx, slug)?;
     Ok(())
 }
 
@@ -802,7 +1006,9 @@ mod tests {
             "second",
             "",
             vec![Repo {
-                path: repo.display().to_string(),
+                // Trashing the parent would also trash this separately owned
+                // nested checkout, so overlap is shared ownership too.
+                path: repo.join("nested").display().to_string(),
                 ..Repo::default()
             }],
         )
@@ -818,6 +1024,133 @@ mod tests {
                     .args
                     .iter()
                     .any(|arg| arg == &repo.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn delete_keeps_a_github_repo_used_by_another_project() {
+        let world = World::new();
+        let first_repo = world.home.path().join("first-repo");
+        let second_repo = world.home.path().join("second-repo");
+        std::fs::create_dir_all(&first_repo).unwrap();
+        std::fs::create_dir_all(&second_repo).unwrap();
+        crate::project::create(
+            &world.root,
+            "first",
+            "",
+            vec![Repo {
+                path: first_repo.display().to_string(),
+                publish_url: Some("https://github.com/acme/shared.git".into()),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
+        crate::project::create(
+            &world.root,
+            "second",
+            "",
+            vec![Repo {
+                path: second_repo.display().to_string(),
+                publish_url: Some("git@github.com:acme/shared.git".into()),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
+        world.runner.on("/usr/bin/trash", ok(""));
+
+        delete(&world.ctx(), "first", true, false).unwrap();
+
+        assert_eq!(world.runner.count("gh repo delete"), 0);
+        assert!(world.runner.calls.borrow().iter().any(|call| {
+            call.program == "/usr/bin/trash"
+                && call
+                    .args
+                    .iter()
+                    .any(|arg| arg == &first_repo.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn delete_keeps_logs_and_pro_files_another_project_claims() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let first_cwd = world.home.path().join("lane.with-dot");
+        thread::allocate(&project, |record| {
+            record.status = thread::Status::Resolved;
+            record.role = "pro".into();
+            record.agent_name = "shared-pro".into();
+            record.worktree_path = first_cwd.display().to_string();
+            record.cwd = record.worktree_path.clone();
+        })
+        .unwrap();
+
+        let other = crate::project::create(&world.root, "second", "", vec![]).unwrap();
+        let other_cwd = world.home.path().join("lane-with-dot");
+        thread::allocate(&other, |record| {
+            record.status = thread::Status::Open;
+            record.role = "pro".into();
+            record.agent_name = "shared-pro".into();
+            record.cwd = other_cwd.display().to_string();
+        })
+        .unwrap();
+
+        let pro = world.root.join("pro-bridge/lanes");
+        std::fs::create_dir_all(&pro).unwrap();
+        std::fs::write(
+            pro.join("shared-pro.toml"),
+            "name = \"shared-pro\"\ncwd = \"/somewhere\"\nparent = \"w1:p1\"\n",
+        )
+        .unwrap();
+        let shared_log = world
+            .home
+            .path()
+            .join(".claude/projects")
+            .join(claude_session_name(&first_cwd));
+        assert_eq!(
+            claude_session_name(&first_cwd),
+            claude_session_name(&other_cwd)
+        );
+        std::fs::create_dir_all(&shared_log).unwrap();
+        world.runner.on("/usr/bin/trash", ok(""));
+
+        delete(&world.ctx(), "demo", false, false).unwrap();
+
+        assert_eq!(world.runner.count("herdr-pro stop shared-pro"), 0);
+        assert!(!world.runner.calls.borrow().iter().any(|call| {
+            call.program == "/usr/bin/trash"
+                && call
+                    .args
+                    .iter()
+                    .any(|arg| arg == &shared_log.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn delete_keeps_other_projects_old_trash_copies() {
+        let world = World::new();
+        world.project("demo", "a.sock");
+        let holding = world.root.join(".trash");
+        let own = holding.join("demo-20260901T000000Z");
+        let other = holding.join("demo-other-20260901T000000Z");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        world.runner.on("/usr/bin/trash", ok(""));
+
+        delete(&world.ctx(), "demo", false, false).unwrap();
+
+        let calls = world.runner.calls.borrow();
+        assert!(calls.iter().any(|call| {
+            call.program == "/usr/bin/trash"
+                && call
+                    .args
+                    .iter()
+                    .any(|arg| arg == &own.display().to_string())
+        }));
+        assert!(!calls.iter().any(|call| {
+            call.program == "/usr/bin/trash"
+                && call.args.iter().any(|arg| {
+                    arg == &other.display().to_string() || arg == &holding.display().to_string()
+                })
         }));
     }
 
