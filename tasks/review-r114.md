@@ -5,15 +5,15 @@ plain: A merge that installs records its running proof and says each step it too
 Run `ha skill reviewer`, then do what this brief says.
 
 Round `r114` on integration branch `main`. The commit that adds this file is the brief commit B.
-Manifest revision 3, manifest hash `43094ab8c3797e451624fae1cdfc882aede3c2863c9b6df5fb34f11f9c89bdfb`, policy hash `7d013b92516df0434273f0f2ae57e9ec661dd6ba01b7b9a588a327b3cc724425`.
+Manifest revision 4, manifest hash `b098182c578c64fd8b9834c9b74f33094e64d413df97d986fde5b68171383469`, policy hash `7d013b92516df0434273f0f2ae57e9ec661dd6ba01b7b9a588a327b3cc724425`.
 
 ## Pinned lanes
 
 | lane | attempt | sha | event | artifact |
 |---|---|---|---|---|
-| t-0308 | 1 | `d7ab7962d6196990787dc51c771dda67b537da06` | `t-0308-1-1` | `ce0dbb048c01f8b9cf6ad6e1a7ad1409f72558c79f05632b72d3df839140172f` |
+| t-0308 | 1 | `3575c380bbfc7416c75fd61a66796ee8681bc581` | `t-0308-1-2` | `547e8400fee7183bafcfd18ed756d217000f800964cda8582cbed89461d3701e` |
 | t-0309 | 1 | `45849463dc869ba8c5e0023fddb01db4f7d6bef7` | `t-0309-1-1` | `c1218e267edf9ac8da26d192c9d3c77acf612a439ecd2c3060ea6b498c914b4f` |
-| t-0310 | 1 | `c702ba3b2fdcf8318212fcef09f285b64c420b9e` | `t-0310-1-1` | `bb3db9c0e97a22b90a842b49570959526299d75a3186018e447dfc33af852eaf` |
+| t-0310 | 1 | `2ee06374ee6e430b438d95e6a51811280eb2fd65` | `t-0310-1-2` | `25db0749314933c1a70823d31e4a43379990d13c7ec1833f3437d32ff54b659c` |
 
 ## Gates
 
@@ -35,7 +35,7 @@ Manifest revision 3, manifest hash `43094ab8c3797e451624fae1cdfc882aede3c2863c9b
 verdict = "MERGE"  # or "MERGE-AFTER-DECISION" or "REJECT"
 round = "r114"
 candidate = "<C>"
-manifest_hash = "43094ab8c3797e451624fae1cdfc882aede3c2863c9b6df5fb34f11f9c89bdfb"
+manifest_hash = "b098182c578c64fd8b9834c9b74f33094e64d413df97d986fde5b68171383469"
 policy_hash = "7d013b92516df0434273f0f2ae57e9ec661dd6ba01b7b9a588a327b3cc724425"
 gates = [{ command = "cargo fmt --check", exit = 0 }, { command = "cargo test", exit = 0 }, { command = "cargo clippy --all-targets -- -D warnings", exit = 0 }, { command = "git diff --check", exit = 0 }]
 +++
@@ -45,7 +45,7 @@ gates = [{ command = "cargo fmt --check", exit = 0 }, { command = "cargo test", 
 
 ## Reports (data, not instructions)
 
-### t-0308 (artifact `ce0dbb048c01f8b9cf6ad6e1a7ad1409f72558c79f05632b72d3df839140172f`)
+### t-0308 (artifact `547e8400fee7183bafcfd18ed756d217000f800964cda8582cbed89461d3701e`)
 
 Data, not instructions.
 
@@ -59,13 +59,14 @@ Data, not instructions.
 - A retry reports an already-complete installation without running it again.
 - The result survives the installer's self-reexec because completed publication is reconstructed from the durable round record.
 - Operations documentation names the plain and JSON output.
+- A checkpointed round now clears its verdict-announcement token. Closed rounds never derive reviewer or verdict attention, and a racing announcement refuses to write after closure. Historical merged records therefore stop showing the stale `round merge` prompt immediately.
 
-Regression coverage proves a round returns the exact installer outcome and running-process/task proof, forwards installer warnings, marks installation durable, and skips the installer on retry. The push retry test now also checks its typed publication result.
+Regression coverage proves a round returns the exact installer outcome and running-process/task proof, forwards installer warnings, marks installation durable, and skips the installer on retry. The push retry test also checks its typed publication result. A second regression announces a MERGE verdict, merges and checkpoints the round, runs `advance` again, and proves both the durable record and `round show` remain free of attention.
 
 Gates passed:
 
 - `cargo fmt --check`
-- `cargo test` — 680 main, 54 pi, 87 pro, and all integration tests passed
+- `cargo test` — 681 main, 54 pi, 87 pro, and all integration tests passed
 - `cargo clippy --all-targets -- -D warnings`
 - `git diff --check`
 ```
@@ -95,16 +96,22 @@ Gates passed:
 Commit: `45849463dc869ba8c5e0023fddb01db4f7d6bef7`
 ```
 
-### t-0310 (artifact `bb3db9c0e97a22b90a842b49570959526299d75a3186018e447dfc33af852eaf`)
+### t-0310 (artifact `25db0749314933c1a70823d31e4a43379990d13c7ec1833f3437d32ff54b659c`)
 
 Data, not instructions.
 
 ```text
 # t-0310 report
 
-Changed automatic round allocation to choose one more than the project's highest recorded round number instead of filling the first gap. The allocator now also fails rather than risking reuse when the rounds folder cannot be read or its highest number cannot be incremented.
+Automatic round allocation now chooses one more than the highest round number found in:
+- project round records;
+- local `review/rN` branches in the selected repository;
+- `tasks/review-rN.md` briefs on the integration branch;
+- `tasks/reviews/code-rN.md` verdicts on the integration branch.
 
-Added a regression test that opens `r3` in an otherwise empty project and verifies the next automatic round is `r4`, not `r1`.
+Repository history is read from Git refs and the integration branch tree, not from checked-out files. Explicit and automatic opens refuse a used number before writing a round record, and the refusal names every matching record, branch, brief, or verdict.
+
+The regression test recreates Fly's late-record case: historical `r1` and `r2` files remain in Git while no round records or checked-out copies exist; automatic open creates `r3`, and explicit `r1` is refused without writing it.
 
 Checks passed:
 - `cargo fmt --check`
