@@ -16,6 +16,8 @@ use crate::thread::{self, CopyOutcome, Group, Status, Thread};
 use crate::threads;
 use crate::{events, inbox, pr, routine};
 
+pub(crate) const TICKER_PROMPT_PREFIX: &str =
+    "[herdr-ade ticker: automated, not the user, approves nothing]";
 pub(crate) const NUDGE_TEXT: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
 const PR_INTERVAL_SECS: i64 = 120;
