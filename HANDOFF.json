@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0201.md",
+      "tasks/review-r84.md",
+      "tasks/t-0202.md",
+      "tasks/review-r83.md",
+      "tasks/t-0200.md",
+      "tasks/review-r82.md",
       "tasks/t-0196.md",
       "tasks/t-0193.md",
       "tasks/t-0198.md",
-      "tasks/review-r82.md",
       "tasks/review-r81.md",
       "tasks/t-0195.md",
-      "tasks/t-0194.md",
-      "tasks/t-0192.md",
-      "tasks/review-r80.md",
-      "tasks/t-0191.md",
-      "tasks/t-0189.md",
-      "tasks/review-r79.md"
+      "tasks/t-0194.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r83.md",
       "tasks/reviews/code-r81.md",
       "tasks/reviews/code-r80.md",
       "tasks/reviews/code-r79.md",
@@ -39,14 +40,21 @@
       "tasks/reviews/code-r74.md",
       "tasks/reviews/code-r73.md",
       "tasks/reviews/code-r72.md",
-      "tasks/reviews/code-r71.md",
-      "tasks/reviews/code-r70.md"
+      "tasks/reviews/code-r71.md"
     ]
   },
-  "generated": "2026-09-21T20:11:42-04:00",
+  "generated": "2026-09-21T20:29:25-04:00",
   "git": {
     "branches": [
       "main",
+      "hp/adeherdr/t-0201-review-r83-a-job-with-no-code-folder-get",
+      "hp/adeherdr/t-0203-review-r84-every-coordinator-waits-for-t",
+      "review/r84",
+      "hp/adeherdr/t-0202-w9-no-workarounds-rule",
+      "hp/adeherdr/t-0199-review-r82-projects-can-run-any-number-o",
+      "review/r83",
+      "hp/adeherdr/t-0200-w8-install-finds-the-box",
+      "review/r82-2",
       "hp/adeherdr/t-0198-w7-pro-start-on-current-codex",
       "hp/adeherdr/t-0195-w6-git-for-no-repo-lanes",
       "hp/adeherdr/t-0196-review-r81-a-new-kind-of-helper-plugs-in",
@@ -317,36 +325,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "41ba4b5 Merge commit 'f10a56605b7484b340a6bb42662dd598046a1d1f'",
-      "41b40ea docs(tasks): t-0198",
-      "f10a566 review(r81): approve repaired candidate",
-      "e3a9380 review(r81): merge earlier reviewed candidate",
-      "25f97dc review(r82): brief for revision 1",
-      "2070d5c docs(tasks): t-0196"
+      "af455f3 Merge commit '4eea06da7993654d71e8acf2ef55c8f98331b29e'",
+      "4eea06d docs(review): round r83 verdict",
+      "ff89cc2 review(threads): preserve adopted cwd during rebind",
+      "76dd652 review(r84): brief for revision 1",
+      "0c1dbdb review(threads): compare managed folders canonically",
+      "81fc62f Merge pinned lane t-0195 for r83"
     ],
-    "remote": "13 ahead, 0 behind origin/main",
+    "remote": "11 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "41ba4b5",
+        "head": "af455f3",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit 'f10a56605b7484b340a6bb42662dd598046a1d1f'"
-      },
-      {
-        "branch": "review/r81",
-        "dirty": 0,
-        "head": "c50c4ea",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r81",
-        "subject": "docs(tasks): t-0193"
-      },
-      {
-        "branch": "review/r81-2",
-        "dirty": 0,
-        "head": "2070d5c",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r81-2",
-        "subject": "docs(tasks): t-0196"
+        "subject": "Merge commit '4eea06da7993654d71e8acf2ef55c8f98331b29e'"
       },
       {
         "branch": "review/r82",
@@ -354,6 +348,55 @@
         "head": "8ba36e1",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r82",
         "subject": "docs(tasks): t-0197"
+      },
+      {
+        "branch": "review/r82-2",
+        "dirty": 0,
+        "head": "dda99f9",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r82-2",
+        "subject": "docs(tasks): t-0199"
+      },
+      {
+        "branch": "review/r83",
+        "dirty": 0,
+        "head": "e4ac703",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r83",
+        "subject": "docs(tasks): t-0201"
+      },
+      {
+        "branch": "review/r84",
+        "dirty": 0,
+        "head": "2063242",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r84",
+        "subject": "docs(tasks): t-0203"
+      },
+      {
+        "branch": "hp/adeherdr/t-0200-w8-install-finds-the-box",
+        "dirty": 7,
+        "head": "3aa671e",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0200",
+        "subject": "docs(tasks): t-0200"
+      },
+      {
+        "branch": "hp/adeherdr/t-0201-review-r83-a-job-with-no-code-folder-get",
+        "dirty": 0,
+        "head": "4eea06d",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0201",
+        "subject": "docs(review): round r83 verdict"
+      },
+      {
+        "branch": "hp/adeherdr/t-0202-w9-no-workarounds-rule",
+        "dirty": 0,
+        "head": "068c020",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0202",
+        "subject": "docs(skills): forbid harness workarounds"
+      },
+      {
+        "branch": "hp/adeherdr/t-0203-review-r84-every-coordinator-waits-for-t",
+        "dirty": 1,
+        "head": "ef36719",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0203",
+        "subject": "Merge commit '068c0200ea5a0f23e9a8eb57ae9685055be736d6' into hp/adeherdr/t-0203-review-r84-every-coordinator-waits-for-t"
       }
     ]
   },
@@ -373,15 +416,100 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r81",
-    "verdict": "f10a56605b7484b340a6bb42662dd598046a1d1f"
+    "round": "r83",
+    "verdict": "4eea06da7993654d71e8acf2ef55c8f98331b29e"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [],
+  "workers": [
+    {
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0200",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0200",
+      "pane_id": "w1G:p3E",
+      "pane_label": null,
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0200--/2026-09-22T00-18-14-696Z_01a0c67a-3c28-75bb-85cb-cba3a4b63656.jsonl",
+      "start_args": [],
+      "status": "working",
+      "tab_id": "w1G:t3A",
+      "tab_label": "t-0200",
+      "title": "π - t-0200",
+      "tokens": {
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "4",
+        "review": "working",
+        "thread": "t-0200"
+      }
+    },
+    {
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0201",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0201",
+      "pane_id": "w1G:p3F",
+      "pane_label": null,
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0201--/2026-09-22T00-19-05-802Z_01a0c67b-03c9-73b2-9f6c-fa33b1aacac6.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t3B",
+      "tab_label": "t-0201",
+      "title": "π - t-0201",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0201",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0201"
+      }
+    },
+    {
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0202",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0202",
+      "pane_id": "w1G:p3G",
+      "pane_label": null,
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0202--/2026-09-22T00-20-08-304Z_01a0c67b-f7f0-708f-a0d4-4cdbeb120c7e.jsonl",
+      "start_args": [],
+      "status": "done",
+      "tab_id": "w1G:t3C",
+      "tab_label": "t-0202",
+      "title": "π - t-0202",
+      "tokens": {
+        "done": "1",
+        "lane": "t-0202",
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "1",
+        "review": "ready-for-review",
+        "thread": "t-0202"
+      }
+    },
+    {
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0203",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0203",
+      "pane_id": "w1G:p3H",
+      "pane_label": null,
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0203--/2026-09-22T00-25-18-197Z_01a0c680-b275-7177-afca-633ed1cecbbb.jsonl",
+      "start_args": [],
+      "status": "working",
+      "tab_id": "w1G:t3D",
+      "tab_label": "t-0203",
+      "title": "π - t-0203",
+      "tokens": {
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "4",
+        "review": "working",
+        "thread": "t-0203"
+      }
+    }
+  ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 2
+    "tabs": 6
   }
 }
