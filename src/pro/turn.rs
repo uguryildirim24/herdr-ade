@@ -138,18 +138,52 @@ pub(crate) fn prepare(
 
     let packet = packet::build(&opts.brief, &opts.attachments, &out)?;
 
-    // The breaker sees a daemon restart on a changed pid (spec §4).
-    let (port, health) = bridge::health_any(runner)?;
+    // Once an endpoint has been recorded, do not let a transient failure on
+    // that port substitute the fallback daemon and masquerade as a restart.
     let previous = BridgeState::read(layout);
-    let restarted = previous.pid.is_some() && previous.pid != health.pid;
-    BridgeState {
-        pid: health.pid,
+    let (port, health) = match previous.port {
+        Some(port) => {
+            let health = bridge::health(runner, port).with_context(|| {
+                format!(
+                    "recorded bridge on port {port} is unavailable; restart status is unknown and the fallback was not substituted"
+                )
+            })?;
+            (port, health)
+        }
+        None => bridge::health_any(runner)?,
+    };
+    let pid = health.pid.with_context(|| {
+        format!("bridge on port {port} did not report a pid; restart status is unknown")
+    })?;
+    let process_start = bridge::process_start(runner, pid)
+        .with_context(|| format!("bridge on port {port} has unknown process identity"))?;
+    let current = BridgeState {
+        pid: Some(pid),
+        process_start: Some(process_start),
+        port: Some(port),
         version: Some(health.version.clone()),
         accepting: Some(health.accepting),
+    };
+    // Records from before process-start and port were stored cannot prove that
+    // a different fallback reply replaced the recorded process. If that old
+    // pid still exists, keep the record and refuse with unknown evidence
+    // instead of draining either daemon.
+    if previous.process_start.is_none()
+        && previous.pid.is_some_and(|recorded| recorded != pid)
+        && let Some(recorded_pid) = previous.pid
+        && let Ok(recorded_start) = bridge::process_start(runner, recorded_pid)
+    {
+        bail!(
+            "recorded bridge state and selected running bridge disagree (pid recorded={recorded_pid} running={pid}, port recorded={} running={port}); recorded pid {recorded_pid} is still running (process_start={recorded_start:?}), so restart status is unknown; bridge was not drained",
+            previous
+                .port
+                .map_or_else(|| "<missing>".into(), |value| value.to_string())
+        );
     }
-    .write(layout)?;
-    if restarted {
-        let detail = trip_breaker(env, layout, runner, port, "the bridge daemon restarted");
+    let restart = bridge_restart_detail(&previous, &current);
+    current.write(layout)?;
+    if let Some(reason) = restart {
+        let detail = trip_breaker(env, layout, runner, port, &reason);
         bail!("refused: {detail}");
     }
 
@@ -503,6 +537,54 @@ fn record_note(layout: &Layout, turn: &mut Turn, note: Result<(), String>) {
         turn.detail = Some(format!("{detail}; notification not delivered: {error}"));
         let _ = turn.write(layout);
     }
+}
+
+/// A restart needs process evidence. Endpoint changes alone are not restarts,
+/// and an older state record contributes only the identity fields it has.
+fn bridge_restart_detail(previous: &BridgeState, current: &BridgeState) -> Option<String> {
+    let pid_changed = previous
+        .pid
+        .zip(current.pid)
+        .is_some_and(|(recorded, running)| recorded != running);
+    let start_changed = previous
+        .process_start
+        .as_deref()
+        .zip(current.process_start.as_deref())
+        .is_some_and(|(recorded, running)| recorded != running);
+    if !pid_changed && !start_changed {
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    if pid_changed {
+        fields.push(format!(
+            "pid recorded={} running={}",
+            previous.pid.unwrap_or_default(),
+            current.pid.unwrap_or_default()
+        ));
+    }
+    if start_changed {
+        fields.push(format!(
+            "process_start recorded={:?} running={:?}",
+            previous.process_start.as_deref().unwrap_or("<missing>"),
+            current.process_start.as_deref().unwrap_or("<missing>")
+        ));
+    }
+    if previous
+        .port
+        .zip(current.port)
+        .is_some_and(|(recorded, running)| recorded != running)
+    {
+        fields.push(format!(
+            "port recorded={} running={}",
+            previous.port.unwrap_or_default(),
+            current.port.unwrap_or_default()
+        ));
+    }
+    Some(format!(
+        "the bridge daemon restarted ({})",
+        fields.join(", ")
+    ))
 }
 
 /// The breaker: write the cooldown and drain the bridge so Codex retries get a
@@ -1084,7 +1166,7 @@ impl RolloutReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pro::sh::fake::{FakeRunner, ok};
+    use crate::pro::sh::fake::{FakeRunner, fail, ok};
     use serde_json::json;
 
     /// A ready lane record with an existing rollout file on disk.
@@ -1594,13 +1676,15 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_bridge_pid_trips_the_breaker_once() {
+    fn a_changed_bridge_process_trips_with_the_disagreeing_values_once() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pro"));
         layout.ensure().unwrap();
         write_ready_lane(dir.path(), &layout);
         BridgeState {
             pid: Some(7),
+            process_start: Some("Mon Sep 21 10:00:00 2026".into()),
+            port: Some(17841),
             version: Some("5.0.8".into()),
             accepting: Some(true),
         }
@@ -1618,6 +1702,7 @@ mod tests {
             ":17841/healthz",
             ok(r#"{"version":"5.0.8","mode":"browser-only","pid":9,"accepting_turns":true}"#),
         );
+        runner.on("/bin/ps -p 9", ok("Tue Sep 22 11:00:00 2026\n"));
         runner.on("codex login status", ok("Logged in\n"));
         let options = |n| TurnOptions {
             lane: "pro".into(),
@@ -1629,15 +1714,155 @@ mod tests {
         };
 
         let error = prepare(&env, &layout, &runner, &options(1)).unwrap_err();
-        assert!(error.to_string().contains("daemon restarted"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("bridge daemon restarted"), "{message}");
+        assert!(message.contains("pid recorded=7 running=9"), "{message}");
+        assert!(
+            message.contains(
+                "process_start recorded=\"Mon Sep 21 10:00:00 2026\" running=\"Tue Sep 22 11:00:00 2026\""
+            ),
+            "{message}"
+        );
         assert!(state::cooldown_active(&layout, jiff::Timestamp::now()));
 
-        // After Rolf clears the breaker the recorded pid matches, so the turn
-        // starts and the restart does not trip again.
+        // After Rolf clears the breaker the recorded process matches, so the
+        // turn starts and the restart does not trip again.
         state::clear_cooldown(&layout).unwrap();
         let turn = prepare(&env, &layout, &runner, &options(2)).unwrap();
         assert_eq!(turn.state, "loading");
         assert!(!state::cooldown_active(&layout, jiff::Timestamp::now()));
+    }
+
+    #[test]
+    fn a_health_reply_without_a_pid_does_not_stop_the_recorded_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pro"));
+        layout.ensure().unwrap();
+        write_ready_lane(dir.path(), &layout);
+        BridgeState {
+            pid: Some(89_145),
+            process_start: Some("Sat Sep 19 17:58:00 2026".into()),
+            port: Some(17841),
+            version: Some("5.0.8".into()),
+            accepting: Some(true),
+        }
+        .write(&layout)
+        .unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "Do the thing").unwrap();
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent list",
+            ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#),
+        );
+        runner.on(
+            ":17841/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","accepting_turns":true}"#),
+        );
+        runner.on("codex login status", ok("Logged in\n"));
+
+        let error = prepare(
+            &env,
+            &layout,
+            &runner,
+            &TurnOptions {
+                lane: "pro".into(),
+                brief,
+                out: dir.path().join("answer.md"),
+                notify: "hcoord".into(),
+                attachments: vec![],
+                id: Some("pro-01".into()),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not report a pid"),
+            "{error}"
+        );
+        assert!(!state::cooldown_active(&layout, jiff::Timestamp::now()));
+        assert_eq!(runner.count("/admin/drain"), 0);
+        assert_eq!(BridgeState::read(&layout).pid, Some(89_145));
+    }
+
+    #[test]
+    fn a_fallback_reply_does_not_stop_a_still_running_recorded_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(dir.path().join("pro"));
+        layout.ensure().unwrap();
+        write_ready_lane(dir.path(), &layout);
+        BridgeState {
+            pid: Some(89_145),
+            version: Some("5.0.8".into()),
+            accepting: Some(true),
+            ..BridgeState::default()
+        }
+        .write(&layout)
+        .unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "Do the thing").unwrap();
+        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent list",
+            ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#),
+        );
+        runner.on(":17841/healthz", fail(7, "connection refused"));
+        runner.on(
+            ":17941/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","pid":9,"accepting_turns":true}"#),
+        );
+        runner.on("/bin/ps -p 9", ok("Tue Sep 22 11:00:00 2026\n"));
+        runner.on("/bin/ps -p 89145", ok("Sat Sep 19 17:58:00 2026\n"));
+        runner.on("codex login status", ok("Logged in\n"));
+
+        let error = prepare(
+            &env,
+            &layout,
+            &runner,
+            &TurnOptions {
+                lane: "pro".into(),
+                brief,
+                out: dir.path().join("answer.md"),
+                notify: "hcoord".into(),
+                attachments: vec![],
+                id: Some("pro-01".into()),
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("pid recorded=89145 running=9"),
+            "{message}"
+        );
+        assert!(
+            message.contains("port recorded=<missing> running=17941"),
+            "{message}"
+        );
+        assert!(message.contains("restart status is unknown"), "{message}");
+        assert!(!state::cooldown_active(&layout, jiff::Timestamp::now()));
+        assert_eq!(runner.count("/admin/drain"), 0);
+        assert_eq!(BridgeState::read(&layout).pid, Some(89_145));
+    }
+
+    #[test]
+    fn the_same_process_is_not_a_restart_when_the_observed_port_changes() {
+        let recorded = BridgeState {
+            pid: Some(89_145),
+            process_start: Some("Sat Sep 19 17:58:00 2026".into()),
+            port: Some(17841),
+            ..BridgeState::default()
+        };
+        let running = BridgeState {
+            pid: Some(89_145),
+            process_start: Some("Sat Sep 19 17:58:00 2026".into()),
+            port: Some(17941),
+            ..BridgeState::default()
+        };
+
+        assert_eq!(bridge_restart_detail(&recorded, &running), None);
     }
 
     #[test]
@@ -1743,6 +1968,7 @@ mod tests {
             ":17841/healthz",
             ok(r#"{"version":"5.0.8","mode":"browser-only","pid":7,"accepting_turns":true}"#),
         );
+        runner.on("/bin/ps -p 7", ok("Sat Sep 19 17:58:00 2026\n"));
         runner.on("codex login status", ok("Logged in\n"));
 
         let turn = prepare(
@@ -1783,6 +2009,7 @@ mod tests {
             ":17841/healthz",
             ok(r#"{"version":"5.0.8","mode":"browser-only","pid":7,"accepting_turns":true}"#),
         );
+        runner.on("/bin/ps -p 7", ok("Sat Sep 19 17:58:00 2026\n"));
         runner.on("codex login status", ok("Logged in\n"));
         let turn = prepare(
             &env,
