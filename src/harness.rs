@@ -1007,6 +1007,14 @@ fn install_box(
 /// `ha harness install`: build every harness repository after a merge and
 /// install it into `~/.local/bin`, then the same on the saved box.
 pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
+    let running = Running::capture()?;
+    install_with_reexec(ctx, |installed| reexec_if_replaced(installed, &running))
+}
+
+pub(crate) fn install_with_reexec(
+    ctx: &Ctx,
+    mut reexec: impl FnMut(&Path) -> Result<()>,
+) -> Result<InstallOutcome> {
     let repos = repos(&ctx.config_dir)?;
     if repos.is_empty() {
         bail!(
@@ -1015,22 +1023,10 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         );
     }
     let _lock = lock(&ctx.config_dir)?;
-    let running = Running::capture()?;
-    let config_text =
-        std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap_or_default();
-    let dispatch = toml::from_str::<RawConfig>(&config_text)
-        .context("config.toml does not parse")?
-        .dispatch
-        .machine;
-    let box_machine = install_box(ctx, &dispatch)?;
-    let box_target = box_machine
-        .as_ref()
-        .map(|(profile, _)| profile.target.clone());
-    let box_paths = box_machine.map(|(_, declaration)| declaration);
     let mut fork = false;
+    let mut kinds = Vec::new();
     let mut installed = Vec::new();
     let mut builds = Vec::new();
-    let mut warnings = Vec::new();
     for repo in &repos {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
@@ -1045,7 +1041,7 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         }
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin)?;
-            reexec_if_replaced(&ctx.env.home.join(".local/bin").join(bin), &running)?;
+            reexec(&ctx.env.home.join(".local/bin").join(bin))?;
         }
         builds.push(InstalledBuild {
             repo: repo.path.clone(),
@@ -1056,13 +1052,40 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         for bin in kind.binaries() {
             binaries.push(installed_version(ctx, bin)?);
         }
-        let mut box_commit = None;
-        let box_installed = match (&box_target, &repo.box_path) {
+        kinds.push(kind);
+        installed.push(InstalledRepo {
+            path: repo.path.clone(),
+            kind: kind.name().into(),
+            binaries,
+            commit,
+            box_path: repo.box_path.clone(),
+            box_installed: false,
+            box_commit: None,
+        });
+    }
+
+    // Machine resolution belongs to the installer image built above. If that
+    // image replaced this process, `reexec` never returns and the new image
+    // restarts the transaction before any box lookup or box command occurs.
+    let config_text =
+        std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap_or_default();
+    let dispatch = toml::from_str::<RawConfig>(&config_text)
+        .context("config.toml does not parse")?
+        .dispatch
+        .machine;
+    let box_machine = install_box(ctx, &dispatch)?;
+    let box_target = box_machine
+        .as_ref()
+        .map(|(profile, _)| profile.target.clone());
+    let box_paths = box_machine.map(|(_, declaration)| declaration);
+    let mut warnings = Vec::new();
+    for ((repo, kind), installed_repo) in repos.iter().zip(kinds).zip(&mut installed) {
+        match (&box_target, &repo.box_path) {
             (Some(target), Some(box_path)) => {
                 let machine = box_paths
                     .as_ref()
                     .context("machine path declaration is missing")?;
-                box_commit = box_build(ctx, target, machine, box_path, kind)?;
+                let box_commit = box_build(ctx, target, machine, box_path, kind)?;
                 if let Some(head) = &box_commit {
                     builds.push(InstalledBuild {
                         repo: repo.path.clone(),
@@ -1070,26 +1093,15 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
                         head: head.clone(),
                     });
                 }
-                true
+                installed_repo.box_installed = true;
+                installed_repo.box_commit = box_commit;
             }
-            (Some(_), None) => {
-                warnings.push(format!(
-                    "note: {} has no box_path; skipped the box step",
-                    repo.path
-                ));
-                false
-            }
-            (None, _) => false,
-        };
-        installed.push(InstalledRepo {
-            path: repo.path.clone(),
-            kind: kind.name().into(),
-            binaries,
-            commit,
-            box_path: repo.box_path.clone(),
-            box_installed,
-            box_commit,
-        });
+            (Some(_), None) => warnings.push(format!(
+                "note: {} has no box_path; skipped the box step",
+                repo.path
+            )),
+            (None, _) => {}
+        }
     }
     if let (Some(target), Some(machine)) = (&box_target, &box_paths) {
         box_settings(ctx, target, machine)?;
