@@ -840,20 +840,30 @@ pub fn policy(
     Ok((gates, sha256_hex(bytes.as_bytes()), row))
 }
 
-fn next_round(project: &Project) -> String {
-    let used: std::collections::BTreeSet<u64> = std::fs::read_dir(rounds_dir(project))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
-        .filter_map(|id| round_number(&id).parse().ok())
-        .collect();
-    let mut n = 1;
-    while used.contains(&n) {
-        n += 1;
+fn next_round(project: &Project) -> Result<String> {
+    let entries = match std::fs::read_dir(rounds_dir(project)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("r1".into()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut highest = 0_u64;
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".toml")) else {
+            continue;
+        };
+        if validate_round_id(id).is_err() {
+            continue;
+        }
+        let number = round_number(id)
+            .parse::<u64>()
+            .with_context(|| format!("round_number_too_large: `{id}` cannot be incremented"))?;
+        highest = highest.max(number);
     }
-    format!("r{n}")
+    let next = highest
+        .checked_add(1)
+        .context("round_number_exhausted: no later automatic round number is available")?;
+    Ok(format!("r{next}"))
 }
 
 // --------------------------------------------------------------------- open
@@ -891,7 +901,10 @@ pub fn open_with_lanes(
     threads: Vec<String>,
 ) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
-    let round = round.unwrap_or_else(|| next_round(&project));
+    let round = match round {
+        Some(round) => round,
+        None => next_round(&project)?,
+    };
     validate_round_id(&round)?;
     let Some(plain) = plain.filter(|p| !p.trim().is_empty()) else {
         bail!(
@@ -4337,6 +4350,36 @@ mod tests {
         let brief = compose_review_brief(&pinned, "manifest", &[], "ha");
         assert!(brief.contains("`cargo test` with environment `RUSTFLAGS=-Dwarnings`"));
         assert!(brief.contains("{ command = \"cargo test\", exit = 0 }"));
+    }
+
+    #[test]
+    fn automatic_round_is_after_the_highest_used_number() {
+        let fx = fixture();
+        open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r3".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+
+        let opened = open_with_lanes(
+            &fx.world.ctx(),
+            "demo",
+            None,
+            None,
+            Some(PLAIN.into()),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(opened.round, "r4");
+        assert!(!round_path(&fx.project, "r1").exists());
     }
 
     #[test]
