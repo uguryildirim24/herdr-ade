@@ -29,7 +29,7 @@ the failure ledger. Errors are never classified by matching message text.
 ## One durable record, derived views
 
 `<project>/.state/ledger.jsonl` is an append-only journal guarded by
-`<project>/.state/ledger.lock`. Historical top-level journals remain readable and move on their next write. Each failure has an id, first and last observation
+`<project>/.state/ledger.lock`. Each failure has an id, first and last observation
 times, kind, subject, full error evidence, repeat count, and closed state.
 Repeated `kind + subject + normalized detail` appends a revision of the **same
 id**, not a new failure. Lists and task briefs replay the latest revision per id;

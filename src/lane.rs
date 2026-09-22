@@ -221,35 +221,30 @@ fn box_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
     let mut matches = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
-        let mut seen = std::collections::BTreeSet::new();
-        for dir in [
-            project.state_dir().join("lanes"),
-            project.dir().join("lanes"),
-        ] {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
+        let dir = project.record_dir("lanes");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(card) = toml::from_str::<LaneCard>(&text) else {
-                    continue;
-                };
-                if card.pane_id != pane || !seen.insert(card.thread.clone()) {
-                    continue;
-                }
-                validate_card(ctx, &card)?;
-                matches.push(Binding {
-                    project: project.clone(),
-                    thread: thread_from_card(&card),
-                    card: Some(card),
-                });
+            let Ok(card) = toml::from_str::<LaneCard>(&text) else {
+                continue;
+            };
+            if card.pane_id != pane {
+                continue;
             }
+            validate_card(ctx, &card)?;
+            matches.push(Binding {
+                project: project.clone(),
+                thread: thread_from_card(&card),
+                card: Some(card),
+            });
         }
     }
     Ok(matches)

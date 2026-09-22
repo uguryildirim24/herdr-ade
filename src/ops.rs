@@ -490,13 +490,7 @@ fn load_box_card(project: &Project, thread: &str) -> Option<crate::contracts::La
     if crate::thread::validate_id(thread).is_err() {
         return None;
     }
-    let name = format!("{thread}.toml");
-    let current = project.state_dir().join("lanes").join(&name);
-    let path = if current.exists() {
-        current
-    } else {
-        project.dir().join("lanes").join(name)
-    };
+    let path = project.record_dir("lanes").join(format!("{thread}.toml"));
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str(&text).ok()
 }
@@ -1078,7 +1072,7 @@ mod tests {
             pane: "w1:p1".into(),
             coordinator_attempt: 1,
         };
-        std::fs::create_dir_all(project.dir().join("lanes")).unwrap();
+        std::fs::create_dir_all(project.state_dir().join("lanes")).unwrap();
         for (thread, attempt) in [("t-0001", 1), ("t-0002", 1)] {
             let card = crate::contracts::LaneCard {
                 project: "demo".into(),
@@ -1100,7 +1094,10 @@ mod tests {
                 created: "2026-09-19T00:00:00Z".into(),
             };
             std::fs::write(
-                project.dir().join("lanes").join(format!("{thread}.toml")),
+                project
+                    .state_dir()
+                    .join("lanes")
+                    .join(format!("{thread}.toml")),
                 toml::to_string(&card).unwrap(),
             )
             .unwrap();

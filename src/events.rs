@@ -62,15 +62,9 @@ fn artifact_dir(project: &Project) -> PathBuf {
     project.state_dir().join("artifacts")
 }
 
-/// The Mac path of one artifact, named by its own hash. Historical artifacts
-/// stay at their recorded path because immutable events may cite it.
+/// The Mac path of one artifact, named by its own hash.
 pub(crate) fn artifact_path(project: &Project, hash: &str) -> PathBuf {
-    let current = artifact_dir(project).join(hash);
-    if current.exists() {
-        current
-    } else {
-        project.dir().join("artifacts").join(hash)
-    }
+    artifact_dir(project).join(hash)
 }
 
 /// The source tuple recorded for every box event imported on the Mac
@@ -120,9 +114,8 @@ pub(crate) enum ImportOutcome {
 
 /// Imports one box envelope into the Mac's canonical ledger, create-only
 /// (SPEC-remote §4.3). The box's own bytes must hash to `event_hash`; the
-/// artifact must hash to the event's `artifact`. The local event keeps the
-/// same id and payload but its `report_path` is rewritten to the Mac artifact
-/// path, so the typed DONE line names a path the Mac owns. The same event id
+/// artifact must hash to the event's `artifact`. The sealed event bytes remain
+/// historical evidence; file lookup uses the artifact hash. The same event id
 /// with different bytes is corruption and refuses.
 pub(crate) fn import_box_event(
     project: &Project,
@@ -166,13 +159,7 @@ pub(crate) fn import_box_event(
         artifact_hash = done.artifact.clone();
     }
 
-    let mut local = event.clone();
-    if let Some(done) = local.payload.done.as_mut() {
-        done.report_path = artifact_path(project, &done.artifact)
-            .to_string_lossy()
-            .into_owned();
-    }
-    seal_create_if_absent(project, &local)
+    seal_create_if_absent(project, &event)
         .with_context(|| format!("could not import event {}", event.id))?;
 
     let source = ImportSource {
@@ -606,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn box_import_is_create_only_hash_checked_and_rewrites_the_report_path() {
+    fn box_import_is_create_only_hash_checked_and_preserves_the_report_path() {
         let (_root, project, _event) = fixture();
         let report = b"report body";
         let hash = format!("{:x}", Sha256::digest(report));
@@ -619,8 +606,7 @@ mod tests {
         );
         let imported = load(&project, &event.id).unwrap();
         let written = imported.payload.done.clone().unwrap().report_path;
-        assert!(written.ends_with(&hash), "{written}");
-        assert!(!written.contains(".reports"), "{written}");
+        assert_eq!(written, ".reports/t-0001.md");
         assert_eq!(
             std::fs::read(artifact_path(&project, &hash)).unwrap(),
             report
