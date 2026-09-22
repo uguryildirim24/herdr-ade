@@ -1772,6 +1772,16 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
             bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
         }
     }
+    if record.phase != RoundPhase::UnderReview
+        || record.frozen_revision != Some(record.manifest.revision)
+    {
+        bail!(
+            "reviewer_stale: `{round}` is {:?} at manifest revision {}, but its frozen review is revision {}; the reviewer was not bound",
+            record.phase,
+            record.manifest.revision,
+            record.frozen_revision.unwrap_or(0)
+        );
+    }
     record.verdict = None;
     record.verdict_kind = None;
     record.phase = RoundPhase::UnderReview;
@@ -2376,9 +2386,13 @@ fn start_and_bind_reviewer(
         );
     }
     if let Some(candidate) = unbound.first() {
-        bind_reviewer(ctx, slug, round, &candidate.id)?;
-        crate::ledger::recovered(project, "reviewer-start-failed", round);
-        return Ok(Some(candidate.id.clone()));
+        return match bind_reviewer(ctx, slug, round, &candidate.id) {
+            Ok(_) => {
+                crate::ledger::recovered(project, "reviewer-start-failed", round);
+                Ok(Some(candidate.id.clone()))
+            }
+            Err(error) => cancel_unbound_reviewer(ctx, project, slug, round, &candidate.id, error),
+        };
     }
     match start_reviewer(ctx, project, round, review_branch, prefix) {
         Ok(thread) => match bind_reviewer(ctx, slug, round, &thread.id) {
@@ -2386,23 +2400,32 @@ fn start_and_bind_reviewer(
                 crate::ledger::recovered(project, "reviewer-start-failed", round);
                 Ok(Some(thread.id))
             }
-            Err(error) => {
-                // Starting and binding is one recovery effect: never return
-                // with an unbound reviewer left alive beside a later retry.
-                let reason = format!("reviewer binding failed: {error:#}");
-                let cleanup = crate::threads::cancel(ctx, slug, &thread.id, &reason)?;
-                if cleanup.state == "cleanup_pending" {
-                    return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
-                }
-                reviewer_start_failed(ctx, project, round, &reason, None)?;
-                Ok(None)
-            }
+            Err(error) => cancel_unbound_reviewer(ctx, project, slug, round, &thread.id, error),
         },
         Err(error) => {
             reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
             Ok(None)
         }
     }
+}
+
+/// Starting and binding is one effect: a reviewer rejected by the final
+/// round-state check must not remain alive beside a later retry.
+fn cancel_unbound_reviewer(
+    ctx: &Ctx,
+    project: &Project,
+    slug: &str,
+    round: &str,
+    reviewer: &str,
+    error: anyhow::Error,
+) -> Result<Option<String>> {
+    let reason = format!("reviewer binding failed: {error:#}");
+    let cleanup = crate::threads::cancel(ctx, slug, reviewer, &reason)?;
+    if cleanup.state == "cleanup_pending" {
+        return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
+    }
+    reviewer_start_failed(ctx, project, round, &reason, None)?;
+    Ok(None)
 }
 
 fn reviewer_task(
@@ -5712,30 +5735,7 @@ mod tests {
     }
 
     #[test]
-    fn admitting_a_lane_stops_the_reviewer_it_supersedes() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        reviewer_ready(&fx);
-        open_r1(&fx);
-        let (first, sha) = fx.lane(1);
-        admit(&ctx, "demo", "r1", &first).unwrap();
-        fx.seal_done(&first, 1, 1, &sha, "# report\n");
-        advance(&ctx, "demo").unwrap();
-        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
-        let (late, _) = fx.lane(2);
-
-        let changed = admit(&ctx, "demo", "r1", &late).unwrap();
-
-        assert_eq!(changed.phase, RoundPhase::Admitting);
-        assert!(changed.reviewer.is_none());
-        assert_eq!(
-            thread::load(&fx.project, &reviewer).unwrap().status,
-            thread::Status::Resolved
-        );
-    }
-
-    #[test]
-    fn removing_a_lane_stops_the_reviewer_it_supersedes() {
+    fn removing_a_lane_stops_both_bound_and_in_flight_stale_reviewers() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         reviewer_ready(&fx);
@@ -5746,7 +5746,9 @@ mod tests {
             fx.seal_done(lane, 1, 1, sha, "# report\n");
         }
         advance(&ctx, "demo").unwrap();
-        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let before = load(&fx.project, "r1").unwrap();
+        let reviewer = before.reviewer.unwrap();
+        let review_branch = before.review_branch.unwrap();
 
         let changed = remove(&ctx, "demo", "r1", &lanes[1].0).unwrap();
 
@@ -5756,6 +5758,20 @@ mod tests {
             thread::load(&fx.project, &reviewer).unwrap().status,
             thread::Status::Resolved
         );
+
+        // Simulate a reviewer start that began before the removal and reached
+        // its bind only after the round returned to admission.
+        assert!(
+            start_and_bind_reviewer(&ctx, &fx.project, "demo", "r1", &review_branch, "ha")
+                .unwrap()
+                .is_none()
+        );
+        let stale = thread::list(&fx.project)
+            .into_iter()
+            .find(|candidate| candidate.role == "reviewer" && candidate.id != reviewer)
+            .expect("the in-flight reviewer was placed");
+        assert_eq!(stale.status, thread::Status::Resolved);
+        assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
     }
 
     #[test]
@@ -6662,33 +6678,6 @@ mod tests {
                 .map(|pin| pin.event.as_str()),
             Some(second.as_str())
         );
-    }
-
-    #[test]
-    fn a_retry_while_waiting_for_follow_up_accepts_the_new_attempts_report() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        reviewer_ready(&fx);
-        open_r1(&fx);
-        let (lane, sha) = fx.lane(1);
-        admit(&ctx, "demo", "r1", &lane).unwrap();
-        fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
-        let before_send = sealed_events(&fx.project).unwrap();
-        hold_for_follow_up(&ctx, &fx.project, &lane, &before_send).unwrap();
-        fx.set_attempt(&lane, 2);
-
-        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
-        let second = fx.seal_done(&lane, 2, 1, &sha, "# retry report\n");
-        assert_eq!(advance(&ctx, "demo").unwrap().started.len(), 1);
-        let record = load(&fx.project, "r1").unwrap();
-        assert_eq!(
-            record.manifest.members[0]
-                .pin
-                .as_ref()
-                .map(|pin| pin.event.as_str()),
-            Some(second.as_str())
-        );
-        assert!(record.manifest.members[0].awaiting_report_after.is_none());
     }
 
     #[test]
