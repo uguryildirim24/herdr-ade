@@ -14,11 +14,11 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-22T16:16:18-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-22T17:02:31-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 2 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/Users/rolfie/.herdr-ade/adeherdr`.
 
-Coordinator session id `22e30006-6abc-4f92-9bcc-c002ce0ce442`.
+Coordinator session id `e090742b-3a62-46fd-8bc3-73a7232d4e90`.
 
 ### Workers nested under the coordinator
 
@@ -28,29 +28,30 @@ Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done)
 
 ### Git
 
-Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (19 ahead, 0 behind origin/main).
+Repo `/Users/rolfie/projects/herdr-ade`, integration branch `main` (16 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/Users/rolfie/projects/herdr-ade` | `main` | 53d78de | 0 | docs(review): round r113 verdict |
-| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r113` | `review/r113` | 7e1307f | 0 | docs(tasks): t-0307 |
+| `/Users/rolfie/projects/herdr-ade` | `main` | 078caf1 | 0 | review(r114): merge |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r114` | `review/r114` | 36d5d64 | 0 | docs(tasks): t-0311 |
+| `/Users/rolfie/projects/herdr-ade/.worktrees/review-r114-2` | `review/r114-2` | badfeb4 | 0 | docs(tasks): t-0312 |
 
 Last commits on the integration branch:
 
 ```
-53d78de docs(review): round r113 verdict
-54f6aee review(ade): keep context and command docs actionable
-d823501 Merge commit 'd0dacafe5f2766d260e546f54b242d4a07d40b7d' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r
-fb15739 Merge commit '505baae8a4f840a3a7d55a9654b4b28effa321b2' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r
-2754f01 Merge commit '76efbc9afcdc841b5551639fbc83e8e1171bf3ea' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r
-b57220d Merge commit '9b6c3eb561fd2352d84e4bb8577937dd07261854' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r
+078caf1 review(r114): merge
+d4a62f4 review(round): reserve repair review branch numbers
+000cd15 Merge commit '2ee06374ee6e430b438d95e6a51811280eb2fd65' into hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record
+7356968 Merge commit '45849463dc869ba8c5e0023fddb01db4f7d6bef7' into hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record
+933d268 Merge commit '3575c380bbfc7416c75fd61a66796ee8681bc581' into hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record
+badfeb4 docs(tasks): t-0312
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0307.md`, `tasks/review-r113.md`, `tasks/t-0306.md`, `tasks/t-0305.md`, `tasks/t-0304.md`, `tasks/t-0303.md`, `tasks/t-0302.md`, `tasks/review-r112.md`, `tasks/t-0301.md`, `tasks/t-0297.md`, `tasks/review-r111.md`, `tasks/t-0300.md`
-- verdicts: `tasks/reviews/code-r113.md`, `tasks/reviews/code-r112.md`, `tasks/reviews/code-r111.md`, `tasks/reviews/code-r110.md`, `tasks/reviews/code-r109.md`, `tasks/reviews/code-r108.md`, `tasks/reviews/code-r107.md`, `tasks/reviews/code-r106.md`, `tasks/reviews/code-r105.md`, `tasks/reviews/code-r104.md`, `tasks/reviews/code-r100.md`, `tasks/reviews/code-r103.md`
+- briefs: `tasks/t-0312.md`, `tasks/review-r114.md`, `tasks/t-0310.md`, `tasks/t-0309.md`, `tasks/t-0308.md`, `tasks/t-0307.md`, `tasks/review-r113.md`, `tasks/t-0306.md`, `tasks/t-0305.md`, `tasks/t-0304.md`, `tasks/t-0303.md`, `tasks/t-0302.md`
+- verdicts: `tasks/reviews/code-r114.md`, `tasks/reviews/code-r113.md`, `tasks/reviews/code-r112.md`, `tasks/reviews/code-r111.md`, `tasks/reviews/code-r110.md`, `tasks/reviews/code-r109.md`, `tasks/reviews/code-r108.md`, `tasks/reviews/code-r107.md`, `tasks/reviews/code-r106.md`, `tasks/reviews/code-r105.md`, `tasks/reviews/code-r104.md`, `tasks/reviews/code-r100.md`
 
 ### Pickup
 
@@ -59,8 +60,8 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 ```bash
 ha pickup <slug>
 # the old coordinator conversation, if herdr did not resume it in the pane:
-# cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume 22e30006-6abc-4f92-9bcc-c002ce0ce442
+# cd /Users/rolfie/.herdr-ade/adeherdr && claude --resume e090742b-3a62-46fd-8bc3-73a7232d4e90
 ```
 
-Round `r113` was merged into `main` at verdict commit `53d78dee9104be7a57f7a0e2c04f2fa9e4ea5ca7`; this checkpoint is its child.
+Round `r114` was merged into `main` at verdict commit `078caf1dddfc2d8731a6d49af3adc672f6ad22e2`; this checkpoint is its child.
 
