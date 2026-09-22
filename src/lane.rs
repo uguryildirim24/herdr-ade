@@ -70,8 +70,12 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
             helper_pid: std::process::id(),
         },
     )?;
-    let cwd = Path::new(&binding.thread.cwd);
-    ops::stage_done(&binding.project, &op.op, cwd, ctx.runner)?;
+    let git_folder = if crate::threads::managed_git_folder(&binding.project, &binding.thread) {
+        &binding.thread.worktree_path
+    } else {
+        &binding.thread.cwd
+    };
+    ops::stage_done(&binding.project, &op.op, Path::new(git_folder), ctx.runner)?;
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
     })?;
@@ -269,7 +273,14 @@ fn local_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
                 continue;
             }
             let recorded = std::fs::canonicalize(&lane.cwd).ok();
-            if cwd.is_some() && recorded.is_some() && cwd != recorded {
+            let managed = crate::threads::managed_git_folder(&project, &lane)
+                .then(|| std::fs::canonicalize(&lane.worktree_path).ok())
+                .flatten();
+            if cwd.is_some()
+                && recorded.is_some()
+                && cwd != recorded
+                && (managed.is_none() || cwd != managed)
+            {
                 continue;
             }
             matches.push(Binding {
