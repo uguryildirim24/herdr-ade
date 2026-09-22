@@ -187,14 +187,14 @@ impl Conversation {
                     text,
                     answer,
                 } => {
-                    if answer.is_some()
-                        || old_carriers.contains(request)
-                        || super::is_historical_system_prompt(text)
-                    {
+                    if answer.is_some() || old_carriers.contains(request) {
                         continue;
                     }
+                    let Some(text) = super::human_request_text(text) else {
+                        continue;
+                    };
                     status = states.get(request).copied();
-                    Body::Rolf(text.clone())
+                    Body::Rolf(text)
                 }
                 Entry::Say { what, means, .. } => Body::Say {
                     what: what.clone(),
