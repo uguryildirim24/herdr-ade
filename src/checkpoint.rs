@@ -1901,6 +1901,16 @@ mod tests {
             ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t9","pane_id":"w1:p99","cwd":"/tmp"}}}"#),
         );
         let ctx = fx.world.ctx();
+        let config = fx.world.home.path().join("cfg/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[safety.\"{}\"]\nstart_threads = \"propose\"\n",
+                fx.project.canonical_dir().display()
+            ),
+        )
+        .unwrap();
         let propose = PickupArgs {
             slug: Some("demo"),
             pane: Some("w1:p1"),
@@ -1908,13 +1918,11 @@ mod tests {
             all: false,
             start: true,
         };
-        // The default `propose` row prints, as today: nothing is started.
+        // A project can still opt into proposal-only starts.
         let out = pickup(&ctx, propose).unwrap();
         assert!(out.contains("gone (not live;"), "{out}");
         assert_eq!(fx.world.runner.count("tab create"), 0);
 
-        let config = fx.world.home.path().join("cfg/config.toml");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(
             &config,
             format!(

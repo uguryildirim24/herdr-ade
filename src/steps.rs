@@ -41,6 +41,8 @@ pub(crate) struct State {
     /// unread. Reset when the set is read or a different set is announced.
     pub(crate) unread_passes: u32,
     pub(crate) session_item_written: bool,
+    /// Last successful automated prompt to continue open work.
+    pub(crate) idle_nudge_last: String,
 }
 
 pub(crate) fn load_state(project: &Project) -> State {

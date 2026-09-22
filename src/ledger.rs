@@ -38,6 +38,7 @@ enum Line {
     Failure(Entry),
     ContextRead { at: String },
     Recovered { kind: String, subject: String },
+    CoordinatorNudge { at: String, next: Vec<String> },
 }
 
 #[derive(Default)]
@@ -99,6 +100,7 @@ fn load(project: &Project) -> Result<State> {
             Line::Recovered { kind, subject } => {
                 state.pending.remove(&(kind, subject));
             }
+            Line::CoordinatorNudge { .. } => {}
         }
     }
     Ok(state)
@@ -297,6 +299,24 @@ pub(crate) fn section(project: &Project) -> Result<String> {
 pub(crate) fn context_read(project: &Project, at: &str) -> Result<()> {
     let _lock = lock(project)?;
     append(project, &Line::ContextRead { at: at.into() })
+}
+
+pub(crate) fn latest_context_read(project: &Project) -> Result<String> {
+    let _lock = lock(project)?;
+    Ok(load(project)?.context_read)
+}
+
+/// Records a successful automated continue prompt without turning it into a
+/// harness failure.
+pub(crate) fn coordinator_nudge(project: &Project, next: &[String]) -> Result<()> {
+    let _lock = lock(project)?;
+    append(
+        project,
+        &Line::CoordinatorNudge {
+            at: jiff::Timestamp::now().to_string(),
+            next: next.to_vec(),
+        },
+    )
 }
 
 /// Close every open occurrence when the observed condition clears. Closure is
