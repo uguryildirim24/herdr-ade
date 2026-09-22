@@ -154,7 +154,6 @@ pub(crate) struct Repo {
 pub(crate) struct Settings {
     pub(crate) name: String,
     pub(crate) goal: String,
-    pub(crate) auto_resolve_days: u32,
     pub(crate) nudge: bool,
     /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
     /// default of item 24: on for a `claude` coordinator, off otherwise
@@ -179,7 +178,6 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             goal: String::new(),
-            auto_resolve_days: 7,
             // On by default: a coordinator that does not read its inbox is
             // unreachable. A project that wants the old notification-only
             // behaviour sets `nudge = false` in PROJECT.md. On herdr 0.9.1 a
@@ -974,7 +972,6 @@ mod tests {
         let (settings, body) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
-        assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert_eq!(
             settings.repos,
