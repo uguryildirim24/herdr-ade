@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0221.md",
+      "tasks/t-0219.md",
+      "tasks/t-0216.md",
+      "tasks/review-r90.md",
       "tasks/t-0220.md",
       "tasks/t-0217.md",
       "tasks/t-0214.md",
       "tasks/review-r88.md",
-      "tasks/review-r90.md",
       "tasks/t-0218.md",
       "tasks/t-0215.md",
       "tasks/review-r89.md",
-      "tasks/t-0212.md",
-      "tasks/t-0213.md",
-      "tasks/review-r87.md",
-      "tasks/t-0211.md"
+      "tasks/t-0212.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r90.md",
       "tasks/reviews/code-r88.md",
       "tasks/reviews/code-r89.md",
       "tasks/reviews/code-r87.md",
@@ -39,16 +40,17 @@
       "tasks/reviews/code-r83.md",
       "tasks/reviews/code-r81.md",
       "tasks/reviews/code-r80.md",
-      "tasks/reviews/code-r79.md",
-      "tasks/reviews/code-r78.md"
+      "tasks/reviews/code-r79.md"
     ]
   },
-  "generated": "2026-09-21T23:35:49-04:00",
+  "generated": "2026-09-21T23:47:22-04:00",
   "git": {
     "branches": [
+      "hp/adeherdr/t-0221-review-r90-every-coordinator-keeps-worki",
+      "main",
+      "review/r90-3",
       "hp/adeherdr/t-0219-review-r90-every-coordinator-keeps-worki",
       "hp/adeherdr/t-0220-review-r88-a-failed-answer-from-the-web",
-      "main",
       "review/r88-3",
       "review/r90-2",
       "hp/adeherdr/t-0216-review-r90-every-coordinator-keeps-worki",
@@ -355,43 +357,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "e6ad477 review(r88): approve candidate on W11 base",
-      "89655af review(r88): merge earlier candidate onto revision 1",
-      "c4a5b5d docs(tasks): t-0220",
-      "fc2cb18 review(r88): brief for revision 1",
-      "b3cb4c4 review(r90): brief for revision 1",
-      "6b3b869 checkpoint(r89): HANDOFF after merging the round"
+      "7f9bfa8 review(autonomy): verdict for r90 revision 3",
+      "e792f5e Merge commit '3dc1c87dface7381ea02daff5c8940bd8a119d9f' into hp/adeherdr/t-0221-review-r90-every-coordinator-keeps-worki",
+      "26d5081 docs(tasks): t-0221",
+      "8249438 review(r90): brief for revision 1",
+      "97140dd checkpoint(r88): HANDOFF after merging the round",
+      "e6ad477 review(r88): approve candidate on W11 base"
     ],
-    "remote": "12 ahead, 0 behind origin/main",
+    "remote": "10 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "e6ad477",
+        "head": "7f9bfa8",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r88): approve candidate on W11 base"
-      },
-      {
-        "branch": "review/r88",
-        "dirty": 0,
-        "head": "a502f5c",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r88",
-        "subject": "docs(tasks): t-0214"
-      },
-      {
-        "branch": "review/r88-2",
-        "dirty": 0,
-        "head": "352e264",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r88-2",
-        "subject": "docs(tasks): t-0217"
-      },
-      {
-        "branch": "review/r88-3",
-        "dirty": 0,
-        "head": "c4a5b5d",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r88-3",
-        "subject": "docs(tasks): t-0220"
+        "subject": "review(autonomy): verdict for r90 revision 3"
       },
       {
         "branch": "review/r90",
@@ -406,6 +387,13 @@
         "head": "bab4c62",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90-2",
         "subject": "docs(tasks): t-0219"
+      },
+      {
+        "branch": "review/r90-3",
+        "dirty": 0,
+        "head": "26d5081",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r90-3",
+        "subject": "docs(tasks): t-0221"
       }
     ]
   },
@@ -425,8 +413,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r88",
-    "verdict": "e6ad477cb929cf74ded077c6c8ba284644f7b6d8"
+    "round": "r90",
+    "verdict": "7f9bfa8e806545d951a72bef886e61bcbe6e0e54"
   },
   "session": "default",
   "unlinked_agents": [],
