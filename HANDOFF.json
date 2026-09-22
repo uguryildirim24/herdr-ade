@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0296.md",
+      "tasks/review-r111.md",
+      "tasks/review-r110.md",
+      "tasks/t-0295.md",
+      "tasks/t-0294.md",
+      "tasks/t-0293.md",
+      "tasks/t-0292.md",
+      "tasks/t-0291.md",
+      "tasks/t-0290.md",
+      "tasks/t-0289.md",
       "tasks/t-0285.md",
-      "tasks/t-0288.md",
-      "tasks/t-0287.md",
-      "tasks/t-0286.md",
-      "tasks/review-r109.md",
-      "tasks/t-0284.md",
-      "tasks/t-0283.md",
-      "tasks/review-r108.md",
-      "tasks/t-0282.md",
-      "tasks/t-0281.md",
-      "tasks/t-0280.md",
-      "tasks/review-r107.md"
+      "tasks/t-0288.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r110.md",
       "tasks/reviews/code-r109.md",
       "tasks/reviews/code-r108.md",
       "tasks/reviews/code-r107.md",
@@ -39,17 +40,27 @@
       "tasks/reviews/code-r103.md",
       "tasks/reviews/code-r102.md",
       "tasks/reviews/code-r98.md",
-      "tasks/reviews/code-r99.md",
-      "tasks/reviews/code-r97.md"
+      "tasks/reviews/code-r99.md"
     ]
   },
-  "generated": "2026-09-22T13:21:51-04:00",
+  "generated": "2026-09-22T14:18:24-04:00",
   "git": {
     "branches": [
       "main",
-      "hp/adeherdr/t-0288-astra-max-more-excess-easier-to-use",
+      "hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match",
+      "hp/adeherdr/t-0297-review-r111-single-commands-and-less-noi",
+      "review/r111",
+      "hp/adeherdr/t-0292-w41-box-lanes-fresh-and-tidy",
+      "hp/adeherdr/t-0294-w43-word-check-only-on-what-rolf-reads",
+      "hp/adeherdr/t-0293-w42-one-command-deletes-a-project",
+      "hp/adeherdr/t-0295-w44-messages-to-a-starting-lane-queue",
+      "hp/adeherdr/t-0291-w40-context-shows-only-what-needs-action",
+      "review/r110",
       "hp/adeherdr/t-0287-w37-one-recipe-list-one-config-reader",
+      "hp/adeherdr/t-0289-w38-finished-lanes-close-themselves",
+      "hp/adeherdr/t-0290-w39-nudge-mixed-with-typing-is-not-rolf",
       "hp/adeherdr/t-0286-w36-docs-match-code-report-tasks-verify",
+      "hp/adeherdr/t-0288-astra-max-more-excess-easier-to-use",
       "hp/adeherdr/t-0285-review-r109-idle-notices-from-other-sess",
       "review/r109",
       "hp/adeherdr/t-0284-w35-idle-notices-are-not-rolf",
@@ -458,36 +469,36 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "94ee12b Merge commit '103bd1405817facd84bb50c3ad44a71d6a1bc88d'",
-      "2976832 docs(tasks): t-0288",
-      "b8ba5f9 docs(tasks): t-0287",
-      "0197096 docs(tasks): t-0286",
-      "103bd14 docs(review): round r109 verdict",
-      "3199b43 review(talk): cover words mixed with idle notices"
+      "0fc18e4 Merge commit 'ed62e579955dd260d548e57dac094b889ba5be1e'",
+      "ed62e57 review(ade): verdict r110",
+      "45d7fbd review(cleanup): reconcile closed round threads",
+      "bad0e84 review(r111): brief for revision 6",
+      "185febd Merge commit 'e14e3e90f21b5bc7c471b277ca2e8513a54a9b93' into hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match",
+      "6e112e9 Merge commit '089ee408300f278f646a7a30ee6710c1ec544e36' into hp/adeherdr/t-0296-review-r110-the-first-cuts-guides-match"
     ],
-    "remote": "11 ahead, 0 behind origin/main",
+    "remote": "21 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "94ee12b",
+        "head": "0fc18e4",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "Merge commit '103bd1405817facd84bb50c3ad44a71d6a1bc88d'"
+        "subject": "Merge commit 'ed62e579955dd260d548e57dac094b889ba5be1e'"
       },
       {
-        "branch": "review/r109",
+        "branch": "review/r110",
         "dirty": 0,
-        "head": "eb4554d",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r109",
-        "subject": "docs(tasks): t-0285"
+        "head": "ef7d6fa",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r110",
+        "subject": "docs(tasks): t-0296"
       },
       {
-        "branch": "hp/adeherdr/t-0288-astra-max-more-excess-easier-to-use",
+        "branch": "review/r111",
         "dirty": 0,
-        "head": "2976832",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0288",
-        "subject": "docs(tasks): t-0288"
+        "head": "c2801eb",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r111",
+        "subject": "docs(tasks): t-0297"
       }
     ]
   },
@@ -502,36 +513,15 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r109",
-    "verdict": "103bd1405817facd84bb50c3ad44a71d6a1bc88d"
+    "round": "r110",
+    "verdict": "ed62e579955dd260d548e57dac094b889ba5be1e"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [
-    {
-      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0288",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0288",
-      "pane_id": "w1G:p3N",
-      "pane_label": null,
-      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0288--/2026-09-22T17-21-39-729Z_01a0ca23-3390-70db-9b21-628dc29d3282.jsonl",
-      "start_args": [],
-      "status": "idle",
-      "tab_id": "w1G:t3H",
-      "tab_label": "t-0288",
-      "title": "π - t-0288",
-      "tokens": {
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "4",
-        "review": "working",
-        "thread": "t-0288"
-      }
-    }
-  ],
+  "workers": [],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 3
+    "tabs": 2
   }
 }
