@@ -620,17 +620,28 @@ fn classify(completion: &Completion) -> Outcome {
         .events
         .iter()
         .filter(|event| task_complete(event).is_none());
-    if non_result_events
-        .clone()
-        .any(|event| value_contains(event, "chatgpt_session_expired"))
+    let result_error = completion.events.iter().find_map(|event| {
+        let (id, _) = task_complete(event)?;
+        (id == completion.turn_id)
+            .then(|| task_complete_error(event))
+            .flatten()
+    });
+    if result_error.is_some_and(|reason| reason.contains("chatgpt_session_expired"))
+        || non_result_events
+            .clone()
+            .any(|event| value_contains(event, "chatgpt_session_expired"))
     {
         return Outcome::ProviderFailed("login: the ChatGPT session expired".into());
     }
-    if non_result_events
-        .clone()
-        .any(|event| value_contains(event, "rate_limit_exceeded"))
+    if result_error.is_some_and(rate_limit_reason)
+        || non_result_events
+            .clone()
+            .any(|event| value_contains(event, "rate_limit_exceeded"))
     {
         return Outcome::Cooldown("the route reported a rate limit".into());
+    }
+    if let Some(reason) = result_error {
+        return Outcome::ProviderFailed(reason.to_string());
     }
     if let Some(reason) = non_result_events.clone().find_map(error_reason) {
         return Outcome::ProviderFailed(reason);
@@ -648,6 +659,11 @@ fn classify(completion: &Completion) -> Outcome {
         return Outcome::Delivered(completion.answer.clone());
     }
     Outcome::Unknown("the turn completed with no answer or failure evidence".into())
+}
+
+fn rate_limit_reason(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("rate_limit") || reason.contains("rate limit")
 }
 
 fn value_contains(value: &Value, needle: &str) -> bool {
@@ -739,6 +755,16 @@ fn task_complete(event: &Value) -> Option<(String, String)> {
     Some((id, answer))
 }
 
+fn task_complete_error(event: &Value) -> Option<&str> {
+    if event["type"] != "event_msg" || event["payload"]["type"] != "task_complete" {
+        return None;
+    }
+    event
+        .pointer("/payload/error/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+}
+
 /// True when this event is the `<user_shell_command>` item for `packet`.
 fn is_shell_command(event: &Value, packet: &str) -> bool {
     if event["type"] != "response_item" || event["payload"]["type"] != "message" {
@@ -795,16 +821,25 @@ fn wait_for_completion_with_settle(
     timeout: Duration,
     settle: impl Fn(),
 ) -> Result<Completion> {
-    let deadline = Instant::now() + timeout;
-    let mut turn_id: Option<String> = None;
-    let mut events: Vec<Value> = Vec::new();
-    loop {
-        let mut completed: Option<(String, String)> = None;
-        for event in reader.new_events()? {
-            if turn_id.is_none() {
-                if let Some(id) = task_started_id(&event) {
-                    turn_id = Some(id);
+    fn observe(
+        incoming: Vec<Value>,
+        turn_id: &mut Option<String>,
+        events: &mut Vec<Value>,
+        completed: &mut Option<(String, String)>,
+    ) {
+        for event in incoming {
+            if let Some(id) = task_started_id(&event) {
+                // The packet load can finish just before the answer turn
+                // starts. Once a newer turn starts, only it can be the TURN
+                // prompt's result.
+                if turn_id.is_none() || completed.is_some() {
+                    *turn_id = Some(id);
+                    events.clear();
+                    *completed = None;
                 }
+                continue;
+            }
+            if turn_id.is_none() {
                 continue;
             }
             events.push(event.clone());
@@ -812,20 +847,43 @@ fn wait_for_completion_with_settle(
                 && let Some((id, answer)) = task_complete(&event)
                 && Some(&id) == turn_id.as_ref()
             {
-                completed = Some((id, answer));
+                *completed = Some((id, answer));
             }
         }
-        if let Some((id, answer)) = completed {
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut turn_id: Option<String> = None;
+    let mut events: Vec<Value> = Vec::new();
+    let mut completed: Option<(String, String)> = None;
+    loop {
+        observe(
+            reader.new_events()?,
+            &mut turn_id,
+            &mut events,
+            &mut completed,
+        );
+        if let Some(settling_id) = completed.as_ref().map(|(id, _)| id.clone()) {
             // The rollout writer can append stream_error just after
             // task_complete. Give it one ordinary poll interval, then keep
-            // every complete trailing event before classifying the turn.
+            // every complete trailing event before classifying the turn. A
+            // newer task_started means the completed pair was the packet
+            // load, so continue until that newer turn completes.
             settle();
-            events.extend(reader.new_events()?);
-            return Ok(Completion {
-                turn_id: id,
-                answer,
-                events,
-            });
+            observe(
+                reader.new_events()?,
+                &mut turn_id,
+                &mut events,
+                &mut completed,
+            );
+            if completed.as_ref().is_some_and(|(id, _)| id == &settling_id) {
+                let (id, answer) = completed.take().expect("checked as complete");
+                return Ok(Completion {
+                    turn_id: id,
+                    answer,
+                    events,
+                });
+            }
         }
         if Instant::now() >= deadline {
             bail!("no task_complete within {}s", timeout.as_secs());
@@ -1093,6 +1151,36 @@ mod tests {
                     .into()
             )
         );
+    }
+
+    #[test]
+    fn task_complete_error_fixture_skips_the_packet_load_and_keeps_the_failure() {
+        let completion = completion_from_fixture(include_str!(
+            "../../tests/fixtures/pro/task-complete-error.jsonl"
+        ));
+        assert_eq!(completion.turn_id, "01a0c751-47a5-real-turn");
+        assert_eq!(
+            classify(&completion),
+            Outcome::ProviderFailed(
+                "stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"
+                    .into()
+            )
+        );
+
+        let rate_limited = Completion {
+            turn_id: "turn-rate-limited".into(),
+            answer: String::new(),
+            events: vec![json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-rate-limited",
+                    "last_agent_message": null,
+                    "error": {"message": "rate_limit_exceeded"}
+                }
+            })],
+        };
+        assert!(matches!(classify(&rate_limited), Outcome::Cooldown(_)));
     }
 
     #[test]
