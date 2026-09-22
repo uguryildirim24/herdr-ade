@@ -517,9 +517,16 @@ else
   printf 'panes\t-\n'
 fi
 [ -d "$root" ] || exit 0
-for dir in "$root"/*/events; do
-  [ -d "$dir" ] || continue
-  slug=${dir%/events}; slug=${slug##*/}
+for project in "$root"/*; do
+  [ -d "$project" ] || continue
+  slug=${project##*/}
+  if [ -d "$project/.state/events" ]; then
+    dir="$project/.state/events"
+  elif [ -d "$project/events" ]; then
+    dir="$project/events"
+  else
+    continue
+  fi
   for f in "$dir"/*.toml; do
     [ -f "$f" ] || continue
     id=${f##*/}; id=${id%.toml}
@@ -529,11 +536,14 @@ for dir in "$root"/*/events; do
     h=$(sha256sum "$f" | cut -d' ' -f1)
     a=$(sed -n 's/^artifact = "\([^"]*\)"/\1/p' "$f" | head -n1)
     if [ -n "$a" ]; then
-      printf 'event\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$f" "$h" "$root/$slug/artifacts/$a" "$a"
+      artifact="$project/.state/artifacts/$a"
+      if [ ! -f "$artifact" ]; then artifact="$project/artifacts/$a"; fi
+      printf 'event\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$f" "$h" "$artifact" "$a"
     else
       printf 'event\t%s\t%s\t%s\t%s\t-\t-\n' "$slug" "$id" "$f" "$h"
     fi
-    rec="$root/$slug/receipts/$id.toml"
+    rec="$project/.state/receipts/$id.toml"
+    if [ ! -f "$rec" ]; then rec="$project/receipts/$id.toml"; fi
     if [ -f "$rec" ]; then
       eh=$(sed -n 's/^event_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
       ah=$(sed -n 's/^artifact_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
@@ -1582,12 +1592,27 @@ mod tests {
     }
 
     #[test]
-    fn courier_helper_answers_only_after_the_taken_cursor() {
+    fn courier_helper_reads_hidden_records_and_historical_records_after_the_taken_cursor() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("ade");
-        let dir = root.join("demo/events");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
+        let historical = root.join("demo/events");
+        std::fs::create_dir_all(&historical).unwrap();
+        std::fs::write(historical.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
+        let hidden = root.join("new/.state");
+        std::fs::create_dir_all(hidden.join("events")).unwrap();
+        std::fs::create_dir_all(hidden.join("artifacts")).unwrap();
+        std::fs::create_dir_all(hidden.join("receipts")).unwrap();
+        std::fs::write(
+            hidden.join("events/t-0002-1-1.toml"),
+            "id = \"t-0002-1-1\"\nartifact = \"def\"\n",
+        )
+        .unwrap();
+        std::fs::write(hidden.join("artifacts/def"), "report").unwrap();
+        std::fs::write(
+            hidden.join("receipts/t-0002-1-1.toml"),
+            "event_hash = \"abc\"\nartifact_hash = \"def\"\n",
+        )
+        .unwrap();
         let script = courier_helper(&test_machine(&root.to_string_lossy()), "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
         let run = |stdin: &str| {
@@ -1610,6 +1635,27 @@ mod tests {
         let fresh = run("");
         assert!(
             fresh.stdout.contains("event\tdemo\tt-0001-1-1"),
+            "{}",
+            fresh.stdout
+        );
+        assert!(
+            fresh.stdout.contains(&format!(
+                "event\tnew\tt-0002-1-1\t{}",
+                hidden.join("events/t-0002-1-1.toml").display()
+            )),
+            "{}",
+            fresh.stdout
+        );
+        assert!(
+            fresh.stdout.contains(&format!(
+                "\t{}\tdef",
+                hidden.join("artifacts/def").display()
+            )),
+            "{}",
+            fresh.stdout
+        );
+        assert!(
+            fresh.stdout.contains("receipt\tnew\tt-0002-1-1\tabc\tdef"),
             "{}",
             fresh.stdout
         );
