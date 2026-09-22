@@ -87,6 +87,12 @@ pub(crate) enum StartAction {
     StopThenSpawn,
 }
 
+#[derive(Debug, PartialEq)]
+enum StopOutcome {
+    Stopped,
+    Pending,
+}
+
 /// The `ticker start` decision. A healthy ticker of the same version is never
 /// replaced; a different version, or a stop in progress, is stopped first so
 /// `open` never ends with no ticker.
@@ -194,7 +200,8 @@ fn spawn(root: &Path) -> Result<()> {
 /// Start the replacement far enough to prove that it can initialize before
 /// asking the current ticker to leave. The initialized child waits for the
 /// parent's release marker, so there is always one viable ticker throughout
-/// the handoff.
+/// the handoff. Once asked, the old ticker is always allowed to finish its
+/// current pass and the replacement is never withdrawn.
 fn replace(root: &Path) -> Result<()> {
     let ready = handoff_path(root);
     let _ = std::fs::remove_file(&ready);
@@ -220,16 +227,10 @@ fn replace(root: &Path) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    if let Err(error) = stop(root) {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&ready);
-        return Err(error);
-    }
+    let _outcome = request_stop(root, STOP_WAIT)?;
     if let Err(error) = std::fs::write(&ready, b"go") {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&ready);
+        // The stop request remains in place. Do not kill the only initialized
+        // replacement after the old ticker has been asked to leave.
         return Err(error).context("could not release the replacement ticker");
     }
     let deadline = Instant::now() + HANDOFF_READY_WAIT;
@@ -246,35 +247,71 @@ fn replace(root: &Path) -> Result<()> {
             bail!("replacement ticker exited during handoff ({status})");
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&ready);
-            bail!("replacement ticker did not take the ticker lock");
+            // The old ticker may still be inside a long pass, or the new one
+            // may be completing its first pass. Both processes now own their
+            // side of the handoff, so the caller need not keep waiting.
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-/// Asks the running ticker to exit and waits for the lock to be released.
-pub(crate) fn stop(root: &Path) -> Result<()> {
+/// Leaves a durable stop request and waits up to `wait` for its holder.
+fn request_stop(root: &Path, wait: Duration) -> Result<StopOutcome> {
     if lock_state(root) == LockState::Free {
         let _ = std::fs::remove_file(stop_path(root));
-        return Ok(());
+        return Ok(StopOutcome::Stopped);
     }
     std::fs::write(stop_path(root), b"")?;
-    let deadline = Instant::now() + STOP_WAIT;
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if lock_state(root) == LockState::Free {
             let _ = std::fs::remove_file(stop_path(root));
+            return Ok(StopOutcome::Stopped);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(StopOutcome::Pending)
+}
+
+/// Asks the running ticker to exit and waits for the lock to be released.
+pub(crate) fn stop(root: &Path) -> Result<()> {
+    match request_stop(root, STOP_WAIT)? {
+        StopOutcome::Stopped => Ok(()),
+        StopOutcome::Pending => bail!(
+            "ticker stop pending: the current pass exceeded {} seconds; the stop request remains active",
+            STOP_WAIT.as_secs()
+        ),
+    }
+}
+
+pub(crate) fn handoff_pending(root: &Path) -> bool {
+    handoff_path(root).exists()
+}
+
+fn take_handoff_lock(
+    lock: &File,
+    marker: &Path,
+    stop: &Path,
+    release_wait: Duration,
+) -> Result<()> {
+    std::fs::write(marker, b"ready")?;
+    let release_deadline = Instant::now() + release_wait;
+    loop {
+        // Once the parent writes `go`, the durable stop request guarantees
+        // that the old ticker will release the lock at its next check. A pass
+        // may take arbitrarily longer than the parent's wait.
+        let released = std::fs::read(marker).is_ok_and(|value| value == b"go");
+        if released && lock.try_lock().is_ok() {
+            let _ = std::fs::remove_file(stop);
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(250));
+        if !released && Instant::now() >= release_deadline {
+            let _ = std::fs::remove_file(marker);
+            bail!("ticker handoff timed out waiting for its release marker");
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
-    let _ = std::fs::remove_file(stop_path(root));
-    bail!(
-        "the ticker did not exit within {} seconds",
-        STOP_WAIT.as_secs()
-    )
 }
 
 pub(crate) fn status(root: &Path) -> Result<()> {
@@ -368,24 +405,14 @@ pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
         .read(true)
         .write(true)
         .open(lock_path(root))?;
-    if handoff {
-        let marker = handoff_path(root);
-        std::fs::write(&marker, b"ready")?;
-        let deadline = Instant::now() + STOP_WAIT + HANDOFF_READY_WAIT;
-        loop {
-            // The parent writes `go` only after the old ticker has released
-            // its lock. Until then this fully initialized child stays viable.
-            let released = std::fs::read(&marker).is_ok_and(|value| value == b"go");
-            if released && lock.try_lock().is_ok() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = std::fs::remove_file(&marker);
-                bail!("ticker handoff timed out waiting for the previous ticker");
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let _ = std::fs::remove_file(&marker);
+    let marker = handoff.then(|| handoff_path(root));
+    if let Some(marker) = &marker {
+        take_handoff_lock(
+            &lock,
+            marker,
+            &stop_path(root),
+            STOP_WAIT + HANDOFF_READY_WAIT,
+        )?;
     } else if lock.try_lock().is_err() {
         return Ok(());
     }
@@ -408,37 +435,44 @@ pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
             })
             .collect(),
     };
-    lock.set_len(0)?;
-    lock.write_all(serde_json::to_string_pretty(&info)?.as_bytes())?;
-    lock.flush()?;
-
     let log = Log {
         path: log_path(root),
     };
+    let mut last_reachable = Instant::now();
+    let mut memory = Memory::new(ctx);
+
+    // Publish this process only after it has completed one pass. Install proof
+    // can then never mistake an initialized-but-waiting replacement, or a new
+    // ticker still in its first pass, for the running worker.
+    if tick(ctx, &log, &mut memory) {
+        last_reachable = Instant::now();
+    }
+    lock.set_len(0)?;
+    lock.write_all(serde_json::to_string_pretty(&info)?.as_bytes())?;
+    lock.flush()?;
+    if let Some(marker) = &marker {
+        let _ = std::fs::remove_file(marker);
+    }
     log.line(&format!(
         "ticker {} started (pid {})",
         info.version, info.pid
     ));
-    let mut last_reachable = Instant::now();
-    let mut memory = Memory::new(ctx);
+
     loop {
-        if stop_path(root).exists() {
-            log.line("stop file found; exiting");
-            return Ok(());
+        // Sleep in short slices so a stop request is honoured promptly.
+        let wake = Instant::now() + TICK;
+        while Instant::now() < wake {
+            if stop_path(root).exists() {
+                log.line("stop file found; exiting");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
             log.line("no project has had a reachable session for five minutes; exiting");
             return Ok(());
-        }
-        // Sleep in short slices so a stop request is honoured promptly.
-        let wake = Instant::now() + TICK;
-        while Instant::now() < wake {
-            if stop_path(root).exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
         }
     }
 }
@@ -1598,6 +1632,66 @@ mod tests {
         std::fs::write(stop_path(root.path()), b"").unwrap();
         stop(root.path()).unwrap();
         assert!(!stop_path(root.path()).exists());
+    }
+
+    #[test]
+    fn a_pass_outlasting_stop_wait_still_hands_off_to_its_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let mut old = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(root.path()))
+            .unwrap();
+        old.lock().unwrap();
+        old.write_all(br#"{"version":"old","pid":1}"#).unwrap();
+
+        assert_eq!(
+            request_stop(root.path(), Duration::from_millis(20)).unwrap(),
+            StopOutcome::Pending
+        );
+        assert!(stop_path(root.path()).exists());
+
+        let marker = handoff_path(root.path());
+        let lock_path = lock_path(root.path());
+        let stop_file = stop_path(root.path());
+        let marker_path = marker.clone();
+        let (acquired, acquired_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            let mut lock = File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            take_handoff_lock(&lock, &marker_path, &stop_file, Duration::from_secs(1)).unwrap();
+            lock.set_len(0).unwrap();
+            lock.write_all(br#"{"version":"new","pid":2}"#).unwrap();
+            acquired.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let ready_deadline = Instant::now() + Duration::from_secs(1);
+        while !std::fs::read(&marker).is_ok_and(|value| value == b"ready") {
+            assert!(Instant::now() < ready_deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::write(&marker, b"go").unwrap();
+
+        // The replacement is initialized but cannot do work while the old
+        // ticker's deliberately long pass still owns the lock.
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(old);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!stop_path(root.path()).exists());
+        assert!(matches!(
+            lock_state(root.path()),
+            LockState::Held(info) if info.version == "new" && info.pid == 2
+        ));
+        release.send(()).unwrap();
+        replacement.join().unwrap();
     }
 
     const AGENT_READY: &str = r#"{"result":{"agents":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle","cwd":"CWD"}]}}"#;
