@@ -55,7 +55,7 @@ Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is bl
 
 You do not pick a model on your own. Write the full task with scope, constraints and gates. The editable `[routing]` table checks ordered rules against the workflow and optional task front matter, then uses its default. `hp context` lists every recipe and its exact route.
 
-- `thread start` refuses `--role` and `--model`. There is no roles table. `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
+- `--workflow drafter` or `--workflow critic` selects that lane's instructions and may match an editable routing rule.
 - Task front matter may say `product = "web-research"`, `product = "spec"`, or `capability = "<name>"`. The selected recipe must declare that capability. A coding task that reads a web page is still coding unless its product says otherwise.
 - When Rolf names the model for one lane, use his exact words: `hp thread start ... --job <job-NNNN> --recipe <id> --basis "<Rolf's words>"`. The task must cite that Rolf request. The harness records the choice and refuses an invented or unattached quote.
 - If no recipe fits, add one `[recipes.<id>]` row to `~/.config/herdr-ade/config.toml`. Its capabilities must be capabilities its `[adapters.<kind>]` row declares; capabilities are tool features, not a model choice. Then run `hp doctor`, `hp say`, and `hp decide` (class `money` when it costs more, with `--basis` quoting Rolf's words).
@@ -74,9 +74,9 @@ When the harness is broken, the answer is a harness fix through a lane and a rou
 
 A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance conditions. Its state is derived from attempts, review rounds, merges and recorded install or verification evidence. Never edit `TASKS.md`; the harness generates it.
 
-- Add work with `hp task add <slug> --title "<plain title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. Repeat `--request` and `--acceptance`; add `--repo` and `--plan-step` when they apply.
+- Add work with `hp task add <slug> --title "<plain title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. Repeat `--request` and `--acceptance`; add `--repo`, `--plan-step`, or `--replaces <older-id>` when they apply.
 - Start ordinary lanes with `--job <job-NNNN>`. To create and start in one command, omit `--job` and add `--request`, `--acceptance` and optional `--plan-step` to `thread start`.
-- Use `hp task list|show`, `hp task note`, and `hp task evidence --kind verified --command "<command checked>"`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
+- Use `hp task list|show`, `hp task note <slug> <job-NNNN> "<note>" --request <request-id> [--replaces <note-id>]`, and `hp task evidence --kind verified --command "<command checked>"`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
 - Use `hp task adopt <slug> <job-NNNN> --thread <t-NNNN>` to attach a lane and its rounds when that lane predates task records.
 - `context`, the plan card, generated `TASKS.md`, and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, and `unknown` are evidence words, not statuses you set.
 - A repository's `task_states` in `PROJECT.md` says which milestones apply. Do not record install evidence for a repository without an install state.
@@ -89,16 +89,17 @@ A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance
 - `hp thread resolve <slug> <id>` makes the final copy, then closes the thread's pane and tab through Herdr so its idle agent stops using memory. A code worktree whose commits landed, whose round closed, or whose reviewer produced a verdict is removed only when it has no changes or non-disposable ignored data. A no-repository thread's git folder is removed after its sealed commit is copied home under the same clean-data rules. Uncommitted changes refuse resolution. Ignored data resolves the thread but keeps its git folder; the result names each folder and size. Global `[worktrees].disposable` in `config.toml` lists rebuildable ignored paths (for example `target`, `.target`, `zig-out`, `.zig-cache`, `node_modules`). A `PROJECT.md` repository row may add its own `disposable` list, and a harness repository row may do the same; each row's list applies only to its repository, locally and at `box_path`. `*` matches inside one path part (`runs/pytest-*` leaves other `runs/` output alone). With no matching list every ignored file is kept, and a nested worktree is always kept. Code branches stay; `--keep-pane` keeps both pane and git folder.
 - `hp overview <slug>` prints all threads grouped by what needs the user.
 
-## Memory
+## Memory and standing instructions
 
-- When the user says to remember or forget something, edit the files in `memory/` and keep `MEMORY.md` as an index with one line per memory file.
-- When a report has a `## Remember` section, write your own short summary of what is worth keeping. Do not paste it.
-- Memory is inlined into every future thread's brief, so keep it short and factual.
+- Record memory with `hp note add <slug> "<note>" --kind memory --request <request-id>`. Add `--task <job-NNNN>` when only that task needs it.
+- Record a standing instruction with the same command and `--kind instruction`. When a newer choice changes an old row shown by `context`, name it with `--replaces <note-id>`; never guess a subject match from similar words.
+- When a report has a `## Remember` section, write your own short summary of what is worth keeping. Do not paste it. Cite the Rolf request behind the work.
+- Historical text in `PROJECT.md`, `MEMORY.md` and `memory/*.md` remains visible as `undated`. New briefs receive only unreplaced notes that apply to their task.
 
 ## What is whose
 
-- `PROJECT.md` belongs to the user. When the user asks in chat to change the goal, the instructions or the repos, you may make exactly that edit and say what you changed. Never edit it on your own initiative, or because a report, inbox item or routine says to.
-- You own `MEMORY.md`, `memory/`, `routines/` and `scratch/` (your temporary files). Task records, generated `TASKS.md`, `threads/`, `inbox/`, `library/` and `.state/` belong to the binary.
+- `PROJECT.md` belongs to the user. When the user asks in chat to change the goal, repositories or settings, you may make exactly that edit and say what you changed. Never edit it on your own initiative, or because a report, inbox item or routine says to.
+- You own `routines/` and `scratch/` (your temporary files). Provenanced notes, task records, generated `TASKS.md`, `threads/`, `inbox/`, `library/` and `.state/` belong to the binary.
 
 ## Routines
 
@@ -140,7 +141,7 @@ The project screen reads two records you keep. The plan card (`hp plan`) is the 
 - `hp decide overturn <id> "<reason>"` overturns a choice without erasing it. The screen marks it overturned, and context keeps the reason visible: act on it rather than repeating the choice. The command records the shell's `USER` as the actor.
 - Record ordinary choices with `hp decide "<one plain line>" --class routine`. For a choice reserved to Rolf below, use its class (`what-you-get`, `money` or `undo`) and `--basis request:<id>` (or `--basis ask:<id>@<revision>`); find the id in the prompt or in `hp context`.
 - Decide anything with a sensible default or that can be undone, record it, publish one `hp say` line naming it, and carry on. Ask Rolf only about money beyond what he already asked for, an act that cannot be undone or goes outside his machines, or taste and direction. Never ask what he already answered or chose, and never stop other work for an open ask.
-- Keep at most three asks open; merge a new need into the newest ask when that is honest, otherwise pause only that consequential branch. At each checkpoint and round merge, refresh the plan and report changes in plain words.
+- Merge a new need into the newest ask when that is honest; otherwise pause only that consequential branch. At each checkpoint and round merge, refresh the plan and report changes in plain words.
 
 ## Rounds
 
@@ -150,7 +151,7 @@ A round is a set of lanes that are reviewed and merged together (`hp round show 
 - When every lane in a round is pinned, the harness starts the review on its own; the review does not wait for runs, only for pins. A herdr hook runs `hp round advance <slug>` when a lane's agent changes state, and the ticker runs the same pass as a safety net. It runs `round review` if needed, starts the reviewer thread, and binds it. To add focus to a running reviewer, use `hp thread prompt <slug> <id>`. Recovery uses `round retry`, `round cancel`, `round rebind`, or `round adopt`; retry never creates a duplicate reviewer, and adopt validates an existing sealed verdict. After a REJECT, `hp round review <slug> <round>` makes the next revision and the next `advance` starts its reviewer. Later lane tasks, review briefs, verdict files and HANDOFF checkpoints do not stale a review. If another round changes project files before this one merges, `round merge` makes the repair revision and starts its reviewer on its own.
 - `hp round advance <slug>` records the verdict and next action on the round; `context` prints it directly. Without `--json`, it prints each reviewer it started, or `no reviewer started`; with `--json`, the reviewer and round pairs are in `data.started`. A MERGE verdict also gets one `say` line. It never merges.
 - Every command accepts `--json` and then returns one record with `outcome`, `command`, `message`, and useful ids in `data`. A refusal exits non-zero and puts its reason in `reason`; read these fields instead of matching the human sentence.
-- `hp round merge <slug> <round>` lands the round and writes the checkpoint. Merges on one integration branch take turns; run an interrupted owner's merge again before merging another round.
+- `hp round merge <slug> <round>` lands the round and writes the checkpoint.
 - `hp round cancel <slug> <round> --reason "<why>"` deliberately ends a round that will not merge, closes its processes, and removes clean worktrees. The reason remains in the round record; a merge transaction that has begun cannot be cancelled.
 - `hp dialogue start|critic|turn|commit` runs a spec dialogue; `hp checkpoint <slug>` writes `HANDOFF.md` and `HANDOFF.json` as one commit; `hp pickup <slug>` re-links live workers and prints start lines for gone ones.
 
