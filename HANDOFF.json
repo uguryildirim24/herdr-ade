@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0272.md",
+      "tasks/review-r104.md",
+      "tasks/t-0271.md",
       "tasks/t-0270.md",
       "tasks/t-0256.md",
       "tasks/review-r100.md",
@@ -19,16 +22,14 @@
       "tasks/t-0268.md",
       "tasks/t-0267.md",
       "tasks/review-r102.md",
-      "tasks/t-0265.md",
-      "tasks/t-0263.md",
-      "tasks/t-0255.md",
-      "tasks/t-0252.md"
+      "tasks/t-0265.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r104.md",
       "tasks/reviews/code-r100.md",
       "tasks/reviews/code-r103.md",
       "tasks/reviews/code-r102.md",
@@ -39,15 +40,17 @@
       "tasks/reviews/code-r92.md",
       "tasks/reviews/code-r95.md",
       "tasks/reviews/code-r93.md",
-      "tasks/reviews/code-r94.md",
-      "tasks/reviews/code-r91.md"
+      "tasks/reviews/code-r94.md"
     ]
   },
-  "generated": "2026-09-22T03:35:42-04:00",
+  "generated": "2026-09-22T04:34:50-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0270-review-r100-helpers-get-their-first-mess",
+      "hp/adeherdr/t-0272-review-r104-commands-read-the-same-way-e",
       "main",
+      "review/r104",
+      "hp/adeherdr/t-0271-w28-per-sentence-acceptance-one-slug-sty",
+      "hp/adeherdr/t-0270-review-r100-helpers-get-their-first-mess",
       "review/r100-2",
       "hp/adeherdr/t-0256-review-r100-helpers-get-their-first-mess",
       "hp/adeherdr/t-0269-review-r103-one-install-always-moves-the",
@@ -434,36 +437,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "22e8b45 review(ade): repair verdict for round r100",
-      "8261bd5 Merge commit '62525575bd12bc368ac65db66f3ad99eb837c475' into hp/adeherdr/t-0270-review-r100-helpers-get-their-first-mess",
-      "0713f8c docs(tasks): t-0270",
-      "8cfbda7 review(r100): brief for revision 2",
-      "d67b3cb checkpoint(r103): HANDOFF after merging the round",
-      "4f619d9 docs(review): round r103 verdict"
+      "5aed547 docs(review): round r104 verdict",
+      "514a315 review(ade): keep omitted project forms working",
+      "34de33a Merge commit 'b9b9e9a1c3c40fcc941a50dff43c77a549bc54f2' into review/r104",
+      "2a6b1ab docs(tasks): t-0272",
+      "fb2a289 review(r104): brief for revision 1",
+      "b9b9e9a fix(hook): preserve installed project flag"
     ],
-    "remote": "9 ahead, 0 behind origin/main",
+    "remote": "8 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "22e8b45",
+        "head": "5aed547",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(ade): repair verdict for round r100"
+        "subject": "docs(review): round r104 verdict"
       },
       {
-        "branch": "review/r100",
+        "branch": "review/r104",
         "dirty": 0,
-        "head": "97f81cd",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r100",
-        "subject": "docs(tasks): t-0256"
-      },
-      {
-        "branch": "review/r100-2",
-        "dirty": 0,
-        "head": "0713f8c",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r100-2",
-        "subject": "docs(tasks): t-0270"
+        "head": "2a6b1ab",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r104",
+        "subject": "docs(tasks): t-0272"
       }
     ]
   },
@@ -483,8 +479,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r100",
-    "verdict": "22e8b4547b5bbf9939e1c23dc5c875d7efa4b78f"
+    "round": "r104",
+    "verdict": "5aed547007b3272ed671789da17767036a5494fe"
   },
   "session": "default",
   "unlinked_agents": [],
