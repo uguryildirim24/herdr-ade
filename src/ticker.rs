@@ -42,6 +42,43 @@ fn handoff_path(root: &Path) -> PathBuf {
     root.join(".ticker.handoff")
 }
 
+fn wake_path(root: &Path) -> PathBuf {
+    root.join(".ticker.wake")
+}
+
+fn poll_request_path(project: &Project) -> PathBuf {
+    project.state_dir().join("poll-now.json")
+}
+
+fn poll_requests(project: &Project) -> std::collections::BTreeSet<String> {
+    project::read_json(&poll_request_path(project)).unwrap_or_default()
+}
+
+/// Wakes the existing ticker and marks this machine due in its normal courier
+/// pass. Thread commands never open their own SSH polling path.
+pub(crate) fn request_remote_poll(root: &Path, project: &Project, machine: &str) -> Result<()> {
+    {
+        let _lock = project.lock()?;
+        let mut requests = poll_requests(project);
+        requests.insert(machine.to_string());
+        project::write_json(&poll_request_path(project), &requests)?;
+    }
+    project::write_atomic(&wake_path(root), b"poll\n")
+}
+
+fn clear_poll_request(project: &Project, machine: &str) {
+    let Ok(_lock) = project.lock() else {
+        return;
+    };
+    let mut requests = poll_requests(project);
+    requests.remove(machine);
+    if requests.is_empty() {
+        let _ = std::fs::remove_file(poll_request_path(project));
+    } else {
+        let _ = project::write_json(&poll_request_path(project), &requests);
+    }
+}
+
 /// What the lock holder writes into the lock file, for `ticker status` and
 /// `doctor`. The pid is for display only; nothing signals it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -466,6 +503,10 @@ pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
                 log.line("stop file found; exiting");
                 return Ok(());
             }
+            if wake_path(root).exists() {
+                let _ = std::fs::remove_file(wake_path(root));
+                break;
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
         if tick(ctx, &log, &mut memory) {
@@ -512,6 +553,21 @@ pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     !reachable.is_empty()
+}
+
+fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail: &str, log: &Log) {
+    let attempted = project::now();
+    for (project, threads) in entries {
+        for lane in threads {
+            if let Err(error) = thread::update(project, &lane.id, |record| {
+                record.observation_attempted = attempted.clone();
+                record.observation_source = "courier".into();
+                record.observation_error = crate::pr::sanitize(detail);
+            }) {
+                log.line(&format!("{error:#}"));
+            }
+        }
+    }
 }
 
 fn clear_lost_connections(entries: &[(Project, Vec<thread::Thread>)], log: &Log) {
@@ -566,7 +622,15 @@ fn machine_passes(
     }
     let mut errors = Vec::new();
     for (machine, entries) in by_machine {
-        if !memory.machine_is_due(&machine) {
+        let forced = entries
+            .iter()
+            .any(|(project, _)| poll_requests(project).contains(&machine));
+        if forced {
+            let tick = memory.tick;
+            let entry = memory.machines.entry(machine.clone()).or_default();
+            entry.last_poll_tick = tick;
+            entry.skip_until_tick = 0;
+        } else if !memory.machine_is_due(&machine) {
             continue;
         }
         let projects: Vec<&Project> = entries.iter().map(|(project, _)| project).collect();
@@ -576,13 +640,20 @@ fn machine_passes(
         {
             let detail = format!("{error:#}");
             errors.push(anyhow::anyhow!("{machine}: {detail}"));
+            record_failed_observation(&entries, &detail, log);
             // This is local configuration evidence, not evidence about the
             // connection. Leave no remote view for the slow pass and replace
             // any stale connection classification with unknown.
             clear_lost_connections(&entries, log);
+            for (project, _) in &entries {
+                clear_poll_request(project, &machine);
+            }
             continue;
         }
         let reason = outcome.as_ref().err().map(|e| format!("{e:#}"));
+        if let Some(reason) = &reason {
+            record_failed_observation(&entries, reason, log);
+        }
         let event = memory.record_machine(&machine, reason.as_deref(), now);
         // After the configured outage period, type one unreachable BLOCKED per
         // open box lane, then stay quiet until the machine answers again
@@ -618,6 +689,9 @@ fn machine_passes(
         };
         if let Err(error) = steps::write_machine_outage(first, &machine, event, memory) {
             errors.push(error.context("machine outage"));
+        }
+        for (project, _) in &entries {
+            clear_poll_request(project, &machine);
         }
         memory
             .machine_views
@@ -801,7 +875,7 @@ fn thread_pass(
             }
             continue;
         }
-        if delivered || state != t.last_state || group.token() != t.last_group {
+        if t.is_remote() || delivered || state != t.last_state || group.token() != t.last_group {
             thread::update(project, &t.id, |t| {
                 if delivered {
                     t.prompt_pending = false;
@@ -809,6 +883,13 @@ fn thread_pass(
                 if state != t.last_state {
                     t.last_state = state.clone();
                     t.last_state_change = project::now();
+                }
+                if t.is_remote() {
+                    let observed = project::now();
+                    t.last_observed = observed.clone();
+                    t.observation_attempted = observed;
+                    t.observation_source = "courier".into();
+                    t.observation_error.clear();
                 }
                 if t.failure_class == crate::contracts::FailureClass::ProcessGone {
                     t.failure_class = crate::contracts::FailureClass::Unknown;
@@ -849,7 +930,7 @@ fn launch_pass(
     may_start: &mut bool,
     one_at_a_time: bool,
     errors: &mut Vec<anyhow::Error>,
-) {
+) -> bool {
     let now = jiff::Timestamp::now();
     let mut pending = Vec::new();
     for t in pass.threads {
@@ -922,7 +1003,7 @@ fn launch_pass(
         }
     }
     let Some(first) = pending.first() else {
-        return;
+        return false;
     };
     let parent = pass
         .project
@@ -972,6 +1053,7 @@ fn launch_pass(
                 .map(|error| error.context(format!("{}: launch", t.id))),
         );
     }
+    true
 }
 
 fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
@@ -1225,7 +1307,7 @@ fn remote_pass(
     };
     let state_pass = thread_pass(&state_input, &prefix, None).map_err(|e| format!("{e:#}"))?;
     errors.extend(state_pass.error);
-    launch_pass(
+    let launched = launch_pass(
         &LaunchPass {
             ctx,
             project,
@@ -1238,6 +1320,12 @@ fn remote_pass(
         false,
         errors,
     );
+    if launched {
+        errors.extend(request_remote_poll(&ctx.root, project, machine).err());
+    }
+    errors.extend(clean_managed_project_tabs(
+        project, machine, &remote, &agents, &panes,
+    ));
     // The D8 BLOCKED/GONE lines for this machine's box lanes (SPEC-remote §4.3).
     errors.extend(steps::remote_attention(
         ctx,
@@ -1252,6 +1340,42 @@ fn remote_pass(
         },
     ));
     Ok(())
+}
+
+/// Closes only a tab the ADE can prove it created and no process still owns.
+/// An unowned shell in a project-labelled workspace is advisory evidence, not
+/// authority to destroy someone else's foreground work.
+fn clean_managed_project_tabs(
+    project: &Project,
+    machine: &str,
+    herdr: &Herdr<'_>,
+    agents: &[Agent],
+    panes: &[Pane],
+) -> Vec<anyhow::Error> {
+    thread::list(project)
+        .into_iter()
+        .filter(|record| {
+            record.is_remote()
+                && record.machine_route() == machine
+                && record.kind != thread::Kind::Adopted
+                && !matches!(
+                    record.status,
+                    thread::Status::Starting | thread::Status::Open
+                )
+                && !agents.iter().any(|agent| agent.tab_id == record.tab_id)
+                && panes.iter().any(|pane| thread::pane_matches(record, pane))
+        })
+        .filter(|record| {
+            herdr
+                .pane_process_info(&record.pane_id)
+                .is_ok_and(|info| info.foreground_processes.is_empty())
+        })
+        .filter_map(|record| {
+            herdr.tab_close(&record.tab_id).err().map(|error| {
+                anyhow::anyhow!("{machine}: close managed tab {}: {error}", record.tab_id)
+            })
+        })
+        .collect()
 }
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
@@ -1519,6 +1643,50 @@ mod tests {
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
+    }
+
+    #[test]
+    fn a_new_box_lane_wakes_the_ticker_and_marks_its_machine_due() {
+        let fixture = fixture(false);
+
+        request_remote_poll(&fixture.root, &fixture.project, "machine-1").unwrap();
+
+        assert!(wake_path(&fixture.root).exists());
+        assert!(poll_requests(&fixture.project).contains("machine-1"));
+    }
+
+    #[test]
+    fn a_box_poll_closes_only_a_managed_tab_with_verified_empty_process_state() {
+        let fixture = fixture(false);
+        thread::allocate(&fixture.project, |record| {
+            record.status = thread::Status::Resolved;
+            record.machine = "oci".into();
+            record.machine_id = "machine-1".into();
+            record.workspace_id = "w2".into();
+            record.tab_id = "w2:t1".into();
+            record.pane_id = "w2:p1".into();
+            record.cwd = "/deleted-worktree".into();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "pane process-info --pane w2:p1",
+            ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#),
+        );
+        runner.on("tab close w2:t1", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "", &runner).on_machine("machine-1");
+        let panes = [Pane {
+            pane_id: "w2:p1".into(),
+            tab_id: "w2:t1".into(),
+            workspace_id: "w2".into(),
+            cwd: "/deleted-worktree".into(),
+        }];
+
+        let errors = clean_managed_project_tabs(&fixture.project, "machine-1", &herdr, &[], &panes);
+
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(runner.count("tab close w2:t1"), 1);
+        assert_eq!(runner.count("tab close w2:t2"), 0);
     }
 
     #[test]

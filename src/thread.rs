@@ -83,6 +83,14 @@ pub(crate) struct Thread {
     pub(crate) updated: String,
     pub(crate) last_state: String,
     pub(crate) last_state_change: String,
+    /// When and where the latest successful remote observation was made.
+    /// Empty on historical and local records.
+    pub(crate) last_observed: String,
+    pub(crate) observation_source: String,
+    /// Latest attempted remote check, successful or not.
+    pub(crate) observation_attempted: String,
+    /// A failed check never overwrites the last successful observation.
+    pub(crate) observation_error: String,
     pub(crate) last_group: String,
     pub(crate) report_hash: String,
     pub(crate) last_report_change: String,

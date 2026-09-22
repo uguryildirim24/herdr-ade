@@ -810,9 +810,10 @@ fn digest_snapshot(
         if let Some(reviewer) = &round.reviewer {
             let _ = writeln!(out, "  reviewer: {reviewer}");
         }
+        let attention = crate::round::current_attention(ctx, project, round);
         if let Some(merge) = &round.merge {
-            if !round.attention.is_empty() {
-                let _ = writeln!(out, "  {}", round.attention);
+            if !attention.is_empty() {
+                let _ = writeln!(out, "  {attention}");
             }
             let _ = writeln!(
                 out,
@@ -825,10 +826,8 @@ fn digest_snapshot(
                 round.round
             );
         } else {
-            if !round.attention.is_empty() {
-                let _ = writeln!(out, "  {}", round.attention);
-            } else if let Some(announced) = &round.announced {
-                let _ = writeln!(out, "  {announced}");
+            if !attention.is_empty() {
+                let _ = writeln!(out, "  {attention}");
             }
             if round.reviewer_start_failures > 0 {
                 let _ = writeln!(
