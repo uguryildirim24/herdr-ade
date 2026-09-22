@@ -376,6 +376,7 @@ pub(crate) struct Ask {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HumanMessage {
     Say {
+        id: String,
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         means: Option<String>,
@@ -867,6 +868,7 @@ mod tests {
             coordinator_binding: "w1:p1".into(),
         });
         json_roundtrip(&HumanMessage::Say {
+            id: "s-1".into(),
             what: "A lane is done.".into(),
             means: None,
             landed_round: None,

@@ -910,6 +910,7 @@ mod tests {
         let g = Glossary::default();
         let pass = check_message(
             &HumanMessage::Say {
+                id: "s-1".into(),
                 what: "The head follows the branch.".into(),
                 means: None,
                 landed_round: None,
@@ -919,6 +920,7 @@ mod tests {
         assert!(pass.passed(), "{:?}", pass.violations);
         let fail = check_message(
             &HumanMessage::Say {
+                id: "s-2".into(),
                 what: "".into(),
                 means: None,
                 landed_round: None,
