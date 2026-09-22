@@ -1599,10 +1599,12 @@ enum TaskCommand {
         #[arg(long)]
         replaces: Option<String>,
     },
-    /// Drop a task whose premise was wrong or was withdrawn
+    /// Drop a task, or withdraw acceptance conditions replaced by a newer choice
     Drop {
         slug: String,
         id: String,
+        #[arg(long = "acceptance")]
+        acceptance: Vec<usize>,
         #[arg(long)]
         reason: String,
     },
@@ -2308,16 +2310,46 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     "",
                 )
             }
-            TaskCommand::Drop { slug, id, reason } => {
+            TaskCommand::Drop {
+                slug,
+                id,
+                acceptance,
+                reason,
+            } => {
                 let project = Project::load(&ctx.root, &slug)?;
-                let record = crate::task::drop_task(&project, &id, &reason)?;
-                let view = crate::task::view(&project, record);
-                crate::output::success(
-                    Some("dropped"),
-                    &serde_json::json!({ "task": view }),
-                    &format!("{} dropped: {}\n", view.record.id, reason.trim()),
-                    "",
-                )
+                if acceptance.is_empty() {
+                    let record = crate::task::drop_task(&project, &id, &reason)?;
+                    let view = crate::task::view(&project, record);
+                    crate::output::success(
+                        Some("dropped"),
+                        &serde_json::json!({ "task": view }),
+                        &format!("{} dropped: {}\n", view.record.id, reason.trim()),
+                        "",
+                    )
+                } else {
+                    let mut numbers = acceptance.clone();
+                    numbers.sort_unstable();
+                    numbers.dedup();
+                    let record =
+                        crate::task::withdraw_acceptance(&project, &id, acceptance, &reason)?;
+                    let view = crate::task::view(&project, record);
+                    let numbers = numbers
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    crate::output::success(
+                        Some("withdrawn"),
+                        &serde_json::json!({ "task": view }),
+                        &format!(
+                            "{} acceptance {} withdrawn: {}\n",
+                            view.record.id,
+                            numbers,
+                            reason.trim()
+                        ),
+                        "",
+                    )
+                }
             }
             TaskCommand::Adopt { slug, id, thread } => {
                 let project = Project::load(&ctx.root, &slug)?;

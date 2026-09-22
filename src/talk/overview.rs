@@ -537,15 +537,41 @@ fn task_rows(project: &Project) -> (Vec<Row>, usize) {
     }
     for view in &views {
         let text = view.record.dropped.last().map_or_else(
-            || view.record.title.clone(),
+            || {
+                format!(
+                    "{}{}",
+                    view.record.title,
+                    crate::task::withdrawal_summary(&view.record)
+                )
+            },
             |drop| format!("{} — dropped: {}", view.record.title, drop.reason),
         );
-        rows.push(tagged_with_marker(
-            project,
-            view.state.word(),
-            &text,
-            &view.record.id,
-            match view.state {
+        // The state, task id and withdrawal dates are generated identifiers.
+        // Check only the coordinator-written title and reasons.
+        let checked_text = view.record.dropped.last().map_or_else(
+            || {
+                format!(
+                    "{} {}",
+                    view.record.title,
+                    view.record
+                        .withdrawn
+                        .iter()
+                        .map(|evidence| evidence.reason.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            },
+            |drop| format!("{} {}", view.record.title, drop.reason),
+        );
+        rows.push(Row {
+            text: if checked(project, &checked_text) {
+                text
+            } else {
+                TASK_INVALID.into()
+            },
+            prefix: view.state.word().into(),
+            marker: view.record.id.clone(),
+            tone: match view.state {
                 crate::task::State::Verified | crate::task::State::Merged => Tone::Green,
                 crate::task::State::Failed
                 | crate::task::State::Cancelled
@@ -553,8 +579,7 @@ fn task_rows(project: &Project) -> (Vec<Row>, usize) {
                 crate::task::State::Unknown => Tone::Peach,
                 _ => Tone::Yellow,
             },
-            TASK_INVALID,
-        ));
+        });
     }
     if rows.is_empty() && errors.is_empty() {
         rows.push(Row::text(NO_TASKS));
