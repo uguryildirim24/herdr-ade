@@ -1853,7 +1853,7 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         )));
     }
     let attempt = record.attempt.max(1);
-    if crate::events::list(&project)
+    if crate::round::sealed_events(&project)?
         .iter()
         .any(|event| event.thread == id && event.attempt == attempt && event.payload.done.is_some())
     {
