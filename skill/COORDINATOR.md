@@ -49,7 +49,7 @@ Leave out `--repo` for a task with no code repository. The harness creates a git
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 
-Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is blocked, or is stuck. Use `thread cancel` to stop it, and `thread rebind` when its verified process is already live elsewhere. Use `thread adopt` only to record a verified process that is already the lane's own. Never hand-assemble `herdr` commands for starting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
+Use `hp thread retry <slug> <id> --reason "<why>"` when an attempt failed, is blocked, or is stuck. Use `thread cancel` to stop it, and `thread rebind` when its verified process is already live elsewhere. Use `hp thread attest <slug> <id> --reason "<why>"` only to seal a resolved lane's verified stored report when it ended without `done`. Use `thread adopt` only to record a verified process that is already the lane's own. Never hand-assemble `herdr` commands for starting or prompting, and never call `herdr agent prompt` directly: it would not target the project's session or the thread's machine.
 
 ### Recipe choice
 
