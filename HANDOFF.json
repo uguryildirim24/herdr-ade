@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0212.md",
+      "tasks/review-r89.md",
+      "tasks/review-r88.md",
+      "tasks/t-0213.md",
+      "tasks/review-r87.md",
+      "tasks/t-0211.md",
+      "tasks/t-0210.md",
       "tasks/t-0209.md",
       "tasks/t-0208.md",
       "tasks/review-r86.md",
       "tasks/t-0207.md",
-      "tasks/t-0199.md",
-      "tasks/t-0197.md",
-      "tasks/review-r82.md",
-      "tasks/t-0206.md",
-      "tasks/t-0205.md",
-      "tasks/review-r85.md",
-      "tasks/t-0204.md",
-      "tasks/t-0203.md"
+      "tasks/t-0199.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r87.md",
       "tasks/reviews/code-r86.md",
       "tasks/reviews/code-r82.md",
       "tasks/reviews/code-r85.md",
@@ -39,21 +40,29 @@
       "tasks/reviews/code-r79.md",
       "tasks/reviews/code-r78.md",
       "tasks/reviews/code-r77.md",
-      "tasks/reviews/code-r75.md",
-      "tasks/reviews/code-r76.md"
+      "tasks/reviews/code-r75.md"
     ]
   },
-  "generated": "2026-09-21T22:28:00-04:00",
+  "generated": "2026-09-21T22:57:25-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0209-review-r86-a-new-web-helper-lane-starts",
       "main",
+      "hp/adeherdr/t-0215-review-r89-the-install-check-sees-the-sa",
+      "review/r89",
+      "hp/adeherdr/t-0214-review-r88-a-failed-answer-from-the-web",
+      "hp/adeherdr/t-0210-w11-builds-compared-by-commit",
+      "review/r88",
+      "hp/adeherdr/t-0211-w12-pro-turn-error-named",
+      "hp/adeherdr/t-0212-review-r87-every-coordinator-sees-each-h",
+      "hp/adeherdr/t-0213-w13-coordinators-keep-moving",
+      "review/r87",
+      "hp/adeherdr/t-0206-w10-recipes-visible",
+      "hp/adeherdr/t-0209-review-r86-a-new-web-helper-lane-starts",
       "review/r86-2",
       "hp/adeherdr/t-0208-review-r86-a-new-web-helper-lane-starts",
       "hp/adeherdr/t-0207-review-r82-projects-can-run-any-number-o",
       "review/r86",
       "review/r82-3",
-      "hp/adeherdr/t-0206-w10-recipes-visible",
       "hp/adeherdr/t-0200-w8-install-finds-the-box",
       "hp/adeherdr/t-0205-review-r85-one-install-run-reaches-the-b",
       "review/r85",
@@ -336,36 +345,43 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "c50263a review(r86): approve repaired candidate",
-      "274f2e3 review(r86): merge earlier reviewed candidate",
-      "4579086 docs(tasks): t-0209",
-      "fcedf25 review(r86): brief for revision 1",
-      "586ff25 checkpoint(r82): HANDOFF after merging the round",
-      "5dae023 Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'"
+      "c34bc4e Merge commit 'fcbfa7821813a9ec21937e6704d564ec0a232179'",
+      "e5ff94c review(r89): brief for revision 1",
+      "7bd61ab review(r88): brief for revision 1",
+      "fcbfa78 docs(review): round r87 verdict",
+      "7f3a0ed docs(tasks): t-0213",
+      "3abaf78 Merge commit 'b82d5fc5ac56bc138917489901f6a01ca84eb9e5' into hp/adeherdr/t-0212-review-r87-every-coordinator-sees-each-h"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "11 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "c50263a",
+        "head": "c34bc4e",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "review(r86): approve repaired candidate"
+        "subject": "Merge commit 'fcbfa7821813a9ec21937e6704d564ec0a232179'"
       },
       {
-        "branch": "review/r86",
+        "branch": "review/r87",
         "dirty": 0,
-        "head": "25dae55",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r86",
-        "subject": "docs(tasks): t-0208"
+        "head": "2562629",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r87",
+        "subject": "docs(tasks): t-0212"
       },
       {
-        "branch": "review/r86-2",
+        "branch": "review/r88",
         "dirty": 0,
-        "head": "4579086",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r86-2",
-        "subject": "docs(tasks): t-0209"
+        "head": "a502f5c",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r88",
+        "subject": "docs(tasks): t-0214"
+      },
+      {
+        "branch": "review/r89",
+        "dirty": 0,
+        "head": "af0a93a",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r89",
+        "subject": "docs(tasks): t-0215"
       }
     ]
   },
@@ -373,7 +389,7 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "done",
+      "status": "working",
       "workspace_id": "w1H"
     },
     {
@@ -385,8 +401,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r86",
-    "verdict": "c50263a557b9926499fcd27a83bd9e27993e8300"
+    "round": "r87",
+    "verdict": "fcbfa7821813a9ec21937e6704d564ec0a232179"
   },
   "session": "default",
   "unlinked_agents": [],
