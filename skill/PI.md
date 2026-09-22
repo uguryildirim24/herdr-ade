@@ -1,11 +1,11 @@
 # PI.md — running pi lanes
 
 A pi lane runs many model services through one program. The harness owns the
-install, the settings folder, and the logins. You start a pi lane like any
-other lane; the wrapper supplies the folder, so the start line carries no
-path and no secret.
+install, the settings folder, and the logins. Start a pi lane through
+`hp thread start` like any other lane. The wrapper supplies the folder, so
+the launch record carries no path and no secret.
 
-## Start line
+## Launch record
 
 ```
 herdr agent start <name> --kind pi --pane <pane> --parent <coordinator pane> \
@@ -67,15 +67,13 @@ done. The guard reports the pane `blocked` and sends one
 
 - `limit`: wait. Do not re-prompt.
 - `login`: tell Rolf to run `herdr-pi login` again.
-- Recovery: type into the pane with
-  `herdr pane send-text <pane> "<your line>"` and then
-  `herdr pane send-keys <pane> enter`. A blocked pane refuses
-  `herdr agent prompt` (`agent_blocked`).
+- `unreachable` or `error`: use `hp thread retry <slug> <id> --reason "<evidence>"`.
+  The recovery policy keeps provider failures on the same recipe.
 - The guard never sends `DONE`. Only `hp done` does.
 
 If you see the trust question or the missing-folder question on screen, type
-nothing. That is not a lane: it is a broken start. A trusted folder runs
-repository code, so the settings file never trusts one.
+nothing. Report the broken start through thread recovery. A trusted folder
+runs repository code, so the settings file never trusts one.
 
 ## After a herdr restart
 
