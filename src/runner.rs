@@ -468,6 +468,7 @@ pub(crate) mod fake {
             "rev-parse HEAD",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
         ),
+        ("git ls-tree", ""),
         ("worktree add", ""),
         ("update-ref", ""),
         ("workspace report-metadata", r#"{"result":{}}"#),

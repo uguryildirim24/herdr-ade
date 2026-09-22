@@ -224,6 +224,37 @@ pub(crate) fn stage_done(
             head.stdout.trim()
         )));
     }
+    let tracked = runner.run(
+        &Cmd::new("git", std::time::Duration::from_secs(20))
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "-z",
+                sha,
+                "--",
+                ".herdr-project/",
+            ])
+            .cwd(worktree),
+    )?;
+    if !tracked.success() {
+        bail!("git_tracked_paths_failed: {}", tracked.error_text());
+    }
+    let tracked: Vec<_> = tracked
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
+    if !tracked.is_empty() {
+        let paths = tracked
+            .iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(crate::refusal::error(format!(
+            "worktree_dirty: commit {sha} tracks paths under .herdr-project/:\n{paths}\nuntrack these paths, commit, then run `ha done` again"
+        )));
+    }
     let second = stable_read(&report)?;
     if first != second {
         bail!("report_unstable: report bytes changed while staging");
@@ -559,6 +590,7 @@ fn write_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail, ok};
 
     fn fixture() -> (tempfile::TempDir, Project, FakeRunner, Recipient) {
@@ -567,7 +599,8 @@ mod tests {
         let runner = FakeRunner::new();
         runner
             .on("git status --short", ok(""))
-            .on("git rev-parse HEAD", ok("abc\n"));
+            .on("git rev-parse HEAD", ok("abc\n"))
+            .on("git ls-tree", ok(""));
         let recipient = Recipient {
             pane: "w1:p1".into(),
             coordinator_attempt: 1,
@@ -869,6 +902,95 @@ mod tests {
     }
 
     #[test]
+    fn done_refuses_a_commit_that_tracks_project_runtime_files() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let out = RealRunner
+                .run(
+                    &Cmd::new("git", std::time::Duration::from_secs(5))
+                        .args(["-C", &repo_s])
+                        .args(args.iter().copied()),
+                )
+                .unwrap();
+            assert!(out.success(), "git {:?}: {}", args, out.error_text());
+            out.stdout.trim().to_string()
+        };
+        let init = RealRunner
+            .run(
+                &Cmd::new("git", std::time::Duration::from_secs(5))
+                    .args(["init", "-b", "main", &repo_s]),
+            )
+            .unwrap();
+        assert!(init.success(), "{}", init.error_text());
+        git(&["config", "user.email", "ade@test"]);
+        git(&["config", "user.name", "ade"]);
+        std::fs::write(repo.join(".git/info/exclude"), ".herdr-project/\n").unwrap();
+        let report = repo.join(".herdr-project/x/report.md");
+        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+        std::fs::write(&report, "result\n").unwrap();
+        git(&["add", "-f", ".herdr-project/x/report.md"]);
+        git(&["commit", "-m", "track runtime report"]);
+        let tracked_sha = git(&["rev-parse", "HEAD"]);
+
+        let project = project::create(&root.path().join("state"), "demo", "", vec![]).unwrap();
+        let recipient = Recipient {
+            pane: "w1:p1".into(),
+            coordinator_attempt: 1,
+        };
+        let tracked_op = reserve(
+            &project,
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient: recipient.clone(),
+                round: None,
+                requested: Requested::Done {
+                    sha: tracked_sha,
+                    report_path: ".herdr-project/x/report.md".into(),
+                },
+                helper_pid: 1,
+            },
+        )
+        .unwrap();
+        let error = stage_done(&project, &tracked_op.op, &repo, &RealRunner).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        let error = error.to_string();
+        assert!(error.starts_with("worktree_dirty:"), "{error}");
+        assert!(error.contains(".herdr-project/x/report.md"), "{error}");
+        assert!(
+            error.contains("untrack these paths, commit, then run `ha done` again"),
+            "{error}"
+        );
+
+        git(&["rm", "--cached", ".herdr-project/x/report.md"]);
+        git(&["commit", "-m", "untrack runtime report"]);
+        let clean_sha = git(&["rev-parse", "HEAD"]);
+        let clean_op = reserve(
+            &project,
+            Reservation {
+                thread: "t-0001",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient,
+                round: None,
+                requested: Requested::Done {
+                    sha: clean_sha,
+                    report_path: ".herdr-project/x/report.md".into(),
+                },
+                helper_pid: 1,
+            },
+        )
+        .unwrap();
+        stage_done(&project, &clean_op.op, &repo, &RealRunner).unwrap();
+        seal(&project, &clean_op.op, |_| Ok(())).unwrap();
+        assert_eq!(load(&project, &clean_op.op).unwrap().state, OpState::Sealed);
+    }
+
+    #[test]
     fn done_refuses_report_that_changes_between_reads() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -887,7 +1009,9 @@ mod tests {
                 Ok(ok(""))
             },
         );
-        runner.on("git rev-parse HEAD", ok("abc\n"));
+        runner
+            .on("git rev-parse HEAD", ok("abc\n"))
+            .on("git ls-tree", ok(""));
         let op = reserve(
             &project,
             Reservation {
