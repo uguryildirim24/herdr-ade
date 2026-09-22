@@ -17,12 +17,6 @@ use crate::runner::Runner;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Deserialize)]
-struct RawConfig {
-    #[serde(default)]
-    worktrees: WorktreeConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
 struct WorktreeConfig {
     #[serde(default)]
     disposable: Vec<String>,
@@ -105,20 +99,8 @@ fn same_repo(left: &str, right: &str) -> bool {
 /// Global disposable paths plus the paths owned by this project's repository
 /// row or, for a harness repository, its config row.
 pub(crate) fn disposable(config_dir: &Path, project: &Project, repo: &str) -> Result<Vec<String>> {
-    let file = config_dir.join("config.toml");
-    let text = match std::fs::read_to_string(&file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", file.display()));
-        }
-    };
-    let config: RawConfig = if text.trim().is_empty() {
-        RawConfig::default()
-    } else {
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?
-    };
-    let mut paths = config.worktrees.disposable;
+    let document = crate::config::Document::read(config_dir)?;
+    let mut paths = document.section::<WorktreeConfig>("worktrees")?.disposable;
     let (settings, _) = project.read_project_md()?;
     paths.extend(
         settings
@@ -128,7 +110,7 @@ pub(crate) fn disposable(config_dir: &Path, project: &Project, repo: &str) -> Re
             .flat_map(|row| row.disposable.iter().cloned()),
     );
     paths.extend(
-        crate::harness::repos(config_dir)?
+        crate::harness::repos_from(&document)?
             .into_iter()
             .filter(|row| same_repo(&row.path, repo))
             .flat_map(|row| row.disposable),
