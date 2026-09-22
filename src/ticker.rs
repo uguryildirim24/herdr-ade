@@ -1886,6 +1886,77 @@ mod tests {
     }
 
     #[test]
+    fn withdrawing_the_last_unverified_condition_stops_work_nudges() {
+        let f = fixture(false);
+        let (mut settings, body) = f.project.read_project_md().unwrap();
+        settings.task_states = vec!["finished".into(), "verified".into()];
+        let front = toml::to_string(&settings).unwrap();
+        std::fs::write(f.project.project_md(), format!("+++\n{front}+++\n\n{body}")).unwrap();
+
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Resolved;
+            lane.attempt = 1;
+        })
+        .unwrap();
+        let task = crate::task::Task {
+            id: "job-0001".into(),
+            title: "Keep the project moving.".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["First.".into(), "Replaced.".into(), "Third.".into()],
+            attempts: vec![lane.id.clone()],
+            verified: vec![crate::task::Evidence {
+                at: project::now(),
+                command: "checked first and third".into(),
+                acceptance: vec![1, 3],
+                machine: None,
+                build: None,
+            }],
+            created: project::now(),
+            ..crate::task::Task::default()
+        };
+        std::fs::write(
+            f.project.dir().join("tasks/job-0001.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+        crate::events::seal_create_if_absent(
+            &f.project,
+            &crate::contracts::Event {
+                id: "done-1".into(),
+                op: "done-1".into(),
+                thread: lane.id,
+                attempt: 1,
+                round: None,
+                recipient: crate::contracts::Recipient::default(),
+                created: project::now(),
+                payload: crate::contracts::EventPayload {
+                    done: Some(crate::contracts::DonePayload {
+                        sha: "lane-sha".into(),
+                        report_path: ".reports/lane.md".into(),
+                        artifact: "report-hash".into(),
+                        attestation: None,
+                    }),
+                    ..crate::contracts::EventPayload::default()
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            open_work_next_steps(&f.project),
+            ["job-0001: verify 1 acceptance condition(s)"]
+        );
+        crate::task::withdraw_acceptance(
+            &f.project,
+            "job-0001",
+            vec![2],
+            "A newer choice replaced it.",
+        )
+        .unwrap();
+        assert!(open_work_next_steps(&f.project).is_empty());
+    }
+
+    #[test]
     fn work_nudge_waits_when_a_lane_is_working_or_every_task_waits_on_rolf() {
         let f = fixture(false);
         let lane = thread::allocate(&f.project, |lane| {

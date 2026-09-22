@@ -270,6 +270,14 @@ fn validate_record(task: &Task) -> Result<()> {
     if withdrawn.len() == task.acceptance.len() {
         bail!("task_withdrawn: every acceptance condition is withdrawn; drop the task instead");
     }
+    let verified: BTreeSet<_> = task
+        .verified
+        .iter()
+        .flat_map(|evidence| evidence.acceptance.iter().copied())
+        .collect();
+    if let Some(index) = withdrawn.intersection(&verified).next() {
+        bail!("task_withdrawn: acceptance {index} also has verification evidence");
+    }
     Ok(())
 }
 
@@ -1059,13 +1067,13 @@ pub(crate) fn record_evidence(
     let mut acceptance = acceptance;
     acceptance.sort_unstable();
     acceptance.dedup();
-    let withdrawn = withdrawn_acceptance(&before.record);
-    if let Some(index) = acceptance.iter().find(|index| withdrawn.contains(index)) {
-        return Err(crate::refusal::error(format!(
-            "task_evidence_withdrawn: acceptance {index} is withdrawn"
-        )));
-    }
     update(project, id, |task| {
+        let withdrawn = withdrawn_acceptance(task);
+        if let Some(index) = acceptance.iter().find(|index| withdrawn.contains(index)) {
+            return Err(crate::refusal::error(format!(
+                "task_evidence_withdrawn: acceptance {index} is withdrawn"
+            )));
+        }
         let evidence = Evidence {
             at: project::now(),
             command: command.trim().to_string(),
@@ -1397,6 +1405,10 @@ created = "2026-09-21T00:00:00Z"
         assert!(task.running.is_empty());
         assert!(task.withdrawn.is_empty());
         validate_record(&task).unwrap();
+
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        assert_eq!(view(&project, task).state, State::Open);
     }
 
     #[test]
@@ -1599,6 +1611,7 @@ created = "2026-09-21T00:00:00Z"
         let withdrawn_date = date(&task.withdrawn[0].at).to_string();
         let view = view(&fx.project, task);
         assert_eq!(view.state, State::Verified);
+        assert!(view.terminal(&fx.project));
         assert_eq!(view.next, "none");
         assert!(render(&view).contains(&format!(
             "2. [withdrawn {withdrawn_date}: The newer cleanup choice replaced it.]"
@@ -1626,6 +1639,31 @@ created = "2026-09-21T00:00:00Z"
                 .iter()
                 .map(|row| row.full_text())
                 .collect::<Vec<_>>()
+        );
+
+        let error = record_evidence(
+            &fx.project,
+            "job-0001",
+            EvidenceKind::Verified,
+            "checked the replaced result",
+            vec![2],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("task_evidence_withdrawn"));
+
+        let mut contradictory = load(&fx.project, "job-0001").unwrap();
+        contradictory.verified.push(Evidence {
+            at: project::now(),
+            command: "contradictory evidence".into(),
+            acceptance: vec![2],
+            machine: None,
+            build: None,
+        });
+        assert!(
+            validate_record(&contradictory)
+                .unwrap_err()
+                .to_string()
+                .contains("also has verification evidence")
         );
     }
 
