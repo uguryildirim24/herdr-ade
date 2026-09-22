@@ -56,12 +56,6 @@ fn canonical_or(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
-/// True when `path` is one of the harness repositories.
-pub(crate) fn is_harness_repo(config_dir: &Path, path: &str) -> bool {
-    let target = canonical_or(path);
-    repos(config_dir).is_ok_and(|repos| repos.iter().any(|repo| canonical_or(&repo.path) == target))
-}
-
 /// True when a project may start a lane or open a round on `path`: the path is
 /// one of its own listed repositories, or a harness repository.
 pub(crate) fn allowed_repo(settings: &Settings, config_dir: &Path, path: &str) -> Result<bool> {

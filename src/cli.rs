@@ -416,9 +416,11 @@ enum RoundCommand {
     /// Open a round: its record, gate list and policy hash
     Open {
         slug: String,
-        round: String,
+        /// Optional round id followed by any lanes to admit
+        #[arg(value_name = "ROUND_OR_THREAD")]
+        members: Vec<String>,
         #[arg(long)]
-        branch: String,
+        branch: Option<String>,
         /// One sentence that says what the round does (required)
         #[arg(long)]
         plain: Option<String>,
@@ -728,28 +730,25 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
         Command::Round { command } => match command {
             RoundCommand::Open {
                 slug,
-                round: id,
+                mut members,
                 branch,
                 plain,
                 repo,
             } => {
-                let r = round::open(
-                    ctx,
-                    &slug,
-                    round::OpenArgs {
-                        round: id,
-                        branch,
-                        plain,
-                        repo,
-                    },
-                )?;
+                let id = members
+                    .first()
+                    .filter(|value| round::validate_round_id(value).is_ok())
+                    .cloned();
+                if id.is_some() {
+                    members.remove(0);
+                }
+                let r = round::open_with_lanes(ctx, &slug, id, branch, plain, repo, members)?;
                 crate::output::insert("phase", serde_json::to_value(r.phase)?);
-                println!(
-                    "opened {} on `{}` (gates: {})",
-                    r.round,
-                    r.branch,
-                    r.gates.len()
-                );
+                let gates = match &r.gates {
+                    None => "not configured".to_string(),
+                    Some(gates) => gates.len().to_string(),
+                };
+                println!("opened {} on `{}` (gates: {gates})", r.round, r.branch);
                 Ok(())
             }
             RoundCommand::Admit {
@@ -877,20 +876,12 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 let stop = stop_after.map(|s| s.parse()).transpose()?;
                 let result = round::merge(ctx, &slug, &id, stop)?;
                 let record = round::load(&Project::load(&ctx.root, &slug)?, &id)?;
-                let install_required =
-                    matches!(
-                        &result,
-                        round::MergeOutcome::Checkpointed { .. } | round::MergeOutcome::NoOp { .. }
-                    ) && crate::harness::is_harness_repo(&ctx.config_dir, &record.repo);
                 let mut message = String::new();
-                if install_required {
-                    // Preserve the established ordering: merge used to print
-                    // this line before returning its outcome to the CLI.
-                    message.push_str("run ha harness install\n");
-                }
                 let outcome = match &result {
                     round::MergeOutcome::Checkpointed { head, lanes } => {
-                        message.push_str(&format!("merged and checkpointed: H {head}\n"));
+                        message.push_str(&format!(
+                            "merged and checkpointed at H {head}; configured publication and installation are complete\n"
+                        ));
                         for lane in lanes {
                             message.push_str(&format!("  {lane}\n"));
                         }
@@ -898,7 +889,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     }
                     round::MergeOutcome::NoOp { head } => {
                         message.push_str(&format!(
-                            "already checkpointed at H {head}; nothing to do\n"
+                            "already checkpointed at H {head}; configured publication and installation are complete\n"
                         ));
                         "already_checkpointed"
                     }
@@ -932,7 +923,8 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     &serde_json::json!({
                         "merge": result,
                         "phase": record.phase,
-                        "harness_install_required": install_required,
+                        "published": record.published,
+                        "installed": record.installed,
                     }),
                     &message,
                     "",
