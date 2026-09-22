@@ -12,9 +12,6 @@ use crate::project::{self, Project, slugify, write_atomic};
 use crate::runner::{Cmd, Runner};
 
 pub(crate) const STARTING_TIMEOUT_SECS: i64 = 300;
-/// Herdr's maximum event wait for a newly launched pi process. Cloud starts
-/// have crossed two minutes, so every pi launch gets the full outer bound.
-pub(crate) const PI_START_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 const NOT_READY_SECS: i64 = 60;
 /// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`
@@ -332,11 +329,8 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
         )
     };
     if t.is_remote() {
-        // The box lane runs the plugin on the box, so the birth line carries
-        // the fixed box prefix, never the Mac's `current_exe` (D12/D14).
         return format!(
-            "Run {} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
-            crate::contracts::box_prefix(),
+            "Run {prefix} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
             t.machine
         );
     }

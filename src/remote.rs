@@ -2,13 +2,14 @@
 //! courier's scp ingress options. No other code builds a string that a shell
 //! will parse.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::contracts::{BOX_REPOS, BoxRepoMap, MACHINE_LOCAL, MachineProfile};
+use crate::contracts::{MACHINE_LOCAL, MachineProfile};
 use crate::runner::{Cmd, Output, Runner};
 
 const SSH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,6 +51,81 @@ struct SavedMachine {
     enabled: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct MachineDeclaration {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) target: String,
+    pub(crate) session: String,
+    pub(crate) home: String,
+    pub(crate) root: String,
+    pub(crate) worktrees: String,
+    pub(crate) build: String,
+    pub(crate) path: String,
+    pub(crate) ade_bin: String,
+    pub(crate) pi_bin: String,
+    pub(crate) repos: Vec<crate::project::Repo>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct MachineConfig {
+    machines: BTreeMap<String, MachineDeclaration>,
+}
+
+fn configured_machine_declarations(
+    config_dir: &Path,
+) -> Result<BTreeMap<String, MachineDeclaration>> {
+    let path = config_dir.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(toml::from_str::<MachineConfig>(&text)
+        .with_context(|| format!("{} does not parse", path.display()))?
+        .machines)
+}
+
+pub(crate) fn machine_declarations(
+    config_dir: &Path,
+) -> Result<BTreeMap<String, MachineDeclaration>> {
+    let mut rows: MachineConfig = toml::from_str(include_str!("../assets/default-machines.toml"))
+        .context("shipped machine declarations do not parse")?;
+    rows.machines
+        .extend(configured_machine_declarations(config_dir)?);
+    for (id, row) in &mut rows.machines {
+        if row.id.is_empty() {
+            row.id = id.clone();
+        }
+        if row.label.is_empty() {
+            row.label = id.clone();
+        }
+        if row.target.is_empty()
+            || row.session.is_empty()
+            || row.path.is_empty()
+            || row.home.is_empty()
+            || row.root.is_empty()
+            || row.build.is_empty()
+            || row.ade_bin.is_empty()
+            || row.pi_bin.is_empty()
+        {
+            bail!("machine_declaration_invalid: `{id}` is missing target, session, or paths");
+        }
+    }
+    Ok(rows.machines)
+}
+
+pub(crate) fn machine_declaration(config_dir: &Path, machine: &str) -> Result<MachineDeclaration> {
+    machine_declarations(config_dir)?
+        .into_values()
+        .find(|row| row.id == machine || row.label == machine)
+        .with_context(|| {
+            format!("machine_declaration_missing: `{machine}` has no path declaration")
+        })
+}
+
 /// The stable profile of one saved machine (SPEC-remote §4.1). `local` is a
 /// real profile with no SSH target.
 pub(crate) fn machine_profile(
@@ -67,7 +143,7 @@ pub(crate) fn machine_profile(
 pub(crate) fn optional_machine_profile(
     runner: &dyn Runner,
     herdr_bin: &str,
-    _config_dir: &Path,
+    config_dir: &Path,
     machine: &str,
 ) -> Result<Option<MachineProfile>> {
     if machine.is_empty() || machine == MACHINE_LOCAL {
@@ -78,11 +154,26 @@ pub(crate) fn optional_machine_profile(
             session: String::new(),
         }));
     }
-    let Some(found) = saved_machines(runner, herdr_bin)?
+    let found = saved_machines(runner, herdr_bin)?
         .into_iter()
-        .find(|m| m.label == machine || m.id == machine)
-    else {
-        return Ok(None);
+        .find(|m| m.label == machine || m.id == machine);
+    let Some(found) = found else {
+        let configured = configured_machine_declarations(config_dir)?;
+        let declared = configured.into_iter().find_map(|(id, mut row)| {
+            if row.id.is_empty() {
+                row.id = id.clone();
+            }
+            if row.label.is_empty() {
+                row.label = id;
+            }
+            (row.id == machine || row.label == machine).then_some(row)
+        });
+        return Ok(declared.map(|row| MachineProfile {
+            id: row.id,
+            label: row.label,
+            target: row.target,
+            session: row.session,
+        }));
     };
     if !found.enabled {
         bail!("machine_disabled: `{}` is disabled", found.label);
@@ -112,8 +203,9 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
 pub(crate) fn registered_machine_names(
     runner: &dyn Runner,
     herdr_bin: &str,
+    config_dir: &Path,
 ) -> Result<Vec<String>> {
-    saved_machines(runner, herdr_bin)?
+    let mut names: Vec<String> = saved_machines(runner, herdr_bin)?
         .into_iter()
         .filter(|machine| machine.enabled)
         .map(|machine| {
@@ -125,13 +217,30 @@ pub(crate) fn registered_machine_names(
                 bail!("machine_profile_invalid: an enabled saved machine has no id or label")
             }
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    names.extend(
+        configured_machine_declarations(config_dir)?
+            .into_values()
+            .map(|row| row.label),
+    );
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box
 /// path is never derived from the Mac path.
-pub(crate) fn box_repo_for(mac_path: &str) -> Option<&'static BoxRepoMap> {
-    BOX_REPOS.iter().find(|row| row.mac == mac_path)
+pub(crate) fn box_repo_for(
+    config_dir: &Path,
+    machine: &str,
+    mac_path: &str,
+) -> Option<crate::project::Repo> {
+    let mut rows = crate::harness::repos(config_dir).ok()?;
+    if let Ok(machine) = machine_declaration(config_dir, machine) {
+        rows.extend(machine.repos);
+    }
+    rows.into_iter()
+        .find(|row| row.path == mac_path && row.box_path.is_some() && row.publish_url.is_some())
 }
 
 /// The URL-matched remote name in `repo`, never by remote name alone. The
@@ -201,11 +310,10 @@ pub(crate) fn ssh(
     timeout: Duration,
 ) -> Result<Output> {
     check_target(target)?;
-    let script = crate::contracts::with_box_path(script);
     let mut cmd = Cmd::new("ssh", timeout).args(SSH_OPTIONS).args([
         "--",
         target,
-        &format!("sh -c {}", quote(&script)),
+        &format!("sh -c {}", quote(script)),
     ]);
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
@@ -325,10 +433,9 @@ pub(crate) fn ssh_courier(
     check_target(target)?;
     let mut args = multiplex_options(control_dir);
     args.extend(SSH_OPTIONS.iter().map(|s| (*s).to_string()));
-    let script = crate::contracts::with_box_path(script);
     args.push("--".into());
     args.push(target.to_string());
-    args.push(format!("sh -c {}", quote(&script)));
+    args.push(format!("sh -c {}", quote(script)));
     runner.run(&Cmd::new("ssh", timeout).args(args).stdin(cursor))
 }
 
@@ -470,11 +577,8 @@ mod tests {
     }
 
     #[test]
-    fn every_ssh_script_carries_the_box_path() {
-        let expected = format!(
-            "sh -c 'PATH={}; export PATH\ntrue'",
-            crate::contracts::BOX_PATH
-        );
+    fn ssh_does_not_invent_a_machine_path() {
+        let expected = "sh -c true";
         let runner = FakeRunner::new();
         runner.on("ssh", ok(""));
         ssh(&runner, "box", "true", None, SSH_TIMEOUT).unwrap();
@@ -517,11 +621,50 @@ mod tests {
     }
 
     #[test]
+    fn a_second_configured_machine_needs_no_engine_change() {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("config.toml"),
+            r#"[machines.lab]
+target = "lab.example"
+session = "saved"
+home = "/srv/agent"
+root = "/srv/ade"
+worktrees = "/srv/work"
+build = "/srv/build"
+path = "/srv/bin:/usr/bin:/bin"
+ade_bin = "/srv/bin/herdr-ade"
+pi_bin = "/srv/bin/herdr-pi"
+[[machines.lab.repos]]
+path = "/local/repo"
+box_path = "/srv/work/repo"
+publish_url = "https://example.test/repo.git"
+"#,
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("machine list --json", ok("[]"));
+        let profile = machine_profile(&runner, "herdr", config.path(), "lab").unwrap();
+        assert_eq!(profile.target, "lab.example");
+        let repo = box_repo_for(config.path(), "lab", "/local/repo").unwrap();
+        assert_eq!(repo.box_path.as_deref(), Some("/srv/work/repo"));
+    }
+
+    #[test]
     fn the_box_repo_map_is_path_exact_and_the_url_remote_is_chosen_by_url() {
-        let row = box_repo_for("/Users/rolfie/projects/herdr").unwrap();
-        assert_eq!(row.box_path, "/home/ubuntu/projects/herdr");
-        assert!(box_repo_for("/Users/rolfie/projects/herdr-ade").is_some());
-        assert!(box_repo_for("/Users/rolfie/projects/other").is_none());
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("config.toml"),
+            r#"[[harness.repos]]
+path = "/Users/rolfie/projects/herdr"
+box_path = "/srv/herdr"
+publish_url = "https://github.com/uguryildirim24/herdr.git"
+"#,
+        )
+        .unwrap();
+        let row = box_repo_for(config.path(), "oci", "/Users/rolfie/projects/herdr").unwrap();
+        assert_eq!(row.box_path.as_deref(), Some("/srv/herdr"));
+        assert!(box_repo_for(config.path(), "oci", "/Users/rolfie/projects/other").is_none());
 
         let runner = FakeRunner::new();
         runner.on(

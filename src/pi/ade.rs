@@ -90,10 +90,17 @@ pub(crate) fn check_with(
     runner: &dyn crate::runner::Runner,
     root: &Path,
     provider: &str,
+    model: &str,
 ) -> Result<CheckReport> {
     let env = Env::from_process()?;
     let rooted = crate::runner::CwdRunner::new(runner, root);
-    let report = doctor::check_report(&env, &layout(root), &Adapter(&rooted), provider);
+    let report = doctor::check_report_model(
+        &env,
+        &layout(root),
+        &Adapter(&rooted),
+        provider,
+        Some(model),
+    );
     if report.ok {
         Ok(report)
     } else {
@@ -112,13 +119,17 @@ pub(crate) fn check_on_machine(
     runner: &dyn crate::runner::Runner,
     local_root: &Path,
     target: &str,
+    remote_root: &str,
+    remote_bin: &str,
     provider: &str,
+    model: &str,
 ) -> Result<()> {
     let script = format!(
-        "HERDR_ADE_ROOT={root} {bin} check {provider}",
-        root = crate::remote::quote(crate::contracts::BOX_ROOT),
-        bin = crate::remote::quote(crate::contracts::BOX_PI_BIN),
+        "HERDR_ADE_ROOT={root} {bin} check {provider} --model {model}",
+        root = crate::remote::quote(remote_root),
+        bin = crate::remote::quote(remote_bin),
         provider = crate::remote::quote(provider),
+        model = crate::remote::quote(model),
     );
     let rooted = crate::runner::CwdRunner::new(runner, local_root);
     let out = crate::remote::ssh(
@@ -174,11 +185,15 @@ pub(crate) fn check_on_machine(
 pub(crate) fn doctor_rows_with(
     runner: &dyn crate::runner::Runner,
     root: &Path,
+    models: &[(String, String)],
 ) -> Result<(Vec<doctor::Row>, bool)> {
     let env = Env::from_process()?;
-    let providers = crate::pi::recipes::enabled_providers();
     let rooted = crate::runner::CwdRunner::new(runner, root);
-    let rows = doctor::doctor_rows_with(&env, &layout(root), &Adapter(&rooted), &providers);
+    let models: Vec<(&str, &str)> = models
+        .iter()
+        .map(|(provider, model)| (provider.as_str(), model.as_str()))
+        .collect();
+    let rows = doctor::doctor_rows_with_models(&env, &layout(root), &Adapter(&rooted), &models);
     let ok = doctor::healthy(&rows);
     Ok((rows, ok))
 }
@@ -220,13 +235,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         runner.on("ssh", ok("{}"));
-        check_on_machine(&runner, dir.path(), "me@box", "opencode-go").unwrap();
+        check_on_machine(
+            &runner,
+            dir.path(),
+            "me@box",
+            "/home/ubuntu/.herdr-ade",
+            "/home/ubuntu/.local/bin/herdr-pi",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+        )
+        .unwrap();
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].cwd.as_deref(), Some(dir.path()));
         assert_eq!(
             calls[0].args.last().unwrap(),
-            "sh -c 'PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH\nHERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go'"
+            "sh -c 'HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go --model deepseek-v4.1-flash'"
         );
         drop(calls);
     }
@@ -237,9 +261,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         runner.on("ssh", fail(1, "error: unrecognized subcommand 'check'\n"));
-        let error = check_on_machine(&runner, dir.path(), "me@box", "opencode-go")
-            .unwrap_err()
-            .to_string();
+        let error = check_on_machine(
+            &runner,
+            dir.path(),
+            "me@box",
+            "/home/ubuntu/.herdr-ade",
+            "/home/ubuntu/.local/bin/herdr-pi",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("pi_not_ready on the box for `opencode-go`"),
             "{error}"
@@ -264,7 +296,16 @@ mod tests {
             },
         );
 
-        let error = check_on_machine(&runner, dir.path(), "me@box", "opencode-go").unwrap_err();
+        let error = check_on_machine(
+            &runner,
+            dir.path(),
+            "me@box",
+            "/home/ubuntu/.herdr-ade",
+            "/home/ubuntu/.local/bin/herdr-pi",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+        )
+        .unwrap_err();
         assert_eq!(
             failure_class(&error),
             crate::contracts::FailureClass::Unknown
