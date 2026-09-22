@@ -614,6 +614,14 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
     let others = other_ownership(ctx, slug)?;
     let coordinator = project.coordinator();
 
+    let record_users = other_projects_using_path(&others, &project.dir());
+    if !record_users.is_empty() {
+        bail!(
+            "cannot delete `{slug}` because its project record overlaps resources owned by {}",
+            record_users.join(", ")
+        );
+    }
+
     let project_paths: Vec<_> = owned_paths(&project, &threads).into_iter().collect();
     let pro_names = pro_thread_names(&threads);
 
@@ -1027,6 +1035,33 @@ mod tests {
                     .iter()
                     .any(|arg| arg == &repo.display().to_string())
         }));
+    }
+
+    #[test]
+    fn delete_refuses_before_trashing_a_repo_inside_its_record_that_another_project_owns() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let nested = project.dir().join("other-project-repo");
+        std::fs::create_dir_all(&nested).unwrap();
+        crate::project::create(
+            &world.root,
+            "second",
+            "",
+            vec![Repo {
+                path: nested.display().to_string(),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
+        world.runner.on("/usr/bin/trash", ok(""));
+
+        let error = delete(&world.ctx(), "demo", false, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("resources owned by second"), "{error}");
+        assert_eq!(world.runner.count("/usr/bin/trash"), 0);
+        assert!(!project.state_dir().join("delete.toml").exists());
     }
 
     #[test]
