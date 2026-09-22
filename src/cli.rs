@@ -1566,7 +1566,7 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum TaskCommand {
-    /// Add a task tied to Rolf's request and plain acceptance conditions
+    /// Add a task tied to Rolf's request and exact acceptance conditions
     Add {
         slug: String,
         #[arg(long)]

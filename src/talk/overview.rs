@@ -173,7 +173,7 @@ fn checked(project: &Project, text: &str) -> bool {
     !text.trim().is_empty()
         && !text.chars().any(char::is_control)
         && glossary::name_in(project, text).is_none()
-        && glossary::gate_row(project, text).is_ok()
+        && glossary::gate(project, text).is_ok()
 }
 fn safe(project: &Project, text: &str, fallback: &str) -> String {
     if checked(project, text) {
@@ -182,6 +182,22 @@ fn safe(project: &Project, text: &str, fallback: &str) -> String {
         fallback.into()
     }
 }
+
+/// Internal records are technical rows, not audience prose. Keep exact text
+/// and let the screen wrap or collapse it; only unusable terminal text falls
+/// back to a fixed label.
+fn internal_checked(text: &str) -> bool {
+    !text.trim().is_empty() && !text.chars().any(char::is_control)
+}
+
+fn internal_safe(text: &str, fallback: &str) -> String {
+    if internal_checked(text) {
+        text.to_string()
+    } else {
+        fallback.into()
+    }
+}
+
 fn tagged(project: &Project, prefix: &str, text: &str, tone: Tone, fallback: &str) -> Row {
     tagged_with_marker(project, prefix, text, "", tone, fallback)
 }
@@ -206,6 +222,15 @@ fn tagged_with_marker(
         } else {
             fallback.into()
         },
+        marker: marker.into(),
+        tone,
+    }
+}
+
+fn tagged_internal(prefix: &str, text: &str, marker: &str, tone: Tone, fallback: &str) -> Row {
+    Row {
+        prefix: prefix.into(),
+        text: internal_safe(text, fallback),
         marker: marker.into(),
         tone,
     }
@@ -353,26 +378,24 @@ impl Overview {
                 Group::Landing => ("reviewed", Tone::Yellow),
                 _ => ("working", Tone::Yellow),
             };
-            let marker = match (t.is_remote(), live.reachable) {
+            let place = match (t.is_remote(), live.reachable) {
                 (true, true) => "box",
                 (true, false) => "box, last seen",
                 (false, false) => "last seen",
                 (false, true) => "",
             };
-            let text = safe(project, &t.plain, TASK_INVALID);
+            let marker = [t.id.as_str(), place]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = internal_safe(&t.plain, TASK_INVALID);
             // A round and its reviewer carry the round's sentence; show the
             // work once. An unnamed row keeps its own fallback.
-            if checked(project, &t.plain) && !seen_work.insert(text.clone()) {
+            if internal_checked(&t.plain) && !seen_work.insert(text.clone()) {
                 continue;
             }
-            out.sections[3].push(tagged_with_marker(
-                project,
-                state,
-                &text,
-                marker,
-                tone,
-                TASK_INVALID,
-            ));
+            out.sections[3].push(tagged_internal(state, &text, &marker, tone, TASK_INVALID));
             // Error strings may contain internal detail; only a checked plain
             // explanation can accompany the retained work row.
             if !t.error.is_empty() && checked(project, &t.error) {
@@ -463,7 +486,7 @@ impl Overview {
             } else {
                 prefix
             };
-            let mut row = tagged(project, prefix, &d.line, tone, DECISION_INVALID);
+            let mut row = tagged_internal(prefix, &d.line, "", tone, DECISION_INVALID);
             // The id is an action target, not user-authored prose.
             row.prefix = format!("{} {}", d.id, row.prefix);
             out.sections[5].push(row);
@@ -564,7 +587,7 @@ fn task_rows(project: &Project) -> (Vec<Row>, usize) {
             |drop| format!("{} {}", view.record.title, drop.reason),
         );
         rows.push(Row {
-            text: if checked(project, &checked_text) {
+            text: if internal_checked(&checked_text) {
                 text
             } else {
                 TASK_INVALID.into()
@@ -709,8 +732,10 @@ mod tests {
         assert_eq!(o.needs, 0);
         assert_eq!(o.active, 0);
         assert!(o.sections[3].iter().all(|r| {
-            r.full_text()
-                .contains("needs you Build the screen. last seen")
+            let text = r.full_text();
+            text.contains("needs you Build the screen.")
+                && text.contains("t-0001")
+                && text.contains("last seen")
         }));
         assert_eq!(fx.world.runner.calls.borrow().len(), before);
     }
@@ -735,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_long_sentence_renders_cut_instead_of_the_invalid_fallback() {
+    fn an_existing_long_sentence_uses_the_plain_fallback() {
         let fx = fixture();
         let (mut settings, body) = fx.project.read_project_md().unwrap();
         settings.goal = format!("{}.", vec!["the"; 26].join(" "));
@@ -751,8 +776,7 @@ mod tests {
             &Conversation::default(),
             &Live::default(),
         );
-        assert_ne!(o.sections[0][0].text, GOAL_INVALID);
-        assert_eq!(o.sections[0][0].text, settings.goal);
+        assert_eq!(o.sections[0][0].text, GOAL_INVALID);
     }
 
     #[test]
@@ -1001,18 +1025,23 @@ mod tests {
                 .iter()
                 .any(|r| r.full_text() == "d-0001 routine I kept the words short.")
         );
-        for r in o.sections.iter().flatten() {
-            assert!(
-                glossary::gate_row(
-                    &fx.project,
+        for (section, rows) in o.sections.iter().enumerate() {
+            if section == 3 {
+                continue;
+            }
+            for r in rows {
+                assert!(
+                    glossary::gate(
+                        &fx.project,
+                        r.full_text()
+                            .strip_prefix("d-0001 ")
+                            .unwrap_or(&r.full_text())
+                    )
+                    .is_ok(),
+                    "{}",
                     r.full_text()
-                        .strip_prefix("d-0001 ")
-                        .unwrap_or(&r.full_text())
-                )
-                .is_ok(),
-                "{}",
-                r.full_text()
-            );
+                );
+            }
         }
         assert_eq!(before, std::fs::read(plan::plan_path(&fx.project)).unwrap());
         assert_eq!(o.sections[4][0].text, EMPTY[4]);

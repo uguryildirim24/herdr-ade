@@ -142,35 +142,6 @@ pub(crate) fn check(text: &str, glossary: &Glossary) -> CheckResult {
     }
 }
 
-/// Check a coordinator record (`ha decide`, a round or thread sentence): every
-/// rule except the known-word one (R4), with the length cap counted over the
-/// whole line. The record is a row on a screen and records what happened, in
-/// whatever words are accurate, so it may name a file. Everything Rolf reads
-/// as prose (`say`, `ask` and their choices) uses [`check`].
-pub(crate) fn check_record(text: &str, glossary: &Glossary) -> CheckResult {
-    let mut violations = Vec::new();
-    violations.extend(check_r1_r2(text, glossary));
-    violations.extend(check_r3(text, glossary));
-    // R5 splits on every dot; a file name like `config.toml` would hide a long
-    // line behind two short pieces. The record's length is the whole line.
-    let cap = glossary.max_words();
-    let n = tokens(text)
-        .into_iter()
-        .filter(|t| t.raw.chars().any(|c| c.is_ascii_alphanumeric()))
-        .count();
-    if n > cap {
-        violations.push(Violation {
-            rule: Rule::LongSentence,
-            span: Span {
-                start: 0,
-                end: text.len(),
-            },
-            fix: format!("split this {n}-word sentence"),
-        });
-    }
-    CheckResult { violations }
-}
-
 /// The non-empty sentences in a record. A `.` between two letters or digits
 /// (`config.toml`, `1.2`) does not end a sentence; other terminators and
 /// newlines do. [`check_r5`] keeps its own split because Rolf's prose has no
@@ -792,25 +763,6 @@ mod tests {
 
     fn codes(result: &CheckResult) -> Vec<&'static str> {
         result.violations.iter().map(|v| v.rule.code()).collect()
-    }
-
-    /// E4: a record line may name a file. The known-word rule is off, the cap
-    /// counts the whole line, and a dot inside a token does not end a sentence.
-    #[test]
-    fn a_record_line_may_name_a_file_but_keeps_the_length_cap() {
-        let g = Glossary::default();
-        assert!(check_record("I changed config.toml today.", &g).passed());
-        // Rolf's prose keeps the known-word rule.
-        assert_eq!(
-            codes(&check("I changed config.toml today.", &g)),
-            ["plain_unknown_word"]
-        );
-        let long = format!("I changed {}.", vec!["config.toml"; 26].join(" "));
-        assert_eq!(codes(&check_record(&long, &g)), ["plain_long_sentence"]);
-        assert_eq!(sentence_count("The round lands config.toml."), 1);
-        assert_eq!(sentence_count("One. Two."), 2);
-        assert_eq!(sentence_count("One.\" Two."), 2);
-        assert_eq!(sentence_count("No terminator here"), 1);
     }
 
     fn list_is_clean(text: &str) {
