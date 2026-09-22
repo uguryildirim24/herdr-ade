@@ -2459,7 +2459,11 @@ recipe = "claude_fable_xhigh"
                 revision: 1,
                 members: ids
                     .into_iter()
-                    .map(|thread| crate::contracts::ManifestMember { thread, pin: None })
+                    .map(|thread| crate::contracts::ManifestMember {
+                        thread,
+                        pin: None,
+                        awaiting_report_after: None,
+                    })
                     .collect(),
             },
             repo: "/repo".into(),
@@ -2601,6 +2605,7 @@ recipe = "claude_fable_xhigh"
                 members: vec![crate::contracts::ManifestMember {
                     thread: thread.id,
                     pin: None,
+                    awaiting_report_after: None,
                 }],
             },
             repo: "/repo".into(),
@@ -2661,6 +2666,7 @@ recipe = "claude_fable_xhigh"
                 members: vec![crate::contracts::ManifestMember {
                     thread: thread.id,
                     pin: None,
+                    awaiting_report_after: None,
                 }],
             },
             repo: "/repo".into(),
