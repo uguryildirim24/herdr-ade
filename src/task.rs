@@ -1270,6 +1270,7 @@ mod tests {
             vec!["The command reports the new result.".into()],
             None,
             None,
+            None,
         )
         .unwrap();
 
