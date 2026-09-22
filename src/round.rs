@@ -456,6 +456,7 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
     let _lock = project.lock()?;
     let mut record = load(project, round)?;
     record.phase = phase_for_merge(intent);
+    record.cleanup_pending = intent.phase == MergePhase::Checkpointed;
     record.merge = Some(intent.clone());
     record.attention.clear();
     save(project, &record)
@@ -1029,6 +1030,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
             .clone()
             .unwrap_or_else(|| reason.to_string());
         record.phase = RoundPhase::Abandoned;
+        record.cleanup_pending = true;
         record.review_intent = None;
         record.verdict = None;
         record.verdict_kind = None;
@@ -1062,6 +1064,9 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
     }
     let _ = crate::board::refresh(ctx, &project);
     let review_worktrees = cleanup_review_worktrees(ctx, &project, &record);
+    if let Err(error) = finish_cleanup_marker(&project, round) {
+        eprintln!("cleanup marker pending for {round}: {error:#}");
+    }
     Ok(CancelOutcome {
         round: round.to_string(),
         phase: record.phase,
@@ -1191,6 +1196,36 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
         }
     }
     lines
+}
+
+/// Clear the round-level bridge marker once every owned thread has its own
+/// durable resolved record. A thread whose external cleanup failed retains
+/// its per-thread marker for the ticker.
+pub(crate) fn finish_cleanup_marker(project: &Project, round: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut record = load(project, round)?;
+    if !record.cleanup_pending {
+        return Ok(());
+    }
+    let mut ids: Vec<_> = record
+        .manifest
+        .members
+        .iter()
+        .map(|member| member.thread.as_str())
+        .collect();
+    if let Some(reviewer) = record.reviewer.as_deref()
+        && !ids.contains(&reviewer)
+    {
+        ids.push(reviewer);
+    }
+    if ids.iter().all(|id| {
+        crate::thread::load(project, id)
+            .is_ok_and(|thread| thread.status == crate::thread::Status::Resolved)
+    }) {
+        record.cleanup_pending = false;
+        save(project, &record)?;
+    }
+    Ok(())
 }
 
 pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
@@ -2973,6 +3008,9 @@ fn merge_inner(
                 );
             }
         }
+        if let Err(error) = finish_cleanup_marker(&project, round) {
+            eprintln!("cleanup marker pending for {round}: {error:#}");
+        }
     }
     outcome
 }
@@ -4748,6 +4786,33 @@ mod tests {
     }
 
     #[test]
+    fn ticker_recovers_a_closed_round_before_its_cleanup_marker() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&ctx, "demo", "r1", None).unwrap();
+        let missed = &lanes[0].0;
+        thread::update(&fx.project, missed, |thread| {
+            thread.status = thread::Status::Open;
+            thread.resolved_reason.clear();
+            thread.cleanup_pending = false;
+            thread.cleanup_reason.clear();
+        })
+        .unwrap();
+        let mut round = load(&fx.project, "r1").unwrap();
+        round.cleanup_pending = true;
+        save(&fx.project, &round).unwrap();
+
+        crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
+
+        let lane = thread::load(&fx.project, missed).unwrap();
+        assert_eq!(lane.status, thread::Status::Resolved);
+        assert_eq!(lane.resolved_reason, "merged");
+        assert!(!load(&fx.project, "r1").unwrap().cleanup_pending);
+    }
+
+    #[test]
     fn a_landed_round_publishes_one_keyed_landing_line() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -5224,6 +5289,10 @@ mod tests {
             moved[1].ends_with("worktree is dirty, not forwarded"),
             "{moved:?}"
         );
+        let dirty = thread::load(&fx.project, &lanes[1].0).unwrap();
+        assert_eq!(dirty.status, thread::Status::Resolved);
+        assert!(dirty.cleanup_pending);
+        assert!(Path::new(&dirty.worktree_path).is_dir());
     }
 
     #[test]

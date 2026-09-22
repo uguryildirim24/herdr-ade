@@ -1753,13 +1753,33 @@ pub(crate) fn resolve_automatically(
 ) -> ResolveOutcome {
     // Record the terminal lifecycle before touching Herdr or a worktree. A
     // process death at any later instruction leaves a ticker-visible retry.
-    let _ = thread::update(project, id, |t| {
+    let before = thread::load(project, id).unwrap_or_default();
+    if let Err(error) = thread::update(project, id, |t| {
         t.status = Status::Resolved;
         t.resolved_reason = "cleanup pending".into();
         t.prompt_pending = false;
         t.cleanup_pending = true;
         t.cleanup_reason = reason.to_string();
-    });
+    }) {
+        let detail = format!("could not record pending cleanup: {error:#}");
+        refresh_plan(ctx, project);
+        return ResolveOutcome {
+            thread: id.to_string(),
+            state: "cleanup_pending".into(),
+            final_copy: "pending".into(),
+            copy_notes: vec![detail.clone()],
+            pane: "cleanup_pending".into(),
+            worktree: if before.worktree_path.is_empty() {
+                "not_recorded"
+            } else {
+                "kept"
+            }
+            .into(),
+            worktree_path: before.worktree_path,
+            worktree_reason: Some(detail),
+            branch: before.branch,
+        };
+    }
     let attempted = resolve(ctx, &project.slug, id, &ResolveArgs::default());
     match attempted {
         Ok(outcome) => {
@@ -1795,6 +1815,8 @@ pub(crate) fn resolve_automatically(
 }
 
 /// Retry every durable cleanup left by cancellation or automatic resolution.
+/// Closed rounds are also reconciled so a process death between closing the
+/// round and marking its first thread cannot strand an unmarked cleanup.
 pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> {
     for record in thread::list(project)
         .into_iter()
@@ -1810,6 +1832,34 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             };
             resolve_automatically(ctx, project, &record.id, reason);
         }
+    }
+
+    for round in crate::round::checked_list(project)?
+        .into_iter()
+        .filter(|round| round.cleanup_pending)
+    {
+        let reason = if round.phase == crate::contracts::RoundPhase::Merged {
+            "merged"
+        } else {
+            "cancelled"
+        };
+        let mut ids: Vec<_> = round
+            .manifest
+            .members
+            .into_iter()
+            .map(|member| member.thread)
+            .collect();
+        if let Some(reviewer) = round.reviewer
+            && !ids.contains(&reviewer)
+        {
+            ids.push(reviewer);
+        }
+        for id in ids {
+            if thread::load(project, &id).is_ok_and(|record| record.status != Status::Resolved) {
+                resolve_automatically(ctx, project, &id, reason);
+            }
+        }
+        crate::round::finish_cleanup_marker(project, &round.round)?;
     }
     Ok(())
 }
