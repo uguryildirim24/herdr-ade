@@ -34,6 +34,12 @@ pub(crate) struct DatedNote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DropEvidence {
+    pub(crate) at: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Evidence {
     pub(crate) at: String,
     pub(crate) command: String,
@@ -69,6 +75,7 @@ pub(crate) struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) replaces: Option<String>,
     pub(crate) notes: Vec<DatedNote>,
+    pub(crate) dropped: Vec<DropEvidence>,
     pub(crate) attempts: Vec<String>,
     pub(crate) rounds: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,6 +101,7 @@ impl Default for Task {
             acceptance: Vec::new(),
             replaces: None,
             notes: Vec::new(),
+            dropped: Vec::new(),
             attempts: Vec::new(),
             rounds: Vec::new(),
             plan_step: None,
@@ -118,6 +126,7 @@ pub(crate) enum State {
     Verified,
     Failed,
     Cancelled,
+    Dropped,
     Unknown,
 }
 
@@ -133,6 +142,7 @@ impl State {
             Self::Verified => "verified",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Dropped => "dropped",
             Self::Unknown => "unknown",
         }
     }
@@ -151,7 +161,7 @@ pub(crate) struct View {
 
 impl View {
     pub(crate) fn terminal(&self, project: &Project) -> bool {
-        if self.state == State::Cancelled {
+        if matches!(self.state, State::Cancelled | State::Dropped) {
             return true;
         }
         required_states(project, &self.record)
@@ -431,6 +441,29 @@ pub(crate) fn note(
     })
 }
 
+pub(crate) fn drop_task(project: &Project, id: &str, reason: &str) -> Result<Task> {
+    if reason.trim().is_empty() {
+        return Err(crate::refusal::error("task_drop: --reason is required"));
+    }
+    update(project, id, |task| {
+        if !task.verified.is_empty() {
+            return Err(crate::refusal::error(
+                "task_drop_verified: a task with verification evidence cannot be dropped",
+            ));
+        }
+        if !task.dropped.is_empty() {
+            return Err(crate::refusal::error(format!(
+                "task_drop_already: `{id}` is already dropped"
+            )));
+        }
+        task.dropped.push(DropEvidence {
+            at: project::now(),
+            reason: reason.trim().to_string(),
+        });
+        Ok(())
+    })
+}
+
 pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<Task> {
     crate::thread::load(project, thread)
         .with_context(|| format!("task_attempt: no thread `{thread}`"))?;
@@ -560,6 +593,7 @@ fn next_for(state: State, required: &[String], task: &Task) -> String {
         State::Working => "finish the current attempt".into(),
         State::Failed => "retry or cancel the current attempt".into(),
         State::Cancelled => "none".into(),
+        State::Dropped => String::new(),
         State::Unknown => "repair the unreadable evidence".into(),
         _ => {
             let at = required
@@ -594,6 +628,15 @@ fn next_for(state: State, required: &[String], task: &Task) -> String {
 }
 
 pub(crate) fn view(project: &Project, task: Task) -> View {
+    if !task.dropped.is_empty() {
+        return View {
+            record: task,
+            state: State::Dropped,
+            next: String::new(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
     let required = match required_states(project, &task) {
         Ok(required) => required,
         Err(_) => {
@@ -995,24 +1038,50 @@ pub(crate) fn refresh_tasks_md(project: &Project) -> Result<()> {
             "{PRESERVED_PREFIX}{path} -->\nPrevious hand-written task list: `{path}`.\n"
         ));
     }
-    for (heading, terminal) in [("Open", false), ("Complete", true)] {
-        text.push_str(&format!("\n## {heading}\n"));
-        let mut any = false;
-        for view in &views {
-            if view.terminal(project) != terminal {
-                continue;
-            }
-            any = true;
-            let mark = if terminal { "x" } else { " " };
-            text.push_str(&format!(
-                "- [{mark}] `{}` {} — {}; next: {}\n",
-                view.record.id,
-                view.record.title,
-                view.state.word(),
-                view.next
-            ));
+    for heading in ["Open", "Dropped", "Complete"] {
+        let rows: Vec<_> = views
+            .iter()
+            .filter(|view| match heading {
+                "Open" => !view.terminal(project),
+                "Dropped" => view.state == State::Dropped,
+                "Complete" => view.terminal(project) && view.state != State::Dropped,
+                _ => false,
+            })
+            .collect();
+        if heading == "Dropped" && rows.is_empty() {
+            continue;
         }
-        if !any {
+        text.push_str(&format!("\n## {heading}\n"));
+        for view in rows {
+            if view.state == State::Dropped {
+                let reason = &view
+                    .record
+                    .dropped
+                    .last()
+                    .expect("dropped state has evidence")
+                    .reason;
+                text.push_str(&format!(
+                    "- `{}` {} — dropped: {reason}\n",
+                    view.record.id, view.record.title
+                ));
+            } else {
+                let mark = if heading == "Complete" { "x" } else { " " };
+                text.push_str(&format!(
+                    "- [{mark}] `{}` {} — {}; next: {}\n",
+                    view.record.id,
+                    view.record.title,
+                    view.state.word(),
+                    view.next
+                ));
+            }
+        }
+        if heading != "Dropped"
+            && !views.iter().any(|view| match heading {
+                "Open" => !view.terminal(project),
+                "Complete" => view.terminal(project) && view.state != State::Dropped,
+                _ => false,
+            })
+        {
             text.push('\n');
         }
     }
@@ -1027,12 +1096,17 @@ pub(crate) fn refresh_tasks_md(project: &Project) -> Result<()> {
 
 pub(crate) fn render(view: &View) -> String {
     let mut out = format!(
-        "{} [{}] {}\nnext: {}\n",
+        "{} [{}] {}\n",
         view.record.id,
         view.state.word(),
-        view.record.title,
-        view.next
+        view.record.title
     );
+    if let Some(drop) = view.record.dropped.last() {
+        out.push_str(&format!("dropped: {}\n", drop.reason));
+    }
+    if !view.next.is_empty() {
+        out.push_str(&format!("next: {}\n", view.next));
+    }
     out.push_str(&format!(
         "authority: {}\n",
         view.record.authority.join(", ")
@@ -1173,6 +1247,72 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn add_then_drop_renders_the_reason_in_every_task_view() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Remove the task if its premise is wrong.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let task = add(
+            &project,
+            "Ship the checked change.",
+            vec!["request:q-1".into()],
+            vec!["The command reports the new result.".into()],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let dropped = drop_task(&project, &task.id, "The premise was wrong.").unwrap();
+        assert_eq!(dropped.dropped.len(), 1);
+        assert!(!dropped.dropped[0].at.is_empty());
+        let view = view(&project, dropped);
+        assert_eq!(view.state, State::Dropped);
+        assert!(view.next.is_empty());
+        assert!(view.terminal(&project));
+        assert!(render(&view).contains("dropped: The premise was wrong."));
+        let listed = views(&project).0.iter().map(render).collect::<String>();
+        assert!(listed.contains("dropped: The premise was wrong."));
+        let generated = std::fs::read_to_string(project.dir().join("TASKS.md")).unwrap();
+        assert!(generated.contains("dropped: The premise was wrong."));
+        assert!(generated.contains("## Dropped"));
+        assert!(!generated.contains("[x] `job-0001`"));
+        let context = crate::coordinator::digest(&world.ctx(), &project, "ha")
+            .unwrap()
+            .0;
+        assert!(context.contains("dropped: The premise was wrong."));
+    }
+
+    #[test]
+    fn dropping_a_task_with_verification_evidence_is_refused() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let mut task = record(&project, "job-0001");
+        task.verified.push(Evidence {
+            at: project::now(),
+            command: "ha doctor".into(),
+            acceptance: vec![1],
+            machine: None,
+            build: None,
+        });
+        write(&project, &task).unwrap();
+
+        let error = drop_task(&project, "job-0001", "The premise was wrong.").unwrap_err();
+        assert!(
+            error.to_string().contains("task_drop_verified"),
+            "{error:#}"
+        );
+        assert!(load(&project, "job-0001").unwrap().dropped.is_empty());
     }
 
     #[test]

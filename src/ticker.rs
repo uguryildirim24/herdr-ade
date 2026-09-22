@@ -1779,6 +1779,15 @@ mod tests {
     }
 
     #[test]
+    fn dropped_tasks_are_not_actionable_work() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        crate::task::drop_task(&f.project, "job-0001", "The premise was wrong.").unwrap();
+
+        assert!(open_work_next_steps(&f.project).is_empty());
+    }
+
+    #[test]
     fn work_nudge_waits_when_a_lane_is_working_or_every_task_waits_on_rolf() {
         let f = fixture(false);
         let lane = thread::allocate(&f.project, |lane| {

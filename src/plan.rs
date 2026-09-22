@@ -513,14 +513,15 @@ fn derive_state(project: &Project, step: &PlanStep) -> StepState {
         .filter(|task| {
             task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
         })
+        .map(|task| crate::task::view(project, task))
+        .filter(|view| view.state != crate::task::State::Dropped)
         .collect();
     if linked_tasks.is_empty() && step.threads.is_empty() && step.rounds.is_empty() {
         return StepState::Left;
     }
     let mut all_satisfied = true;
     let mut any_started = false;
-    for task in linked_tasks {
-        let view = crate::task::view(project, task);
+    for view in linked_tasks {
         if !view.terminal(project) {
             all_satisfied = false;
         }
