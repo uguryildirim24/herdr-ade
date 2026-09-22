@@ -14,9 +14,9 @@ use crate::runner::{Cmd, Runner};
 pub(crate) const STARTING_TIMEOUT_SECS: i64 = 300;
 pub(crate) const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 const NOT_READY_SECS: i64 = 60;
-/// The brief's memory budget. `compose_brief` stops inlining `memory/*.md`
+/// The brief's memory-note budget. `compose_brief` stops adding dated notes
 /// past this, and `ha doctor` / `ha context` warn at it: the warning fires at
-/// the point where a brief starts dropping files, and 32k is a small enough
+/// the point where a brief starts dropping notes, and 32k is a small enough
 /// share of a lane's context to prune before it costs real tokens.
 pub(crate) const MEMORY_CAP_CHARS: usize = 32_000;
 const LIBRARY_CAP_KB: u64 = 50 * 1024;
@@ -367,82 +367,109 @@ pub(crate) fn with_lane_skill(prefix: &str, brief: &str) -> String {
     )
 }
 
-/// The memory a brief would inline: `MEMORY.md` plus every regular
-/// `memory/*.md` file, sorted by name. `total_chars` counts the whole memory,
-/// including a file the cap would drop, so the warning describes the budget
-/// itself rather than only what fits.
+/// The largest dated-note payload carried by any current task's brief.
+/// `total_chars` includes notes the cap would drop, so the warning describes
+/// the attempted payload rather than only what fits.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemoryUse {
-    pub(crate) index: String,
-    pub(crate) files: Vec<(String, String)>,
-    pub(crate) total_chars: usize,
+    notes: Vec<(String, String)>,
+    total_chars: usize,
 }
 
 impl MemoryUse {
+    fn from_rows<'a>(rows: impl Iterator<Item = &'a crate::note::Row>) -> Self {
+        let notes: Vec<_> = rows
+            .filter(|row| brief_carries_memory(row))
+            .map(|row| (row.id.clone(), render_brief_row(row)))
+            .collect();
+        let total_chars = notes
+            .iter()
+            .map(|(id, text)| memory_block(id, text).chars().count())
+            .sum();
+        Self { notes, total_chars }
+    }
+
     fn over_budget(&self) -> bool {
         self.total_chars > MEMORY_CAP_CHARS
     }
 
-    /// The `ha doctor` / `ha context` warning, or `None` when the memory fits.
-    /// Names the file and its size and points at `memory/archive/`.
+    /// The `ha doctor` / `ha context` warning, or `None` when every brief fits.
     pub(crate) fn warning(&self) -> Option<String> {
         if !self.over_budget() {
             return None;
         }
-        let mut parts = Vec::new();
-        if !self.index.trim().is_empty() {
-            parts.push(format!("MEMORY.md {}", self.index.chars().count()));
-        }
-        for (name, text) in &self.files {
-            parts.push(format!("memory/{name} {}", text.chars().count()));
-        }
+        let parts = self
+            .notes
+            .iter()
+            .map(|(id, text)| format!("{id} {}", memory_block(id, text).chars().count()))
+            .collect::<Vec<_>>()
+            .join(", ");
         Some(format!(
-            "memory over budget: {} of {} characters ({}); move old entries to memory/archive/",
-            self.total_chars,
-            MEMORY_CAP_CHARS,
-            parts.join(", ")
+            "memory over budget: {} of {} characters ({parts}); replace stale dated notes",
+            self.total_chars, MEMORY_CAP_CHARS
         ))
     }
 }
 
-/// Measures current memory notes after explicit replacements are folded.
-/// Task-scoped rows all count here, making the warning an upper bound across
-/// briefs. Legacy symbolic links never become rows.
-pub(crate) fn memory_use(project: &Project) -> MemoryUse {
-    let mut index = String::new();
-    let mut files = Vec::new();
-    for row in crate::note::active_rows(project)
-        .into_iter()
-        .filter(|row| row.kind == "memory" || row.kind == "task note")
-    {
-        if row.source == "MEMORY.md" {
-            index = row.text;
-        } else {
-            let name = row
-                .source
-                .strip_prefix("memory/")
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{}.md", row.id.replace(':', "-")));
-            files.push((name, row.text));
+fn render_brief_row(row: &crate::note::Row) -> String {
+    let provenance = match (&row.at, &row.request) {
+        (Some(at), Some(request)) => {
+            format!("{} · request:{}", &at[..at.len().min(10)], request)
         }
+        _ => "undated".into(),
+    };
+    format!("<!-- {} · {} -->\n{}", row.id, provenance, row.text.trim())
+}
+
+fn brief_carries_instruction(row: &crate::note::Row) -> bool {
+    row.kind == "standing instruction"
+        && (row.source == "PROJECT.md" || row.at.is_some() && row.request.is_some())
+}
+
+fn brief_carries_memory(row: &crate::note::Row) -> bool {
+    row.kind == "task note"
+        || row.kind == "memory"
+            && row.at.is_some()
+            && row.request.is_some()
+            && row.source != "MEMORY.md"
+            && !row.source.starts_with("memory/")
+}
+
+fn memory_block(id: &str, text: &str) -> String {
+    format!("\n## {id}\n\n{}\n", text.trim())
+}
+
+/// Measures the largest note payload a current brief would attempt to carry.
+/// Task scopes are measured separately because no brief receives notes for a
+/// different task. Legacy Markdown remains available to coordinator views but
+/// contributes no characters here.
+pub(crate) fn memory_use(project: &Project) -> MemoryUse {
+    let rows = crate::note::active_rows(project);
+    let mut scopes = std::collections::BTreeSet::from([None]);
+    for task in rows.iter().flat_map(|row| &row.tasks) {
+        scopes.insert(Some(task.as_str()));
     }
-    let total_chars = index.chars().count()
-        + files
-            .iter()
-            .map(|(_, text)| text.chars().count())
-            .sum::<usize>();
-    MemoryUse {
-        index,
-        files,
-        total_chars,
-    }
+    scopes
+        .into_iter()
+        .map(|task| {
+            let mut applicable: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    row.tasks.is_empty()
+                        || task.is_some_and(|id| row.tasks.iter().any(|item| item == id))
+                })
+                .collect();
+            applicable.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
+            MemoryUse::from_rows(applicable.into_iter())
+        })
+        .max_by_key(|usage| usage.total_chars)
+        .unwrap_or_default()
 }
 
 pub(crate) struct BriefInput<'a> {
     pub(crate) instructions: &'a str,
-    pub(crate) memory_index: &'a str,
-    /// (file name, contents), in the order they should be inlined.
-    pub(crate) memory_files: &'a [(String, String)],
+    /// (note id, rendered note), in the order they should be included.
+    pub(crate) memory_notes: &'a [(String, String)],
     pub(crate) task: &'a str,
     pub(crate) restart: bool,
     pub(crate) report_path: &'a str,
@@ -458,24 +485,23 @@ fn compose_brief(input: &BriefInput) -> String {
     }
     brief.push_str("# Project instructions\n\n");
     brief.push_str(input.instructions.trim());
-    brief.push_str("\n\n# Project memory\n\n");
-    brief.push_str(input.memory_index.trim());
-    brief.push('\n');
+    brief.push_str("\n\n# Project memory\n");
 
-    let mut used = input.memory_index.chars().count();
+    let mut used = 0;
     let mut left_out = Vec::new();
-    for (name, text) in input.memory_files {
-        let size = text.chars().count();
+    for (id, text) in input.memory_notes {
+        let block = memory_block(id, text);
+        let size = block.chars().count();
         if used + size <= MEMORY_CAP_CHARS {
             used += size;
-            brief.push_str(&format!("\n## memory/{name}\n\n{}\n", text.trim()));
+            brief.push_str(&block);
         } else {
-            left_out.push(format!("memory/{name}"));
+            left_out.push(id.as_str());
         }
     }
     if !left_out.is_empty() {
         brief.push_str(&format!(
-            "\nNot inlined because project memory is over {MEMORY_CAP_CHARS} characters: {}.\n",
+            "\nNot included because dated memory notes are over {MEMORY_CAP_CHARS} characters: {}.\n",
             left_out.join(", ")
         ));
     }
@@ -503,38 +529,16 @@ pub(crate) fn brief_for(
         .map(|record| record.id);
     let mut active = crate::note::active_for(project, task_id.as_deref());
     crate::note::sort_newest_first(&mut active);
-    let render = |row: &crate::note::Row| {
-        let provenance = match (&row.at, &row.request) {
-            (Some(at), Some(request)) => {
-                format!("{} · request:{}", &at[..at.len().min(10)], request)
-            }
-            _ => "undated".into(),
-        };
-        format!("<!-- {} · {} -->\n{}", row.id, provenance, row.text.trim())
-    };
     let instructions = active
         .iter()
-        .filter(|row| row.kind == "standing instruction")
-        .map(&render)
+        .filter(|row| brief_carries_instruction(row))
+        .map(render_brief_row)
         .collect::<Vec<_>>()
         .join("\n\n");
-    let memory_index = active
-        .iter()
-        .filter(|row| row.source == "MEMORY.md")
-        .map(&render)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let memory_files: Vec<(String, String)> = active
-        .iter()
-        .filter(|row| {
-            (row.kind == "memory" || row.kind == "task note") && row.source != "MEMORY.md"
-        })
-        .map(|row| (row.id.replace(':', "-"), render(row)))
-        .collect();
+    let memory = MemoryUse::from_rows(active.iter());
     Ok(compose_brief(&BriefInput {
         instructions: &instructions,
-        memory_index: &memory_index,
-        memory_files: &memory_files,
+        memory_notes: &memory.notes,
         task,
         restart,
         report_path: &thread.report_path(),
@@ -1431,15 +1435,14 @@ mod tests {
 
     #[test]
     fn brief_order_and_memory_cap() {
-        let files = vec![
-            ("a.md".to_string(), "alpha fact".to_string()),
-            ("b.md".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
-            ("c.md".to_string(), "gamma fact".to_string()),
+        let notes = vec![
+            ("n-0001".to_string(), "alpha fact".to_string()),
+            ("n-0002".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
+            ("n-0003".to_string(), "gamma fact".to_string()),
         ];
         let brief = compose_brief(&BriefInput {
             instructions: "Always run the tests.",
-            memory_index: "# Memory\n- a\n- b\n- c",
-            memory_files: &files,
+            memory_notes: &notes,
             task: "Do the thing.",
             restart: true,
             report_path: "/wt/.herdr-project/demo-t-0001/report.md",
@@ -1452,28 +1455,116 @@ mod tests {
         };
         assert!(brief.starts_with("**A previous attempt"));
         assert!(pos("previous attempt") < pos("Always run the tests."));
-        assert!(pos("Always run the tests.") < pos("# Memory"));
-        assert!(pos("# Memory") < pos("alpha fact"));
+        assert!(pos("Always run the tests.") < pos("# Project memory"));
+        assert!(pos("# Project memory") < pos("alpha fact"));
         assert!(pos("alpha fact") < pos("Do the thing."));
         assert!(pos("Do the thing.") < pos("/wt/.herdr-project/demo-t-0001/report.md"));
         assert!(brief.contains("gamma fact"));
-        assert!(
-            brief.contains(
-                "Not inlined because project memory is over 32000 characters: memory/b.md."
-            )
-        );
+        assert!(brief.contains(
+            "Not included because dated memory notes are over 32000 characters: n-0002."
+        ));
         assert!(!brief.contains(&"x".repeat(100)));
 
         let fresh = compose_brief(&BriefInput {
             instructions: "",
-            memory_index: "",
-            memory_files: &[],
+            memory_notes: &[],
             task: "t",
             restart: false,
             report_path: "r",
             library_path: "l",
         });
         assert!(!fresh.contains("previous attempt"));
+    }
+
+    #[test]
+    fn brief_carries_applicable_dated_notes_but_not_legacy_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::write(
+            project.dir().join("MEMORY.md"),
+            "# Legacy index marker\n- state\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.dir().join("memory/state.md"),
+            format!("Legacy state marker. {}", "x".repeat(MEMORY_CAP_CHARS)),
+        )
+        .unwrap();
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Keep helper briefs focused.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let current = crate::task::add(
+            &project,
+            "Ship the checked change.",
+            vec!["request:q-1".into()],
+            vec!["The command reports the new result.".into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let other = crate::task::add(
+            &project,
+            "Ship another checked change.",
+            vec!["request:q-1".into()],
+            vec!["The command reports another result.".into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::note::add(
+            &project,
+            crate::note::Kind::Instruction,
+            "Dated instruction marker.",
+            "q-1",
+            None,
+            vec![],
+        )
+        .unwrap();
+        crate::note::add(
+            &project,
+            crate::note::Kind::Memory,
+            "Applicable dated marker.",
+            "q-1",
+            None,
+            vec![],
+        )
+        .unwrap();
+        crate::note::add(
+            &project,
+            crate::note::Kind::Memory,
+            "Other task marker.",
+            "q-1",
+            None,
+            vec![other.id],
+        )
+        .unwrap();
+        let thread = allocate(&project, |_| {}).unwrap();
+        crate::task::link_attempt(&project, &current.id, &thread.id).unwrap();
+
+        let brief = brief_for(&project, &thread, "Do the task.", false).unwrap();
+        assert!(
+            brief.contains("Historical standing instructions may remain here"),
+            "{brief}"
+        );
+        assert!(brief.contains("Dated instruction marker."), "{brief}");
+        assert!(brief.contains("Applicable dated marker."), "{brief}");
+        assert!(!brief.contains("Legacy index marker"), "{brief}");
+        assert!(!brief.contains("Legacy state marker"), "{brief}");
+        assert!(!brief.contains("Other task marker"), "{brief}");
+        assert!(memory_use(&project).warning().is_none());
+
+        let context = crate::note::render_context(&project);
+        assert!(context.contains("undated:MEMORY.md"), "{context}");
+        assert!(context.contains("undated:memory/state.md"), "{context}");
     }
 
     #[test]
@@ -1495,28 +1586,44 @@ mod tests {
     }
 
     #[test]
-    fn memory_over_budget_warns_with_the_file_and_size() {
+    fn memory_over_budget_warns_with_the_note_and_size() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        std::fs::create_dir_all(project.dir().join("memory")).unwrap();
-        std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n- state\n").unwrap();
-        std::fs::write(
-            project.dir().join("memory/state.md"),
-            "x".repeat(MEMORY_CAP_CHARS + 1),
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Keep helper briefs focused.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let note = crate::note::add(
+            &project,
+            crate::note::Kind::Memory,
+            &"x".repeat(MEMORY_CAP_CHARS + 1),
+            "q-1",
+            None,
+            vec![],
         )
         .unwrap();
 
         let use_ = memory_use(&project);
         assert!(use_.over_budget());
         let warning = use_.warning().unwrap();
-        assert!(warning.contains("memory/state.md"), "{warning}");
-        assert!(
-            warning.contains(&(MEMORY_CAP_CHARS + 1).to_string()),
-            "{warning}"
-        );
-        assert!(warning.contains("memory/archive/"), "{warning}");
+        assert!(warning.contains(&note.id), "{warning}");
+        assert!(warning.contains("replace stale dated notes"), "{warning}");
 
-        std::fs::write(project.dir().join("memory/state.md"), "short").unwrap();
+        crate::note::add(
+            &project,
+            crate::note::Kind::Memory,
+            "short",
+            "q-1",
+            Some(&note.id),
+            vec![],
+        )
+        .unwrap();
         assert!(memory_use(&project).warning().is_none());
     }
 
