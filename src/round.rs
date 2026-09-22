@@ -843,20 +843,96 @@ pub fn policy(
     Ok((gates, sha256_hex(bytes.as_bytes()), row))
 }
 
-fn next_round(project: &Project) -> String {
-    let used: std::collections::BTreeSet<u64> = std::fs::read_dir(rounds_dir(project))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
-        .filter_map(|id| round_number(&id).parse().ok())
-        .collect();
-    let mut n = 1;
-    while used.contains(&n) {
-        n += 1;
+fn parsed_round_number(id: &str) -> Result<u64> {
+    validate_round_id(id)?;
+    round_number(id)
+        .parse::<u64>()
+        .with_context(|| format!("round_number_too_large: `{id}` cannot be incremented"))
+}
+
+fn record_round_use(
+    uses: &mut std::collections::BTreeMap<u64, Vec<String>>,
+    id: &str,
+    description: String,
+) -> Result<()> {
+    let number = parsed_round_number(id)?;
+    uses.entry(number).or_default().push(description);
+    Ok(())
+}
+
+/// Every durable use of a round number that can predate the round records.
+/// Repository evidence is read from refs and the integration tree, never from
+/// whichever worktree happens to be checked out.
+fn round_uses(
+    project: &Project,
+    git: &Git<'_>,
+    branch: &str,
+) -> Result<std::collections::BTreeMap<u64, Vec<String>>> {
+    let mut uses = std::collections::BTreeMap::new();
+    match std::fs::read_dir(rounds_dir(project)) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                let Some(id) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".toml"))
+                else {
+                    continue;
+                };
+                if validate_round_id(id).is_ok() {
+                    record_round_use(&mut uses, id, format!("round record `{}`", path.display()))?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    format!("r{n}")
+
+    for name in git
+        .run(&[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/review/",
+        ])?
+        .lines()
+    {
+        let Some(id) = name.strip_prefix("review/") else {
+            continue;
+        };
+        if validate_round_id(id).is_ok() {
+            record_round_use(&mut uses, id, format!("local branch `{name}`"))?;
+        }
+    }
+
+    let paths = git.run(&["ls-tree", "-r", "-z", "--name-only", branch, "--", "tasks"])?;
+    for path in paths.split('\0').filter(|path| !path.is_empty()) {
+        let (id, kind) = if let Some(id) = path
+            .strip_prefix("tasks/review-")
+            .and_then(|name| name.strip_suffix(".md"))
+        {
+            (id, "brief")
+        } else if let Some(id) = path
+            .strip_prefix("tasks/reviews/code-")
+            .and_then(|name| name.strip_suffix(".md"))
+        {
+            (id, "verdict")
+        } else {
+            continue;
+        };
+        if validate_round_id(id).is_ok() {
+            record_round_use(&mut uses, id, format!("{kind} `{path}` on `{branch}`"))?;
+        }
+    }
+    Ok(uses)
+}
+
+fn next_round(uses: &std::collections::BTreeMap<u64, Vec<String>>) -> Result<String> {
+    let highest = uses.last_key_value().map_or(0, |(number, _)| *number);
+    let next = highest
+        .checked_add(1)
+        .context("round_number_exhausted: no later automatic round number is available")?;
+    Ok(format!("r{next}"))
 }
 
 // --------------------------------------------------------------------- open
@@ -894,8 +970,9 @@ pub fn open_with_lanes(
     threads: Vec<String>,
 ) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
-    let round = round.unwrap_or_else(|| next_round(&project));
-    validate_round_id(&round)?;
+    if let Some(round) = &round {
+        validate_round_id(round)?;
+    }
     let Some(plain) = plain.filter(|p| !p.trim().is_empty()) else {
         bail!(
             "plain_missing: `round open` needs --plain \"<one sentence that says what this round does>\""
@@ -974,6 +1051,18 @@ pub fn open_with_lanes(
             selected.display()
         );
     }
+    let uses = round_uses(&project, &git, &branch)?;
+    let round = match round {
+        Some(round) => round,
+        None => next_round(&uses)?,
+    };
+    let number = parsed_round_number(&round)?;
+    if let Some(existing) = uses.get(&number) {
+        bail!(
+            "round_exists: `{round}` cannot open because {} already exists",
+            existing.join(", ")
+        );
+    }
     let states = if row.task_states.is_empty() {
         settings.task_states
     } else {
@@ -1013,7 +1102,10 @@ pub fn open_with_lanes(
     {
         let _lock = project.lock()?;
         if round_path(&project, &round).exists() {
-            bail!("round_exists: `{round}` is already open");
+            bail!(
+                "round_exists: `{round}` cannot open because round record `{}` already exists",
+                round_path(&project, &round).display()
+            );
         }
         let mut record = record;
         refresh_pins(&project, &mut record, &events)?;
@@ -4469,6 +4561,60 @@ mod tests {
         let brief = compose_review_brief(&pinned, "manifest", &[], "ha");
         assert!(brief.contains("`cargo test` with environment `RUSTFLAGS=-Dwarnings`"));
         assert!(brief.contains("{ command = \"cargo test\", exit = 0 }"));
+    }
+
+    #[test]
+    fn historical_review_files_reserve_round_numbers_without_records() {
+        let fx = fixture();
+        commit_file(
+            &fx.repo,
+            "tasks/review-r1.md",
+            "old review brief\n",
+            "historical review brief",
+        );
+        commit_file(
+            &fx.repo,
+            "tasks/reviews/code-r2.md",
+            "old verdict\n",
+            "historical verdict",
+        );
+        std::fs::remove_file(fx.repo.join("tasks/review-r1.md")).unwrap();
+        std::fs::remove_file(fx.repo.join("tasks/reviews/code-r2.md")).unwrap();
+        assert!(!rounds_dir(&fx.project).exists());
+
+        let opened = open_with_lanes(
+            &fx.world.ctx(),
+            "demo",
+            None,
+            None,
+            Some(PLAIN.into()),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(opened.round, "r3");
+
+        let before = std::fs::read(round_path(&fx.project, "r3")).unwrap();
+        let error = err(open(
+            &fx.world.ctx(),
+            "demo",
+            OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: None,
+            },
+        ));
+        assert!(error.starts_with("round_exists: `r1`"), "{error}");
+        assert!(
+            error.contains("brief `tasks/review-r1.md` on `main`"),
+            "{error}"
+        );
+        assert!(!round_path(&fx.project, "r1").exists());
+        assert_eq!(
+            std::fs::read(round_path(&fx.project, "r3")).unwrap(),
+            before
+        );
     }
 
     #[test]
