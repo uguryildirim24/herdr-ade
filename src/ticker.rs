@@ -2329,7 +2329,7 @@ mod tests {
             prompt.contains("job-0001: verify 1 acceptance condition(s)"),
             "{prompt}"
         );
-        let ledger = std::fs::read_to_string(f.project.dir().join("ledger.jsonl")).unwrap();
+        let ledger = std::fs::read_to_string(f.project.record_file("ledger.jsonl")).unwrap();
         assert!(ledger.contains("coordinator_nudge"), "{ledger}");
     }
 

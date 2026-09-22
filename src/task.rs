@@ -187,7 +187,11 @@ impl View {
 }
 
 fn dir(project: &Project) -> PathBuf {
-    project.dir().join("tasks")
+    project.record_dir("tasks")
+}
+
+fn dir_for_write(project: &Project) -> Result<PathBuf> {
+    project.record_dir_for_write("tasks")
 }
 
 fn path(project: &Project, id: &str) -> PathBuf {
@@ -279,6 +283,7 @@ fn validate_record(task: &Task) -> Result<()> {
 
 fn write(project: &Project, task: &Task) -> Result<()> {
     validate_record(task)?;
+    dir_for_write(project)?;
     write_atomic(&path(project, &task.id), toml::to_string(task)?.as_bytes())
 }
 
@@ -401,7 +406,7 @@ pub(crate) fn add(
             .unwrap_or(repo)
     });
     let _lock = project.lock()?;
-    std::fs::create_dir_all(dir(project))?;
+    dir_for_write(project)?;
     let task = Task {
         id: next_id(project)?,
         title,
@@ -796,7 +801,7 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             };
         }
     };
-    let event_dir = project.dir().join("events");
+    let event_dir = project.record_dir("events");
     let events_readable = std::fs::read_dir(&event_dir)
         .map(|entries| {
             entries

@@ -16,11 +16,7 @@ use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 
 fn ops_dir(project: &Project) -> PathBuf {
-    project.dir().join("ops")
-}
-
-fn artifacts_dir(project: &Project) -> PathBuf {
-    project.dir().join("artifacts")
+    project.record_dir("ops")
 }
 
 fn op_path(project: &Project, id: &str) -> Result<PathBuf> {
@@ -63,7 +59,7 @@ pub(crate) fn list(project: &Project) -> Vec<Op> {
 }
 
 fn write_op(project: &Project, op: &Op) -> Result<()> {
-    std::fs::create_dir_all(ops_dir(project))?;
+    project.record_dir_for_write("ops")?;
     project::write_atomic(&op_path(project, &op.op)?, toml::to_string(op)?.as_bytes())
 }
 
@@ -494,7 +490,13 @@ fn load_box_card(project: &Project, thread: &str) -> Option<crate::contracts::La
     if crate::thread::validate_id(thread).is_err() {
         return None;
     }
-    let path = project.dir().join("lanes").join(format!("{thread}.toml"));
+    let name = format!("{thread}.toml");
+    let current = project.state_dir().join("lanes").join(&name);
+    let path = if current.exists() {
+        current
+    } else {
+        project.dir().join("lanes").join(name)
+    };
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str(&text).ok()
 }
@@ -556,7 +558,7 @@ fn stable_read(path: &Path) -> Result<Vec<u8>> {
 
 fn write_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
     let hash = format!("{:x}", Sha256::digest(bytes));
-    let dir = artifacts_dir(project);
+    let dir = project.state_dir().join("artifacts");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(&hash);
     if path.exists() {

@@ -681,7 +681,7 @@ pub(crate) struct PlanStep {
     pub(crate) rounds: Vec<String>,
 }
 
-/// `<project>/plan.toml` (SPEC-talk §6.5).
+/// `<project>/.state/plan.toml` (SPEC-talk §6.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub(crate) struct Plan {
@@ -701,7 +701,7 @@ pub(crate) struct Plan {
 /// `undo` need human authority; `routine` does not.
 pub(crate) const DECISION_CLASSES: &[&str] = &["what-you-get", "money", "undo", "routine"];
 
-/// One complete line of `<project>/decisions.jsonl` (SPEC-talk §6.6). Nullable
+/// One complete line of `<project>/.state/decisions.jsonl` (SPEC-talk §6.6). Nullable
 /// fields stay present as `null` so an old reader sees the shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]

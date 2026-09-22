@@ -625,7 +625,7 @@ fn thread_record(project: &Project, id: &str) -> Result<thread::Thread> {
 // ------------------------------------------------------------------- events
 
 pub fn events_dir(project: &Project) -> PathBuf {
-    project.dir().join("events")
+    project.record_dir("events")
 }
 
 /// Every sealed event. An unreadable event file fails closed: a decision
@@ -2568,10 +2568,6 @@ pub fn verdict_path(round: &str) -> String {
     format!("tasks/reviews/code-{round}.md")
 }
 
-pub fn artifacts_dir(project: &Project) -> PathBuf {
-    project.dir().join("artifacts")
-}
-
 /// A fence longer than any backtick run inside `body` (D10).
 pub fn fence_for(body: &str) -> String {
     let mut longest = 0;
@@ -2649,7 +2645,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     let mut reports = Vec::new();
     for member in &record.manifest.members {
         let pin = member.pin.as_ref().context("round_not_complete")?;
-        let path = artifacts_dir(&project).join(&pin.artifact);
+        let path = crate::events::artifact_path(&project, &pin.artifact);
         let bytes = std::fs::read(&path)
             .map_err(|e| anyhow::anyhow!("artifact_missing: {} ({e})", path.display()))?;
         if sha256_hex(&bytes) != pin.artifact {

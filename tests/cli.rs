@@ -131,8 +131,9 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
         "{}",
         String::from_utf8_lossy(&withdrawn.stderr)
     );
-    assert!(root.join("demo/asks/a-1/r1.toml").is_file());
-    let record = std::fs::read_to_string(root.join("demo/asks/a-1/r1.withdrawn.toml")).unwrap();
+    assert!(root.join("demo/.state/asks/a-1/r1.toml").is_file());
+    let record =
+        std::fs::read_to_string(root.join("demo/.state/asks/a-1/r1.withdrawn.toml")).unwrap();
     assert!(record.contains("by = \"rolf\""));
     assert!(run(&ask_args).status.success());
     assert!(

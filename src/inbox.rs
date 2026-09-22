@@ -23,8 +23,8 @@ pub(crate) struct Item {
     pub(crate) body: String,
 }
 
-fn inbox_dir(project: &Project) -> PathBuf {
-    project.dir().join("inbox")
+pub(crate) fn inbox_dir(project: &Project) -> PathBuf {
+    project.record_dir("inbox")
 }
 
 fn parse(text: &str) -> Option<Item> {
@@ -89,10 +89,7 @@ pub(crate) fn write(
         bail!("inbox_record_kind: `{kind}` belongs in its owning record");
     }
     let _lock = project.lock()?;
-    let inbox = inbox_dir(project);
-    if !inbox.is_dir() {
-        std::fs::create_dir(&inbox)?;
-    }
+    project.record_dir_for_write("inbox")?;
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     project::write_json(&counter_path, &n)?;
@@ -138,10 +135,7 @@ pub(crate) fn write_event(
         bail!("inbox_record_kind: `{kind}` belongs in its owning record");
     }
     let _lock = project.lock()?;
-    let inbox = inbox_dir(project);
-    if !inbox.is_dir() {
-        std::fs::create_dir(&inbox)?;
-    }
+    project.record_dir_for_write("inbox")?;
     let id = if kind == "recipient-changed" {
         format!("recipient-changed-{}", event.id)
     } else {

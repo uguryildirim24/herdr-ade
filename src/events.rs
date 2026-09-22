@@ -14,11 +14,11 @@ use crate::contracts::{DeliveryLine, DeliveryState, Event, EventPayload};
 use crate::project::{self, Project};
 
 fn events_dir(project: &Project) -> PathBuf {
-    project.dir().join("events")
+    project.record_dir("events")
 }
 
 fn deliveries_dir(project: &Project) -> PathBuf {
-    project.dir().join("deliveries")
+    project.record_dir("deliveries")
 }
 
 pub(crate) fn event_path(project: &Project, id: &str) -> Result<PathBuf> {
@@ -59,12 +59,18 @@ fn validate_machine(machine: &str) -> Result<()> {
 
 /// The Mac's content-addressed artifact folder (SPEC-remote §4.3).
 fn artifact_dir(project: &Project) -> PathBuf {
-    project.dir().join("artifacts")
+    project.state_dir().join("artifacts")
 }
 
-/// The Mac path of one artifact, named by its own hash.
+/// The Mac path of one artifact, named by its own hash. Historical artifacts
+/// stay at their recorded path because immutable events may cite it.
 pub(crate) fn artifact_path(project: &Project, hash: &str) -> PathBuf {
-    artifact_dir(project).join(hash)
+    let current = artifact_dir(project).join(hash);
+    if current.exists() {
+        current
+    } else {
+        project.dir().join("artifacts").join(hash)
+    }
 }
 
 /// The source tuple recorded for every box event imported on the Mac
@@ -85,7 +91,7 @@ pub(crate) struct ImportSource {
 }
 
 fn imports_dir(project: &Project) -> PathBuf {
-    project.dir().join("imports")
+    project.record_dir("imports")
 }
 
 fn import_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf> {
@@ -182,6 +188,7 @@ pub(crate) fn import_box_event(
 }
 
 fn write_import_create_only(project: &Project, source: &ImportSource) -> Result<()> {
+    project.record_dir_for_write("imports")?;
     let path = import_path(project, &source.machine, &source.event)?;
     let mut text = toml::to_string(source)?;
     if !text.ends_with('\n') {
@@ -311,7 +318,7 @@ pub(crate) fn bytes(event: &Event) -> Result<Vec<u8>> {
 /// Creates an immutable event. If another helper already created it, only
 /// exact byte equality is accepted.
 pub(crate) fn seal_create_if_absent(project: &Project, event: &Event) -> Result<()> {
-    std::fs::create_dir_all(events_dir(project))?;
+    project.record_dir_for_write("events")?;
     let path = event_path(project, &event.id)?;
     let expected = bytes(event)?;
     // Written whole beside the target, then linked into place: a reader never
@@ -360,7 +367,7 @@ pub(crate) struct Receipt {
 }
 
 fn receipts_dir(project: &Project) -> PathBuf {
-    project.dir().join("receipts")
+    project.record_dir("receipts")
 }
 
 pub(crate) fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
@@ -371,6 +378,7 @@ pub(crate) fn receipt_path(project: &Project, id: &str) -> Result<PathBuf> {
 /// Writes the receipt create-only. A retry with the same bytes is a no-op;
 /// different bytes for a sealed event are corruption.
 pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
+    project.record_dir_for_write("receipts")?;
     let event_hash = hash_bytes(&bytes(event)?);
     let (artifact, artifact_hash) = match &event.payload.done {
         Some(done) => (done.artifact.clone(), done.artifact.clone()),
@@ -391,7 +399,6 @@ pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    std::fs::create_dir_all(receipts_dir(project))?;
     let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -447,7 +454,7 @@ pub(crate) fn append_delivery_locked(
     event: &str,
     state: DeliveryState,
 ) -> Result<()> {
-    std::fs::create_dir_all(deliveries_dir(project))?;
+    project.record_dir_for_write("deliveries")?;
     if state != DeliveryState::Submitted && states(project, event)?.contains(&state) {
         return Ok(());
     }
