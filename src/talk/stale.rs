@@ -84,10 +84,20 @@ pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     // 4. The box's herdr server image.
     if let Some((target, path)) = box_target(ctx, project) {
         match server_stale(ctx.runner, &herdr_bin, Some((&target, &path))) {
-            Some(true) => stale.items.push(Item {
-                what: "The box's herdr server is still running an older program.".into(),
-                remedy: format!("Hand the box server over: `ssh {target} herdr server restart`."),
-            }),
+            Some(true) => {
+                let restart = format!(
+                    "PATH={}; export PATH; herdr server restart",
+                    crate::remote::quote(&path)
+                );
+                stale.items.push(Item {
+                    what: "The box's herdr server is still running an older program.".into(),
+                    remedy: format!(
+                        "Hand the box server over: `ssh {} {}`.",
+                        crate::remote::quote(&target),
+                        crate::remote::quote(&restart)
+                    ),
+                });
+            }
             None => stale.unknown = true,
             Some(false) => {}
         }

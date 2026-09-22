@@ -1964,7 +1964,13 @@ fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ti
 #[test]
 fn a_saved_machine_lookup_fault_never_becomes_a_lost_connection() {
     let (world, project) = remote_world();
-    thread::update(&project, "t-0001", |t| t.machine_id = "1".into()).unwrap();
+    thread::update(&project, "t-0001", |t| {
+        t.machine_id = "1".into();
+        t.failure_class = crate::contracts::FailureClass::LostConnection;
+        t.last_failure = "the old lookup fault was misclassified".into();
+        t.error = t.last_failure.clone();
+    })
+    .unwrap();
     std::fs::write(
         world.home.path().join("cfg/config.toml"),
         "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
@@ -1979,8 +1985,36 @@ fn a_saved_machine_lookup_fault_never_becomes_a_lost_connection() {
 
     let lane = thread::load(&project, "t-0001").unwrap();
     assert_eq!(lane.failure_class, crate::contracts::FailureClass::Unknown);
+    assert!(lane.last_failure.is_empty());
+    assert!(lane.error.is_empty());
     assert!(items_of(&project, "outage").is_empty());
     assert_eq!(world.runner.count("ssh"), 0);
+    assert!(!memory.machine_views.contains_key("1"));
+}
+
+#[test]
+fn a_successful_courier_clears_a_persisted_lost_connection_after_restart() {
+    let (world, project) = remote_world();
+    thread::update(&project, "t-0001", |t| {
+        t.machine_id = "1".into();
+        t.failure_class = crate::contracts::FailureClass::LostConnection;
+        t.last_failure = "the link was unreachable".into();
+        t.error = t.last_failure.clone();
+    })
+    .unwrap();
+    world
+        .runner
+        .on("ssh", ok("boot\tboot-1\nfree\t1\nagents\t-\npanes\t-\n"));
+    let ctx = world.ctx();
+    let mut fresh_memory = Memory::new(&ctx);
+    fresh_memory.tick = 1;
+
+    ticker::tick_project_with(&ctx, &project, &mut fresh_memory).unwrap();
+
+    let lane = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(lane.failure_class, crate::contracts::FailureClass::Unknown);
+    assert!(lane.last_failure.is_empty());
+    assert!(lane.error.is_empty());
 }
 
 #[test]
