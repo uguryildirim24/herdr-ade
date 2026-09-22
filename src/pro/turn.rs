@@ -21,7 +21,7 @@ use super::sh::Runner;
 use super::state::{self, BridgeState, Inflight, Lane, Turn};
 use super::{Env, Layout, bridge, doctor};
 
-/// The poll interval while waiting on the rollout.
+/// The poll interval while waiting on rollout events.
 const POLL: Duration = Duration::from_millis(500);
 /// The DONE line is typed again once after this wait.
 const NOTIFY_RETRY: Duration = Duration::from_secs(5);
@@ -116,17 +116,6 @@ pub(crate) fn prepare(
     if out.exists() {
         bail!("refused: {} already exists", out.display());
     }
-    // A lane with no Codex rollout cannot be collected, and the collector
-    // would type the packet before it found that out: refuse before anything
-    // is sent. `start` guarantees a rollout, so a missing one means a stale or
-    // hand-made record.
-    if lane::refresh_rollout(env, &mut lane).is_none() {
-        bail!(
-            "refused: lane `{}` has no Codex rollout yet; start or resume it and wait for the session file",
-            opts.lane
-        );
-    }
-
     let tag = match &opts.id {
         Some(id) => id.clone(),
         None => super::next_turn_id(layout, &opts.lane),
@@ -265,6 +254,17 @@ pub(crate) fn collect(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str
 }
 
 fn collect_inner(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> Result<()> {
+    collect_inner_with_clock(env, layout, runner, tag, super::LOAD_TIMEOUT, &SystemClock)
+}
+
+fn collect_inner_with_clock(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn Runner,
+    tag: &str,
+    rollout_timeout: Duration,
+    clock: &dyn Clock,
+) -> Result<()> {
     layout.ensure()?;
     let _guard = InflightGuard::new(layout, tag);
     let mut turn = Turn::read(layout, tag)?;
@@ -274,18 +274,10 @@ fn collect_inner(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> 
         .clone()
         .context("the turn record has no packet path")?;
 
-    // 1. loading: paste the packet, wait for its shell-command item.
-    let Some(mut reader) = RolloutReader::for_turn(env, layout, &turn)? else {
-        return finish_failed(
-            env,
-            layout,
-            runner,
-            &mut turn,
-            "load",
-            "no Codex rollout was found for the lane",
-            true,
-        );
-    };
+    // 1. loading: start at the end of an existing rollout. A new Codex
+    // session does not create its rollout until this first input is typed, so
+    // in that case find the file afterward and read it from byte zero.
+    let reader = RolloutReader::for_turn(env, layout, &turn, ReaderPosition::End)?;
     let load = format!("!cat -- {}", shell_quote(&packet));
     if let Err(error) = herdr_cli::agent_prompt(runner, &bin, &turn.lane, &load) {
         return finish_failed(
@@ -298,6 +290,48 @@ fn collect_inner(env: &Env, layout: &Layout, runner: &dyn Runner, tag: &str) -> 
             true,
         );
     }
+    let mut reader = match reader {
+        Some(reader) => reader,
+        None => match wait_for_first_rollout(env, layout, runner, &turn, rollout_timeout, clock)? {
+            FirstRolloutWait::Found(reader) => reader,
+            FirstRolloutWait::Blocked(reason) => {
+                return finish_failed(
+                    env,
+                    layout,
+                    runner,
+                    &mut turn,
+                    "rollout",
+                    &format!("Codex blocked before writing its rollout: {reason}"),
+                    false,
+                );
+            }
+            FirstRolloutWait::Gone => {
+                return finish_failed(
+                    env,
+                    layout,
+                    runner,
+                    &mut turn,
+                    "rollout",
+                    "the Codex agent disappeared before writing its rollout",
+                    false,
+                );
+            }
+            FirstRolloutWait::TimedOut => {
+                return finish_failed(
+                    env,
+                    layout,
+                    runner,
+                    &mut turn,
+                    "rollout",
+                    &format!(
+                        "no Codex rollout appeared within {}s after the packet load was typed",
+                        rollout_timeout.as_secs()
+                    ),
+                    false,
+                );
+            }
+        },
+    };
     if let Err(error) = wait_for_shell_command(&mut reader, &packet, super::LOAD_TIMEOUT) {
         return finish_failed(
             env,
@@ -727,6 +761,79 @@ fn wait_for_completion(reader: &mut RolloutReader, timeout: Duration) -> Result<
     }
 }
 
+trait Clock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+enum FirstRolloutWait {
+    Found(RolloutReader),
+    Blocked(String),
+    Gone,
+    TimedOut,
+}
+
+/// Wait after the first input for Codex to create the session rollout. Each
+/// non-timeout result is observed state, and the deadline bounds missing
+/// evidence.
+fn wait_for_first_rollout(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn Runner,
+    turn: &Turn,
+    timeout: Duration,
+    clock: &dyn Clock,
+) -> Result<FirstRolloutWait> {
+    let deadline = clock.now() + timeout;
+    let bin = env.herdr_bin();
+    let lane_record = Lane::read(layout, &turn.lane)?;
+    loop {
+        if let Some(reader) = RolloutReader::for_turn(env, layout, turn, ReaderPosition::Start)? {
+            return Ok(FirstRolloutWait::Found(reader));
+        }
+        match herdr_cli::agent_find(runner, &bin, &turn.lane) {
+            Ok(Some(agent)) if agent.blocked() => {
+                let reason = herdr_cli::pane_read(runner, &bin, &lane_record.pane_id)
+                    .ok()
+                    .and_then(|text| text.lines().last().map(str::trim).map(str::to_string))
+                    .filter(|line| !line.is_empty())
+                    .unwrap_or_else(|| "the agent reports blocked".into());
+                return Ok(FirstRolloutWait::Blocked(reason));
+            }
+            Ok(None) => return Ok(FirstRolloutWait::Gone),
+            _ => {}
+        }
+        let alive = herdr_cli::process_info(runner, &bin, &lane_record.pane_id)
+            .map(|info| info.runs("codex"))
+            .unwrap_or(true);
+        if !alive {
+            return Ok(FirstRolloutWait::Gone);
+        }
+        if clock.now() >= deadline {
+            return Ok(FirstRolloutWait::TimedOut);
+        }
+        clock.sleep(POLL);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReaderPosition {
+    Start,
+    End,
+}
+
 /// Reads new complete JSON lines from a rollout, by byte offset. A truncation
 /// or replacement resets the offset.
 struct RolloutReader {
@@ -736,26 +843,29 @@ struct RolloutReader {
 }
 
 impl RolloutReader {
-    fn for_turn(env: &Env, layout: &Layout, turn: &Turn) -> Result<Option<RolloutReader>> {
-        let lane = Lane::read(layout, &turn.lane)?;
-        let started = super::parse_rfc3339(&lane.started_at).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
-        let path = lane
-            .rollout
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .or_else(|| {
-                lane::find_rollout(
-                    &env.lane_codex_home(),
-                    &lane.cwd,
-                    started,
-                    lane.session_id.as_deref(),
-                )
-            });
-        let Some(path) = path else {
+    fn for_turn(
+        env: &Env,
+        layout: &Layout,
+        turn: &Turn,
+        position: ReaderPosition,
+    ) -> Result<Option<RolloutReader>> {
+        let mut lane = Lane::read(layout, &turn.lane)?;
+        let Some(path) = lane::refresh_rollout(env, &mut lane) else {
             return Ok(None);
         };
-        Ok(Some(RolloutReader::at_end(path)?))
+        lane.write(layout)?;
+        match position {
+            ReaderPosition::Start => Ok(Some(RolloutReader::at_start(path))),
+            ReaderPosition::End => Ok(Some(RolloutReader::at_end(path)?)),
+        }
+    }
+
+    fn at_start(path: PathBuf) -> RolloutReader {
+        RolloutReader {
+            path,
+            offset: 0,
+            partial: Vec::new(),
+        }
     }
 
     fn at_end(path: PathBuf) -> Result<RolloutReader> {
@@ -812,8 +922,7 @@ mod tests {
     use crate::pro::sh::fake::{FakeRunner, ok};
     use serde_json::json;
 
-    /// A ready lane record with a rollout file on disk, so `prepare`'s rollout
-    /// gate passes. Returns the lane file path the record was written to.
+    /// A ready lane record with an existing rollout file on disk.
     fn write_ready_lane(dir: &Path, layout: &Layout) {
         let rollout = dir.join("rollout-pro.jsonl");
         std::fs::write(&rollout, "{}\n").unwrap();
@@ -972,6 +1081,190 @@ mod tests {
         assert!(!is_shell_command(&event, "/tmp/other.md"));
     }
 
+    struct FakeClock {
+        origin: Instant,
+        elapsed: std::cell::Cell<Duration>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            FakeClock {
+                origin: Instant::now(),
+                elapsed: std::cell::Cell::new(Duration::ZERO),
+            }
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.origin + self.elapsed.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+        }
+    }
+
+    fn write_loading_turn_without_rollout(dir: &Path, layout: &Layout) -> (Turn, PathBuf) {
+        let packet = layout.packet("pro-01");
+        std::fs::write(&packet, "packet").unwrap();
+        Lane {
+            name: "pro".into(),
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t2".into(),
+            workspace_id: "w1".into(),
+            parent: None,
+            cwd: dir.display().to_string(),
+            profile: None,
+            session_id: None,
+            rollout: None,
+            started_at: "2026-09-19T09:00:00Z".into(),
+            state: "in_turn".into(),
+            stopped: false,
+            last_turn: Some("pro-01".into()),
+        }
+        .write(layout)
+        .unwrap();
+        let mut record = turn("loading");
+        record.packet = Some(packet.display().to_string());
+        record.out = dir.join("answer.md").display().to_string();
+        record.write(layout).unwrap();
+        (record, packet)
+    }
+
+    #[test]
+    fn first_input_creates_the_rollout_and_reads_it_from_the_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pro");
+        let layout = Layout::for_test(&root);
+        layout.ensure().unwrap();
+        let (turn, packet) = write_loading_turn_without_rollout(dir.path(), &layout);
+        let root_text = root.display().to_string();
+        let env = Env::for_test(
+            dir.path(),
+            &[
+                ("HERDR_BIN_PATH", "/h/herdr"),
+                ("HERDR_PRO_STATE_DIR", &root_text),
+            ],
+        );
+        let rollout = layout
+            .codex_home()
+            .join("sessions/2026/09/20/rollout-new.jsonl");
+        let rollout_for_prompt = rollout.clone();
+        let cwd = dir.path().display().to_string();
+        let packet_text = packet.display().to_string();
+        let prompts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let prompt_count = prompts.clone();
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.display().contains("agent prompt"),
+            move |_| {
+                prompt_count.set(prompt_count.get() + 1);
+                match prompt_count.get() {
+                    1 => {
+                        assert!(
+                            !rollout_for_prompt.exists(),
+                            "the rollout existed before the first input"
+                        );
+                        std::fs::create_dir_all(rollout_for_prompt.parent().unwrap()).unwrap();
+                        let lines = [
+                            json!({"type":"session_meta","payload":{"id":"new-session","cwd":cwd,"timestamp":"2026-09-20T10:00:00Z"}}),
+                            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("<user_shell_command><command>cat -- '{}'</command></user_shell_command>", packet_text)}]}}),
+                            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"cat","last_agent_message":""}}),
+                        ];
+                        std::fs::write(
+                            &rollout_for_prompt,
+                            lines.iter().map(|value| format!("{value}\n")).collect::<String>(),
+                        )
+                        .unwrap();
+                    }
+                    2 => {
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&rollout_for_prompt)
+                            .unwrap();
+                        writeln!(file, "{}", json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"answer"}})).unwrap();
+                        writeln!(file, "{}", json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"answer","last_agent_message":"today's answer"}})).unwrap();
+                    }
+                    _ => {}
+                }
+                Ok(ok(r#"{"result":{}}"#))
+            },
+        );
+
+        collect_inner_with_clock(
+            &env,
+            &layout,
+            &runner,
+            &turn.tag,
+            Duration::from_secs(3),
+            &FakeClock::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("answer.md")).unwrap(),
+            "today's answer"
+        );
+        let stored = Lane::read(&layout, "pro").unwrap();
+        assert_eq!(stored.rollout.as_deref(), Some(rollout.to_str().unwrap()));
+        assert_eq!(stored.session_id.as_deref(), Some("new-session"));
+        assert_eq!(Turn::read(&layout, "pro-01").unwrap().state, "delivered");
+    }
+
+    #[test]
+    fn a_missing_first_rollout_fails_the_typed_turn_at_the_outer_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pro");
+        let layout = Layout::for_test(&root);
+        layout.ensure().unwrap();
+        let (turn, _) = write_loading_turn_without_rollout(dir.path(), &layout);
+        let root_text = root.display().to_string();
+        let env = Env::for_test(
+            dir.path(),
+            &[
+                ("HERDR_BIN_PATH", "/h/herdr"),
+                ("HERDR_PRO_STATE_DIR", &root_text),
+            ],
+        );
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on(
+            "agent list",
+            ok(r#"{"result":{"agents":[{"name":"pro","agent":"codex","agent_status":"idle"}]}}"#),
+        );
+        runner.on(
+            "pane process-info",
+            ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"codex"}]}}}"#),
+        );
+
+        collect_inner_with_clock(
+            &env,
+            &layout,
+            &runner,
+            &turn.tag,
+            Duration::from_secs(3),
+            &FakeClock::new(),
+        )
+        .unwrap();
+
+        let failed = Turn::read(&layout, "pro-01").unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.failure_class.as_deref(), Some("unknown"));
+        let detail = failed.detail.unwrap();
+        assert!(
+            detail.contains("no Codex rollout appeared within 3s"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("after the packet load was typed"),
+            "{detail}"
+        );
+        assert_eq!(runner.count("agent prompt"), 2);
+        assert_eq!(Lane::read(&layout, "pro").unwrap().state, "ready");
+    }
+
     #[test]
     fn a_changed_bridge_pid_trips_the_breaker_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -1066,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_refuses_a_lane_without_a_rollout_before_typing() {
+    fn prepare_accepts_a_ready_lane_without_a_rollout() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pro"));
         layout.ensure().unwrap();
@@ -1078,7 +1371,7 @@ mod tests {
             parent: None,
             cwd: "/w".into(),
             profile: None,
-            session_id: None,
+            session_id: Some("new-session".into()),
             rollout: None,
             started_at: crate::pro::now_rfc3339(),
             state: "ready".into(),
@@ -1087,25 +1380,38 @@ mod tests {
         }
         .write(&layout)
         .unwrap();
+        let brief = dir.path().join("b.md");
+        std::fs::write(&brief, "answer this").unwrap();
         let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
         let runner = FakeRunner::new();
-        let error = prepare(
+        runner.on(
+            "agent list",
+            ok(r#"{"result":{"agents":[{"name":"pro","agent_status":"idle"}]}}"#),
+        );
+        runner.on(
+            ":17841/healthz",
+            ok(r#"{"version":"5.0.8","mode":"browser-only","pid":7,"accepting_turns":true}"#),
+        );
+        runner.on("codex login status", ok("Logged in\n"));
+
+        let turn = prepare(
             &env,
             &layout,
             &runner,
             &TurnOptions {
                 lane: "pro".into(),
-                brief: dir.path().join("b.md"),
+                brief,
                 out: dir.path().join("answer.md"),
                 notify: "hcoord".into(),
                 attachments: vec![],
                 id: None,
             },
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("no Codex rollout"), "{error}");
-        assert_eq!(runner.count("agent prompt"), 0);
-        assert!(!layout.turn("pro-01").exists());
+        .unwrap();
+
+        assert_eq!(turn.state, "loading");
+        assert!(layout.turn("pro-01").exists());
+        assert_eq!(Lane::read(&layout, "pro").unwrap().rollout, None);
     }
 
     #[test]
