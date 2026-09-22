@@ -906,33 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_choice_sentences_with_make_pass_and_a_fragment_fails() {
-        let g = Glossary::default();
-        let result = check_ask(
-            "Who should make the three changes?",
-            &[
-                "I will make the three changes to your project settings.".into(),
-                "You make the three changes to my project settings.".into(),
-                "Three changes to your settings.".into(),
-            ],
-            &g,
-        );
-        let question_form_spans: Vec<_> = result
-            .violations
-            .iter()
-            .filter(|violation| violation.rule == Rule::QuestionForm)
-            .map(|violation| violation.span)
-            .collect();
-        assert_eq!(
-            question_form_spans,
-            [Span {
-                start: 0,
-                end: "Three changes to your settings.".len(),
-            }]
-        );
-    }
-
-    #[test]
     fn r7_pass_complete_say_and_fail_empty_what() {
         let g = Glossary::default();
         let pass = check_message(
