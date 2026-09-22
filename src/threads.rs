@@ -407,30 +407,39 @@ fn resolve_placement(
                 .map(|_| None)
                 .map_err(|error| format!("{error:#}"))
         } else {
-            match remote::machine_profile(
-                ctx.runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                &candidate,
-            ) {
+            match remote::machine_declaration(&ctx.config_dir, &candidate) {
                 Err(error) => Err(format!("{error:#}")),
-                Ok(profile) if profile.is_local() => crate::doctor::recipe_ready_local(ctx, launch)
-                    .map(|_| None)
-                    .map_err(|error| format!("{error:#}")),
-                Ok(profile) => box_repo_candidate(&ctx.config_dir, &profile.label, repo, listed)
-                    .map_err(|error| format!("{error:#}"))
-                    .and_then(|_| {
-                        if project::machine_held(&ctx.root, &profile.id) {
-                            Err(format!(
-                                "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
-                                profile.label, profile.label
-                            ))
-                        } else {
-                            crate::doctor::recipe_ready_on_box(ctx, &profile, launch)
-                                .map(|_| Some(profile))
-                                .map_err(|error| format!("{error:#}"))
-                        }
-                    }),
+                Ok(machine) if !machine.runs_kind(&launch.kind) => Err(format!(
+                    "machine_kind_unavailable: `{}` does not run adapter kind `{}`",
+                    machine.label, launch.kind
+                )),
+                Ok(_) => match remote::machine_profile(
+                    ctx.runner,
+                    &ctx.env.herdr_bin(),
+                    &ctx.config_dir,
+                    &candidate,
+                ) {
+                    Err(error) => Err(format!("{error:#}")),
+                    Ok(profile) if profile.is_local() => {
+                        crate::doctor::recipe_ready_local(ctx, launch)
+                            .map(|_| None)
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                    Ok(profile) => box_repo_candidate(&ctx.config_dir, &profile.label, repo, listed)
+                        .map_err(|error| format!("{error:#}"))
+                        .and_then(|_| {
+                            if project::machine_held(&ctx.root, &profile.id) {
+                                Err(format!(
+                                    "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
+                                    profile.label, profile.label
+                                ))
+                            } else {
+                                crate::doctor::recipe_ready_on_box(ctx, &profile, launch)
+                                    .map(|_| Some(profile))
+                                    .map_err(|error| format!("{error:#}"))
+                            }
+                        }),
+                },
             }
         };
         match checked {
@@ -506,6 +515,8 @@ fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
         "the box has no folder for this repository, so this lane runs here"
     } else if missing.contains("box_repo_unmapped") {
         "this repository has no box location, so this lane runs here"
+    } else if missing.contains("machine_kind_unavailable") {
+        "the box does not run this kind of helper, so this lane runs here"
     } else {
         "the box was not ready, so this lane runs here"
     };
@@ -3365,7 +3376,13 @@ mod tests {
         );
     }
 
-    const LANE_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"oci\"\n";
+    const SHIPPED_MACHINE_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"oci\"\n";
+
+    const NATIVE_BOX: &str = "\n[machines.oci]\nlabel = \"oci\"\ntarget = \"oci-pi\"\nsession = \"default\"\nhome = \"/home/ubuntu\"\nroot = \"/home/ubuntu/.herdr-ade\"\nworktrees = \"/home/ubuntu/projects\"\nbuild = \"/home/ubuntu/build/lanes\"\npath = \"/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/ubuntu/.local/bin/herdr-ade\"\npi_bin = \"/home/ubuntu/.local/bin/herdr-pi\"\nkinds = [\"pi\", \"claude\", \"agy\"]\n";
+
+    fn lane_config() -> String {
+        format!("{SHIPPED_MACHINE_CONFIG}{NATIVE_BOX}")
+    }
 
     fn start_args(repo: Option<String>, machine: Option<String>) -> StartArgs {
         StartArgs {
@@ -3411,7 +3428,7 @@ mod tests {
     #[test]
     fn box_lanes_share_one_project_workspace_and_take_separate_tabs() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         stub_box(&fx);
         let started = start(
             &fx.world.ctx(),
@@ -3467,51 +3484,46 @@ mod tests {
     }
 
     #[test]
-    fn a_research_pick_uses_the_mac_when_the_box_has_no_agy_and_records_why() {
+    fn claude_and_agy_picks_use_the_mac_without_box_readiness_checks() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
-        fx.world.runner.on_fn(
-            |cmd| {
-                cmd.program == "ssh"
-                    && cmd
-                        .args
-                        .last()
-                        .is_some_and(|script| script.contains("command -v agy"))
-            },
-            |_| {
-                Ok(crate::runner::fake::fail(
-                    127,
-                    "agy is missing from the lane PATH",
-                ))
-            },
-        );
+        write_config(&fx, SHIPPED_MACHINE_CONFIG);
         stub_box(&fx);
-        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        let repo = Some(fx.repo.to_string_lossy().into_owned());
+        let claude = start(&fx.world.ctx(), "demo", start_args(repo.clone(), None)).unwrap();
+        assert_eq!(claude.launch.recipe_id, "test_claude");
+        assert!(claude.machine.is_empty());
+
+        let mut args = start_args(repo, None);
         args.task = "+++\nproduct = \"web-research\"\n+++\nCompare the published results.".into();
-        let started = start(&fx.world.ctx(), "demo", args).unwrap();
-        assert_eq!(started.launch.recipe_id, "agy_gemini_flash");
-        assert!(
-            started.machine.is_empty(),
-            "research must stay off this box"
-        );
+        let agy = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(agy.launch.recipe_id, "agy_gemini_flash");
+        assert!(agy.machine.is_empty());
+
         let ledger =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
-        let placement = ledger
-            .lines()
-            .rfind(|line| line.contains("\"kind\":\"placement\""))
-            .unwrap();
-        assert!(placement.contains("\"machine\":\"local\""), "{placement}");
         assert!(
-            placement.contains("agy is missing from the lane PATH"),
-            "{placement}"
+            ledger.contains("does not run adapter kind `claude`"),
+            "{ledger}"
         );
-        assert!(placement.contains("agy_gemini_flash"), "{placement}");
+        assert!(
+            ledger.contains("does not run adapter kind `agy`"),
+            "{ledger}"
+        );
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.program != "ssh"),
+            "an unsupported kind must not probe the box"
+        );
     }
 
     #[test]
-    fn a_pi_pick_still_uses_a_ready_box() {
+    fn pi_lanes_and_reviewers_still_use_a_ready_box() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, SHIPPED_MACHINE_CONFIG);
         let task = "Run the bounded coding task.";
         let config_path = fx.world.home.path().join("cfg/config.toml");
         let config = std::fs::read_to_string(&config_path).unwrap();
@@ -3522,33 +3534,21 @@ mod tests {
         )
         .unwrap();
         stub_box(&fx);
-        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
-        args.task = task.into();
-        let started = start(&fx.world.ctx(), "demo", args).unwrap();
-        assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
-        assert_eq!(started.machine, "oci");
-        assert_eq!(started.machine_id, "oci-id");
+        for role in [None, Some("reviewer")] {
+            let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+            args.task = task.into();
+            args.workflow = role.map(str::to_string);
+            let started = start(&fx.world.ctx(), "demo", args).unwrap();
+            assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
+            assert_eq!(started.machine, "oci");
+            assert_eq!(started.machine_id, "oci-id");
+        }
     }
 
     #[test]
-    fn an_explicit_machine_that_cannot_run_the_pick_is_refused() {
+    fn an_explicit_machine_that_excludes_the_pick_is_refused_without_ssh() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
-        fx.world.runner.on_fn(
-            |cmd| {
-                cmd.program == "ssh"
-                    && cmd
-                        .args
-                        .last()
-                        .is_some_and(|script| script.contains("command -v agy"))
-            },
-            |_| {
-                Ok(crate::runner::fake::fail(
-                    127,
-                    "agy is missing from the lane PATH",
-                ))
-            },
-        );
+        write_config(&fx, SHIPPED_MACHINE_CONFIG);
         stub_box(&fx);
         let mut args = start_args(
             Some(fx.repo.to_string_lossy().into_owned()),
@@ -3561,14 +3561,20 @@ mod tests {
         assert!(error.contains("recipe_unavailable"), "{error}");
         assert!(error.contains("agy_gemini_flash"), "{error}");
         assert!(error.contains("oci"), "{error}");
-        assert!(
-            error.contains("agy is missing from the lane PATH"),
-            "{error}"
-        );
+        assert!(error.contains("does not run adapter kind `agy`"), "{error}");
         assert!(thread::list(&fx.project).is_empty());
         let ledger =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
         assert!(ledger.contains("placement-refused"), "{ledger}");
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.program != "ssh"),
+            "an explicitly unsupported kind must not probe the box"
+        );
     }
 
     #[test]
@@ -3595,10 +3601,13 @@ mod tests {
             |cmd| cmd.program == "agy",
             |_| Ok(crate::runner::fake::fail(1, "agy is not signed in here")),
         );
+        let config_dir = home.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), lane_config()).unwrap();
         let ctx = Ctx {
             env: &env,
             root: home.path().join("root"),
-            config_dir: home.path().join("cfg"),
+            config_dir,
             runner: &runner,
             detached_ticker: false,
         };
@@ -3680,7 +3689,7 @@ mod tests {
         settings.repos[0].publish_url = None;
         let text = format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap());
         std::fs::write(fx.project.project_md(), text).unwrap();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         stub_box(&fx);
         let started = start(
             &fx.world.ctx(),
@@ -3722,7 +3731,7 @@ mod tests {
     #[test]
     fn machine_local_keeps_a_box_repo_lane_on_this_mac() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         stub_box(&fx);
         let started = start(
             &fx.world.ctx(),
@@ -3867,7 +3876,7 @@ mod tests {
         use crate::scenarios::{agent_json, pane_json};
 
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         stub_box(&fx);
         fx.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
         fx.world.runner.on("tab close", ok(r#"{"result":{}}"#));
@@ -3987,7 +3996,7 @@ mod tests {
     #[test]
     fn a_held_box_falls_back_to_this_mac_with_one_line() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         stub_box(&fx);
         let ctx = fx.world.ctx();
         project::machine_hold(&ctx.root, "oci-id").unwrap();
@@ -4007,7 +4016,7 @@ mod tests {
     #[test]
     fn an_unreachable_box_falls_back_to_this_mac() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         fx.world.runner.on_fn(
             |cmd| {
                 cmd.program == "ssh"
@@ -4035,7 +4044,7 @@ mod tests {
     #[test]
     fn an_explicit_held_box_refuses() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, LANE_CONFIG);
+        write_config(&fx, &lane_config());
         stub_box(&fx);
         let ctx = fx.world.ctx();
         project::machine_hold(&ctx.root, "oci-id").unwrap();
@@ -4061,7 +4070,9 @@ mod tests {
         let (fx, remote) = box_fixture();
         write_config(
             &fx,
-            "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n",
+            &format!(
+                "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n{NATIVE_BOX}"
+            ),
         );
         stub_box(&fx);
         let ctx = fx.world.ctx();
