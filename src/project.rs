@@ -1196,8 +1196,14 @@ const RECORD_FILES: &[(&str, &str)] = &[
 
 fn top_level_thread_records(project: &Project) -> Result<Vec<PathBuf>> {
     let dir = project.dir().join("threads");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("could not inspect old thread records in {}", dir.display())
+            });
+        }
     };
     let mut records = Vec::new();
     for entry in entries {
@@ -1724,6 +1730,17 @@ mod tests {
         assert!(error.contains("project_convert_conflict"), "{error}");
         assert!(conflict.dir().join("events/untouched").is_file());
         assert!(!conflict.state_dir().join("events").exists());
+
+        let malformed = create(root.path(), "malformed", "", vec![]).unwrap();
+        std::fs::remove_file(malformed.state_dir().join("records-converted")).unwrap();
+        std::fs::write(malformed.dir().join("threads"), b"not a record folder\n").unwrap();
+        let error = convert(&malformed).unwrap_err().to_string();
+        assert!(
+            error.contains("could not inspect old thread records"),
+            "{error}"
+        );
+        assert!(malformed.dir().join("threads").is_file());
+        assert!(!malformed.state_dir().join("records-converted").exists());
     }
 
     #[test]

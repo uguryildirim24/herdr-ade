@@ -2898,17 +2898,23 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
         .filter(|c| c.program == "ssh")
         .map(|c| c.args.last().cloned().unwrap_or_default())
         .collect();
+    let build_scripts: Vec<_> = scripts
+        .iter()
+        .filter(|script| script.contains("git fetch --quiet"))
+        .collect();
+    assert_eq!(build_scripts.len(), 2, "{scripts:?}");
     assert!(
-        scripts[..2].iter().all(|s| s.contains("git fetch --quiet")
-            && s.contains("git merge --ff-only")
-            && s.contains("cargo build --release --locked")
-            && s.contains("source_dirty=\"$(git status --porcelain")
-            && s.contains("cp target/release/")
-            && s.contains("install_to=/home/ubuntu/.local/bin/")
-            && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
+        build_scripts
+            .iter()
+            .all(|s| s.contains("git merge --ff-only")
+                && s.contains("cargo build --release --locked")
+                && s.contains("source_dirty=\"$(git status --porcelain")
+                && s.contains("cp target/release/")
+                && s.contains("install_to=/home/ubuntu/.local/bin/")
+                && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
         "{scripts:?}"
     );
-    for script in &scripts[..2] {
+    for script in build_scripts {
         let refresh = script
             .find("git read-tree HEAD && git update-index -q --refresh")
             .expect("box build refreshes the sync-stale index");
@@ -2920,28 +2926,35 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
             "box index refresh must precede source inspection and build: {script}"
         );
     }
+    let conversion = scripts
+        .iter()
+        .position(|script| script.contains("ticker stop") && script.contains("project convert"))
+        .expect("box project conversion");
+    let later_build = scripts
+        .iter()
+        .rposition(|script| script.contains("cargo build --release --locked"))
+        .unwrap();
     assert!(
-        scripts[2].contains("$dir/RULES.md")
-            && scripts[2].contains(crate::harness::BOX_WORKER_MARKER),
-        "{}",
-        scripts[2]
+        conversion < later_build,
+        "box records must move immediately after installing the new plugin: {scripts:?}"
     );
     let settings = calls
         .iter()
-        .filter(|call| call.program == "ssh")
-        .nth(2)
+        .find(|call| {
+            call.program == "ssh"
+                && call
+                    .args
+                    .last()
+                    .is_some_and(|script| script.contains(crate::harness::BOX_WORKER_MARKER))
+        })
         .unwrap();
     assert_eq!(settings.stdin.as_deref(), Some("# Lane rules\n"));
     assert!(
-        scripts[3].contains("HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade")
-            && scripts[3].contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard"),
-        "{}",
-        scripts[3]
-    );
-    assert!(
-        scripts[4].contains("ticker stop") && scripts[4].contains("project convert"),
-        "{}",
-        scripts[4]
+        scripts.iter().any(
+            |script| script.contains("HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade")
+                && script.contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard")
+        ),
+        "{scripts:?}"
     );
     drop(calls);
 
@@ -2967,8 +2980,11 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
 }
 
 #[test]
-fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
+fn harness_install_builds_reexecs_and_converts_before_a_failed_box_lookup() {
     let world = World::new();
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    std::fs::remove_file(project.state_dir().join("records-converted")).unwrap();
+    std::fs::write(project.dir().join("ledger.jsonl"), "old record\n").unwrap();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
     write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
     world.runner.on("cargo build", ok(""));
@@ -3000,6 +3016,11 @@ fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
 
     assert!(error.contains("machine_list_failed"), "{error}");
     assert_eq!(world.runner.count("cargo build"), 1);
+    assert!(!project.dir().join("ledger.jsonl").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.state_dir().join("ledger.jsonl")).unwrap(),
+        "old record\n"
+    );
     assert!(
         reexecs
             .borrow()

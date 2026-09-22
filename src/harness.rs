@@ -1221,6 +1221,8 @@ pub(crate) fn install_with_reexec(
     let mut kinds = Vec::new();
     let mut installed = Vec::new();
     let mut builds = Vec::new();
+    let mut conversions = Vec::new();
+    let mut local_projects_converted = false;
     for repo in &repos {
         let kind = kind(&repo.path)?;
         fork |= kind == Kind::Fork;
@@ -1258,6 +1260,19 @@ pub(crate) fn install_with_reexec(
             box_installed: false,
             box_commit: None,
         });
+        if kind == Kind::Plugin && !local_projects_converted {
+            // In production, replacing herdr-ade re-executes above and never
+            // returns here in the old image. Convert as soon as the new image
+            // is installed, before a box outage or a later build can leave
+            // the new readers pointed at records that have not moved yet.
+            conversions.extend(convert_local_projects(ctx)?);
+            local_projects_converted = true;
+        }
+    }
+    // A custom harness list need not contain the plugin. The running image
+    // still knows this layout, so retain explicit conversion for that case.
+    if !local_projects_converted {
+        conversions.extend(convert_local_projects(ctx)?);
     }
     if kinds.contains(&Kind::Plugin) {
         crate::pi::install::write_guard(&crate::pi::Layout {
@@ -1293,7 +1308,12 @@ pub(crate) fn install_with_reexec(
                 }
                 installed_repo.box_installed = true;
                 installed_repo.box_commit = box_commit;
-                box_plugin_installed |= kind == Kind::Plugin;
+                if kind == Kind::Plugin && !box_plugin_installed {
+                    // Do not let a later box build or settings step strand
+                    // old records behind the newly installed box reader.
+                    conversions.extend(convert_box_projects(ctx, machine)?);
+                    box_plugin_installed = true;
+                }
             }
             (Some(_), None) => warnings.push(format!(
                 "note: {} has no box_path; skipped the box step",
@@ -1307,10 +1327,6 @@ pub(crate) fn install_with_reexec(
         if box_plugin_installed {
             refresh_box_guard(ctx, target, machine)?;
         }
-    }
-    let mut conversions = convert_local_projects(ctx)?;
-    if let Some(machine) = &box_paths {
-        conversions.extend(convert_box_projects(ctx, machine)?);
     }
     let plugin_version = installed
         .iter()
