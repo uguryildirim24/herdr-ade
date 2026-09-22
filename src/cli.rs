@@ -1743,9 +1743,10 @@ enum PlainCommand {
     /// Native CLI end-of-turn hook
     #[command(hide = true)]
     Hook {
-        slug: String,
         #[arg(long)]
         kind: String,
+        #[arg(long)]
+        project: String,
         #[arg(long)]
         binding: String,
         #[arg(long, default_value = "complete")]
@@ -1796,7 +1797,7 @@ fn machine_command(matches: &clap::ArgMatches) -> (String, BTreeMap<String, serd
     let mut data = BTreeMap::new();
     loop {
         for key in [
-            "slug", "round", "thread", "id", "name", "sha", "report", "branch", "pane",
+            "slug", "project", "round", "thread", "id", "name", "sha", "report", "branch", "pane",
         ] {
             if let Ok(Some(value)) = leaf.try_get_one::<String>(key) {
                 data.insert(key.to_string(), serde_json::Value::String(value.clone()));
@@ -2547,11 +2548,11 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 }
             }
             PlainCommand::Hook {
-                slug,
                 kind,
+                project,
                 binding,
                 phase,
-            } => crate::hook::run(&ctx, &kind, &slug, &binding, &phase),
+            } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         },
         Command::Doctor { session } => {
             let result = doctor::run(&ctx, &session.into())?;
@@ -2616,6 +2617,40 @@ mod tests {
                 provider_kind: None,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn the_installed_hook_keeps_its_machine_interface() {
+        let cli = Cli::try_parse_from([
+            "ha",
+            "--root",
+            "/home/agent/.herdr-ade",
+            "plain",
+            "hook",
+            "--kind",
+            "claude",
+            "--project",
+            "adeherdr",
+            "--binding",
+            "w1G:p1",
+            "--phase",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Plain {
+                command: PlainCommand::Hook {
+                    kind,
+                    project,
+                    binding,
+                    phase,
+                }
+            } if kind == "claude"
+                && project == "adeherdr"
+                && binding == "w1G:p1"
+                && phase == "prompt"
         ));
     }
 
@@ -2696,15 +2731,6 @@ mod tests {
                 "name",
                 "--plain",
                 "This is one name.",
-            ],
-            &[
-                "plain",
-                "hook",
-                "demo",
-                "--kind",
-                "claude",
-                "--binding",
-                "w1:p1",
             ],
         ];
         for args in cases {
