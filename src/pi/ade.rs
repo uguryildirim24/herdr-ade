@@ -119,17 +119,19 @@ pub(crate) fn check_on_machine(
     runner: &dyn crate::runner::Runner,
     local_root: &Path,
     target: &str,
-    remote_root: &str,
-    remote_bin: &str,
+    machine: &crate::remote::MachineDeclaration,
     provider: &str,
     model: &str,
 ) -> Result<()> {
-    let script = format!(
-        "HERDR_ADE_ROOT={root} {bin} check {provider} --model {model}",
-        root = crate::remote::quote(remote_root),
-        bin = crate::remote::quote(remote_bin),
-        provider = crate::remote::quote(provider),
-        model = crate::remote::quote(model),
+    let script = crate::remote::with_path(
+        &machine.path,
+        &format!(
+            "HERDR_ADE_ROOT={root} {bin} check {provider} --model {model}",
+            root = crate::remote::quote(&machine.root),
+            bin = crate::remote::quote(&machine.pi_bin),
+            provider = crate::remote::quote(provider),
+            model = crate::remote::quote(model),
+        ),
     );
     let rooted = crate::runner::CwdRunner::new(runner, local_root);
     let out = crate::remote::ssh(
@@ -228,6 +230,15 @@ mod tests {
         let _ = (&env, &layout);
     }
 
+    fn box_machine() -> crate::remote::MachineDeclaration {
+        crate::remote::MachineDeclaration {
+            root: "/home/ubuntu/.herdr-ade".into(),
+            path: "/home/ubuntu/.local/bin:/usr/bin:/bin".into(),
+            pi_bin: "/home/ubuntu/.local/bin/herdr-pi".into(),
+            ..Default::default()
+        }
+    }
+
     /// The readiness check runs on the box through `herdr-pi`, never the plugin
     /// binary, and names the provider.
     #[test]
@@ -239,8 +250,7 @@ mod tests {
             &runner,
             dir.path(),
             "me@box",
-            "/home/ubuntu/.herdr-ade",
-            "/home/ubuntu/.local/bin/herdr-pi",
+            &box_machine(),
             "opencode-go",
             "deepseek-v4.1-flash",
         )
@@ -250,7 +260,7 @@ mod tests {
         assert_eq!(calls[0].cwd.as_deref(), Some(dir.path()));
         assert_eq!(
             calls[0].args.last().unwrap(),
-            "sh -c 'HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go --model deepseek-v4.1-flash'"
+            "sh -c 'PATH=/home/ubuntu/.local/bin:/usr/bin:/bin; export PATH\nHERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go --model deepseek-v4.1-flash'"
         );
         drop(calls);
     }
@@ -265,8 +275,7 @@ mod tests {
             &runner,
             dir.path(),
             "me@box",
-            "/home/ubuntu/.herdr-ade",
-            "/home/ubuntu/.local/bin/herdr-pi",
+            &box_machine(),
             "opencode-go",
             "deepseek-v4.1-flash",
         )
@@ -300,8 +309,7 @@ mod tests {
             &runner,
             dir.path(),
             "me@box",
-            "/home/ubuntu/.herdr-ade",
-            "/home/ubuntu/.local/bin/herdr-pi",
+            &box_machine(),
             "opencode-go",
             "deepseek-v4.1-flash",
         )

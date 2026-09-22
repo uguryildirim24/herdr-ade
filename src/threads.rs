@@ -700,11 +700,13 @@ fn place_box_worktree(
     // step 3).
     let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
 
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &record.machine)?;
     if record.failure_event.is_empty() {
         remote::provision(
             runner,
             &target,
             &remote::Provision {
+                path: &machine.path,
                 box_repo: &box_repo,
                 worktree: &box_worktree,
                 branch: &branch,
@@ -726,7 +728,6 @@ fn place_box_worktree(
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
     let attempt = record.attempt.max(1);
-    let machine = crate::remote::machine_declaration(&ctx.config_dir, &record.machine)?;
     let env = project::tab_env(
         &project.slug,
         &record.id,
@@ -1957,9 +1958,13 @@ pub(crate) fn remove_scratch_session(ctx: &Ctx, record: &Thread) -> Result<()> {
 
     let profile =
         remote::machine_profile(ctx.runner, &bin, &ctx.config_dir, record.machine_route())?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     let quoted = remote::quote(&name);
-    let script = format!(
-        "state=$(herdr session list --json | python3 -c 'import json,sys; n=sys.argv[1]; rows=json.load(sys.stdin).get(\"sessions\",[]); r=next((r for r in rows if r.get(\"name\")==n),None); print(\"missing\" if r is None else (\"running\" if r.get(\"running\") else \"stopped\"))' {quoted}); case \"$state\" in running) herdr session stop {quoted} --json >/dev/null; herdr session delete {quoted} --json >/dev/null;; stopped) herdr session delete {quoted} --json >/dev/null;; missing) :;; *) exit 1;; esac"
+    let script = remote::with_path(
+        &machine.path,
+        &format!(
+            "state=$(herdr session list --json | python3 -c 'import json,sys; n=sys.argv[1]; rows=json.load(sys.stdin).get(\"sessions\",[]); r=next((r for r in rows if r.get(\"name\")==n),None); print(\"missing\" if r is None else (\"running\" if r.get(\"running\") else \"stopped\"))' {quoted}); case \"$state\" in running) herdr session stop {quoted} --json >/dev/null; herdr session delete {quoted} --json >/dev/null;; stopped) herdr session delete {quoted} --json >/dev/null;; missing) :;; *) exit 1;; esac"
+        ),
     );
     let out = remote::ssh(
         ctx.runner,
@@ -2210,9 +2215,11 @@ pub(crate) fn inspect_worktree_for_removal(
         &ctx.config_dir,
         record.machine_route(),
     )?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     crate::worktrees::inspect_remote(
         ctx.runner,
         &profile.target,
+        &machine.path,
         &record.worktree_path,
         &disposable,
     )
@@ -2237,11 +2244,14 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     .target;
     let machine = remote::machine_declaration(&ctx.config_dir, &record.machine)?;
     let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
-    let script = format!(
-        "cd {} && git worktree remove {} && rm -rf -- {}",
-        remote::quote(&box_repo),
-        remote::quote(&record.worktree_path),
-        remote::quote(&build)
+    let script = remote::with_path(
+        &machine.path,
+        &format!(
+            "cd {} && git worktree remove {} && rm -rf -- {}",
+            remote::quote(&box_repo),
+            remote::quote(&record.worktree_path),
+            remote::quote(&build)
+        ),
     );
     let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
     if !out.success() {

@@ -82,8 +82,8 @@ pub(crate) fn scan(ctx: &Ctx, project: &Project) -> Stale {
     }
 
     // 4. The box's herdr server image.
-    if let Some(target) = box_target(ctx, project) {
-        match server_stale(ctx.runner, &herdr_bin, Some(&target)) {
+    if let Some((target, path)) = box_target(ctx, project) {
+        match server_stale(ctx.runner, &herdr_bin, Some((&target, &path))) {
             Some(true) => stale.items.push(Item {
                 what: "The box's herdr server is still running an older program.".into(),
                 remedy: format!("Hand the box server over: `ssh {target} herdr server restart`."),
@@ -229,12 +229,12 @@ fn json(runner: &dyn Runner, cmd: &Cmd) -> Option<Value> {
 /// `None` means the check could not be read, which is not the same as current.
 /// A remote check asks the box for its own `herdr` on the box's `PATH`; the
 /// plugin's binary path is a Mac path and does not exist there.
-fn server_stale(runner: &dyn Runner, bin: &str, target: Option<&str>) -> Option<bool> {
-    let output = match target {
-        Some(target) => crate::remote::ssh(
+fn server_stale(runner: &dyn Runner, bin: &str, remote: Option<(&str, &str)>) -> Option<bool> {
+    let output = match remote {
+        Some((target, path)) => crate::remote::ssh(
             runner,
             target,
-            "herdr status server --json",
+            &crate::remote::with_path(path, "herdr status server --json"),
             None,
             BOX_CHECK_TIMEOUT,
         )
@@ -255,7 +255,7 @@ fn flag(value: &Value, key: &str) -> bool {
 }
 
 /// The SSH target of the machine this project's lanes run on.
-fn box_target(ctx: &Ctx, project: &Project) -> Option<String> {
+fn box_target(ctx: &Ctx, project: &Project) -> Option<(String, String)> {
     let machine = thread::list(project)
         .into_iter()
         .find(|lane| lane.is_remote())
@@ -263,7 +263,8 @@ fn box_target(ctx: &Ctx, project: &Project) -> Option<String> {
     let profile =
         crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &machine)
             .ok()?;
-    (!profile.target.is_empty()).then_some(profile.target)
+    let declaration = crate::remote::machine_declaration(&ctx.config_dir, &profile.label).ok()?;
+    (!profile.target.is_empty()).then_some((profile.target, declaration.path))
 }
 
 /// The plugin source checkout, where the skill files live.
@@ -457,11 +458,21 @@ mod tests {
     fn the_box_server_check_asks_the_box_for_its_own_herdr() {
         let runner = crate::runner::fake::FakeRunner::new();
         runner.on("herdr status server", ok(r#"{"server_binary_stale":true}"#));
-        let state = server_stale(&runner, "/home/agent/.local/bin/herdr", Some("remote-host"));
+        let state = server_stale(
+            &runner,
+            "/home/agent/.local/bin/herdr",
+            Some(("remote-host", "/custom/bin:/bin")),
+        );
         assert_eq!(state, Some(true));
         let calls: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
         assert!(
             calls.iter().any(|c| c.contains("herdr status server")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("PATH=/custom/bin:/bin; export PATH")),
             "{calls:?}"
         );
         assert!(
@@ -474,7 +485,10 @@ mod tests {
     fn an_unreadable_server_check_is_unknown_not_current() {
         let runner = crate::runner::fake::FakeRunner::new();
         // No rule: the check fails, and that is unknown, not fine.
-        assert_eq!(server_stale(&runner, "herdr", Some("remote-host")), None);
+        assert_eq!(
+            server_stale(&runner, "herdr", Some(("remote-host", "/bin"))),
+            None
+        );
         runner.on("status server", ok("not json"));
         assert_eq!(server_stale(&runner, "herdr", None), None);
     }

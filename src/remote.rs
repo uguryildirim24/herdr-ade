@@ -321,10 +321,17 @@ pub(crate) fn ssh(
     runner.run(&cmd)
 }
 
+/// Give a non-login box shell the exact executable search path declared for
+/// that saved machine.
+pub(crate) fn with_path(path: &str, script: &str) -> String {
+    format!("PATH={}; export PATH\n{script}", quote(path))
+}
+
 /// One box start's git effect (SPEC-remote §4.2 step 3): the box fetches the
 /// lane branch, verifies `FETCH_HEAD = B`, and creates the worktree from it
 /// under the box clone. One SSH call; nothing is copied.
 pub(crate) struct Provision<'a> {
+    pub(crate) path: &'a str,
     pub(crate) box_repo: &'a str,
     pub(crate) worktree: &'a str,
     pub(crate) branch: &'a str,
@@ -333,8 +340,10 @@ pub(crate) struct Provision<'a> {
 }
 
 pub(crate) fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) -> Result<()> {
-    let script = format!(
-        "set -e\n\
+    let script = with_path(
+        req.path,
+        &format!(
+            "set -e\n\
          cd {repo} || exit 3\n\
          git rev-parse --show-toplevel >/dev/null || exit 3\n\
          {norm}\
@@ -359,13 +368,14 @@ pub(crate) fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) 
          fi\n\
          test \"$(git -C {wt} rev-parse HEAD)\" = {base} || {{ echo worktree_head_mismatch >&2; exit 7; }}\n\
          git -C {wt} rev-parse HEAD\n",
-        norm = NORM_URL_SH,
-        repo = quote(req.box_repo),
-        wt = quote(req.worktree),
-        branch = quote(req.branch),
-        base = quote(req.base),
-        url = quote(req.publish_url),
-        ref = quote(&format!("refs/heads/{}", req.branch)),
+            norm = NORM_URL_SH,
+            repo = quote(req.box_repo),
+            wt = quote(req.worktree),
+            branch = quote(req.branch),
+            base = quote(req.base),
+            url = quote(req.publish_url),
+            ref = quote(&format!("refs/heads/{}", req.branch)),
+        ),
     );
     let out = ssh(runner, target, &script, None, SSH_START_TIMEOUT)?;
     if !out.success() {
@@ -692,6 +702,7 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
         let runner = FakeRunner::new();
         runner.on("ssh", ok("b0b0\n"));
         let req = Provision {
+            path: "/custom/bin:/usr/bin:/bin",
             box_repo: "/home/ubuntu/projects/herdr",
             worktree: "/home/ubuntu/projects/herdr/.worktrees/t-0001",
             branch: "hp/demo/t-0001",
@@ -701,6 +712,7 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
         provision(&runner, "box", &req).unwrap();
         let calls = runner.calls.borrow();
         let script = calls[0].args.last().unwrap();
+        assert!(script.contains("PATH=/custom/bin:/usr/bin:/bin; export PATH"));
         assert!(script.contains("git fetch --quiet"));
         assert!(script.contains("FETCH_HEAD"));
         assert!(script.contains("git worktree add"));
@@ -810,6 +822,7 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
             &runner,
             "box",
             &Provision {
+                path: "/usr/bin:/bin",
                 box_repo: box_clone.to_str().unwrap(),
                 worktree: worktree.to_str().unwrap(),
                 branch: "lane",
@@ -833,6 +846,7 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
             &runner,
             "box",
             &Provision {
+                path: "/usr/bin:/bin",
                 box_repo: box_clone.to_str().unwrap(),
                 worktree: worktree.to_str().unwrap(),
                 branch: "lane",
