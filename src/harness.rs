@@ -1076,6 +1076,23 @@ fn record_task_proofs(
     Ok(recorded)
 }
 
+fn refresh_box_guard(ctx: &Ctx, target: &str, machine: &remote::MachineDeclaration) -> Result<()> {
+    let command = format!(
+        "HERDR_ADE_ROOT={} {} refresh-guard",
+        remote::quote(&machine.root),
+        remote::quote(&machine.pi_bin)
+    );
+    let script = remote::with_path(&machine.path, &command);
+    let output = remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(30))?;
+    if !output.success() {
+        bail!(
+            "harness_box_guard_failed: could not refresh the pi guard on {target}: {}",
+            output.error_text()
+        );
+    }
+    Ok(())
+}
+
 fn install_box(
     ctx: &Ctx,
     dispatch: &str,
@@ -1157,6 +1174,11 @@ pub(crate) fn install_with_reexec(
             box_commit: None,
         });
     }
+    if kinds.contains(&Kind::Plugin) {
+        crate::pi::install::write_guard(&crate::pi::Layout {
+            root: ctx.root.join("pi"),
+        })?;
+    }
 
     // Machine resolution belongs to the installer image built above. If that
     // image replaced this process, `reexec` never returns and the new image
@@ -1173,6 +1195,7 @@ pub(crate) fn install_with_reexec(
         .map(|(profile, _)| profile.target.clone());
     let box_paths = box_machine.map(|(_, declaration)| declaration);
     let mut warnings = Vec::new();
+    let mut box_plugin_installed = false;
     for ((repo, kind), installed_repo) in repos.iter().zip(kinds).zip(&mut installed) {
         match (&box_target, &repo.box_path) {
             (Some(target), Some(box_path)) => {
@@ -1189,6 +1212,7 @@ pub(crate) fn install_with_reexec(
                 }
                 installed_repo.box_installed = true;
                 installed_repo.box_commit = box_commit;
+                box_plugin_installed |= kind == Kind::Plugin;
             }
             (Some(_), None) => warnings.push(format!(
                 "note: {} has no box_path; skipped the box step",
@@ -1199,6 +1223,9 @@ pub(crate) fn install_with_reexec(
     }
     if let (Some(target), Some(machine)) = (&box_target, &box_paths) {
         box_settings(ctx, target, machine)?;
+        if box_plugin_installed {
+            refresh_box_guard(ctx, target, machine)?;
+        }
     }
     let plugin_version = installed
         .iter()
