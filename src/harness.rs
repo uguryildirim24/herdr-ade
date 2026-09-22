@@ -150,7 +150,7 @@ pub(crate) struct InstallOutcome {
     pub(crate) processes: Vec<ProcessProof>,
     pub(crate) tasks: Vec<TaskInstallProof>,
     #[serde(skip)]
-    warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 impl InstallOutcome {

@@ -459,6 +459,9 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
     record.phase = phase_for_merge(intent);
     record.cleanup_pending = intent.phase == MergePhase::Checkpointed;
     record.merge = Some(intent.clone());
+    if intent.phase == MergePhase::Checkpointed {
+        record.announced = None;
+    }
     record.attention.clear();
     save(project, &record)
 }
@@ -2250,6 +2253,18 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
 /// Older records still load their stored line; only durable merge-repair and
 /// divergence facts continue to use it.
 pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundRecord) -> String {
+    // A closed round has no reviewer or verdict action. Keep only a durable
+    // post-merge failure, which uses a typed lower-case error prefix; old
+    // generated `Round ...` attention is stale announcement text.
+    if record.phase.closed() {
+        return if record.attention.starts_with("Round ") {
+            String::new()
+        } else {
+            record.attention.clone()
+        };
+    }
+    // Historical merged records retain verdict_kind as evidence; the closed
+    // phase boundary above keeps it from resurrecting the old merge prompt.
     let verdict = record.verdict_kind.as_deref().or_else(|| {
         record
             .announced
@@ -2413,6 +2428,12 @@ fn announce_once(
     {
         let _lock = project.lock()?;
         let mut record = load(project, round)?;
+        // `advance` and an explicit merge use different operation locks. If
+        // the merge closes the round after advance's list read, this boundary
+        // prevents the late announcement from putting action back on it.
+        if record.phase.closed() {
+            return Ok(());
+        }
         let already = record.announced.as_deref() == Some(token);
         record.announced = Some(token.to_string());
         // The summary is deliberately not persisted. Context derives reviewer
@@ -2910,6 +2931,66 @@ impl std::str::FromStr for Stop {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PublishedRef {
+    pub(crate) branch: String,
+    pub(crate) remote: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum InstallationStep {
+    Completed {
+        outcome: crate::harness::InstallOutcome,
+    },
+    AlreadyComplete,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct MergeEffects {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publication: Option<PublishedRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) installation: Option<InstallationStep>,
+}
+
+impl MergeEffects {
+    pub(crate) fn message(&self) -> String {
+        let mut message = String::new();
+        if let Some(publication) = &self.publication {
+            message.push_str(&format!(
+                "pushed {} to {}\n",
+                publication.branch, publication.remote
+            ));
+        }
+        if let Some(installation) = &self.installation {
+            match installation {
+                InstallationStep::Completed { outcome } => {
+                    message.push_str("installed harness repositories\n");
+                    message.push_str(&outcome.message());
+                }
+                InstallationStep::AlreadyComplete => {
+                    message.push_str("installation was already complete\n");
+                }
+            }
+        }
+        message
+    }
+
+    pub(crate) fn warnings(&self) -> String {
+        match &self.installation {
+            Some(InstallationStep::Completed { outcome }) => outcome.warnings(),
+            _ => String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct MergeRun {
+    pub(crate) merge: MergeOutcome,
+    pub(crate) effects: MergeEffects,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum MergeOutcome {
     /// `H` is recorded; `lanes` lists what happened to each lane worktree.
@@ -3185,8 +3266,21 @@ pub fn read_verdict(project: &Project, record: &RoundRecord, git: &Git) -> Optio
     read_verdict_checked(project, record, git).ok().flatten()
 }
 
-/// `ha round merge` resumes the transaction in the owning round record.
+/// Test-facing shorthand when only the merge transaction itself matters.
+#[cfg(test)]
 pub fn merge(ctx: &Ctx, slug: &str, round: &str, stop: Option<Stop>) -> Result<MergeOutcome> {
+    Ok(merge_run(ctx, slug, round, stop)?.merge)
+}
+
+/// The command-facing result includes every post-merge effect. Keeping the
+/// install outcome here gives `round merge` the same process proof as the
+/// standalone installer instead of reducing it to an `installed` boolean.
+pub(crate) fn merge_run(
+    ctx: &Ctx,
+    slug: &str,
+    round: &str,
+    stop: Option<Stop>,
+) -> Result<MergeRun> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
     let result = merge_inner(ctx, project.clone(), slug, round, stop);
@@ -3208,7 +3302,7 @@ fn merge_inner(
     slug: &str,
     round: &str,
     stop: Option<Stop>,
-) -> Result<MergeOutcome> {
+) -> Result<MergeRun> {
     // Serialize explicit changes to this round. The repository lock inside
     // the merge effect serializes only the ref transaction across rounds.
     let operation = operation_lock(&project, round)?;
@@ -3222,18 +3316,27 @@ fn merge_inner(
                 // `review` owns the next operation lock. Release this one
                 // before entering the ordinary review + advance path.
                 drop(operation);
-                return start_moved_base_repair(ctx, &project, slug, round, &from, &to);
+                return Ok(MergeRun {
+                    merge: start_moved_base_repair(ctx, &project, slug, round, &from, &to)?,
+                    effects: MergeEffects::default(),
+                });
             }
         },
     };
-    if matches!(
+    let effects = if matches!(
         &outcome,
         Ok(MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. })
-    ) && let Err(error) = finish_publication(ctx, &project, round)
-    {
-        let _ = crate::board::refresh(ctx, &project);
-        return Err(error);
-    }
+    ) {
+        match finish_publication(ctx, &project, round) {
+            Ok(effects) => effects,
+            Err(error) => {
+                let _ = crate::board::refresh(ctx, &project);
+                return Err(error);
+            }
+        }
+    } else {
+        MergeEffects::default()
+    };
     // The durable completion boundary: the landing evidence and the shared
     // plan refresh. Both are retry-safe and never roll back the merge
     // (SPEC-talk §6.1, §6.5).
@@ -3290,12 +3393,21 @@ fn merge_inner(
             eprintln!("cleanup marker pending for {round}: {error:#}");
         }
     }
-    outcome
+    outcome.map(|merge| MergeRun { merge, effects })
 }
 
 /// Finish post-merge effects in order. Each successful effect is durable, so
 /// retry starts at the first outstanding one and never merges or pushes twice.
-fn finish_publication(ctx: &Ctx, project: &Project, round: &str) -> Result<()> {
+fn finish_publication(ctx: &Ctx, project: &Project, round: &str) -> Result<MergeEffects> {
+    finish_publication_with(ctx, project, round, crate::harness::install)
+}
+
+fn finish_publication_with(
+    ctx: &Ctx,
+    project: &Project,
+    round: &str,
+    installer: impl FnOnce(&Ctx) -> Result<crate::harness::InstallOutcome>,
+) -> Result<MergeEffects> {
     let record = load(project, round)?;
     if record.push_remote.is_some() && !record.published {
         let remote = record
@@ -3330,24 +3442,44 @@ fn finish_publication(ctx: &Ctx, project: &Project, round: &str) -> Result<()> {
     }
 
     let record = load(project, round)?;
-    if record.install_required && !record.installed {
-        if let Err(error) = crate::harness::install(ctx) {
-            let message = format!(
-                "round_install_pending: `{round}` is merged and published; installation failed: {error:#}"
-            );
-            let _lock = project.lock()?;
-            let mut current = load(project, round)?;
-            current.attention = message.clone();
-            save(project, &current)?;
-            bail!(message);
-        }
+    let installation = if record.install_required && !record.installed {
+        let outcome = match installer(ctx) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = format!(
+                    "round_install_pending: `{round}` is merged and published; installation failed: {error:#}"
+                );
+                let _lock = project.lock()?;
+                let mut current = load(project, round)?;
+                current.attention = message.clone();
+                save(project, &current)?;
+                bail!(message);
+            }
+        };
         let _lock = project.lock()?;
         let mut current = load(project, round)?;
         current.installed = true;
         current.attention.clear();
         save(project, &current)?;
-    }
-    Ok(())
+        Some(InstallationStep::Completed { outcome })
+    } else if record.install_required {
+        Some(InstallationStep::AlreadyComplete)
+    } else {
+        None
+    };
+    let finished = load(project, round)?;
+    let publication = if finished.published {
+        finished.push_remote.map(|remote| PublishedRef {
+            branch: finished.branch,
+            remote,
+        })
+    } else {
+        None
+    };
+    Ok(MergeEffects {
+        publication,
+        installation,
+    })
 }
 
 fn fresh_merge(
@@ -5189,14 +5321,94 @@ mod tests {
         assert_eq!(fx.world.runner.count("push publish"), 1);
 
         std::fs::remove_file(hook).unwrap();
-        assert!(matches!(
-            merge(&fx.world.ctx(), "demo", "r1", None).unwrap(),
-            MergeOutcome::NoOp { .. }
-        ));
+        let retried = merge_run(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        assert!(matches!(retried.merge, MergeOutcome::NoOp { .. }));
+        assert_eq!(
+            retried.effects.publication,
+            Some(PublishedRef {
+                branch: "main".into(),
+                remote: "publish".into(),
+            })
+        );
         let finished = load(&fx.project, "r1").unwrap();
         assert!(finished.published);
         assert_eq!(finished.merge.as_ref().unwrap().head, checkpoint);
         assert_eq!(fx.world.runner.count("push publish"), 2);
+    }
+
+    #[test]
+    fn round_install_returns_the_installers_running_proof_and_does_not_repeat_it() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&ctx, "demo", "r1", None).unwrap();
+
+        let mut record = load(&fx.project, "r1").unwrap();
+        record.install_required = true;
+        record.installed = false;
+        save(&fx.project, &record).unwrap();
+        let install = crate::harness::InstallOutcome {
+            repositories: Vec::new(),
+            box_target: Some("remote-host".into()),
+            box_settings_installed: true,
+            live_handoff_required: false,
+            processes: vec![crate::harness::ProcessProof {
+                machine: "oci".into(),
+                process: "ticker".into(),
+                pid: Some(42),
+                build: Some("installed-head".into()),
+                state: "running".into(),
+                reason: None,
+            }],
+            tasks: vec![crate::harness::TaskInstallProof {
+                project: "demo".into(),
+                task: "job-0001".into(),
+                machine: "oci".into(),
+                build: "installed-head".into(),
+                running_processes: true,
+            }],
+            warnings: vec!["note: one optional step was skipped".into()],
+        };
+
+        let effects =
+            finish_publication_with(&ctx, &fx.project, "r1", |_| Ok(install.clone())).unwrap();
+        assert_eq!(
+            effects.installation,
+            Some(InstallationStep::Completed {
+                outcome: install.clone()
+            })
+        );
+        assert!(
+            effects.message().contains(&install.message()),
+            "{}",
+            effects.message()
+        );
+        assert_eq!(effects.warnings(), install.warnings());
+        let typed = serde_json::to_value(&effects).unwrap();
+        assert_eq!(
+            typed["installation"]["outcome"]["processes"][0]["build"],
+            "installed-head"
+        );
+        assert_eq!(
+            typed["installation"]["outcome"]["tasks"][0]["running_processes"],
+            true
+        );
+        assert!(load(&fx.project, "r1").unwrap().installed);
+
+        let repeated = finish_publication_with(&ctx, &fx.project, "r1", |_| {
+            panic!("an already completed installation must not run again")
+        })
+        .unwrap();
+        assert_eq!(
+            repeated.installation,
+            Some(InstallationStep::AlreadyComplete)
+        );
+        assert!(
+            repeated
+                .message()
+                .contains("installation was already complete")
+        );
     }
 
     #[test]
@@ -5953,6 +6165,33 @@ mod tests {
                 .0,
             digest
         );
+    }
+
+    #[test]
+    fn a_checkpointed_round_never_regains_merge_verdict_attention() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+
+        advance(&ctx, "demo").unwrap();
+        let announced = load(&fx.project, "r1").unwrap();
+        assert!(current_attention(&ctx, &fx.project, &announced).contains("run `round merge r1`"));
+
+        merge(&ctx, "demo", "r1", None).unwrap();
+        advance(&ctx, "demo").unwrap();
+
+        let merged = load(&fx.project, "r1").unwrap();
+        assert_eq!(merged.phase, RoundPhase::Merged);
+        assert!(merged.attention.is_empty(), "{merged:?}");
+        assert!(merged.announced.is_none(), "{merged:?}");
+        assert!(
+            current_attention(&ctx, &fx.project, &merged).is_empty(),
+            "{}",
+            current_attention(&ctx, &fx.project, &merged)
+        );
+        let shown = show(&ctx, "demo", "r1").unwrap();
+        assert!(!shown.contains("attention:"), "{shown}");
     }
 
     /// Automation may consume a verdict and announce it, but only a command
