@@ -1768,6 +1768,12 @@ fn awaiting_follow_up(record: &Thread) -> bool {
     })
 }
 
+fn awaiting_bootstrap(record: &Thread) -> bool {
+    record.kind != Kind::Adopted
+        && !record.launch.kind.is_empty()
+        && record.bootstrap != "acknowledged"
+}
+
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutcome> {
@@ -1784,7 +1790,11 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     }
     // The brief and every follow-up have one ordered delivery path. Once one
     // message is queued, later messages join it until the ticker drains them.
-    if record.status == Status::Starting || record.prompt_pending || awaiting_follow_up(&record) {
+    if record.status == Status::Starting
+        || record.prompt_pending
+        || awaiting_bootstrap(&record)
+        || awaiting_follow_up(&record)
+    {
         let mut queued = false;
         record = thread::update_checked(&project, id, |thread| {
             match thread.status {
@@ -1796,6 +1806,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             }
             if thread.status == Status::Starting
                 || thread.prompt_pending
+                || awaiting_bootstrap(thread)
                 || awaiting_follow_up(thread)
             {
                 thread.follow_ups.push(FollowUp {
@@ -3206,6 +3217,23 @@ mod tests {
             agent_status: state.into(),
             ..Agent::default()
         }
+    }
+
+    #[test]
+    fn a_follow_up_stays_queued_until_the_matching_bootstrap_receipt() {
+        let mut record = worktree_thread();
+        record.status = Status::Open;
+        record.prompt_pending = false;
+        record.launch.kind = "pi".into();
+        record.bootstrap.clear();
+        assert!(awaiting_bootstrap(&record));
+
+        record.bootstrap = "acknowledged".into();
+        assert!(!awaiting_bootstrap(&record));
+
+        record.kind = Kind::Adopted;
+        record.bootstrap.clear();
+        assert!(!awaiting_bootstrap(&record));
     }
 
     #[test]
