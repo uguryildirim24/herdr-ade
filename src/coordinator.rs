@@ -517,21 +517,26 @@ fn digest_snapshot(
     let open: Vec<_> = rows
         .iter()
         .filter(|row| {
-            matches!(
-                row.group,
-                crate::thread::Group::ReadyForReview
-                    | crate::thread::Group::WaitingOnYou
-                    | crate::thread::Group::Unknown
-                    | crate::thread::Group::Landing
-            ) || row.thread.lineage_mismatch
-                || !row.thread.copy_notes.is_empty()
-                || !row.thread.pr_note.is_empty()
-                || crate::round::latest_event(&events, &row.thread.id, row.thread.attempt.max(1))
+            row.group != crate::thread::Group::Resolved
+                && (matches!(
+                    row.group,
+                    crate::thread::Group::ReadyForReview
+                        | crate::thread::Group::WaitingOnYou
+                        | crate::thread::Group::Unknown
+                        | crate::thread::Group::Landing
+                ) || row.thread.lineage_mismatch
+                    || !row.thread.copy_notes.is_empty()
+                    || !row.thread.pr_note.is_empty()
+                    || crate::round::latest_event(
+                        &events,
+                        &row.thread.id,
+                        row.thread.attempt.max(1),
+                    )
                     .is_some_and(|event| {
                         event.payload.done.is_some()
                             || event.payload.waiting.is_some()
                             || event.payload.failed.is_some()
-                    })
+                    }))
         })
         .collect();
     if !open.is_empty() {
