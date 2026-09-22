@@ -213,6 +213,12 @@ pub(crate) enum PendingPrompt {
 struct PendingPromptRecord {
     delivery: Option<String>,
     at: i64,
+    /// Stored so a hook can remove a harness prompt that was joined to words
+    /// already waiting in the pane. Older records had only the hash.
+    #[serde(default)]
+    pane: String,
+    #[serde(default)]
+    text: String,
 }
 
 /// A marker older than this belongs to a hook that never fired; it must not
@@ -357,6 +363,35 @@ pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
             && text.contains(" context "))
 }
 
+/// Returns only Rolf's words from a recorded request. Before prompt markers
+/// carried their text, a ticker line could be appended to words already in the
+/// pane; remove that known suffix while leaving the append-only row readable.
+pub(crate) fn human_request_text(text: &str) -> Option<String> {
+    if is_historical_system_prompt(text) {
+        return None;
+    }
+    let mut kept = String::new();
+    let mut stripped = false;
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        if let Some(start) = body.find(crate::steps::TICKER_PROMPT_PREFIX) {
+            kept.push_str(&body[..start]);
+            stripped = true;
+        } else {
+            kept.push_str(body);
+        }
+        kept.push_str(newline);
+    }
+    let kept = if stripped { kept.trim() } else { text };
+    if kept.trim().is_empty() || is_historical_system_prompt(kept) {
+        None
+    } else {
+        Some(kept.to_string())
+    }
+}
+
 fn pending_prompt_path(project: &Project, pane: &str, text: &str) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(pane.as_bytes());
@@ -388,6 +423,8 @@ fn mark_pending_prompt(
         &PendingPromptRecord {
             delivery: delivery.map(str::to_string),
             at: jiff::Timestamp::now().as_second(),
+            pane: pane.to_string(),
+            text: marker_text(text).trim_end().to_string(),
         },
     )
 }
@@ -424,6 +461,78 @@ pub(crate) fn take_pending_prompt(
         Some(request) => PendingPrompt::Delivery(request),
         None => PendingPrompt::Automated,
     })
+}
+
+fn remove_marked_once(prompt: &str, marked: &str) -> Option<String> {
+    let mut search = 0;
+    while let Some(relative) = prompt[search..].find(PASTE_OPEN) {
+        let start = search + relative;
+        let after_open = &prompt[start + PASTE_OPEN.len()..];
+        let Some((id, after_id)) = after_open.split_once("\">") else {
+            break;
+        };
+        if id.is_empty() || id.contains(['<', '>', '"']) {
+            search = start + PASTE_OPEN.len();
+            continue;
+        }
+        let close = format!("</pasted_content id=\"{id}\">");
+        let Some((content, after_close)) = after_id.split_once(&close) else {
+            break;
+        };
+        if content.trim() == marked.trim() {
+            let end = prompt.len() - after_close.len();
+            let mut result = prompt.to_string();
+            result.replace_range(start..end, "");
+            return Some(result);
+        }
+        search = prompt.len() - after_close.len();
+    }
+
+    let start = prompt.find(marked)?;
+    let mut result = prompt.to_string();
+    result.replace_range(start..start + marked.len(), "");
+    Some(result)
+}
+
+/// Consumes every live automated marker whose sent text occurs in this hook
+/// prompt and returns the words that were already present in the pane.
+pub(crate) fn take_automated_parts(project: &Project, pane: &str, text: &str) -> String {
+    let dir = talk_dir(project).join("prompts");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return text.to_string();
+    };
+    let now = jiff::Timestamp::now().as_second();
+    let mut markers = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(record) = project::read_json::<PendingPromptRecord>(&path) else {
+            continue;
+        };
+        if now - record.at > PENDING_PROMPT_SECS {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        if record.delivery.is_none()
+            && record.pane == pane
+            && !record.text.is_empty()
+            && text.contains(&record.text)
+        {
+            markers.push((record.text, path));
+        }
+    }
+    markers.sort_by_key(|marker| std::cmp::Reverse(marker.0.len()));
+    let mut remainder = text.to_string();
+    for (marked, path) in markers {
+        let mut removed = false;
+        while let Some(stripped) = remove_marked_once(&remainder, &marked) {
+            remainder = stripped;
+            removed = true;
+        }
+        if removed {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    remainder.trim().to_string()
 }
 
 // ------------------------------------------------------------- settings
@@ -541,11 +650,7 @@ pub(crate) fn request_text(project: &Project, id: &str) -> Option<String> {
         .into_iter()
         .rev()
         .find_map(|line| match line.entry {
-            Entry::Rolf { request, text, .. }
-                if request == id && !is_historical_system_prompt(&text) =>
-            {
-                Some(text)
-            }
+            Entry::Rolf { request, text, .. } if request == id => human_request_text(&text),
             _ => None,
         })
 }
@@ -567,8 +672,8 @@ pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, S
         .lines
         .iter()
         .filter_map(|line| match &line.entry {
-            Entry::Rolf { request, text, .. } if !is_historical_system_prompt(text) => {
-                Some((request.clone(), text.clone()))
+            Entry::Rolf { request, text, .. } => {
+                human_request_text(text).map(|text| (request.clone(), text))
             }
             _ => None,
         })
