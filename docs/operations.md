@@ -15,8 +15,9 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
 
 ```
 ~/.herdr-ade/<project>/
-  PROJECT.md              settings (TOML between +++ lines) and your standing instructions; yours
-  MEMORY.md, memory/      project memory; the coordinator's
+  PROJECT.md              settings and historical standing instructions; yours
+  notes.jsonl             dated memory and instructions with request ids and replacements
+  MEMORY.md, memory/      historical memory, shown as undated until explicitly replaced
   tasks/job-NNNN.toml     stable tasks: request, acceptance, links and evidence; the binary's
   TASKS.md                generated task view; never edit it (the first task archives any old hand-written list in memory/archive/)
   routines/<name>.md      routines; the coordinator's
@@ -66,7 +67,8 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
-| `task add`, `task show`, `task list`, `task note`, `task evidence` | Create and inspect stable tasks, add dated notes, and record installation or per-condition verification commands. State is derived from linked events and rounds. |
+| `task add`, `task show`, `task list`, `task note`, `task evidence` | Create and inspect stable tasks, add task notes with a request id and optional explicit replacement, and record installation or per-condition verification commands. State is derived from linked events and rounds. |
+| `note add` | Add dated project memory or a standing instruction with its request id; optionally scope it to tasks or explicitly replace an older row. |
 | `thread start <project> --title T --plain S (--job TASK \| --request R --acceptance S...) [--repo PATH] [--machine M] [--base BRANCH] --task-file F` | An ordinary lane names its task or creates it in the same command. Routing is resolved before any worktree or tab exists. Its selected recipe supplies kind and args. The brief `tasks/<id>.md` is committed on the integration branch, then the worktree and tab are created. `--plain` is required; returns before the agent is up. `[dispatch].machine` supplies default box placement for repositories with a box clone. |
 | `thread retry`, `thread cancel`, `thread rebind`, `thread adopt`, `thread prompt`, `thread list`, `thread show`, `thread ack` | See `--help` on each. |
 | `thread resolve <project> <id> [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy and close the pane and tab. A landed or closed-round worktree is removed only when it has no changes or non-disposable ignored data. Changes refuse resolution; ignored data resolves the thread but keeps the worktree with folder sizes. The branch is always retained. |
@@ -226,7 +228,7 @@ For other agents the principle is the same: allow reading and steering, keep any
 - **They are soft.** Agents have a shell. The guards are the skill text, your agent's permission prompts, keeping the approval list outside every agent's working directory, and `routine approve` refusing without a terminal and a typed confirmation. None of this stops an agent that runs with skip-permission arguments from editing those files directly.
 - **A thread can impersonate you.** Any thread agent can prompt the coordinator's pane through Herdr, and that message carries no ticker marker. The skill's rule that a go-ahead must name the threads lowers the risk; it does not remove it.
 - **An approved routine command covers the command text only.** `./check.sh` keeps its hash while the script changes.
-- **Prompt injection is reduced, not removed.** The coordinator reads reports and may choose to fetch pull request comments itself. Memory is a carrier: whatever it writes there is inlined into every later brief.
+- **Prompt injection is reduced, not removed.** The coordinator reads reports and may choose to fetch pull request comments itself. Current unscoped memory reaches later briefs; task-scoped and replaced notes are filtered by the binary.
 - **Cost.** Every thread is a full agent session, and each nudge and each `context` spends coordinator tokens.
 
 ## Nudges and notifications
