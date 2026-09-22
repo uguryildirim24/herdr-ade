@@ -5869,7 +5869,6 @@ mod tests {
                 state: "running".into(),
                 reason: None,
             }],
-            conversions: vec!["local project demo: already converted".into()],
             tasks: vec![crate::harness::TaskInstallProof {
                 project: "demo".into(),
                 task: "job-0001".into(),

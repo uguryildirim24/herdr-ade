@@ -26,13 +26,13 @@ How Herdr ADE works, what it writes where, what its safety settings do and don't
     threads/<id>.task.md  the task as given      threads/<id>/     project-owned lane folder
     inbox/, inbox/done/   messages with no thread or round home
     asks/, events/, ops/  proof, delivery and recovery records
-    rounds/               pinned round state     history/           converted old documents
+    rounds/               pinned round state     history/           archived old documents
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
 ~/.config/herdr-ade/config.toml             executable recipes, editable routing, dispatch placement, machines and harness repositories; any coordinator may edit it
 ~/.config/herdr-ade/approved-routines.json  written only by `routine approve`
 ```
 
-Content folders in this tree are created on their first write; a new project has only `PROJECT.md` and `.state/`. `project convert` explicitly moves every old top-level machine record into `.state/` and is a no-op once done. It refuses before moving anything when an old and new location both exist. A live project-owned lane folder stays where its thread record says it is; only the thread's record files move.
+Content folders in this tree are created on their first write; a new project has only `PROJECT.md` and `.state/`. All binary-owned records live under `.state/`. A project-owned lane folder stays where its thread record says it is.
 
 Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The lane is primed with `Run <prefix> skill <role>, then read tasks/<id>.md and do what it says.` The thread directory is `<worktree>/.herdr-project/<project>-<id>/`: the agent writes `report.md` and creates `library/` only for real deliverables; a tab thread with no repository gets its `brief.md` there instead. That folder, and `.worktrees/`, are added to `info/exclude`. `done` seals the report once as `.state/artifacts/<hash>`; thread and task views find it from the thread record. Unmatched historical `.state/threads/<id>.md` reports remain readable. Resolving removes a finished worktree with `git worktree remove` without `--force`, after copying real deliverables. A remote lane's rebuildable Cargo folder is removed in the same operation. Uncommitted tracked or untracked changes refuse resolution. Ignored data keeps both the worktree and its build folder but does not stop resolution; the typed `ignored_data` reason names each folder and its size. The branch is always kept.
 
@@ -65,7 +65,6 @@ Every command accepts the global `--json` flag. It returns one record with an
 | Command | What it does |
 | --- | --- |
 | `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder with its one current page. |
-| `project convert <project>` | Move old machine records into `.state/` and retired project documents byte-for-byte into timestamped `.state/history/`. Refuses all old/new conflicts before moving anything and refuses while a round is being merged. A repeated conversion changes nothing. |
 | `list [--all]` | Projects with status and thread counts by group. |
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The `PROJECT.md` body followed by new messages from Rolf, unhandled inbox items, current failures, work needing action and the compact recipe list. `--peek` records nothing. |
