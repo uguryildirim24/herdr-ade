@@ -40,7 +40,7 @@ usage.jsonl            one line per Pro send
 cooldown-until         RFC 3339; the 2 h breaker
 start.lock             flock; one Codex start at a time
 turn.lock              flock; turn admission and the two-turn cap are atomic
-bridge-state.json      last /healthz pid and version
+bridge-state.json      last bridge pid, process start, port and health fields
 codex-home/            the shared Pro Codex home (config.toml, instructions.md, AGENTS.md)
 ```
 
