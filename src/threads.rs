@@ -412,7 +412,7 @@ fn resolve_placement(
                 Ok(profile) if profile.is_local() => crate::doctor::recipe_ready_local(ctx, launch)
                     .map(|_| None)
                     .map_err(|error| format!("{error:#}")),
-                Ok(profile) => box_repo_candidate(repo, listed)
+                Ok(profile) => box_repo_candidate(&ctx.config_dir, &candidate, repo, listed)
                     .map_err(|error| format!("{error:#}"))
                     .and_then(|_| {
                         if project::machine_held(&ctx.root, &profile.id) {
@@ -507,16 +507,6 @@ fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
     crate::ask::say(ctx, slug, what, None)
 }
 
-/// A `kind = "pi"` launch is refused unless its provider is ready (SPEC-pi
-/// §3.4, T11): never a lane that waits for a first prompt it cannot answer.
-pub fn pi_ready(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
-    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-        .context("pi_args_forbidden: a pi launch names no --provider")?;
-    crate::pi_ade::check_with(ctx.runner, &ctx.root, &provider)
-        .map(|_| ())
-        .with_context(|| format!("pi_not_ready: provider {provider}"))
-}
-
 /// Recipe readiness on a box is owned by the doctor probes.
 fn box_launch_ready(
     ctx: &Ctx,
@@ -527,9 +517,13 @@ fn box_launch_ready(
         .with_context(|| format!("recipe `{}` on `{}`", launch.recipe_id, profile.label))
 }
 
-/// Box pi readiness: the check runs on the box, never against the Mac login
-/// (SPEC-remote §4.1, SPEC-pi §3.4).
-pub fn box_pi_ready(ctx: &Ctx, machine: &str, launch: &crate::contracts::Launch) -> Result<()> {
+/// Recipe readiness on a remote machine, measured there rather than against
+/// this machine's executable or login state.
+pub(crate) fn box_launch_ready_for(
+    ctx: &Ctx,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
     box_launch_ready(ctx, &profile, launch)
@@ -575,6 +569,8 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
 /// repo with neither falls back to the built-in harness map, or keeps the
 /// mapping message (t-0070).
 fn box_repo_candidate(
+    config_dir: &Path,
+    machine: &str,
     repo: Option<&str>,
     row: Option<&crate::project::Repo>,
 ) -> Result<(String, String)> {
@@ -591,21 +587,28 @@ fn box_repo_candidate(
             "box_path_missing: `{repo}` has a publish_url in PROJECT.md but no `box_path` in that row; add the box clone path before the first box start"
         ),
         (None, None) => {
-            let map = crate::remote::box_repo_for(repo).with_context(|| {
+            let map = crate::remote::box_repo_for(config_dir, machine, repo).with_context(|| {
                 format!(
                     "box_repo_unmapped: {repo} has no Mac-to-box row; add one before the first box start"
                 )
             })?;
-            Ok((map.box_path.to_string(), map.publish_url.to_string()))
+            Ok((map.box_path.unwrap(), map.publish_url.unwrap()))
         }
     }
 }
 
 pub(crate) fn box_repo_row(
+    config_dir: &Path,
     settings: &crate::project::Settings,
+    machine: &str,
     repo: &str,
 ) -> Result<(String, String)> {
-    box_repo_candidate(repo.into(), settings.repos.iter().find(|r| r.path == repo))
+    box_repo_candidate(
+        config_dir,
+        machine,
+        repo.into(),
+        settings.repos.iter().find(|r| r.path == repo),
+    )
 }
 
 /// The box start side (SPEC-remote §4.2 steps 2–5): commit the brief `B` on
@@ -623,7 +626,8 @@ fn place_box_worktree(
     let runner = ctx.runner;
     let (settings, _) = project.read_project_md()?;
     let label = crate::project::display_name(&settings.name, &project.slug);
-    let (box_repo, publish_url) = box_repo_row(&settings, &record.repo)?;
+    let (box_repo, publish_url) =
+        box_repo_row(&ctx.config_dir, &settings, &record.machine, &record.repo)?;
     // Both clones must name the configured publish URL. The push still uses
     // the URL itself; finding the matching remote only validates this clone.
     let _ = remote::remote_for_url(runner, &record.repo, &publish_url)?;
@@ -722,12 +726,13 @@ fn place_box_worktree(
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
     let attempt = record.attempt.max(1);
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &record.machine)?;
     let env = project::tab_env(
         &project.slug,
         &record.id,
         attempt,
         &brief_hash,
-        &record.machine,
+        Some(&machine),
         &spec,
     );
     // One project owns one workspace on this machine. Starts can provision
@@ -815,8 +820,9 @@ fn place_box_worktree(
             }
         })
         .unwrap_or_default();
+    let remote_prefix = format!("{} --root {}", machine.ade_bin, machine.root);
     let start_line = thread::launch_prompt(
-        "",
+        &remote_prefix,
         &project.slug,
         &Thread {
             machine: record.machine.clone(),
@@ -842,7 +848,7 @@ fn place_box_worktree(
         start_line,
         created: crate::project::now(),
     };
-    let card_path = crate::contracts::box_lane_card(&project.slug, &record.id);
+    let card_path = format!("{}/{}/lanes/{}.toml", machine.root, project.slug, record.id);
     remote::provision_card(
         runner,
         &target,
@@ -1016,7 +1022,7 @@ fn place_ade_worktree(
         &record.id,
         record.attempt.max(1),
         &brief_hash,
-        "",
+        None,
         &spec,
     );
     match view
@@ -1118,7 +1124,7 @@ fn place_ade_tab(
         &record.id,
         record.attempt.max(1),
         &brief_hash,
-        "",
+        None,
         &spec,
     );
     let created = view
@@ -1254,9 +1260,7 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
         box_launch_ready(ctx, &profile, &record.launch)?;
         place_and_brief(ctx, project, &view, &record.id, true)?;
     } else {
-        if record.launch.kind == "pi" {
-            pi_ready(ctx, &record.launch)?;
-        }
+        crate::doctor::recipe_ready_local(ctx, &record.launch)?;
         if record.kind == Kind::Worktree && record.worktree_path.is_empty()
             || record.kind == Kind::Tab && record.pane_id.is_empty()
         {
@@ -1645,27 +1649,37 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
-    let state = prompt_state(&record, &agents)?;
+    let kind = if record.launch.kind.is_empty() {
+        &record.agent
+    } else {
+        &record.launch.kind
+    };
+    let resumable = crate::adapters::declaration(&ctx.config_dir, kind)
+        .is_ok_and(|adapter| adapter.blocked_error_resumable);
+    let state = prompt_state(&record, &agents, resumable)?;
     view.herdr
         .on_machine(record.machine_route())
         .agent_prompt(&record.pane_id, text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // A pi lane reports `blocked` for its own recorded error; a prompt
-    // resumes it, so that error is cleared.
-    if record.agent == "pi" && state == "blocked" && !record.error.is_empty() {
+    // A blocked lane with its own recorded error is resumed by this prompt.
+    if resumable && state == "blocked" && !record.error.is_empty() {
         thread::update(&project, id, |t| t.error.clear())?;
     }
     Ok(state)
 }
 
 /// The state a follow-up may be sent in, or the refusal.
-pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
+pub fn prompt_state(
+    record: &Thread,
+    agents: &[Agent],
+    blocked_error_resumable: bool,
+) -> Result<String> {
     let agent = agents
         .iter()
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread retry`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" if record.agent != "pi" || record.error.is_empty() => {
+        "blocked" if !blocked_error_resumable || record.error.is_empty() => {
             Err(crate::refusal::error(format!(
                 "agent_blocked: {} is waiting on the user in its pane ({})",
                 record.id, record.pane_id
@@ -2213,7 +2227,7 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         bail!("{} has no recorded worktree", record.id);
     }
     let (settings, _) = project.read_project_md()?;
-    let (box_repo, _) = box_repo_row(&settings, &record.repo)?;
+    let (box_repo, _) = box_repo_row(&ctx.config_dir, &settings, &record.machine, &record.repo)?;
     let target = remote::machine_profile(
         ctx.runner,
         &ctx.env.herdr_bin(),
@@ -2221,7 +2235,8 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         record.machine_route(),
     )?
     .target;
-    let build = crate::contracts::box_build_folder(&project.slug, &record.id);
+    let machine = remote::machine_declaration(&ctx.config_dir, &record.machine)?;
+    let build = format!("{}/{}-{}", machine.build, project.slug, record.id);
     let script = format!(
         "cd {} && git worktree remove {} && rm -rf -- {}",
         remote::quote(&box_repo),
@@ -2517,20 +2532,23 @@ mod tests {
             ..worktree_thread()
         };
         assert!(
-            prompt_state(&t, &[])
+            prompt_state(&t, &[], false)
                 .unwrap_err()
                 .to_string()
                 .contains("bare shell prompt")
         );
-        assert!(prompt_state(&t, &[agent("unknown")]).is_err());
+        assert!(prompt_state(&t, &[agent("unknown")], false).is_err());
         assert!(
-            prompt_state(&t, &[agent("blocked")])
+            prompt_state(&t, &[agent("blocked")], false)
                 .unwrap_err()
                 .to_string()
                 .contains("agent_blocked")
         );
-        assert_eq!(prompt_state(&t, &[agent("working")]).unwrap(), "working");
-        assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
+        assert_eq!(
+            prompt_state(&t, &[agent("working")], false).unwrap(),
+            "working"
+        );
+        assert_eq!(prompt_state(&t, &[agent("idle")], false).unwrap(), "idle");
     }
 
     #[test]
@@ -3344,7 +3362,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let e = box_repo_row(&settings, "/r").unwrap_err().to_string();
+        let e = box_repo_row(Path::new(""), &settings, "oci", "/r")
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("box_publish_url_missing") && e.contains("publish_url"),
             "{e}"
@@ -3352,7 +3372,9 @@ mod tests {
 
         settings.repos[0].box_path = None;
         settings.repos[0].publish_url = Some("https://example/r.git".into());
-        let e = box_repo_row(&settings, "/r").unwrap_err().to_string();
+        let e = box_repo_row(Path::new(""), &settings, "oci", "/r")
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("box_path_missing") && e.contains("box_path"),
             "{e}"
@@ -3361,9 +3383,17 @@ mod tests {
         // A repo with neither, and not in the built-in list, keeps the
         // mapping message; a built-in harness repo resolves from the map.
         settings.repos[0].publish_url = None;
-        let e = box_repo_row(&settings, "/other").unwrap_err().to_string();
+        let e = box_repo_row(Path::new(""), &settings, "oci", "/other")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("box_repo_unmapped"), "{e}");
-        let (box_path, url) = box_repo_row(&settings, "/home/agent/projects/herdr").unwrap();
+        let (box_path, url) = box_repo_row(
+            Path::new(""),
+            &settings,
+            "oci",
+            "/home/agent/projects/herdr",
+        )
+        .unwrap();
         assert_eq!(box_path, "/home/ubuntu/projects/herdr");
         assert!(url.ends_with("herdr.git"), "{url}");
     }

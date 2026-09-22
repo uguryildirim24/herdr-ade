@@ -129,9 +129,15 @@ When Rolf asks in chat to change a recorded choice, the coordinator treats it li
 
 A round is a set of lanes that are reviewed and merged together. `hp round advance <slug>` starts the reviewer on its own, including after a REJECT once `hp round review <slug> <round>` makes the next revision. Rounds may be reviewed side by side: later lane tasks, review briefs, verdict files and HANDOFF checkpoints are bookkeeping, so they do not make an earlier verdict stale. When `hp round merge <slug> <round>` finds any other changed path after the brief commit, it makes the next `review/<round>-<n>` revision on the new base and starts a repair reviewer. That reviewer's task names the earlier candidate C and verdict commit V, so it merges C, including the earlier reviewer's fixes, over the new base instead of merging the raw lane shas. This happens even when Git reports a clean merge: textual compatibility does not establish that two independently reviewed changes work together. Merge transactions on the same integration branch take one durable turn at a time; if one is interrupted, retry that round's merge before merging another. Recovery uses the same four verbs as threads: `round retry` replaces the reviewer attempt without making a duplicate, `round cancel` stops the round and cleans its processes, `round rebind` binds a verified live reviewer thread, and `round adopt` accepts valid sealed lane work or a verdict whose candidate, manifest and policy hashes match. A start that does not take says so and remains bounded by routing.
 
+## Agent and machine adapters
+
+Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `talk`, `capabilities`, required flags and effort names, a doctor readiness driver and argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events, prompt event, final-message fields and block response. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
+
+Machine facts live in `[machines.<name>]`: `target`, `session`, `home`, `root`, `worktrees`, `build`, `path`, `ade_bin`, `pi_bin`, and `repos`. Each repo row names `path`, `box_path`, and `publish_url`. Placement, lane environment, start lines, courier paths and cleanup resolve the selected machine row; another box does not add a code branch.
+
 ## Task-based routing
 
-`thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. `--workflow` selects instruction text and is available to routing rules. Optional task front matter may set `product = "code"`, `"spec"` or `"web-research"`, and `requires_claude = true`. The title and body do not select a recipe.
+`thread start --task-file <full brief>` has no `--role`, `--recipe` or `--model`; those arguments are refused. `--workflow` selects instruction text and is available to routing rules. Optional task front matter may set `product = "code"`, `"spec"` or `"web-research"`, and `capability = "<name>"`. The selected recipe must declare that capability. The title and body do not select a recipe.
 
 Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table.
 
@@ -156,7 +162,7 @@ product = "web-research"
 recipe = "agy_gemini_flash"
 
 [[routing.rules]]
-requires_claude = true
+capability = "native-chat"
 recipe = "claude_fable_xhigh"
 
 [routing.pins]

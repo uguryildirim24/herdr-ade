@@ -18,8 +18,6 @@ use crate::project::{Repo, Settings};
 use crate::remote;
 use crate::runner::Cmd;
 
-/// The saved machine whose box gets the same build and install.
-const BOX_MACHINE: &str = "oci";
 /// The plugin build's tool path, exactly as the coordinator uses it by hand.
 pub(crate) const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -35,6 +33,8 @@ pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
 struct RawConfig {
     #[serde(default)]
     harness: HarnessConfig,
+    #[serde(default)]
+    dispatch: crate::launch::DispatchConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -311,11 +311,6 @@ fn installed_version(ctx: &Ctx, bin: &str) -> Result<InstalledBinary> {
     })
 }
 
-/// The box's PATH for a build, exported before the zig probe and the cargo
-/// call. The box keeps zig in `$HOME/.local/bin`, which a non-login SSH shell
-/// does not otherwise carry.
-const BOX_BUILD_PATH: &str = "/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin";
-
 /// Resolve the box's zig on the box for a fork build, as a shell snippet.
 ///
 /// The repository-local `<box_path>/.target/rebase/zig-0.16.0/zig` wins when it
@@ -344,7 +339,25 @@ fn box_zig_script(box_path: &str) -> String {
     )
 }
 
-fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<Option<String>> {
+fn box_binary(machine: &crate::remote::MachineDeclaration, bin: &str) -> Result<String> {
+    match bin {
+        "herdr-ade" => Ok(machine.ade_bin.clone()),
+        "herdr-pi" => Ok(machine.pi_bin.clone()),
+        "herdr" => Path::new(&machine.ade_bin)
+            .parent()
+            .map(|dir| dir.join(bin).to_string_lossy().into_owned())
+            .context("machine ade_bin has no parent folder"),
+        _ => bail!("harness binary `{bin}` has no machine destination"),
+    }
+}
+
+fn box_build(
+    ctx: &Ctx,
+    target: &str,
+    machine: &crate::remote::MachineDeclaration,
+    box_path: &str,
+    kind: Kind,
+) -> Result<Option<String>> {
     let zig = if kind == Kind::Fork {
         format!("\n{}", box_zig_script(box_path))
     } else {
@@ -353,9 +366,13 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<Opti
     let mut installs = String::new();
     for bin in kind.binaries() {
         installs.push_str(&format!(
-            "\ncp target/release/{bin} $HOME/.local/bin/.{bin}.install.$$\n\
-             chmod 755 $HOME/.local/bin/.{bin}.install.$$\n\
-             mv -f $HOME/.local/bin/.{bin}.install.$$ $HOME/.local/bin/{bin}"
+            "\ninstall_to={to}\n\
+             install_tmp=\"${{install_to}}.install.$$\"\n\
+             mkdir -p \"$(dirname \"$install_to\")\"\n\
+             cp target/release/{bin} \"$install_tmp\"\n\
+             chmod 755 \"$install_tmp\"\n\
+             mv -f \"$install_tmp\" \"$install_to\"",
+            to = remote::quote(&box_binary(machine, bin)?),
         ));
     }
     let script = format!(
@@ -365,11 +382,10 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<Opti
          git merge --ff-only @{{u}}\n\
          export PATH={build_path}\n\
          export DEVELOPER_DIR={DEVELOPER_DIR}{zig}\n\
-         cargo build --release --locked\n\
-         mkdir -p $HOME/.local/bin{installs}\n\
+         cargo build --release --locked{installs}\n\
          printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$(git rev-parse HEAD)\"",
         path = remote::quote(box_path),
-        build_path = BOX_BUILD_PATH,
+        build_path = remote::quote(&machine.path),
     );
     let out = remote::ssh(ctx.runner, target, &script, None, BOX_BUILD_TIMEOUT)?;
     if !out.success() {
@@ -389,20 +405,25 @@ fn box_build(ctx: &Ctx, target: &str, box_path: &str, kind: Kind) -> Result<Opti
 /// Install only the policy a lane machine consumes. Dispatch recipes and the
 /// routing rubric stay on the coordinator; copying them would give the box a
 /// second, stale source of model-selection policy.
-fn box_settings(ctx: &Ctx, target: &str) -> Result<()> {
+fn box_settings(
+    ctx: &Ctx,
+    target: &str,
+    machine: &crate::remote::MachineDeclaration,
+) -> Result<()> {
     let rules_path = ctx.config_dir.join("RULES.md");
     let rules = std::fs::read_to_string(&rules_path)
         .with_context(|| format!("harness_rules_missing: {}", rules_path.display()))?;
     let script = format!(
         "set -e\n\
-         dir=\"$HOME/.config/herdr-ade\"\n\
+         dir={config_dir}\n\
          mkdir -p \"$dir\"\n\
          tmp=\"$dir/.RULES.md.install.$$\"\n\
          cat > \"$tmp\"\n\
          chmod 600 \"$tmp\"\n\
          mv -f \"$tmp\" \"$dir/RULES.md\"\n\
          printf '%s\\n' 'lane worker; dispatch stays on the coordinator' > \"$dir/{BOX_WORKER_MARKER}\"\n\
-         chmod 600 \"$dir/{BOX_WORKER_MARKER}\""
+         chmod 600 \"$dir/{BOX_WORKER_MARKER}\"",
+        config_dir = remote::quote(&format!("{}/.config/herdr-ade", machine.home)),
     );
     let out = remote::ssh(ctx.runner, target, &script, Some(&rules), INSTALL_TIMEOUT)?;
     if !out.success() {
@@ -712,32 +733,38 @@ fn talk_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessPr
     proofs
 }
 
-fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
+fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) -> Vec<ProcessProof> {
     let script = format!(
         "set -e\n\
-         bin=$HOME/.local/bin/herdr-ade\n\
+         export PATH={path}\n\
+         bin={bin}\n\
+         root={root}\n\
          version=\"$($bin --version)\"\n\
          printf 'HERDR_ADE_BOX_BINARY=%s\\n' \"$version\"\n\
-         $bin --root $HOME/.herdr-ade ticker start\n\
-         expected={}\n\
+         $bin --root \"$root\" ticker start\n\
+         expected={version}\n\
          n=0\n\
          while [ $n -lt 80 ]; do\n\
-           if grep -F '\"version\": \"'$expected'\"' $HOME/.herdr-ade/.ticker.lock >/dev/null 2>&1; then\n\
-             pid=$(grep '\"pid\"' $HOME/.herdr-ade/.ticker.lock | tr -cd '0-9')\n\
+           if grep -F '\"version\": \"'$expected'\"' \"$root/.ticker.lock\" >/dev/null 2>&1; then\n\
+             pid=$(grep '\"pid\"' \"$root/.ticker.lock\" | tr -cd '0-9')\n\
              printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$expected\"\n\
              exit 0\n\
            fi\n\
            n=$((n+1)); sleep 0.5\n\
          done\n\
          printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker did not report the installed build\\n'",
-        remote::quote(crate::VERSION)
+        path = remote::quote(&machine.path),
+        bin = remote::quote(&machine.ade_bin),
+        root = remote::quote(&machine.root),
+        version = remote::quote(crate::VERSION),
     );
+    let target = &machine.target;
     let out = match remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(140)) {
         Ok(out) if out.success() => out,
         Ok(out) => {
             let reason = out.error_text();
             return vec![ProcessProof {
-                machine: BOX_MACHINE.into(),
+                machine: machine.id.clone(),
                 process: "box binary and ticker".into(),
                 pid: None,
                 build: None,
@@ -747,7 +774,7 @@ fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
         }
         Err(error) => {
             return vec![ProcessProof {
-                machine: BOX_MACHINE.into(),
+                machine: machine.id.clone(),
                 process: "box binary and ticker".into(),
                 pid: None,
                 build: None,
@@ -764,7 +791,7 @@ fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
     {
         let current = version.contains(crate::VERSION);
         proofs.push(ProcessProof {
-            machine: BOX_MACHINE.into(),
+            machine: machine.id.clone(),
             process: "herdr-ade binary".into(),
             pid: None,
             build: Some(version.to_string()),
@@ -778,7 +805,7 @@ fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
         });
     } else {
         proofs.push(ProcessProof {
-            machine: BOX_MACHINE.into(),
+            machine: machine.id.clone(),
             process: "herdr-ade binary".into(),
             pid: None,
             build: None,
@@ -793,7 +820,7 @@ fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
     {
         let (pid, build) = value.split_once(':').unwrap_or(("", value));
         proofs.push(ProcessProof {
-            machine: BOX_MACHINE.into(),
+            machine: machine.id.clone(),
             process: "ticker".into(),
             pid: pid.parse().ok(),
             build: Some(build.to_string()),
@@ -802,7 +829,7 @@ fn box_process_proofs(ctx: &Ctx, target: &str) -> Vec<ProcessProof> {
         });
     } else {
         proofs.push(ProcessProof {
-            machine: BOX_MACHINE.into(),
+            machine: machine.id.clone(),
             process: "ticker".into(),
             pid: None,
             build: None,
@@ -936,13 +963,27 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
     }
     let _lock = lock(&ctx.config_dir)?;
     let running = Running::capture()?;
-    let box_target = remote::optional_machine_profile(
-        ctx.runner,
-        &ctx.env.herdr_bin(),
-        &ctx.config_dir,
-        BOX_MACHINE,
-    )?
-    .map(|profile| profile.target);
+    let config_text =
+        std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap_or_default();
+    let dispatch = toml::from_str::<RawConfig>(&config_text)
+        .context("config.toml does not parse")?
+        .dispatch
+        .machine;
+    let box_profile = if dispatch.is_empty() || dispatch == crate::contracts::MACHINE_LOCAL {
+        None
+    } else {
+        remote::optional_machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            &dispatch,
+        )?
+    };
+    let box_target = box_profile.as_ref().map(|profile| profile.target.clone());
+    let box_paths = box_profile
+        .as_ref()
+        .map(|profile| remote::machine_declaration(&ctx.config_dir, &profile.id))
+        .transpose()?;
     let mut fork = false;
     let mut installed = Vec::new();
     let mut builds = Vec::new();
@@ -975,11 +1016,14 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         let mut box_commit = None;
         let box_installed = match (&box_target, &repo.box_path) {
             (Some(target), Some(box_path)) => {
-                box_commit = box_build(ctx, target, box_path, kind)?;
+                let machine = box_paths
+                    .as_ref()
+                    .context("machine path declaration is missing")?;
+                box_commit = box_build(ctx, target, machine, box_path, kind)?;
                 if let Some(head) = &box_commit {
                     builds.push(InstalledBuild {
                         repo: repo.path.clone(),
-                        machine: BOX_MACHINE.into(),
+                        machine: machine.id.clone(),
                         head: head.clone(),
                     });
                 }
@@ -1004,8 +1048,8 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
             box_commit,
         });
     }
-    if let Some(target) = &box_target {
-        box_settings(ctx, target)?;
+    if let (Some(target), Some(machine)) = (&box_target, &box_paths) {
+        box_settings(ctx, target, machine)?;
     }
     let plugin_version = installed
         .iter()
@@ -1013,8 +1057,8 @@ pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
         .find(|binary| binary.name == "herdr-ade")
         .map(|binary| binary.version.clone());
     let mut processes = local_process_proofs(ctx, plugin_version.as_deref());
-    if let Some(target) = &box_target {
-        processes.extend(box_process_proofs(ctx, target));
+    if let Some(machine) = &box_paths {
+        processes.extend(box_process_proofs(ctx, machine));
     }
     let tasks = record_task_proofs(ctx, &builds, &processes)?;
     Ok(InstallOutcome {
@@ -1143,7 +1187,20 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        box_build(&ctx, "box", "/home/ubuntu/projects/herdr", Kind::Fork).unwrap();
+        let machine = crate::remote::MachineDeclaration {
+            path: "/bin:$HOME/.local/bin".into(),
+            ade_bin: "/srv/bin/herdr-ade".into(),
+            pi_bin: "/srv/bin/herdr-pi".into(),
+            ..Default::default()
+        };
+        box_build(
+            &ctx,
+            "box",
+            &machine,
+            "/home/ubuntu/projects/herdr",
+            Kind::Fork,
+        )
+        .unwrap();
         let calls = runner.calls.borrow();
         let script = calls.last().unwrap().args.last().unwrap();
         assert!(script.contains("herdr_repo_zig"), "{script}");
@@ -1171,9 +1228,17 @@ mod tests {
             detached_ticker: false,
         };
 
-        let proofs = box_process_proofs(&ctx, "box");
+        let machine = crate::remote::MachineDeclaration {
+            id: "lab".into(),
+            target: "box".into(),
+            root: "/srv/ade".into(),
+            path: "/srv/bin:/usr/bin:/bin".into(),
+            ade_bin: "/srv/bin/herdr-ade".into(),
+            ..Default::default()
+        };
+        let proofs = box_process_proofs(&ctx, &machine);
         assert_eq!(proofs.len(), 1);
-        assert_eq!(proofs[0].machine, BOX_MACHINE);
+        assert_eq!(proofs[0].machine, "lab");
         assert_eq!(proofs[0].state, "unknown");
         assert_eq!(proofs[0].build, None);
         assert!(
@@ -1289,7 +1354,7 @@ mod tests {
                 },
                 InstalledBuild {
                     repo: "/unrelated/repository".into(),
-                    machine: BOX_MACHINE.into(),
+                    machine: "oci".into(),
                     head: "other-head".into(),
                 },
             ],
