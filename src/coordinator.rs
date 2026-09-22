@@ -29,18 +29,24 @@ fn overflow_count(out: &mut String, total: usize) {
 fn request_preview(text: &str) -> String {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let first = lines.next().unwrap_or_default();
-    let (pasted, words) = if first == "<pasted_content>" {
-        (
+    let paste = first
+        .strip_prefix("<pasted_content")
+        .filter(|rest| rest.starts_with('>') || rest.starts_with(char::is_whitespace))
+        .and_then(|rest| rest.split_once('>'));
+    let (pasted, words) = match paste {
+        Some((_, inline)) if !inline.trim().is_empty() => (true, inline.trim()),
+        Some(_) => (
             true,
             lines
-                .find(|line| *line != "</pasted_content>")
+                .find(|line| !line.starts_with("</pasted_content"))
                 .unwrap_or_default(),
-        )
-    } else if let Some(words) = first.strip_prefix("<pasted_content>") {
-        (true, words.trim())
-    } else {
-        (false, first)
+        ),
+        None => (false, first),
     };
+    let words = words
+        .split_once("</pasted_content")
+        .map_or(words, |(words, _)| words)
+        .trim();
     let short: String = words.chars().take(160).collect();
     if pasted {
         format!("pasted text: {short}")
@@ -827,7 +833,7 @@ mod tests {
         );
         assert_eq!(
             request_preview(
-                "\n<pasted_content>\nKeep this project page complete.\n</pasted_content>"
+                "\n<pasted_content id=\"2460\">\nKeep this project page complete.\n</pasted_content id=\"2460\">"
             ),
             "pasted text: Keep this project page complete."
         );
