@@ -65,7 +65,16 @@ pub(crate) struct MachineDeclaration {
     pub(crate) path: String,
     pub(crate) ade_bin: String,
     pub(crate) pi_bin: String,
+    /// Adapter kinds this machine is allowed to run. An empty list means the
+    /// machine runs no agent jobs; its operational doctor rows still apply.
+    pub(crate) kinds: Vec<String>,
     pub(crate) repos: Vec<crate::project::Repo>,
+}
+
+impl MachineDeclaration {
+    pub(crate) fn runs_kind(&self, kind: &str) -> bool {
+        self.kinds.iter().any(|allowed| allowed == kind)
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -645,6 +654,7 @@ build = "/srv/build"
 path = "/srv/bin:/usr/bin:/bin"
 ade_bin = "/srv/bin/herdr-ade"
 pi_bin = "/srv/bin/herdr-pi"
+kinds = ["pi", "claude"]
 [[machines.lab.repos]]
 path = "/local/repo"
 box_path = "/srv/work/repo"
@@ -656,6 +666,10 @@ publish_url = "https://example.test/repo.git"
         runner.on("machine list --json", ok("[]"));
         let profile = machine_profile(&runner, "herdr", config.path(), "lab").unwrap();
         assert_eq!(profile.target, "lab.example");
+        let declaration = machine_declaration(config.path(), "lab").unwrap();
+        assert!(declaration.runs_kind("pi"));
+        assert!(declaration.runs_kind("claude"));
+        assert!(!declaration.runs_kind("agy"));
         let repo = box_repo_for(config.path(), "lab", "/local/repo").unwrap();
         assert_eq!(repo.box_path.as_deref(), Some("/srv/work/repo"));
     }
