@@ -11,6 +11,9 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0280.md",
+      "tasks/review-r107.md",
+      "tasks/t-0279.md",
       "tasks/t-0278.md",
       "tasks/review-r106.md",
       "tasks/t-0277.md",
@@ -19,16 +22,14 @@
       "tasks/t-0274.md",
       "tasks/review-r105.md",
       "tasks/t-0273.md",
-      "tasks/t-0272.md",
-      "tasks/review-r104.md",
-      "tasks/t-0271.md",
-      "tasks/t-0270.md"
+      "tasks/t-0272.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r107.md",
       "tasks/reviews/code-r106.md",
       "tasks/reviews/code-r105.md",
       "tasks/reviews/code-r104.md",
@@ -39,15 +40,17 @@
       "tasks/reviews/code-r99.md",
       "tasks/reviews/code-r97.md",
       "tasks/reviews/code-r96.md",
-      "tasks/reviews/code-r92.md",
-      "tasks/reviews/code-r95.md"
+      "tasks/reviews/code-r92.md"
     ]
   },
-  "generated": "2026-09-22T09:08:32-04:00",
+  "generated": "2026-09-22T09:49:24-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
+      "hp/adeherdr/t-0280-review-r107-one-goal-a-newer-choice-repl",
       "main",
+      "review/r107",
+      "hp/adeherdr/t-0279-w33-withdraw-one-condition",
+      "hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
       "review/r106",
       "hp/adeherdr/t-0276-w31-ended-lane-is-not-working",
       "hp/adeherdr/t-0277-w32-briefs-carry-task-notes-only",
@@ -445,29 +448,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "f84fffa review(r106): verdict",
-      "524d313 review(threads): fail closed on attestation evidence",
-      "766bd2b Merge commit '4ae9e5c1af0875c3480b393313c155fc522a4e54' into hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
-      "3da8008 Merge commit '99aea5062ace38a483ca1f254c80e7508c667d3a' into hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
-      "5068a85 Merge commit 'dfacff1b344988a722df090a19492e1f8776ead0' into hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
-      "94f53f0 docs(tasks): t-0278"
+      "6d1a972 review(r107): verdict",
+      "564d3d8 review(tasks): keep withdrawal and verification mutually exclusive",
+      "02ccb83 Merge commit '6ffad5b0e0f6b5da568dfcd17816f7e14bcbcecb' into hp/adeherdr/t-0280-review-r107-one-goal-a-newer-choice-repl",
+      "f002a67 docs(tasks): t-0280",
+      "baf70e7 review(r107): brief for revision 1",
+      "6ffad5b feat(tasks): withdraw replaced acceptance conditions"
     ],
-    "remote": "13 ahead, 0 behind origin/main",
+    "remote": "7 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "f84fffa",
+        "head": "6d1a972",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "review(r106): verdict"
+        "subject": "review(r107): verdict"
       },
       {
-        "branch": "review/r106",
+        "branch": "review/r107",
         "dirty": 0,
-        "head": "94f53f0",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r106",
-        "subject": "docs(tasks): t-0278"
+        "head": "f002a67",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r107",
+        "subject": "docs(tasks): t-0280"
       }
     ]
   },
@@ -480,15 +483,15 @@
     },
     {
       "label": "PRL-8-53",
-      "status": "blocked",
+      "status": "done",
       "workspace_id": "w1N"
     }
   ],
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r106",
-    "verdict": "f84fffaac54db97d2398c47ab85e2205541e2d87"
+    "round": "r107",
+    "verdict": "6d1a97260e3e9396066f893e667ff996603eaa7b"
   },
   "session": "default",
   "unlinked_agents": [],
