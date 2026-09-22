@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0265.md",
+      "tasks/t-0263.md",
+      "tasks/t-0255.md",
+      "tasks/t-0252.md",
+      "tasks/t-0245.md",
+      "tasks/review-r102.md",
+      "tasks/t-0266.md",
+      "tasks/review-r98.md",
       "tasks/t-0264.md",
       "tasks/t-0261.md",
       "tasks/t-0259.md",
-      "tasks/t-0258.md",
-      "tasks/t-0257.md",
-      "tasks/t-0253.md",
-      "tasks/review-r99.md",
-      "tasks/review-r98.md",
-      "tasks/t-0254.md",
-      "tasks/t-0251.md",
-      "tasks/t-0244.md",
-      "tasks/t-0260.md"
+      "tasks/t-0258.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r98.md",
       "tasks/reviews/code-r99.md",
       "tasks/reviews/code-r97.md",
       "tasks/reviews/code-r96.md",
@@ -39,16 +40,20 @@
       "tasks/reviews/code-r91.md",
       "tasks/reviews/code-r90.md",
       "tasks/reviews/code-r88.md",
-      "tasks/reviews/code-r89.md",
-      "tasks/reviews/code-r87.md"
+      "tasks/reviews/code-r89.md"
     ]
   },
-  "generated": "2026-09-22T02:36:46-04:00",
+  "generated": "2026-09-22T02:48:39-04:00",
   "git": {
     "branches": [
+      "main",
+      "hp/adeherdr/t-0267-review-r102-a-helper-that-lost-its-conne",
+      "review/r102",
+      "hp/adeherdr/t-0266-w27-ticker-stop-survives-a-long-pass",
+      "hp/adeherdr/t-0265-review-r98-finished-work-leaves-nothing",
+      "review/r98-5",
       "hp/adeherdr/t-0260-w26-unknown-failure-recovery",
       "hp/adeherdr/t-0264-review-r99-every-install-shows-plainly-w",
-      "main",
       "hp/adeherdr/t-0263-review-r98-finished-work-leaves-nothing",
       "review/r99-3",
       "review/r98-4",
@@ -423,22 +428,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "3fb27ae docs(review): round r99 repair verdict",
-      "be550d6 Merge commit '0a440989e554019f619f013737c7f4ff86e5a48a' into hp/adeherdr/t-0264-review-r99-every-install-shows-plainly-w",
-      "91145a9 docs(tasks): t-0264",
-      "80b21e0 review(r99): brief for revision 1",
-      "ce69988 review(r98): brief for revision 1",
-      "30dbe1a checkpoint(r97): HANDOFF after merging the round"
+      "6505c43 Merge commit '82382bfbe3bd63227d1c2fddfb2d2c0a83aff90e'",
+      "30eb805 review(r102): brief for revision 1",
+      "34b9704 docs(tasks): t-0266",
+      "82382bf docs(review): round r98 repair verdict",
+      "fb00327 Merge commit '6c9a22640a61a0e32493bafa7d327d2dbe6c8f15' into hp/adeherdr/t-0265-review-r98-finished-work-leaves-nothing",
+      "6564ca5 docs(tasks): t-0265"
     ],
-    "remote": "12 ahead, 0 behind origin/main",
+    "remote": "16 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "3fb27ae",
+        "head": "6505c43",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r99 repair verdict"
+        "subject": "Merge commit '82382bfbe3bd63227d1c2fddfb2d2c0a83aff90e'"
       },
       {
         "branch": "review/r100",
@@ -446,6 +451,13 @@
         "head": "97f81cd",
         "path": "/home/agent/projects/herdr-ade/.worktrees/review-r100",
         "subject": "docs(tasks): t-0256"
+      },
+      {
+        "branch": "review/r102",
+        "dirty": 0,
+        "head": "91fe439",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r102",
+        "subject": "docs(tasks): t-0267"
       },
       {
         "branch": "review/r98",
@@ -476,25 +488,11 @@
         "subject": "docs(tasks): t-0263"
       },
       {
-        "branch": "review/r99",
+        "branch": "review/r98-5",
         "dirty": 0,
-        "head": "72a6ea3",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r99",
-        "subject": "docs(tasks): t-0253"
-      },
-      {
-        "branch": "review/r99-2",
-        "dirty": 0,
-        "head": "ecba0b8",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r99-2",
-        "subject": "docs(tasks): t-0261"
-      },
-      {
-        "branch": "review/r99-3",
-        "dirty": 0,
-        "head": "91145a9",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r99-3",
-        "subject": "docs(tasks): t-0264"
+        "head": "6564ca5",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r98-5",
+        "subject": "docs(tasks): t-0265"
       }
     ]
   },
@@ -514,8 +512,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r99",
-    "verdict": "3fb27ae33bdbde088a9f4a61eff78e6cb424b15b"
+    "round": "r98",
+    "verdict": "82382bfbe3bd63227d1c2fddfb2d2c0a83aff90e"
   },
   "session": "default",
   "unlinked_agents": [],
