@@ -1030,6 +1030,27 @@ mod tests {
     }
 
     #[test]
+    fn historical_records_without_running_evidence_still_load() {
+        let text = r#"
+schema = 1
+id = "job-0001"
+title = "Historical task"
+authority = ["request:q-1"]
+acceptance = ["The old record loads."]
+attempts = []
+rounds = []
+installed = []
+verified = []
+created = "2026-09-21T00:00:00Z"
+"#;
+
+        let task: Task = toml::from_str(text).unwrap();
+
+        assert!(task.running.is_empty());
+        validate_record(&task).unwrap();
+    }
+
+    #[test]
     fn unreadable_records_keep_their_identity_and_are_never_replaced() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
