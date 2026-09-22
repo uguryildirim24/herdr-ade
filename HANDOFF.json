@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0285.md",
+      "tasks/t-0288.md",
+      "tasks/t-0287.md",
+      "tasks/t-0286.md",
+      "tasks/review-r109.md",
+      "tasks/t-0284.md",
       "tasks/t-0283.md",
       "tasks/review-r108.md",
       "tasks/t-0282.md",
       "tasks/t-0281.md",
       "tasks/t-0280.md",
-      "tasks/review-r107.md",
-      "tasks/t-0279.md",
-      "tasks/t-0278.md",
-      "tasks/review-r106.md",
-      "tasks/t-0277.md",
-      "tasks/t-0276.md",
-      "tasks/t-0275.md"
+      "tasks/review-r107.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r109.md",
       "tasks/reviews/code-r108.md",
       "tasks/reviews/code-r107.md",
       "tasks/reviews/code-r106.md",
@@ -39,15 +40,20 @@
       "tasks/reviews/code-r102.md",
       "tasks/reviews/code-r98.md",
       "tasks/reviews/code-r99.md",
-      "tasks/reviews/code-r97.md",
-      "tasks/reviews/code-r96.md"
+      "tasks/reviews/code-r97.md"
     ]
   },
-  "generated": "2026-09-22T11:23:45-04:00",
+  "generated": "2026-09-22T13:21:51-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0283-review-r108-only-rolf-s-own-messages-cou",
       "main",
+      "hp/adeherdr/t-0288-astra-max-more-excess-easier-to-use",
+      "hp/adeherdr/t-0287-w37-one-recipe-list-one-config-reader",
+      "hp/adeherdr/t-0286-w36-docs-match-code-report-tasks-verify",
+      "hp/adeherdr/t-0285-review-r109-idle-notices-from-other-sess",
+      "review/r109",
+      "hp/adeherdr/t-0284-w35-idle-notices-are-not-rolf",
+      "hp/adeherdr/t-0283-review-r108-only-rolf-s-own-messages-cou",
       "review/r108",
       "hp/adeherdr/t-0282-w35-what-to-simplify-or-cut",
       "hp/adeherdr/t-0281-w34-only-rolf-s-messages-are-his",
@@ -452,29 +458,36 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "826f7ea docs(review): round r108 verdict",
-      "9b8f1aa review(talk): cover unmarked automated prompts",
-      "c887198 Merge commit '660cc11f66acf0aa5fba62f74110363255411420' into review/r108",
-      "a39fe0e docs(tasks): t-0283",
-      "936b42c review(r108): brief for revision 1",
-      "87e4929 docs(tasks): t-0282"
+      "94ee12b Merge commit '103bd1405817facd84bb50c3ad44a71d6a1bc88d'",
+      "2976832 docs(tasks): t-0288",
+      "b8ba5f9 docs(tasks): t-0287",
+      "0197096 docs(tasks): t-0286",
+      "103bd14 docs(review): round r109 verdict",
+      "3199b43 review(talk): cover words mixed with idle notices"
     ],
-    "remote": "8 ahead, 0 behind origin/main",
+    "remote": "11 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "826f7ea",
+        "head": "94ee12b",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r108 verdict"
+        "subject": "Merge commit '103bd1405817facd84bb50c3ad44a71d6a1bc88d'"
       },
       {
-        "branch": "review/r108",
+        "branch": "review/r109",
         "dirty": 0,
-        "head": "a39fe0e",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r108",
-        "subject": "docs(tasks): t-0283"
+        "head": "eb4554d",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r109",
+        "subject": "docs(tasks): t-0285"
+      },
+      {
+        "branch": "hp/adeherdr/t-0288-astra-max-more-excess-easier-to-use",
+        "dirty": 0,
+        "head": "2976832",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/t-0288",
+        "subject": "docs(tasks): t-0288"
       }
     ]
   },
@@ -484,25 +497,41 @@
       "label": "Flyonenomics",
       "status": "done",
       "workspace_id": "w1H"
-    },
-    {
-      "label": "PRL-8-53",
-      "status": "done",
-      "workspace_id": "w1N"
     }
   ],
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r108",
-    "verdict": "826f7ea4431b1f6bf9e60cfd8bb0a9b5688409a9"
+    "round": "r109",
+    "verdict": "103bd1405817facd84bb50c3ad44a71d6a1bc88d"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [],
+  "workers": [
+    {
+      "cwd": "/home/agent/projects/herdr-ade/.worktrees/t-0288",
+      "kind": "pi",
+      "name": "hp-adeherdr-t-0288",
+      "pane_id": "w1G:p3N",
+      "pane_label": null,
+      "session_id": "/home/agent/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0288--/2026-09-22T17-21-39-729Z_01a0ca23-3390-70db-9b21-628dc29d3282.jsonl",
+      "start_args": [],
+      "status": "idle",
+      "tab_id": "w1G:t3H",
+      "tab_label": "t-0288",
+      "title": "π - t-0288",
+      "tokens": {
+        "parent": "w1G:p1",
+        "project": "adeherdr",
+        "rank": "4",
+        "review": "working",
+        "thread": "t-0288"
+      }
+    }
+  ],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 2
+    "tabs": 3
   }
 }
