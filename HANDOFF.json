@@ -11,6 +11,8 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0269.md",
+      "tasks/review-r103.md",
       "tasks/t-0268.md",
       "tasks/t-0267.md",
       "tasks/review-r102.md",
@@ -20,15 +22,14 @@
       "tasks/t-0252.md",
       "tasks/t-0245.md",
       "tasks/t-0266.md",
-      "tasks/review-r98.md",
-      "tasks/t-0264.md",
-      "tasks/t-0261.md"
+      "tasks/review-r98.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r103.md",
       "tasks/reviews/code-r102.md",
       "tasks/reviews/code-r98.md",
       "tasks/reviews/code-r99.md",
@@ -39,15 +40,17 @@
       "tasks/reviews/code-r93.md",
       "tasks/reviews/code-r94.md",
       "tasks/reviews/code-r91.md",
-      "tasks/reviews/code-r90.md",
-      "tasks/reviews/code-r88.md"
+      "tasks/reviews/code-r90.md"
     ]
   },
-  "generated": "2026-09-22T03:07:35-04:00",
+  "generated": "2026-09-22T03:22:07-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0268-review-r102-a-helper-that-lost-its-conne",
+      "hp/adeherdr/t-0256-review-r100-helpers-get-their-first-mess",
+      "hp/adeherdr/t-0269-review-r103-one-install-always-moves-the",
       "main",
+      "review/r103",
+      "hp/adeherdr/t-0268-review-r102-a-helper-that-lost-its-conne",
       "hp/adeherdr/t-0266-w27-ticker-stop-survives-a-long-pass",
       "review/r102-2",
       "hp/adeherdr/t-0267-review-r102-a-helper-that-lost-its-conne",
@@ -67,7 +70,6 @@
       "hp/adeherdr/t-0254-review-r97-a-job-that-should-never-have",
       "hp/adeherdr/t-0255-review-r98-finished-work-leaves-nothing",
       "hp/adeherdr/t-0253-review-r99-every-install-shows-plainly-w",
-      "hp/adeherdr/t-0256-review-r100-helpers-get-their-first-mess",
       "review/r100",
       "review/r98-3",
       "review/r97-3",
@@ -430,22 +432,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "959bed0 docs(review): round r102 repair verdict",
-      "958c1d1 Merge commit '0ec88a01d89f66e0be3105e55e15ab0da5a376d2' into hp/adeherdr/t-0268-review-r102-a-helper-that-lost-its-conne",
-      "6671177 docs(tasks): t-0268",
-      "12bca15 review(r102): brief for revision 1",
-      "17bf688 checkpoint(r98): HANDOFF after merging the round",
-      "6505c43 Merge commit '82382bfbe3bd63227d1c2fddfb2d2c0a83aff90e'"
+      "4f619d9 docs(review): round r103 verdict",
+      "da23480 Merge commit 'b9f92da8130db10323ce6c14f283432a911f1ef9' into hp/adeherdr/t-0269-review-r103-one-install-always-moves-the",
+      "ec1e920 docs(tasks): t-0269",
+      "9663d44 review(r103): brief for revision 1",
+      "b4fd82a checkpoint(r102): HANDOFF after merging the round",
+      "959bed0 docs(review): round r102 repair verdict"
     ],
-    "remote": "7 ahead, 0 behind origin/main",
+    "remote": "5 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "959bed0",
+        "head": "4f619d9",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r102 repair verdict"
+        "subject": "docs(review): round r103 verdict"
       },
       {
         "branch": "review/r100",
@@ -455,18 +457,11 @@
         "subject": "docs(tasks): t-0256"
       },
       {
-        "branch": "review/r102",
+        "branch": "review/r103",
         "dirty": 0,
-        "head": "91fe439",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r102",
-        "subject": "docs(tasks): t-0267"
-      },
-      {
-        "branch": "review/r102-2",
-        "dirty": 0,
-        "head": "6671177",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r102-2",
-        "subject": "docs(tasks): t-0268"
+        "head": "ec1e920",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r103",
+        "subject": "docs(tasks): t-0269"
       }
     ]
   },
@@ -479,15 +474,15 @@
     },
     {
       "label": "PRL-8-53",
-      "status": "blocked",
+      "status": "done",
       "workspace_id": "w1N"
     }
   ],
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r102",
-    "verdict": "959bed0101881cc059a20f08348cb38d9344a827"
+    "round": "r103",
+    "verdict": "4f619d9193e31ca9d89ee3f79be9077b62df010b"
   },
   "session": "default",
   "unlinked_agents": [],
