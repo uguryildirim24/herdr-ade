@@ -5,30 +5,31 @@
     "kind": "claude",
     "pane_id": "w1G:p1",
     "pane_label": null,
-    "session_id": "22e30006-6abc-4f92-9bcc-c002ce0ce442",
+    "session_id": "e090742b-3a62-46fd-8bc3-73a7232d4e90",
     "status": "working",
     "tab_id": "w1G:t1"
   },
   "files": {
     "briefs": [
+      "tasks/t-0312.md",
+      "tasks/review-r114.md",
+      "tasks/t-0310.md",
+      "tasks/t-0309.md",
+      "tasks/t-0308.md",
       "tasks/t-0307.md",
       "tasks/review-r113.md",
       "tasks/t-0306.md",
       "tasks/t-0305.md",
       "tasks/t-0304.md",
       "tasks/t-0303.md",
-      "tasks/t-0302.md",
-      "tasks/review-r112.md",
-      "tasks/t-0301.md",
-      "tasks/t-0297.md",
-      "tasks/review-r111.md",
-      "tasks/t-0300.md"
+      "tasks/t-0302.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r114.md",
       "tasks/reviews/code-r113.md",
       "tasks/reviews/code-r112.md",
       "tasks/reviews/code-r111.md",
@@ -39,15 +40,21 @@
       "tasks/reviews/code-r106.md",
       "tasks/reviews/code-r105.md",
       "tasks/reviews/code-r104.md",
-      "tasks/reviews/code-r100.md",
-      "tasks/reviews/code-r103.md"
+      "tasks/reviews/code-r100.md"
     ]
   },
-  "generated": "2026-09-22T16:16:18-04:00",
+  "generated": "2026-09-22T17:02:31-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r",
+      "hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record",
       "main",
+      "hp/adeherdr/t-0311-review-r114-a-merge-that-installs-record",
+      "review/r114-2",
+      "hp/adeherdr/t-0310-w54-round-ids-never-reuse-old-numbers",
+      "hp/adeherdr/t-0308-w52-merge-leaves-install-proof-and-says",
+      "review/r114",
+      "hp/adeherdr/t-0309-w53-short-page-rolf-s-own-words",
+      "hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r",
       "review/r113",
       "hp/adeherdr/t-0304-w49-starting-work-reuses-the-task",
       "hp/adeherdr/t-0305-w50-folders-on-use-one-report",
@@ -482,29 +489,36 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "53d78de docs(review): round r113 verdict",
-      "54f6aee review(ade): keep context and command docs actionable",
-      "d823501 Merge commit 'd0dacafe5f2766d260e546f54b242d4a07d40b7d' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r",
-      "fb15739 Merge commit '505baae8a4f840a3a7d55a9654b4b28effa321b2' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r",
-      "2754f01 Merge commit '76efbc9afcdc841b5551639fbc83e8e1171bf3ea' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r",
-      "b57220d Merge commit '9b6c3eb561fd2352d84e4bb8577937dd07261854' into hp/adeherdr/t-0307-review-r113-the-lead-s-page-and-briefs-r"
+      "078caf1 review(r114): merge",
+      "d4a62f4 review(round): reserve repair review branch numbers",
+      "000cd15 Merge commit '2ee06374ee6e430b438d95e6a51811280eb2fd65' into hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record",
+      "7356968 Merge commit '45849463dc869ba8c5e0023fddb01db4f7d6bef7' into hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record",
+      "933d268 Merge commit '3575c380bbfc7416c75fd61a66796ee8681bc581' into hp/adeherdr/t-0312-review-r114-a-merge-that-installs-record",
+      "badfeb4 docs(tasks): t-0312"
     ],
-    "remote": "19 ahead, 0 behind origin/main",
+    "remote": "16 ahead, 0 behind origin/main",
     "repo": "/home/agent/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "53d78de",
+        "head": "078caf1",
         "path": "/home/agent/projects/herdr-ade",
-        "subject": "docs(review): round r113 verdict"
+        "subject": "review(r114): merge"
       },
       {
-        "branch": "review/r113",
+        "branch": "review/r114",
         "dirty": 0,
-        "head": "7e1307f",
-        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r113",
-        "subject": "docs(tasks): t-0307"
+        "head": "36d5d64",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r114",
+        "subject": "docs(tasks): t-0311"
+      },
+      {
+        "branch": "review/r114-2",
+        "dirty": 0,
+        "head": "badfeb4",
+        "path": "/home/agent/projects/herdr-ade/.worktrees/review-r114-2",
+        "subject": "docs(tasks): t-0312"
       }
     ]
   },
@@ -519,8 +533,8 @@
   "repo": "/home/agent/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r113",
-    "verdict": "53d78dee9104be7a57f7a0e2c04f2fa9e4ea5ca7"
+    "round": "r114",
+    "verdict": "078caf1dddfc2d8731a6d49af3adc672f6ad22e2"
   },
   "session": "default",
   "unlinked_agents": [],
