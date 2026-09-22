@@ -550,15 +550,6 @@ struct Token<'a> {
     end: usize,
 }
 
-/// The checker's word normalization: whitespace tokens, edge punctuation
-/// stripped, ASCII case folded. Keep order and interior punctuation.
-pub(crate) fn normalized_words(text: &str) -> Vec<String> {
-    tokens(text)
-        .into_iter()
-        .map(|t| t.raw.to_ascii_lowercase())
-        .collect()
-}
-
 fn tokens(text: &str) -> Vec<Token<'_>> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
