@@ -235,6 +235,7 @@ fn record_closed_round(project: &Project, thread: &str, repo: &str, phase: Round
             members: vec![ManifestMember {
                 thread: thread.into(),
                 pin: None,
+                awaiting_report_after: None,
             }],
         },
         repo: repo.into(),
