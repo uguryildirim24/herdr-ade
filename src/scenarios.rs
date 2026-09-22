@@ -398,6 +398,44 @@ fn rebind_moves_an_existing_thread_to_its_verified_live_agent() {
 }
 
 #[test]
+fn an_adopted_no_repo_thread_rebinds_at_its_original_cwd() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().join("original");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let managed = project.dir().join("threads/t-0001");
+    std::fs::create_dir_all(managed.join(".git")).unwrap();
+    world.thread(&project, &cwd, |t| {
+        t.kind = Kind::Adopted;
+        t.status = Status::Failed;
+        t.repo.clear();
+        t.worktree_path = std::fs::canonicalize(&managed)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        t.agent_name.clear();
+    });
+    let cwd = cwd.to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w3", "w3:t1", "w3:p1", &cwd)
+    );
+    *world.agents.borrow_mut() =
+        format!("[{}]", agent_json("w3", "w3:t1", "w3:p1", &cwd, "", "idle"));
+
+    let outcome = threads::rebind(&world.ctx(), "demo", "t-0001", "w3:p1").unwrap();
+    assert_eq!(outcome.pane_id, "w3:p1");
+    let record = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(record.status, Status::Open);
+    assert_eq!(record.cwd, cwd);
+    assert_eq!(
+        Path::new(&record.worktree_path),
+        std::fs::canonicalize(managed).unwrap().as_path()
+    );
+}
+
+#[test]
 fn cancel_reports_pending_cleanup_when_the_session_is_unreachable() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
