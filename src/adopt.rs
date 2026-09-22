@@ -205,19 +205,18 @@ pub(crate) fn adopt(
         return Err(error);
     }
 
-    // Prompt now when the agent is ready for one; otherwise the ticker's one
-    // delivery path sends the line later (also when the agent ends in `done`).
-    // Passive adopt (SPEC-ADE D7) sends nothing.
+    // Keep the record in Starting while this command owns first delivery, so
+    // the ticker cannot race it and send the brief twice. Passive adopt
+    // (SPEC-ADE D7) sends nothing.
     let _ = herdr.pane_set_parent(pane, &record.pane_id);
-    let placed = thread::load(&project, &id)?;
-    let sent = !passive
-        && agent.ready()
-        && herdr
-            .agent_prompt(pane, &thread::launch_prompt("", slug, &placed))
-            .is_ok();
+    let pending = !passive;
     let adopted = thread::update(&project, &id, |t| {
-        t.status = Status::Open;
-        t.prompt_pending = !passive && !sent;
+        t.status = if passive {
+            Status::Open
+        } else {
+            Status::Starting
+        };
+        t.prompt_pending = pending;
         t.last_state = agent.agent_status.clone();
         t.last_state_change = project::now();
         thread::bind_identity(
@@ -229,6 +228,54 @@ pub(crate) fn adopt(
                 .ok()
                 .and_then(|p| p.identity(&agent.agent)),
         );
+    })?;
+    if passive {
+        threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
+        return Ok(adopted);
+    }
+
+    let timeout_ms = adopted.launch.ready_timeout_ms.max(1);
+    let ready = if agent.ready() {
+        agent
+    } else {
+        match herdr.agent_wait_ready(pane, timeout_ms) {
+            Ok(agent) => agent,
+            Err(error) => {
+                let pending = thread::update(&project, &id, |t| t.status = Status::Open)?;
+                threads::report_thread_tokens(&herdr, &pending, slug, thread::Group::Working);
+                bail!(
+                    "thread {id} was adopted, but its brief was not delivered: herdr reported status `{}` in pane {pane}, then readiness failed: {error}; the brief remains pending",
+                    agent.agent_status
+                );
+            }
+        }
+    };
+    let placed = thread::update(&project, &id, |t| {
+        t.last_state = ready.agent_status.clone();
+        t.last_state_change = project::now();
+        thread::bind_identity(
+            t,
+            &record.socket,
+            &ready,
+            herdr
+                .pane_process_info(pane)
+                .ok()
+                .and_then(|p| p.identity(&ready.agent)),
+        );
+    })?;
+    if let Err(error) =
+        herdr.agent_prompt_wait_started(pane, &thread::launch_prompt("", slug, &placed), timeout_ms)
+    {
+        let pending = thread::update(&project, &id, |t| t.status = Status::Open)?;
+        threads::report_thread_tokens(&herdr, &pending, slug, thread::Group::Working);
+        bail!(
+            "thread {id} was adopted, but its brief was not delivered: herdr reported status `{}` in pane {pane}, then refused or stalled the prompt: {error}; the brief remains pending",
+            ready.agent_status
+        );
+    }
+    let adopted = thread::update(&project, &id, |t| {
+        t.status = Status::Open;
+        t.prompt_pending = false;
     })?;
     threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
     Ok(adopted)
@@ -346,13 +393,13 @@ mod tests {
             |cmd| cmd.program == "git",
             |cmd| crate::runner::RealRunner.run(cmd),
         );
-        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
         (world, project, cwd)
     }
 
     #[test]
     fn adopting_a_ready_agent_writes_a_brief_and_prompts_it() {
         let (world, project, _cwd) = world_with_agent("idle", "my-agent");
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
         let t = adopt(
             &world.ctx(),
             "demo",
@@ -394,26 +441,96 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_agent_gets_its_prompt_later_even_when_it_ends_in_done() {
-        let (world, project, cwd) = world_with_agent("working", "my-agent");
-        let t = adopt(&world.ctx(), "demo", "w5:p1", "Busy", None, lane()).unwrap();
-        assert!(t.prompt_pending);
-        assert_eq!(world.runner.count("agent prompt"), 0);
-
-        *world.agents.borrow_mut() = format!(
-            "[{}]",
-            agent_json("w5", "w5:t1", "w5:p1", &cwd, "my-agent", "done")
+    fn adopting_a_starting_agent_waits_until_ready_before_prompting() {
+        let (world, _project, cwd) = world_with_agent("starting", "my-agent");
+        world.runner.on(
+            "agent wait",
+            ok(&format!(
+                r#"{{"result":{{"agent":{}}}}}"#,
+                agent_json("w5", "w5:t1", "w5:p1", &cwd, "my-agent", "idle")
+            )),
         );
-        crate::ticker::tick_project(&world.ctx(), &project).unwrap();
-        assert_eq!(world.runner.count("agent prompt"), 1);
-        assert!(!thread::load(&project, "t-0001").unwrap().prompt_pending);
-        // The ticker never tries to start an agent in an adopted pane it found busy.
-        assert_eq!(world.runner.count("agent start"), 0);
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+
+        let t = adopt(&world.ctx(), "demo", "w5:p1", "Starting", None, lane()).unwrap();
+        assert!(!t.prompt_pending);
+        let calls = world.runner.calls.borrow();
+        let waited = calls
+            .iter()
+            .position(|call| call.display().contains("agent wait"))
+            .unwrap();
+        let prompted = calls
+            .iter()
+            .position(|call| call.display().contains("agent prompt"))
+            .unwrap();
+        assert!(waited < prompted);
+        assert!(
+            calls[waited]
+                .display()
+                .contains("--until idle --until done")
+        );
+        assert!(
+            calls[prompted]
+                .display()
+                .contains("--wait --until working --until blocked")
+        );
+    }
+
+    #[test]
+    fn adopting_an_agent_that_never_becomes_ready_reports_failure_and_keeps_brief_pending() {
+        let (world, project, _cwd) = world_with_agent("starting", "my-agent");
+        world.runner.on(
+            "agent wait",
+            crate::runner::fake::fail(
+                1,
+                r#"{"error":{"code":"timeout","message":"timed out waiting for agent status"}}"#,
+            ),
+        );
+
+        let error = adopt(&world.ctx(), "demo", "w5:p1", "Starting", None, lane())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("herdr reported status `starting`"),
+            "{error}"
+        );
+        assert!(
+            error.contains("timed out waiting for agent status"),
+            "{error}"
+        );
+        let t = thread::load(&project, "t-0001").unwrap();
+        assert_eq!(t.status, Status::Open);
+        assert!(t.prompt_pending);
+        assert!(Path::new(&t.thread_dir).join("brief.md").is_file());
+        assert_eq!(world.runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn a_stalled_adopt_prompt_is_reported_and_stays_pending() {
+        let (world, project, _cwd) = world_with_agent("idle", "my-agent");
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("agent prompt"),
+            |_| {
+                Ok(crate::runner::fake::fail(
+                    1,
+                    r#"{"error":{"code":"agent_prompt_stalled","message":"agent prompt produced no observed working state"}}"#,
+                ))
+            },
+        );
+
+        let error = adopt(&world.ctx(), "demo", "w5:p1", "Ready", None, lane())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agent_prompt_stalled"), "{error}");
+        let t = thread::load(&project, "t-0001").unwrap();
+        assert_eq!(t.status, Status::Open);
+        assert!(t.prompt_pending);
     }
 
     #[test]
     fn refusals_happen_before_anything_is_created() {
         let (world, project, _) = world_with_agent("idle", "my-agent");
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
         let ctx = world.ctx();
         // No detected agent in that pane.
         assert!(

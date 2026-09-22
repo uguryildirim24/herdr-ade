@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::sh::{Cmd, Runner};
+use super::sh::{Cmd, Runner, SHORT};
 use super::{Env, SEEN_BRIDGE_MAJORS};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,6 +90,29 @@ pub(crate) fn health_any(runner: &dyn Runner) -> Result<(u16, Health)> {
     let health = health(runner, fallback)
         .map_err(|error| anyhow::anyhow!("no bridge on {primary} or {fallback}: {error:#}"))?;
     Ok((fallback, health))
+}
+
+/// The kernel's stable start stamp for one process. PID alone is not an
+/// identity because the kernel can reuse it after a daemon exits.
+pub(crate) fn process_start(runner: &dyn Runner, pid: u32) -> Result<String> {
+    let pid = pid.to_string();
+    let output = runner.run(
+        &Cmd::new("/bin/ps", SHORT)
+            .args(["-p", &pid, "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC"),
+    )?;
+    if !output.success() {
+        bail!(
+            "could not read start time for bridge pid {pid}: {}",
+            output.error_text()
+        );
+    }
+    let start = output.stdout.trim();
+    if start.is_empty() {
+        bail!("could not read start time for bridge pid {pid}: ps returned no process");
+    }
+    Ok(start.to_string())
 }
 
 /// The bridge's own config: `$CODEX_CHATGPT_WEB_HOME/config.json` else
