@@ -176,12 +176,12 @@ impl InstallOutcome {
                     process.machine, process.process, build, process.state
                 )),
                 (None, Some(reason)) => message.push_str(&format!(
-                    "{} {}: unknown ({reason})\n",
-                    process.machine, process.process
+                    "{} {}: {} ({reason})\n",
+                    process.machine, process.process, process.state
                 )),
                 (None, None) => message.push_str(&format!(
-                    "{} {}: unknown\n",
-                    process.machine, process.process
+                    "{} {}: {}\n",
+                    process.machine, process.process, process.state
                 )),
             }
         }
@@ -646,6 +646,17 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
                 state: "running".into(),
                 reason: None,
             },
+            Err(_error) if crate::ticker::handoff_pending(&ctx.root) => ProcessProof {
+                machine: "local".into(),
+                process: "ticker".into(),
+                pid: None,
+                build: None,
+                state: "pending handoff".into(),
+                reason: Some(
+                    "the old ticker is finishing its current pass; the initialized replacement is waiting"
+                        .into(),
+                ),
+            },
             Err(error) => ProcessProof {
                 machine: "local".into(),
                 process: "ticker".into(),
@@ -847,7 +858,9 @@ fn box_process_script(
            fi\n\
            n=$((n+1)); sleep {delay_seconds}\n\
          done\n\
-         if [ -n \"$seen\" ] && [ -n \"$pid\" ]; then\n\
+         if [ -e \"$root/.ticker.handoff\" ]; then\n\
+           printf 'HERDR_ADE_BOX_TICKER_PENDING=the old ticker is finishing its current pass; the initialized replacement is waiting\\n'\n\
+         elif [ -n \"$seen\" ] && [ -n \"$pid\" ]; then\n\
            printf 'HERDR_ADE_BOX_TICKER_STALE=%s:%s\\n' \"$pid\" \"$seen\"\n\
          else\n\
            printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker lock did not contain a complete build record\\n'\n\
@@ -936,6 +949,19 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
                     crate::VERSION
                 )
             }),
+        });
+    } else if let Some(reason) = out
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER_PENDING="))
+    {
+        proofs.push(ProcessProof {
+            machine: machine.id.clone(),
+            process: "ticker".into(),
+            pid: None,
+            build: None,
+            state: "pending handoff".into(),
+            reason: Some(reason.to_string()),
         });
     } else if let Some(value) = out
         .stdout
