@@ -928,6 +928,13 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         }
     }
 
+    // Older versions parked deleted projects here. Remove this slug's copies,
+    // but keep and name every other project's retained copy; the redundant
+    // holding folder goes only when no retained copy still needs it. Do this
+    // before the project record: a cleanup failure must leave the deletion
+    // intent available for retry.
+    clean_old_trash(ctx, slug)?;
+
     {
         // No project writer can land after this point. The trash command moves
         // the directory atomically on macOS, while the open lock inode remains
@@ -935,11 +942,6 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         let _lock = project.lock()?;
         trash(ctx, &project.dir(), "project record")?;
     }
-
-    // Older versions parked deleted projects here. Remove this slug's copies,
-    // but keep and name every other project's retained copy; the redundant
-    // holding folder goes only when no retained copy still needs it.
-    clean_old_trash(ctx, slug)?;
     Ok(())
 }
 
@@ -1152,6 +1154,23 @@ mod tests {
                     arg == &other.display().to_string() || arg == &holding.display().to_string()
                 })
         }));
+        let old_copy = calls
+            .iter()
+            .position(|call| {
+                call.args
+                    .iter()
+                    .any(|arg| arg == &own.display().to_string())
+            })
+            .unwrap();
+        let project_record = calls
+            .iter()
+            .position(|call| {
+                call.args
+                    .iter()
+                    .any(|arg| arg == &world.root.join("demo").display().to_string())
+            })
+            .unwrap();
+        assert!(old_copy < project_record);
     }
 
     #[test]
