@@ -865,23 +865,19 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 stop_after,
             } => {
                 let stop = stop_after.map(|s| s.parse()).transpose()?;
-                let result = round::merge(ctx, &slug, &id, stop)?;
+                let run = round::merge_run(ctx, &slug, &id, stop)?;
                 let record = round::load(&Project::load(&ctx.root, &slug)?, &id)?;
                 let mut message = String::new();
-                let outcome = match &result {
+                let outcome = match &run.merge {
                     round::MergeOutcome::Checkpointed { head, lanes } => {
-                        message.push_str(&format!(
-                            "merged and checkpointed at H {head}; configured publication and installation are complete\n"
-                        ));
+                        message.push_str(&format!("merged and checkpointed at H {head}\n"));
                         for lane in lanes {
                             message.push_str(&format!("  {lane}\n"));
                         }
                         "merged"
                     }
                     round::MergeOutcome::NoOp { head } => {
-                        message.push_str(&format!(
-                            "already checkpointed at H {head}; configured publication and installation are complete\n"
-                        ));
+                        message.push_str(&format!("already checkpointed at H {head}\n"));
                         "already_checkpointed"
                     }
                     round::MergeOutcome::RepairReviewStarted {
@@ -909,16 +905,18 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         "stopped"
                     }
                 };
+                message.push_str(&run.effects.message());
                 crate::output::success(
                     Some(outcome),
                     &serde_json::json!({
-                        "merge": result,
+                        "merge": run.merge,
+                        "effects": run.effects,
                         "phase": record.phase,
                         "published": record.published,
                         "installed": record.installed,
                     }),
                     &message,
-                    "",
+                    &run.effects.warnings(),
                 )
             }
             RoundCommand::Advance { slug } => {
