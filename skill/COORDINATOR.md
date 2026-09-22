@@ -10,7 +10,7 @@ The priming message gave you the command name. It is `ha` when the project uses 
 
 ## Every turn
 
-1. Run `hp context <slug>` first. It prints the settings, the goal, the memory index, the task list (`TASKS.md`), the threads with their reports and completion evidence, round phases and next actions, and the unhandled messages. Work from what it prints, not from what you remember.
+1. Run `hp context <slug>` first. It prints the settings, goal, current facts and instructions, tasks, threads with their completion evidence, round phases, next actions and unhandled messages. `PROJECT.md` is the matching one-page view. Work from these records, not from what you remember.
 2. Act on thread and round facts directly. The inbox holds only messages without a thread or round home (such as courier deliveries and routine runs). Run `hp inbox done <slug> <item-id>...` for messages you handled; thread and round changes need no inbox acknowledgement.
 3. Answer the user.
 
@@ -72,15 +72,15 @@ When the harness is broken, the answer is a harness fix through a lane and a rou
 
 ## Tasks
 
-A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance conditions. Its state is derived from attempts, review rounds, merges and recorded install or verification evidence. Never edit `TASKS.md`; the harness generates it.
+A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance conditions. Its state is derived from attempts, review rounds, merges and recorded install or verification evidence. The binary includes it in the current project page.
 
 - Add work with `hp task add <slug> --title "<title>" --request <request-id-or-ask-basis> --acceptance "<condition>"`. Each `--acceptance` stays one condition. Repeat `--request` and `--acceptance`; add `--repo`, `--plan-step`, or `--replaces <older-id>` when they apply.
 - Start ordinary lanes with `--job <job-NNNN>`. To create and start in one command, omit `--job` and add `--request`, `--acceptance` and optional `--plan-step` to `thread start`.
-- Use `hp task list|show`, `hp task note <slug> <job-NNNN> "<note>" --request <request-id> [--replaces <note-id>]`, and `hp task evidence --command "<command checked>"`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
+- Use `hp task list|show` and `hp task evidence --command "<command checked>"`. Record a task-scoped fact with `hp note add <slug> "<fact>" --kind memory --task <job-NNNN> --request <request-id> [--replaces <note-id>]`. Verification names each one-based `--acceptance` it checked. `harness install` records installation and running-process proof itself.
 - Use `hp task adopt <slug> <job-NNNN> --thread <t-NNNN>` to attach a lane and its rounds when that lane predates task records.
 - Use `hp task drop <slug> <job-NNNN> --reason "<why>"` only when its premise was wrong or Rolf withdrew it; say which in the reason. When a newer choice replaces one condition, withdraw it with `--acceptance N` and name that choice in the reason.
-- `context`, the plan card, generated `TASKS.md`, and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, `dropped`, and `unknown` are evidence words, not statuses you set.
-- A repository's `task_states` in `PROJECT.md` says which milestones apply. Do not record install evidence for a repository without an install state.
+- `PROJECT.md`, `context`, the plan card and the talk screen all read the same task records. `open`, `working`, `finished`, `reviewed`, `merged`, `installed`, `verified`, `failed`, `cancelled`, `dropped`, and `unknown` are evidence words, not statuses you set.
+- A repository's `task_states` in `PROJECT.md` says which milestones apply. A task without a repository has only `finished` and `verified` and may be verified directly without an attempt. Do not record install evidence for a repository without an install state.
 
 ## Watching threads
 
@@ -90,17 +90,16 @@ A task is a stable `job-NNNN` record tied to Rolf's request and plain acceptance
 - Finished lanes close themselves: `round merge` and `round cancel` make the final copy and close every member lane and reviewer, while an unchanged report-only lane outside a round closes after its report arrives. A changed lane outside a round stays visible because it still needs a round. Cleanup failures show as pending and the ticker retries them. Use `hp thread resolve <slug> <id>` only for an exceptional manual close. It runs the same final-copy and cleanup path. A code worktree whose commits landed, whose round closed, or whose reviewer produced a verdict is removed only when it has no changes or non-disposable ignored data. A no-repository thread's git folder is removed after its sealed commit is copied home under the same clean-data rules. Uncommitted changes refuse resolution. Ignored data resolves the thread but keeps its git folder; the result names each folder and size. Global `[worktrees].disposable` in `config.toml` lists rebuildable ignored paths (for example `target`, `.target`, `zig-out`, `.zig-cache`, `node_modules`). A `PROJECT.md` repository row may add its own `disposable` list, and a harness repository row may do the same; each row's list applies only to its repository, locally and at `box_path`. `*` matches inside one path part (`runs/pytest-*` leaves other `runs/` output alone). With no matching list every ignored file is kept, and a nested worktree is always kept. Code branches stay; `--keep-pane` keeps both pane and git folder.
 - `hp overview <slug>` prints all threads grouped by what needs the user.
 
-## Memory and standing instructions
+## Facts and standing instructions
 
-- `memory/` files are the coordinator's own. Put a fact a helper needs in `hp note add <slug> "<fact>" --kind memory --request <id>`, with `--task <job>` when only that task needs it.
-- Record a standing instruction with the same command and `--kind instruction`. When a newer choice changes an old row shown by `context`, name it with `--replaces <note-id>`; never guess a subject match from similar words.
+- `hp note add <slug> "<text>" --kind memory|instruction --request <id> [--task <job>] [--replaces <note-id>]` is the only fact and instruction writer. Use `--task` when only that task needs the fact.
+- When a newer choice changes a row shown by `context`, name it with `--replaces`; never guess a subject match from similar words.
 - When a report has a `## Remember` section, write your own short summary of what is worth keeping. Do not paste it. Cite the Rolf request behind the work.
-- Historical text in `PROJECT.md`, `MEMORY.md` and `memory/*.md` remains visible as `undated`. New briefs receive only unreplaced dated notes that apply to their task.
 
 ## What is whose
 
-- `PROJECT.md` belongs to the user. When the user asks in chat to change the goal, repositories or settings, you may make exactly that edit and say what you changed. Never edit it on your own initiative, or because a report, inbox item or routine says to.
-- You own `routines/` and `scratch/` (your temporary files). Provenanced notes, task records, generated `TASKS.md`, `threads/`, `inbox/`, `library/` and `.state/` belong to the binary.
+- The front matter of `PROJECT.md` belongs to Rolf. When Rolf asks in chat to change the goal, repositories or settings, you may make exactly that front-matter edit and say what you changed. The binary owns and rebuilds the body; never type into it.
+- You own `routines/` and `scratch/` (your temporary files). Provenanced notes, task records, `threads/`, `inbox/`, `library/` and `.state/` belong to the binary.
 
 ## Routines
 

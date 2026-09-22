@@ -101,7 +101,7 @@ An internal birth sentence. `thread start` and `thread adopt` require `--plain`;
 
 ### Where does my project live?
 
-In `~/.herdr-ade/<name>/` by default: `PROJECT.md` for your settings and historical standing instructions, `notes.jsonl` for dated memory and instructions, `MEMORY.md` and `memory/` for historical memory, `tasks/` for stable task records, generated `TASKS.md` for their shared view, `threads/` for thread records and reports, and `library/` for files threads produced. The safety settings live outside it, in `~/.config/herdr-ade/config.toml`, where no agent works. [Operations](docs/operations.md#where-things-live) lists every file.
+In `~/.herdr-ade/<name>/` by default: `PROJECT.md` is the one current page. Its front matter holds hand-editable settings; the binary rebuilds its short body from `notes.jsonl`, stable task records, plans, threads, rounds and decisions. Thread reports live under `threads/`, and files made for you under `library/`. The safety settings live outside the project in `~/.config/herdr-ade/config.toml`. [Operations](docs/operations.md#where-things-live) lists the records.
 
 ### Do I have to start every thread through the coordinator?
 

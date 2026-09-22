@@ -1,8 +1,7 @@
 //! Provenanced project memory and standing instructions.
 //!
-//! New notes are append-only records. Historical Markdown remains readable as
-//! an `undated:*` note until an explicit replacement supersedes it; subject
-//! matching is never guessed from prose.
+//! New notes are append-only records. Historical task notes still load from
+//! task records; current facts and instructions live only in this log.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -88,80 +87,20 @@ pub(crate) fn read(project: &Project) -> Vec<Note> {
         .collect()
 }
 
-fn legacy_rows(project: &Project) -> Vec<Row> {
-    let mut rows = Vec::new();
-    if let Ok((_, body)) = project.read_project_md()
-        && !body.trim().is_empty()
-    {
-        rows.push(Row {
-            id: "undated:PROJECT.md".into(),
-            kind: "standing instruction".into(),
-            at: None,
-            request: None,
-            text: body.trim().into(),
-            replaces: None,
-            tasks: Vec::new(),
-            source: "PROJECT.md".into(),
-        });
-    }
-    let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
-    if !index.trim().is_empty() {
-        rows.push(Row {
-            id: "undated:MEMORY.md".into(),
-            kind: "memory".into(),
-            at: None,
-            request: None,
-            text: index.trim().into(),
-            replaces: None,
-            tasks: Vec::new(),
-            source: "MEMORY.md".into(),
-        });
-    }
-    let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| name.ends_with(".md") && !name.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    for name in names {
-        let file = project.dir().join("memory").join(&name);
-        if !std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
-            continue;
-        }
-        if let Ok(text) = std::fs::read_to_string(file)
-            && !text.trim().is_empty()
-        {
-            rows.push(Row {
-                id: format!("undated:memory/{name}"),
-                kind: "memory".into(),
-                at: None,
-                request: None,
-                text: text.trim().into(),
-                replaces: None,
-                tasks: Vec::new(),
-                source: format!("memory/{name}"),
-            });
-        }
-    }
-    rows
-}
-
 pub(crate) fn rows(project: &Project) -> Vec<Row> {
-    let mut rows = legacy_rows(project);
-    rows.extend(read(project).into_iter().map(|note| Row {
-        id: note.id,
-        kind: note.kind.word().into(),
-        at: Some(note.at),
-        request: Some(note.request),
-        text: note.text,
-        replaces: note.replaces,
-        tasks: note.tasks,
-        source: "notes.jsonl".into(),
-    }));
+    let mut rows: Vec<Row> = read(project)
+        .into_iter()
+        .map(|note| Row {
+            id: note.id,
+            kind: note.kind.word().into(),
+            at: Some(note.at),
+            request: Some(note.request),
+            text: note.text,
+            replaces: note.replaces,
+            tasks: note.tasks,
+            source: "notes.jsonl".into(),
+        })
+        .collect();
     for decision in crate::decide::read(project).records {
         let request = decision.request.clone().or_else(|| {
             decision
@@ -290,6 +229,9 @@ pub(crate) fn add(
         .open(path(project))?;
     writeln!(file, "{}", serde_json::to_string(&note)?)?;
     file.sync_all()?;
+    drop(file);
+    drop(_lock);
+    crate::project::refresh_page(project)?;
     Ok(note)
 }
 
@@ -351,7 +293,7 @@ pub(crate) fn render_context(project: &Project) -> String {
     }
     if total > 20 {
         out.push_str(&format!(
-            "… {} more; read notes.jsonl, decisions.jsonl, tasks/, PROJECT.md and memory/.\n",
+            "… {} more; read notes.jsonl, decisions.jsonl and tasks/.\n",
             total - 20
         ));
     }
@@ -459,7 +401,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(render_context(&fx.project).contains("undated:PROJECT.md [undated"));
+        assert!(!render_context(&fx.project).contains("undated:PROJECT.md"));
         let old = add(&fx.project, Kind::Memory, "Keep this.", "q-1", None, vec![]).unwrap();
         let new = add(
             &fx.project,

@@ -182,7 +182,6 @@ pub(crate) fn start(
         }
         save(&project, &d)?;
     }
-    let _ = crate::glossary::rewrite(&project);
     let prefix =
         crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "herdr-ade".into());
     let coord = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
