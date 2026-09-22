@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 use crate::herdr;
 use crate::runner::Runner;
@@ -51,10 +50,10 @@ impl Env {
     /// Config directory: `$XDG_CONFIG_HOME/herdr-ade` when that variable is set
     /// (SPEC-ADE item 39), else `~/.config/herdr-ade`.
     pub(crate) fn config_dir(&self) -> PathBuf {
-        match self.var("XDG_CONFIG_HOME") {
-            Some(xdg) => self.expand_tilde(xdg).join("herdr-ade"),
-            None => self.home.join(".config").join("herdr-ade"),
-        }
+        let xdg = self
+            .var("XDG_CONFIG_HOME")
+            .map(|value| self.expand_tilde(value));
+        crate::config::dir(&self.home, xdg.as_deref())
     }
 
     /// `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
@@ -82,13 +81,6 @@ pub(crate) struct Ctx<'a> {
     pub(crate) detached_ticker: bool,
 }
 
-/// The part of `config.toml` that resolution needs. Safety tables are read by
-/// the `project` module from the same file.
-#[derive(Debug, Default, Deserialize)]
-struct RootConfig {
-    root: Option<String>,
-}
-
 /// Projects root: `--root`, then `HERDR_ADE_ROOT`, then `root` in
 /// `<config_dir>/config.toml`, then `~/.herdr-ade`.
 pub(crate) fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result<PathBuf> {
@@ -98,13 +90,13 @@ pub(crate) fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) ->
     if let Some(var) = env.var("HERDR_ADE_ROOT") {
         return absolute(&env.expand_tilde(var));
     }
-    let config_file = config_dir.join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(&config_file) {
-        let config: RootConfig = toml::from_str(&text)
-            .with_context(|| format!("{} does not parse", config_file.display()))?;
-        if let Some(root) = config.root.filter(|r| !r.is_empty()) {
-            return absolute(&env.expand_tilde(&root));
-        }
+    let document = crate::config::Document::read(config_dir)?;
+    if let Some(root) = document
+        .value("root")
+        .and_then(toml::Value::as_str)
+        .filter(|root| !root.is_empty())
+    {
+        return absolute(&env.expand_tilde(root));
     }
     Ok(env.home.join(".herdr-ade"))
 }

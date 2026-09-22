@@ -555,19 +555,10 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// The effective safety settings: `[safety."<canonical project path>"]` in
 /// `<config_dir>/config.toml`, with defaults for an absent table or key.
 fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
-    #[derive(Deserialize, Default)]
-    struct Config {
-        #[serde(default)]
-        safety: std::collections::BTreeMap<String, Safety>,
-    }
+    let document = crate::config::Document::read(config_dir)?;
     let file = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(Safety::default());
-    };
-    let mut config: Config =
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
-    let safety = config
-        .safety
+    let mut configured: std::collections::BTreeMap<String, Safety> = document.section("safety")?;
+    let safety = configured
         .remove(&*canonical_project_dir.to_string_lossy())
         .unwrap_or_default();
     if !matches!(safety.start_threads.as_str(), "propose" | "auto") {
@@ -596,19 +587,9 @@ impl Default for CoordinatorSettings {
 
 /// Global coordinator behaviour from `[coordinator]` in `config.toml`.
 pub(crate) fn coordinator_settings(config_dir: &Path) -> Result<CoordinatorSettings> {
-    #[derive(Deserialize, Default)]
-    struct Config {
-        #[serde(default)]
-        coordinator: CoordinatorSettings,
-    }
-
+    let document = crate::config::Document::read(config_dir)?;
     let file = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(CoordinatorSettings::default());
-    };
-    let settings: CoordinatorSettings = toml::from_str::<Config>(&text)
-        .with_context(|| format!("{} does not parse", file.display()))?
-        .coordinator;
+    let settings: CoordinatorSettings = document.section("coordinator")?;
     if settings.idle_nudge_minutes == 0 {
         bail!(
             "{}: coordinator.idle_nudge_minutes must be at least 1",

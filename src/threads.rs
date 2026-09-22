@@ -225,7 +225,7 @@ fn start_with_ticker(
                 .with_context(|| format!("repository {repo} does not exist"))?
                 .to_string_lossy()
                 .into_owned();
-            if !crate::harness::allowed_repo(&settings, &ctx.config_dir, &path) {
+            if !crate::harness::allowed_repo(&settings, &ctx.config_dir, &path)? {
                 bail!(
                     "repo_not_listed: {path} is not listed in `repos` in PROJECT.md and is not a harness repository"
                 );
@@ -608,7 +608,7 @@ fn box_repo_candidate(
             "box_path_missing: `{repo}` has a publish_url in PROJECT.md but no `box_path` in that row; add the box clone path before the first box start"
         ),
         (None, None) => {
-            let map = crate::remote::box_repo_for(config_dir, machine, repo).with_context(|| {
+            let map = crate::remote::box_repo_for(config_dir, machine, repo)?.with_context(|| {
                 format!(
                     "box_repo_unmapped: {repo} has no Mac-to-box row; add one before the first box start"
                 )

@@ -307,29 +307,8 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
         report_with_checks(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
     // The pi rows read only providers named by enabled configured recipes;
     // unused built-in provider knowledge never causes a doctor failure.
-    let pi_models: Vec<(String, String)> = crate::launch::parse_launch_config(&ctx.config_dir)
-        .map(|config| {
-            let routed = config.routing.recipe_ids();
-            config
-                .recipes
-                .iter()
-                .filter(|(id, recipe)| {
-                    routed.contains(id.as_str())
-                        && recipe.enabled
-                        && config
-                            .adapters
-                            .get(&recipe.kind)
-                            .is_some_and(|adapter| adapter.doctor.readiness == "pi")
-                })
-                .filter_map(|(_, recipe)| {
-                    crate::pi::launch::flag_value(&recipe.args, "--model")
-                        .map(|model| (recipe.provider.clone(), model))
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        })
-        .unwrap_or_default();
+    let pi_models =
+        crate::pi::doctor::configured_routed_models(&ctx.config_dir).unwrap_or_default();
     match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, &pi_models) {
         Ok((rows, pi_healthy)) => {
             healthy &= pi_healthy;
@@ -1508,8 +1487,17 @@ fn box_rows(
             ));
         }
     }
-    let mut repos: Vec<crate::project::Repo> =
-        crate::harness::repos(config_dir).unwrap_or_default();
+    let mut repos = match crate::harness::repos(config_dir) {
+        Ok(repos) => repos,
+        Err(error) => {
+            rows.push((
+                Some(false),
+                format!("box {label} repositories"),
+                format!("{error:#}"),
+            ));
+            Vec::new()
+        }
+    };
     repos.extend(machine_paths.repos.clone());
     let mut script = format!(
         "set -u\n\

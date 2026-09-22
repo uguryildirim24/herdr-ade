@@ -63,15 +63,6 @@ struct DoctorOnlyConfig {
     doctor: DoctorConfig,
 }
 
-fn config_text(config_dir: &Path) -> Result<String> {
-    let file = config_dir.join("config.toml");
-    match std::fs::read_to_string(&file) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e).with_context(|| format!("read {}", file.display())),
-    }
-}
-
 fn validate_doctor_config(config: &DoctorConfig) -> Result<()> {
     if !config.min_free_disk_gb.is_finite() || config.min_free_disk_gb < 0.0 {
         bail!("doctor_min_free_disk_invalid: [doctor].min_free_disk_gb must be zero or greater");
@@ -80,15 +71,15 @@ fn validate_doctor_config(config: &DoctorConfig) -> Result<()> {
 }
 
 pub fn doctor_config(config_dir: &Path) -> Result<DoctorConfig> {
-    let raw: DoctorOnlyConfig =
-        toml::from_str(&config_text(config_dir)?).context("config.toml does not parse")?;
+    let document = crate::config::Document::read(config_dir)?;
+    let raw: DoctorOnlyConfig = document.decode()?;
     validate_doctor_config(&raw.doctor)?;
     Ok(raw.doctor)
 }
 
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
-    let value: toml::Value =
-        toml::from_str(&config_text(config_dir)?).context("config.toml does not parse")?;
+    let document = crate::config::Document::read(config_dir)?;
+    let value = toml::Value::Table(document.decode::<toml::Table>()?);
     if value.get("roles").is_some() {
         bail!(
             "roles_removed: remove [roles] and every [roles.*] table from config.toml; keep model rows in [recipes.*]"
@@ -115,7 +106,7 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
     let mut recipes = defaults.recipes;
     // A configured row is complete and replaces the shipped data row.
     recipes.extend(raw.recipes);
-    let adapters = crate::adapters::declarations(config_dir)?;
+    let adapters = crate::adapters::declarations_from(&document)?;
     let policy_hash = crate::thread::sha256_hex(
         serde_json::to_vec(&(&recipes, &adapters, &raw.dispatch, &raw.routing))?.as_slice(),
     );

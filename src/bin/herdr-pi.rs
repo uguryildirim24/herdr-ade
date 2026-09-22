@@ -9,6 +9,9 @@
 //! library target by design (SPEC-pi v2 §3: one library crate, two binaries).
 
 #[allow(dead_code)]
+#[path = "../config.rs"]
+mod config;
+#[allow(dead_code)]
 #[path = "../pi/mod.rs"]
 mod pi;
 

@@ -158,8 +158,9 @@ fn write_provider(layout: &Layout) -> Result<Option<String>> {
 /// Write the DeepSeek `contextWindow` overrides into `models.json`. Runs on
 /// every setup, with or without the relay's `serve.json`; the merge keeps the
 /// `pro` provider and every other key.
-fn write_deepseek(layout: &Layout) -> Result<()> {
-    deepseek::write_overrides(&layout.models())
+fn write_deepseek(env: &super::Env, layout: &Layout) -> Result<()> {
+    let models = super::doctor::configured_deepseek_models(&env.config_dir())?;
+    deepseek::write_overrides(&layout.models(), &models)
 }
 
 /// Setup: pinned install, shared folder, guard, the running herdr's state
@@ -174,7 +175,7 @@ pub(crate) fn setup(
     let wrapper = super::launch::write_wrapper(layout)?;
     let guard = write_guard(layout)?;
     let provider = write_provider(layout)?;
-    write_deepseek(layout)?;
+    write_deepseek(env, layout)?;
 
     let integration = runner.run(
         &sh::Cmd::new(env.herdr_bin(), Duration::from_secs(120))
