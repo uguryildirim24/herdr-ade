@@ -14,7 +14,7 @@
 
 ## Traps
 
-## Herdr (generated 2026-09-21T22:28:00-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
+## Herdr (generated 2026-09-21T22:57:25-04:00 by herdr-ade checkpoint, herdr 0.9.1, session `default`)
 
 Workspace `w1G` (Adeherdr), 2 tabs. Coordinator: pane `w1G:p1` in tab `w1G:t1`, agent name `hp-adeherdr-coordinator`, kind claude, status working, cwd `/home/agent/.herdr-ade/adeherdr`.
 
@@ -24,34 +24,35 @@ Coordinator session id `22e30006-6abc-4f92-9bcc-c002ce0ce442`.
 
 _none_
 
-Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (done), `w1N` PRL-8-53 (done)
+Other workspaces on this server (not yours to touch): `w1H` Flyonenomics (working), `w1N` PRL-8-53 (done)
 
 ### Git
 
-Repo `/home/agent/projects/herdr-ade`, integration branch `main` (7 ahead, 0 behind origin/main).
+Repo `/home/agent/projects/herdr-ade`, integration branch `main` (11 ahead, 0 behind origin/main).
 
 | worktree | branch | head | dirty files | last commit |
 |---|---|---|---|---|
-| `/home/agent/projects/herdr-ade` | `main` | c50263a | 0 | review(r86): approve repaired candidate |
-| `/home/agent/projects/herdr-ade/.worktrees/review-r86` | `review/r86` | 25dae55 | 0 | docs(tasks): t-0208 |
-| `/home/agent/projects/herdr-ade/.worktrees/review-r86-2` | `review/r86-2` | 4579086 | 0 | docs(tasks): t-0209 |
+| `/home/agent/projects/herdr-ade` | `main` | c34bc4e | 0 | Merge commit 'fcbfa7821813a9ec21937e6704d564ec0a232179' |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r87` | `review/r87` | 2562629 | 0 | docs(tasks): t-0212 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r88` | `review/r88` | a502f5c | 0 | docs(tasks): t-0214 |
+| `/home/agent/projects/herdr-ade/.worktrees/review-r89` | `review/r89` | af0a93a | 0 | docs(tasks): t-0215 |
 
 Last commits on the integration branch:
 
 ```
-c50263a review(r86): approve repaired candidate
-274f2e3 review(r86): merge earlier reviewed candidate
-4579086 docs(tasks): t-0209
-fcedf25 review(r86): brief for revision 1
-586ff25 checkpoint(r82): HANDOFF after merging the round
-5dae023 Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'
+c34bc4e Merge commit 'fcbfa7821813a9ec21937e6704d564ec0a232179'
+e5ff94c review(r89): brief for revision 1
+7bd61ab review(r88): brief for revision 1
+fcbfa78 docs(review): round r87 verdict
+7f3a0ed docs(tasks): t-0213
+3abaf78 Merge commit 'b82d5fc5ac56bc138917489901f6a01ca84eb9e5' into hp/adeherdr/t-0212-review-r87-every-coordinator-sees-each-h
 ```
 
 ### Record files (newest first)
 
 - handoff: `HANDOFF.md`
-- briefs: `tasks/t-0209.md`, `tasks/t-0208.md`, `tasks/review-r86.md`, `tasks/t-0207.md`, `tasks/t-0199.md`, `tasks/t-0197.md`, `tasks/review-r82.md`, `tasks/t-0206.md`, `tasks/t-0205.md`, `tasks/review-r85.md`, `tasks/t-0204.md`, `tasks/t-0203.md`
-- verdicts: `tasks/reviews/code-r86.md`, `tasks/reviews/code-r82.md`, `tasks/reviews/code-r85.md`, `tasks/reviews/code-r84.md`, `tasks/reviews/code-r83.md`, `tasks/reviews/code-r81.md`, `tasks/reviews/code-r80.md`, `tasks/reviews/code-r79.md`, `tasks/reviews/code-r78.md`, `tasks/reviews/code-r77.md`, `tasks/reviews/code-r75.md`, `tasks/reviews/code-r76.md`
+- briefs: `tasks/t-0212.md`, `tasks/review-r89.md`, `tasks/review-r88.md`, `tasks/t-0213.md`, `tasks/review-r87.md`, `tasks/t-0211.md`, `tasks/t-0210.md`, `tasks/t-0209.md`, `tasks/t-0208.md`, `tasks/review-r86.md`, `tasks/t-0207.md`, `tasks/t-0199.md`
+- verdicts: `tasks/reviews/code-r87.md`, `tasks/reviews/code-r86.md`, `tasks/reviews/code-r82.md`, `tasks/reviews/code-r85.md`, `tasks/reviews/code-r84.md`, `tasks/reviews/code-r83.md`, `tasks/reviews/code-r81.md`, `tasks/reviews/code-r80.md`, `tasks/reviews/code-r79.md`, `tasks/reviews/code-r78.md`, `tasks/reviews/code-r77.md`, `tasks/reviews/code-r75.md`
 
 ### Pickup
 
@@ -63,5 +64,5 @@ Run from the coordinator pane after a server restart, or from the fresh coordina
 # cd /home/agent/.herdr-ade/adeherdr && claude --resume 22e30006-6abc-4f92-9bcc-c002ce0ce442
 ```
 
-Round `r86` was merged into `main` at verdict commit `c50263a557b9926499fcd27a83bd9e27993e8300`; this checkpoint is its child.
+Round `r87` was merged into `main` at verdict commit `fcbfa7821813a9ec21937e6704d564ec0a232179`; this checkpoint is its child.
 
