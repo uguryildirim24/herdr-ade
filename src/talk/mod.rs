@@ -494,6 +494,18 @@ pub(crate) fn requests(journal: &Journal) -> Vec<(TalkInbound, String)> {
         .collect()
 }
 
+/// Rolf's exact words for one durable request id.
+pub(crate) fn request_text(project: &Project, id: &str) -> Option<String> {
+    read(project)
+        .lines
+        .into_iter()
+        .rev()
+        .find_map(|line| match line.entry {
+            Entry::Rolf { request, text, .. } if request == id => Some(text),
+            _ => None,
+        })
+}
+
 /// The most recent messages Rolf sent, oldest first, with the request id to
 /// cite. The coordinator digest prints them so an id is always findable.
 pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, String)> {
