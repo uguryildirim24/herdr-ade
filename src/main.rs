@@ -45,6 +45,7 @@ mod lane;
 mod launch;
 mod ledger;
 mod lifecycle;
+mod note;
 mod ops;
 mod overview;
 mod paths;

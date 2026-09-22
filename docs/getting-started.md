@@ -41,7 +41,7 @@ herdr-ade open billing
 
 The default project root is `~/.herdr-ade`. `new` creates the project record; `open` creates or focuses its Herdr workspace and coordinator. The coordinator reads its skill and current digest before answering.
 
-Edit the new `PROJECT.md` for standing instructions, repositories, and project settings. Recipe selection does not live there: the editable `[routing]` table in `config.toml` selects it.
+Edit the new `PROJECT.md` for repositories and project settings. Add standing instructions with `herdr-ade note add <project> "<instruction>" --kind instruction --request <request-id>` so they carry provenance and can be explicitly replaced. Recipe selection lives in the editable `[routing]` table in `config.toml`.
 
 ## 4. Start work
 

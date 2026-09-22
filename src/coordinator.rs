@@ -557,6 +557,17 @@ fn digest_snapshot(
         let _ = writeln!(out, "{}", crate::decide::status_line(decision));
     }
 
+    let _ = writeln!(
+        out,
+        "\n## Memory notes and standing instructions — newer first"
+    );
+    let notes = crate::note::render_context(project);
+    if notes.is_empty() {
+        let _ = writeln!(out, "(none)");
+    } else {
+        out.push_str(&notes);
+    }
+
     let _ = writeln!(out, "\n## Memory index (MEMORY.md)");
     let memory = crate::thread::memory_use(project);
     for line in memory.index.trim().lines().take(DIGEST_ROWS) {

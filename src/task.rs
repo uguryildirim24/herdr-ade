@@ -20,8 +20,17 @@ const PRESERVED_PREFIX: &str = "<!-- Preserved hand-written TASKS.md: ";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DatedNote {
+    /// Empty on historical notes written before provenance was required.
+    #[serde(default)]
+    pub(crate) id: String,
     pub(crate) at: String,
+    /// The request id behind this note. Empty historical notes are displayed
+    /// as undated rather than being assigned guessed authority.
+    #[serde(default)]
+    pub(crate) request: String,
     pub(crate) text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) replaces: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +65,9 @@ pub(crate) struct Task {
     /// `request:<id>` or `ask:<id>@<revision>`, all validated at creation.
     pub(crate) authority: Vec<String>,
     pub(crate) acceptance: Vec<String>,
+    /// An explicit older note, instruction, decision or task this task supersedes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) replaces: Option<String>,
     pub(crate) notes: Vec<DatedNote>,
     pub(crate) attempts: Vec<String>,
     pub(crate) rounds: Vec<String>,
@@ -80,6 +92,7 @@ impl Default for Task {
             title: String::new(),
             authority: Vec::new(),
             acceptance: Vec::new(),
+            replaces: None,
             notes: Vec::new(),
             attempts: Vec::new(),
             rounds: Vec::new(),
@@ -283,6 +296,7 @@ pub(crate) fn add(
     acceptance: Vec<String>,
     repo: Option<String>,
     plan_step: Option<String>,
+    replaces: Option<String>,
 ) -> Result<Task> {
     if title.trim().is_empty() {
         return Err(crate::refusal::error(
@@ -315,6 +329,23 @@ pub(crate) fn add(
             )));
         }
     }
+    let _replacement_lock = replaces
+        .as_ref()
+        .map(|_| crate::note::replacement_lock(project))
+        .transpose()?;
+    if let Some(old) = replaces.as_deref() {
+        if !crate::note::target_exists(project, old) {
+            return Err(crate::refusal::error(format!(
+                "task_replacement: no note, decision or task `{old}` exists"
+            )));
+        }
+        let rows = crate::note::rows(project);
+        if crate::note::replacement_map(&rows).contains_key(old) {
+            return Err(crate::refusal::error(format!(
+                "task_replacement: `{old}` already has a replacement"
+            )));
+        }
+    }
     if let Some(step) = plan_step.as_deref() {
         let plan = crate::plan::load(project)?
             .ok_or_else(|| crate::refusal::error("task_plan: no plan is written down"))?;
@@ -337,6 +368,7 @@ pub(crate) fn add(
         title,
         authority,
         acceptance: checked_acceptance,
+        replaces,
         plan_step,
         repo,
         created: project::now(),
@@ -362,14 +394,38 @@ fn update(
     Ok(task)
 }
 
-pub(crate) fn note(project: &Project, id: &str, text: &str) -> Result<Task> {
+pub(crate) fn note(
+    project: &Project,
+    id: &str,
+    text: &str,
+    request: &str,
+    replaces: Option<&str>,
+) -> Result<Task> {
     if text.trim().is_empty() {
         return Err(crate::refusal::error("task_note: a note is required"));
     }
+    let request = request.strip_prefix("request:").unwrap_or(request);
+    crate::decide::validate_basis(project, &format!("request:{request}"))?;
+    let _replacement_lock = replaces
+        .map(|_| crate::note::replacement_lock(project))
+        .transpose()?;
+    if let Some(old) = replaces {
+        if !crate::note::target_exists(project, old) {
+            bail!("task_note_replacement: no note `{old}` exists");
+        }
+        let rows = crate::note::rows(project);
+        if crate::note::replacement_map(&rows).contains_key(old) {
+            bail!("task_note_replacement: `{old}` already has a replacement");
+        }
+    }
     update(project, id, |task| {
+        let next = task.notes.len() + 1;
         task.notes.push(DatedNote {
+            id: format!("{id}:note-{next:04}"),
             at: project::now(),
+            request: request.to_string(),
             text: text.trim().to_string(),
+            replaces: replaces.map(str::to_string),
         });
         Ok(())
     })
@@ -981,12 +1037,40 @@ pub(crate) fn render(view: &View) -> String {
         "authority: {}\n",
         view.record.authority.join(", ")
     ));
+    if let Some(old) = &view.record.replaces {
+        out.push_str(&format!("replaces: {old}\n"));
+    }
     out.push_str("acceptance:\n");
     for (index, condition) in view.record.acceptance.iter().enumerate() {
         out.push_str(&format!("  {}. {}\n", index + 1, condition));
     }
     if let Some(class) = view.failure_class {
         out.push_str(&format!("failure: {}\n", class.plain()));
+    }
+    if !view.record.notes.is_empty() {
+        out.push_str("notes:\n");
+        for (index, note) in view.record.notes.iter().enumerate().rev() {
+            let id = if note.id.is_empty() {
+                format!("undated:{}:note-{:04}", view.record.id, index + 1)
+            } else {
+                note.id.clone()
+            };
+            let provenance = if note.request.is_empty() {
+                "undated".to_string()
+            } else {
+                format!(
+                    "{} request:{}",
+                    &note.at[..note.at.len().min(10)],
+                    note.request
+                )
+            };
+            let replaces = note
+                .replaces
+                .as_deref()
+                .map(|old| format!("; replaces {old}"))
+                .unwrap_or_default();
+            out.push_str(&format!("  {id} [{provenance}{replaces}] {}\n", note.text));
+        }
     }
     for evidence in &view.record.installed {
         if let (Some(machine), Some(build)) = (&evidence.machine, &evidence.build) {
@@ -1100,6 +1184,7 @@ mod tests {
             "Ship the checked change.",
             vec!["request:q-missing".into()],
             vec!["The command reports the new result.".into()],
+            None,
             None,
             None,
         )
