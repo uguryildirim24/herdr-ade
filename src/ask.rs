@@ -94,7 +94,7 @@ pub(crate) struct Answer {
 }
 
 fn asks_dir(project: &Project) -> PathBuf {
-    project.dir().join("asks")
+    project.record_dir("asks")
 }
 
 fn ask_dir(project: &Project, id: &str) -> PathBuf {
@@ -105,7 +105,7 @@ fn ask_dir(project: &Project, id: &str) -> PathBuf {
 /// (SPEC-talk §6.7).
 const MAX_OPEN_ASKS: usize = 3;
 
-/// The shared ask-set lock, `<project>/asks/.open.lock`. Creation, re-asking
+/// The shared ask-set lock, `<project>/.state/asks/.open.lock`. Creation, re-asking
 /// and answering take it inside the project lock so concurrent writers cannot
 /// each claim the third slot.
 struct AskSetLock {
@@ -113,8 +113,7 @@ struct AskSetLock {
 }
 
 fn ask_set_lock(project: &Project) -> Result<AskSetLock> {
-    let dir = asks_dir(project);
-    std::fs::create_dir_all(&dir)?;
+    let dir = project.record_dir_for_write("asks")?;
     let file = std::fs::File::options()
         .create(true)
         .truncate(false)

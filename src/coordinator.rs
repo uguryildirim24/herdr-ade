@@ -587,7 +587,7 @@ fn digest_snapshot(
         if let Some(event) = completion {
             if let Some(done) = &event.payload.done {
                 let report = crate::thread::sealed_report_reference(project, t)
-                    .unwrap_or_else(|| format!("artifacts/{} (missing)", done.artifact));
+                    .unwrap_or_else(|| format!(".state/artifacts/{} (missing)", done.artifact));
                 let _ = writeln!(
                     out,
                     "  done: {} report={} event={}",

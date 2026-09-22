@@ -149,14 +149,17 @@ pub(crate) fn adopt(
     let briefed = (|| -> Result<()> {
         {
             let _lock = project.lock()?;
-            project::write_atomic(&thread::task_path(&project, &id), task.as_bytes())?;
+            project::write_atomic(
+                &thread::task_path_for_write(&project, &id)?,
+                task.as_bytes(),
+            )?;
         }
         let prefix = crate::coordinator::current_prefix(&ctx.root)?;
         if created.repo.is_empty() {
             // An adopted process cannot have its cwd replaced, but all of its
             // durable work lives in the same project-owned git folder as a
             // newly started no-repository thread. `done` stages this folder.
-            let folder = project.dir().join("threads").join(&id);
+            let folder = thread::threads_dir_for_write(&project)?.join(&id);
             let with_dir = Thread {
                 worktree_path: folder.to_string_lossy().into_owned(),
                 thread_dir: folder.to_string_lossy().into_owned(),
@@ -415,7 +418,7 @@ mod tests {
         assert_eq!(t.agent_name, "my-agent");
         assert_eq!(
             Path::new(&t.thread_dir),
-            std::fs::canonicalize(project.dir().join("threads/t-0001"))
+            std::fs::canonicalize(thread::threads_dir(&project).join("t-0001"))
                 .unwrap()
                 .as_path()
         );
@@ -430,7 +433,7 @@ mod tests {
         let second = adopt(&world.ctx(), "demo", "w5:p2", "Second", None, lane()).unwrap();
         assert_eq!(
             Path::new(&second.thread_dir),
-            std::fs::canonicalize(project.dir().join("threads/t-0002"))
+            std::fs::canonicalize(thread::threads_dir(&project).join("t-0002"))
                 .unwrap()
                 .as_path()
         );
