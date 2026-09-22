@@ -2519,9 +2519,25 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 text_file,
             } => {
                 let text = read_text(&text_file)?;
-                let state = threads::prompt(&ctx, &slug, &id, &text)?;
-                crate::output::insert("agent_state", state.clone());
-                println!("sent to {id} (agent was {state})");
+                match threads::prompt(&ctx, &slug, &id, &text)? {
+                    threads::PromptOutcome::Queued { attempt } => {
+                        crate::output::set_outcome("queued");
+                        crate::output::insert("delivery", "queued");
+                        crate::output::insert("attempt", attempt);
+                        println!(
+                            "queued for {id} attempt {attempt}; it will be delivered after the brief"
+                        );
+                    }
+                    threads::PromptOutcome::Sent {
+                        attempt,
+                        agent_state,
+                    } => {
+                        crate::output::insert("delivery", "sent");
+                        crate::output::insert("attempt", attempt);
+                        crate::output::insert("agent_state", agent_state.clone());
+                        println!("sent to {id} (agent was {agent_state})");
+                    }
+                }
                 Ok(())
             }
             ThreadCommand::Adopt {
