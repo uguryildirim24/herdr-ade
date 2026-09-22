@@ -2889,8 +2889,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        6,
-        "one box build per repo plus lane settings, the pi guard, project conversion, and the running-process check"
+        5,
+        "one box build per repo plus lane settings, the pi guard, and the running-process check"
     );
     let calls = with_box.runner.calls.borrow();
     let scripts: Vec<String> = calls
@@ -2926,18 +2926,6 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
             "box index refresh must precede source inspection and build: {script}"
         );
     }
-    let conversion = scripts
-        .iter()
-        .position(|script| script.contains("ticker stop") && script.contains("project convert"))
-        .expect("box project conversion");
-    let later_build = scripts
-        .iter()
-        .rposition(|script| script.contains("cargo build --release --locked"))
-        .unwrap();
-    assert!(
-        conversion < later_build,
-        "box records must move immediately after installing the new plugin: {scripts:?}"
-    );
     let settings = calls
         .iter()
         .find(|call| {
@@ -2980,11 +2968,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
 }
 
 #[test]
-fn harness_install_builds_reexecs_and_converts_before_a_failed_box_lookup() {
+fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
     let world = World::new();
-    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
-    std::fs::remove_file(project.state_dir().join("records-converted")).unwrap();
-    std::fs::write(project.dir().join("ledger.jsonl"), "old record\n").unwrap();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
     write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
     world.runner.on("cargo build", ok(""));
@@ -3016,11 +3001,6 @@ fn harness_install_builds_reexecs_and_converts_before_a_failed_box_lookup() {
 
     assert!(error.contains("machine_list_failed"), "{error}");
     assert_eq!(world.runner.count("cargo build"), 1);
-    assert!(!project.dir().join("ledger.jsonl").exists());
-    assert_eq!(
-        std::fs::read_to_string(project.state_dir().join("ledger.jsonl")).unwrap(),
-        "old record\n"
-    );
     assert!(
         reexecs
             .borrow()
