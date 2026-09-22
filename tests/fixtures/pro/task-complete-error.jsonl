@@ -1,0 +1,4 @@
+{"timestamp":"2026-09-22T04:21:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"packet-load"}}
+{"timestamp":"2026-09-22T04:21:00.025Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"packet-load","last_agent_message":null}}
+{"timestamp":"2026-09-22T04:21:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"01a0c751-47a5-real-turn"}}
+{"timestamp":"2026-09-22T04:45:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"01a0c751-47a5-real-turn","last_agent_message":null,"error":{"message":"stream disconnected before completion: ChatGPT displayed 'Stopped thinking'"}}}
