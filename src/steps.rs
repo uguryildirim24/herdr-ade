@@ -212,14 +212,14 @@ fn publish_url_for(
     project: &Project,
     machine: &str,
     repo: &str,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if let Ok((settings, _)) = project.read_project_md()
         && let Some(row) = settings.repos.iter().find(|row| row.path == repo)
         && let Some(url) = &row.publish_url
     {
-        return Some(url.clone());
+        return Ok(Some(url.clone()));
     }
-    crate::remote::box_repo_for(config_dir, machine, repo).and_then(|row| row.publish_url)
+    Ok(crate::remote::box_repo_for(config_dir, machine, repo)?.and_then(|row| row.publish_url))
 }
 
 /// Before a box lane's DONE is typed, the Mac fetches the lane branch from the
@@ -233,7 +233,7 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
     if lane.branch.is_empty() {
         bail!("published_branch_missing: {} has no lane branch", lane.id);
     }
-    let url = publish_url_for(&ctx.config_dir, project, &lane.machine, &lane.repo)
+    let url = publish_url_for(&ctx.config_dir, project, &lane.machine, &lane.repo)?
         .with_context(|| format!("box_repo_unmapped: {} has no publish URL", lane.repo))?;
     let remote = crate::remote::remote_for_url(ctx.runner, &lane.repo, &url)?;
     let git = |args: &[&str]| {

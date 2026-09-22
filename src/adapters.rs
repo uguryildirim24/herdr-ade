@@ -54,22 +54,17 @@ pub(crate) struct Adapter {
     pub(crate) doctor: DoctorAdapter,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct RawConfig {
-    adapters: BTreeMap<String, Adapter>,
+pub(crate) fn declarations(config_dir: &Path) -> Result<BTreeMap<String, Adapter>> {
+    let document = crate::config::Document::read(config_dir)?;
+    declarations_from(&document)
 }
 
-pub(crate) fn declarations(config_dir: &Path) -> Result<BTreeMap<String, Adapter>> {
-    let path = config_dir.join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-    };
-    let raw: RawConfig = toml::from_str(&text).context("config.toml does not parse")?;
+pub(crate) fn declarations_from(
+    document: &crate::config::Document,
+) -> Result<BTreeMap<String, Adapter>> {
+    let configured: BTreeMap<String, Adapter> = document.section("adapters")?;
     let mut rows = builtin();
-    rows.extend(raw.adapters);
+    rows.extend(configured);
     for (kind, row) in &rows {
         validate(kind, row)?;
     }
@@ -302,8 +297,7 @@ pub(crate) fn validate_recipe(adapter: &Adapter, id: &str, recipe: &Recipe) -> R
     // Provider-specific syntax belongs to its declared readiness driver, not
     // to dispatch or to an agent-kind name.
     if adapter.doctor.readiness == "pi" {
-        crate::pi::launch::validate_args(&recipe.args)?;
-        crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args)?;
+        crate::pi::launch::validate_recipe(id, &recipe.provider, &recipe.args, &recipe.env)?;
     }
     Ok(())
 }

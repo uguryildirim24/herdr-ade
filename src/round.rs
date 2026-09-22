@@ -856,7 +856,7 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
         &project.read_project_md()?.0,
         &ctx.config_dir,
         &repo_path.to_string_lossy(),
-    ) {
+    )? {
         bail!(
             "repo_not_listed: {} is not listed in `repos` in PROJECT.md and is not a harness repository",
             repo_path.display()
