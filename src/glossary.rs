@@ -39,7 +39,7 @@ struct TermsFile {
 }
 
 fn terms_path(project: &Project) -> PathBuf {
-    project.dir().join("terms.toml")
+    project.record_file("terms.toml")
 }
 
 pub(crate) fn terms(project: &Project) -> Vec<Term> {
@@ -337,7 +337,8 @@ pub(crate) fn add_term(
             bail!("term_exists: `{name}` already has a sentence");
         }
         file.term.push(term.clone());
-        write_atomic(&terms_path(&project), toml::to_string(&file)?.as_bytes())?;
+        let path = project.record_file_for_write("terms.toml")?;
+        write_atomic(&path, toml::to_string(&file)?.as_bytes())?;
     }
     Ok(term)
 }

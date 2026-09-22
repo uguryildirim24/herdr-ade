@@ -183,20 +183,59 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn threads_dir(project: &Project) -> PathBuf {
+pub(crate) fn threads_dir(project: &Project) -> PathBuf {
+    project.state_dir().join("threads")
+}
+
+fn historical_threads_dir(project: &Project) -> PathBuf {
     project.dir().join("threads")
 }
 
+pub(crate) fn threads_dir_for_write(project: &Project) -> Result<PathBuf> {
+    let dir = threads_dir(project);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn existing_thread_path(project: &Project, name: &str) -> PathBuf {
+    let current = threads_dir(project).join(name);
+    if current.exists() {
+        current
+    } else {
+        historical_threads_dir(project).join(name)
+    }
+}
+
 fn record_path(project: &Project, id: &str) -> PathBuf {
-    threads_dir(project).join(format!("{id}.toml"))
+    existing_thread_path(project, &format!("{id}.toml"))
+}
+
+fn sidecar_path(project: &Project, id: &str, suffix: &str) -> PathBuf {
+    let name = format!("{id}{suffix}");
+    let current = threads_dir(project).join(&name);
+    if current.exists() {
+        return current;
+    }
+    let historical = historical_threads_dir(project).join(&name);
+    if historical.exists() {
+        historical
+    } else if threads_dir(project).join(format!("{id}.toml")).exists() {
+        current
+    } else {
+        historical
+    }
 }
 
 pub(crate) fn task_path(project: &Project, id: &str) -> PathBuf {
-    threads_dir(project).join(format!("{id}.task.md"))
+    sidecar_path(project, id, ".task.md")
+}
+
+pub(crate) fn task_path_for_write(project: &Project, id: &str) -> Result<PathBuf> {
+    Ok(threads_dir_for_write(project)?.join(format!("{id}.task.md")))
 }
 
 pub(crate) fn home_report_path(project: &Project, id: &str) -> PathBuf {
-    threads_dir(project).join(format!("{id}.md"))
+    sidecar_path(project, id, ".md")
 }
 
 fn regular_file(path: &Path) -> bool {
@@ -254,36 +293,41 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
 }
 
 pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::Error>) {
-    let entries = match std::fs::read_dir(threads_dir(project)) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new());
-        }
-        Err(error) => return (Vec::new(), vec![error.into()]),
-    };
-    let mut threads = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    for dir in [historical_threads_dir(project), threads_dir(project)] {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 errors.push(error.into());
                 continue;
             }
         };
-        let Ok(name) = entry.file_name().into_string() else {
-            errors.push(anyhow::anyhow!("a thread record name is not UTF-8"));
-            continue;
-        };
-        let Some(id) = name.strip_suffix(".toml") else {
-            continue;
-        };
-        match load(project, id) {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(error.into());
+                    continue;
+                }
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                errors.push(anyhow::anyhow!("a thread record name is not UTF-8"));
+                continue;
+            };
+            if let Some(id) = name.strip_suffix(".toml") {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    let mut threads = Vec::new();
+    for id in ids {
+        match load(project, &id) {
             Ok(thread) => threads.push(thread),
             Err(error) => errors.push(error),
         }
     }
-    threads.sort_by(|a, b| a.id.cmp(&b.id));
     (threads, errors)
 }
 
@@ -292,15 +336,20 @@ pub(crate) fn list(project: &Project) -> Vec<Thread> {
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
-    let dir = threads_dir(project);
-    if !dir.is_dir() {
-        // The caller holds the project lock. Do not recreate a deleted project.
-        std::fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    // A live historical no-repository thread may still have its working git
+    // folder under `threads/`. Move only its record to hidden state.
+    let dir = threads_dir_for_write(project)?;
+    let current = dir.join(format!("{}.toml", thread.id));
+    write_atomic(&current, toml::to_string(thread)?.as_bytes())?;
+    let historical = historical_threads_dir(project).join(format!("{}.toml", thread.id));
+    if historical != current {
+        match std::fs::remove_file(&historical) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    write_atomic(
-        &record_path(project, &thread.id),
-        toml::to_string(thread)?.as_bytes(),
-    )
+    Ok(())
 }
 
 /// Read-modify-write under the project lock: re-reads the record, lets `change`
@@ -1639,7 +1688,7 @@ mod tests {
             (t.title.as_str(), t.pane_id.as_str(), t.prompt_pending),
             ("Hello", "w1:p2", true)
         );
-        let leftovers = std::fs::read_dir(project.dir().join("threads"))
+        let leftovers = std::fs::read_dir(threads_dir(&project))
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
