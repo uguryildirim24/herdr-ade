@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0207.md",
+      "tasks/t-0199.md",
+      "tasks/t-0197.md",
+      "tasks/review-r86.md",
+      "tasks/review-r82.md",
+      "tasks/t-0206.md",
       "tasks/t-0205.md",
       "tasks/review-r85.md",
       "tasks/t-0204.md",
       "tasks/t-0203.md",
       "tasks/review-r84.md",
-      "tasks/t-0201.md",
-      "tasks/t-0202.md",
-      "tasks/review-r83.md",
-      "tasks/t-0200.md",
-      "tasks/review-r82.md",
-      "tasks/t-0196.md",
-      "tasks/t-0193.md"
+      "tasks/t-0201.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r82.md",
       "tasks/reviews/code-r85.md",
       "tasks/reviews/code-r84.md",
       "tasks/reviews/code-r83.md",
@@ -39,17 +40,21 @@
       "tasks/reviews/code-r77.md",
       "tasks/reviews/code-r75.md",
       "tasks/reviews/code-r76.md",
-      "tasks/reviews/code-r74.md",
-      "tasks/reviews/code-r73.md"
+      "tasks/reviews/code-r74.md"
     ]
   },
-  "generated": "2026-09-21T21:56:40-04:00",
+  "generated": "2026-09-21T22:12:17-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0205-review-r85-one-install-run-reaches-the-b",
       "main",
-      "review/r85",
+      "hp/adeherdr/t-0207-review-r82-projects-can-run-any-number-o",
+      "hp/adeherdr/t-0208-review-r86-a-new-web-helper-lane-starts",
+      "review/r86",
+      "review/r82-3",
+      "hp/adeherdr/t-0206-w10-recipes-visible",
       "hp/adeherdr/t-0200-w8-install-finds-the-box",
+      "hp/adeherdr/t-0205-review-r85-one-install-run-reaches-the-b",
+      "review/r85",
       "hp/adeherdr/t-0202-w9-no-workarounds-rule",
       "hp/adeherdr/t-0204-review-r84-every-coordinator-waits-for-t",
       "hp/adeherdr/t-0198-w7-pro-start-on-current-codex",
@@ -329,22 +334,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "cbf1457 docs(review): round r85 verdict",
-      "defffa3 review(ade): finish stable machine recovery",
-      "f9016b0 Merge commit 'd15a6640330f9e63d136a64b32887461d1a5d06b' into hp/adeherdr/t-0205-review-r85-one-install-run-reaches-the-b",
-      "0c8fc37 docs(tasks): t-0205",
-      "e22c233 review(r85): brief for revision 1",
-      "d15a664 fix(remote): resolve box declarations by label"
+      "5dae023 Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'",
+      "20d6a83 review(r82): approve repaired candidate",
+      "2090d04 review(r82): merge earlier reviewed candidate",
+      "898af0e review(r86): brief for revision 1",
+      "c0b5e92 docs(tasks): t-0207",
+      "7d04e23 review(r82): brief for revision 1"
     ],
-    "remote": "6 ahead, 0 behind origin/main",
+    "remote": "12 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "cbf1457",
+        "head": "5dae023",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r85 verdict"
+        "subject": "Merge commit '20d6a83f2c15328dfa44fea2696ada04a26dac19'"
       },
       {
         "branch": "review/r82",
@@ -361,25 +366,18 @@
         "subject": "docs(tasks): t-0199"
       },
       {
-        "branch": "review/r85",
+        "branch": "review/r82-3",
         "dirty": 0,
-        "head": "0c8fc37",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r85",
-        "subject": "docs(tasks): t-0205"
+        "head": "c0b5e92",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r82-3",
+        "subject": "docs(tasks): t-0207"
       },
       {
-        "branch": "hp/adeherdr/t-0200-w8-install-finds-the-box",
+        "branch": "review/r86",
         "dirty": 0,
-        "head": "d15a664",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0200",
-        "subject": "fix(remote): resolve box declarations by label"
-      },
-      {
-        "branch": "hp/adeherdr/t-0205-review-r85-one-install-run-reaches-the-b",
-        "dirty": 0,
-        "head": "cbf1457",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0205",
-        "subject": "docs(review): round r85 verdict"
+        "head": "25dae55",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r86",
+        "subject": "docs(tasks): t-0208"
       }
     ]
   },
@@ -399,56 +397,15 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r85",
-    "verdict": "cbf1457e9f4b729e1e5c6e0196353b7e03a99c2b"
+    "round": "r82",
+    "verdict": "20d6a83f2c15328dfa44fea2696ada04a26dac19"
   },
   "session": "default",
   "unlinked_agents": [],
-  "workers": [
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0200",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0200",
-      "pane_id": "w1G:p3E",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0200--/2026-09-22T00-18-14-696Z_01a0c67a-3c28-75bb-85cb-cba3a4b63656.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:t3A",
-      "tab_label": "t-0200",
-      "title": "π - t-0200",
-      "tokens": {
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0200"
-      }
-    },
-    {
-      "cwd": "/Users/rolfie/projects/herdr-ade/.worktrees/t-0205",
-      "kind": "pi",
-      "name": "hp-adeherdr-t-0205",
-      "pane_id": "w1G:p3K",
-      "pane_label": null,
-      "session_id": "/Users/rolfie/.herdr-ade/pi/agent/sessions/--Users-rolfie-projects-herdr-ade-.worktrees-t-0205--/2026-09-22T00-40-08-753Z_01a0c68e-4931-756e-979a-d52478e23b07.jsonl",
-      "start_args": [],
-      "status": "done",
-      "tab_id": "w1G:t3F",
-      "tab_label": "t-0205",
-      "title": "π - t-0205",
-      "tokens": {
-        "parent": "w1G:p1",
-        "project": "adeherdr",
-        "rank": "1",
-        "review": "ready-for-review",
-        "thread": "t-0205"
-      }
-    }
-  ],
+  "workers": [],
   "workspace": {
     "id": "w1G",
     "label": "Adeherdr",
-    "tabs": 4
+    "tabs": 2
   }
 }
