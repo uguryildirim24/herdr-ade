@@ -440,8 +440,13 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
     match crate::talk::take_pending_prompt(project, pane, text) {
         Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
         Some(crate::talk::PendingPrompt::Automated) => Ok(None),
-        None if crate::talk::is_historical_system_prompt(text) => Ok(None),
-        None => Ok(Some(crate::talk::record_pane_request(project, text)?)),
+        None => {
+            let text = crate::talk::take_automated_parts(project, pane, text);
+            let Some(text) = crate::talk::human_request_text(&text) else {
+                return Ok(None);
+            };
+            Ok(Some(crate::talk::record_pane_request(project, &text)?))
+        }
     }
 }
 
@@ -835,10 +840,65 @@ mod tests {
         let mixed_paste = "Keep working.\n<pasted_content id=\"2460\">\nGONE t-0002\n</pasted_content id=\"2460\">";
         let mixed_paste_id = handle_prompt(&project, "w1:p1", mixed_paste)
             .unwrap()
-            .expect("native text mixed with a pasted harness line is Rolf's request");
+            .expect("native text around a pasted harness line is Rolf's request");
         assert!(
             crate::talk::recent_requests(&project, 5)
-                .contains(&(mixed_paste_id, mixed_paste.to_string()))
+                .contains(&(mixed_paste_id, "Keep working.".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_nudge_joined_to_half_typed_words_records_only_rolfs_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        install(&ctx, &project, "claude", "w1:p1").unwrap();
+        let nudge = "[herdr-ade ticker: automated, not the user, approves nothing] Continue open work: job-0001: verify 3 acceptance condition(s); job-0005: ...";
+        let mixed = format!("e{nudge}");
+
+        crate::talk::mark_automated_prompt(&project, "w1:p1", nudge).unwrap();
+        let request = handle_prompt(&project, "w1:p1", &mixed)
+            .unwrap()
+            .expect("the half-typed word remains Rolf's request");
+        assert_eq!(
+            crate::talk::request_text(&project, &request).as_deref(),
+            Some("e")
+        );
+
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-historical-mixed-nudge".into(),
+                text: mixed,
+                answer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::talk::request_text(&project, "q-historical-mixed-nudge").as_deref(),
+            Some("e")
+        );
+
+        let other = "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
+        crate::talk::mark_automated_prompt(&project, "w1:p1", nudge).unwrap();
+        crate::talk::mark_automated_prompt(&project, "w1:p1", other).unwrap();
+        let request = handle_prompt(&project, "w1:p1", &format!("hal{nudge}{other}f"))
+            .unwrap()
+            .expect("words around two marked prompts remain");
+        assert_eq!(
+            crate::talk::request_text(&project, &request).as_deref(),
+            Some("half")
         );
     }
 

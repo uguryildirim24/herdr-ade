@@ -456,6 +456,7 @@ fn write_merge(project: &Project, round: &str, intent: &MergeIntent) -> Result<(
     let _lock = project.lock()?;
     let mut record = load(project, round)?;
     record.phase = phase_for_merge(intent);
+    record.cleanup_pending = intent.phase == MergePhase::Checkpointed;
     record.merge = Some(intent.clone());
     record.attention.clear();
     save(project, &record)
@@ -856,7 +857,7 @@ pub fn open(ctx: &Ctx, slug: &str, args: OpenArgs) -> Result<RoundRecord> {
         &project.read_project_md()?.0,
         &ctx.config_dir,
         &repo_path.to_string_lossy(),
-    ) {
+    )? {
         bail!(
             "repo_not_listed: {} is not listed in `repos` in PROJECT.md and is not a harness repository",
             repo_path.display()
@@ -993,7 +994,7 @@ pub struct CancelOutcome {
     pub round: String,
     pub phase: RoundPhase,
     pub reason: String,
-    pub threads: Vec<crate::threads::CancelOutcome>,
+    pub threads: Vec<crate::threads::ResolveOutcome>,
     pub review_worktrees: Vec<String>,
 }
 
@@ -1029,6 +1030,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
             .clone()
             .unwrap_or_else(|| reason.to_string());
         record.phase = RoundPhase::Abandoned;
+        record.cleanup_pending = true;
         record.review_intent = None;
         record.verdict = None;
         record.verdict_kind = None;
@@ -1050,18 +1052,21 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
     }
     let mut outcomes = Vec::new();
     for id in ids {
-        outcomes.push(crate::threads::cancel(
+        outcomes.push(crate::threads::resolve_automatically(
             ctx,
-            slug,
+            &project,
             &id,
-            record.abandoned_reason.as_deref().unwrap_or(reason),
-        )?);
+            "cancelled",
+        ));
     }
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
     let _ = crate::board::refresh(ctx, &project);
     let review_worktrees = cleanup_review_worktrees(ctx, &project, &record);
+    if let Err(error) = finish_cleanup_marker(&project, round) {
+        eprintln!("cleanup marker pending for {round}: {error:#}");
+    }
     Ok(CancelOutcome {
         round: round.to_string(),
         phase: record.phase,
@@ -1191,6 +1196,36 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
         }
     }
     lines
+}
+
+/// Clear the round-level bridge marker once every owned thread has its own
+/// durable resolved record. A thread whose external cleanup failed retains
+/// its per-thread marker for the ticker.
+pub(crate) fn finish_cleanup_marker(project: &Project, round: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut record = load(project, round)?;
+    if !record.cleanup_pending {
+        return Ok(());
+    }
+    let mut ids: Vec<_> = record
+        .manifest
+        .members
+        .iter()
+        .map(|member| member.thread.as_str())
+        .collect();
+    if let Some(reviewer) = record.reviewer.as_deref()
+        && !ids.contains(&reviewer)
+    {
+        ids.push(reviewer);
+    }
+    if ids.iter().all(|id| {
+        crate::thread::load(project, id)
+            .is_ok_and(|thread| thread.status == crate::thread::Status::Resolved)
+    }) {
+        record.cleanup_pending = false;
+        save(project, &record)?;
+    }
+    Ok(())
 }
 
 pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
@@ -2950,6 +2985,32 @@ fn merge_inner(
         for line in cleanup_review_worktrees(ctx, &project, &closed) {
             println!("{line}");
         }
+        let mut ids: Vec<_> = closed
+            .manifest
+            .members
+            .iter()
+            .map(|member| member.thread.clone())
+            .collect();
+        if let Some(reviewer) = &closed.reviewer
+            && !ids.contains(reviewer)
+        {
+            ids.push(reviewer.clone());
+        }
+        for id in ids {
+            let cleanup = crate::threads::resolve_automatically(ctx, &project, &id, "merged");
+            if cleanup.state == "cleanup_pending" {
+                eprintln!(
+                    "cleanup pending for {id}: {}",
+                    cleanup
+                        .worktree_reason
+                        .as_deref()
+                        .unwrap_or("cleanup did not complete")
+                );
+            }
+        }
+        if let Err(error) = finish_cleanup_marker(&project, round) {
+            eprintln!("cleanup marker pending for {round}: {error:#}");
+        }
     }
     outcome
 }
@@ -3755,7 +3816,10 @@ pub mod testkit {
                 t.kind = Kind::Worktree;
                 t.status = Status::Open;
                 t.agent = "claude".into();
+                t.workspace_id = "w1".into();
+                t.tab_id = format!("w1:t{}", n + 10);
                 t.pane_id = format!("w1:p{}", n + 10);
+                t.repo = self.repo.to_string_lossy().into_owned();
                 t.worktree_path = wt.to_string_lossy().into_owned();
                 t.cwd = t.worktree_path.clone();
                 t.branch = format!("lane/{n}");
@@ -4655,6 +4719,7 @@ mod tests {
         let review_worktree = fx.repo.join(".worktrees/review-r1");
         assert!(review_worktree.is_dir());
         let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
         let out = merge(&ctx, "demo", "r1", None).unwrap();
         assert!(!review_worktree.exists(), "closed round review worktree");
         assert!(
@@ -4684,15 +4749,67 @@ mod tests {
             moved.iter().all(|l| l.ends_with("fast-forwarded to H")),
             "{moved:?}"
         );
-        for (i, _) in lanes.iter().enumerate() {
-            let wt = fx.repo.join(format!(".worktrees/lane-{}", i + 1));
-            assert_eq!(git(&wt, &["rev-parse", "HEAD"]), head);
+        for ((id, _), i) in lanes.iter().zip(1..) {
+            let lane = thread::load(&fx.project, id).unwrap();
+            assert_eq!(lane.status, thread::Status::Resolved);
+            assert_eq!(lane.resolved_reason, "merged");
+            assert!(!fx.repo.join(format!(".worktrees/lane-{i}")).exists());
         }
+        let reviewer = thread::load(&fx.project, &reviewer).unwrap();
+        assert_eq!(reviewer.status, thread::Status::Resolved);
+        assert_eq!(reviewer.resolved_reason, "merged");
         assert_eq!(
             merge(&ctx, "demo", "r1", None).unwrap(),
             MergeOutcome::NoOp { head: head.clone() }
         );
         assert_eq!(main_head(&fx), head);
+    }
+
+    #[test]
+    fn failed_thread_cleanup_does_not_fail_a_completed_merge() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        std::fs::remove_file(fx.world.home.path().join("a.sock")).unwrap();
+
+        let outcome = merge(&ctx, "demo", "r1", None).unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::Checkpointed { .. }));
+        assert_eq!(load(&fx.project, "r1").unwrap().phase, RoundPhase::Merged);
+        for (id, _) in lanes {
+            let lane = thread::load(&fx.project, &id).unwrap();
+            assert_eq!(lane.status, thread::Status::Resolved);
+            assert!(lane.cleanup_pending);
+            assert_eq!(lane.resolved_reason, "cleanup pending");
+        }
+    }
+
+    #[test]
+    fn ticker_recovers_a_closed_round_before_its_cleanup_marker() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&ctx, "demo", "r1", None).unwrap();
+        let missed = &lanes[0].0;
+        thread::update(&fx.project, missed, |thread| {
+            thread.status = thread::Status::Open;
+            thread.resolved_reason.clear();
+            thread.cleanup_pending = false;
+            thread.cleanup_reason.clear();
+        })
+        .unwrap();
+        let mut round = load(&fx.project, "r1").unwrap();
+        round.cleanup_pending = true;
+        save(&fx.project, &round).unwrap();
+
+        crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
+
+        let lane = thread::load(&fx.project, missed).unwrap();
+        assert_eq!(lane.status, thread::Status::Resolved);
+        assert_eq!(lane.resolved_reason, "merged");
+        assert!(!load(&fx.project, "r1").unwrap().cleanup_pending);
     }
 
     #[test]
@@ -5172,6 +5289,10 @@ mod tests {
             moved[1].ends_with("worktree is dirty, not forwarded"),
             "{moved:?}"
         );
+        let dirty = thread::load(&fx.project, &lanes[1].0).unwrap();
+        assert_eq!(dirty.status, thread::Status::Resolved);
+        assert!(dirty.cleanup_pending);
+        assert!(Path::new(&dirty.worktree_path).is_dir());
     }
 
     #[test]

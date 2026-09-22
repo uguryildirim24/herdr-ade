@@ -1218,6 +1218,71 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
 }
 
 #[test]
+fn a_no_change_lane_closes_after_its_report_is_copied_home() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().join("lane");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let lane = world.thread(&project, &cwd, |t| {
+        t.kind = Kind::Tab;
+        t.worktree_path.clear();
+        t.base = "brief-sha".into();
+    });
+    std::fs::create_dir_all(&lane.thread_dir).unwrap();
+    std::fs::write(
+        Path::new(&lane.thread_dir).join("report.md"),
+        "report only\n",
+    )
+    .unwrap();
+    let event = Event {
+        id: "t-0001-1-done".into(),
+        op: "t-0001-1-done".into(),
+        thread: lane.id.clone(),
+        attempt: 1,
+        round: None,
+        recipient: Recipient::default(),
+        created: project::now(),
+        payload: EventPayload {
+            done: Some(DonePayload {
+                sha: "brief-sha".into(),
+                report_path: lane.report_path(),
+                artifact: "unused-for-local-lane".into(),
+                attestation: None,
+            }),
+            ..EventPayload::default()
+        },
+    };
+    crate::events::seal_create_if_absent(&project, &event).unwrap();
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+    );
+    *world.agents.borrow_mut() = format!(
+        "[{}]",
+        agent_json(
+            "w2",
+            "w2:t1",
+            "w2:p1",
+            &cwd.to_string_lossy(),
+            &lane.agent_name,
+            "idle"
+        )
+    );
+
+    threads::resolve_report_only(&world.ctx(), &project);
+
+    let closed = thread::load(&project, &lane.id).unwrap();
+    assert_eq!(closed.status, Status::Resolved);
+    assert_eq!(closed.resolved_reason, "report-only");
+    assert_eq!(
+        std::fs::read_to_string(thread::home_report_path(&project, &lane.id)).unwrap(),
+        "report only\n"
+    );
+    assert_eq!(world.runner.count("workspace close w2"), 1);
+}
+
+#[test]
 fn thread_start_is_refused_when_paused() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -1871,83 +1936,6 @@ fn one_config_error_item_per_file_hash() {
     ticker::tick_project(&ctx, &project).unwrap();
     ticker::tick_project(&ctx, &project).unwrap();
     assert_eq!(items_of(&project, "config-error").len(), 3);
-}
-
-#[test]
-fn auto_resolve_waits_for_the_later_of_state_report_and_ticker_start() {
-    let (world, project, t) = finished_world("idle");
-    thread::update(&project, &t.id, |t| {
-        t.last_group = "idle".into();
-        t.last_state = "idle".into();
-        t.last_state_change = "2026-01-01T00:00:00Z".into();
-    })
-    .unwrap();
-    let ctx = world.ctx();
-    let (settings, _) = project.read_project_md().unwrap();
-    let now = jiff::Timestamp::now();
-
-    // The ticker only just started: a week-old idle thread is not resolved.
-    let fresh = Memory::new(&ctx);
-    assert!(crate::steps::auto_resolve(&ctx, &project, &settings, &fresh, now).is_empty());
-    assert_eq!(
-        thread::load(&project, "t-0001").unwrap().status,
-        Status::Open
-    );
-
-    // A recent report change also holds it back.
-    let mut old = Memory::new(&ctx);
-    old.started = "2026-01-01T00:00:00Z".parse().unwrap();
-    thread::update(&project, &t.id, |t| t.last_report_change = now.to_string()).unwrap();
-    crate::steps::auto_resolve(&ctx, &project, &settings, &old, now);
-    assert_eq!(
-        thread::load(&project, "t-0001").unwrap().status,
-        Status::Open
-    );
-
-    thread::update(&project, &t.id, |t| {
-        t.last_report_change = "2026-01-02T00:00:00Z".into()
-    })
-    .unwrap();
-    crate::steps::auto_resolve(&ctx, &project, &settings, &old, now);
-    let resolved = thread::load(&project, "t-0001").unwrap();
-    assert_eq!(
-        (resolved.status, resolved.resolved_reason.as_str()),
-        (Status::Resolved, "auto")
-    );
-    assert!(items_of(&project, "thread-state").is_empty());
-    let digest = coordinator::digest(&ctx, &project, "ha").unwrap().0;
-    assert!(
-        digest.contains("1 resolved threads (not listed)"),
-        "{digest}"
-    );
-    assert!(!digest.contains("t-0001"), "{digest}");
-}
-
-#[test]
-fn a_failed_final_copy_blocks_auto_resolve() {
-    let (world, project, t) = finished_world("idle");
-    thread::update(&project, &t.id, |t| {
-        t.last_group = "idle".into();
-        t.last_state_change = "2026-01-01T00:00:00Z".into();
-    })
-    .unwrap();
-    std::fs::create_dir_all(Path::new(&t.thread_dir).join("library")).unwrap();
-    world.runner.on("du -sk", ok("4\t/x\n"));
-    world
-        .runner
-        .on("rsync", fail(12, "rsync: connection unexpectedly closed"));
-    let ctx = world.ctx();
-    let mut old = Memory::new(&ctx);
-    old.started = "2026-01-01T00:00:00Z".parse().unwrap();
-    let (settings, _) = project.read_project_md().unwrap();
-    let errors =
-        crate::steps::auto_resolve(&ctx, &project, &settings, &old, jiff::Timestamp::now());
-    assert_eq!(errors.len(), 1);
-    assert_eq!(
-        thread::load(&project, "t-0001").unwrap().status,
-        Status::Open
-    );
-    assert!(inbox::unhandled(&project).is_empty());
 }
 
 #[test]

@@ -173,13 +173,7 @@ fn check_class(class: &str) -> Result<()> {
 
 /// A human message a `request:<id>` reference names.
 fn request_exists(project: &Project, id: &str) -> bool {
-    talk::read(project).lines.iter().any(|line| {
-        matches!(
-            &line.entry,
-            talk::Entry::Rolf { request, text, .. }
-                if request == id && !talk::is_historical_system_prompt(text)
-        )
-    })
+    talk::request_text(project, id).is_some()
 }
 
 /// Validates a `--basis` reference and its provenance (SPEC-talk §6.6): an
