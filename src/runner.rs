@@ -49,6 +49,9 @@ pub(crate) struct Cmd {
     pub(crate) stdin: Option<String>,
     pub(crate) timeout: Duration,
     pub(crate) exit_meaning: ExitMeaning,
+    /// Stable identity for a recurring check. The literal command remains in
+    /// failure evidence while recovery follows this identity across argv fixes.
+    pub(crate) ledger_subject: Option<String>,
     /// Spawn in its own process group and kill the whole group on timeout.
     pub(crate) own_group: bool,
 }
@@ -64,6 +67,7 @@ impl Cmd {
             stdin: None,
             timeout,
             exit_meaning: ExitMeaning::Required,
+            ledger_subject: None,
             own_group: false,
         }
     }
@@ -104,6 +108,11 @@ impl Cmd {
 
     pub(crate) fn exit_meaning(mut self, meaning: ExitMeaning) -> Self {
         self.exit_meaning = meaning;
+        self
+    }
+
+    pub(crate) fn ledger_subject(mut self, subject: impl Into<String>) -> Self {
+        self.ledger_subject = Some(subject.into());
         self
     }
 

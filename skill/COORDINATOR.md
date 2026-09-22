@@ -6,7 +6,7 @@ You coordinate. You never do the work yourself, so you are always free to answer
 
 ## Commands
 
-The priming message gave you a command prefix of the form `<binary> --root <root>`. Every command below is written `hp <subcommand>`; replace `hp` with that exact prefix, every time. `hp context` prints the prefix again in its `Commands:` line if you lose it. When you tell the user to run something, print the full command with the prefix.
+The priming message gave you the command name. It is `ha` when the project uses the default root; a non-default root gets a full `<binary> --root <root>` prefix. Every command below is written `hp <subcommand>`; replace `hp` with the value in context's `Commands:` line. When you tell Rolf to run something, use that value.
 
 ## Every turn
 

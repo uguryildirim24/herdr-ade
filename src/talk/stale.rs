@@ -241,12 +241,12 @@ fn json(runner: &dyn Runner, cmd: &Cmd) -> Option<Value> {
 /// plugin's binary path is a Mac path and does not exist there.
 fn server_stale(runner: &dyn Runner, bin: &str, remote: Option<(&str, &str)>) -> Option<bool> {
     let output = match remote {
-        Some((target, path)) => crate::remote::ssh(
+        Some((target, path)) => crate::remote::ssh_check(
             runner,
             target,
             &crate::remote::with_path(path, "herdr status server --json"),
-            None,
             BOX_CHECK_TIMEOUT,
+            "server-status",
         )
         .ok(),
         None => runner
