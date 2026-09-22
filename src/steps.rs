@@ -3,6 +3,7 @@
 //! without a thread or round home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -202,14 +203,19 @@ pub(crate) fn deliver_event(
 
 /// The configured publish URL for a repository (SPEC-remote §4.1): the
 /// project's own row wins, then the committed Mac→box map.
-fn publish_url_for(project: &Project, repo: &str) -> Option<String> {
+fn publish_url_for(
+    config_dir: &Path,
+    project: &Project,
+    machine: &str,
+    repo: &str,
+) -> Option<String> {
     if let Ok((settings, _)) = project.read_project_md()
         && let Some(row) = settings.repos.iter().find(|row| row.path == repo)
         && let Some(url) = &row.publish_url
     {
         return Some(url.clone());
     }
-    crate::remote::box_repo_for(repo).map(|row| row.publish_url.to_string())
+    crate::remote::box_repo_for(config_dir, machine, repo).and_then(|row| row.publish_url)
 }
 
 /// Before a box lane's DONE is typed, the Mac fetches the lane branch from the
@@ -223,7 +229,7 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
     if lane.branch.is_empty() {
         bail!("published_branch_missing: {} has no lane branch", lane.id);
     }
-    let url = publish_url_for(project, &lane.repo)
+    let url = publish_url_for(&ctx.config_dir, project, &lane.machine, &lane.repo)
         .with_context(|| format!("box_repo_unmapped: {} has no publish URL", lane.repo))?;
     let remote = crate::remote::remote_for_url(ctx.runner, &lane.repo, &url)?;
     let git = |args: &[&str]| {
@@ -486,14 +492,16 @@ pub(crate) struct CourierOutcome {
 /// the helper and the batched `scp`.
 const COURIER_HELPER: &str = r#"set -u
 root=__ROOT__
-herdr_bin="$HOME/.local/bin/herdr"
+PATH=__PATH__; export PATH
+herdr_bin=$(command -v herdr 2>/dev/null || true)
+ade_bin=__ADE_BIN__
 cursor=$(mktemp)
 trap 'rm -f "$cursor"' EXIT
 cat > "$cursor"
 printf 'boot\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
 printf 'free\t%s\n' "${avail:-0}"
-"$HOME/.local/bin/herdr-ade" --root "$HOME/.herdr-ade" recover >/dev/null 2>&1 || true
+"$ade_bin" --root "$root" recover >/dev/null 2>&1 || true
 if [ -x "$herdr_bin" ]; then
   a=$("$herdr_bin" --session __SESSION__ agent list 2>/dev/null | tr -d '\n')
   p=$("$herdr_bin" --session __SESSION__ pane list 2>/dev/null | tr -d '\n')
@@ -538,9 +546,11 @@ for f in "$root"/*/.state/bootstrap/*.json; do
 done
 "#;
 
-fn courier_helper(box_root: &str, session: &str) -> String {
+fn courier_helper(machine: &crate::remote::MachineDeclaration, session: &str) -> String {
     COURIER_HELPER
-        .replace("__ROOT__", &crate::remote::quote(box_root))
+        .replace("__ROOT__", &crate::remote::quote(&machine.root))
+        .replace("__PATH__", &crate::remote::quote(&machine.path))
+        .replace("__ADE_BIN__", &crate::remote::quote(&machine.ade_bin))
         .replace("__SESSION__", &crate::remote::quote(session))
 }
 
@@ -683,7 +693,8 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
         states.insert(project.slug.clone(), state);
     }
 
-    let script = courier_helper(crate::contracts::BOX_ROOT, &profile.session);
+    let machine_paths = crate::remote::machine_declaration(&ctx.config_dir, machine)?;
+    let script = courier_helper(&machine_paths, &profile.session);
     let out = crate::remote::ssh_courier(
         ctx.runner,
         &target,
@@ -1383,6 +1394,15 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn test_machine(root: &str) -> crate::remote::MachineDeclaration {
+        crate::remote::MachineDeclaration {
+            root: root.into(),
+            path: "/bin:/usr/bin".into(),
+            ade_bin: "/missing/herdr-ade".into(),
+            ..Default::default()
+        }
+    }
+
     /// A project with a ready coordinator in its bound pane, and the fake
     /// runner answering `agent prompt`.
     fn delivery_world() -> (World, Project) {
@@ -1560,7 +1580,7 @@ mod tests {
 
     #[test]
     fn courier_helper_survives_a_hostile_box_root() {
-        let script = courier_helper("/home/it's a $(box)", "default");
+        let script = courier_helper(&test_machine("/home/it's a $(box)"), "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
         // A throwaway HOME so the script's box recovery never touches the real
         // ADE root; the box binaries are absent there.
@@ -1586,7 +1606,7 @@ mod tests {
         let dir = root.join("demo/events");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
-        let script = courier_helper(&root.to_string_lossy(), "default");
+        let script = courier_helper(&test_machine(&root.to_string_lossy()), "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
         let run = |stdin: &str| {
             crate::runner::RealRunner
@@ -1761,10 +1781,27 @@ mod tests {
         env: &'a crate::paths::Env,
         runner: &'a dyn crate::runner::Runner,
     ) -> Ctx<'a> {
+        let config_dir = root.join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r#"[machines.box]
+target = "me@box"
+session = "default"
+home = "/home/ubuntu"
+root = "/home/ubuntu/.herdr-ade"
+worktrees = "/home/ubuntu/projects"
+build = "/home/ubuntu/build/lanes"
+path = "/home/ubuntu/.local/bin:/usr/bin:/bin"
+ade_bin = "/home/ubuntu/.local/bin/herdr-ade"
+pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
+"#,
+        )
+        .unwrap();
         Ctx {
             env,
             root: root.to_path_buf(),
-            config_dir: root.join("cfg"),
+            config_dir,
             runner,
             detached_ticker: false,
         }

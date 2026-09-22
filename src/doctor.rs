@@ -32,66 +32,36 @@ pub(crate) struct DoctorOutcome {
 
 /// One agent runtime's existing doctor probe. Recipes identify the runtime by
 /// `kind`; placement never carries a separate allowlist of recipe ids.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct NativeProbe {
-    kind: &'static str,
-    program: &'static str,
-    args: &'static [&'static str],
+    kind: String,
+    cache_key: String,
+    program: String,
+    args: Vec<String>,
 }
 
-/// The cheapest real model call each native runtime offers. Status and model
-/// listing commands only prove that a credential was stored; they do not catch
-/// an expired subscription.
-fn native_probe(kind: &str) -> Option<NativeProbe> {
-    let (program, args): (_, &[_]) = match kind {
-        "claude" => (
-            "claude",
-            &[
-                "-p",
-                "Reply only OK.",
-                "--model",
-                "claude-haiku-4-5-20251001",
-                "--effort",
-                "low",
-                "--max-turns",
-                "1",
-                "--tools",
-                "",
-                "--no-session-persistence",
-            ],
-        ),
-        "codex" => (
-            "codex",
-            &[
-                "exec",
-                "--model",
-                "gpt-5.6-sol",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "Reply only OK.",
-            ],
-        ),
-        "agy" => (
-            "agy",
-            &[
-                "-p",
-                "Reply only OK.",
-                "--model",
-                "gemini-3.8-flash-low",
-                "--effort",
-                "low",
-                "--max-turns",
-                "1",
-                "--tools",
-                "",
-            ],
-        ),
-        _ => return None,
-    };
+/// Build the real readiness call from the adapter declaration and the exact
+/// routed recipe. No provider or model is selected in doctor code.
+fn native_probe(
+    adapter: &crate::adapters::Adapter,
+    recipe: &crate::contracts::Recipe,
+) -> Option<NativeProbe> {
+    if adapter.doctor.args.is_empty() {
+        return None;
+    }
+    let mut args = Vec::new();
+    for value in &adapter.doctor.args {
+        if value == "{args}" {
+            args.extend(crate::adapters::launch_args(adapter, recipe));
+        } else {
+            args.push(value.clone());
+        }
+    }
+    let digest = crate::thread::sha256_hex(args.join("\0").as_bytes());
     Some(NativeProbe {
-        kind: program,
-        program,
+        kind: recipe.kind.clone(),
+        cache_key: format!("{}-{}", recipe.kind, &digest[..12]),
+        program: adapter.binary.clone(),
         args,
     })
 }
@@ -120,11 +90,11 @@ fn probe_error(kind: &str, output: &crate::runner::Output) -> String {
 
 fn run_native_probe(
     ctx: &Ctx,
-    probe: NativeProbe,
+    probe: &NativeProbe,
     timeout: Duration,
 ) -> Result<crate::runner::Output> {
     let cache_dir = ctx.root.join(".readiness");
-    let cache = cache_dir.join(format!("native-{}.json", probe.kind));
+    let cache = cache_dir.join(format!("native-{}.json", probe.cache_key));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -165,8 +135,8 @@ fn run_native_probe(
         });
     }
     let output = ctx.runner.run(
-        &Cmd::new(probe.program, timeout)
-            .args(probe.args.iter().copied())
+        &Cmd::new(&probe.program, timeout)
+            .args(probe.args.iter().map(String::as_str))
             .cwd(&ctx.root),
     )?;
     let provider_failure = !output.timed_out
@@ -184,7 +154,11 @@ fn run_native_probe(
             "ok": output.success(),
             "provider_failure": provider_failure,
         });
-        let staged = cache_dir.join(format!(".native-{}-{}", probe.kind, std::process::id()));
+        let staged = cache_dir.join(format!(
+            ".native-{}-{}",
+            probe.cache_key,
+            std::process::id()
+        ));
         if std::fs::write(&staged, value.to_string()).is_ok() {
             let _ = std::fs::rename(&staged, &cache);
         }
@@ -193,9 +167,9 @@ fn run_native_probe(
     Ok(output)
 }
 
-fn native_probe_command(probe: NativeProbe) -> String {
-    std::iter::once(probe.program)
-        .chain(probe.args.iter().copied())
+fn native_probe_command(probe: &NativeProbe) -> String {
+    std::iter::once(probe.program.as_str())
+        .chain(probe.args.iter().map(String::as_str))
         .map(crate::remote::quote)
         .collect::<Vec<_>>()
         .join(" ")
@@ -203,7 +177,11 @@ fn native_probe_command(probe: NativeProbe) -> String {
 
 /// A box-side real model call cached for one ticker interval. The cache holds
 /// only `ok`, `failed` or `missing`; provider output never lands on disk.
-fn box_native_probe_script(probe: NativeProbe, fact: bool) -> String {
+fn box_native_probe_script(
+    probe: &NativeProbe,
+    fact: bool,
+    machine: &crate::remote::MachineDeclaration,
+) -> String {
     let command = native_probe_command(probe);
     let finish = if fact {
         format!("printf 'login_{}\\t%s\\n' \"$probe_status\"", probe.kind)
@@ -211,8 +189,9 @@ fn box_native_probe_script(probe: NativeProbe, fact: bool) -> String {
         "[ \"$probe_status\" = ok ]".into()
     };
     format!(
-        "probe_dir=\"$HOME/.herdr-ade/.readiness\"\n\
-         probe_cache=\"$probe_dir/native-{kind}\"\n\
+        "PATH={path}; export PATH\n\
+         probe_dir={root}/.readiness\n\
+         probe_cache=\"$probe_dir/native-{cache_key}\"\n\
          probe_status=\n\
          probe_now=$(date +%s)\n\
          probe_then=$(stat -c %Y \"$probe_cache\" 2>/dev/null || echo 0)\n\
@@ -226,19 +205,33 @@ fn box_native_probe_script(probe: NativeProbe, fact: bool) -> String {
            mv -f \"$probe_cache.tmp.$$\" \"$probe_cache\"\n\
          fi\n\
          {finish}\n",
-        kind = probe.kind,
+        path = crate::remote::quote(&machine.path),
+        root = crate::remote::quote(&machine.root),
+        cache_key = probe.cache_key,
         ttl = crate::pi::doctor::READINESS_CACHE_TTL.as_secs(),
-        program = crate::remote::quote(probe.program),
+        program = crate::remote::quote(&probe.program),
     )
 }
 
 /// Whether the chosen recipe can run on this Mac. This is the same provider
 /// or login probe the doctor owns, not a placement-specific capability table.
 pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
-    if launch.kind == "pi" {
-        return crate::threads::pi_ready(ctx, launch);
+    let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
+    if adapter.doctor.readiness == "pi" {
+        let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+            .context("pi_args_forbidden: a provider launch names no --provider")?;
+        let model = crate::pi::launch::flag_value(&launch.args, "--model")
+            .context("pi_args_forbidden: a provider launch names no --model")?;
+        return crate::pi_ade::check_with(ctx.runner, &ctx.root, &provider, &model)
+            .map(|_| ())
+            .with_context(|| format!("pi_not_ready: provider {provider}"));
     }
-    let probe = native_probe(&launch.kind).with_context(|| {
+    let recipe = crate::contracts::Recipe {
+        kind: launch.kind.clone(),
+        args: launch.args.clone(),
+        ..Default::default()
+    };
+    let probe = native_probe(&adapter, &recipe).with_context(|| {
         format!(
             "no doctor readiness probe exists for agent kind `{}`",
             launch.kind
@@ -246,12 +239,12 @@ pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -
     })?;
     let output = run_native_probe(
         ctx,
-        probe,
+        &probe,
         Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
     )
     .with_context(|| format!("{} is not installed", probe.program))?;
     if !output.success() {
-        anyhow::bail!(probe_error(probe.kind, &output));
+        anyhow::bail!(probe_error(&probe.kind, &output));
     }
     Ok(())
 }
@@ -264,19 +257,37 @@ pub(crate) fn recipe_ready_on_box(
     profile: &crate::contracts::MachineProfile,
     launch: &crate::contracts::Launch,
 ) -> Result<()> {
-    if launch.kind == "pi" {
+    let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
+    if adapter.doctor.readiness == "pi" {
         let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
-            .context("pi_args_forbidden: a pi launch names no --provider")?;
-        return crate::pi_ade::check_on_machine(ctx.runner, &ctx.root, &profile.target, &provider)
-            .with_context(|| format!("provider {provider}"));
+            .context("pi_args_forbidden: a provider launch names no --provider")?;
+        let model = crate::pi::launch::flag_value(&launch.args, "--model")
+            .context("pi_args_forbidden: a provider launch names no --model")?;
+        let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        return crate::pi_ade::check_on_machine(
+            ctx.runner,
+            &ctx.root,
+            &profile.target,
+            &machine.root,
+            &machine.pi_bin,
+            &provider,
+            &model,
+        )
+        .with_context(|| format!("provider {provider}"));
     }
-    let probe = native_probe(&launch.kind).with_context(|| {
+    let recipe = crate::contracts::Recipe {
+        kind: launch.kind.clone(),
+        args: launch.args.clone(),
+        ..Default::default()
+    };
+    let probe = native_probe(&adapter, &recipe).with_context(|| {
         format!(
             "no doctor readiness probe exists for agent kind `{}`",
             launch.kind
         )
     })?;
-    let script = box_native_probe_script(probe, false);
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let script = box_native_probe_script(&probe, false, &machine);
     let rooted = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
     let output = crate::remote::ssh(
         &rooted,
@@ -286,7 +297,7 @@ pub(crate) fn recipe_ready_on_box(
         Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
     )?;
     if !output.success() {
-        anyhow::bail!(probe_error(probe.kind, &output));
+        anyhow::bail!(probe_error(&probe.kind, &output));
     }
     Ok(())
 }
@@ -295,8 +306,32 @@ pub(crate) fn recipe_ready_on_box(
 pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
     let (mut text, mut healthy, mut checks) =
         report_with_checks(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
-    // The pi rows read the process's own layout (SPEC-pi §3.4).
-    match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root) {
+    // The pi rows read only providers named by enabled configured recipes;
+    // unused built-in provider knowledge never causes a doctor failure.
+    let pi_models: Vec<(String, String)> = crate::launch::parse_launch_config(&ctx.config_dir)
+        .map(|config| {
+            let routed = config.routing.recipe_ids();
+            config
+                .recipes
+                .iter()
+                .filter(|(id, recipe)| {
+                    routed.contains(id.as_str())
+                        && recipe.enabled
+                        && config
+                            .adapters
+                            .get(&recipe.kind)
+                            .is_some_and(|adapter| adapter.doctor.readiness == "pi")
+                })
+                .filter_map(|(_, recipe)| {
+                    crate::pi::launch::flag_value(&recipe.args, "--model")
+                        .map(|model| (recipe.provider.clone(), model))
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, &pi_models) {
         Ok((rows, pi_healthy)) => {
             healthy &= pi_healthy;
             for row in rows {
@@ -753,6 +788,7 @@ fn report_with_checks(
                             for (ok, label, detail) in box_rows(
                                 runner,
                                 &bin,
+                                config_dir,
                                 &profile,
                                 &config.recipes,
                                 config.doctor.min_free_disk_gb,
@@ -778,7 +814,7 @@ fn report_with_checks(
                             let (mut leftovers, data_kept, mut errors) =
                                 finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
                             let (builds, build_errors) =
-                                finished_build_folders(&ctx, &profile.id, &profile.target);
+                                finished_build_folders(&ctx, &profile.label, &profile.target);
                             leftovers.extend(builds);
                             errors.extend(build_errors);
                             check(
@@ -1023,6 +1059,10 @@ fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String
     let mut active = BTreeSet::new();
     let mut uncertain_projects = BTreeSet::new();
     let mut errors = Vec::new();
+    let machine_paths = match crate::remote::machine_declaration(&ctx.config_dir, machine) {
+        Ok(machine) => machine,
+        Err(error) => return (Vec::new(), vec![format!("build root unknown: {error:#}")]),
+    };
     for slug in project::list_slugs(&ctx.root) {
         let project = match project::Project::load(&ctx.root, &slug) {
             Ok(project) => project,
@@ -1054,10 +1094,10 @@ fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String
         }
     }
 
-    let root = crate::contracts::BOX_BUILD;
+    let root = machine_paths.build;
     let script = format!(
         "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -exec du -sk -- {{}} +; fi; printf '__HERDR_BUILDS_DONE__\\n'",
-        root = crate::remote::quote(root),
+        root = crate::remote::quote(&root),
     );
     let output = match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
         Ok(output) if output.success() => output,
@@ -1329,7 +1369,9 @@ fn machines_to_check(
     if !dispatch.is_empty() {
         machines.insert(dispatch.clone());
     }
-    machines.extend(crate::remote::registered_machine_names(runner, herdr_bin)?);
+    machines.extend(crate::remote::registered_machine_names(
+        runner, herdr_bin, config_dir,
+    )?);
 
     let add_repos = |machines: &mut std::collections::BTreeSet<String>,
                      repos: Vec<crate::project::Repo>| {
@@ -1370,6 +1412,7 @@ fn machines_to_check(
 fn box_rows(
     runner: &dyn Runner,
     herdr_bin: &str,
+    config_dir: &Path,
     profile: &crate::contracts::MachineProfile,
     recipes: &BTreeMap<String, crate::contracts::Recipe>,
     min_free_disk_gb: f64,
@@ -1382,16 +1425,43 @@ fn box_rows(
             "has no SSH target".into(),
         )];
     }
+    let machine_paths = match crate::remote::machine_declaration(config_dir, label) {
+        Ok(machine) => machine,
+        Err(error) => {
+            return vec![(
+                Some(false),
+                format!("box {label}"),
+                format!("machine path declaration is missing: {error:#}"),
+            )];
+        }
+    };
     // The executable recipes own which checks exist. Native probe definitions
     // only describe how to check a runtime; they never select one to require.
     let mut natives = BTreeMap::new();
     let mut providers = BTreeSet::new();
     let mut rows = Vec::new();
-    for (id, recipe) in recipes.iter().filter(|(_, recipe)| recipe.enabled) {
-        if recipe.kind == "pi" {
+    let launch_config = crate::launch::parse_launch_config(config_dir).ok();
+    let routed = launch_config
+        .as_ref()
+        .map(|config| config.routing.recipe_ids());
+    let adapters = crate::adapters::declarations(config_dir).unwrap_or_default();
+    for (id, recipe) in recipes.iter().filter(|(id, recipe)| {
+        recipe.enabled && routed.as_ref().is_none_or(|ids| ids.contains(id.as_str()))
+    }) {
+        let Some(adapter) = adapters.get(&recipe.kind) else {
+            rows.push((
+                Some(false),
+                format!("box {label} recipe {id}"),
+                format!("no adapter exists for agent kind `{}`", recipe.kind),
+            ));
+            continue;
+        };
+        if adapter.doctor.readiness == "pi" {
             match crate::pi::launch::validate_provider_column(&recipe.provider, &recipe.args) {
                 Ok(()) => {
-                    providers.insert(recipe.provider.as_str());
+                    let model =
+                        crate::pi::launch::flag_value(&recipe.args, "--model").unwrap_or_default();
+                    providers.insert((recipe.provider.as_str(), model));
                 }
                 Err(error) => rows.push((
                     Some(false),
@@ -1399,8 +1469,8 @@ fn box_rows(
                     format!("{error:#}"),
                 )),
             }
-        } else if let Some(probe) = native_probe(&recipe.kind) {
-            natives.insert(probe.kind, probe);
+        } else if let Some(probe) = native_probe(adapter, recipe) {
+            natives.insert(id.clone(), probe);
         } else {
             rows.push((
                 Some(false),
@@ -1412,36 +1482,48 @@ fn box_rows(
             ));
         }
     }
-    let repos: Vec<&crate::contracts::BoxRepoMap> = crate::contracts::BOX_REPOS.iter().collect();
-    let mut script = String::from(
+    let mut repos: Vec<crate::project::Repo> =
+        crate::harness::repos(config_dir).unwrap_or_default();
+    repos.extend(machine_paths.repos.clone());
+    let mut script = format!(
         "set -u\n\
+         PATH={path}; export PATH\n\
          printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
          printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
-         printf 'server\\t%s\\n' \"$(\"$HOME/.local/bin/herdr\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
+         herdr_bin=$(command -v herdr 2>/dev/null || true)\n\
+         printf 'server\\t%s\\n' \"$(\"$herdr_bin\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
          printf 'tailscale\\t%s\\n' \"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"\n\
          printf 'nproc\\t%s\\n' \"$(nproc 2>/dev/null || echo 0)\"\n\
-         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
+         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{{print $2}}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
          printf 'df_free\\t%s\\n' \"$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\"\n\
          printf 'listeners\\t%s\\n' \"$(ss -tln 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')\"\n\
          printf 'git_name\\t%s\\n' \"$(git config --global user.name 2>/dev/null || true)\"\n\
          printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
          printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
-         printf 'rules\\t%s\\n' \"$(sha256sum \"$HOME/.config/herdr-ade/RULES.md\" 2>/dev/null | cut -d' ' -f1 || true)\"\n\
+         printf 'rules\\t%s\\n' \"$(sha256sum {home}/.config/herdr-ade/RULES.md 2>/dev/null | cut -d' ' -f1 || true)\"\n\
 ",
+        path = crate::remote::quote(&machine_paths.path),
+        home = crate::remote::quote(&machine_paths.home),
     );
     for probe in natives.values() {
-        script.push_str(&box_native_probe_script(*probe, true));
+        script.push_str(&box_native_probe_script(probe, true, &machine_paths));
     }
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
-    for provider in &providers {
+    for (provider, model) in &providers {
         let provider = crate::remote::quote(provider);
+        let model = crate::remote::quote(model);
         script.push_str(&format!(
-            "HERDR_ADE_ROOT=\"$HOME/.herdr-ade\" \"$HOME/.local/bin/herdr-pi\" check {provider} >/dev/null 2>&1 && printf 'pi_%s\\tok\\n' {provider} || printf 'pi_%s\\tfail\\n' {provider}\n"
+            "HERDR_ADE_ROOT={root} {pi_bin} check {provider} --model {model} >/dev/null 2>&1 && printf 'pi_%s/%s\\tok\\n' {provider} {model} || printf 'pi_%s/%s\\tfail\\n' {provider} {model}\n",
+            root = crate::remote::quote(&machine_paths.root),
+            pi_bin = crate::remote::quote(&machine_paths.pi_bin),
         ));
     }
-    for repo in repos {
-        let path = crate::remote::quote(repo.box_path);
+    for repo in &repos {
+        let Some(box_path) = &repo.box_path else {
+            continue;
+        };
+        let path = crate::remote::quote(box_path);
         script.push_str(&format!(
             "if [ -d {path}/.git ]; then printf 'repo %s\\tok\\n' {path}; else printf 'repo %s\\tmissing\\n' {path}; fi\n"
         ));
@@ -1482,7 +1564,7 @@ fn box_rows(
             None
         },
         format!("box {label} server"),
-        format!("{} ({})", fact("server"), "$HOME/.local/bin/herdr"),
+        format!("{} (from machine PATH)", fact("server")),
     ));
     let tailscale = fact("tailscale");
     rows.push((
@@ -1502,12 +1584,15 @@ fn box_rows(
             fact("listeners")
         ),
     ));
-    for repo in crate::contracts::BOX_REPOS.iter() {
-        let key = format!("repo {}", repo.box_path);
+    for repo in &repos {
+        let Some(box_path) = &repo.box_path else {
+            continue;
+        };
+        let key = format!("repo {box_path}");
         let value = fact(&key);
         rows.push((
             env_bool(&value, &["ok"]),
-            format!("box {label} repo {}", repo.box_path),
+            format!("box {label} repo {box_path}"),
             format!("clone {value}"),
         ));
     }
@@ -1527,7 +1612,7 @@ fn box_rows(
         format!("gh auth status: {}", fact("gh")),
     ));
     for probe in natives.values() {
-        let kind = probe.kind;
+        let kind = &probe.kind;
         let value = fact(&format!("login_{kind}"));
         rows.push((
             env_bool(&value, &["ok"]),
@@ -1545,12 +1630,21 @@ fn box_rows(
     // answers `type -a -P pi` and `command -v` in its own shell.
     let required_tools: Vec<&str> = ["cargo", "just", "node"]
         .into_iter()
-        .chain(natives.values().map(|probe| probe.program))
+        .chain(natives.values().map(|probe| probe.program.as_str()))
         .collect();
-    match box_pane_probe(runner, herdr_bin, profile, &required_tools) {
+    match box_pane_probe(
+        runner,
+        herdr_bin,
+        profile,
+        Some(&machine_paths),
+        &required_tools,
+    ) {
         Ok(answer) => {
             let (pi, tools) = parse_box_probe(&answer);
-            let wrapper = "/home/ubuntu/.local/bin/pi";
+            let wrapper = Path::new(&machine_paths.pi_bin)
+                .parent()
+                .map(|dir| dir.join("pi").to_string_lossy().into_owned())
+                .unwrap_or_default();
             rows.push((
                 if pi == wrapper {
                     Some(true)
@@ -1594,12 +1688,12 @@ fn box_rows(
             format!("the box pane probe failed: {error:#}"),
         )),
     }
-    for provider in providers {
-        let value = fact(&format!("pi_{provider}"));
+    for (provider, model) in providers {
+        let value = fact(&format!("pi_{provider}/{model}"));
         rows.push((
             env_bool(&value, &["ok"]),
-            format!("box {label} pi {provider}"),
-            format!("herdr-pi check {provider}: {value}"),
+            format!("box {label} pi {provider}/{model}"),
+            format!("herdr-pi check {provider} --model {model}: {value}"),
         ));
     }
     let nproc = fact("nproc").parse::<u64>().ok();
@@ -1658,6 +1752,7 @@ fn box_pane_probe(
     runner: &dyn Runner,
     herdr_bin: &str,
     profile: &crate::contracts::MachineProfile,
+    machine: Option<&crate::remote::MachineDeclaration>,
     tools: &[&str],
 ) -> Result<String> {
     let tools = tools
@@ -1671,14 +1766,10 @@ fn box_pane_probe(
          printf '@@done\\n'"
     );
     let herdr = Herdr::new(herdr_bin, "", runner).on_machine(&profile.id);
-    let env = vec![format!("PATH={}", crate::contracts::BOX_PATH)];
+    let machine = machine.context("machine path declaration is missing")?;
+    let env = vec![format!("PATH={}", machine.path)];
     let created = herdr
-        .workspace_create_env(
-            Path::new(crate::contracts::BOX_HOME),
-            "ha-doctor-probe",
-            false,
-            &env,
-        )
+        .workspace_create_env(Path::new(&machine.home), "ha-doctor-probe", false, &env)
         .map_err(|error| anyhow::anyhow!("box probe pane: {error}"))?;
     let pane = created.pane_id.clone();
     let answer = (|| -> Result<String> {
@@ -1751,7 +1842,7 @@ product = "web-research"
 recipe = "agy_gemini_flash"
 
 [[routing.rules]]
-requires_claude = true
+capability = "native-chat"
 recipe = "claude_fable_xhigh"
 "#;
 
@@ -1852,8 +1943,13 @@ recipe = "claude_fable_xhigh"
 
         let first = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
         assert!(first.contains("subscription expired"), "{first}");
-        let cache =
-            std::fs::read_to_string(ctx.root.join(".readiness/native-claude.json")).unwrap();
+        let cache_path = std::fs::read_dir(ctx.root.join(".readiness"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let cache = std::fs::read_to_string(cache_path).unwrap();
         assert!(!cache.contains("subscription expired"), "{cache}");
 
         let cached = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
@@ -1905,6 +2001,46 @@ recipe = "claude_fable_xhigh"
         }
         assert_eq!(runner.count("claude"), 2);
         assert!(!ctx.root.join(".readiness/native-claude.json").exists());
+    }
+
+    #[test]
+    fn agy_probe_arguments_match_the_installed_cli() {
+        let config = tempfile::tempdir().unwrap();
+        let adapter = crate::adapters::declaration(config.path(), "agy").unwrap();
+        let recipe = crate::contracts::Recipe {
+            kind: "agy".into(),
+            args: vec![
+                "--model".into(),
+                "gemini-3.8-flash-high".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+            ..Default::default()
+        };
+        let probe = native_probe(&adapter, &recipe).unwrap();
+        assert_eq!(
+            probe.args,
+            [
+                "--model",
+                "gemini-3.8-flash-high",
+                "--dangerously-skip-permissions",
+                "-p",
+                "Reply only OK.",
+                "--print-timeout",
+                "60s",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_diagnostic_is_a_local_fault() {
+        let output = crate::runner::Output {
+            code: Some(1),
+            stderr: "flags provided but not defined: -max-turns".into(),
+            ..Default::default()
+        };
+        let error = probe_error("agy", &output);
+        assert!(error.contains("failed locally"), "{error}");
+        assert!(!error.contains("stored sign-in"), "{error}");
     }
 
     #[test]
@@ -2596,7 +2732,7 @@ recipe = "claude_fable_xhigh"
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         let thread = crate::thread::allocate(&project, |thread| {
             thread.status = crate::thread::Status::Open;
-            thread.machine = "oci-id".into();
+            thread.machine = "oci".into();
         })
         .unwrap();
         let runner = FakeRunner::new();
@@ -2615,7 +2751,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, errors) = finished_build_folders(&ctx, "oci-id", "me@box");
+        let (leftovers, errors) = finished_build_folders(&ctx, "oci", "me@box");
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(errors.is_empty(), "{errors:?}");
@@ -2641,7 +2777,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, errors) = finished_build_folders(&ctx, "oci-id", "me@box");
+        let (leftovers, errors) = finished_build_folders(&ctx, "oci", "me@box");
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(
@@ -2839,23 +2975,31 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
-            ok(&box_facts().replace("login_codex\tok", "login_codex\tmissing")),
+            ok(&(box_facts() + "pi_openai-codex/gpt-6-astra\tok\n")
+                .replace("login_codex\tok", "login_codex\tmissing")),
         );
         runner.on("pane read", ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
         probe_fakes(&runner);
         let mut recipes = default_recipes();
         recipes.retain(|_, recipe| recipe.kind == "pi" && recipe.provider == "openai-codex");
-        // Multiple enabled models share one provider readiness check.
+        // Every routed model gets its own readiness call.
         for recipe in recipes.values_mut() {
             recipe.enabled = true;
         }
-        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
+        let rows = box_rows(
+            &runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &recipes,
+            12.0,
+        );
         assert!(rows.iter().all(|row| row.0 == Some(true)), "{rows:?}");
         assert_eq!(
             rows.iter()
-                .filter(|row| row.1 == "box oci pi openai-codex")
+                .filter(|row| row.1.starts_with("box oci pi openai-codex/"))
                 .count(),
-            1
+            2
         );
         assert!(!rows.iter().any(|row| row.1.contains(" login ")));
         let calls = runner.calls.borrow();
@@ -2864,7 +3008,7 @@ recipe = "claude_fable_xhigh"
             .find(|call| call.program == "ssh")
             .unwrap()
             .display();
-        assert_eq!(ssh.matches("check openai-codex").count(), 1, "{ssh}");
+        assert_eq!(ssh.matches("check openai-codex").count(), 2, "{ssh}");
         assert!(!ssh.contains("codex login status"), "{ssh}");
         assert!(!ssh.contains("command -v codex"), "{ssh}");
     }
@@ -2889,7 +3033,14 @@ recipe = "claude_fable_xhigh"
                     ..Default::default()
                 },
             )]);
-            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
+            let rows = box_rows(
+                &runner,
+                "herdr",
+                Path::new(""),
+                &box_profile(),
+                &recipes,
+                12.0,
+            );
             let login = rows
                 .iter()
                 .find(|row| row.1 == format!("box oci login {kind}"))
@@ -2904,10 +3055,8 @@ recipe = "claude_fable_xhigh"
                 .find(|call| call.program == "ssh")
                 .unwrap()
                 .display();
-            let probe = native_probe(kind).unwrap();
             assert!(ssh.contains(&format!("command -v {kind}")), "{ssh}");
             assert!(ssh.contains("Reply only OK."), "{ssh}");
-            assert!(ssh.contains(probe.args[0]), "{ssh}");
         }
     }
 
@@ -2921,7 +3070,14 @@ recipe = "claude_fable_xhigh"
             let runner = FakeRunner::new();
             runner.on("ssh", ok(&box_facts()));
             probe_fakes(&runner);
-            let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
+            let rows = box_rows(
+                &runner,
+                "herdr",
+                Path::new(""),
+                &box_profile(),
+                &recipes,
+                12.0,
+            );
             assert!(
                 !rows
                     .iter()
@@ -2962,7 +3118,14 @@ recipe = "claude_fable_xhigh"
                 },
             ),
         ]);
-        let rows = box_rows(&runner, "herdr", &box_profile(), &recipes, 12.0);
+        let rows = box_rows(
+            &runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &recipes,
+            12.0,
+        );
         for id in ["unknown", "mismatch"] {
             assert_eq!(
                 rows.iter()
@@ -3002,8 +3165,12 @@ recipe = "claude_fable_xhigh"
         .into_iter()
         .map(String::from)
         .collect();
-        for provider in crate::pi::recipes::enabled_providers() {
-            lines.push(format!("pi_{provider}\tok"));
+        for recipe in default_recipes()
+            .into_values()
+            .filter(|recipe| recipe.enabled && recipe.kind == "pi")
+        {
+            let model = crate::pi::launch::flag_value(&recipe.args, "--model").unwrap();
+            lines.push(format!("pi_{}/{}\tok", recipe.provider, model));
         }
         lines.extend(["__HERDR_BUILDS__".into(), "__HERDR_BUILDS_DONE__".into()]);
         lines.join("\n") + "\n"
@@ -3036,7 +3203,14 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
         probe_fakes(&runner);
-        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 12.0);
+        let rows = box_rows(
+            &runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &default_recipes(),
+            12.0,
+        );
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -3057,7 +3231,14 @@ recipe = "claude_fable_xhigh"
         );
         assert_eq!(find("box oci capacity").0, Some(true));
         assert!(find("box oci capacity").1.contains("refuses below 12 GB"));
-        let configured = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 120.0);
+        let configured = box_rows(
+            &runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &default_recipes(),
+            120.0,
+        );
         assert_eq!(
             configured
                 .iter()
@@ -3077,23 +3258,21 @@ recipe = "claude_fable_xhigh"
             .find(|call| call.program == "ssh")
             .and_then(|call| call.args.last())
             .unwrap();
-        assert!(
-            script.starts_with(&format!("sh -c 'PATH={}", crate::contracts::BOX_PATH)),
-            "{script}"
-        );
+        assert!(script.starts_with("sh -c "), "{script}");
         assert!(
             ssh.contains("command -v claude")
-                && ssh.contains("claude-haiku-4-5-20251001")
+                && ssh.contains("claude-fable-5-1")
                 && ssh.contains("Reply only OK."),
             "{ssh}"
         );
+        assert!(!ssh.contains("command -v codex"), "{ssh}");
         assert!(
-            !ssh.contains("command -v codex") && !ssh.contains("gpt-5.6-sol"),
+            ssh.contains("check openai-codex --model gpt-5.6-sol"),
             "{ssh}"
         );
         assert!(
             ssh.contains("command -v agy")
-                && ssh.contains("gemini-3.8-flash-low")
+                && ssh.contains("gemini-3.8-flash-high")
                 && ssh.contains("Reply only OK."),
             "{ssh}"
         );
@@ -3119,7 +3298,14 @@ recipe = "claude_fable_xhigh"
 
         let runner = FakeRunner::new();
         runner.on("ssh", fail(255, "ssh: connect timed out"));
-        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 12.0);
+        let rows = box_rows(
+            &runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &default_recipes(),
+            12.0,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, Some(false));
         assert!(rows[0].2.contains("unreachable"));
@@ -3130,7 +3316,7 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         let facts = box_facts()
             .replace("login_agy\tok", "login_agy\tmissing")
-            .replace("pi_pro\tok", "pi_pro\tfail");
+            .replace("pi_pro/pro\tok", "pi_pro/pro\tfail");
         runner.on("ssh", ok(&facts));
         runner.on(
             "workspace create",
@@ -3142,7 +3328,14 @@ recipe = "claude_fable_xhigh"
             ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
         );
         runner.on("workspace close", ok(r#"{"result":{}}"#));
-        let rows = box_rows(&runner, "herdr", &box_profile(), &default_recipes(), 12.0);
+        let rows = box_rows(
+            &runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &default_recipes(),
+            12.0,
+        );
         let find = |label: &str| {
             rows.iter()
                 .find(|(_, name, _)| name == label)
@@ -3152,7 +3345,7 @@ recipe = "claude_fable_xhigh"
         assert_eq!(find("box oci tools").0, Some(false));
         assert!(find("box oci tools").2.contains("agy claude"));
         assert!(!find("box oci tools").2.contains("codex"));
-        assert_eq!(find("box oci pi pro").0, Some(false));
+        assert_eq!(find("box oci pi pro/pro").0, Some(false));
     }
 
     #[test]
@@ -3172,10 +3365,17 @@ recipe = "claude_fable_xhigh"
     }
 
     fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
-        box_rows(runner, "herdr", &box_profile(), &default_recipes(), 12.0)
-            .into_iter()
-            .find(|(_, name, _)| name == label)
-            .unwrap_or_else(|| panic!("no row {label}"))
+        box_rows(
+            runner,
+            "herdr",
+            Path::new(""),
+            &box_profile(),
+            &default_recipes(),
+            12.0,
+        )
+        .into_iter()
+        .find(|(_, name, _)| name == label)
+        .unwrap_or_else(|| panic!("no row {label}"))
     }
 
     #[test]
