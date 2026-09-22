@@ -49,7 +49,7 @@ Both commands create a durable event. Do not type a separate DONE or WAITING lin
 
 ## On the cloud box
 
-A brief that says you run on the cloud box named `oci` runs on a saved machine, not on this Mac. The birth line carries the fixed box prefix `/home/ubuntu/.local/bin/herdr-ade --root /home/ubuntu/.herdr-ade`; run that skill call first.
+A brief that says you run on the cloud box named `oci` runs on a saved machine, not on this Mac. The box's default-root command is `ha`; run the birth line's skill call first.
 
 - The brief was committed on the Mac's integration branch as `B` and reaches the box through your lane branch. Read `tasks/<id>.md` in your checkout; there is no `brief.md`.
 - Every kind logs in once per machine. If your kind is not signed in on the box, stop and run `ha waiting "<kind> is not signed in on the box"`; never copy a Mac credential across.

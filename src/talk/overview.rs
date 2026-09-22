@@ -485,8 +485,14 @@ impl Overview {
                         "retry" => "The harness had to try again",
                         _ => "A command failed",
                     };
+                    let disposition = crate::ledger::disposition(project, &entry)
+                        .map(|state| state.word())
+                        .unwrap_or("unknown");
                     out.sections[6].push(Row {
-                        text: format!("{what} ({} times).", entry.count),
+                        text: format!(
+                            "{what} ({} times; {disposition}; last observed {}).",
+                            entry.count, entry.last_at
+                        ),
                         prefix: String::new(),
                         marker: entry.id,
                         tone: Tone::Yellow,

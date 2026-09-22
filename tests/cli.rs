@@ -190,6 +190,39 @@ fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
 }
 
 #[test]
+fn context_uses_ha_for_the_default_root_and_keeps_recipe_commands_in_the_skill() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config/herdr-ade");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[routing]\ndefault = \"pi_codex_sol_high\"\n",
+    )
+    .unwrap();
+    assert!(hp(home.path(), &["new", "demo"]).status.success());
+
+    let out = hp(home.path(), &["context", "demo", "--peek"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().next(), Some("Commands: ha"));
+    let recipes = text
+        .split("## Recipes\n")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(!recipes.contains("--root"), "{recipes}");
+    assert!(!recipes.contains("thread start"), "{recipes}");
+    assert!(!recipes.contains("herdr-pro start"), "{recipes}");
+    assert!(recipes.contains("Rolf's one-off choice"), "{recipes}");
+}
+
+#[test]
 fn peek_records_nothing_and_context_records_seen_items() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");

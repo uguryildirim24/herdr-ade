@@ -259,16 +259,52 @@ pub(crate) fn task(entry: &Entry) -> String {
     )
 }
 
-pub(crate) fn summary(entry: &Entry) -> String {
+fn summary_with_state(entry: &Entry, state: &str) -> String {
     let text = normalize(&format!(
-        "{} ({} times) {} — {}: {}",
-        entry.id, entry.count, entry.kind, entry.subject, entry.detail
+        "{} [{state}; last observed {}] ({} times) {} — {}: {}",
+        entry.id, entry.last_at, entry.count, entry.kind, entry.subject, entry.detail
     ));
     if text.chars().count() > 220 {
         format!("{}…", text.chars().take(219).collect::<String>())
     } else {
         text
     }
+}
+
+pub(crate) fn summary(entry: &Entry) -> String {
+    summary_with_state(entry, if entry.closed { "resolved" } else { "open" })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    Current,
+    Unknown,
+    Resolved,
+}
+
+impl Disposition {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Unknown => "unknown",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+fn disposition_at(entry: &Entry, context_read: &str) -> Disposition {
+    if entry.closed {
+        Disposition::Resolved
+    } else if time_cmp(&entry.last_at, context_read).is_gt() {
+        Disposition::Current
+    } else {
+        Disposition::Unknown
+    }
+}
+
+pub(crate) fn disposition(project: &Project, entry: &Entry) -> Result<Disposition> {
+    let _lock = lock(project)?;
+    Ok(disposition_at(entry, &load(project)?.context_read))
 }
 
 pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
@@ -279,7 +315,19 @@ pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
         .into_values()
         .filter(|e| !e.closed && (e.count > 1 || time_cmp(&e.last_at, &state.context_read).is_gt()))
         .collect();
-    worst_first(&mut entries);
+    entries.sort_by(|a, b| {
+        let current = |entry: &Entry| {
+            matches!(
+                disposition_at(entry, &state.context_read),
+                Disposition::Current
+            )
+        };
+        current(b)
+            .cmp(&current(a))
+            .then(b.count.cmp(&a.count))
+            .then(time_cmp(&b.last_at, &a.last_at))
+            .then(a.id.cmp(&b.id))
+    });
     entries.truncate(5);
     Ok(entries)
 }
@@ -290,8 +338,10 @@ pub(crate) fn section(project: &Project) -> Result<String> {
     if rows.is_empty() {
         text.push_str("(none)\n");
     }
+    let context_read = latest_context_read(project)?;
     for entry in rows {
-        text.push_str(&format!("- {}\n", summary(&entry)));
+        let disposition = disposition_at(&entry, &context_read).word();
+        text.push_str(&format!("- {}\n", summary_with_state(&entry, disposition)));
     }
     Ok(text)
 }
@@ -369,7 +419,7 @@ fn observe_current(kind: &str, subject: &str, detail: &str) {
 
 pub(crate) struct RecordingRunner<'a>(pub &'a dyn Runner);
 
-fn command_subject(cmd: &Cmd) -> String {
+fn command_line(cmd: &Cmd) -> String {
     format!(
         "{} {}",
         cmd.program,
@@ -379,6 +429,12 @@ fn command_subject(cmd: &Cmd) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
+}
+
+fn command_subject(cmd: &Cmd) -> String {
+    cmd.ledger_subject
+        .clone()
+        .unwrap_or_else(|| command_line(cmd))
 }
 
 fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
@@ -392,11 +448,19 @@ fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
             "command-failed",
             subject,
             &format!(
-                "exit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
-                out.code, out.timed_out, out.stdout, out.stderr
+                "command: {}\nexit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
+                command_line(cmd),
+                out.code,
+                out.timed_out,
+                out.stdout,
+                out.stderr
             ),
         ),
-        Err(error) => observe_current("command-failed", subject, &format!("{error:#}")),
+        Err(error) => observe_current(
+            "command-failed",
+            subject,
+            &format!("command: {}\n{error:#}", command_line(cmd)),
+        ),
     }
 }
 
@@ -518,9 +582,15 @@ mod tests {
         assert!(text.lines().all(|l| l.chars().count() <= 222));
         assert!(recent(&p).unwrap()[0].subject == "r0");
         context_read(&p, &jiff::Timestamp::now().to_string()).unwrap();
-        assert_eq!(recent(&p).unwrap().len(), 1);
+        let old = recent(&p).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(disposition(&p, &old[0]).unwrap(), Disposition::Unknown);
+        assert!(section(&p).unwrap().contains("[unknown; last observed"));
         record(&p, "new", "r9", "new").unwrap();
-        assert_eq!(recent(&p).unwrap().len(), 2);
+        let rows = recent(&p).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].subject, "r9");
+        assert_eq!(disposition(&p, &rows[0]).unwrap(), Disposition::Current);
     }
     #[test]
     fn recovery_closes_the_failure_without_a_retry_twin() {
@@ -572,6 +642,29 @@ mod tests {
         }
         assert!(list(&p).unwrap().is_empty());
         assert!(!p.dir().join("ledger.jsonl").exists());
+    }
+
+    #[test]
+    fn a_stable_check_identity_recovers_across_command_changes_and_keeps_argv() {
+        let (_root, p) = fixture();
+        let _scope = Scope::new(&[&p]);
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        let failed = Cmd::new("/bin/sh", Duration::from_secs(5))
+            .args(["-c", "exit 9"])
+            .ledger_subject("check:fixture");
+        assert!(!runner.run(&failed).unwrap().success());
+        let entry = list(&p).unwrap().remove(0);
+        assert_eq!(entry.subject, "check:fixture");
+        assert!(entry.detail.contains("command: /bin/sh \"-c\" \"exit 9\""));
+
+        let fixed = Cmd::new("/bin/sh", Duration::from_secs(5))
+            .args(["-c", "exit 0"])
+            .ledger_subject("check:fixture");
+        assert!(runner.run(&fixed).unwrap().success());
+        assert!(list(&p).unwrap().is_empty());
+        let recovered = show(&p, &entry.id).unwrap();
+        assert!(recovered.closed);
+        assert_eq!(disposition(&p, &recovered).unwrap(), Disposition::Resolved);
     }
 
     #[test]
