@@ -1,0 +1,413 @@
+//! Provenanced project memory and standing instructions.
+//!
+//! New notes are append-only records. Historical Markdown remains readable as
+//! an `undated:*` note until an explicit replacement supersedes it; subject
+//! matching is never guessed from prose.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
+
+use anyhow::{Result, bail};
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+
+use crate::project::{self, Project};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+pub(crate) enum Kind {
+    Memory,
+    Instruction,
+}
+
+impl Kind {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Instruction => "standing instruction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Note {
+    pub(crate) schema: u32,
+    pub(crate) id: String,
+    pub(crate) kind: Kind,
+    pub(crate) at: String,
+    pub(crate) request: String,
+    pub(crate) text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) replaces: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tasks: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Row {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) at: Option<String>,
+    pub(crate) request: Option<String>,
+    pub(crate) text: String,
+    pub(crate) replaces: Option<String>,
+    pub(crate) tasks: Vec<String>,
+    pub(crate) source: String,
+}
+
+fn path(project: &Project) -> PathBuf {
+    project.dir().join("notes.jsonl")
+}
+
+pub(crate) fn read(project: &Project) -> Vec<Note> {
+    std::fs::read_to_string(path(project))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn legacy_rows(project: &Project) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if let Ok((_, body)) = project.read_project_md()
+        && !body.trim().is_empty()
+    {
+        rows.push(Row {
+            id: "undated:PROJECT.md".into(),
+            kind: "standing instruction".into(),
+            at: None,
+            request: None,
+            text: body.trim().into(),
+            replaces: None,
+            tasks: Vec::new(),
+            source: "PROJECT.md".into(),
+        });
+    }
+    let index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
+    if !index.trim().is_empty() {
+        rows.push(Row {
+            id: "undated:MEMORY.md".into(),
+            kind: "memory".into(),
+            at: None,
+            request: None,
+            text: index.trim().into(),
+            replaces: None,
+            tasks: Vec::new(),
+            source: "MEMORY.md".into(),
+        });
+    }
+    let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.ends_with(".md") && !name.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    for name in names {
+        let file = project.dir().join("memory").join(&name);
+        if !std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(file)
+            && !text.trim().is_empty()
+        {
+            rows.push(Row {
+                id: format!("undated:memory/{name}"),
+                kind: "memory".into(),
+                at: None,
+                request: None,
+                text: text.trim().into(),
+                replaces: None,
+                tasks: Vec::new(),
+                source: format!("memory/{name}"),
+            });
+        }
+    }
+    rows
+}
+
+pub(crate) fn rows(project: &Project) -> Vec<Row> {
+    let mut rows = legacy_rows(project);
+    rows.extend(read(project).into_iter().map(|note| Row {
+        id: note.id,
+        kind: note.kind.word().into(),
+        at: Some(note.at),
+        request: Some(note.request),
+        text: note.text,
+        replaces: note.replaces,
+        tasks: note.tasks,
+        source: "notes.jsonl".into(),
+    }));
+    for decision in crate::decide::read(project).records {
+        let request = decision.request.clone().or_else(|| {
+            decision
+                .basis
+                .as_deref()
+                .and_then(|basis| basis.strip_prefix("request:"))
+                .map(str::to_string)
+        });
+        rows.push(Row {
+            id: decision.id,
+            kind: "decision".into(),
+            at: Some(decision.at),
+            request,
+            text: decision.line,
+            replaces: decision.replaces,
+            tasks: Vec::new(),
+            source: "decisions.jsonl".into(),
+        });
+    }
+    let tasks = crate::task::list_with_errors(project).0;
+    let replaced_tasks: BTreeSet<String> = tasks
+        .iter()
+        .filter_map(|task| task.replaces.clone())
+        .collect();
+    for task in tasks {
+        if task.replaces.is_some() || replaced_tasks.contains(&task.id) {
+            let request = task
+                .authority
+                .iter()
+                .find_map(|authority| authority.strip_prefix("request:").map(str::to_string));
+            rows.push(Row {
+                id: task.id.clone(),
+                kind: "task".into(),
+                at: Some(task.created.clone()),
+                request,
+                text: task.title.clone(),
+                replaces: task.replaces.clone(),
+                tasks: vec![task.id.clone()],
+                source: format!("tasks/{}.toml", task.id),
+            });
+        }
+        for (index, note) in task.notes.into_iter().enumerate() {
+            let id = if note.id.is_empty() {
+                format!("undated:{}:note-{:04}", task.id, index + 1)
+            } else {
+                note.id
+            };
+            let dated = !note.request.is_empty();
+            rows.push(Row {
+                id,
+                kind: "task note".into(),
+                at: dated.then_some(note.at),
+                request: dated.then_some(note.request),
+                text: note.text,
+                replaces: note.replaces,
+                tasks: vec![task.id.clone()],
+                source: format!("tasks/{}.toml", task.id),
+            });
+        }
+    }
+    rows
+}
+
+pub(crate) fn replacement_map(rows: &[Row]) -> BTreeMap<String, String> {
+    rows.iter()
+        .filter_map(|row| {
+            row.replaces
+                .as_ref()
+                .map(|old| (old.clone(), row.id.clone()))
+        })
+        .collect()
+}
+
+pub(crate) fn target_exists(project: &Project, id: &str) -> bool {
+    rows(project).iter().any(|row| row.id == id)
+        || (id.starts_with("job-") && crate::task::load(project, id).is_ok())
+}
+
+pub(crate) fn add(
+    project: &Project,
+    kind: Kind,
+    text: &str,
+    request: &str,
+    replaces: Option<&str>,
+    tasks: Vec<String>,
+) -> Result<Note> {
+    if text.trim().is_empty() {
+        return Err(crate::refusal::error("note_text: a note is required"));
+    }
+    let request = request.strip_prefix("request:").unwrap_or(request);
+    crate::decide::validate_basis(project, &format!("request:{request}"))?;
+    for task in &tasks {
+        crate::task::load(project, task)?;
+    }
+    if let Some(old) = replaces {
+        if !target_exists(project, old) {
+            bail!("note_replacement: no note `{old}` exists");
+        }
+        let rows = rows(project);
+        if replacement_map(&rows).contains_key(old) {
+            bail!("note_replacement: `{old}` already has a replacement");
+        }
+    }
+    let _lock = project.lock()?;
+    let records = read(project);
+    let next = records
+        .iter()
+        .filter_map(|record| record.id.strip_prefix("n-")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let note = Note {
+        schema: 1,
+        id: format!("n-{next:04}"),
+        kind,
+        at: project::now(),
+        request: request.into(),
+        text: text.trim().into(),
+        replaces: replaces.map(str::to_string),
+        tasks,
+    };
+    let mut file = File::options()
+        .create(true)
+        .append(true)
+        .open(path(project))?;
+    writeln!(file, "{}", serde_json::to_string(&note)?)?;
+    file.sync_all()?;
+    Ok(note)
+}
+
+pub(crate) fn sort_newest_first(rows: &mut Vec<Row>) {
+    rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
+    // Rounded timestamps can tie. Explicit replacement is stronger evidence
+    // of order than an id or a guessed prose subject.
+    let replacements = replacement_map(rows);
+    for _ in 0..rows.len() {
+        let positions: BTreeMap<String, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.id.clone(), index))
+            .collect();
+        let Some((old_index, new_index)) = rows.iter().enumerate().find_map(|(old_index, row)| {
+            let new_index = *positions.get(replacements.get(&row.id)?)?;
+            (new_index > old_index).then_some((old_index, new_index))
+        }) else {
+            break;
+        };
+        let newer = rows.remove(new_index);
+        rows.insert(old_index, newer);
+    }
+}
+
+pub(crate) fn render_context(project: &Project) -> String {
+    let mut rows = rows(project);
+    let replacements = replacement_map(&rows);
+    sort_newest_first(&mut rows);
+    let total = rows.len();
+    let mut out = String::new();
+    for row in rows.into_iter().take(20) {
+        let provenance = match (&row.at, &row.request) {
+            (Some(at), Some(request)) => format!("{} request:{}", &at[..at.len().min(10)], request),
+            _ => "undated".into(),
+        };
+        let first = row
+            .text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let short: String = first.chars().take(160).collect();
+        let scope = if row.tasks.is_empty() {
+            String::new()
+        } else {
+            format!(" tasks={}", row.tasks.join(","))
+        };
+        let relation = if let Some(newer) = replacements.get(&row.id) {
+            format!(" — replaced by {newer}")
+        } else if let Some(old) = &row.replaces {
+            format!(" — replaces {old}")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "- {} [{}; {}; {}{}] {}{}\n",
+            row.id, provenance, row.kind, row.source, scope, short, relation
+        ));
+    }
+    if total > 20 {
+        out.push_str(&format!(
+            "… {} more; read notes.jsonl, decisions.jsonl, tasks/, PROJECT.md and memory/.\n",
+            total - 20
+        ));
+    }
+    out
+}
+
+pub(crate) fn active_rows(project: &Project) -> Vec<Row> {
+    let rows = rows(project);
+    let replaced: BTreeSet<String> = replacement_map(&rows).into_keys().collect();
+    rows.into_iter()
+        .filter(|row| !replaced.contains(&row.id))
+        .collect()
+}
+
+pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
+    active_rows(project)
+        .into_iter()
+        .filter(|row| {
+            row.tasks.is_empty() || task.is_some_and(|id| row.tasks.iter().any(|t| t == id))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::round::testkit::fixture;
+
+    #[test]
+    fn explicit_replacement_hides_old_note_from_active_rows() {
+        let fx = fixture();
+        crate::talk::append(
+            &fx.project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Use the newer instruction.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        assert!(render_context(&fx.project).contains("undated:PROJECT.md [undated"));
+        let old = add(&fx.project, Kind::Memory, "Keep this.", "q-1", None, vec![]).unwrap();
+        let new = add(
+            &fx.project,
+            Kind::Memory,
+            "Keep that instead.",
+            "q-1",
+            Some(&old.id),
+            vec![],
+        )
+        .unwrap();
+        let active = active_for(&fx.project, None);
+        assert!(!active.iter().any(|row| row.id == old.id));
+        assert!(active.iter().any(|row| row.id == new.id));
+        let context = render_context(&fx.project);
+        assert!(context.find(&new.id).unwrap() < context.find(&old.id).unwrap());
+        assert!(context.contains(&format!("replaced by {}", new.id)));
+
+        let task = crate::task::add(
+            &fx.project,
+            "Ship the checked change.",
+            vec!["request:q-1".into()],
+            vec!["The command reports the new result.".into()],
+            None,
+            None,
+            Some(new.id.clone()),
+        )
+        .unwrap();
+        let context = render_context(&fx.project);
+        assert!(context.contains(&format!("replaced by {}", task.id)));
+        assert!(
+            !active_for(&fx.project, None)
+                .iter()
+                .any(|row| row.id == new.id)
+        );
+    }
+}
