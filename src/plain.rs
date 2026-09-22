@@ -190,7 +190,11 @@ pub(crate) fn check_ask(question: &str, choices: &[String], glossary: &Glossary)
     for choice in choices {
         violations.extend(check_text(choice, glossary));
     }
-    violations.extend(check_question_form(question, choices, glossary));
+    violations.extend(
+        check_question_form(question, choices, glossary)
+            .into_iter()
+            .map(|(_, violation)| violation),
+    );
     CheckResult { violations }
 }
 
@@ -452,18 +456,25 @@ fn check_r5(text: &str, glossary: &Glossary) -> Vec<Violation> {
     violations
 }
 
-fn check_question_form(question: &str, choices: &[String], glossary: &Glossary) -> Vec<Violation> {
+pub(crate) fn check_question_form<'a>(
+    question: &'a str,
+    choices: &'a [String],
+    glossary: &Glossary,
+) -> Vec<(&'a str, Violation)> {
     let mut violations = Vec::new();
     let trimmed = question.trim();
     if !trimmed.ends_with('?') {
-        violations.push(Violation {
-            rule: Rule::QuestionForm,
-            span: Span {
-                start: 0,
-                end: question.len(),
+        violations.push((
+            question,
+            Violation {
+                rule: Rule::QuestionForm,
+                span: Span {
+                    start: 0,
+                    end: question.len(),
+                },
+                fix: "end the question with a question mark".into(),
             },
-            fix: "end the question with a question mark".into(),
-        });
+        ));
     }
     for choice in choices {
         let words: Vec<_> = tokens(choice)
@@ -475,30 +486,39 @@ fn check_question_form(question: &str, choices: &[String], glossary: &Glossary) 
             end: choice.len(),
         };
         if glossary.is_registry(choice.trim()) {
-            violations.push(Violation {
-                rule: Rule::QuestionForm,
-                span,
-                fix: "a choice cannot be a registry name".into(),
-            });
+            violations.push((
+                choice.as_str(),
+                Violation {
+                    rule: Rule::QuestionForm,
+                    span,
+                    fix: "a choice cannot be a registry name".into(),
+                },
+            ));
             continue;
         }
         if words.len() <= 1 {
-            violations.push(Violation {
-                rule: Rule::QuestionForm,
-                span,
-                fix: "a choice cannot be a single word".into(),
-            });
+            violations.push((
+                choice.as_str(),
+                Violation {
+                    rule: Rule::QuestionForm,
+                    span,
+                    fix: "a choice cannot be a single word".into(),
+                },
+            ));
             continue;
         }
         let has_verb = words
             .iter()
             .any(|t| VERBS.contains(t.raw.to_ascii_lowercase().as_str()));
         if !has_verb {
-            violations.push(Violation {
-                rule: Rule::QuestionForm,
-                span,
-                fix: "each choice must be a sentence with a verb".into(),
-            });
+            violations.push((
+                choice.as_str(),
+                Violation {
+                    rule: Rule::QuestionForm,
+                    span,
+                    fix: "each choice must be a sentence with a verb".into(),
+                },
+            ));
         }
     }
     violations
