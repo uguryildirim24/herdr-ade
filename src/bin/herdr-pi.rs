@@ -40,8 +40,11 @@ enum Command {
     Doctor,
     /// Read-only readiness for one provider (JSON); exit 1 when not ready
     Check {
-        /// The pi provider id, for example kimi-coding
+        /// The pi provider id.
         provider: String,
+        /// The exact routed model to probe.
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -89,8 +92,9 @@ fn run(cli: &Cli) -> Result<bool> {
             }
             Ok(healthy)
         }
-        Command::Check { provider } => {
-            let report = pi::doctor::check_report(&env, &layout, &runner, provider);
+        Command::Check { provider, model } => {
+            let report =
+                pi::doctor::check_report_model(&env, &layout, &runner, provider, model.as_deref());
             println!("{}", serde_json::to_string_pretty(&report.json())?);
             Ok(report.ok)
         }
