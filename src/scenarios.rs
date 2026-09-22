@@ -2763,6 +2763,18 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
             && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
         "{scripts:?}"
     );
+    for script in &scripts[..2] {
+        let refresh = script
+            .find("git read-tree HEAD && git update-index -q --refresh")
+            .expect("box build refreshes the sync-stale index");
+        let source_head = script.find("source_head=").unwrap();
+        let source_dirty = script.find("source_dirty=").unwrap();
+        let build = script.find("cargo build --release --locked").unwrap();
+        assert!(
+            refresh < source_head && refresh < source_dirty && refresh < build,
+            "box index refresh must precede source inspection and build: {script}"
+        );
+    }
     assert!(
         scripts[2].contains("$dir/RULES.md")
             && scripts[2].contains(crate::harness::BOX_WORKER_MARKER),
