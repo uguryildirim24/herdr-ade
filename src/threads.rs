@@ -115,6 +115,11 @@ pub struct StartArgs {
     pub plain: String,
     /// Internal flow/skill label; never a coordinator model-selection input.
     pub workflow: Option<String>,
+    /// An exact recipe Rolf named for this one lane.
+    pub recipe: Option<String>,
+    /// Verbatim words from a Rolf request attached to `task_id`.
+    pub recipe_basis: Option<String>,
+    pub task_id: String,
 }
 
 /// Birth sentence: required, one sentence, R1–R5 except the known-word rule
@@ -231,12 +236,30 @@ fn start_with_ticker(
     let listed = (!repo.is_empty())
         .then(|| settings.repos.iter().find(|row| row.path == repo))
         .flatten();
+    let recipe_request = match &args.recipe {
+        Some(recipe) => Some(crate::launch::authorize_explicit_recipe(
+            ctx,
+            &project,
+            &args.task_id,
+            &args.task,
+            role,
+            recipe,
+            args.recipe_basis.as_deref().unwrap_or_default(),
+        )?),
+        None if args.recipe_basis.is_some() => {
+            bail!("recipe_basis_without_recipe: --basis is only valid with --recipe")
+        }
+        None => None,
+    };
     let launch = crate::launch::resolve_launch(
         ctx,
         &project,
         &crate::launch::ResolveInput {
             task: &args.task,
             workflow: role,
+            recipe: args.recipe.as_deref(),
+            recipe_basis: args.recipe_basis.as_deref().map(str::trim),
+            recipe_request: recipe_request.as_deref(),
             source_truncation: source_truncation.as_ref(),
             ..Default::default()
         },
@@ -1421,6 +1444,7 @@ fn retry_with_ticker(
             previous: Some(&record.launch),
             failure: Some(reason),
             source_truncation: record.launch.source_truncation.as_ref(),
+            ..Default::default()
         },
         record.failure_class,
     )?;
@@ -2080,6 +2104,7 @@ pub(crate) fn fail_start(
                 previous: Some(&record.launch),
                 failure: Some(reason),
                 source_truncation: record.launch.source_truncation.as_ref(),
+                ..Default::default()
             },
             class,
         ) {
@@ -2848,6 +2873,9 @@ mod tests {
                 task: "Do the thing.".into(),
                 plain: "The lane does the work.".into(),
                 workflow: None,
+                recipe: None,
+                recipe_basis: None,
+                task_id: String::new(),
             },
         )
         .unwrap();
@@ -3030,6 +3058,9 @@ mod tests {
             task: "Do the thing.".into(),
             plain: "The lane does the work.".into(),
             workflow: None,
+            recipe: None,
+            recipe_basis: None,
+            task_id: String::new(),
         };
 
         let other = world.home.path().join("other");
@@ -3071,6 +3102,9 @@ mod tests {
                 task: "Do the thing.".into(),
                 plain: String::new(),
                 workflow: None,
+                recipe: None,
+                recipe_basis: None,
+                task_id: String::new(),
             },
         )
         .unwrap_err()
@@ -3240,6 +3274,9 @@ mod tests {
             task: "Do the thing.".into(),
             plain: "The lane does the work.".into(),
             workflow: None,
+            recipe: None,
+            recipe_basis: None,
+            task_id: String::new(),
         }
     }
 
