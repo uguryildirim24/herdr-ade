@@ -302,6 +302,7 @@ fn event_from_op(op: &Op) -> Result<Event> {
                     .artifact
                     .clone()
                     .context("op_payload_invalid: staged done has no artifact")?,
+                attestation: None,
             }),
             waiting: None,
             failed: None,

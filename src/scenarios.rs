@@ -196,6 +196,7 @@ fn record_stored_report(project: &Project, thread_id: &str) {
                     sha: "lane-sha".into(),
                     report_path: format!(".reports/{thread_id}.md"),
                     artifact,
+                    attestation: None,
                 }),
                 ..EventPayload::default()
             },

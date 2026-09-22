@@ -276,12 +276,23 @@ pub(crate) struct Op {
     pub(crate) artifact: Option<String>,
 }
 
+/// A coordinator's explicit acceptance of a resolved lane's stored report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct Attestation {
+    pub(crate) coordinator: String,
+    pub(crate) reason: String,
+}
+
 /// Sealed `done` payload (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct DonePayload {
+    /// Empty only when an attested historical lane has no git folder left.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) sha: String,
     pub(crate) report_path: String,
     pub(crate) artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attestation: Option<Attestation>,
 }
 
 /// Sealed `waiting` payload (SPEC-ADE D5).
@@ -778,6 +789,7 @@ mod tests {
                     sha: "abc".into(),
                     report_path: ".reports/a.md".into(),
                     artifact: "deadbeef".into(),
+                    attestation: None,
                 }),
                 waiting: None,
                 failed: None,
