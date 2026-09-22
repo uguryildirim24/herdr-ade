@@ -154,7 +154,6 @@ pub(crate) struct Repo {
 pub(crate) struct Settings {
     pub(crate) name: String,
     pub(crate) goal: String,
-    pub(crate) max_parallel_threads: u32,
     pub(crate) auto_resolve_days: u32,
     pub(crate) nudge: bool,
     /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
@@ -180,7 +179,6 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             goal: String::new(),
-            max_parallel_threads: 3,
             auto_resolve_days: 7,
             // On by default: a coordinator that does not read its inbox is
             // unreachable. A project that wants the old notification-only
@@ -223,8 +221,8 @@ fn parse_project_md(text: &str) -> Result<(Settings, String)> {
     Ok((settings, body.trim_start_matches('\n').to_string()))
 }
 
-/// Keys D2 removes. Present in the front-matter table, not merely defaulted.
-pub(crate) fn legacy_agent_keys(front: &str) -> Vec<String> {
+/// Removed keys that `doctor` refuses when they remain in front matter.
+pub(crate) fn removed_project_keys(front: &str) -> Vec<String> {
     let Ok(value) = toml::from_str::<toml::Value>(front) else {
         return Vec::new();
     };
@@ -236,6 +234,7 @@ pub(crate) fn legacy_agent_keys(front: &str) -> Vec<String> {
         "thread_agent",
         "coordinator_agent_args",
         "thread_agent_args",
+        "max_parallel_threads",
     ]
     .into_iter()
     .filter(|key| table.contains_key(*key))
@@ -938,7 +937,6 @@ mod tests {
         let (settings, body) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
-        assert_eq!(settings.max_parallel_threads, 3);
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert_eq!(
@@ -1058,12 +1056,13 @@ mod tests {
     }
 
     #[test]
-    fn new_project_does_not_write_removed_agent_keys() {
+    fn new_project_does_not_write_removed_settings() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
         let text = std::fs::read_to_string(project.project_md()).unwrap();
         let front = project_md_front(&text).unwrap();
-        assert!(legacy_agent_keys(front).is_empty(), "{front}");
+        assert!(removed_project_keys(front).is_empty(), "{front}");
+        assert!(!front.contains("max_parallel_threads"), "{front}");
         assert!(!front.contains("talk"), "{front}");
         let (settings, _) = parse_project_md(&text).unwrap();
         assert_eq!(settings.talk, None);
