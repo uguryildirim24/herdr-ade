@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0278.md",
+      "tasks/review-r106.md",
+      "tasks/t-0277.md",
+      "tasks/t-0276.md",
+      "tasks/t-0275.md",
       "tasks/t-0274.md",
       "tasks/review-r105.md",
       "tasks/t-0273.md",
       "tasks/t-0272.md",
       "tasks/review-r104.md",
       "tasks/t-0271.md",
-      "tasks/t-0270.md",
-      "tasks/t-0256.md",
-      "tasks/review-r100.md",
-      "tasks/t-0269.md",
-      "tasks/review-r103.md",
-      "tasks/t-0268.md"
+      "tasks/t-0270.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r106.md",
       "tasks/reviews/code-r105.md",
       "tasks/reviews/code-r104.md",
       "tasks/reviews/code-r100.md",
@@ -39,15 +40,19 @@
       "tasks/reviews/code-r97.md",
       "tasks/reviews/code-r96.md",
       "tasks/reviews/code-r92.md",
-      "tasks/reviews/code-r95.md",
-      "tasks/reviews/code-r93.md"
+      "tasks/reviews/code-r95.md"
     ]
   },
-  "generated": "2026-09-22T04:59:57-04:00",
+  "generated": "2026-09-22T09:08:32-04:00",
   "git": {
     "branches": [
-      "hp/adeherdr/t-0274-review-r105-recording-a-choice-tells-you",
+      "hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
       "main",
+      "review/r106",
+      "hp/adeherdr/t-0276-w31-ended-lane-is-not-working",
+      "hp/adeherdr/t-0277-w32-briefs-carry-task-notes-only",
+      "hp/adeherdr/t-0275-w30-lane-reports-never-committed",
+      "hp/adeherdr/t-0274-review-r105-recording-a-choice-tells-you",
       "review/r105",
       "hp/adeherdr/t-0273-w29-decide-says-all-it-needs",
       "hp/adeherdr/t-0272-review-r104-commands-read-the-same-way-e",
@@ -440,29 +445,29 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "4b8bebd docs(review): round r105 verdict",
-      "76c95e1 Merge commit '6592b3423b1e3c296bec7f483eb2a0ec1ddaa1f8' into review/r105",
-      "7fc67a6 docs(tasks): t-0274",
-      "555ea0f review(r105): brief for revision 1",
-      "6592b34 fix(decide): report class requirements together",
-      "0405a2f docs(tasks): t-0273"
+      "f84fffa review(r106): verdict",
+      "524d313 review(threads): fail closed on attestation evidence",
+      "766bd2b Merge commit '4ae9e5c1af0875c3480b393313c155fc522a4e54' into hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
+      "3da8008 Merge commit '99aea5062ace38a483ca1f254c80e7508c667d3a' into hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
+      "5068a85 Merge commit 'dfacff1b344988a722df090a19492e1f8776ead0' into hp/adeherdr/t-0278-review-r106-helper-notes-stay-out-of-sha",
+      "94f53f0 docs(tasks): t-0278"
     ],
-    "remote": "6 ahead, 0 behind origin/main",
+    "remote": "13 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "4b8bebd",
+        "head": "f84fffa",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "docs(review): round r105 verdict"
+        "subject": "review(r106): verdict"
       },
       {
-        "branch": "review/r105",
+        "branch": "review/r106",
         "dirty": 0,
-        "head": "7fc67a6",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r105",
-        "subject": "docs(tasks): t-0274"
+        "head": "94f53f0",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r106",
+        "subject": "docs(tasks): t-0278"
       }
     ]
   },
@@ -470,20 +475,20 @@
   "other_workspaces": [
     {
       "label": "Flyonenomics",
-      "status": "done",
+      "status": "working",
       "workspace_id": "w1H"
     },
     {
       "label": "PRL-8-53",
-      "status": "done",
+      "status": "blocked",
       "workspace_id": "w1N"
     }
   ],
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r105",
-    "verdict": "4b8bebdb7600857c21e5f3e9e68646cc35b31fd0"
+    "round": "r106",
+    "verdict": "f84fffaac54db97d2398c47ab85e2205541e2d87"
   },
   "session": "default",
   "unlinked_agents": [],
