@@ -221,6 +221,8 @@ const PENDING_PROMPT_SECS: i64 = 120;
 const PASTE_OPEN: &str = "<pasted_content id=\"";
 const TASK_OPEN: &str = "<task-notification>";
 const TASK_CLOSE: &str = "</task-notification>";
+const CROSS_SESSION_OPEN: &str = "<cross-session-message";
+const CROSS_SESSION_CLOSE: &str = "</cross-session-message>";
 
 /// Removes Claude Code's wrapper only when the whole prompt is made of paste
 /// blocks. Native words before or after a block make this `None`, so a mixed
@@ -263,6 +265,32 @@ pub(crate) fn is_task_notification_prompt(text: &str) -> bool {
     found && rest.is_empty()
 }
 
+/// True only when the complete prompt is Claude Code's cross-session wrapper.
+/// Native words before or after the wrapper remain Rolf's request.
+pub(crate) fn is_cross_session_prompt(text: &str) -> bool {
+    let text = text.trim();
+    let Some(after_name) = text.strip_prefix(CROSS_SESSION_OPEN) else {
+        return false;
+    };
+    if !after_name.starts_with('>')
+        && !after_name.starts_with(|character: char| character.is_whitespace())
+    {
+        return false;
+    }
+    let Some((_, body)) = after_name.split_once('>') else {
+        return false;
+    };
+    body.strip_suffix(CROSS_SESSION_CLOSE).is_some()
+}
+
+/// A ticker prompt is one complete, possibly paste-wrapped line. Keeping this
+/// to one line means native words mixed into the same prompt still count.
+fn is_ticker_prompt(text: &str) -> bool {
+    let marker = marker_text(text);
+    let marker = marker.trim();
+    !marker.contains('\n') && marker.starts_with(crate::steps::TICKER_PROMPT_PREFIX)
+}
+
 /// Historical hook mistakes stay in the append-only journal but are omitted
 /// from the conversation. A pasted human message is retained; only known
 /// harness lines inside a pure paste wrapper are hidden.
@@ -290,17 +318,12 @@ fn is_parent_status_line(text: &str) -> bool {
     !slug.is_empty() && thread.len() >= 4 && thread.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Herdr's parent notifier keys BLOCKED/GONE by the full agent name, unlike
-/// the plugin courier's `t-NNNN` lines. They are machine input, not a request.
-pub(crate) fn mark_parent_status_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
-    if is_parent_status_line(text) {
-        mark_automated_prompt(project, pane, text)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
-    if is_task_notification_prompt(text) || is_parent_status_line(text) {
+    if is_task_notification_prompt(text)
+        || is_cross_session_prompt(text)
+        || is_ticker_prompt(text)
+        || is_parent_status_line(text)
+    {
         return true;
     }
     let Some(text) = pasted_contents(text) else {
@@ -311,7 +334,6 @@ pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
         || text.starts_with("WAITING t-")
         || text.starts_with("BLOCKED t-")
         || text.starts_with("GONE t-")
-        || text == crate::steps::NUDGE_TEXT
         || (text.starts_with("You are the coordinator of the herdr project `")
             && text.contains(" skill coordinator`")
             && text.contains(" context "))
@@ -501,7 +523,11 @@ pub(crate) fn request_text(project: &Project, id: &str) -> Option<String> {
         .into_iter()
         .rev()
         .find_map(|line| match line.entry {
-            Entry::Rolf { request, text, .. } if request == id => Some(text),
+            Entry::Rolf { request, text, .. }
+                if request == id && !is_historical_system_prompt(&text) =>
+            {
+                Some(text)
+            }
             _ => None,
         })
 }

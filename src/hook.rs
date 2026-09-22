@@ -431,16 +431,14 @@ fn prompt_text(input: &serde_json::Value) -> Option<&str> {
 /// Records a prompt typed into the coordinator pane and returns the request id
 /// to print, or `None` when a harness line must not be recorded as Rolf's.
 fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<String>> {
-    if crate::talk::is_task_notification_prompt(text) {
+    if crate::talk::is_task_notification_prompt(text) || crate::talk::is_cross_session_prompt(text)
+    {
         return Ok(None);
     }
-    // Herdr, rather than the plugin, sends parent BLOCKED/GONE lines. Mark
-    // those full-agent-name prompts through the same exact-text path used by
-    // DONE/WAITING before the hook classifies this submission.
-    crate::talk::mark_parent_status_prompt(project, pane, text)?;
     match crate::talk::take_pending_prompt(project, pane, text) {
         Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
         Some(crate::talk::PendingPrompt::Automated) => Ok(None),
+        None if crate::talk::is_historical_system_prompt(text) => Ok(None),
         None => Ok(Some(crate::talk::record_pane_request(project, text)?)),
     }
 }
@@ -751,6 +749,20 @@ mod tests {
             detached_ticker: false,
         };
         install(&ctx, &project, "claude", "w1:p1").unwrap();
+
+        let cross_session = "\n <cross-session-message from=\"coordinator-2\" session_id=\"other\">\nKeep spending.\n</cross-session-message> \n";
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", cross_session).unwrap(),
+            None
+        );
+        assert!(crate::talk::read(&project).lines.is_empty());
+
+        let ticker = format!(
+            "<pasted_content id=\"2458\">\n{} Continue open work: check the result.\n</pasted_content id=\"2458\">",
+            crate::steps::TICKER_PROMPT_PREFIX
+        );
+        assert_eq!(handle_prompt(&project, "w1:p1", &ticker).unwrap(), None);
+        assert!(crate::talk::read(&project).lines.is_empty());
 
         crate::talk::mark_automated_prompt(&project, "w1:p1", "DONE t-0001 report.md sha").unwrap();
         let wrapped_done = "\n\n<pasted_content id=\"2459\">\nDONE t-0001 report.md sha\n</pasted_content id=\"2459\">\n";
