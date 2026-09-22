@@ -32,11 +32,10 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     assert!(
         run(&[
             "decide",
+            "demo",
             "I kept the words short.",
             "--class",
             "routine",
-            "--project",
-            "demo"
         ])
         .status
         .success()
@@ -44,10 +43,9 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     let overturned = run(&[
         "decide",
         "overturn",
+        "demo",
         "d-0001",
         "I want more detail.",
-        "--project",
-        "demo",
     ]);
     assert!(
         overturned.status.success(),
@@ -56,26 +54,18 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     );
     assert!(String::from_utf8_lossy(&overturned.stdout).contains("overturned by rolf"));
     assert!(
-        !run(&[
-            "decide",
-            "overturn",
-            "d-9999",
-            "No thanks.",
-            "--project",
-            "demo"
-        ])
-        .status
-        .success()
+        !run(&["decide", "overturn", "demo", "d-9999", "No thanks.",])
+            .status
+            .success()
     );
     let ask_args = [
         "ask",
+        "demo",
         "May I spend\n five dollars on this check?",
         "--choice",
         "Keep it running.",
         "--choice",
         "Stop it now.",
-        "--project",
-        "demo",
     ];
     let asked = run(&ask_args);
     assert!(
@@ -90,14 +80,7 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     let duplicate = run(&ask_args);
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("ask_duplicate: `a-1`"));
-    let withdrawn = run(&[
-        "ask",
-        "withdraw",
-        "a-1",
-        "No longer needed.",
-        "--project",
-        "demo",
-    ]);
+    let withdrawn = run(&["ask", "withdraw", "demo", "a-1", "No longer needed."]);
     assert!(
         withdrawn.status.success(),
         "{}",
@@ -108,27 +91,11 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     assert!(record.contains("by = \"rolf\""));
     assert!(run(&ask_args).status.success());
     assert!(
-        run(&[
-            "ask",
-            "answer",
-            "a-2",
-            "--revision",
-            "1",
-            "1",
-            "--project",
-            "demo"
-        ])
-        .status
-        .success()
+        run(&["ask", "answer", "demo", "a-2", "--revision", "1", "1",])
+            .status
+            .success()
     );
-    let refused = run(&[
-        "ask",
-        "withdraw",
-        "a-2",
-        "No longer needed.",
-        "--project",
-        "demo",
-    ]);
+    let refused = run(&["ask", "withdraw", "demo", "a-2", "No longer needed."]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("answered ask cannot be withdrawn"));
 }
@@ -296,6 +263,27 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
 }
 
 #[test]
+fn round_show_without_a_round_lists_and_there_is_no_list_alias() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(
+        hp(home.path(), &["--root", root_arg, "new", "demo"])
+            .status
+            .success()
+    );
+
+    let shown = hp(home.path(), &["--root", root_arg, "round", "show", "demo"]);
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let alias = hp(home.path(), &["--root", root_arg, "round", "list", "demo"]);
+    assert!(!alias.status.success());
+}
+
+#[test]
 fn path_like_names_and_slugs_are_refused() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
@@ -342,8 +330,8 @@ fn every_named_verb_returns_a_structured_refusal() {
         &["thread", "show", "missing", "t-1"],
         &["ask"],
         &["decide"],
-        &["plan", "show", "--project", "missing"],
-        &["say", "--what", "This was checked.", "--project", "missing"],
+        &["plan", "show", "missing"],
+        &["say", "missing", "--what", "This was checked."],
         &["done", "--report", "report.md", "--sha", "deadbeef"],
         &["thread", "resolve", "missing", "t-1"],
         &["context", "missing"],
