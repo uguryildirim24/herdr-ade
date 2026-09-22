@@ -62,6 +62,24 @@ fn path(project: &Project) -> PathBuf {
     project.dir().join("notes.jsonl")
 }
 
+pub(crate) struct ReplacementLock {
+    _file: File,
+}
+
+/// Serializes the check-and-append boundary shared by notes, decisions and
+/// tasks. Their own storage locks cannot prevent two different record kinds
+/// from replacing the same current row at once.
+pub(crate) fn replacement_lock(project: &Project) -> Result<ReplacementLock> {
+    let path = project.state_dir().join("replacements.lock");
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    file.lock()?;
+    Ok(ReplacementLock { _file: file })
+}
+
 pub(crate) fn read(project: &Project) -> Vec<Note> {
     std::fs::read_to_string(path(project))
         .unwrap_or_default()
@@ -238,6 +256,7 @@ pub(crate) fn add(
     for task in &tasks {
         crate::task::load(project, task)?;
     }
+    let _replacement_lock = replaces.map(|_| replacement_lock(project)).transpose()?;
     if let Some(old) = replaces {
         if !target_exists(project, old) {
             bail!("note_replacement: no note `{old}` exists");
@@ -360,6 +379,72 @@ pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::round::testkit::fixture;
+
+    #[test]
+    fn a_note_replacement_removes_a_stale_decision_from_current_views() {
+        let fx = fixture();
+        crate::talk::append(
+            &fx.project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "Use the newer instruction.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let decision = crate::decide::decide(
+            &fx.world.ctx(),
+            "demo",
+            crate::decide::NewDecision {
+                line: "I kept the old instruction.",
+                class: "routine",
+                key: None,
+                basis: None,
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap();
+        add(
+            &fx.project,
+            Kind::Instruction,
+            "Use the newer instruction.",
+            "q-1",
+            Some(&decision.id),
+            vec![],
+        )
+        .unwrap();
+
+        assert!(crate::decide::current(&fx.project).is_empty());
+        let overview = crate::talk::overview::Overview::load(
+            &fx.project,
+            &crate::talk::Journal::default(),
+            &crate::talk::view::Conversation::default(),
+            &crate::talk::overview::Live::default(),
+        );
+        assert!(
+            overview
+                .sections
+                .iter()
+                .flatten()
+                .all(|row| !row.full_text().contains("I kept the old instruction."))
+        );
+        let error = crate::decide::decide(
+            &fx.world.ctx(),
+            "demo",
+            crate::decide::NewDecision {
+                line: "I chose another replacement.",
+                class: "routine",
+                key: None,
+                basis: None,
+                replaces: Some(&decision.id),
+                request: Some("q-1"),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().starts_with("decision_replaced"));
+    }
 
     #[test]
     fn explicit_replacement_hides_old_note_from_active_rows() {

@@ -329,6 +329,10 @@ pub(crate) fn add(
             )));
         }
     }
+    let _replacement_lock = replaces
+        .as_ref()
+        .map(|_| crate::note::replacement_lock(project))
+        .transpose()?;
     if let Some(old) = replaces.as_deref() {
         if !crate::note::target_exists(project, old) {
             return Err(crate::refusal::error(format!(
@@ -402,6 +406,9 @@ pub(crate) fn note(
     }
     let request = request.strip_prefix("request:").unwrap_or(request);
     crate::decide::validate_basis(project, &format!("request:{request}"))?;
+    let _replacement_lock = replaces
+        .map(|_| crate::note::replacement_lock(project))
+        .transpose()?;
     if let Some(old) = replaces {
         if !crate::note::target_exists(project, old) {
             bail!("task_note_replacement: no note `{old}` exists");
