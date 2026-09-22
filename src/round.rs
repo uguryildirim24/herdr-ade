@@ -1109,6 +1109,29 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
     let mut lines = Vec::new();
     for (path, _) in worktrees.into_iter().filter(|(path, _)| belongs(path)) {
         let path_text = path.to_string_lossy().into_owned();
+        match path.try_exists() {
+            Ok(false) => {
+                match crate::git::worktree_prune(ctx.runner, &record.repo) {
+                    Ok(()) => lines.push(format!(
+                        "review worktree {} removed; its branch was kept",
+                        path.display()
+                    )),
+                    Err(error) => lines.push(format!(
+                        "review worktree {} kept: {error:#}",
+                        path.display()
+                    )),
+                }
+                continue;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                lines.push(format!(
+                    "review worktree {} kept: could not inspect it: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        }
         match crate::worktrees::inspect_local(ctx.runner, &record.repo, &path_text, &disposable) {
             Ok(inspection) if !inspection.dirty.is_empty() => lines.push(format!(
                 "review worktree {} kept: worktree_dirty ({})",
@@ -4498,6 +4521,29 @@ mod tests {
 
         assert!(review_worktree.is_dir(), "ignored run data must be kept");
         assert!(review_worktree.join("camber-runs/raw.bin").is_file());
+    }
+
+    #[test]
+    fn closed_round_cleanup_prunes_an_already_gone_review_worktree() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewed(&fx);
+        let review_worktree = fx.repo.join(".worktrees/review-r1");
+        std::fs::remove_dir_all(&review_worktree).unwrap();
+        let mut record = load(&fx.project, "r1").unwrap();
+        record.phase = RoundPhase::Merged;
+
+        let lines = cleanup_review_worktrees(&ctx, &fx.project, &record);
+
+        assert_eq!(
+            lines,
+            vec![format!(
+                "review worktree {} removed; its branch was kept",
+                review_worktree.display()
+            )]
+        );
+        let registered = git(&fx.repo, &["worktree", "list", "--porcelain"]);
+        assert!(!registered.contains(&review_worktree.to_string_lossy().to_string()));
     }
 
     #[test]
