@@ -513,6 +513,18 @@ fn digest_snapshot(
         }
     }
 
+    let _ = writeln!(out, "\n## Recipes");
+    match crate::launch::parse_launch_config(&ctx.config_dir) {
+        Ok(config) => {
+            for line in crate::launch::context_recipe_lines(&config, prefix, slug) {
+                let _ = writeln!(out, "{line}");
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(out, "config-error: {error:#}");
+        }
+    }
+
     // Rolf's own words, each under the request id `ha decide --basis` cites.
     let requests = crate::talk::recent_requests(project, REQUEST_ROWS);
     if !requests.is_empty() {
@@ -610,6 +622,13 @@ fn digest_snapshot(
         );
         if !t.machine.is_empty() || !t.pane_id.is_empty() {
             let _ = writeln!(out, "  pane={} machine={}", t.pane_id, t.machine);
+        }
+        if !t.launch.recipe_basis.is_empty() {
+            let _ = writeln!(
+                out,
+                "  recipe={} via {}: {:?}",
+                t.launch.recipe_id, t.launch.recipe_request, t.launch.recipe_basis
+            );
         }
         if !t.error.is_empty() {
             let kind = t

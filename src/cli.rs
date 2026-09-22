@@ -1492,6 +1492,12 @@ enum ThreadCommand {
         /// Instruction set for this lane; the routing table may match it
         #[arg(long, value_name = "FLOW")]
         workflow: Option<String>,
+        /// Exact configured recipe Rolf named for this one lane
+        #[arg(long, value_name = "ID", requires = "basis")]
+        recipe: Option<String>,
+        /// Verbatim words from Rolf's request for the exact recipe
+        #[arg(long, requires = "recipe")]
+        basis: Option<String>,
         /// Birth sentence (SPEC-ADE D17 item 6)
         #[arg(long)]
         plain: Option<String>,
@@ -2122,6 +2128,8 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 base,
                 task_file,
                 workflow,
+                recipe,
+                basis,
                 plain,
                 job,
                 requests,
@@ -2176,6 +2184,9 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         task,
                         plain: plain.unwrap_or_default(),
                         workflow,
+                        recipe,
+                        recipe_basis: basis,
+                        task_id: task_id.clone(),
                     },
                 )?;
                 if !task_id.is_empty() {
