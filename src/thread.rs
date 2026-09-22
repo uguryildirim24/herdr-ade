@@ -317,9 +317,9 @@ pub(crate) fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 /// The one line the agent is prompted with. Nothing from outside is ever
 /// placed in a prompt. A launched lane's first instruction is its role skill,
 /// which is also the bootstrap receipt (D12, D14); its brief is the committed
-/// `tasks/<id>.md` in a worktree (D9) or `brief.md` in a tab's folder. An
-/// adopted pane has no launch receipt and a remote one no `ha` (D13): they
-/// read `brief.md`, which carries the lane skill.
+/// `tasks/<id>.md` in a code worktree (D9) or `brief.md` in a project-owned git
+/// folder. An adopted pane has no launch receipt and a remote one no `ha`
+/// (D13): they read `brief.md`, which carries the lane skill.
 pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     let id = &t.id;
     let role = if t.role.is_empty() { "lane" } else { &t.role };
@@ -344,8 +344,12 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
         Kind::Worktree if !t.is_remote() => {
             format!("Run {prefix} skill {role}, then read tasks/{id}.md and do what it says.")
         }
-        Kind::Tab => format!(
-            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
+        Kind::Tab => {
+            format!("Run {prefix} skill {role}, then read brief.md and do what it says.")
+        }
+        Kind::Adopted if t.repo.is_empty() && !t.thread_dir.is_empty() => format!(
+            "Read {}/brief.md and do what it says. Work and commit in {}.",
+            t.thread_dir, t.worktree_path
         ),
         _ => format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says."),
     };

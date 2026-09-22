@@ -1052,7 +1052,7 @@ fn place_ade_worktree(
 }
 
 fn place_ade_tab(
-    _ctx: &Ctx,
+    ctx: &Ctx,
     project: &Project,
     view: &SessionView,
     record: &Thread,
@@ -1069,32 +1069,17 @@ fn place_ade_tab(
         );
     }
     let folder = if record.worktree_path.is_empty() {
-        let folder = project.dir().join("threads").join(&record.id);
-        {
-            let _lock = project.lock()?;
-            if !folder.is_dir() {
-                std::fs::create_dir(&folder)
-                    .with_context(|| format!("could not create {}", folder.display()))?;
-            }
-        }
-        std::fs::canonicalize(&folder)?
+        project.dir().join("threads").join(&record.id)
     } else {
         Path::new(&record.worktree_path).to_path_buf()
     };
-    let spec = crate::contracts::RoleSpec {
-        kind: record.launch.kind.clone(),
-        args: record.launch.args.clone(),
-        env: record.launch.env.clone(),
-        ready_timeout_ms: record.launch.ready_timeout_ms,
-    };
-    // No repository, so no committed brief: the brief is written once into
-    // the thread directory and its hash fixed before the tab exists.
-    let brief_hash = if record.launch.brief_hash.is_empty() {
+    let managed = record.kind == Kind::Tab;
+    let (folder, brief_hash, base) = if managed {
         let task =
             std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
-        let dir = thread::thread_dir(&folder.to_string_lossy(), &project.slug, &record.id);
         let stub = Thread {
-            thread_dir: dir.clone(),
+            worktree_path: folder.to_string_lossy().into_owned(),
+            thread_dir: folder.to_string_lossy().into_owned(),
             ..record.clone()
         };
         let brief = format!(
@@ -1102,16 +1087,29 @@ fn place_ade_tab(
             record.plain,
             thread::brief_for(project, &stub, &task, false)?
         );
-        std::fs::create_dir_all(&dir).with_context(|| format!("could not create {dir}"))?;
-        project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
-        let hash = thread::sha256_hex(brief.as_bytes());
-        thread::update(project, &record.id, |t| {
-            t.launch.brief_hash = hash.clone();
-            t.thread_dir = dir;
-        })?;
-        hash
+        prepare_managed_git_folder(ctx.runner, &folder, &brief)?
     } else {
-        record.launch.brief_hash.clone()
+        (
+            folder,
+            record.launch.brief_hash.clone(),
+            record.base.clone(),
+        )
+    };
+    let folder_text = folder.to_string_lossy().into_owned();
+    if managed {
+        thread::update(project, &record.id, |t| {
+            t.worktree_path = folder_text.clone();
+            t.thread_dir = folder_text.clone();
+            t.branch = "main".into();
+            t.base = base.clone();
+            t.launch.brief_hash = brief_hash.clone();
+        })?;
+    }
+    let spec = crate::contracts::RoleSpec {
+        kind: record.launch.kind.clone(),
+        args: record.launch.args.clone(),
+        env: record.launch.env.clone(),
+        ready_timeout_ms: record.launch.ready_timeout_ms,
     };
     let env = project::tab_env(
         &project.slug,
@@ -1136,10 +1134,97 @@ fn place_ade_tab(
         t.workspace_id = created.workspace_id;
         t.tab_id = created.tab_id;
         t.pane_id = created.pane_id;
-        if t.worktree_path.is_empty() && t.kind == Kind::Worktree {
-            t.worktree_path = folder.to_string_lossy().into_owned();
+        if managed {
+            t.worktree_path = folder_text.clone();
+            t.thread_dir = folder_text;
+            t.branch = "main".into();
+            t.base = base;
+            t.launch.brief_hash = brief_hash;
         }
     })
+}
+
+/// Makes the project-owned git folder used by a thread with no code
+/// repository. Its first commit contains only `brief.md`; the lane commits its
+/// report and library files in the same repository before calling `done`.
+pub(crate) fn prepare_managed_git_folder(
+    runner: &dyn Runner,
+    folder: &Path,
+    brief: &str,
+) -> Result<(std::path::PathBuf, String, String)> {
+    std::fs::create_dir_all(folder)
+        .with_context(|| format!("could not create {}", folder.display()))?;
+    let folder = std::fs::canonicalize(folder)?;
+    let folder_text = folder.to_string_lossy().into_owned();
+    let brief_path = folder.join("brief.md");
+
+    let head = if folder.join(".git").is_dir() {
+        git(
+            runner,
+            &folder_text,
+            &["for-each-ref", "--format=%(objectname)", "refs/heads/main"],
+            GIT_TIMEOUT,
+        )?
+        .lines()
+        .next()
+        .filter(|head| !head.is_empty())
+        .map(str::to_string)
+    } else {
+        None
+    };
+    if let Some(head) = head {
+        let tracked = git(
+            runner,
+            &folder_text,
+            &["ls-tree", "--name-only", "HEAD", "--", "brief.md"],
+            GIT_TIMEOUT,
+        )?;
+        if tracked != "brief.md" || !brief_path.is_file() {
+            bail!(
+                "managed_folder_invalid: {} has a first commit without brief.md",
+                folder.display()
+            );
+        }
+        let bytes = std::fs::read(&brief_path)?;
+        std::fs::create_dir_all(folder.join("library"))?;
+        return Ok((folder, thread::sha256_hex(&bytes), head));
+    }
+
+    project::write_atomic(&brief_path, brief.as_bytes())?;
+    if !folder.join(".git").is_dir() {
+        git(
+            runner,
+            &folder_text,
+            &["init", "-q", "-b", "main"],
+            GIT_TIMEOUT,
+        )?;
+    }
+    git(
+        runner,
+        &folder_text,
+        &["add", "--", "brief.md"],
+        GIT_TIMEOUT,
+    )?;
+    git(
+        runner,
+        &folder_text,
+        &[
+            "-c",
+            "user.name=herdr-ade",
+            "-c",
+            "user.email=herdr-ade@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "docs: thread brief",
+        ],
+        GIT_TIMEOUT,
+    )?;
+    let head = git(runner, &folder_text, &["rev-parse", "HEAD"], GIT_TIMEOUT)?;
+    std::fs::create_dir_all(folder.join("library"))?;
+    Ok((folder, thread::sha256_hex(brief.as_bytes()), head))
 }
 
 /// Creates the recorded thread directory with its library and keeps it out
@@ -1152,7 +1237,7 @@ fn prepare_local_dir(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()
     };
     std::fs::create_dir_all(Path::new(&dir).join("library"))
         .with_context(|| format!("could not create {dir}"))?;
-    if placed.kind != Kind::Tab {
+    if placed.kind != Kind::Tab && !managed_git_folder(project, placed) {
         exclude_from_git(ctx.runner, &placed.cwd)?;
     }
     thread::update(project, &placed.id, |t| t.thread_dir = dir)?;
@@ -1560,7 +1645,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
 
     let mut worktree = "not_applicable".to_string();
     let mut worktree_reason = close_error;
-    if record.kind == Kind::Worktree && !record.worktree_path.is_empty() {
+    if removable_folder(&project, &record) {
         if pane == "cleanup_pending" {
             worktree = "kept".into();
         } else {
@@ -1794,10 +1879,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         match copied.outcome {
             CopyOutcome::Complete => ("complete".to_string(), Vec::new()),
             CopyOutcome::Partial(notes) => {
-                if record.kind == Kind::Worktree
-                    && !record.worktree_path.is_empty()
-                    && !args.discard_uncopied
-                {
+                if removable_folder(&project, &record) && !args.discard_uncopied {
                     removal_refusal = Some(
                         "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
                             .to_string(),
@@ -1815,7 +1897,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
 
     let mut pane_closed = false;
     let mut worktree_removed = false;
-    if record.kind == Kind::Worktree && !record.worktree_path.is_empty() {
+    if removable_folder(&project, &record) {
         if args.keep_pane {
             removal_refusal = Some(
                 "worktree_in_use: the worktree was kept because --keep-pane leaves its pane open"
@@ -1872,11 +1954,10 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         ("removed", None)
     } else if let Some(reason) = removal_refusal {
         ("kept", Some(reason))
+    } else if resolved.kind == Kind::Worktree || managed_git_folder(&project, &resolved) {
+        ("not_recorded", None)
     } else {
-        match resolved.kind {
-            Kind::Worktree => ("not_recorded", None),
-            _ => ("not_applicable", None),
-        }
+        ("not_applicable", None)
     };
     refresh_plan(ctx, &project);
     Ok(ResolveOutcome {
@@ -2137,6 +2218,24 @@ pub(crate) fn finished_worktree_reason(
     project: &Project,
     record: &Thread,
 ) -> Result<Option<String>> {
+    if managed_git_folder(project, record) {
+        let done = crate::events::list(project)
+            .into_iter()
+            .filter(|event| event.thread == record.id && event.attempt == record.attempt.max(1))
+            .find_map(|event| event.payload.done);
+        let Some(done) = done else {
+            return Ok(Some(
+                "work_not_done: no sealed done event exists for this folder".into(),
+            ));
+        };
+        let head = crate::git::rev_parse(ctx.runner, &record.worktree_path, "HEAD")?;
+        return Ok((head != done.sha).then(|| {
+            format!(
+                "work_not_done: folder HEAD is {head}, not the sealed done commit {}",
+                done.sha
+            )
+        }));
+    }
     for round in crate::round::checked_list(project)? {
         let member = round
             .manifest
@@ -2181,6 +2280,16 @@ pub(crate) fn inspect_worktree_for_removal(
     project: &Project,
     record: &Thread,
 ) -> Result<crate::worktrees::Inspection> {
+    if managed_git_folder(project, record) {
+        let disposable =
+            crate::worktrees::disposable(&ctx.config_dir, project, &record.worktree_path)?;
+        return crate::worktrees::inspect_local(
+            ctx.runner,
+            &record.worktree_path,
+            &record.worktree_path,
+            &disposable,
+        );
+    }
     let disposable = crate::worktrees::disposable(&ctx.config_dir, project, &record.repo)?;
     if !record.is_remote() {
         return crate::worktrees::inspect_local(
@@ -2206,6 +2315,11 @@ pub(crate) fn inspect_worktree_for_removal(
 
 /// Never forces. Git's refusal is reported unchanged.
 fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if managed_git_folder(project, record) {
+        std::fs::remove_dir_all(&record.worktree_path)
+            .with_context(|| format!("could not remove managed folder {}", record.worktree_path))?;
+        return Ok(());
+    }
     if !record.is_remote() {
         return remove_ade_worktree(ctx, project, record);
     }
@@ -2233,6 +2347,23 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         bail!("{}", out.error_text());
     }
     Ok(())
+}
+
+/// True only for the git folder ADE created inside this project's state.
+/// Historical adopted records with no such folder continue to load unchanged.
+pub(crate) fn managed_git_folder(project: &Project, record: &Thread) -> bool {
+    if !record.repo.is_empty() || record.worktree_path.is_empty() {
+        return false;
+    }
+    let expected = project.dir().join("threads").join(&record.id);
+    let actual = Path::new(&record.worktree_path);
+    std::fs::canonicalize(&expected).ok() == std::fs::canonicalize(actual).ok()
+        && actual.join(".git").is_dir()
+}
+
+fn removable_folder(project: &Project, record: &Thread) -> bool {
+    !record.worktree_path.is_empty()
+        && (record.kind == Kind::Worktree || managed_git_folder(project, record))
 }
 
 fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
@@ -2587,7 +2718,7 @@ mod tests {
 
     impl crate::runner::Runner for GitReal<'_> {
         fn run(&self, cmd: &crate::runner::Cmd) -> anyhow::Result<crate::runner::Output> {
-            if cmd.program == "git" {
+            if matches!(cmd.program.as_str(), "git" | "du" | "rsync") {
                 crate::runner::RealRunner.run(cmd)
             } else {
                 self.fake.run(cmd)
@@ -3438,14 +3569,122 @@ mod tests {
     }
 
     #[test]
-    fn a_task_with_no_repo_stays_a_local_tab() {
+    fn a_task_with_no_repo_finishes_delivers_and_resolves_its_git_folder() {
+        use crate::round::testkit::git;
+        use crate::runner::fake::ok;
+        use crate::scenarios::{agent_json, pane_json};
+
         let (fx, _remote) = box_fixture();
         write_config(&fx, LANE_CONFIG);
         stub_box(&fx);
+        fx.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        fx.world.runner.on("tab close", ok(r#"{"result":{}}"#));
+        fx.world
+            .runner
+            .on("session list --json", ok(r#"{"result":{"sessions":[]}}"#));
         *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
-        let started = start(&fx.world.ctx(), "demo", start_args(None, None)).unwrap();
+        let split = GitReal {
+            fake: &fx.world.runner,
+        };
+        let ctx = crate::paths::Ctx {
+            env: &fx.world.env,
+            root: fx.world.root.clone(),
+            config_dir: fx.world.home.path().join("cfg"),
+            runner: &split,
+            detached_ticker: false,
+        };
+        let started = start(&ctx, "demo", start_args(None, None)).unwrap();
         assert_eq!(started.kind, Kind::Tab);
         assert!(started.machine.is_empty());
+        let folder = Path::new(&started.worktree_path);
+        assert_eq!(folder, fx.project.dir().join("threads").join(&started.id));
+        assert!(folder.join(".git").is_dir());
+        assert_eq!(
+            git(folder, &["show", "--format=", "--name-only", "HEAD"]),
+            "brief.md"
+        );
+        assert_eq!(started.thread_dir, started.worktree_path);
+
+        std::fs::write(folder.join("report.md"), "no-repo result\n").unwrap();
+        git(folder, &["add", "report.md"]);
+        git(
+            folder,
+            &[
+                "-c",
+                "user.name=Lane",
+                "-c",
+                "user.email=lane@example.com",
+                "commit",
+                "-m",
+                "finish report",
+            ],
+        );
+        let done_sha = git(folder, &["rev-parse", "HEAD"]);
+        let coordinator = fx.project.coordinator().unwrap();
+        let op = crate::ops::reserve(
+            &fx.project,
+            crate::ops::Reservation {
+                thread: &started.id,
+                attempt: 1,
+                kind: crate::contracts::OpKind::Done,
+                recipient: crate::contracts::Recipient {
+                    pane: coordinator.pane_id.clone(),
+                    coordinator_attempt: coordinator.attempt(),
+                },
+                round: None,
+                requested: crate::contracts::Requested::Done {
+                    sha: done_sha,
+                    report_path: "report.md".into(),
+                },
+                helper_pid: std::process::id(),
+            },
+        )
+        .unwrap();
+        crate::ops::stage_done(&fx.project, &op.op, folder, ctx.runner).unwrap();
+        crate::ops::seal(&fx.project, &op.op, |_| Ok(())).unwrap();
+        let coordinator_cwd = fx.project.canonical_dir().to_string_lossy().into_owned();
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                &coordinator.workspace_id,
+                &coordinator.tab_id,
+                &coordinator.pane_id,
+                &coordinator_cwd,
+                &coordinator.agent_name,
+                "idle"
+            )
+        );
+        crate::steps::deliver_events(&ctx, &fx.project).unwrap();
+        assert!(fx.world.runner.calls.borrow().iter().any(|call| {
+            let line = call.display();
+            line.contains("agent prompt") && line.contains(&format!("DONE {}", started.id))
+        }));
+
+        let cwd = started.cwd.clone();
+        *fx.world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            fx.world.coordinator_pane(&fx.project),
+            pane_json("w1", &started.tab_id, &started.pane_id, &cwd)
+        );
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                "w1",
+                &started.tab_id,
+                &started.pane_id,
+                &cwd,
+                &started.agent_name,
+                "done"
+            )
+        );
+        let outcome = resolve(&ctx, "demo", &started.id, &ResolveArgs::default()).unwrap();
+        assert_eq!(outcome.final_copy, "complete");
+        assert_eq!(outcome.worktree, "removed");
+        assert!(!folder.exists());
+        assert_eq!(
+            std::fs::read_to_string(thread::home_report_path(&fx.project, &started.id)).unwrap(),
+            "no-repo result\n"
+        );
     }
 
     #[test]
