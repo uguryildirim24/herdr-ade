@@ -946,6 +946,85 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .collect()
 }
 
+fn open_work_next_steps(project: &Project) -> Vec<String> {
+    let now = jiff::Timestamp::now();
+    if thread::list(project)
+        .iter()
+        .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
+    {
+        return Vec::new();
+    }
+    crate::task::views(project)
+        .0
+        .into_iter()
+        .filter(|view| !view.terminal(project) && !view.next.starts_with("wait for Rolf"))
+        .map(|view| format!("{}: {}", view.record.id, view.next))
+        .collect()
+}
+
+fn idle_nudge_due(
+    project: &Project,
+    state: &steps::State,
+    minutes: u64,
+    now: jiff::Timestamp,
+) -> Result<bool> {
+    if state.idle_nudge_last.is_empty() {
+        return Ok(true);
+    }
+    let interval_secs = minutes.saturating_mul(60).min(i64::MAX as u64) as i64;
+    if thread::seconds_since(&state.idle_nudge_last, now) < interval_secs {
+        return Ok(false);
+    }
+    let context = crate::ledger::latest_context_read(project)?;
+    let last = state.idle_nudge_last.parse::<jiff::Timestamp>().ok();
+    let context = context.parse::<jiff::Timestamp>().ok();
+    Ok(matches!((context, last), (Some(context), Some(last)) if context > last))
+}
+
+fn nudge_idle_coordinator(
+    ctx: &Ctx,
+    project: &Project,
+    state: &mut steps::State,
+    herdr: &Herdr,
+    coordinator: &crate::project::Coordinator,
+    agent: Option<&Agent>,
+) -> Result<()> {
+    if coordinator.prime_pending
+        || agent.is_none_or(|agent| agent.agent_status != "idle")
+        || crate::talk::has_waiting_request(project)
+    {
+        return Ok(());
+    }
+    let next = open_work_next_steps(project);
+    if next.is_empty() {
+        return Ok(());
+    }
+    let settings = crate::project::coordinator_settings(&ctx.config_dir)?;
+    if !idle_nudge_due(
+        project,
+        state,
+        settings.idle_nudge_minutes,
+        jiff::Timestamp::now(),
+    )? {
+        return Ok(());
+    }
+    let text = format!(
+        "[herdr-ade ticker: automated, not the user, approves nothing] Continue open work: {}.",
+        next.join("; ")
+    );
+    let _writer = crate::talk::writer_lock(project)?;
+    if crate::talk::writer_suspended(project) {
+        return Ok(());
+    }
+    crate::talk::mark_automated_prompt(project, &coordinator.pane_id, &text)?;
+    // Keep the send start, not the return time: the prompted turn can read
+    // context before a fast transport call returns, and that turn must count.
+    let sent_at = project::now();
+    herdr.agent_prompt(&coordinator.pane_id, &text)?;
+    state.idle_nudge_last = sent_at;
+    crate::ledger::coordinator_nudge(project, &next)
+}
+
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
@@ -1042,6 +1121,13 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
             .map(|_| record.pane_id.as_str());
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
             first_error = first_error.or(Some(error.context("nudge")));
+        }
+        let inbox_prompted = settings.nudge && state.nudged != before.nudged;
+        if !inbox_prompted
+            && let Err(error) =
+                nudge_idle_coordinator(ctx, project, &mut state, &herdr, &record, agent.as_ref())
+        {
+            first_error = first_error.or(Some(error.context("idle coordinator nudge")));
         }
         if state != before {
             steps::save_state(project, &state)?;
@@ -1555,6 +1641,180 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    fn write_task(project: &Project, attempts: Vec<String>) {
+        let task = crate::task::Task {
+            id: "job-0001".into(),
+            title: "Keep the project moving.".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["The next step is complete.".into()],
+            attempts,
+            created: project::now(),
+            ..crate::task::Task::default()
+        };
+        std::fs::write(
+            project.dir().join("tasks/job-0001.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn work_nudge_requires_an_idle_coordinator() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let coordinator = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, &runner);
+
+        for status in ["working", "blocked"] {
+            let agent = Agent {
+                agent_status: status.into(),
+                ..Agent::default()
+            };
+            nudge_idle_coordinator(
+                &ctx,
+                &f.project,
+                &mut steps::State::default(),
+                &herdr,
+                &coordinator,
+                Some(&agent),
+            )
+            .unwrap();
+        }
+        assert_eq!(runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn another_work_nudge_requires_cooldown_and_a_coordinator_turn() {
+        let f = fixture(false);
+        let mut state = steps::State {
+            idle_nudge_last: "2026-01-01T00:00:00Z".into(),
+            ..steps::State::default()
+        };
+        let at_ten = "2026-01-01T00:10:00Z".parse().unwrap();
+        let at_thirty = "2026-01-01T00:30:00Z".parse().unwrap();
+
+        assert!(!idle_nudge_due(&f.project, &state, 20, at_ten).unwrap());
+        assert!(!idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+        crate::ledger::context_read(&f.project, "2026-01-01T00:05:00Z").unwrap();
+        assert!(idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+
+        state.idle_nudge_last = "2026-01-01T00:06:00Z".into();
+        assert!(!idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+    }
+
+    #[test]
+    fn pending_rolf_message_prevents_a_work_nudge() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        crate::talk::handle(&ctx, &f.project, "Please choose red or blue.").unwrap();
+        assert!(crate::talk::has_waiting_request(&f.project));
+
+        let coordinator = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, &runner);
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        nudge_idle_coordinator(
+            &ctx,
+            &f.project,
+            &mut steps::State::default(),
+            &herdr,
+            &coordinator,
+            Some(&agent),
+        )
+        .unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
+    }
+
+    #[test]
+    fn idle_coordinator_is_nudged_once_for_open_work() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on("report-metadata", ok("{}"));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        assert_eq!(runner.count("agent prompt"), 1);
+        let calls = runner.calls.borrow();
+        let prompt = calls
+            .iter()
+            .find(|call| call.display().contains("agent prompt"))
+            .unwrap()
+            .display();
+        assert!(prompt.contains("job-0001: start an attempt"), "{prompt}");
+        let ledger = std::fs::read_to_string(f.project.dir().join("ledger.jsonl")).unwrap();
+        assert!(ledger.contains("coordinator_nudge"), "{ledger}");
+    }
+
+    #[test]
+    fn work_nudge_waits_when_a_lane_is_working_or_every_task_waits_on_rolf() {
+        let f = fixture(false);
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Open;
+            lane.last_group = thread::Group::Working.token().into();
+            lane.attempt = 1;
+        })
+        .unwrap();
+        write_task(&f.project, vec![lane.id.clone()]);
+        assert!(open_work_next_steps(&f.project).is_empty());
+
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.last_group = thread::Group::Idle.token().into();
+        })
+        .unwrap();
+        crate::events::seal_create_if_absent(
+            &f.project,
+            &crate::contracts::Event {
+                id: "wait-1".into(),
+                op: "op-1".into(),
+                thread: lane.id,
+                attempt: 1,
+                round: None,
+                recipient: crate::contracts::Recipient::default(),
+                created: project::now(),
+                payload: crate::contracts::EventPayload {
+                    waiting: Some(crate::contracts::WaitingPayload {
+                        text: "Choose the final colour.".into(),
+                        ..crate::contracts::WaitingPayload::default()
+                    }),
+                    ..crate::contracts::EventPayload::default()
+                },
+            },
+        )
+        .unwrap();
+        assert!(open_work_next_steps(&f.project).is_empty());
     }
 
     #[test]

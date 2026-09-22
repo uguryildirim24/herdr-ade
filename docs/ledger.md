@@ -39,9 +39,11 @@ CSI formatting, not error codes, numbers, paths, or case.
 
 Closing is idempotent and records `closed_at`. A new occurrence reopens the
 same id and retains its first observation and cumulative count. A successful
-re-entry closes the original entry; there is no separate retry entry. Recovery
-and context-read cursors are journal facts, not extra writable records.
-Malformed or torn journal rows produce an error; they are never silently dropped.
+re-entry closes the original entry; there is no separate retry entry. Recovery,
+context-read cursors, and automated coordinator nudges are journal facts, not
+extra writable records. A nudge row keeps its time and the task next steps it
+sent. Malformed or torn journal rows produce an error; they are never silently
+dropped.
 
 ## Observation sites
 
