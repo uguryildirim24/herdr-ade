@@ -146,6 +146,14 @@ impl View {
             .and_then(|states| states.last().cloned())
             .is_some_and(|last| last == self.state.word())
     }
+
+    fn status(&self) -> &'static str {
+        if self.state == State::Verified && !running_current(&self.record) {
+            "verified; latest process check unknown"
+        } else {
+            self.state.word()
+        }
+    }
 }
 
 fn dir(project: &Project) -> PathBuf {
@@ -705,7 +713,7 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         "installed" => !task.installed.is_empty(),
         "verified" => {
             all_verified
-                && (!required.iter().any(|state| state == "installed") || running_current(&task))
+                && (!required.iter().any(|state| state == "installed") || !task.running.is_empty())
         }
         _ => false,
     };
@@ -952,7 +960,7 @@ pub(crate) fn refresh_tasks_md(project: &Project) -> Result<()> {
                 "- [{mark}] `{}` {} — {}; next: {}\n",
                 view.record.id,
                 view.record.title,
-                view.state.word(),
+                view.status(),
                 view.next
             ));
         }
@@ -973,7 +981,7 @@ pub(crate) fn render(view: &View) -> String {
     let mut out = format!(
         "{} [{}] {}\nnext: {}\n",
         view.record.id,
-        view.state.word(),
+        view.status(),
         view.record.title,
         view.next
     );
@@ -1002,7 +1010,11 @@ pub(crate) fn render(view: &View) -> String {
             ));
         }
     } else if !view.record.installed.is_empty() {
-        out.push_str("running processes: unknown; verification is blocked\n");
+        if view.state == State::Verified {
+            out.push_str("running processes: latest check unknown; earlier verification remains\n");
+        } else {
+            out.push_str("running processes: unknown; verification is blocked\n");
+        }
     }
     out
 }
@@ -1015,6 +1027,27 @@ mod tests {
     fn ids_do_not_overlap_lane_ids() {
         assert!(validate_id("job-0001").is_ok());
         assert!(validate_id("t-0001").is_err());
+    }
+
+    #[test]
+    fn historical_records_without_running_evidence_still_load() {
+        let text = r#"
+schema = 1
+id = "job-0001"
+title = "Historical task"
+authority = ["request:q-1"]
+acceptance = ["The old record loads."]
+attempts = []
+rounds = []
+installed = []
+verified = []
+created = "2026-09-21T00:00:00Z"
+"#;
+
+        let task: Task = toml::from_str(text).unwrap();
+
+        assert!(task.running.is_empty());
+        validate_record(&task).unwrap();
     }
 
     #[test]
@@ -1244,6 +1277,36 @@ mod tests {
         refresh_tasks_md(&fx.project).unwrap();
         let generated = std::fs::read_to_string(fx.project.dir().join("TASKS.md")).unwrap();
         assert!(generated.contains("job-0001` Ship the checked change. — verified"));
+
+        // A later install can finish while its process proof is unavailable.
+        // That uncertainty is visible, but it does not erase acceptance
+        // evidence that was gated by an earlier successful process check.
+        update(&fx.project, "job-0001", |task| {
+            task.installed.push(Evidence {
+                at: "9999-12-31T23:59:59Z".into(),
+                command: "ha harness install".into(),
+                acceptance: Vec::new(),
+                machine: Some("local".into()),
+                build: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+            });
+            Ok(())
+        })
+        .unwrap();
+        let still_verified = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(still_verified.state, State::Verified);
+        assert!(still_verified.terminal(&fx.project));
+        assert_eq!(still_verified.next, "none");
+        assert_eq!(
+            still_verified.status(),
+            "verified; latest process check unknown"
+        );
+        assert!(
+            render(&still_verified)
+                .contains("running processes: latest check unknown; earlier verification remains")
+        );
+        refresh_tasks_md(&fx.project).unwrap();
+        let generated = std::fs::read_to_string(fx.project.dir().join("TASKS.md")).unwrap();
+        assert!(generated.contains("— verified; latest process check unknown; next: none"));
     }
 
     #[test]
