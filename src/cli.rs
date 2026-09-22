@@ -79,11 +79,6 @@ enum Command {
         #[arg(long = "repo", value_name = "PATH[@MACHINE]")]
         repos: Vec<String>,
     },
-    /// Project page maintenance
-    Project {
-        #[command(subcommand)]
-        command: ProjectCommand,
-    },
     /// List projects
     List {
         /// Include archived projects
@@ -1487,12 +1482,6 @@ enum InboxCommand {
 }
 
 #[derive(Subcommand)]
-enum ProjectCommand {
-    /// Move old project documents to history and write the current page
-    Convert { slug: String },
-}
-
-#[derive(Subcommand)]
 enum TaskCommand {
     /// Add a task tied to Rolf's request and exact acceptance conditions
     Add {
@@ -2021,26 +2010,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             );
             Ok(())
         }
-        Command::Project { command } => match command {
-            ProjectCommand::Convert { slug } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let (history, moved) = project::convert(&project)?;
-                let message = if moved.is_empty() {
-                    format!("`{slug}` is already converted\n")
-                } else {
-                    format!(
-                        "converted `{slug}`; moved under .state: {}\n",
-                        moved.join(", ")
-                    )
-                };
-                crate::output::success(
-                    Some("converted"),
-                    &serde_json::json!({ "history": history, "moved": moved }),
-                    &message,
-                    "",
-                )
-            }
-        },
         Command::List { all } => {
             for slug in project::list_slugs(&ctx.root) {
                 let project = Project::load(&ctx.root, &slug)?;
