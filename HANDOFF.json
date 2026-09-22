@@ -11,24 +11,25 @@
   },
   "files": {
     "briefs": [
+      "tasks/t-0240.md",
+      "tasks/t-0232.md",
+      "tasks/review-r96.md",
+      "tasks/review-r92.md",
+      "tasks/review-r95.md",
+      "tasks/t-0239.md",
+      "tasks/t-0238.md",
       "tasks/t-0234.md",
       "tasks/t-0231.md",
       "tasks/t-0229.md",
       "tasks/t-0237.md",
-      "tasks/review-r92.md",
-      "tasks/t-0235.md",
-      "tasks/review-r93.md",
-      "tasks/t-0230.md",
-      "tasks/review-r95.md",
-      "tasks/review-r94.md",
-      "tasks/t-0227.md",
-      "tasks/review-r91.md"
+      "tasks/t-0235.md"
     ],
     "handoff": [
       "HANDOFF.md"
     ],
     "reports": [],
     "verdicts": [
+      "tasks/reviews/code-r95.md",
       "tasks/reviews/code-r93.md",
       "tasks/reviews/code-r94.md",
       "tasks/reviews/code-r91.md",
@@ -39,20 +40,27 @@
       "tasks/reviews/code-r86.md",
       "tasks/reviews/code-r82.md",
       "tasks/reviews/code-r85.md",
-      "tasks/reviews/code-r84.md",
-      "tasks/reviews/code-r83.md"
+      "tasks/reviews/code-r84.md"
     ]
   },
-  "generated": "2026-09-22T00:52:37-04:00",
+  "generated": "2026-09-22T01:10:43-04:00",
   "git": {
     "branches": [
       "main",
+      "hp/adeherdr/t-0241-review-r92-installing-twice-on-the-same",
+      "hp/adeherdr/t-0242-review-r96-a-failed-answer-from-the-web",
+      "hp/adeherdr/t-0240-review-r95-rolf-s-newer-choices-always-c",
+      "review/r96",
+      "hp/adeherdr/t-0235-w18-pro-error-inside-completion",
+      "review/r92-4",
+      "review/r95-2",
+      "hp/adeherdr/t-0239-w21-drop-a-wrong-task",
+      "hp/adeherdr/t-0236-review-r92-installing-twice-on-the-same",
+      "hp/adeherdr/t-0238-w20-report-never-keeps-a-worktree",
+      "hp/adeherdr/t-0232-review-r95-rolf-s-newer-choices-always-c",
       "hp/adeherdr/t-0237-w19-briefs-off-main",
       "hp/adeherdr/t-0234-review-r93-jobs-for-the-two-sign-in-help",
-      "hp/adeherdr/t-0236-review-r92-installing-twice-on-the-same",
       "review/r92-3",
-      "hp/adeherdr/t-0235-w18-pro-error-inside-completion",
-      "hp/adeherdr/t-0232-review-r95-rolf-s-newer-choices-always-c",
       "hp/adeherdr/t-0233-review-r92-installing-twice-on-the-same",
       "review/r93-3",
       "hp/adeherdr/t-0231-review-r93-jobs-for-the-two-sign-in-help",
@@ -382,22 +390,22 @@
     ],
     "integration_branch": "main",
     "integration_log": [
-      "caac1b7 Merge commit 'b4d814010501d284e9bf68a950078999bd09fd67'",
-      "2fd101e docs(tasks): t-0237",
-      "b4d8140 review(dispatch): approve r93 after cleanup merge",
-      "50b68c7 review(r92): brief for revision 1",
-      "4e5a3d9 docs(tasks): t-0235",
-      "b2e16ec Merge commit 'f9b4efe00ab008a3f448f2bd9b9ef1ac776a4102' into hp/adeherdr/t-0234-review-r93-jobs-for-the-two-sign-in-help"
+      "a7dd0d6 Merge commit '7c87096409b738a48fe55a6cd493cdbb424468c7'",
+      "7c87096 docs(review): round r95 repair verdict",
+      "a53217a review(r96): brief for revision 1",
+      "feb103b Merge commit '2ceea19fbbfcdb28f71aee6bd8c0232e138714ef' into hp/adeherdr/t-0240-review-r95-rolf-s-newer-choices-always-c",
+      "6467078 review(r92): brief for revision 1",
+      "e256dd0 docs(tasks): t-0240"
     ],
-    "remote": "15 ahead, 0 behind origin/main",
+    "remote": "13 ahead, 0 behind origin/main",
     "repo": "/Users/rolfie/projects/herdr-ade",
     "worktrees": [
       {
         "branch": "main",
         "dirty": 0,
-        "head": "caac1b7",
+        "head": "a7dd0d6",
         "path": "/Users/rolfie/projects/herdr-ade",
-        "subject": "Merge commit 'b4d814010501d284e9bf68a950078999bd09fd67'"
+        "subject": "Merge commit '7c87096409b738a48fe55a6cd493cdbb424468c7'"
       },
       {
         "branch": "review/r92",
@@ -421,25 +429,11 @@
         "subject": "docs(tasks): t-0236"
       },
       {
-        "branch": "review/r93",
+        "branch": "review/r92-4",
         "dirty": 0,
-        "head": "345f901",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r93",
-        "subject": "docs(tasks): t-0229"
-      },
-      {
-        "branch": "review/r93-2",
-        "dirty": 0,
-        "head": "e1016c0",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r93-2",
-        "subject": "docs(tasks): t-0231"
-      },
-      {
-        "branch": "review/r93-3",
-        "dirty": 0,
-        "head": "7dca92d",
-        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r93-3",
-        "subject": "docs(tasks): t-0234"
+        "head": "33fc226",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r92-4",
+        "subject": "docs(tasks): t-0241"
       },
       {
         "branch": "review/r95",
@@ -447,6 +441,20 @@
         "head": "a131cfe",
         "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r95",
         "subject": "docs(tasks): t-0232"
+      },
+      {
+        "branch": "review/r95-2",
+        "dirty": 0,
+        "head": "e256dd0",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r95-2",
+        "subject": "docs(tasks): t-0240"
+      },
+      {
+        "branch": "review/r96",
+        "dirty": 0,
+        "head": "eb52279",
+        "path": "/Users/rolfie/projects/herdr-ade/.worktrees/review-r96",
+        "subject": "docs(tasks): t-0242"
       }
     ]
   },
@@ -466,8 +474,8 @@
   "repo": "/Users/rolfie/projects/herdr-ade",
   "round": {
     "branch": "main",
-    "round": "r93",
-    "verdict": "b4d814010501d284e9bf68a950078999bd09fd67"
+    "round": "r95",
+    "verdict": "7c87096409b738a48fe55a6cd493cdbb424468c7"
   },
   "session": "default",
   "unlinked_agents": [],
