@@ -1,4 +1,4 @@
-//! The rundown lists work, not completed records, and receipts cover only rows shown.
+//! Context starts from the project page and adds only bounded action rows.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,16 +34,12 @@ impl Project {
 
     fn context(&self, peek: bool) -> String {
         let mut command = Command::new(BIN);
-        command
-            .env_clear()
-            .env("HOME", self.home.path())
-            .env("HERDR_PANE_ID", "w1:p1")
-            .args([
-                "--root",
-                self.dir.parent().unwrap().to_str().unwrap(),
-                "context",
-                "demo",
-            ]);
+        command.env_clear().env("HOME", self.home.path()).args([
+            "--root",
+            self.dir.parent().unwrap().to_str().unwrap(),
+            "context",
+            "demo",
+        ]);
         if peek {
             command.arg("--peek");
         }
@@ -55,181 +51,72 @@ impl Project {
         );
         String::from_utf8(result.stdout).unwrap()
     }
+}
 
-    fn round(&self, n: usize, phase: &str) {
-        let mut record = format!(
-            "round = \"r{n}\"\nphase = \"{phase}\"\nbranch = \"main\"\nplain = \"Work for round {n}\"\npolicy_hash = \"fixture\"\n[manifest]\nrevision = 1\nmembers = []\n"
-        );
-        if phase == "merged" {
-            record.push_str("[merge]\nop = \"merge\"\nexpected_old = \"old\"\ncandidate = \"candidate\"\nverdict = \"verdict\"\nphase = \"checkpointed\"\nhead = \"checkpoint\"\n");
-        }
-        self.write(format!(".state/rounds/r{n}.toml"), record);
-    }
-
-    fn op(&self, id: &str, attempt: u32, state: &str) {
-        self.write(format!("ops/{id}.toml"), format!("op = \"{id}\"\nrevision = 1\nthread = \"t-0001\"\nattempt = {attempt}\nkind = \"done\"\nhelper_pid = 1\nevent = \"{id}\"\nstate = \"{state}\"\ncreated = \"2026-09-20T00:00:00Z\"\n[recipient]\npane = \"w1:p1\"\ncoordinator_attempt = 1\n[requested]\nsha = \"sha\"\nreport_path = \"report.md\"\n"));
-    }
+fn page_body(page: &str) -> &str {
+    page.split_once("\n+++\n")
+        .unwrap()
+        .1
+        .trim_start_matches('\n')
 }
 
 #[test]
-fn closed_rounds_are_counted_without_names_and_open_rounds_are_listed() {
-    let p = Project::new();
-    for n in 1..=44 {
-        p.round(n, "merged");
-    }
-    p.round(45, "abandoned");
-    p.round(46, "admitting");
-    let text = p.context(true);
-    assert!(
-        text.contains("## Rounds (1 open; 44 merged, 1 abandoned not listed)"),
-        "{text}"
-    );
-    assert!(text.contains("- r46 [Admitting] main — Work for round 46"));
-    assert!(!text.contains("[Merged]"));
-    assert!(!text.contains("[Abandoned]"));
-    assert!(!text.contains("Work for round 1"));
-    assert!(!text.contains("Work for round 45"));
-}
-
-#[test]
-fn superseded_abandonment_and_obsolete_preparation_never_reach_digest() {
+fn context_starts_with_the_complete_project_page_without_duplicate_tours() {
     let p = Project::new();
     p.write(
         "threads/t-0001.toml",
-        "id = \"t-0001\"\nstatus = \"open\"\nattempt = 2\n",
+        "id = \"t-0001\"\ntitle = \"Needs help\"\nstatus = \"failed\"\nattempt = 1\nerror = \"compiler failure\"\n",
     );
-    p.op("t-0001-1-1", 1, "abandoned");
-    p.op("t-0001-1-2", 1, "sealed");
-    p.op("t-0001-1-3", 1, "staged");
-    assert!(!p.context(true).contains("Completion preparation"));
-    assert!(!p.context(true).contains("preparation-abandoned"));
-    p.op("t-0001-2-1", 2, "reserved");
-    let text = p.context(true);
-    assert!(text.contains("## Completion preparation (1)"));
-    assert!(text.contains("t-0001-2-1 attempt 2 (Reserved"));
-    assert!(!text.contains("t-0001-1-"));
-    p.write(
-        "threads/t-0001.toml",
-        "id = \"t-0001\"\nstatus = \"resolved\"\nattempt = 2\n",
-    );
-    assert!(!p.context(true).contains("Completion preparation"));
+    let text = p.context(false);
+    let page = std::fs::read_to_string(p.dir.join("PROJECT.md")).unwrap();
+    assert!(text.starts_with(page_body(&page)), "{text}");
+    assert!(text.contains("## Threads needing action"), "{text}");
+    assert!(text.contains("compiler failure"), "{text}");
+    assert!(!text.contains("## Memory notes and standing instructions"));
+    assert!(!text.contains("## Completion preparation"));
+    assert!(!text.contains("## Routines"));
+    assert_eq!(text.matches("## Open tasks").count(), 1, "{text}");
 }
 
 #[test]
-fn terminal_preparation_does_not_hide_the_current_failure_or_change_records() {
+fn action_rows_are_bounded_without_raw_storage_pointers() {
     let p = Project::new();
-    let thread = "id = \"t-0001\"\nstatus = \"failed\"\nattempt = 1\nerror = \"Report could not be sealed\"\n";
-    p.write("threads/t-0001.toml", thread);
-    // No successor operation: the terminal operation is still history, but
-    // its unresolved thread must continue to tell the coordinator to act.
-    p.op("t-0001-1-1", 1, "abandoned");
-    let op_path = p.dir.join("ops/t-0001-1-1.toml");
-    let before = std::fs::read(&op_path).unwrap();
-    let text = p.context(true);
-    assert!(text.contains("## Open threads (1)"), "{text}");
-    assert!(text.contains("- t-0001 ["), "{text}");
-    assert!(
-        text.contains("failure unknown: Report could not be sealed"),
-        "{text}"
-    );
-    assert!(!text.contains("Completion preparation"), "{text}");
-    assert!(!text.contains("t-0001-1-1"), "{text}");
-    assert_eq!(std::fs::read(&op_path).unwrap(), before);
-    assert_eq!(
-        std::fs::read_to_string(p.dir.join("threads/t-0001.toml")).unwrap(),
-        thread
-    );
-}
-
-#[test]
-fn round_and_preparation_lists_are_bounded() {
-    let p = Project::new();
-    for n in 1..=21 {
-        p.round(n, "admitting");
-        p.op(&format!("t-0001-1-{n:02}"), 1, "staged");
-    }
-    let text = p.context(true);
-    assert!(text.contains("- r20 [Admitting]"));
-    assert!(!text.contains("- r21 [Admitting]"));
-    assert!(text.contains("1 more; read .state/rounds/ (digest limit 20)"));
-    assert!(text.contains("1 more; read ops/ (digest limit 20)"));
-    assert!(!text.contains("t-0001-1-21"));
-}
-
-#[test]
-fn inactive_routines_are_counted_and_live_routine_errors_are_bounded() {
-    let p = Project::new();
-    p.write(
-        "routines/retired.md",
-        "+++\nschedule = \"every 1h\"\nenabled = false\n+++\nOld task\n",
-    );
-    for n in 1..=21 {
-        p.write(
-            format!("routines/live-{n:02}.md"),
-            "+++\nschedule = \"every 1h\"\nenabled = true\n+++\nCheck the work\n",
-        );
-        p.write(format!("routines/broken-{n:02}.md"), "bad config");
-    }
-    let text = p.context(true);
-    assert!(text.contains("## Routines (21 enabled; 1 disabled not listed)"));
-    assert!(text.contains("live-20"));
-    assert!(!text.contains("live-21"));
-    assert!(!text.contains("retired"));
-    assert!(text.contains("config-error: routines/broken-20.md"));
-    assert!(!text.contains("broken-21"));
-    assert_eq!(
-        text.matches("1 more; read routines/ (digest limit 20)")
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn bounded_threads_and_inbox_do_not_receipt_hidden_rows() {
-    let p = Project::new();
-    p.write(
-        ".state/coordinator.json",
-        r#"{"pane_id":"w1:p1","generation":1,"bootstrap":"acknowledged","launch":{"attempt":1}}"#,
-    );
     for n in 1..=21 {
         let id = format!("t-{n:04}");
         p.write(
             format!("threads/{id}.toml"),
-            format!("id = \"{id}\"\nstatus = \"open\"\nattempt = 1\n"),
+            format!(
+                "id = \"{id}\"\ntitle = \"task {n}\"\nstatus = \"failed\"\nattempt = 1\nerror = \"failure {n}\"\n"
+            ),
         );
-        p.write(format!("events/{id}-1-1.toml"), format!("id = \"{id}-1-1\"\nop = \"{id}-1-1\"\nthread = \"{id}\"\nattempt = 1\ncreated = \"2026-09-20T00:00:00Z\"\n[recipient]\npane = \"w1:p1\"\ncoordinator_attempt = 1\n[payload.waiting]\ntext = \"wait-{n:04}\"\n"));
-        p.write(format!("inbox/i-{n:04}.md"), format!("+++\nid = \"i-{n:04}\"\nkind = \"routine\"\nsubject = \"job\"\ncreated = \"2026-09-20T00:00:00Z\"\nsummary = \"message-{n:04}\"\n+++\n"));
+        p.write(
+            format!("inbox/i-{n:04}.md"),
+            format!("+++\nid = \"i-{n:04}\"\nkind = \"routine\"\nsubject = \"job\"\ncreated = \"x\"\nsummary = \"message-{n:04}\"\n+++\n"),
+        );
     }
     let text = p.context(true);
-    assert!(text.contains("1 more; read threads/ (digest limit 20)"));
-    assert!(text.contains("1 more; read inbox/ (digest limit 20)"));
-    assert!(text.contains("wait-0020"));
-    assert!(!text.contains("wait-0021"));
+    assert_eq!(text.matches("… 1 more.").count(), 2, "{text}");
+    assert!(text.contains("failure 20"));
+    assert!(!text.contains("failure 21"));
     assert!(text.contains("message-0020"));
     assert!(!text.contains("message-0021"));
-    // A valid coordinator receipt exercises event acknowledgements too.
-    p.write(".state/coordinator.json", r#"{"pane_id":"w1:p1","generation":1,"bootstrap":"acknowledged","launch":{"attempt":1,"brief_hash":"fixture"}}"#);
-    let result = Command::new(BIN)
-        .env_clear()
-        .env("HOME", p.home.path())
-        .env("HERDR_PANE_ID", "w1:p1")
-        .env("HERDR_ADE_LAUNCH", "demo/coordinator/1/fixture")
-        .args([
-            "--root",
-            p.dir.parent().unwrap().to_str().unwrap(),
-            "context",
-            "demo",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+    assert!(!text.contains("read threads/"));
+    assert!(!text.contains("read inbox/"));
+}
+
+#[test]
+fn only_rounds_needing_action_get_details_after_the_page() {
+    let p = Project::new();
+    p.write(
+        ".state/rounds/r1.toml",
+        "round = \"r1\"\nphase = \"under_review\"\nbranch = \"main\"\nplain = \"Reviewing\"\npolicy_hash = \"fixture\"\n[manifest]\nrevision = 1\nmembers = []\n",
     );
-    assert!(p.dir.join("deliveries/t-0020-1-1.jsonl").exists());
-    assert!(!p.dir.join("deliveries/t-0021-1-1.jsonl").exists());
-    let seen = std::fs::read_to_string(p.dir.join(".state/inbox-seen.json")).unwrap();
-    assert!(seen.contains("i-0020"), "{seen}");
-    assert!(!seen.contains("i-0021"), "{seen}");
+    p.write(
+        ".state/rounds/r2.toml",
+        "round = \"r2\"\nphase = \"admitting\"\nbranch = \"main\"\nplain = \"Needs lanes\"\npolicy_hash = \"fixture\"\n[manifest]\nrevision = 1\nmembers = []\n",
+    );
+    let text = p.context(false);
+    let actions = text.split("## Rounds needing action").nth(1).unwrap();
+    assert!(actions.contains("r2 [Admitting]"), "{actions}");
+    assert!(!actions.contains("r1 [UnderReview]"), "{actions}");
 }

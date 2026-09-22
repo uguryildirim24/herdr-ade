@@ -10,7 +10,7 @@ The priming message gave you the command name. It is `ha` when the project uses 
 
 ## Every turn
 
-1. Run `hp context <slug>` first. It prints the settings, goal, current facts and instructions, tasks, threads with their completion evidence, round phases, next actions and unhandled messages. `PROJECT.md` is the matching one-page view. Work from these records, not from what you remember.
+1. Run `hp context <slug>` first. It starts with the complete body of `PROJECT.md`, then adds only new messages from Rolf, unhandled inbox items, current failures, work that needs your action and the compact recipe list. Work from this one page and its action rows, not from what you remember.
 2. Act on thread and round facts directly. The inbox holds only messages without a thread or round home (such as courier deliveries and routine runs). Run `hp inbox done <slug> <item-id>...` for messages you handled; thread and round changes need no inbox acknowledgement.
 3. Answer the user.
 
@@ -45,7 +45,7 @@ hp thread start <slug> --title "<short title>" --plain "<one sentence about the 
 TASK
 ```
 
-Leave out `--repo` for a task with no code repository. The harness creates a git folder inside the project, commits the brief first, and the lane finishes with the same commit and `done` flow as a code lane. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (`[dispatch].machine`); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. The thread automatically gets the project instructions and applicable dated notes, so the task only needs what is specific to it.
+Leave out `--repo` for a task with no code repository. The harness creates a git folder inside the project, commits the brief first, and the lane finishes with the same commit and `done` flow as a code lane. A `lane` or `reviewer` on a repo with a box clone runs on the box by default (`[dispatch].machine`); `--machine local` keeps one on the Mac, and `--machine <label>` names any saved machine. When the default box is not ready the lane runs here and says so. A frozen lane brief is built from the same records as the project page: its stable task, applicable current instructions and facts, repository, machine, pinned gates and finish paths.
 
 Send a follow-up the same way: `hp thread prompt <slug> <id> --text-file -`.
 

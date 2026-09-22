@@ -484,7 +484,7 @@ fn brief_carries_instruction(row: &crate::note::Row) -> bool {
 }
 
 fn brief_carries_memory(row: &crate::note::Row) -> bool {
-    row.kind == "task note" || row.kind == "memory" && row.at.is_some() && row.request.is_some()
+    row.kind == "memory" && row.at.is_some() && row.request.is_some()
 }
 
 fn memory_block(id: &str, text: &str) -> String {
@@ -518,10 +518,13 @@ pub(crate) fn memory_use(project: &Project) -> MemoryUse {
 }
 
 pub(crate) struct BriefInput<'a> {
+    pub(crate) task: &'a str,
     pub(crate) instructions: &'a str,
     /// (note id, rendered note), in the order they should be included.
-    pub(crate) memory_notes: &'a [(String, String)],
-    pub(crate) task: &'a str,
+    pub(crate) facts: &'a [(String, String)],
+    pub(crate) repository: &'a str,
+    pub(crate) machine: &'a str,
+    pub(crate) gates: Option<&'a [crate::project::Gate]>,
     pub(crate) restart: bool,
     pub(crate) report_path: &'a str,
     pub(crate) library_path: &'a str,
@@ -534,13 +537,20 @@ fn compose_brief(input: &BriefInput) -> String {
             "**A previous attempt at this task exists on this branch.** Read its report at the report path below first, look at what is already on the branch, and continue from there.\n\n",
         );
     }
-    brief.push_str("# Project instructions\n\n");
-    brief.push_str(input.instructions.trim());
-    brief.push_str("\n\n# Project memory\n");
+    brief.push_str("# Task\n\n");
+    brief.push_str(input.task.trim());
+    brief.push_str("\n\n# Instructions in force\n\n");
+    if input.instructions.trim().is_empty() {
+        brief.push_str("None.\n");
+    } else {
+        brief.push_str(input.instructions.trim());
+        brief.push('\n');
+    }
+    brief.push_str("\n# Facts in force\n");
 
     let mut used = 0;
     let mut left_out = Vec::new();
-    for (id, text) in input.memory_notes {
+    for (id, text) in input.facts {
         let block = memory_block(id, text);
         let size = block.chars().count();
         if used + size <= MEMORY_CAP_CHARS {
@@ -550,35 +560,87 @@ fn compose_brief(input: &BriefInput) -> String {
             left_out.push(id.as_str());
         }
     }
+    if input.facts.is_empty() {
+        brief.push_str("\nNone.\n");
+    }
     if !left_out.is_empty() {
         brief.push_str(&format!(
-            "\nNot included because dated memory notes are over {MEMORY_CAP_CHARS} characters: {}.\n",
+            "\nNot included because dated facts are over {MEMORY_CAP_CHARS} characters: {}.\n",
             left_out.join(", ")
         ));
     }
 
-    brief.push_str("\n# Task\n\n");
-    brief.push_str(input.task.trim());
+    brief.push_str("\n# Repository, machine and pinned gates\n\n");
+    if input.repository.is_empty() {
+        brief.push_str("- Repository: none.\n");
+    } else {
+        brief.push_str(&format!("- Repository: `{}`.\n", input.repository));
+    }
+    brief.push_str(&format!("- Machine: {}.\n", input.machine));
+    match input.gates {
+        None if input.repository.is_empty() => brief.push_str("- Gates: not applicable.\n"),
+        None => brief.push_str("- Gates: not configured for this repository.\n"),
+        Some([]) => brief.push_str("- Gates: this repository is explicitly gate-free.\n"),
+        Some(gates) => {
+            brief.push_str("- Gates:\n");
+            for gate in gates {
+                brief.push_str(&format!("  - `{}`", gate.command));
+                if !gate.env.is_empty() {
+                    brief.push_str(" with environment ");
+                    brief.push_str(
+                        &gate
+                            .env
+                            .iter()
+                            .map(|(key, value)| format!("`{key}={value}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                brief.push('\n');
+            }
+        }
+    }
     brief.push_str(&format!(
-        "\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for the user: `{}`\n",
-        input.report_path, input.library_path
+        "\n# Finish\n\nCommit the finished work, then run `hp done --report {} --sha <commit-sha>`.\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for Rolf: `{}`\n",
+        input.report_path, input.report_path, input.library_path
     ));
     brief
 }
 
-/// Reads the project's instructions and memory and composes the brief.
+fn render_task(record: &crate::task::Task, rows: &[crate::note::Row]) -> String {
+    let mut out = format!(
+        "## {} — {}\n\nRequests: {}\n\nAcceptance conditions:\n",
+        record.id,
+        record.title.trim(),
+        record.authority.join(", ")
+    );
+    for (index, condition) in record.acceptance.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", index + 1, condition.trim()));
+    }
+    let notes: Vec<_> = rows.iter().filter(|row| row.kind == "task note").collect();
+    if !notes.is_empty() {
+        out.push_str("\nTask notes:\n\n");
+        for note in notes {
+            out.push_str(&render_brief_row(note));
+            out.push_str("\n\n");
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Builds a frozen helper brief from the same current records as PROJECT.md.
 pub(crate) fn brief_for(
     project: &Project,
     thread: &Thread,
-    task: &str,
+    supplied_task: &str,
     restart: bool,
 ) -> Result<String> {
-    let task_id = crate::task::list_with_errors(project)
+    let task_record = crate::task::list_with_errors(project)
         .0
         .into_iter()
-        .find(|record| record.attempts.iter().any(|attempt| attempt == &thread.id))
-        .map(|record| record.id);
-    let mut active = crate::note::active_for(project, task_id.as_deref());
+        .find(|record| record.attempts.iter().any(|attempt| attempt == &thread.id));
+    let task_id = task_record.as_ref().map(|record| record.id.as_str());
+    let mut active = crate::note::active_for(project, task_id);
     crate::note::sort_newest_first(&mut active);
     let instructions = active
         .iter()
@@ -586,11 +648,26 @@ pub(crate) fn brief_for(
         .map(render_brief_row)
         .collect::<Vec<_>>()
         .join("\n\n");
-    let memory = MemoryUse::from_rows(active.iter());
+    let facts = MemoryUse::from_rows(active.iter());
+    let task = task_record
+        .as_ref()
+        .map(|record| render_task(record, &active))
+        .unwrap_or_else(|| supplied_task.trim().to_string());
+    let (settings, _) = project.read_project_md()?;
+    let repo = settings.repos.iter().find(|repo| repo.path == thread.repo);
+    let gates = repo.and_then(|repo| repo.gates.as_deref());
+    let machine = if thread.machine.is_empty() {
+        "local"
+    } else {
+        &thread.machine
+    };
     Ok(compose_brief(&BriefInput {
+        task: &task,
         instructions: &instructions,
-        memory_notes: &memory.notes,
-        task,
+        facts: &facts.notes,
+        repository: &thread.repo,
+        machine,
+        gates,
         restart,
         report_path: &thread.report_path(),
         library_path: &thread.library_path(),
@@ -1521,10 +1598,17 @@ mod tests {
             ("n-0002".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
             ("n-0003".to_string(), "gamma fact".to_string()),
         ];
+        let gates = vec![crate::project::Gate {
+            command: "cargo test".into(),
+            env: std::collections::BTreeMap::from([("RUST_BACKTRACE".into(), "1".into())]),
+        }];
         let brief = compose_brief(&BriefInput {
-            instructions: "Always run the tests.",
-            memory_notes: &notes,
             task: "Do the thing.",
+            instructions: "Always run the tests.",
+            facts: &notes,
+            repository: "/repo",
+            machine: "local",
+            gates: Some(&gates),
             restart: true,
             report_path: "/wt/.herdr-project/demo-t-0001/report.md",
             library_path: "/wt/.herdr-project/demo-t-0001/library",
@@ -1536,20 +1620,26 @@ mod tests {
         };
         assert!(brief.starts_with("**A previous attempt"));
         assert!(pos("previous attempt") < pos("Always run the tests."));
-        assert!(pos("Always run the tests.") < pos("# Project memory"));
-        assert!(pos("# Project memory") < pos("alpha fact"));
-        assert!(pos("alpha fact") < pos("Do the thing."));
-        assert!(pos("Do the thing.") < pos("/wt/.herdr-project/demo-t-0001/report.md"));
+        assert!(pos("Do the thing.") < pos("Always run the tests."));
+        assert!(pos("Always run the tests.") < pos("# Facts in force"));
+        assert!(pos("# Facts in force") < pos("alpha fact"));
+        assert!(pos("alpha fact") < pos("/wt/.herdr-project/demo-t-0001/report.md"));
+        assert!(brief.contains("- Repository: `/repo`."));
+        assert!(brief.contains("- Machine: local."));
+        assert!(brief.contains("`cargo test` with environment `RUST_BACKTRACE=1`"));
         assert!(brief.contains("gamma fact"));
-        assert!(brief.contains(
-            "Not included because dated memory notes are over 32000 characters: n-0002."
-        ));
+        assert!(
+            brief.contains("Not included because dated facts are over 32000 characters: n-0002.")
+        );
         assert!(!brief.contains(&"x".repeat(100)));
 
         let fresh = compose_brief(&BriefInput {
-            instructions: "",
-            memory_notes: &[],
             task: "t",
+            instructions: "",
+            facts: &[],
+            repository: "",
+            machine: "local",
+            gates: None,
             restart: false,
             report_path: "r",
             library_path: "l",
@@ -1558,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn brief_carries_applicable_dated_notes_and_not_the_project_page() {
+    fn brief_carries_the_task_and_only_applicable_current_page_facts() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         crate::talk::append(
@@ -1622,10 +1712,24 @@ mod tests {
         crate::task::link_attempt(&project, &current.id, &thread.id).unwrap();
 
         let brief = brief_for(&project, &thread, "Do the task.", false).unwrap();
-        assert!(!brief.contains("# Project\n"), "{brief}");
+        assert!(
+            brief.contains(&format!("## {} — Ship the checked change.", current.id)),
+            "{brief}"
+        );
+        assert!(brief.contains("Requests: request:q-1"), "{brief}");
+        assert!(
+            brief.contains("The command reports the new result."),
+            "{brief}"
+        );
+        assert!(!brief.contains("Do the task."), "{brief}");
         assert!(brief.contains("Dated instruction marker."), "{brief}");
         assert!(brief.contains("Applicable dated marker."), "{brief}");
         assert!(!brief.contains("Other task marker"), "{brief}");
+        assert!(
+            brief.contains("# Repository, machine and pinned gates"),
+            "{brief}"
+        );
+        assert!(brief.contains("# Finish"), "{brief}");
         assert!(memory_use(&project).warning().is_none());
     }
 

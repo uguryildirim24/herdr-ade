@@ -1699,11 +1699,9 @@ fn a_merged_pull_request_resolves_its_thread_after_the_final_copy() {
         (Status::Resolved, "merged")
     );
     assert!(items_of(&project, "pr").is_empty());
+    crate::project::refresh_page(&project).unwrap();
     let digest = coordinator::digest(&world.ctx(), &project, "ha").unwrap().0;
-    assert!(
-        digest.contains("1 resolved threads (not listed)"),
-        "{digest}"
-    );
+    assert!(!digest.contains("## Threads needing action"), "{digest}");
     assert!(!digest.contains("t-0001"), "{digest}");
 }
 
@@ -2539,7 +2537,7 @@ fn open_accepts_a_non_claude_coordinator_recipe() {
 }
 
 #[test]
-fn the_digest_warns_when_memory_is_over_budget() {
+fn the_digest_uses_the_complete_fact_from_the_project_page() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     crate::talk::append(
@@ -2562,9 +2560,12 @@ fn the_digest_warns_when_memory_is_over_budget() {
     )
     .unwrap();
     let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
-    assert!(digest.contains("memory over budget"), "{digest}");
     assert!(digest.contains(&note.id), "{digest}");
-    assert!(digest.contains("replace stale dated notes"), "{digest}");
+    assert!(
+        digest.contains(&"x".repeat(crate::thread::MEMORY_CAP_CHARS + 1)),
+        "{digest}"
+    );
+    assert!(!digest.contains("memory over budget"), "{digest}");
 }
 
 fn parse_json_stdout(out: &crate::runner::Output) -> serde_json::Value {

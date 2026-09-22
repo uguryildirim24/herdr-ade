@@ -332,20 +332,6 @@ pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-pub(crate) fn section(project: &Project) -> Result<String> {
-    let rows = recent(project)?;
-    let mut text = String::from("\n## Failures\n");
-    if rows.is_empty() {
-        text.push_str("(none)\n");
-    }
-    let context_read = latest_context_read(project)?;
-    for entry in rows {
-        let disposition = disposition_at(&entry, &context_read).word();
-        text.push_str(&format!("- {}\n", summary_with_state(&entry, disposition)));
-    }
-    Ok(text)
-}
-
 pub(crate) fn context_read(project: &Project, at: &str) -> Result<()> {
     let _lock = lock(project)?;
     append(project, &Line::ContextRead { at: at.into() })
@@ -571,21 +557,18 @@ mod tests {
         }
     }
     #[test]
-    fn digest_is_bounded_sorted_and_uses_the_context_cursor() {
+    fn recent_failures_use_the_context_cursor() {
         let (_root, p) = fixture();
         for n in 0..8 {
             record(&p, "start", &format!("r{n}"), &"bad\n".repeat(300)).unwrap();
         }
         record(&p, "start", "r0", &"bad\n".repeat(300)).unwrap();
-        let text = section(&p).unwrap();
-        assert_eq!(text.lines().filter(|l| l.starts_with("- ")).count(), 5);
-        assert!(text.lines().all(|l| l.chars().count() <= 222));
+        assert_eq!(recent(&p).unwrap().len(), 5);
         assert!(recent(&p).unwrap()[0].subject == "r0");
         context_read(&p, &jiff::Timestamp::now().to_string()).unwrap();
         let old = recent(&p).unwrap();
         assert_eq!(old.len(), 1);
         assert_eq!(disposition(&p, &old[0]).unwrap(), Disposition::Unknown);
-        assert!(section(&p).unwrap().contains("[unknown; last observed"));
         record(&p, "new", "r9", "new").unwrap();
         let rows = recent(&p).unwrap();
         assert_eq!(rows.len(), 2);
