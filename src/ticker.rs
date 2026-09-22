@@ -1014,8 +1014,11 @@ fn nudge_idle_coordinator(
         return Ok(());
     }
     crate::talk::mark_automated_prompt(project, &coordinator.pane_id, &text)?;
+    // Keep the send start, not the return time: the prompted turn can read
+    // context before a fast transport call returns, and that turn must count.
+    let sent_at = project::now();
     herdr.agent_prompt(&coordinator.pane_id, &text)?;
-    state.idle_nudge_last = project::now();
+    state.idle_nudge_last = sent_at;
     crate::ledger::coordinator_nudge(project, &next)
 }
 
@@ -1648,6 +1651,93 @@ mod tests {
             toml::to_string(&task).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn work_nudge_requires_an_idle_coordinator() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let coordinator = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, &runner);
+
+        for status in ["working", "blocked"] {
+            let agent = Agent {
+                agent_status: status.into(),
+                ..Agent::default()
+            };
+            nudge_idle_coordinator(
+                &ctx,
+                &f.project,
+                &mut steps::State::default(),
+                &herdr,
+                &coordinator,
+                Some(&agent),
+            )
+            .unwrap();
+        }
+        assert_eq!(runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn another_work_nudge_requires_cooldown_and_a_coordinator_turn() {
+        let f = fixture(false);
+        let mut state = steps::State {
+            idle_nudge_last: "2026-01-01T00:00:00Z".into(),
+            ..steps::State::default()
+        };
+        let at_ten = "2026-01-01T00:10:00Z".parse().unwrap();
+        let at_thirty = "2026-01-01T00:30:00Z".parse().unwrap();
+
+        assert!(!idle_nudge_due(&f.project, &state, 20, at_ten).unwrap());
+        assert!(!idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+        crate::ledger::context_read(&f.project, "2026-01-01T00:05:00Z").unwrap();
+        assert!(idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+
+        state.idle_nudge_last = "2026-01-01T00:06:00Z".into();
+        assert!(!idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+    }
+
+    #[test]
+    fn pending_rolf_message_prevents_a_work_nudge() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        crate::talk::handle(&ctx, &f.project, "Please choose red or blue.").unwrap();
+        assert!(crate::talk::has_waiting_request(&f.project));
+
+        let coordinator = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, &runner);
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        nudge_idle_coordinator(
+            &ctx,
+            &f.project,
+            &mut steps::State::default(),
+            &herdr,
+            &coordinator,
+            Some(&agent),
+        )
+        .unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
     }
 
     #[test]
