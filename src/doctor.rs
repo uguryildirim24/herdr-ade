@@ -268,8 +268,7 @@ pub(crate) fn recipe_ready_on_box(
             ctx.runner,
             &ctx.root,
             &profile.target,
-            &machine.root,
-            &machine.pi_bin,
+            &machine,
             &provider,
             &model,
         )
@@ -812,9 +811,8 @@ fn report_with_checks(
                                 detached_ticker: false,
                             };
                             let (mut leftovers, data_kept, mut errors) =
-                                finished_worktrees(&ctx, Some((&profile.id, &profile.target)));
-                            let (builds, build_errors) =
-                                finished_build_folders(&ctx, &profile.label, &profile.target);
+                                finished_worktrees(&ctx, Some(&profile));
+                            let (builds, build_errors) = finished_build_folders(&ctx, &profile);
                             leftovers.extend(builds);
                             errors.extend(build_errors);
                             check(
@@ -930,9 +928,21 @@ fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
 /// Finished thread worktrees that still exist on one machine. Completion is
 /// derived from the same records as `thread resolve`; existence is checked on
 /// the machine that owns the checkout.
+fn thread_is_on_machine(
+    thread: &crate::thread::Thread,
+    profile: &crate::contracts::MachineProfile,
+) -> bool {
+    thread.is_remote()
+        && if thread.machine_id.is_empty() {
+            thread.machine == profile.label
+        } else {
+            thread.machine_id == profile.id
+        }
+}
+
 fn finished_worktrees(
     ctx: &Ctx,
-    remote: Option<(&str, &str)>,
+    remote: Option<&crate::contracts::MachineProfile>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
@@ -955,7 +965,7 @@ fn finished_worktrees(
             }
             let on_machine = match remote {
                 None => !thread.is_remote(),
-                Some((machine, _)) => thread.is_remote() && thread.machine_route() == machine,
+                Some(profile) => thread_is_on_machine(&thread, profile),
             };
             if !on_machine {
                 continue;
@@ -971,7 +981,7 @@ fn finished_worktrees(
     // shell always exits zero after printing each yes/no answer, so a healthy
     // "gone" result cannot enter the command-failure ledger and a transport
     // failure remains distinguishable from a negative answer.
-    let remote_exists = remote.map(|(_, target)| {
+    let remote_exists = remote.map(|profile| {
         let script = candidates
             .iter()
             .enumerate()
@@ -988,7 +998,7 @@ fn finished_worktrees(
         if candidates.is_empty() {
             return Vec::new();
         }
-        match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
+        match crate::remote::ssh(ctx.runner, &profile.target, &script, None, TOOL_TIMEOUT) {
             Ok(output) if output.success() => {
                 let facts: BTreeMap<usize, bool> = output
                     .stdout
@@ -1055,11 +1065,14 @@ fn finished_worktrees(
 
 /// Rebuildable box output whose owning thread is no longer open. The folder
 /// names come from the same helper that sets `CARGO_TARGET_DIR` at launch.
-fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String>, Vec<String>) {
+fn finished_build_folders(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+) -> (Vec<String>, Vec<String>) {
     let mut active = BTreeSet::new();
     let mut uncertain_projects = BTreeSet::new();
     let mut errors = Vec::new();
-    let machine_paths = match crate::remote::machine_declaration(&ctx.config_dir, machine) {
+    let machine_paths = match crate::remote::machine_declaration(&ctx.config_dir, &profile.label) {
         Ok(machine) => machine,
         Err(error) => return (Vec::new(), vec![format!("build root unknown: {error:#}")]),
     };
@@ -1086,8 +1099,7 @@ fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String
         );
         for thread in threads {
             if thread.status != crate::thread::Status::Resolved
-                && thread.is_remote()
-                && thread.machine_route() == machine
+                && thread_is_on_machine(&thread, profile)
             {
                 active.insert(format!("{slug}-{}", thread.id));
             }
@@ -1099,7 +1111,8 @@ fn finished_build_folders(ctx: &Ctx, machine: &str, target: &str) -> (Vec<String
         "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -exec du -sk -- {{}} +; fi; printf '__HERDR_BUILDS_DONE__\\n'",
         root = crate::remote::quote(&root),
     );
-    let output = match crate::remote::ssh(ctx.runner, target, &script, None, TOOL_TIMEOUT) {
+    let output = match crate::remote::ssh(ctx.runner, &profile.target, &script, None, TOOL_TIMEOUT)
+    {
         Ok(output) if output.success() => output,
         Ok(output) => {
             errors.push(output.error_text());
@@ -2347,7 +2360,13 @@ recipe = "claude_fable_xhigh"
         };
         let _scope = crate::ledger::Scope::new(&[&project]);
 
-        let (leftovers, data, errors) = finished_worktrees(&ctx, Some(("box-1", "me@box")));
+        let profile = crate::contracts::MachineProfile {
+            id: "box-1".into(),
+            label: "oci".into(),
+            target: "me@box".into(),
+            session: "default".into(),
+        };
+        let (leftovers, data, errors) = finished_worktrees(&ctx, Some(&profile));
 
         assert!(leftovers.is_empty());
         assert!(data.is_empty());
@@ -2733,6 +2752,8 @@ recipe = "claude_fable_xhigh"
         let thread = crate::thread::allocate(&project, |thread| {
             thread.status = crate::thread::Status::Open;
             thread.machine = "oci".into();
+            thread.machine_id = "oci-id".into();
+            thread.title = "Review r1".into();
         })
         .unwrap();
         let runner = FakeRunner::new();
@@ -2751,7 +2772,13 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, errors) = finished_build_folders(&ctx, "oci", "me@box");
+        let profile = crate::contracts::MachineProfile {
+            id: "oci-id".into(),
+            label: "oci".into(),
+            target: "me@box".into(),
+            session: "default".into(),
+        };
+        let (leftovers, errors) = finished_build_folders(&ctx, &profile);
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(errors.is_empty(), "{errors:?}");
@@ -2777,7 +2804,13 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, errors) = finished_build_folders(&ctx, "oci", "me@box");
+        let profile = crate::contracts::MachineProfile {
+            id: "oci-id".into(),
+            label: "oci".into(),
+            target: "me@box".into(),
+            session: "default".into(),
+        };
+        let (leftovers, errors) = finished_build_folders(&ctx, &profile);
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(
