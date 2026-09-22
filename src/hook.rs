@@ -1,6 +1,5 @@
-//! Coordinator correction-hook lifecycle, budget, and typed envelope parsing.
+//! Coordinator hook lifecycle and per-turn `ha say` / `ha ask` receipts.
 
-use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -8,20 +7,18 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::contracts::HumanMessage;
 use crate::paths::Ctx;
-use crate::plain;
 use crate::project::{self, Project};
 use crate::remote::quote;
 
-const INPUT_LIMIT: usize = 64 * 1024;
-/// The hook input read to find the session; the reply inside it is bounded
-/// by `INPUT_LIMIT`.
 const READ_LIMIT: usize = 4 * 1024 * 1024;
-/// One block per turn: a second failed check publishes the fixed notice
-/// instead of asking for another rewrite, so a reply is never lost to a loop.
-const MAX_CORRECTIONS: u32 = 1;
-const DEADLINE_SECS: i64 = 10 * 60;
+const MISSING_RECEIPT: &str = "Run `ha say` before you finish this reply.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopDecision {
+    Pass,
+    SendBack,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Binding {
@@ -37,19 +34,26 @@ struct Binding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct Budget {
-    turn: String,
-    corrections: u32,
-    started: String,
-    started_second: i64,
+struct Turn {
+    kind: String,
+    project: String,
+    pane: String,
+    session: String,
+    coordinator_attempt: u32,
+    id: String,
+    #[serde(default)]
+    completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CursorPending {
+struct Receipt {
+    kind: String,
+    project: String,
+    pane: String,
     session: String,
+    coordinator_attempt: u32,
     turn: String,
-    text: String,
-    reason: String,
+    publications: Vec<String>,
 }
 
 fn binding_path(project: &Project) -> PathBuf {
@@ -270,7 +274,7 @@ fn verify_owned_entry(
 }
 
 /// Runs from a native CLI hook. Non-matching pane/session invocations are out
-/// of scope and exit successfully without checking or publishing.
+/// of scope and exit successfully without checking the turn.
 pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let inherited = std::env::var("HERDR_PANE_ID").unwrap_or_default();
@@ -282,7 +286,6 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
         .take((READ_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() > READ_LIMIT {
-        // Too large to read the session from: not blocked, and not checked.
         return Ok(());
     }
     let input: serde_json::Value =
@@ -291,10 +294,9 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     if !scope_binding(&project, kind, pane, session)? {
         return Ok(());
     }
-    // A prompt Rolf typed straight into the pane: record it under a request id
-    // the coordinator can cite. A talk delivery or a harness line is not his
-    // words and is not recorded again.
+    bind_current_turn_session(&project, kind, pane, session)?;
     if phase == "prompt" {
+        begin_turn(&project, kind, pane, session, &input)?;
         let text = prompt_text(&input).unwrap_or_default();
         if !text.trim().is_empty()
             && let Some(request) = handle_prompt(&project, pane, text)?
@@ -303,107 +305,14 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
         }
         return Ok(());
     }
-    // The coordinator's turn ended: talk requests it was handed are taken.
-    if phase != "observe" {
-        crate::talk::mark_accepted(&project)?;
-    }
-    let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
-    let cursor_shape = adapter.hook.shape == "cursor";
-    if cursor_shape && phase == "stop" {
-        return cursor_stop(ctx, &project, kind);
-    }
-    let text = crate::adapters::reply_text(&adapter, &input).unwrap_or_default();
-    // An oversize reply is a failed check like any other: it spends the
-    // turn's budget and ends in the fixed notice, never a block loop.
-    let (text, oversize) = if text.len() > INPUT_LIMIT {
-        ("", true)
-    } else {
-        (text, false)
-    };
-    let turn = if cursor_shape {
-        project::read_json::<CursorPending>(&cursor_pending_path(&project))
-            .map(|pending| pending.turn)
-            .map_or_else(|| turn_key(&project, session, &input, text), Ok)?
-    } else {
-        turn_key(&project, session, &input, text)?
-    };
-    if oversize {
-        return failed_check(
-            ctx,
-            &project,
-            kind,
-            session,
-            &turn,
-            "plain_input_too_large: reply exceeds 64 KiB",
-        );
-    }
-    let messages = match parse_envelopes(text) {
-        Ok(messages) => messages,
-        Err(error) => {
-            if cursor_shape && phase == "observe" {
-                return save_cursor_pending(&project, session, &turn, text, &error.to_string());
-            }
-            return failed_check(ctx, &project, kind, session, &turn, &error.to_string());
-        }
-    };
-    if let Some(reason) = messages.iter().find_map(|message| {
-        validate_message(&project, message)
-            .err()
-            .map(|error| error.to_string())
-    }) {
-        if cursor_shape && phase == "observe" {
-            return save_cursor_pending(&project, session, &turn, text, &reason);
-        }
-        return failed_check(ctx, &project, kind, session, &turn, &reason);
-    }
-    publish(ctx, &project, session, &turn, &messages)?;
-    if cursor_shape {
-        let _ = std::fs::remove_file(cursor_pending_path(&project));
-    }
-    Ok(())
-}
-
-fn cursor_pending_path(project: &Project) -> PathBuf {
-    project
-        .state_dir()
-        .join("plain")
-        .join("cursor-pending.json")
-}
-
-fn save_cursor_pending(
-    project: &Project,
-    session: &str,
-    turn: &str,
-    text: &str,
-    reason: &str,
-) -> Result<()> {
-    let path = cursor_pending_path(project);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    project::write_json(
-        &path,
-        &CursorPending {
-            session: session.to_string(),
-            turn: turn.to_string(),
-            text: text.to_string(),
-            reason: reason.to_string(),
-        },
-    )
-}
-
-fn cursor_stop(ctx: &Ctx, project: &Project, kind: &str) -> Result<()> {
-    let Some(pending) = project::read_json::<CursorPending>(&cursor_pending_path(project)) else {
+    if phase == "observe" {
         return Ok(());
-    };
-    failed_check(
-        ctx,
-        project,
-        kind,
-        &pending.session,
-        &pending.turn,
-        &pending.reason,
-    )
+    }
+    crate::talk::mark_accepted(&project)?;
+    match stop_decision(&project, kind, pane, session)? {
+        StopDecision::Pass => Ok(()),
+        StopDecision::SendBack => correction(ctx, kind),
+    }
 }
 
 fn scope_binding(project: &Project, kind: &str, pane: &str, session: &str) -> Result<bool> {
@@ -450,196 +359,228 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
     }
 }
 
-/// The human turn this stop belongs to. A native id wins. Claude sends none:
-/// its first stop of a turn has `stop_hook_active = false` and starts a new
-/// turn (a fresh budget and fresh publication keys); a continuation has it
-/// `true` and keeps the turn it continues.
-fn turn_key(
-    project: &Project,
-    session: &str,
-    input: &serde_json::Value,
-    text: &str,
-) -> Result<String> {
-    for field in ["turn_id", "last_user_message_id", "prompt_id"] {
-        if let Some(value) = input[field].as_str().filter(|value| !value.is_empty()) {
-            return Ok(value.to_string());
-        }
-    }
-    // Without the flag (Cursor) the transcript is the turn, as before.
-    let Some(continuing) = input["stop_hook_active"].as_bool() else {
-        return Ok(input["transcript_path"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("text-{:x}", Sha256::digest(text.as_bytes()))));
-    };
-    let path = project
+fn current_turn_path(project: &Project) -> PathBuf {
+    project.state_dir().join("plain").join("current-turn.json")
+}
+
+fn receipt_path(project: &Project, turn: &str) -> PathBuf {
+    project
         .state_dir()
         .join("plain")
-        .join("turn")
-        .join(format!("{:x}", Sha256::digest(session.as_bytes())));
-    if continuing && let Ok(turn) = std::fs::read_to_string(&path) {
-        return Ok(turn);
+        .join("receipts")
+        .join(format!("{:x}.json", Sha256::digest(turn.as_bytes())))
+}
+
+fn turn_id(input: &serde_json::Value) -> String {
+    for field in ["turn_id", "last_user_message_id", "prompt_id"] {
+        if let Some(value) = input[field].as_str().filter(|value| !value.is_empty()) {
+            return value.to_string();
+        }
     }
-    let turn = format!(
+    format!(
         "turn-{:x}",
         Sha256::digest(
             format!(
-                "{}\n{}\n{text}",
-                input["transcript_path"].as_str().unwrap_or_default(),
+                "{}\n{}\n{}",
+                input["session_id"].as_str().unwrap_or_default(),
+                prompt_text(input).unwrap_or_default(),
                 jiff::Timestamp::now().as_nanosecond()
             )
             .as_bytes()
         )
-    );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    project::write_atomic(&path, turn.as_bytes())?;
-    Ok(turn)
-}
-
-fn failed_check(
-    ctx: &Ctx,
-    project: &Project,
-    kind: &str,
-    session: &str,
-    turn: &str,
-    reason: &str,
-) -> Result<()> {
-    let mut budget = load_budget(project, session, turn)?;
-    let now = jiff::Timestamp::now().as_second();
-    let expired = now - budget.started_second >= DEADLINE_SECS;
-    if !expired && budget.corrections < MAX_CORRECTIONS {
-        budget.corrections += 1;
-        save_budget(project, session, &budget)?;
-        return correction(ctx, kind, reason);
-    }
-    publish(
-        ctx,
-        project,
-        session,
-        turn,
-        &[HumanMessage::Notice {
-            id: "plain_exhausted".into(),
-        }],
     )
 }
 
-fn correction(ctx: &Ctx, kind: &str, reason: &str) -> Result<()> {
-    let reason = format!("Rewrite the reply for the plain-language check: {reason}");
-    let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
-    if let Some(value) = crate::adapters::correction(&adapter, &reason) {
-        println!("{}", serde_json::to_string(&value)?);
+fn new_turn(project: &Project, kind: &str, pane: &str, session: &str, id: String) -> Turn {
+    Turn {
+        kind: kind.to_string(),
+        project: project.slug.clone(),
+        pane: pane.to_string(),
+        session: session.to_string(),
+        coordinator_attempt: project.coordinator().map_or(0, |record| record.attempt()),
+        id,
+        completed: false,
     }
-    Ok(())
 }
 
-fn parse_envelopes(text: &str) -> Result<Vec<HumanMessage>> {
-    let mut messages = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("```ade-") {
-        rest = &rest[start + 3..];
-        let Some((header, body_and_tail)) = rest.split_once('\n') else {
-            bail!("plain_envelope: envelope fence has no body");
-        };
-        let Some((body, tail)) = body_and_tail.split_once("```") else {
-            bail!("plain_envelope: envelope fence is not closed");
-        };
-        let fields: BTreeMap<String, String> = body
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
-            .collect();
-        match header.trim() {
-            "ade-say" => messages.push(HumanMessage::Say {
-                what: fields.get("what").cloned().unwrap_or_default(),
-                means: fields
-                    .get("means")
-                    .cloned()
-                    .filter(|value| !value.is_empty()),
-                landed_round: None,
-            }),
-            "ade-ask" => {
-                let ask = fields.get("ask").map(String::as_str).unwrap_or_default();
-                let (id, revision) = ask
-                    .rsplit_once('@')
-                    .context("plain_envelope: ask must be <id>@<revision>")?;
-                messages.push(HumanMessage::Ask {
-                    id: id.to_string(),
-                    revision: revision
-                        .parse()
-                        .context("plain_envelope: ask revision is not a number")?,
-                });
-            }
-            _ => {}
-        }
-        rest = tail;
-    }
-    if messages.is_empty() {
-        bail!("plain_envelope: end your reply with an `ade-say` block");
-    }
-    Ok(messages)
-}
-
-pub(crate) fn validate_message(project: &Project, message: &HumanMessage) -> Result<()> {
-    let glossary = crate::glossary::registry(project);
-    let result = plain::check_message(message, &glossary);
-    if let Some(violation) = result.violations.first() {
-        bail!("{}: {}", violation.rule.code(), violation.fix);
-    }
-    if let HumanMessage::Ask { id, revision } = message {
-        crate::ask::open_revision(project, id, *revision, &glossary)?;
-    }
-    Ok(())
-}
-
-/// Hands each checked message to the one publisher, keyed by session, turn
-/// and position so a repeated hook run of the same reply appends once.
-fn publish(
-    ctx: &Ctx,
+fn begin_turn(
     project: &Project,
+    kind: &str,
+    pane: &str,
     session: &str,
-    turn: &str,
-    messages: &[HumanMessage],
+    input: &serde_json::Value,
 ) -> Result<()> {
-    for (n, message) in messages.iter().enumerate() {
-        let key = format!("hook:{session}:{turn}:{n}");
-        crate::ask::publish_keyed(ctx, project, message, Some(&key))?;
+    let _lock = project.lock()?;
+    project::write_json(
+        &current_turn_path(project),
+        &new_turn(project, kind, pane, session, turn_id(input)),
+    )
+}
+
+/// Records that an authored `ha say` or `ha ask` ran during the current turn.
+/// Projects without an installed coordinator hook need no receipt.
+pub(crate) fn record_receipt(project: &Project, publication: &str) -> Result<()> {
+    let pane = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+    record_receipt_for(project, publication, &pane)
+}
+
+fn record_receipt_for(project: &Project, publication: &str, pane: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let Some(binding) = project::read_json::<Binding>(&binding_path(project)) else {
+        return Ok(());
+    };
+    let Some(coordinator) = project.coordinator() else {
+        return Ok(());
+    };
+    if pane != binding.pane
+        || binding.pane != coordinator.pane_id
+        || binding.project != project.slug
+    {
+        return Ok(());
+    }
+    let mut turn = project::read_json::<Turn>(&current_turn_path(project)).unwrap_or_else(|| {
+        new_turn(
+            project,
+            &binding.kind,
+            &binding.pane,
+            &binding.session_id,
+            format!(
+                "command-{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}\n{}",
+                        publication,
+                        jiff::Timestamp::now().as_nanosecond()
+                    )
+                    .as_bytes()
+                )
+            ),
+        )
+    });
+    if turn.completed
+        || turn.kind != binding.kind
+        || turn.pane != binding.pane
+        || turn.session != binding.session_id
+        || turn.coordinator_attempt != coordinator.attempt()
+    {
+        turn = new_turn(
+            project,
+            &binding.kind,
+            &binding.pane,
+            &binding.session_id,
+            format!(
+                "command-{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}\n{}",
+                        publication,
+                        jiff::Timestamp::now().as_nanosecond()
+                    )
+                    .as_bytes()
+                )
+            ),
+        );
+    }
+    project::write_json(&current_turn_path(project), &turn)?;
+    let path = receipt_path(project, &turn.id);
+    std::fs::create_dir_all(path.parent().expect("receipt path has a parent"))?;
+    let fresh_receipt = || Receipt {
+        kind: turn.kind.clone(),
+        project: turn.project.clone(),
+        pane: turn.pane.clone(),
+        session: turn.session.clone(),
+        coordinator_attempt: turn.coordinator_attempt,
+        turn: turn.id.clone(),
+        publications: Vec::new(),
+    };
+    let mut receipt = project::read_json::<Receipt>(&path).unwrap_or_else(&fresh_receipt);
+    if receipt.kind != turn.kind
+        || receipt.project != turn.project
+        || receipt.pane != turn.pane
+        || receipt.session != turn.session
+        || receipt.coordinator_attempt != turn.coordinator_attempt
+        || receipt.turn != turn.id
+    {
+        receipt = fresh_receipt();
+    }
+    if !receipt.publications.iter().any(|id| id == publication) {
+        receipt.publications.push(publication.to_string());
+        project::write_json(&path, &receipt)?;
     }
     Ok(())
 }
 
-fn budget_path(project: &Project, session: &str) -> PathBuf {
-    let hash = format!("{:x}", Sha256::digest(session.as_bytes()));
-    project
-        .state_dir()
-        .join("plain")
-        .join("budget")
-        .join(format!("{hash}.json"))
+fn bind_current_turn_session(
+    project: &Project,
+    kind: &str,
+    pane: &str,
+    session: &str,
+) -> Result<()> {
+    if session.is_empty() {
+        return Ok(());
+    }
+    let _lock = project.lock()?;
+    let Some(mut turn) = project::read_json::<Turn>(&current_turn_path(project)) else {
+        return Ok(());
+    };
+    if !turn.session.is_empty() || turn.kind != kind || turn.pane != pane {
+        return Ok(());
+    }
+    turn.session = session.to_string();
+    project::write_json(&current_turn_path(project), &turn)?;
+    let path = receipt_path(project, &turn.id);
+    if let Some(mut receipt) = project::read_json::<Receipt>(&path) {
+        receipt.session = session.to_string();
+        project::write_json(&path, &receipt)?;
+    }
+    Ok(())
 }
 
-fn load_budget(project: &Project, session: &str, turn: &str) -> Result<Budget> {
-    let path = budget_path(project, session);
-    if let Some(budget) = project::read_json::<Budget>(&path)
-        && budget.turn == turn
-    {
-        return Ok(budget);
+fn current_turn_has_receipt(project: &Project, kind: &str, pane: &str, session: &str) -> bool {
+    let Some(turn) = project::read_json::<Turn>(&current_turn_path(project)) else {
+        return false;
+    };
+    if turn.completed || turn.kind != kind || turn.pane != pane || turn.session != session {
+        return false;
     }
-    Ok(Budget {
-        turn: turn.to_string(),
-        corrections: 0,
-        started: project::now(),
-        started_second: jiff::Timestamp::now().as_second(),
+    let attempt = project.coordinator().map_or(0, |record| record.attempt());
+    if turn.coordinator_attempt != attempt {
+        return false;
+    }
+    project::read_json::<Receipt>(&receipt_path(project, &turn.id)).is_some_and(|receipt| {
+        receipt.kind == kind
+            && receipt.project == project.slug
+            && receipt.pane == pane
+            && receipt.session == session
+            && receipt.coordinator_attempt == attempt
+            && receipt.turn == turn.id
+            && !receipt.publications.is_empty()
     })
 }
 
-fn save_budget(project: &Project, session: &str, budget: &Budget) -> Result<()> {
-    let path = budget_path(project, session);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn stop_decision(project: &Project, kind: &str, pane: &str, session: &str) -> Result<StopDecision> {
+    if !current_turn_has_receipt(project, kind, pane, session) {
+        return Ok(StopDecision::SendBack);
     }
-    project::write_json(&path, budget)
+    finish_turn(project)?;
+    Ok(StopDecision::Pass)
+}
+
+fn finish_turn(project: &Project) -> Result<()> {
+    let _lock = project.lock()?;
+    if let Some(mut turn) = project::read_json::<Turn>(&current_turn_path(project)) {
+        turn.completed = true;
+        project::write_json(&current_turn_path(project), &turn)?;
+    }
+    Ok(())
+}
+
+fn correction(ctx: &Ctx, kind: &str) -> Result<()> {
+    let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
+    if let Some(value) = crate::adapters::correction(&adapter, MISSING_RECEIPT) {
+        println!("{}", serde_json::to_string(&value)?);
+    }
+    Ok(())
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Value> {
@@ -668,32 +609,6 @@ mod tests {
     use super::*;
     use crate::paths::Env;
     use crate::runner::fake::FakeRunner;
-
-    #[test]
-    fn raw_question_does_not_bypass_the_typed_envelope() {
-        assert!(
-            parse_envelopes("Keep it running, or stop it now?")
-                .unwrap_err()
-                .to_string()
-                .contains("ade-say")
-        );
-    }
-
-    #[test]
-    fn prose_question_is_private_when_say_envelope_exists() {
-        let messages = parse_envelopes(
-            "Keep it running, or stop it now?\n```ade-say\nwhat: The work is ready.\n```",
-        )
-        .unwrap();
-        assert_eq!(
-            messages,
-            vec![HumanMessage::Say {
-                what: "The work is ready.".into(),
-                means: None,
-                landed_round: None
-            }]
-        );
-    }
 
     #[test]
     fn claude_install_is_idempotent_and_preserves_unrelated_hooks() {
@@ -1004,55 +919,63 @@ mod tests {
         assert!(crate::talk::recent_requests(&project, 5).is_empty());
     }
 
-    /// Review defect: Claude's key was the transcript path, so the budget of
-    /// the first failing turn never reset for the rest of the session.
-    #[test]
-    fn a_new_human_turn_gets_a_new_key_and_a_continuation_keeps_it() {
+    fn receipt_project() -> (tempfile::TempDir, Project) {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let stop =
-            |active| serde_json::json!({"transcript_path": "/t.jsonl", "stop_hook_active": active});
-        let first = turn_key(&project, "s", &stop(false), "a").unwrap();
-        assert_eq!(turn_key(&project, "s", &stop(true), "b").unwrap(), first);
-        assert_ne!(turn_key(&project, "s", &stop(false), "a").unwrap(), first);
+        project
+            .update_coordinator(|record| {
+                record.pane_id = "w1:p1".into();
+                record.generation = 1;
+            })
+            .unwrap();
+        std::fs::create_dir_all(binding_path(&project).parent().unwrap()).unwrap();
+        project::write_json(
+            &binding_path(&project),
+            &Binding {
+                kind: "claude".into(),
+                project: "demo".into(),
+                pane: "w1:p1".into(),
+                session_id: "session-one".into(),
+                adapter: crate::adapters::Adapter::default(),
+            },
+        )
+        .unwrap();
+        begin_turn(
+            &project,
+            "claude",
+            "w1:p1",
+            "session-one",
+            &serde_json::json!({"prompt_id": "turn-one"}),
+        )
+        .unwrap();
+        (root, project)
     }
 
     #[test]
-    fn correction_budget_persists_across_continuations_and_exhausts_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let env = Env::for_test(temp.path(), &[]);
-        let runner = FakeRunner::new();
-        let root = temp.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: temp.path().join("config"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        for _ in 0..5 {
-            failed_check(
-                &ctx,
-                &project,
-                "claude",
-                "session-one",
-                "same-turn",
-                "plain_unknown_word: replace it",
-            )
-            .unwrap();
-        }
-        let budget = load_budget(&project, "session-one", "same-turn").unwrap();
-        assert_eq!(budget.corrections, 1);
-        let lines = crate::talk::read(&project).lines;
-        assert_eq!(lines.len(), 1);
+    fn a_turn_with_a_say_receipt_passes_the_stop_check_without_a_block() {
+        let (_root, project) = receipt_project();
+        record_receipt_for(&project, "say:s-1", "w1:p1").unwrap();
         assert_eq!(
-            lines[0].entry,
-            crate::talk::Entry::Notice {
-                id: "plain_exhausted".into()
-            }
+            stop_decision(&project, "claude", "w1:p1", "session-one").unwrap(),
+            StopDecision::Pass
         );
+        assert!(!current_turn_has_receipt(
+            &project,
+            "claude",
+            "w1:p1",
+            "session-one"
+        ));
+    }
+
+    #[test]
+    fn a_turn_without_a_receipt_is_sent_back() {
+        let (_root, project) = receipt_project();
+        assert_eq!(
+            stop_decision(&project, "claude", "w1:p1", "session-one").unwrap(),
+            StopDecision::SendBack
+        );
+        assert!(MISSING_RECEIPT.contains("ha say"));
+        assert_eq!(MISSING_RECEIPT.lines().count(), 1);
     }
 
     #[test]

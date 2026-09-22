@@ -525,7 +525,7 @@ fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
     } else {
         "the box was not ready, so this lane runs here"
     };
-    crate::ask::say(ctx, slug, what, None)
+    crate::ask::say(ctx, slug, what, None).map(|_| ())
 }
 
 /// Recipe readiness on a box is owned by the doctor probes.

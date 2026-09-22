@@ -21,8 +21,6 @@ pub(crate) struct HookAdapter {
     pub(crate) path: String,
     pub(crate) events: Vec<String>,
     pub(crate) prompt_event: String,
-    /// Candidate JSON fields, in order, containing the final reply.
-    pub(crate) last_message: Vec<String>,
     /// `block`, `followup`, or `none`.
     pub(crate) block: String,
 }
@@ -91,12 +89,9 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
         );
     }
     if row.talk
-        && (row.hook.shape == "none"
-            || row.hook.path.is_empty()
-            || row.hook.events.is_empty()
-            || row.hook.last_message.is_empty())
+        && (row.hook.shape == "none" || row.hook.path.is_empty() || row.hook.events.is_empty())
     {
-        bail!("adapter_invalid: talk adapter `{kind}` needs hook path, events, and last_message");
+        bail!("adapter_invalid: talk adapter `{kind}` needs a hook path and events");
     }
     if !matches!(row.hook.block.as_str(), "none" | "block" | "followup") {
         bail!(
@@ -116,20 +111,12 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
     Ok(())
 }
 
-fn hook(
-    shape: &str,
-    path: &str,
-    events: &[&str],
-    prompt: &str,
-    last: &[&str],
-    block: &str,
-) -> HookAdapter {
+fn hook(shape: &str, path: &str, events: &[&str], prompt: &str, block: &str) -> HookAdapter {
     HookAdapter {
         shape: shape.into(),
         path: path.into(),
         events: events.iter().map(|value| (*value).into()).collect(),
         prompt_event: prompt.into(),
-        last_message: last.iter().map(|value| (*value).into()).collect(),
         block: block.into(),
     }
 }
@@ -158,7 +145,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ".claude/settings.local.json",
             &["Stop", "UserPromptSubmit"],
             "UserPromptSubmit",
-            &["last_assistant_message"],
             "block",
         ),
         &[
@@ -184,14 +170,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
         "codex".into(),
         native(
             "codex",
-            hook(
-                "claude",
-                ".codex/hooks.json",
-                &["Stop"],
-                "",
-                &["last_assistant_message", "text"],
-                "block",
-            ),
+            hook("claude", ".codex/hooks.json", &["Stop"], "", "block"),
             &[
                 "exec",
                 "{args}",
@@ -210,7 +189,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ".cursor/hooks.json",
             &["afterAgentResponse", "stop"],
             "",
-            &["text", "response"],
             "followup",
         ),
         &["{args}", "-p", "Reply only OK."],
@@ -225,7 +203,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ".agy/hooks.json",
             &["Stop", "UserPromptSubmit"],
             "UserPromptSubmit",
-            &["last_assistant_message", "text"],
             "block",
         ),
         &["{args}", "-p", "Reply only OK.", "--print-timeout", "60s"],
@@ -251,7 +228,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
                 ".pi/hooks.json",
                 &["Stop", "UserPromptSubmit"],
                 "UserPromptSubmit",
-                &["last_assistant_message", "text"],
                 "block",
             ),
             doctor: DoctorAdapter {
@@ -307,14 +283,6 @@ pub(crate) fn settings_path(project_dir: &Path, adapter: &Adapter) -> Option<Pat
         .then(|| project_dir.join(&adapter.hook.path))
 }
 
-pub(crate) fn reply_text<'a>(adapter: &Adapter, input: &'a serde_json::Value) -> Option<&'a str> {
-    adapter
-        .hook
-        .last_message
-        .iter()
-        .find_map(|field| input[field].as_str())
-}
-
 pub(crate) fn correction(adapter: &Adapter, reason: &str) -> Option<serde_json::Value> {
     match adapter.hook.block.as_str() {
         "block" => Some(serde_json::json!({ "decision": "block", "reason": reason })),
@@ -357,7 +325,6 @@ hook.shape = "claude"
 hook.path = ".acme/hooks.json"
 hook.events = ["Stop", "UserPromptSubmit"]
 hook.prompt_event = "UserPromptSubmit"
-hook.last_message = ["answer"]
 hook.block = "block"
 "#,
         )
@@ -365,10 +332,6 @@ hook.block = "block"
         let row = declaration(dir.path(), "acme").unwrap();
         assert_eq!(row.binary, "acme-agent");
         assert_eq!(launch_args(&row, &Recipe::default()), ["--yes"]);
-        assert_eq!(
-            reply_text(&row, &serde_json::json!({"answer":"done"})),
-            Some("done")
-        );
     }
 
     #[test]
