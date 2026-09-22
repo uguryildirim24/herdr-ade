@@ -110,6 +110,11 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Provenanced project memory and standing instructions
+    Note {
+        #[command(subcommand)]
+        command: NoteCommand,
+    },
     /// Threads: the project's worker agents
     Thread {
         #[command(subcommand)]
@@ -1441,6 +1446,9 @@ enum TaskCommand {
         repo: Option<String>,
         #[arg(long, value_name = "STEP")]
         plan_step: Option<String>,
+        /// Older note, instruction, decision or task this task replaces
+        #[arg(long)]
+        replaces: Option<String>,
     },
     /// Show one task and its derived state
     Show { slug: String, id: String },
@@ -1451,6 +1459,12 @@ enum TaskCommand {
         slug: String,
         id: String,
         text: String,
+        /// Request id behind this note
+        #[arg(long)]
+        request: String,
+        /// Note or instruction this explicitly replaces
+        #[arg(long)]
+        replaces: Option<String>,
     },
     /// Link a thread and its historical rounds to this task
     Adopt {
@@ -1469,6 +1483,26 @@ enum TaskCommand {
         command: String,
         #[arg(long = "acceptance")]
         acceptance: Vec<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NoteCommand {
+    /// Add a memory note or standing instruction with its provenance
+    Add {
+        slug: String,
+        text: String,
+        #[arg(long, value_enum)]
+        kind: crate::note::Kind,
+        /// Request id behind this note
+        #[arg(long)]
+        request: String,
+        /// Note or instruction this explicitly replaces
+        #[arg(long)]
+        replaces: Option<String>,
+        /// Limit this note to briefs for these stable tasks
+        #[arg(long = "task")]
+        tasks: Vec<String>,
     },
 }
 
@@ -2015,6 +2049,26 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 Ok(())
             }
         },
+        Command::Note { command } => match command {
+            NoteCommand::Add {
+                slug,
+                text,
+                kind,
+                request,
+                replaces,
+                tasks,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let note =
+                    crate::note::add(&project, kind, &text, &request, replaces.as_deref(), tasks)?;
+                crate::output::success(
+                    Some("noted"),
+                    &serde_json::json!({ "note": note }),
+                    &format!("noted {}\n", note.id),
+                    "",
+                )
+            }
+        },
         Command::Task { command } => match command {
             TaskCommand::Add {
                 slug,
@@ -2023,6 +2077,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                 acceptance,
                 repo,
                 plan_step,
+                replaces,
             } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let authority = requests
@@ -2035,8 +2090,9 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                         }
                     })
                     .collect();
-                let record =
-                    crate::task::add(&project, &title, authority, acceptance, repo, plan_step)?;
+                let record = crate::task::add(
+                    &project, &title, authority, acceptance, repo, plan_step, replaces,
+                )?;
                 let view = crate::task::view(&project, record);
                 crate::output::success(
                     Some("added"),
@@ -2078,9 +2134,16 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     "",
                 )
             }
-            TaskCommand::Note { slug, id, text } => {
+            TaskCommand::Note {
+                slug,
+                id,
+                text,
+                request,
+                replaces,
+            } => {
                 let project = Project::load(&ctx.root, &slug)?;
-                let record = crate::task::note(&project, &id, &text)?;
+                let record =
+                    crate::task::note(&project, &id, &text, &request, replaces.as_deref())?;
                 let view = crate::task::view(&project, record);
                 crate::output::success(
                     Some("noted"),
@@ -2169,6 +2232,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                             acceptance,
                             repo.clone(),
                             plan_step,
+                            None,
                         )?
                         .id
                     }
@@ -2190,7 +2254,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command, observed_project: Option<&Project>) 
                     },
                 )?;
                 if !task_id.is_empty() {
-                    crate::task::link_attempt(&project, &task_id, &thread.id)?;
                     crate::output::insert("task", task_id);
                 }
                 crate::output::insert("id", thread.id.clone());
