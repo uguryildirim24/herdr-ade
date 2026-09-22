@@ -2548,17 +2548,29 @@ fn open_accepts_a_non_claude_coordinator_recipe() {
 fn the_digest_warns_when_memory_is_over_budget() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
-    std::fs::create_dir_all(project.dir().join("memory")).unwrap();
-    std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n- state\n").unwrap();
-    std::fs::write(
-        project.dir().join("memory/state.md"),
-        "x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
+    crate::talk::append(
+        &project,
+        None,
+        crate::talk::Entry::Rolf {
+            request: "q-1".into(),
+            text: "Keep helper briefs focused.".into(),
+            answer: None,
+        },
+    )
+    .unwrap();
+    let note = crate::note::add(
+        &project,
+        crate::note::Kind::Memory,
+        &"x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
+        "q-1",
+        None,
+        vec![],
     )
     .unwrap();
     let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
     assert!(digest.contains("memory over budget"), "{digest}");
-    assert!(digest.contains("memory/state.md"), "{digest}");
-    assert!(digest.contains("memory/archive/"), "{digest}");
+    assert!(digest.contains(&note.id), "{digest}");
+    assert!(digest.contains("replace stale dated notes"), "{digest}");
 }
 
 fn parse_json_stdout(out: &crate::runner::Output) -> serde_json::Value {
