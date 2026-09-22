@@ -438,6 +438,8 @@ fn box_build(
          cd {path}\n\
          git fetch --quiet\n\
          git merge --ff-only @{{u}}\n\
+         # The box clone's files arrive by sync, but its index does not.\n\
+         git read-tree HEAD && git update-index -q --refresh\n\
          source_head=\"$(git rev-parse HEAD)\"\n\
          source_dirty=\"$(git status --porcelain --untracked-files=normal)\"\n\
          export PATH={build_path}\n\
