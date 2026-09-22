@@ -6105,7 +6105,10 @@ mod tests {
             crate::runner::fake::ok(r#"{"result":{}}"#),
         );
         let state = crate::threads::prompt(&ctx, "demo", &id, "carry on").unwrap();
-        assert_eq!(state, "blocked");
+        assert!(matches!(
+            state,
+            crate::threads::PromptOutcome::Sent { agent_state, .. } if agent_state == "blocked"
+        ));
         assert_eq!(fx.world.runner.count("agent prompt"), 0);
         assert_eq!(fx.world.runner.count("pane send-text"), 1);
         assert_eq!(fx.world.runner.count("pane send-keys"), 1);

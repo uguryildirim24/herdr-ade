@@ -814,23 +814,121 @@ fn thread_pass(
             live.state_secs = live.state_secs.max(thread::BLOCKED_DEBOUNCE_SECS);
         }
 
+        let ready = live
+            .agent_state
+            .as_deref()
+            .is_some_and(crate::herdr::ready_state);
         let mut delivered = false;
-        if t.prompt_pending
-            && live
-                .agent_state
-                .as_deref()
-                .is_some_and(crate::herdr::ready_state)
-        {
+        if t.prompt_pending && ready {
             match herdr.agent_prompt_wait_started(
                 &t.pane_id,
                 &thread::launch_prompt(prefix, slug, t),
                 agent_start_timeout(&t.launch),
             ) {
-                Ok(()) => delivered = true,
+                Ok(()) => {
+                    delivered = true;
+                    thread::update(project, &t.id, |thread| thread.prompt_pending = false)?;
+                }
                 Err(error) => {
                     pass.error = pass
                         .error
                         .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+                }
+            }
+        } else if !t.prompt_pending && t.bootstrap == "acknowledged" && ready {
+            // The matching bootstrap receipt proves the lane consumed this
+            // attempt's brief. Mark each message uncertain before transport:
+            // a crash or ambiguous transport result must never resend it.
+            loop {
+                let current = thread::load(project, &t.id)?;
+                if current.status != thread::Status::Open
+                    || current.prompt_pending
+                    || current.bootstrap != "acknowledged"
+                {
+                    break;
+                }
+                let attempt = current.attempt.max(1);
+                let Some((index, follow_up)) = current
+                    .follow_ups
+                    .iter()
+                    .enumerate()
+                    .find(|(_, follow_up)| {
+                        follow_up.attempt == attempt
+                            && matches!(
+                                follow_up.state,
+                                thread::FollowUpState::Queued | thread::FollowUpState::Uncertain
+                            )
+                    })
+                    .map(|(index, follow_up)| (index, follow_up.clone()))
+                else {
+                    break;
+                };
+                if follow_up.state == thread::FollowUpState::Uncertain {
+                    break;
+                }
+                thread::update_checked(project, &t.id, |thread| {
+                    if thread.status != thread::Status::Open
+                        || thread.attempt.max(1) != attempt
+                        || thread.follow_ups.get(index) != Some(&follow_up)
+                    {
+                        anyhow::bail!("queued follow-up changed before delivery");
+                    }
+                    thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
+                    Ok(())
+                })?;
+                match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
+                    Ok(()) => {
+                        delivered = true;
+                        thread::update_checked(project, &t.id, |thread| {
+                            let Some(saved) = thread.follow_ups.get(index) else {
+                                anyhow::bail!("queued follow-up disappeared during delivery");
+                            };
+                            if saved.attempt != attempt
+                                || saved.text != follow_up.text
+                                || saved.state != thread::FollowUpState::Uncertain
+                            {
+                                anyhow::bail!("queued follow-up changed during delivery");
+                            }
+                            thread.follow_ups.remove(index);
+                            Ok(())
+                        })?;
+                    }
+                    Err(error)
+                        if !matches!(error.code.as_str(), "timeout" | "unreachable" | "failed") =>
+                    {
+                        // Herdr refused before typing (for example a newly
+                        // blocked approval prompt), so this remains retryable.
+                        thread::update_checked(project, &t.id, |thread| {
+                            if let Some(saved) = thread.follow_ups.get_mut(index)
+                                && saved.attempt == attempt
+                                && saved.text == follow_up.text
+                                && saved.state == thread::FollowUpState::Uncertain
+                            {
+                                saved.state = thread::FollowUpState::Queued;
+                            }
+                            Ok(())
+                        })?;
+                        pass.error = pass
+                            .error
+                            .or(Some(anyhow::anyhow!("{}: queued prompt: {error}", t.id)));
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = inbox::write(
+                            project,
+                            "prompt-uncertain",
+                            &t.id,
+                            &format!(
+                                "{} attempt {attempt} may have received a follow-up; check the lane before sending it again",
+                                t.id
+                            ),
+                            "",
+                        );
+                        pass.error = pass
+                            .error
+                            .or(Some(anyhow::anyhow!("{}: queued prompt: {error}", t.id)));
+                        break;
+                    }
                 }
             }
         }
@@ -842,11 +940,11 @@ fn thread_pass(
             Some(hashes) => hashes.get(&t.id).cloned(),
             None => thread::local_report_hash(t),
         };
-        let report_hash = fresh_hash.unwrap_or_else(|| t.report_hash.clone());
+        let current = thread::load(project, &t.id)?;
+        let report_hash = fresh_hash.unwrap_or_else(|| current.report_hash.clone());
         let after = thread::Thread {
-            prompt_pending: t.prompt_pending && !delivered,
             report_hash,
-            ..t.clone()
+            ..current
         };
         // In the tick that delivers a prompt the agent still reads as idle; it
         // has just been given work, so it is Working, not Idle.
@@ -858,7 +956,9 @@ fn thread_pass(
         let process_gone = !t.is_remote()
             && after.report_hash.is_empty()
             && (!live.pane_exists
-                || (live.agent_state.is_none() && !t.prompt_pending && !t.last_state.is_empty()));
+                || (live.agent_state.is_none()
+                    && !after.prompt_pending
+                    && !t.last_state.is_empty()));
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
             if let Err(error) = threads::fail_start(
@@ -877,9 +977,6 @@ fn thread_pass(
         }
         if t.is_remote() || delivered || state != t.last_state || group.token() != t.last_group {
             thread::update(project, &t.id, |t| {
-                if delivered {
-                    t.prompt_pending = false;
-                }
                 if state != t.last_state {
                     t.last_state = state.clone();
                     t.last_state_change = project::now();
@@ -1557,7 +1654,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
 mod tests {
     use super::*;
     use crate::paths::Env;
-    use crate::runner::fake::{FakeRunner, fail, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok, timeout};
 
     fn held(version: &str) -> LockState {
         LockState::Held(Info {
@@ -1914,6 +2011,159 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn follow_ups_queued_during_start_arrive_after_the_brief_in_order() {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Open;
+            lane.prompt_pending = true;
+            lane.workspace_id = "w1".into();
+            lane.tab_id = "w1:t2".into();
+            lane.pane_id = "w1:p2".into();
+            lane.cwd = "/wt".into();
+            lane.agent = "claude".into();
+            lane.agent_name = "hp-demo-t-0001".into();
+        })
+        .unwrap();
+
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane.id, "check the first gate").unwrap(),
+            crate::threads::PromptOutcome::Queued { attempt: 1 }
+        ));
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane.id, "then check the second gate").unwrap(),
+            crate::threads::PromptOutcome::Queued { attempt: 1 }
+        ));
+        assert_eq!(runner.count("agent prompt"), 0);
+
+        let agent = Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            name: lane.agent_name.clone(),
+            agent: lane.agent.clone(),
+            agent_status: "idle".into(),
+            cwd: lane.cwd.clone(),
+            ..Agent::default()
+        };
+        let pane = Pane {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let run_pass = || {
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &f.project,
+                    herdr: &herdr,
+                    threads: &[thread::load(&f.project, &lane.id).unwrap()],
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+            )
+            .unwrap()
+        };
+        let pass = run_pass();
+        assert!(pass.error.is_none());
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(
+            thread::load(&f.project, &lane.id).unwrap().follow_ups.len(),
+            2
+        );
+
+        // Transporting the brief is not enough. The matching skill receipt is
+        // the ordering gate for follow-ups.
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.bootstrap = "acknowledged".into()
+        })
+        .unwrap();
+        let pass = run_pass();
+        assert!(pass.error.is_none());
+
+        let calls = runner.calls.borrow();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.display().contains("agent prompt"))
+            .map(|call| call.display())
+            .collect();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("skill lane"), "{}", prompts[0]);
+        assert!(
+            prompts[1].contains("check the first gate"),
+            "{}",
+            prompts[1]
+        );
+        assert!(
+            prompts[2].contains("then check the second gate"),
+            "{}",
+            prompts[2]
+        );
+        let saved = thread::load(&f.project, &lane.id).unwrap();
+        assert!(!saved.prompt_pending);
+        assert!(saved.follow_ups.is_empty());
+        drop(calls);
+
+        // Ambiguous transport is durable before the call and is never blindly
+        // retried on a later pass.
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.follow_ups.push(thread::FollowUp {
+                attempt: 1,
+                text: "an uncertain clarification".into(),
+                state: thread::FollowUpState::Queued,
+            });
+        })
+        .unwrap();
+        let uncertain_runner = FakeRunner::new();
+        uncertain_runner.on("agent prompt", timeout());
+        uncertain_runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        let uncertain_ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &uncertain_runner,
+            detached_ticker: false,
+        };
+        let uncertain_herdr = Herdr::new("herdr", "", &uncertain_runner);
+        let uncertain_pass = || {
+            thread_pass(
+                &LaunchPass {
+                    ctx: &uncertain_ctx,
+                    project: &f.project,
+                    herdr: &uncertain_herdr,
+                    threads: &[thread::load(&f.project, &lane.id).unwrap()],
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+            )
+            .unwrap()
+        };
+        assert!(uncertain_pass().error.is_some());
+        assert!(uncertain_pass().error.is_none());
+        assert_eq!(uncertain_runner.count("agent prompt"), 1);
+        assert_eq!(
+            thread::load(&f.project, &lane.id).unwrap().follow_ups[0].state,
+            thread::FollowUpState::Uncertain
+        );
+        assert_eq!(crate::inbox::unhandled(&f.project).len(), 1);
     }
 
     fn write_task(project: &Project, attempts: Vec<String>) {
