@@ -1458,7 +1458,9 @@ fn guarded<T>(cleanup: impl FnMut(), run: impl FnOnce() -> Result<T>) -> Result<
 /// same build this process was already asked to start. The attempted version
 /// stops a broken hand-off loop without suppressing a later install.
 fn screen_should_reexec(installed: Option<&str>, attempted: Option<&str>) -> bool {
-    installed.is_some_and(|version| version != crate::VERSION && Some(version) != attempted)
+    installed.is_some_and(|version| {
+        !crate::build::same_commit(version, crate::VERSION) && Some(version) != attempted
+    })
 }
 
 fn screen_reexec_plan(ctx: &Ctx, attempted: Option<&str>) -> Option<(PathBuf, String)> {
