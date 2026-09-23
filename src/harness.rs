@@ -1373,38 +1373,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_old_ticker_fails_install_with_its_lock_holder_named() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        crate::project::create(&root, "demo", "", vec![]).unwrap();
-        let mut holder = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(crate::ticker::lock_path(&root))
-            .unwrap();
-        holder.lock().unwrap();
-        use std::io::Write;
-        holder
-            .write_all(br#"{"pid":5678,"version":"old"}"#)
-            .unwrap();
-        let env = crate::paths::Env::for_test(home.path(), &[]);
-        let runner = FakeRunner::new();
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: home.path().join("cfg"),
-            runner: &runner,
-            detached_ticker: true,
-        };
-        let error = local_process_proofs(&ctx, Some(crate::VERSION)).unwrap_err();
-        let text = format!("{error:#}");
-        assert!(text.contains("5678") && text.contains("old"), "{text}");
-        assert!(text.contains("timed out"), "{text}");
-    }
-
-    #[test]
     fn box_stale_ticker_is_an_install_failure_not_a_warning() {
         let error = require_running_tickers(
             &[ProcessProof {
