@@ -1310,6 +1310,7 @@ fn thread_start_is_refused_when_paused() {
         recipe: None,
         recipe_basis: None,
         task_id: String::new(),
+        review_round: String::new(),
     };
     let error = threads::start(&world.ctx(), "demo", args)
         .unwrap_err()
@@ -2242,6 +2243,7 @@ fn a_remote_thread_without_a_repo_is_refused() {
         recipe: None,
         recipe_basis: None,
         task_id: String::new(),
+        review_round: String::new(),
     };
     assert!(
         threads::start(&world.ctx(), "demo", args)

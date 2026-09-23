@@ -120,6 +120,8 @@ pub struct StartArgs {
     /// Verbatim words from a Rolf request attached to `task_id`.
     pub recipe_basis: Option<String>,
     pub task_id: String,
+    /// Internal reviewer identity; empty for every non-reviewer start.
+    pub review_round: String,
 }
 
 /// Internal birth sentence: required and structurally one sentence. Exact and
@@ -306,6 +308,7 @@ fn start_with_ticker(
         t.agent = launch.kind.clone();
         t.base = args.base.clone().unwrap_or_default();
         t.role = role.to_string();
+        t.review_round = args.review_round.clone();
         t.plain = args.plain.trim().to_string();
         t.attempt = 1;
         t.launch = launch.clone();
@@ -3621,6 +3624,7 @@ mod tests {
                 recipe_basis: None,
                 // The CLI maps `--job` to this stable task id.
                 task_id: stable_task.id.clone(),
+                review_round: String::new(),
             },
         )
         .unwrap();
@@ -3814,6 +3818,7 @@ mod tests {
             recipe: None,
             recipe_basis: None,
             task_id: String::new(),
+            review_round: String::new(),
         };
 
         let other = world.home.path().join("other");
@@ -3858,6 +3863,7 @@ mod tests {
                 recipe: None,
                 recipe_basis: None,
                 task_id: String::new(),
+                review_round: String::new(),
             },
         )
         .unwrap_err()
@@ -4036,6 +4042,7 @@ mod tests {
             recipe: None,
             recipe_basis: None,
             task_id: String::new(),
+            review_round: String::new(),
         }
     }
 
