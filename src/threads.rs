@@ -1913,6 +1913,49 @@ fn awaiting_bootstrap(record: &Thread) -> bool {
         && record.bootstrap != "acknowledged"
 }
 
+/// Box lane state has no Mac round records. Publish the barriers before the
+/// correction prompt can reach its pane, or refuse to send the prompt.
+pub(crate) fn sync_box_corrections(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if !record.is_remote() || record.machine_route() == crate::contracts::MACHINE_LOCAL {
+        return Ok(());
+    }
+    let events = crate::ops::correction_barriers(project, &record.id)?;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let bin = ctx.env.herdr_bin();
+    let profile =
+        remote::machine_profile(ctx.runner, &bin, &ctx.config_dir, record.machine_route())?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let dir = format!("{}/{}/.state/corrections", machine.root, project.slug);
+    let path = format!("{dir}/{}.toml", record.id);
+    let content = toml::to_string(&crate::ops::BoxCorrections {
+        thread: record.id.clone(),
+        attempt: record.attempt.max(1),
+        events,
+    })?;
+    let script = format!(
+        "set -e; mkdir -p {dir}; tmp=$(mktemp {dir}/.correction.XXXXXXXX); trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; mv \"$tmp\" {path}",
+        dir = remote::quote(&dir),
+        path = remote::quote(&path),
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        Some(&content),
+        std::time::Duration::from_secs(30),
+    )?;
+    if !out.success() {
+        bail!(
+            "could not publish correction barrier for {}: {}",
+            record.id,
+            out.error_text()
+        );
+    }
+    Ok(())
+}
+
 fn latest_waiting_event_id(
     events: &[crate::contracts::Event],
     thread: &str,
@@ -2040,6 +2083,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         })?;
         return Err(error);
     }
+    sync_box_corrections(ctx, &project, &record)?;
     // Herdr rejects `agent prompt` for every blocked pane. An adapter-owned
     // error screen is different from an approval dialog: submit through the
     // pane so the adapter's input hook clears its block. A blocked lane with
@@ -4508,6 +4552,49 @@ mod tests {
         let registered = git(&fx.repo, &["worktree", "list", "--porcelain"]);
         assert!(!registered.contains(&cancelled_path), "{registered}");
         assert!(!registered.contains(&resolved_path), "{registered}");
+    }
+
+    #[test]
+    fn correction_barrier_reaches_box_before_prompt_delivery() {
+        use crate::contracts::{RoundPhase, RoundRecord};
+        use crate::runner::fake::ok;
+
+        let fx = crate::round::testkit::fixture();
+        let record = thread::allocate(&fx.project, |t| {
+            t.machine = "box".into();
+            t.machine_id = "box-id".into();
+        })
+        .unwrap();
+        let round = RoundRecord {
+            round: "r54".into(),
+            phase: RoundPhase::UnderReview,
+            reviewer: Some(record.id.clone()),
+            reviewer_awaiting_report_after: Some(format!("{}-1-1", record.id)),
+            ..RoundRecord::default()
+        };
+        std::fs::create_dir_all(crate::round::rounds_dir(&fx.project)).unwrap();
+        std::fs::write(
+            crate::round::round_path(&fx.project, "r54"),
+            toml::to_string(&round).unwrap(),
+        )
+        .unwrap();
+        fx.world.runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"box-id","label":"box","target":"box","session":"default","enabled":true}]"#),
+        );
+        fx.world
+            .runner
+            .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+        sync_box_corrections(&fx.world.ctx(), &fx.project, &record).unwrap();
+        let calls = fx.world.runner.calls.borrow();
+        let sent = calls.iter().find(|cmd| cmd.program == "ssh").unwrap();
+        assert!(sent.args.last().unwrap().contains(".state/corrections"));
+        assert!(
+            sent.stdin
+                .as_ref()
+                .unwrap()
+                .contains(&format!("{}-1-1", record.id))
+        );
     }
 
     #[test]

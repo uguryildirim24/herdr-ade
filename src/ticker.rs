@@ -809,6 +809,12 @@ fn thread_pass(
                 if follow_up.state == thread::FollowUpState::Uncertain {
                     break;
                 }
+                if let Err(error) = crate::threads::sync_box_corrections(ctx, project, &current) {
+                    pass.error = pass.error.or(Some(
+                        error.context(format!("{}: correction barrier before queued prompt", t.id)),
+                    ));
+                    break;
+                }
                 thread::update_checked(project, &t.id, |thread| {
                     if thread.status != thread::Status::Open
                         || thread.attempt.max(1) != attempt
