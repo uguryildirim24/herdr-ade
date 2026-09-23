@@ -560,19 +560,9 @@ fn begin_prompt_turn(
     rolf_request: bool,
 ) -> Result<()> {
     if input["queued"] == true {
-        if rolf_request {
-            let _lock = project.lock()?;
-            if let Some(mut turn) = project::read_json::<Turn>(&current_turn_path(project))
-                && !turn.completed
-                && turn.kind == kind
-                && turn.pane == pane
-                && turn.session == session
-                && turn.coordinator_attempt == project.coordinator().map_or(0, |c| c.attempt())
-            {
-                turn.rolf_request = true;
-                project::write_json(&current_turn_path(project), &turn)?;
-            }
-        }
+        // Pi has not shown these words to the running turn. Requiring a
+        // receipt now would force a board line before the lead can answer.
+        // The queued request becomes answerable at its own activation.
         return Ok(());
     }
     begin_turn(project, kind, pane, session, input, rolf_request)
@@ -1308,7 +1298,7 @@ plain = "the named helper"
     }
 
     #[test]
-    fn automated_turns_pass_but_a_queued_rolf_request_requires_a_reply() {
+    fn automated_turns_pass_and_a_queued_request_requires_a_reply_on_activation() {
         for kind in ["claude", "pi"] {
             let (_root, project) = receipt_project();
             for prompt in [
@@ -1330,9 +1320,10 @@ plain = "the named helper"
             begin_prompt_turn(&project, kind, "w1:p1", "session-one", &queued, true).unwrap();
             assert_eq!(
                 stop_decision(&project, kind, "w1:p1", "session-one").unwrap(),
-                StopDecision::SendBack
+                StopDecision::Pass,
+                "the active nudge has not seen Rolf's queued words"
             );
-            // Pi's delayed activation still carries the prompt hook's classification.
+            // Pi's delayed activation carries the prompt hook's classification.
             begin_turn(&project, kind, "w1:p1", "session-one", &queued, true).unwrap();
             assert_eq!(
                 stop_decision(&project, kind, "w1:p1", "session-one").unwrap(),
