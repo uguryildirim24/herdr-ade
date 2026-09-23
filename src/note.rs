@@ -45,6 +45,14 @@ pub(crate) struct Note {
     pub(crate) tasks: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Retirement {
+    pub(crate) id: String,
+    pub(crate) at: String,
+    pub(crate) request: String,
+    pub(crate) reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Row {
     pub(crate) id: String,
@@ -99,6 +107,17 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
             tasks: note.tasks,
         })
         .collect();
+    for retirement in retirements(project) {
+        rows.push(Row {
+            id: format!("retired:{}", retirement.id),
+            kind: "retirement".into(),
+            at: Some(retirement.at),
+            request: Some(retirement.request),
+            text: retirement.reason,
+            replaces: Some(retirement.id),
+            tasks: Vec::new(),
+        });
+    }
     for decision in crate::decide::read(project).records {
         let request = decision.request.clone().or_else(|| {
             decision
@@ -157,6 +176,54 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
         }
     }
     rows
+}
+
+fn retirements(project: &Project) -> Vec<Retirement> {
+    std::fs::read_to_string(project.record_file("retirements.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Retire a current memory or instruction without inventing a replacement fact.
+pub(crate) fn retire(
+    project: &Project,
+    id: &str,
+    request: &str,
+    reason: &str,
+) -> Result<Retirement> {
+    if reason.trim().is_empty() {
+        bail!("note_retirement: a reason is required");
+    }
+    let reference = if request.starts_with("request:") {
+        request.to_string()
+    } else {
+        format!("request:{request}")
+    };
+    let request = crate::decide::validate_basis(project, &reference)?;
+    let _replacement_lock = replacement_lock(project)?;
+    let _lock = project.lock()?;
+    if !read(project).iter().any(|note| note.id == id) {
+        bail!("note_retirement: no note `{id}` exists");
+    }
+    if replacement_map(&rows(project)).contains_key(id) {
+        bail!("note_retirement: `{id}` is already replaced or retired");
+    }
+    let record = Retirement {
+        id: id.to_string(),
+        at: project::now(),
+        request: request.trim_start_matches("request:").to_string(),
+        reason: reason.trim().to_string(),
+    };
+    let path = project.record_file_for_write("retirements.jsonl")?;
+    let mut file = File::options().create(true).append(true).open(path)?;
+    writeln!(file, "{}", serde_json::to_string(&record)?)?;
+    file.sync_all()?;
+    drop(file);
+    drop(_lock);
+    crate::project::refresh_page(project)?;
+    Ok(record)
 }
 
 pub(crate) fn replacement_map(rows: &[Row]) -> BTreeMap<String, String> {
@@ -261,7 +328,7 @@ pub(crate) fn active_rows(project: &Project) -> Vec<Row> {
     let rows = rows(project);
     let replaced: BTreeSet<String> = replacement_map(&rows).into_keys().collect();
     rows.into_iter()
-        .filter(|row| !replaced.contains(&row.id))
+        .filter(|row| row.kind != "retirement" && !replaced.contains(&row.id))
         .collect()
 }
 
@@ -343,6 +410,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().starts_with("decision_replaced"));
+    }
+
+    #[test]
+    fn retirement_keeps_history_but_removes_current_fact_and_instruction() {
+        let fx = fixture();
+        crate::talk::append(
+            &fx.project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-1".into(),
+                text: "These are no longer true.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        for kind in [Kind::Memory, Kind::Instruction] {
+            let note = add(
+                &fx.project,
+                kind,
+                "The old fact is true.",
+                "q-1",
+                None,
+                vec![],
+            )
+            .unwrap();
+            let retired = retire(&fx.project, &note.id, "q-1", "It is now false.").unwrap();
+            assert_eq!(retired.id, note.id);
+            assert!(read(&fx.project).iter().any(|old| old.id == note.id));
+            assert!(
+                !active_for(&fx.project, None)
+                    .iter()
+                    .any(|row| row.id == note.id)
+            );
+            assert!(retire(&fx.project, &note.id, "q-1", "Again.").is_err());
+        }
+        let page = std::fs::read_to_string(fx.project.project_md()).unwrap();
+        assert!(!page.contains("The old fact is true."));
+        assert_eq!(retirements(&fx.project).len(), 2);
     }
 
     #[test]

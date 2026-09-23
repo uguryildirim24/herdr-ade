@@ -87,6 +87,7 @@ enum Command {
     },
     /// Open a project: its workspace, coordinator tab and coordinator agent
     Open {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Send the priming prompt again
         #[arg(long)]
@@ -105,6 +106,7 @@ enum Command {
     },
     /// Print the digest the coordinator reads at the start of every turn
     Context {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Print without recording the inbox items as seen
         #[arg(long)]
@@ -112,6 +114,7 @@ enum Command {
     },
     /// Print threads grouped by what needs you
     Overview {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Include resolved thread history
         #[arg(long)]
@@ -121,7 +124,10 @@ enum Command {
         wait: bool,
     },
     /// Show only one project's panes in the sidebar, sorted by attention
-    Focus { slug: String },
+    Focus {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Clear the sidebar view (herdr holds one, so this clears any tool's view)
     Unfocus {
         #[command(flatten)]
@@ -166,15 +172,28 @@ enum Command {
         command: RoutineCommand,
     },
     /// Pause a project: the ticker skips it and `thread start` is refused
-    Pause { slug: String },
+    Pause {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Make a paused project active again
-    Resume { slug: String },
+    Resume {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Archive a project: paused, hidden, tokens cleared, `open` refused
-    Archive { slug: String },
+    Archive {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Make an archived project active again
-    Unarchive { slug: String },
+    Unarchive {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Delete a project everywhere; use `archive` to keep a reversible copy
     Delete {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Also permanently delete project-owned GitHub repositories
         #[arg(long)]
@@ -249,7 +268,10 @@ enum Command {
         role: String,
     },
     /// Retire a coordinator binding and remove its owned hook
-    Close { slug: String },
+    Close {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Plain-language checking and native correction hooks
     Plain {
         #[command(subcommand)]
@@ -280,6 +302,7 @@ enum Command {
     },
     /// Seal the handoff pair as a project artifact tied to the current commit
     Checkpoint {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// The coordinator pane (default: $HERDR_PANE_ID, then the record)
         #[arg(long)]
@@ -302,6 +325,7 @@ enum Command {
             required_unless_present = "all",
             conflicts_with = "all"
         )]
+        #[arg(value_name = "PROJECT")]
         slug: Option<String>,
         /// Cover every active project under the root
         #[arg(long)]
@@ -401,6 +425,7 @@ enum Command {
     },
     /// The talk tab: Rolf's checked conversation with the coordinator (SPEC-ADE D18)
     Talk {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Print the journal once and exit; sends nothing
         #[arg(long, conflicts_with_all = ["accepted", "open_tab"])]
@@ -414,6 +439,7 @@ enum Command {
     },
     /// Publish the board rows now, or print them
     Board {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Print one lane's board line (names its machine, SPEC-remote §5)
         #[arg(long, value_name = "THREAD")]
@@ -432,6 +458,7 @@ enum Command {
 enum RoundCommand {
     /// Open a round: its record, gate list and policy hash
     Open {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Optional round id followed by any lanes to admit
         #[arg(value_name = "ROUND_OR_THREAD")]
@@ -446,18 +473,21 @@ enum RoundCommand {
     },
     /// Admit a lane to the round's manifest
     Admit {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         thread: String,
     },
     /// Remove a lane from the round's manifest
     Remove {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         thread: String,
     },
     /// Replace this round's reviewer attempt without starting a duplicate
     Retry {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         #[arg(long)]
@@ -465,6 +495,7 @@ enum RoundCommand {
     },
     /// Stop the round, its lanes and reviewer, and retry pending cleanup
     Cancel {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         #[arg(long)]
@@ -472,6 +503,7 @@ enum RoundCommand {
     },
     /// Bind an existing live reviewer thread to this round
     Rebind {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         #[arg(long, value_name = "THREAD")]
@@ -479,6 +511,7 @@ enum RoundCommand {
     },
     /// Accept a lane's sealed work or a reviewer's valid sealed verdict
     Adopt {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         #[arg(long, value_name = "THREAD")]
@@ -486,9 +519,14 @@ enum RoundCommand {
     },
     /// Manual repair only: commit the review brief B, freeze the manifest,
     /// create the review branch. `round advance` does this on its own.
-    Review { slug: String, round: String },
+    Review {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        round: String,
+    },
     /// Merge on an exact MERGE verdict, then checkpoint; resumes after a crash
     Merge {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         round: String,
         /// Test-only fault injection: stop after ref, merged, intent or commit
@@ -496,11 +534,21 @@ enum RoundCommand {
         stop_after: Option<String>,
     },
     /// Start the review and reviewer for every ready round; announce verdicts
-    Advance { slug: String },
+    Advance {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Show one round's record and merge phase; omit ROUND to list all rounds
-    Show { slug: String, round: Option<String> },
+    Show {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        round: Option<String>,
+    },
     /// Run the ticker's pass for rounds, asks, talk and the board once
-    Tick { slug: String },
+    Tick {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -513,6 +561,7 @@ enum HarnessCommand {
 enum DialogueCommand {
     /// Record a dialogue and print the lines that start its two sides
     Start {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         topic: String,
         #[arg(long)]
@@ -530,6 +579,7 @@ enum DialogueCommand {
     },
     /// Record the critic's pane after checking who is in it
     Critic {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         topic: String,
         #[arg(long)]
@@ -537,13 +587,19 @@ enum DialogueCommand {
     },
     /// Pin the next turn and send the TURN line
     Turn {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         topic: String,
         #[arg(long)]
         resend: bool,
     },
     /// Commit the expected turn file, then advance
-    Commit { slug: String, topic: String, n: u32 },
+    Commit {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        topic: String,
+        n: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -559,12 +615,15 @@ enum PlanCommand {
         /// Project slug
         #[arg(value_name = "PROJECT")]
         slug: String,
-        #[arg(long, value_name = "KIND")]
+        /// End result: screen, command, background, document, picture, number, or finding
+        #[arg(long, value_parser = ["screen", "command", "background", "document", "picture", "number", "finding"])]
         kind: String,
+        /// One sentence about what this project delivers
         #[arg(long)]
         does: String,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
     /// Add, edit, link, unlink, remove or move one step
     Step {
@@ -587,21 +646,25 @@ enum PlanStepCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
         text: String,
+        /// Stable task ids to bind to this step
         #[arg(long = "task", value_name = "ID")]
         tasks: Vec<String>,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
     /// Replace one step's sentence
     Edit {
         /// Project slug
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Step id
         id: String,
         /// Replacement text
         text: String,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
     /// Add required work to a step
     Link {
@@ -609,10 +672,12 @@ enum PlanStepCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
+        /// Stable task ids to link to this step
         #[arg(long = "task", value_name = "ID", required = true)]
         tasks: Vec<String>,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
     /// Remove required work from a step
     Unlink {
@@ -620,12 +685,15 @@ enum PlanStepCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
+        /// Stable task ids to unlink from this step
         #[arg(long = "task", value_name = "ID", required = true)]
         tasks: Vec<String>,
+        /// Why this step or link is removed
         #[arg(long)]
         why: String,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
     /// Remove one step (identifiers are never reused)
     Remove {
@@ -633,10 +701,12 @@ enum PlanStepCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
+        /// Why this step or link is removed
         #[arg(long)]
         why: String,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
     /// Change display order only
     Move {
@@ -644,10 +714,12 @@ enum PlanStepCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
+        /// Step id that should follow this one
         #[arg(long, value_name = "ID")]
         before: String,
+        /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
-        expect: u64,
+        expect: Option<u64>,
     },
 }
 
@@ -656,6 +728,7 @@ enum DecideCommand {
     /// Overturn a decision, keeping its history
     Overturn {
         /// Project slug
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Decision id
         id: String,
@@ -682,6 +755,7 @@ enum AskCommand {
     /// Withdraw an open question, keeping its history
     Withdraw {
         /// Project slug
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Ask id
         id: String,
@@ -691,12 +765,14 @@ enum AskCommand {
     /// Answer an ask by id and revision
     Answer {
         /// Project slug
+        #[arg(value_name = "PROJECT")]
         slug: String,
         /// Ask id
         id: String,
         #[arg(long)]
         revision: u32,
-        choice: u32,
+        /// Choice number (0 means not understood), or exact choice sentence
+        choice: String,
     },
 }
 
@@ -1075,7 +1151,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 revision,
                 choice,
             }) => {
-                let answer = ask::answer(ctx, &slug, &id, revision, choice, "command")?;
+                let answer = ask::answer_text(ctx, &slug, &id, revision, &choice, "command")?;
                 crate::output::success(
                     Some("answered"),
                     &serde_json::json!({ "ask": id, "answer": answer }),
@@ -1469,24 +1545,48 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
 #[derive(Subcommand)]
 enum LedgerCommand {
     /// Open failures, worst repeat count first
-    List { slug: String },
+    List {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Show a failure and its evidence
-    Show { slug: String, id: String },
+    Show {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
     /// Close a failure
-    Done { slug: String, id: String },
+    Done {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
     /// Print an actionable task brief to standard output
-    Task { slug: String, id: String },
+    Task {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum InboxCommand {
+    /// List unhandled inbox items, oldest first
+    List {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Move handled items to inbox/done/
     Done {
+        #[arg(value_name = "PROJECT")]
         slug: String,
-        #[arg(value_name = "ITEM_ID", required_unless_present = "all")]
+        #[arg(value_name = "ITEM_ID", required_unless_present_any = ["all", "kind"])]
         ids: Vec<String>,
-        #[arg(long, conflicts_with = "ids")]
+        #[arg(long, conflicts_with_all = ["ids", "kind"])]
         all: bool,
+        /// Acknowledge every unhandled item of this kind
+        #[arg(long, conflicts_with = "ids")]
+        kind: Option<String>,
     },
 }
 
@@ -1494,6 +1594,7 @@ enum InboxCommand {
 enum TaskCommand {
     /// Add a task tied to Rolf's request and exact acceptance conditions
     Add {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         #[arg(long)]
         title: String,
@@ -1509,11 +1610,19 @@ enum TaskCommand {
         replaces: Option<String>,
     },
     /// Show one task and its derived state
-    Show { slug: String, id: String },
+    Show {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
     /// List tasks and their derived state
-    List { slug: String },
+    List {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Drop a task, or withdraw acceptance conditions replaced by a newer choice
     Drop {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long = "acceptance")]
@@ -1523,6 +1632,7 @@ enum TaskCommand {
     },
     /// Link a thread and its historical rounds to this task
     Adopt {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long)]
@@ -1530,6 +1640,7 @@ enum TaskCommand {
     },
     /// Record per-condition verification evidence
     Evidence {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long)]
@@ -1541,8 +1652,21 @@ enum TaskCommand {
 
 #[derive(Subcommand)]
 enum NoteCommand {
+    /// Retire a current memory or instruction, preserving its history
+    Retire {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+        /// Request id behind this retirement
+        #[arg(long)]
+        request: String,
+        /// Why this fact or instruction is no longer in force
+        #[arg(long)]
+        reason: String,
+    },
     /// Add a memory note or standing instruction with its provenance
     Add {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         text: String,
         #[arg(long, value_enum)]
@@ -1563,6 +1687,7 @@ enum NoteCommand {
 enum ThreadCommand {
     /// Start a thread from a stable task; explicit details override that task
     Start {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         #[arg(long)]
         title: Option<String>,
@@ -1600,6 +1725,7 @@ enum ThreadCommand {
     },
     /// Replace a failed, blocked, or stuck attempt through bounded routing
     Retry {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long)]
@@ -1607,6 +1733,7 @@ enum ThreadCommand {
     },
     /// Stop a thread, close its pane and remove its clean worktree
     Cancel {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long)]
@@ -1614,6 +1741,7 @@ enum ThreadCommand {
     },
     /// Point this thread at the verified live process already doing its work
     Rebind {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long, value_name = "PANE")]
@@ -1621,6 +1749,7 @@ enum ThreadCommand {
     },
     /// Seal completion from a resolved lane's verified stored report
     Attest {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long)]
@@ -1628,6 +1757,7 @@ enum ThreadCommand {
     },
     /// Send a follow-up to a thread's agent
     Prompt {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         /// The text; `-` reads standard input
@@ -1635,11 +1765,19 @@ enum ThreadCommand {
         text_file: String,
     },
     /// List threads with live state and group
-    List { slug: String },
+    List {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Show one thread's record
-    Show { slug: String, id: String },
+    Show {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
     /// Record an existing local agent pane as a thread of this project
     Adopt {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         #[arg(long, value_name = "ID")]
         pane: String,
@@ -1658,9 +1796,14 @@ enum ThreadCommand {
         passive: bool,
     },
     /// Record that the user has seen the current report
-    Ack { slug: String, id: String },
+    Ack {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
     /// Resolve a thread (final copy first), or reopen a resolved one
     Resolve {
+        #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
         #[arg(long, conflicts_with_all = ["skip_copy", "discard_uncopied", "keep_pane"])]
@@ -1722,15 +1865,25 @@ enum MachineCommand {
 #[derive(Subcommand)]
 enum RoutineCommand {
     /// Approve a routine's command (a person at a terminal only)
-    Approve { slug: String, name: String },
+    Approve {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        name: String,
+    },
     /// List routines with their approval status
-    List { slug: String },
+    List {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum SafetyCommand {
     /// Print the effective safety settings and the config.toml table to edit
-    Show { slug: String },
+    Show {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2131,14 +2284,36 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             Ok(())
         }
         Command::Inbox { command } => match command {
-            InboxCommand::Done { slug, ids, all } => {
+            InboxCommand::List { slug } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let items = inbox::unhandled(&project);
+                let human = if items.is_empty() {
+                    "no unhandled inbox items\n".to_string()
+                } else {
+                    items
+                        .iter()
+                        .map(|item| format!("{}  {}  {}\n", item.id, item.kind, item.summary))
+                        .collect()
+                };
+                crate::output::success(None, &serde_json::json!({ "items": items }), &human, "")
+            }
+            InboxCommand::Done {
+                slug,
+                ids,
+                all,
+                kind,
+            } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let record = project.coordinator();
                 let pane = std::env::var("HERDR_PANE_ID").ok();
                 let binding = record
                     .as_ref()
                     .and_then(|record| pane.as_deref().map(|pane| (pane, record.attempt())));
-                let result = inbox::done_bound(&project, &ids, all, binding)?;
+                let result = if let Some(kind) = kind {
+                    inbox::done_kind_bound(&project, &kind, binding)?
+                } else {
+                    inbox::done_bound(&project, &ids, all, binding)?
+                };
                 crate::output::success(
                     None,
                     &serde_json::json!({
@@ -2190,6 +2365,21 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             }
         },
         Command::Note { command } => match command {
+            NoteCommand::Retire {
+                slug,
+                id,
+                request,
+                reason,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::note::retire(&project, &id, &request, &reason)?;
+                crate::output::success(
+                    Some("retired"),
+                    &serde_json::json!({ "retirement": record }),
+                    &format!("retired {id}\n"),
+                    "",
+                )
+            }
             NoteCommand::Add {
                 slug,
                 text,
@@ -2855,6 +3045,98 @@ mod tests {
                 && binding == "w1G:p1"
                 && phase == "prompt"
         ));
+    }
+
+    #[test]
+    fn enum_flags_name_values_in_help_and_errors() {
+        for (path, flag, values) in [
+            (
+                &["plan", "set"][..],
+                "--kind",
+                "screen, command, background, document, picture, number, finding",
+            ),
+            (&["note", "add"][..], "--kind", "memory, instruction"),
+            (
+                &["decide"][..],
+                "--class",
+                "what-you-get, money, undo, routine",
+            ),
+            (
+                &["failed"][..],
+                "--class",
+                "provider, lost_connection, process_gone, work_failed, unknown",
+            ),
+        ] {
+            let mut help = vec!["herdr-ade"];
+            help.extend(path);
+            help.push("--help");
+            let rendered = Cli::try_parse_from(help).err().unwrap().to_string();
+            assert!(
+                rendered.contains("[possible values:"),
+                "{path:?}: {rendered}"
+            );
+            for value in values.split(", ") {
+                assert!(rendered.contains(value), "{path:?}: {value}");
+            }
+            let mut invalid = vec!["herdr-ade"];
+            invalid.extend(path);
+            invalid.extend([flag, "not-a-valid-value"]);
+            let error = Cli::try_parse_from(invalid).err().unwrap().to_string();
+            assert!(error.contains("[possible values:"), "{path:?}: {error}");
+            for value in values.split(", ") {
+                assert!(error.contains(value), "{path:?}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn project_positionals_use_project_in_every_command_usage() {
+        fn visit(command: &clap::Command) {
+            for arg in command.get_arguments().filter(|arg| arg.get_id() == "slug") {
+                assert_eq!(
+                    arg.get_value_names().unwrap()[0].as_str(),
+                    "PROJECT",
+                    "{}",
+                    command.get_name()
+                );
+            }
+            for subcommand in command.get_subcommands() {
+                visit(subcommand);
+            }
+        }
+        visit(&Cli::command());
+        assert!(Cli::try_parse_from(["herdr-ade", "inbox", "list", "demo"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["herdr-ade", "inbox", "done", "demo", "--kind", "routine"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "herdr-ade",
+                "note",
+                "retire",
+                "demo",
+                "n-0001",
+                "--request",
+                "q-1",
+                "--reason",
+                "Outdated."
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "herdr-ade",
+                "ask",
+                "answer",
+                "demo",
+                "a-1",
+                "--revision",
+                "1",
+                "Take the first option."
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
