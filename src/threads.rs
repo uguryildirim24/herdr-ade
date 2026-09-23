@@ -1477,6 +1477,15 @@ fn retry_with_ticker(
         }
         t.attempt = launch.attempt;
         t.agent = launch.kind.clone();
+        let machine = if t.machine.is_empty() {
+            "local"
+        } else {
+            &t.machine
+        };
+        t.placement_reason = format!(
+            "retry on `{machine}` with recipe `{}`; machine kept from the previous attempt",
+            launch.recipe_id
+        );
         t.launch = launch;
         t.status = Status::Failed;
         t.prompt_pending = false;
@@ -3322,10 +3331,12 @@ fn placement_summary(record: &Thread) -> String {
     } else {
         &record.machine
     };
-    format!(
-        "runs_on = {machine:?}\nplacement = {:?}\n",
-        record.placement_reason
-    )
+    let reason = if record.placement_reason.is_empty() {
+        "not recorded"
+    } else {
+        &record.placement_reason
+    };
+    format!("runs_on = {machine:?}\nplacement = {reason:?}\n")
 }
 
 pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
@@ -3861,6 +3872,8 @@ mod tests {
         assert_eq!(retried.launch.escalations, 0);
         assert_eq!(retried.launch.same_recipe_retries, 1);
         assert_eq!(retried.launch.brief_hash, started.launch.brief_hash);
+        assert!(retried.placement_reason.contains("retry on `local`"));
+        assert!(retried.placement_reason.contains(&retried.launch.recipe_id));
         let retried_brief = crate::thread::artifact(&project, &retried.launch.brief_hash).unwrap();
         assert!(String::from_utf8_lossy(&retried_brief).contains(lead_brief));
         let calls = world.runner.calls.borrow();
@@ -4471,6 +4484,9 @@ mod tests {
         let summary = placement_summary(&thread::load(&fx.project, &started.id).unwrap());
         assert!(summary.contains("runs_on = \"local\""), "{summary}");
         assert!(summary.contains("box_publish_url_missing"), "{summary}");
+        let mut older = started.clone();
+        older.placement_reason.clear();
+        assert!(placement_summary(&older).contains("placement = \"not recorded\""));
         assert!(
             started
                 .worktree_path
