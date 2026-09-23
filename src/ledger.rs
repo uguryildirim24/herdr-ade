@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -185,6 +185,8 @@ pub(crate) fn observe(project: &Project, kind: &str, subject: &str, detail: &str
             project.slug
         );
     }
+    // A failure in this pass must be visible to a later successful command.
+    invalidate_pending(project);
 }
 
 fn time_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -371,6 +373,7 @@ pub(crate) fn recovered(project: &Project, kind: &str, subject: &str) {
         }
         Ok(())
     })();
+    invalidate_pending(project);
     if let Err(e) = result {
         eprintln!("warning: could not record recovery: {e:#}");
     }
@@ -378,7 +381,59 @@ pub(crate) fn recovered(project: &Project, kind: &str, subject: &str) {
 
 // Child process failures are classified by each command's exit contract. A
 // normal negative answer is never a failure; an inability to answer is.
-thread_local! { static PROJECTS: RefCell<Vec<Project>> = const { RefCell::new(Vec::new()) }; }
+thread_local! {
+    static PROJECTS: RefCell<Vec<Project>> = const { RefCell::new(Vec::new()) };
+    static PENDING: RefCell<BTreeMap<PathBuf, PendingSnapshot>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// A stat is cheap; replaying the entire append-only ledger for every successful
+/// child command is not. Include length as well as mtime for coarse clocks.
+struct PendingSnapshot {
+    fingerprint: Option<(u64, std::time::SystemTime)>,
+    keys: BTreeSet<(String, String)>,
+}
+
+fn fingerprint(path: &Path) -> Result<Option<(u64, std::time::SystemTime)>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some((meta.len(), meta.modified()?))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn invalidate_pending(project: &Project) {
+    PENDING.with(|cache| {
+        cache
+            .borrow_mut()
+            .remove(&project.record_file("ledger.jsonl"));
+    });
+}
+
+fn command_recovery_needed(project: &Project, subject: &str) -> Result<bool> {
+    let path = project.record_file("ledger.jsonl");
+    let stamp = fingerprint(&path)?;
+    PENDING.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache
+            .get(&path)
+            .is_none_or(|snapshot| snapshot.fingerprint != stamp)
+        {
+            let _lock = lock(project)?;
+            let keys = load(project)?.pending;
+            cache.insert(
+                path.clone(),
+                PendingSnapshot {
+                    fingerprint: stamp,
+                    keys,
+                },
+            );
+        }
+        Ok(cache[&path]
+            .keys
+            .contains(&("command-failed".into(), subject.into())))
+    })
+}
+
 pub(crate) struct Scope(Vec<Project>);
 impl Scope {
     pub(crate) fn new(projects: &[&Project]) -> Self {
@@ -425,7 +480,11 @@ fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
     match result {
         Ok(out) if cmd.exit_meaning.answered(out) => PROJECTS.with(|projects| {
             for project in projects.borrow().iter() {
-                recovered(project, "command-failed", subject);
+                match command_recovery_needed(project, subject) {
+                    Ok(true) => recovered(project, "command-failed", subject),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("warning: could not check command recovery: {error:#}"),
+                }
             }
         }),
         Ok(out) => observe_current(
@@ -474,6 +533,19 @@ impl Runner for RecordingRunner<'_> {
 mod tests {
     use super::*;
     use crate::project;
+    #[test]
+    fn idle_command_recovery_reads_ledger_only_when_it_changes() {
+        let (_home, project) = fixture();
+        assert!(!command_recovery_needed(&project, "git status").unwrap());
+        observe(&project, "command-failed", "git status", "connection lost");
+        assert!(command_recovery_needed(&project, "git status").unwrap());
+        recovered(&project, "command-failed", "git status");
+        assert!(!command_recovery_needed(&project, "git status").unwrap());
+        // A later append in the same process invalidates the cached negative.
+        observe(&project, "command-failed", "git status", "connection lost");
+        assert!(command_recovery_needed(&project, "git status").unwrap());
+    }
+
     fn fixture() -> (tempfile::TempDir, Project) {
         let root = tempfile::tempdir().unwrap();
         let p = project::create(root.path(), "demo", "", vec![]).unwrap();
