@@ -806,6 +806,19 @@ pub fn latest_event<'e>(events: &'e [Event], thread: &str, attempt: u32) -> Opti
         .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
 }
 
+/// The seal before a follow-up may be followed by a waiting event. Keep
+/// tracking that completion until a newer completion replaces it.
+pub(crate) fn latest_done_event<'e>(
+    events: &'e [Event],
+    thread: &str,
+    attempt: u32,
+) -> Option<&'e Event> {
+    events
+        .iter()
+        .filter(|e| e.thread == thread && e.attempt == attempt && e.payload.done.is_some())
+        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
+}
+
 fn event_sequence(event: &Event) -> Option<u32> {
     event
         .id
@@ -7851,9 +7864,15 @@ mod tests {
         open_r1(&fx);
         let (lane, sha) = fx.lane(1);
         admit(&ctx, "demo", "r1", &lane).unwrap();
-        fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
+        let first_done = fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
         advance(&ctx, "demo").unwrap();
         let first_reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        fx.seal_waiting(&lane, 1, 2, "One more detail?");
+        assert_eq!(
+            latest_done_event(&sealed_events(&fx.project).unwrap(), &lane, 1)
+                .map(|event| event.id.as_str()),
+            Some(first_done.as_str()),
+        );
         thread::update(&fx.project, &lane, |thread| thread.prompt_pending = true).unwrap();
 
         assert!(matches!(
@@ -7872,7 +7891,7 @@ mod tests {
         assert!(advance(&ctx, "demo").unwrap().started.is_empty());
         thread::update(&fx.project, &lane, |thread| {
             thread.follow_ups[0].state = crate::thread::FollowUpState::Delivered;
-            thread.follow_ups[0].after_seal = format!("{lane}-1-1");
+            thread.follow_ups[0].after_seal = first_done;
             thread.follow_ups[0].delivered_at = crate::project::now();
         })
         .unwrap();
@@ -7881,7 +7900,7 @@ mod tests {
             "the first seal must not feed a review after the follow-up lands"
         );
 
-        fx.seal_done(&lane, 1, 2, &sha, "# second report\n");
+        fx.seal_done(&lane, 1, 3, &sha, "# second report\n");
         let advanced = advance(&ctx, "demo").unwrap();
         assert_eq!(advanced.started.len(), 1);
         assert_ne!(advanced.started[0].reviewer, first_reviewer);
