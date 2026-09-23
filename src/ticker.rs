@@ -945,6 +945,11 @@ fn thread_pass(
                     thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
                     Ok(())
                 })?;
+                let after_seal =
+                    crate::round::latest_event(&crate::events::list(project), &t.id, attempt)
+                        .filter(|event| event.payload.done.is_some())
+                        .map(|event| event.id.clone())
+                        .unwrap_or_default();
                 match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
                     Ok(()) => {
                         delivered = true;
@@ -964,7 +969,9 @@ fn thread_pass(
                             {
                                 anyhow::bail!("queued follow-up changed during delivery");
                             }
-                            thread.follow_ups.remove(index);
+                            thread.follow_ups[index].state = thread::FollowUpState::Delivered;
+                            thread.follow_ups[index].delivered_at = project::now();
+                            thread.follow_ups[index].after_seal = after_seal;
                             Ok(())
                         })?;
                     }
@@ -1276,8 +1283,29 @@ fn open_work_next_steps(project: &Project) -> BTreeMap<String, String> {
     crate::task::views(project)
         .0
         .into_iter()
-        .filter(|view| !view.terminal(project) && !view.next.starts_with("wait for Rolf"))
-        .map(|view| (view.record.id, view.next))
+        .filter(|view| {
+            !view.terminal(project) && !view.next.starts_with("wait for the queued follow-up")
+        })
+        .filter_map(|view| {
+            if let Some(wait) = crate::task::active_wait(project, &view.record) {
+                if wait.kind != "event" {
+                    return None;
+                }
+                let today = project::now().chars().take(10).collect::<String>();
+                if wait.since.starts_with(&today) {
+                    return None;
+                }
+                return Some((
+                    view.record.id.clone(),
+                    format!(
+                        "{} (still waiting on {}: {}; {today})",
+                        view.next, wait.kind, wait.target
+                    ),
+                ));
+            }
+            let suffix = view.record.wait.as_ref().map_or("", |_| " (hold resolved)");
+            Some((view.record.id, format!("{}{suffix}", view.next)))
+        })
         .collect()
 }
 
@@ -2740,7 +2768,10 @@ mod tests {
         );
         let saved = thread::load(&f.project, &lane.id).unwrap();
         assert!(!saved.prompt_pending);
-        assert!(saved.follow_ups.is_empty());
+        assert_eq!(saved.follow_ups.len(), 2);
+        assert!(saved.follow_ups.iter().all(|follow_up| follow_up.state
+            == thread::FollowUpState::Delivered
+            && !follow_up.delivered_at.is_empty()));
         assert_eq!(saved.answered_waiting_event, first_wait);
         assert_ne!(saved.answered_waiting_event, second_wait);
         drop(calls);
@@ -2787,7 +2818,7 @@ mod tests {
         assert!(uncertain_pass().error.is_none());
         assert_eq!(uncertain_runner.count("agent prompt"), 1);
         assert_eq!(
-            thread::load(&f.project, &lane.id).unwrap().follow_ups[0].state,
+            thread::load(&f.project, &lane.id).unwrap().follow_ups[2].state,
             thread::FollowUpState::Uncertain
         );
         assert_eq!(crate::inbox::unhandled(&f.project).len(), 1);
@@ -2907,6 +2938,90 @@ mod tests {
     }
 
     #[test]
+    fn task_holds_suppress_nudges_until_target_changes_and_events_repeat_daily() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Open;
+            lane.attempt = 1;
+        })
+        .unwrap();
+        let mut round = crate::contracts::RoundRecord {
+            round: "r1".into(),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(crate::round::rounds_dir(&f.project)).unwrap();
+        let file = crate::round::round_path(&f.project, "r1");
+        std::fs::write(&file, toml::to_string(&round).unwrap()).unwrap();
+        for (kind, target) in [("round", "r1"), ("lane", lane.id.as_str())] {
+            crate::task::set_wait(&f.project, "job-0001", kind, target).unwrap();
+            assert!(open_work_next_steps(&f.project).is_empty(), "{kind}");
+        }
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.status = thread::Status::Resolved
+        })
+        .unwrap();
+        assert!(open_work_next_steps(&f.project)["job-0001"].contains("hold resolved"));
+        assert!(
+            crate::task::render(
+                &f.project,
+                &crate::task::view(
+                    &f.project,
+                    crate::task::load(&f.project, "job-0001").unwrap()
+                )
+            )
+            .contains("hold resolved: lane")
+        );
+        crate::task::set_wait(&f.project, "job-0001", "round", "r1").unwrap();
+        assert!(open_work_next_steps(&f.project).is_empty());
+        round.phase = crate::contracts::RoundPhase::Abandoned;
+        std::fs::write(&file, toml::to_string(&round).unwrap()).unwrap();
+        assert!(open_work_next_steps(&f.project)["job-0001"].contains("hold resolved"));
+        let ask_dir = f.project.state_dir().join("asks/a-1");
+        std::fs::create_dir_all(&ask_dir).unwrap();
+        let ask = crate::contracts::Ask {
+            id: "a-1".into(),
+            revision: 1,
+            project: "demo".into(),
+            question: "Choose one?".into(),
+            choices: vec!["One".into()],
+            asked: project::now(),
+            ..Default::default()
+        };
+        std::fs::write(ask_dir.join("r1.toml"), toml::to_string(&ask).unwrap()).unwrap();
+        crate::task::set_wait(&f.project, "job-0001", "ask", "a-1").unwrap();
+        assert!(open_work_next_steps(&f.project).is_empty());
+        std::fs::write(
+            ask_dir.join("r1.answer.toml"),
+            toml::to_string(&crate::ask::Answer {
+                id: "a-1".into(),
+                revision: 1,
+                choice: 1,
+                text: "One".into(),
+                not_understood: false,
+                answered: project::now(),
+                by: "Rolf".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(open_work_next_steps(&f.project)["job-0001"].contains("hold resolved"));
+        crate::task::set_wait(&f.project, "job-0001", "event", "next Claude lane start").unwrap();
+        assert!(open_work_next_steps(&f.project).is_empty());
+        let mut task = crate::task::load(&f.project, "job-0001").unwrap();
+        task.wait.as_mut().unwrap().since = "2020-01-01T00:00:00Z".into();
+        std::fs::write(
+            f.project.state_dir().join("tasks/job-0001.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+        let today = project::now().chars().take(10).collect::<String>();
+        assert!(open_work_next_steps(&f.project)["job-0001"].contains(&today));
+        crate::task::clear_wait(&f.project, "job-0001").unwrap();
+        assert!(!open_work_next_steps(&f.project)["job-0001"].contains("waiting"));
+    }
+
+    #[test]
     fn dropped_tasks_are_not_actionable_work() {
         let f = fixture(false);
         write_task(&f.project, Vec::new());
@@ -2987,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn work_nudge_waits_when_a_lane_is_working_or_every_task_waits_on_rolf() {
+    fn work_nudge_waits_when_a_lane_is_working_but_lane_waits_need_the_coordinator() {
         let f = fixture(false);
         let lane = thread::allocate(&f.project, |lane| {
             lane.status = thread::Status::Open;
@@ -3022,7 +3137,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(open_work_next_steps(&f.project).is_empty());
+        assert_eq!(
+            open_work_next_steps(&f.project)
+                .get("job-0001")
+                .map(String::as_str),
+            Some("answer the lane wait: Choose the final colour.")
+        );
     }
 
     #[test]

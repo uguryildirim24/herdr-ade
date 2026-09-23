@@ -2079,6 +2079,8 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
                     state: FollowUpState::Queued,
                     waiting_event: latest_waiting_event_id(&events_before_send, id, attempt)
                         .unwrap_or_default(),
+                    queued_at: project::now(),
+                    ..FollowUp::default()
                 });
                 queued = true;
             }
@@ -2134,6 +2136,22 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     let attempt = record.attempt.max(1);
     let waiting = latest_waiting_event_id(&events_before_send, id, attempt).unwrap_or_default();
     record_answered_wait(&project, id, attempt, &waiting)?;
+    let after_seal = crate::round::latest_event(&events_before_send, id, attempt)
+        .filter(|event| event.payload.done.is_some())
+        .map(|event| event.id.clone())
+        .unwrap_or_default();
+    thread::update(&project, id, |thread| {
+        thread.follow_ups.push(FollowUp {
+            attempt,
+            text: text.to_string(),
+            state: FollowUpState::Delivered,
+            waiting_event: waiting.clone(),
+            queued_at: project::now(),
+            delivered_at: project::now(),
+            after_seal,
+            ..FollowUp::default()
+        });
+    })?;
     Ok(PromptOutcome::Sent {
         attempt,
         agent_state: state,
@@ -2409,6 +2427,22 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     }
     if args.skip_copy && args.discard_uncopied {
         bail!("--skip-copy cannot be combined with --discard-uncopied");
+    }
+    if record.follow_ups.iter().any(|f| {
+        f.attempt == record.attempt.max(1)
+            && (matches!(f.state, FollowUpState::Queued | FollowUpState::Uncertain)
+                || f.state == FollowUpState::Delivered
+                    && !f.after_seal.is_empty()
+                    && crate::round::latest_event(
+                        &crate::events::list(&project),
+                        id,
+                        record.attempt.max(1),
+                    )
+                    .is_some_and(|event| event.id == f.after_seal))
+    }) {
+        bail!(
+            "follow_up_pending: {id} must finish the queued follow-up and seal again before resolution"
+        );
     }
     crate::round::require_resolvable(&project, id)?;
 
@@ -3464,6 +3498,21 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     println!("live = {:?}", row.note);
     print!("{}", placement_summary(&record));
     print!("{}", toml::to_string(&record)?);
+    for (index, follow_up) in record.follow_ups.iter().enumerate() {
+        println!(
+            "follow-up {} [{}] queued={} delivered={} closed={} — {}",
+            index + 1,
+            format!("{:?}", follow_up.state).to_lowercase(),
+            follow_up.queued_at,
+            follow_up.delivered_at,
+            follow_up.closed_at,
+            follow_up
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     if let Some(attestation) = done_attestation(&project, &record) {
         println!(
             "attested = {:?}",
