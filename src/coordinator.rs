@@ -175,6 +175,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 
     // A project belongs to the session it was opened in.
     let mut previous = project.coordinator();
+    let mut rebound_launch = None;
     if let Some(record) = &previous
         && !record.socket.is_empty()
         && record.socket != socket
@@ -193,6 +194,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         }
         println!("rebinding `{slug}` from {} to {socket}", record.socket);
         crate::hook::remove(ctx, &project)?;
+        rebound_launch = Some(record.launch.clone());
         previous = None;
     }
 
@@ -253,6 +255,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let previous_launch = previous
         .as_ref()
         .map(|r| r.launch.clone())
+        .or(rebound_launch)
         .unwrap_or_default();
     let brief_hash =
         crate::thread::sha256_hex(&std::fs::read(project.project_md()).unwrap_or_default());
