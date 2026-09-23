@@ -1935,6 +1935,20 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         || awaiting_follow_up(&record)
     {
         let events_before_send = crate::round::sealed_events(&project)?;
+        // Keep the queued message invisible to the ticker until every round
+        // it affects is durably held. Working also closes the gap between this
+        // thread update and that hold for an already accepted reviewer.
+        let previous_group = record.last_group.clone();
+        thread::update(&project, id, |thread| {
+            thread.last_group = Group::Working.token().to_string();
+        })?;
+        if let Err(error) = crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)
+        {
+            thread::update(&project, id, |thread| {
+                thread.last_group = previous_group;
+            })?;
+            return Err(error);
+        }
         let mut queued = false;
         record = thread::update_checked(&project, id, |thread| {
             match thread.status {
@@ -1959,24 +1973,6 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             Ok(())
         })?;
         if queued {
-            if let Err(error) =
-                crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)
-            {
-                // The merge intent may have won just before this queue write.
-                // Remove the message so the ticker cannot deliver work against
-                // an already committed historical verdict.
-                let attempt = record.attempt.max(1);
-                thread::update(&project, id, |thread| {
-                    if let Some(index) = thread.follow_ups.iter().rposition(|follow_up| {
-                        follow_up.attempt == attempt
-                            && follow_up.text == text
-                            && follow_up.state == FollowUpState::Queued
-                    }) {
-                        thread.follow_ups.remove(index);
-                    }
-                })?;
-                return Err(error);
-            }
             return Ok(PromptOutcome::Queued {
                 attempt: record.attempt.max(1),
             });

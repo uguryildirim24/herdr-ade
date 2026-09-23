@@ -3482,7 +3482,8 @@ fn reviewer_completion(
                 follow_up.state,
                 crate::thread::FollowUpState::Queued | crate::thread::FollowUpState::Uncertain
             )
-    }) || (record.verdict.is_some() && lane.last_group == crate::thread::Group::Working.token())
+    }) || ((record.verdict.is_some() || record.reviewer_awaiting_report_after.is_some())
+        && lane.last_group == crate::thread::Group::Working.token())
     {
         return Ok(None);
     }
@@ -5337,6 +5338,12 @@ mod tests {
         thread::update(&fx.project, &reviewer, |thread| {
             thread.prompt_pending = false;
             thread.follow_ups.clear();
+        })
+        .unwrap();
+        // A completion that raced ahead of the correction delivery cannot
+        // satisfy the barrier while the reviewer is still recorded as working.
+        assert!(err(merge(&ctx, "demo", "r1", None)).starts_with("verdict_correction_pending"));
+        thread::update(&fx.project, &reviewer, |thread| {
             thread.last_group = crate::thread::Group::ReadyForReview.token().into();
         })
         .unwrap();
