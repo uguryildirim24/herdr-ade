@@ -74,9 +74,25 @@ pub(crate) struct Reservation<'a> {
     pub(crate) helper_pid: u32,
 }
 
+/// A done's report bytes and the round's correction barriers are part of its
+/// dedup key. Read the report before locking; stage_done still validates the
+/// report, git state and sha before any new event is sealed.
+pub(crate) fn reserve_done(project: &Project, r: Reservation<'_>, worktree: &Path) -> Result<Op> {
+    let Requested::Done { report_path, .. } = &r.requested else {
+        bail!("op_payload_invalid: reserve_done needs a done payload");
+    };
+    let report = stable_read(&resolve_report(worktree, report_path)?)?;
+    let hash = format!("{:x}", Sha256::digest(&report));
+    reserve_inner(project, r, Some(&hash))
+}
+
 /// Reserve the complete payload under the project lock. Same-payload retries
 /// resume one op. A changed payload abandons it and allocates the next id.
 pub(crate) fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
+    reserve_inner(project, r, None)
+}
+
+fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str>) -> Result<Op> {
     let Reservation {
         thread,
         attempt,
@@ -92,13 +108,51 @@ pub(crate) fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
         .filter(|op| op.thread == thread && op.attempt == attempt)
         .collect();
     existing.sort_by(|a, b| a.op.cmp(&b.op));
-    if let Some(op) = existing.iter().rev().find(|op| {
+    // The round record is authoritative for a requested correction. The
+    // barrier can still be present after a fresh done, before round advance;
+    // in that case retrying that fresh op must remain idempotent.
+    let barriers = if report_hash.is_some() {
+        crate::round::checked_list(project)?
+            .into_iter()
+            .filter(|record| !record.phase.closed())
+            .flat_map(|record| {
+                let mut barriers = Vec::new();
+                if record.reviewer.as_deref() == Some(thread) {
+                    barriers.extend(record.reviewer_awaiting_report_after);
+                }
+                for member in record.manifest.members {
+                    if member.thread == thread {
+                        barriers.extend(member.awaiting_report_after);
+                    }
+                }
+                barriers
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let matches = |op: &&Op| {
         op.state != OpState::Abandoned
             && op.kind == kind
             && op.requested == requested
             && op.recipient == recipient
             && op.round == round
-    }) {
+            && report_hash.is_none_or(|hash| op.artifact.as_deref().is_none_or(|a| a == hash))
+            && barriers.iter().all(|barrier| op_after_barrier(op, barrier))
+    };
+    // Only the latest done may be retried: reverting report bytes to an
+    // earlier version is still a new submission. Other verbs keep their
+    // existing same-payload retry semantics.
+    let reusable = if report_hash.is_some() {
+        existing
+            .iter()
+            .rev()
+            .find(|op| op.state != OpState::Abandoned)
+            .filter(matches)
+    } else {
+        existing.iter().rev().find(matches)
+    };
+    if let Some(op) = reusable {
         return Ok(op.clone());
     }
     for mut op in existing
@@ -134,6 +188,23 @@ pub(crate) fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
     };
     write_op(project, &op)?;
     Ok(op)
+}
+
+fn op_after_barrier(op: &Op, barrier: &str) -> bool {
+    let prefix = format!("{}-{}-", op.thread, op.attempt);
+    let Some(before) = barrier.strip_prefix(&prefix) else {
+        // A barrier from an earlier attempt cannot block this attempt.
+        return true;
+    };
+    match (
+        before.parse::<u32>(),
+        op.op
+            .strip_prefix(&prefix)
+            .and_then(|n| n.parse::<u32>().ok()),
+    ) {
+        (Ok(before), Some(now)) => now > before,
+        _ => false,
+    }
 }
 
 /// The published lane ref must equal `sha` before a box `done` stages
@@ -645,6 +716,128 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("ls-remote", ok("new\trefs/heads/hp/demo/reviewer\n"));
         check_published_ref(&runner, worktree, branch, url, "new").unwrap();
+    }
+
+    fn done_again(
+        project: &Project,
+        worktree: &Path,
+        runner: &dyn Runner,
+        recipient: &Recipient,
+        thread: &str,
+    ) -> Event {
+        let op = reserve_done(
+            project,
+            Reservation {
+                thread,
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient: recipient.clone(),
+                round: None,
+                requested: Requested::Done {
+                    sha: "abc".into(),
+                    report_path: "report.md".into(),
+                },
+                helper_pid: 1,
+            },
+            worktree,
+        )
+        .unwrap();
+        stage_done(project, &op.op, worktree, runner).unwrap();
+        seal(project, &op.op, |_| Ok(())).unwrap()
+    }
+
+    fn correction_round(project: &Project, thread: &str, barrier: &str, reviewer: bool) {
+        use crate::contracts::{ManifestMember, RoundPhase, RoundRecord};
+        let mut record = RoundRecord {
+            round: "r54".into(),
+            phase: RoundPhase::UnderReview,
+            ..RoundRecord::default()
+        };
+        if reviewer {
+            record.reviewer = Some(thread.into());
+            record.reviewer_awaiting_report_after = Some(barrier.into());
+        } else {
+            record.manifest.members.push(ManifestMember {
+                thread: thread.into(),
+                awaiting_report_after: Some(barrier.into()),
+                ..ManifestMember::default()
+            });
+        }
+        std::fs::create_dir_all(crate::round::rounds_dir(project)).unwrap();
+        std::fs::write(
+            crate::round::round_path(project, "r54"),
+            toml::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn r54_late_reviewer_correction_seals_a_new_event_with_the_same_sha_and_report() {
+        let (root, project, runner, recipient) = fixture();
+        let report = root.path().join("report.md");
+        std::fs::write(&report, "+++\nverdict = 'MERGE'\n+++\nfirst\n").unwrap();
+        let first = done_again(&project, root.path(), &runner, &recipient, "t-0088");
+        assert_eq!(
+            done_again(&project, root.path(), &runner, &recipient, "t-0088"),
+            first
+        );
+        // The prompt arrived only after the first verdict. Redoing the same
+        // bytes answers the correction, even before the round accepts it.
+        correction_round(&project, "t-0088", &first.id, true);
+        let second = done_again(&project, root.path(), &runner, &recipient, "t-0088");
+        assert_eq!(second.id, "t-0088-1-2");
+        assert_eq!(second.payload.done.as_ref().unwrap().sha, "abc");
+        assert_eq!(
+            second.payload.done.as_ref().unwrap().artifact,
+            first.payload.done.unwrap().artifact
+        );
+        assert_eq!(
+            done_again(&project, root.path(), &runner, &recipient, "t-0088"),
+            second
+        );
+        // r54 also had an edited report after the duplicate done. That edit
+        // must not continue pointing at the old sealed artifact either.
+        std::fs::write(&report, "+++\nverdict = 'MERGE'\n+++\ncorrected\n").unwrap();
+        let third = done_again(&project, root.path(), &runner, &recipient, "t-0088");
+        assert_eq!(third.id, "t-0088-1-3");
+        assert_ne!(
+            third.payload.done.as_ref().unwrap().artifact,
+            second.payload.done.as_ref().unwrap().artifact
+        );
+        assert_eq!(crate::round::sealed_events(&project).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn edited_report_with_unchanged_sha_seals_new_artifact_without_correction() {
+        let (root, project, runner, recipient) = fixture();
+        let report = root.path().join("report.md");
+        std::fs::write(&report, "first\n").unwrap();
+        let first = done_again(&project, root.path(), &runner, &recipient, "t-0001");
+        std::fs::write(&report, "corrected\n").unwrap();
+        let second = done_again(&project, root.path(), &runner, &recipient, "t-0001");
+        assert_eq!(second.id, "t-0001-1-2");
+        assert_ne!(
+            first.payload.done.unwrap().artifact,
+            second.payload.done.as_ref().unwrap().artifact
+        );
+        assert_eq!(
+            done_again(&project, root.path(), &runner, &recipient, "t-0001"),
+            second
+        );
+    }
+
+    #[test]
+    fn lane_correction_barrier_also_requires_a_fresh_done() {
+        let (root, project, runner, recipient) = fixture();
+        std::fs::write(root.path().join("report.md"), "unchanged\n").unwrap();
+        let first = done_again(&project, root.path(), &runner, &recipient, "t-0001");
+        correction_round(&project, "t-0001", &first.id, false);
+        let second = done_again(&project, root.path(), &runner, &recipient, "t-0001");
+        assert_eq!(second.id, "t-0001-1-2");
+        assert_eq!(
+            done_again(&project, root.path(), &runner, &recipient, "t-0001"),
+            second
+        );
     }
 
     #[test]
