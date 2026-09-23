@@ -25,6 +25,48 @@ static VOCAB: LazyLock<BTreeSet<String>> = LazyLock::new(|| parse_list(VOCAB_TXT
 static VERBS: LazyLock<BTreeSet<&'static str>> =
     LazyLock::new(|| VERB_LIST.iter().copied().collect());
 
+// Names Rolf already uses, without requiring a definition in every message.
+const FAMILIAR_NAMES: &[&str] = &[
+    "adeherdr",
+    "am",
+    "april",
+    "august",
+    "chatgpt",
+    "claude",
+    "codex",
+    "cpu",
+    "cvs",
+    "december",
+    "elicio",
+    "february",
+    "flyonenomics",
+    "friday",
+    "gemini",
+    "github",
+    "gpu",
+    "january",
+    "jev",
+    "july",
+    "june",
+    "mac",
+    "march",
+    "may",
+    "monday",
+    "november",
+    "october",
+    "oracle",
+    "pm",
+    "prl",
+    "saturday",
+    "september",
+    "somebody",
+    "sunday",
+    "thursday",
+    "tuesday",
+    "venator",
+    "wednesday",
+];
+
 fn parse_list(text: &str) -> BTreeSet<String> {
     text.lines()
         .map(str::trim)
@@ -48,6 +90,8 @@ fn plugin_vocabulary() -> &'static BTreeSet<String> {
 pub(crate) struct Glossary {
     pub(crate) names: BTreeMap<String, String>,
     pub(crate) terms: BTreeMap<String, String>,
+    /// Names that need no birth sentence (including this project's own name).
+    pub(crate) familiar_names: BTreeSet<String>,
     pub(crate) max_sentence_words: usize,
 }
 
@@ -56,13 +100,14 @@ impl Default for Glossary {
         Self {
             names: BTreeMap::new(),
             terms: BTreeMap::new(),
+            familiar_names: BTreeSet::new(),
             max_sentence_words: 25,
         }
     }
 }
 
 impl Glossary {
-    fn max_words(&self) -> usize {
+    pub(crate) fn max_words(&self) -> usize {
         if self.max_sentence_words == 0 {
             25
         } else {
@@ -74,11 +119,22 @@ impl Glossary {
         self.names.contains_key(token)
     }
 
+    pub(crate) fn is_plain_name(&self, token: &str) -> bool {
+        self.is_familiar(token) || shipped_words().contains(&token.to_ascii_lowercase())
+    }
+
+    fn is_familiar(&self, token: &str) -> bool {
+        let lower = token.to_ascii_lowercase();
+        FAMILIAR_NAMES.contains(&lower.as_str()) || self.familiar_names.contains(&lower)
+    }
+
     fn is_known_name(&self, token: &str) -> bool {
-        self.names
-            .keys()
-            .chain(self.terms.keys())
-            .any(|name| !name.is_empty() && name.eq_ignore_ascii_case(token))
+        self.is_familiar(token)
+            || self
+                .names
+                .keys()
+                .chain(self.terms.keys())
+                .any(|name| !name.is_empty() && name.eq_ignore_ascii_case(token))
     }
 }
 
@@ -256,13 +312,18 @@ fn check_r1_r2(text: &str, glossary: &Glossary) -> Vec<Violation> {
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
     for name in names {
         let sentence = glossary.names.get(name).map(String::as_str).unwrap_or("");
+        // A word such as "main" can also be an internal registry name. In
+        // ordinary prose it remains an ordinary word, not a forced gloss.
+        if glossary.is_plain_name(name) {
+            continue;
+        }
         for (start, end) in name_spans(text, name) {
             let invented = invented_definition(text, start, end, sentence);
             if invented {
                 violations.push(Violation {
                     rule: Rule::InventedDefinition,
                     span: Span { start, end },
-                    fix: format!("use the recorded sentence: {sentence}"),
+                    fix: "definitions must use the recorded description for this name".into(),
                 });
                 continue;
             }
@@ -270,7 +331,7 @@ fn check_r1_r2(text: &str, glossary: &Glossary) -> Vec<Violation> {
                 violations.push(Violation {
                     rule: Rule::BareName,
                     span: Span { start, end },
-                    fix: format!("write: {sentence} ({name})"),
+                    fix: "first use of a technical name needs its recorded description".into(),
                 });
             }
         }
@@ -282,12 +343,15 @@ fn check_r1_r2(text: &str, glossary: &Glossary) -> Vec<Violation> {
             continue;
         }
         let sentence = glossary.terms.get(name).map(String::as_str).unwrap_or("");
+        if sentence.is_empty() || glossary.is_familiar(name) {
+            continue;
+        }
         for (start, end) in name_spans(text, name) {
             if invented_definition(text, start, end, sentence) {
                 violations.push(Violation {
                     rule: Rule::InventedDefinition,
                     span: Span { start, end },
-                    fix: format!("use the recorded sentence: {sentence}"),
+                    fix: "definitions must use the recorded description for this name".into(),
                 });
             }
         }
@@ -366,17 +430,22 @@ fn invented_definition(text: &str, _start: usize, end: usize, sentence: &str) ->
 fn check_r3(text: &str, glossary: &Glossary) -> Vec<Violation> {
     let mut violations = Vec::new();
     for token in tokens(text) {
-        if glossary.is_known_name(token.raw) {
-            continue;
-        }
-        if is_identifier_shaped(token.raw) {
+        let glossed_code = glossary.names.iter().any(|(name, sentence)| {
+            name.eq_ignore_ascii_case(token.raw)
+                && is_gloss_form(text, token.start, token.end, sentence)
+        });
+        if (is_code(token.raw) && !glossed_code && !glossary.is_familiar(token.raw))
+            || (!glossed_code
+                && !glossary.is_known_name(token.raw)
+                && is_identifier_shaped(token.raw))
+        {
             violations.push(Violation {
                 rule: Rule::Identifier,
                 span: Span {
                     start: token.start,
                     end: token.end,
                 },
-                fix: "replace it with words, or add it with `ha term add`".into(),
+                fix: "codes, flags and paths are not allowed; replace this with words".into(),
             });
         }
     }
@@ -390,6 +459,7 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
             || shipped_words().contains(word)
             || plugin_vocabulary().contains(word)
             || extra.contains(word)
+            || glossary.is_familiar(word)
     };
     let mut violations = Vec::new();
     for token in tokens(text) {
@@ -418,7 +488,7 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
             .filter(|part| part.chars().any(char::is_alphabetic))
             .any(|part| {
                 let part = part.strip_suffix("'s").unwrap_or(part);
-                !is_admitted(part)
+                !is_admitted(part) && !glossary.is_known_name(part)
             });
         if unknown {
             violations.push(Violation {
@@ -427,9 +497,7 @@ fn check_r4(text: &str, glossary: &Glossary) -> Vec<Violation> {
                     start: token.start,
                     end: token.end,
                 },
-                fix: format!(
-                    "replace {base} with words, or run: ha term add {base} --plain \"one sentence that says what {base} is\""
-                ),
+                fix: "only everyday words and familiar names are allowed; add a name with `ha term add --name`".into(),
             });
         }
     }
@@ -449,7 +517,7 @@ fn check_r5(text: &str, glossary: &Glossary) -> Vec<Violation> {
             violations.push(Violation {
                 rule: Rule::LongSentence,
                 span: Span { start, end },
-                fix: format!("split this {n}-word sentence"),
+                fix: format!("split this {n}-word sentence; the limit is {cap} words"),
             });
         }
     }
@@ -571,6 +639,22 @@ fn tokens(text: &str) -> Vec<Token<'_>> {
             i += 1;
         }
         let (core_start, core_end) = trim_punct(text, start, i);
+        if core_start < core_end
+            && (text[start..i].starts_with("--") || text[start..i].starts_with("q-…"))
+        {
+            // Keep flag dashes and the ellipsis in a shortened request ID.
+            let end = if text[start..i].starts_with("q-…") {
+                i
+            } else {
+                core_end
+            };
+            out.push(Token {
+                raw: &text[start..end],
+                start,
+                end,
+            });
+            continue;
+        }
         if core_start < core_end {
             out.push(Token {
                 raw: &text[core_start..core_end],
@@ -614,13 +698,22 @@ fn trim_punct(text: &str, start: usize, end: usize) -> (usize, usize) {
     (start + lead, start + trail)
 }
 
-fn is_identifier_shaped(token: &str) -> bool {
-    is_path_token(token)
+fn is_code(token: &str) -> bool {
+    token.starts_with("--")
+        || token.starts_with("q-")
+        || token
+            .strip_prefix('r')
+            .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+        || is_kebab_with_digit(token)
+        || is_hex_run(token)
+}
+
+pub(crate) fn is_identifier_shaped(token: &str) -> bool {
+    is_code(token)
+        || is_path_token(token)
         || is_snake_case(token)
         || is_camel_case(token)
         || is_all_caps(token)
-        || is_kebab_with_digit(token)
-        || is_hex_run(token)
 }
 
 fn is_path_token(token: &str) -> bool {
@@ -635,7 +728,7 @@ fn is_snake_case(token: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-fn is_camel_case(token: &str) -> bool {
+pub(crate) fn is_camel_case(token: &str) -> bool {
     let mut chars = token.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -714,12 +807,13 @@ fn sentences(text: &str) -> Vec<(usize, usize)> {
 
 const VERB_LIST: &[&str] = &[
     "add", "allow", "answer", "ask", "be", "bind", "build", "choose", "close", "come", "comes",
-    "continue", "decide", "did", "do", "does", "end", "fail", "follow", "follows", "get", "give",
-    "go", "goes", "has", "have", "help", "hold", "is", "keep", "land", "lands", "leave", "let",
-    "look", "make", "mean", "means", "merge", "need", "open", "pass", "print", "put", "read",
-    "refuse", "replace", "run", "running", "said", "say", "see", "send", "set", "show", "split",
-    "start", "stay", "stays", "stop", "take", "tell", "try", "type", "use", "wait", "want", "was",
-    "were", "work", "write", "wrote",
+    "continue", "count", "cut", "decide", "delete", "did", "do", "does", "end", "fail", "follow",
+    "follows", "get", "give", "go", "goes", "has", "have", "help", "hold", "is", "keep", "land",
+    "lands", "leave", "let", "look", "make", "mean", "means", "merge", "move", "need", "open",
+    "pass", "print", "put", "read", "redesign", "refuse", "remove", "replace", "run", "running",
+    "said", "say", "see", "send", "set", "show", "split", "start", "stay", "stays", "stop",
+    "switch", "take", "tell", "try", "type", "use", "wait", "want", "was", "were", "work", "write",
+    "wrote",
 ];
 
 #[cfg(test)]
@@ -781,6 +875,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn w79_plain_words_names_and_limits() {
+        let mut g = Glossary::default();
+        // A registry collision must not turn an English word into a bare name.
+        g.names.insert(
+            "main".into(),
+            "Rebuilds the compartments of another task.".into(),
+        );
+        g.familiar_names.insert("custombrand".into());
+        g.familiar_names.insert("prl-8-53".into());
+        for text in [
+            "the main project folder",
+            "7 AM",
+            "Thursday",
+            "September",
+            "i wa",
+            "I delete the old screens",
+            "I remove the location filter",
+            "I switch Jev on",
+            "I count the rows",
+            "I move the lane",
+            "I redesign the dashboard",
+            "I cut the old step",
+            "Claude",
+            "GitHub",
+            "ChatGPT",
+            "Codex",
+            "Gemini",
+            "Mac",
+            "Oracle",
+            "CVS's",
+            "flyonenomics",
+            "venator",
+            "elicio",
+            "somebody",
+            "adeherdr",
+            "prl",
+            "prl-8-53",
+            "custombrand",
+            "rented-GPU",
+            "CPU-only",
+            "long-running",
+        ] {
+            let result = check(text, &g);
+            assert!(result.passed(), "{text}: {:?}", result.violations);
+            if text.starts_with("I ") {
+                let choices = [text.to_string()];
+                let form = check_question_form("Which one?", &choices, &g);
+                assert!(form.is_empty(), "{text}: {form:?}");
+            }
+        }
+        let long = (0..26).map(|_| "the").collect::<Vec<_>>().join(" ");
+        let refusals = [
+            ("t-0369", Rule::Identifier, "t-0369"),
+            ("job-0042", Rule::Identifier, "job-0042"),
+            ("r138", Rule::Identifier, "r138"),
+            ("f-0292", Rule::Identifier, "f-0292"),
+            ("q-1234", Rule::Identifier, "q-1234"),
+            ("q-…", Rule::Identifier, "q-…"),
+            ("a1b2c3d4", Rule::Identifier, "a1b2c3d4"),
+            ("snake_case", Rule::Identifier, "snake_case"),
+            ("--flags", Rule::Identifier, "--flags"),
+            (
+                "~/projects/somebody",
+                Rule::Identifier,
+                "~/projects/somebody",
+            ),
+            (
+                "/home/agent/projects",
+                Rule::Identifier,
+                "/home/agent/projects",
+            ),
+            (long.as_str(), Rule::LongSentence, long.as_str()),
+        ];
+        for (text, rule, phrase) in refusals {
+            let result = check(text, &g);
+            let violation = result
+                .violations
+                .iter()
+                .find(|v| v.rule == rule)
+                .unwrap_or_else(|| panic!("{text}: {:?}", result.violations));
+            assert_eq!(&text[violation.span.start..violation.span.end], phrase);
+            let refusal = crate::glossary::format_check(text, &result);
+            assert!(refusal.contains(&format!("\"{phrase}\"")), "{refusal}");
+            assert!(!refusal.contains("Rebuilds"), "{refusal}");
+            if rule == Rule::LongSentence {
+                assert!(violation.fix.contains("limit is 25 words"));
+            } else {
+                assert!(violation.fix.contains("not allowed"));
+            }
+            assert!(!violation.fix.contains("Rebuilds"));
+        }
+    }
+
     fn codes(result: &CheckResult) -> Vec<&'static str> {
         result.violations.iter().map(|v| v.rule.code()).collect()
     }
@@ -837,7 +1025,7 @@ mod tests {
         assert_eq!(codes(&fail), ["plain_bare_name"]);
         assert_eq!(
             fail.violations[0].fix,
-            "write: Keeps the worker list after an update. (lineage-persist)"
+            "first use of a technical name needs its recorded description"
         );
     }
 
@@ -853,7 +1041,7 @@ mod tests {
         assert!(codes(&fail).contains(&"plain_invented_definition"));
         assert_eq!(
             fail.violations[0].fix,
-            "use the recorded sentence: Keeps the worker list after an update."
+            "definitions must use the recorded description for this name"
         );
     }
 
@@ -874,7 +1062,7 @@ mod tests {
                 .find(|v| v.rule == Rule::Identifier)
                 .unwrap()
                 .fix,
-            "replace it with words, or add it with `ha term add`"
+            "codes, flags and paths are not allowed; replace this with words"
         );
     }
 
@@ -885,11 +1073,7 @@ mod tests {
         assert!(pass.passed(), "{:?}", pass.violations);
         let fail = check("The bisimulation quotient establishes confluence.", &g);
         assert!(codes(&fail).contains(&"plain_unknown_word"));
-        assert!(
-            fail.violations
-                .iter()
-                .any(|v| v.fix.contains("bisimulation"))
-        );
+        assert!(fail.violations.iter().any(|v| v.rule == Rule::UnknownWord));
     }
 
     #[test]
@@ -900,7 +1084,10 @@ mod tests {
         let words = (0..26).map(|_| "the").collect::<Vec<_>>().join(" ");
         let fail = check(&format!("{words}."), &g);
         assert_eq!(codes(&fail), ["plain_long_sentence"]);
-        assert_eq!(fail.violations[0].fix, "split this 26-word sentence");
+        assert_eq!(
+            fail.violations[0].fix,
+            "split this 26-word sentence; the limit is 25 words"
+        );
     }
 
     #[test]
