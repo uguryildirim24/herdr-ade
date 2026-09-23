@@ -140,6 +140,10 @@ pub(crate) struct Thread {
     pub(crate) cleanup_reason: String,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub(crate) role: String,
+    /// Round this reviewer was started for. Empty on lanes and historical
+    /// reviewer records created before this identity was stored.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) review_round: String,
     pub(crate) launch: crate::contracts::Launch,
     pub(crate) attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
