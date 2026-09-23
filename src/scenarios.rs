@@ -361,7 +361,8 @@ fn two_projects_in_two_sockets_sharing_a_pane_id_do_not_mix() {
         .collect();
     assert_eq!(prompts.len(), 1);
     assert_eq!(socket_of(prompts[0]), b_socket);
-    assert!(prompts[0].display().contains("tasks/t-0001.md"));
+    assert!(prompts[0].display().contains(".herdr-project/"));
+    assert!(prompts[0].display().contains("/brief.md"));
     drop(calls);
     assert!(thread::load(&a, "t-0001").unwrap().prompt_pending);
     assert!(!thread::load(&b, "t-0001").unwrap().prompt_pending);

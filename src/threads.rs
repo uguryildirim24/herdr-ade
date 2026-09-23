@@ -575,13 +575,26 @@ fn place_and_brief(
     finish_placement(project, view, id)
 }
 
-/// The thread directory is local bookkeeping; on a box lane the committed
-/// brief travels by git (D9) and there is nothing to write here.
+/// Materializes the frozen, content-addressed brief in the lane's ignored
+/// runtime folder. The product repository never tracks it.
 fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
     if placed.is_remote() {
         return Ok(());
     }
-    prepare_local_dir(ctx, project, placed)
+    prepare_local_dir(ctx, project, placed)?;
+    if placed.kind == Kind::Worktree {
+        let path = Path::new(&placed.thread_dir).join("brief.md");
+        if !path.is_file() {
+            match thread::artifact(project, &placed.launch.brief_hash) {
+                Ok(bytes) => project::write_atomic(&path, &bytes)?,
+                Err(_) if placed.launch.brief_hash.len() != 64 => {
+                    // Historical code lanes received their brief from git.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The box clone path and publish URL a box start needs for `repo`, each
@@ -632,11 +645,9 @@ pub(crate) fn box_repo_row(
     )
 }
 
-/// The box start side (SPEC-remote §4.2 steps 2–5): commit the brief `B` on
-/// the Mac integration branch, push only the lane branch to the URL-matched
-/// remote, one ssh call to fetch and create the box worktree, create the box
-/// tab through machine routing, then write the lane card. The brief is never
-/// copied; it travels by git (D9).
+/// The box start side: freeze the brief as a project artifact, branch from an
+/// exact integration commit, provision the checkout, and materialize the brief
+/// only in the checkout's ignored runtime folder.
 fn place_box_worktree(
     ctx: &Ctx,
     project: &Project,
@@ -667,8 +678,8 @@ fn place_box_worktree(
     };
     let dir = thread::thread_dir(&box_worktree, &project.slug, &record.id);
 
-    // A restart reuses the brief commit already on the record; a first start
-    // commits it (D9). The brief is never rewritten.
+    // A restart reuses the exact frozen artifact and code base. A first start
+    // records both before any remote process exists.
     let reusable = restart && !record.base.is_empty() && !record.launch.brief_hash.is_empty();
     let (base, brief_hash) = if reusable {
         if record.failure_event.is_empty() {
@@ -683,9 +694,8 @@ fn place_box_worktree(
             ..record.clone()
         };
         let brief = thread::brief_for(project, &stub, &task, restart)?;
-        let committed = format!("plain: {}\n\n{brief}", record.plain);
-        let rel = format!("tasks/{}.md", record.id);
-        let brief_hash = thread::sha256_hex(committed.as_bytes());
+        let frozen = format!("plain: {}\n\n{brief}", record.plain);
+        let brief_hash = thread::store_artifact(project, frozen.as_bytes())?;
         let integration = integration_branch(runner, record)?;
         let repo_lock = crate::git::lock(runner, &record.repo)?;
         if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
@@ -693,19 +703,10 @@ fn place_box_worktree(
         }
         let head =
             crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
-        let sha = crate::git::commit_files_locked(
-            runner,
-            Path::new(&record.repo),
-            &integration,
-            &[(rel.as_str(), committed.as_str())],
-            &format!("docs(tasks): {}", record.id),
-            &head,
-            &repo_lock.common_dir.join("herdr-ade-tmp"),
-        )?;
-        ensure_branch(runner, &record.repo, &branch, &sha)?;
+        ensure_branch(runner, &record.repo, &branch, &head)?;
         drop(repo_lock);
-        push_branch(runner, &record.repo, &publish_url, &branch, &sha)?;
-        (sha, brief_hash)
+        push_branch(runner, &record.repo, &publish_url, &branch, &head)?;
+        (head, brief_hash)
     };
 
     thread::update(project, &record.id, |t| {
@@ -736,6 +737,14 @@ fn place_box_worktree(
             },
         )?;
     }
+    let frozen = thread::artifact(project, &brief_hash)?;
+    remote::write_runtime_file(
+        runner,
+        &target,
+        &format!("{dir}/brief.md"),
+        &String::from_utf8(frozen).context("brief artifact is not UTF-8")?,
+        &brief_hash,
+    )?;
 
     // Step 4: route by the stable profile id. `workspace create` already
     // creates a first tab, so that pane is the lane instead of adding a
@@ -892,8 +901,8 @@ fn place_box_worktree(
     })
 }
 
-/// The integration branch the brief commits on: `--base`, else the branch the
-/// repository has checked out (D9).
+/// The integration branch whose exact head becomes the lane's code base:
+/// `--base`, else the branch the repository has checked out.
 fn integration_branch(runner: &dyn Runner, record: &Thread) -> Result<String> {
     if !record.base.is_empty() {
         return Ok(record.base.clone());
@@ -943,11 +952,9 @@ fn push_branch(runner: &dyn Runner, repo: &str, url: &str, branch: &str, sha: &s
     Ok(())
 }
 
-/// SPEC-ADE D4 and D9, in order: under one repository lock, keep the plugin's
-/// folders out of git, commit the brief `tasks/<id>.md` on the integration
-/// branch (item 55), record its hash, then `git worktree add` the lane from
-/// that commit so the brief is in its checkout; then the tab, whose
-/// `HERDR_ADE_LAUNCH` carries the same hash as the record.
+/// Places a code lane from an exact integration commit. Its frozen brief is a
+/// project artifact and is materialized later under `.herdr-project`, never
+/// committed to the code repository.
 fn place_ade_worktree(
     ctx: &Ctx,
     project: &Project,
@@ -970,8 +977,8 @@ fn place_ade_worktree(
     )
     .unwrap_or_default();
     // The integration branch is a local branch: `--base`, else the branch
-    // the repository has checked out. A remote-tracking ref or a bare sha
-    // cannot take the brief commit (D9).
+    // the repository has checked out. A remote-tracking ref or bare sha is
+    // not a mutable integration branch.
     let integration = if record.base.is_empty() {
         git(
             runner,
@@ -996,36 +1003,27 @@ fn place_ade_worktree(
         ..record.clone()
     };
     let brief = thread::brief_for(project, &stub, &task, false)?;
-    let committed = format!("plain: {}\n\n{brief}", record.plain);
-    let rel = format!("tasks/{}.md", record.id);
-    let brief_hash = thread::sha256_hex(committed.as_bytes());
+    let frozen = format!("plain: {}\n\n{brief}", record.plain);
+    let brief_hash = thread::store_artifact(project, frozen.as_bytes())?;
 
     let placed = {
-        let repo_lock = crate::git::lock(runner, &record.repo)?;
+        let _repo_lock = crate::git::lock(runner, &record.repo)?;
         if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
             eprintln!("warning: {error:#}");
         }
         let head =
             crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
-        let sha = crate::git::commit_files_locked(
-            runner,
-            Path::new(&record.repo),
-            &integration,
-            &[(rel.as_str(), committed.as_str())],
-            &format!("docs(tasks): {}", record.id),
-            &head,
-            &repo_lock.common_dir.join("herdr-ade-tmp"),
-        )?;
-        // The hash is on the record before the lane branch exists (D9).
+        // The artifact hash and exact code base are durable before the lane
+        // branch or worktree exists.
         thread::update(project, &record.id, |t| {
             t.launch.brief_hash = brief_hash.clone();
             t.thread_dir = stub.thread_dir.clone();
-            t.base = sha.clone();
+            t.base = head.clone();
             t.branch = branch.clone();
             t.partial = Some("worktree_add".into());
         })?;
-        let path = crate::git::worktree_add(runner, &record.repo, &record.id, &branch, &sha)?;
-        (sha, path)
+        let path = crate::git::worktree_add(runner, &record.repo, &record.id, &branch, &head)?;
+        (head, path)
     };
     let (sha, path) = placed;
     let cwd = path.to_string_lossy().into_owned();
@@ -3610,8 +3608,8 @@ mod tests {
         assert_eq!(started.attempt, 1);
         let wt = Path::new(&repo_s).join(".worktrees").join(&started.id);
         assert!(wt.is_dir(), "git worktree should exist");
-        // D9: the brief is a commit on the integration branch, the lane
-        // branches from it, and its hash is on the record and in the env.
+        // The lane branches from the exact integration commit while its brief
+        // is a content-addressed project artifact and ignored runtime file.
         let git_out = |args: &[&str]| {
             crate::runner::RealRunner
                 .run(
@@ -3624,17 +3622,13 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        let rel = format!("tasks/{}.md", started.id);
-        let committed = git_out(&["show", &format!("main:{rel}")]);
-        assert!(
-            committed.starts_with("plain: The lane does the work."),
-            "{committed}"
-        );
         assert_eq!(git_out(&["rev-parse", "main"]), started.base);
-        assert!(wt.join(&rel).is_file(), "the brief is in the lane checkout");
+        assert!(git_out(&["ls-tree", "-r", "--name-only", "main", "--", "tasks"]).is_empty());
+        let artifact = crate::thread::artifact(&project, &started.launch.brief_hash).unwrap();
+        assert!(String::from_utf8_lossy(&artifact).starts_with("plain: The lane does the work."));
         assert_eq!(
-            started.launch.brief_hash,
-            crate::thread::sha256_hex(format!("{committed}\n").as_bytes())
+            std::fs::read(Path::new(&started.thread_dir).join("brief.md")).unwrap(),
+            artifact
         );
         let exclude =
             std::fs::read_to_string(Path::new(&repo_s).join(".git/info/exclude")).unwrap();
@@ -3676,8 +3670,8 @@ mod tests {
         assert!(launch.contains("--parent w1:p1"), "{launch}");
         drop(calls);
 
-        // A1 H2: the ready lane is primed once with its role skill and the
-        // committed brief, never with the pre-ADE `brief.md` line.
+        // The ready lane is primed once with its role skill and frozen
+        // runtime brief.
         *world.agents.borrow_mut() = format!(
             "[{}]",
             crate::scenarios::agent_json("w1", "w1:t2", "w1:p2", &wt_s, "hp-demo-t-0001", "idle")
@@ -3693,7 +3687,7 @@ mod tests {
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(
             prompts[0].ends_with(&format!(
-                " skill lane, then read tasks/{}.md and do what it says.",
+                " skill lane, then read .herdr-project/demo-{}/brief.md and do what it says.",
                 started.id
             )),
             "{}",
@@ -4677,7 +4671,7 @@ mod tests {
     fn a_box_reviewer_can_publish_its_verdict_and_seal_without_a_manual_coordinator_push() {
         use crate::contracts::{OpKind, Recipient, Requested};
         use crate::ops;
-        use crate::round::testkit::{commit_file, git};
+        use crate::round::testkit::git;
 
         let (fx, remote) = box_fixture();
         write_config(
@@ -4721,14 +4715,14 @@ mod tests {
         )
         .unwrap();
         let skill = crate::lane::skill_text(&started.role);
-        assert!(skill.contains("publish V on **your own lane branch**"));
+        assert!(skill.contains("publish C on **your own lane branch**"));
         assert!(
             skill.contains("Never push `main`, the integration branch, or another lane's branch")
         );
-        let brief = git(
-            &fx.repo,
-            &["show", &format!("{}:tasks/review-r1.md", started.base)],
-        );
+        let brief = String::from_utf8(
+            thread::artifact(&fx.project, record.review_artifact.as_deref().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert!(brief.contains("Follow the reviewer skill's Done instructions"));
 
         // A separate clone stands in for the box; only herdr/ssh are faked.
@@ -4753,19 +4747,21 @@ mod tests {
             git(&box_repo, &["merge", "--no-edit", sha]);
         }
         let candidate = git(&box_repo, &["rev-parse", "HEAD"]);
-        let verdict = commit_file(
-            &box_repo,
-            "tasks/reviews/code-r1.md",
-            &format!(
+        let report = format!(".herdr-project/demo-{}/report.md", started.id);
+        std::fs::write(box_repo.join(".git/info/exclude"), ".herdr-project/\n").unwrap();
+        std::fs::create_dir_all(box_repo.join(&report).parent().unwrap()).unwrap();
+        std::fs::write(
+            box_repo.join(&report),
+            format!(
                 "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{candidate}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll lanes checked.\n",
                 record.manifest_hash.as_deref().unwrap(),
                 record.policy_hash,
             ),
-            "review(r1): verdict",
-        );
-        assert_ne!(started.base, verdict);
+        )
+        .unwrap();
+        assert_ne!(started.base, candidate);
         let error =
-            ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &verdict)
+            ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &candidate)
                 .unwrap_err()
                 .to_string();
         assert!(error.starts_with("published_ref_mismatch:"), "{error}");
@@ -4787,7 +4783,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&repaired.stderr)
         );
-        ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &verdict)
+        ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &candidate)
             .unwrap();
         assert_eq!(git(&fx.repo, &["rev-parse", &started.branch]), started.base);
         assert_eq!(
@@ -4809,8 +4805,8 @@ mod tests {
                 },
                 round: None,
                 requested: Requested::Done {
-                    sha: verdict.clone(),
-                    report_path: "tasks/reviews/code-r1.md".into(),
+                    sha: candidate.clone(),
+                    report_path: report.clone(),
                 },
                 helper_pid: std::process::id(),
             },
@@ -4818,7 +4814,7 @@ mod tests {
         .unwrap();
         ops::stage_done(&box_project, &op.op, &box_repo, ctx.runner).unwrap();
         let event = ops::seal(&box_project, &op.op, |_| Ok(())).unwrap();
-        assert_eq!(event.payload.done.unwrap().sha, verdict);
+        assert_eq!(event.payload.done.unwrap().sha, candidate);
         assert_eq!(crate::events::list(&box_project).len(), 1);
     }
 }
