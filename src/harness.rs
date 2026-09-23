@@ -620,7 +620,7 @@ fn repo_clean(ctx: &Ctx, repo: &str) -> Result<bool> {
     Ok(out.stdout.trim().is_empty())
 }
 
-fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessProof> {
+fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Result<Vec<ProcessProof>> {
     let mut proofs = Vec::new();
     if let Some(version) = plugin_version {
         proofs.push(ProcessProof {
@@ -634,10 +634,8 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
     }
 
     if !crate::project::list_slugs(&ctx.root).is_empty() {
-        let ticker = crate::ticker::start_for_install(ctx).and_then(|pending| {
-            if pending {
-                bail!("old ticker is busy; replacement was not started; retry ticker start after its pass");
-            }
+        crate::ticker::start_for_install(ctx).context("harness_ticker_failed: local ticker")?;
+        let ticker: Result<crate::ticker::Info> = {
             let deadline = Instant::now() + PROCESS_WAIT;
             loop {
                 if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
@@ -654,7 +652,7 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-        });
+        };
         proofs.push(match ticker {
             Ok(info) => ProcessProof {
                 machine: "local".into(),
@@ -664,24 +662,11 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
                 state: "running".into(),
                 reason: None,
             },
-            Err(error) => {
-                let holder = match crate::ticker::lock_state(&ctx.root) {
-                    crate::ticker::LockState::Held(info) if info.pid != 0 => Some(info),
-                    _ => None,
-                };
-                ProcessProof {
-                    machine: "local".into(),
-                    process: "ticker".into(),
-                    pid: holder.as_ref().map(|info| info.pid),
-                    build: holder.as_ref().map(|info| info.version.clone()),
-                    state: if holder.is_some() { "stale" } else { "unknown" }.into(),
-                    reason: Some(format!("{error:#}")),
-                }
-            }
+            Err(error) => bail!("harness_ticker_failed: local ticker did not take the lock: {error:#}; lock state: {:?}", crate::ticker::lock_state(&ctx.root)),
         });
     }
     proofs.extend(talk_process_proofs(ctx, plugin_version));
-    proofs
+    Ok(proofs)
 }
 
 fn same_executable_image(running_inode: u64, installed_inode: u64) -> bool {
@@ -848,12 +833,12 @@ fn box_process_script(
          root={root}\n\
          version=\"$($bin --version)\"\n\
          printf 'HERDR_ADE_BOX_BINARY=%s\\n' \"$version\"\n\
-         $bin --root \"$root\" ticker start\n\
          expected={expected}\n\
          seen=\n\
          pid=\n\
          n=0\n\
          while [ $n -lt {attempts} ]; do\n\
+           $bin --root \"$root\" ticker start || :\n\
            seen=\n\
            pid=\n\
            if [ -r \"$root/.ticker.lock\" ] && ! ( flock -n 9 ) 9<>\"$root/.ticker.lock\"; then\n\
@@ -997,6 +982,33 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
         });
     }
     proofs
+}
+
+fn require_running_tickers(processes: &[ProcessProof], expected: &[&str]) -> Result<()> {
+    for machine in expected {
+        if !processes
+            .iter()
+            .any(|proof| proof.machine == *machine && proof.process == "ticker")
+        {
+            let evidence = processes
+                .iter()
+                .filter(|proof| proof.machine == *machine)
+                .collect::<Vec<_>>();
+            bail!("harness_ticker_failed: {machine} did not report a ticker: {evidence:?}");
+        }
+    }
+    for proof in processes {
+        if proof.process == "ticker" && proof.state != "running" {
+            bail!(
+                "harness_ticker_failed: {} ticker pid {:?}, build {:?}: {}",
+                proof.machine,
+                proof.pid,
+                proof.build,
+                proof.reason.as_deref().unwrap_or(&proof.state)
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1262,10 +1274,18 @@ pub(crate) fn install_with_reexec(
         .flat_map(|repo| &repo.binaries)
         .find(|binary| binary.name == "herdr-ade")
         .map(|binary| binary.version.clone());
-    let mut processes = local_process_proofs(ctx, plugin_version.as_deref());
+    let mut processes = local_process_proofs(ctx, plugin_version.as_deref())?;
     if let Some(machine) = &box_paths {
         processes.extend(box_process_proofs(ctx, machine));
     }
+    let mut expected = Vec::new();
+    if !crate::project::list_slugs(&ctx.root).is_empty() {
+        expected.push("local");
+    }
+    if let Some(machine) = &box_paths {
+        expected.push(machine.id.as_str());
+    }
+    require_running_tickers(&processes, &expected)?;
     let tasks = record_task_proofs(ctx, &builds, &processes)?;
     Ok(InstallOutcome {
         repositories: installed,
@@ -1315,7 +1335,7 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        let proof = local_process_proofs(&ctx, Some(crate::VERSION));
+        let proof = local_process_proofs(&ctx, Some(crate::VERSION)).unwrap();
         let ticker = proof
             .iter()
             .find(|proof| proof.process == "ticker")
@@ -1341,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_old_ticker_is_reported_without_waiting_for_a_successor() {
+    fn blocked_old_ticker_fails_install_with_its_lock_holder_named() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         crate::project::create(&root, "demo", "", vec![]).unwrap();
@@ -1366,24 +1386,49 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        let start = Instant::now();
-        let proof = local_process_proofs(&ctx, Some(crate::VERSION));
-        assert!(start.elapsed() < Duration::from_secs(2));
-        let ticker = proof
-            .iter()
-            .find(|proof| proof.process == "ticker")
-            .unwrap();
-        assert_eq!(
-            (ticker.pid, ticker.build.as_deref(), ticker.state.as_str()),
-            (Some(5678), Some("old"), "stale")
-        );
+        let error = local_process_proofs(&ctx, Some(crate::VERSION)).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("5678") && text.contains("old"), "{text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[test]
+    fn box_stale_ticker_is_an_install_failure_not_a_warning() {
+        let error = require_running_tickers(
+            &[ProcessProof {
+                machine: "oci".into(),
+                process: "ticker".into(),
+                pid: Some(42928),
+                build: Some("0.1.0+4083d1b.1".into()),
+                state: "stale".into(),
+                reason: Some("old ticker did not release the lock".into()),
+            }],
+            &["oci"],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
-            ticker
-                .reason
-                .as_deref()
-                .unwrap()
-                .contains("replacement was not started")
+            error.contains("oci") && error.contains("42928") && error.contains("4083d1b"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn box_connection_failure_cannot_pass_without_a_ticker_proof() {
+        let error = require_running_tickers(
+            &[ProcessProof {
+                machine: "oci".into(),
+                process: "box binary and ticker".into(),
+                pid: None,
+                build: None,
+                state: "unknown".into(),
+                reason: Some("connection refused".into()),
+            }],
+            &["oci"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("connection refused"), "{error}");
     }
 
     #[test]
