@@ -889,6 +889,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     {
         let attempt = thread.attempt.max(1);
         if let Some(event) = crate::round::latest_event(&events, &thread.id, attempt)
+            && event.id != thread.answered_waiting_event
             && let Some(evidence) = &event.payload.waiting
         {
             waiting.push(format!(

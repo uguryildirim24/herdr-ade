@@ -586,7 +586,8 @@ fn digest_snapshot(
                     )
                     .is_some_and(|event| {
                         event.payload.done.is_some()
-                            || event.payload.waiting.is_some()
+                            || (event.payload.waiting.is_some()
+                                && event.id != row.thread.answered_waiting_event)
                             || event.payload.failed.is_some()
                     }))
         })
@@ -639,7 +640,12 @@ fn digest_snapshot(
                     "  done: {} report={} event={}",
                     done.sha, report, event.id
                 );
-            } else if let Some(waiting) = &event.payload.waiting {
+            } else if let Some(waiting) = event
+                .payload
+                .waiting
+                .as_ref()
+                .filter(|_| event.id != t.answered_waiting_event)
+            {
                 let kind = waiting
                     .provider_kind
                     .as_deref()
@@ -667,7 +673,7 @@ fn digest_snapshot(
                 );
             }
             if event.payload.done.is_some()
-                || event.payload.waiting.is_some()
+                || (event.payload.waiting.is_some() && event.id != t.answered_waiting_event)
                 || event.payload.failed.is_some()
             {
                 shown_events.push(event.clone());
@@ -858,6 +864,90 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_round_with_a_removed_member_worktree_does_not_probe_it_in_context() {
+        use crate::contracts::{MergeIntent, MergePhase, RoundPhase};
+        use crate::round::testkit::fixture;
+
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lane, sha) = fx.lane(1);
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The change landed.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        let path = crate::round::rounds_dir(&fx.project).join("r1.toml");
+        let mut round = crate::round::load(&fx.project, "r1").unwrap();
+        round.phase = RoundPhase::Merged;
+        round.merge = Some(MergeIntent {
+            op: "test-merge".into(),
+            expected_old: sha.clone(),
+            candidate: sha.clone(),
+            verdict: sha.clone(),
+            phase: MergePhase::Checkpointed,
+            merged: Some(sha),
+            checkpoint: None,
+            head: None,
+        });
+        std::fs::write(path, toml::to_string(&round).unwrap()).unwrap();
+        let missing = fx.repo.join(".worktrees/removed-lane");
+        crate::thread::update(&fx.project, &lane, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.worktree_path = missing.to_string_lossy().into_owned();
+            thread.cwd = thread.worktree_path.clone();
+            thread.resolved_reason = "manual".into();
+        })
+        .unwrap();
+        fx.world.runner.calls.borrow_mut().clear();
+
+        crate::project::refresh_page(&fx.project).unwrap();
+        let (text, _) = digest(&ctx, &fx.project, "ha").unwrap();
+        assert!(text.contains("# Project"), "{text}");
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.program != "git"),
+            "context probed a resolved round member's removed checkout"
+        );
+    }
+
+    #[test]
+    fn answered_wait_is_absent_from_context_and_project_page() {
+        let fx = crate::round::testkit::fixture();
+        let lane = fx.thread("Waiting lane");
+        let event = fx.seal_waiting(&lane, 1, 1, "Need a choice.");
+        crate::project::refresh_page(&fx.project).unwrap();
+        assert!(
+            fx.project
+                .read_project_md()
+                .unwrap()
+                .1
+                .contains("Need a choice.")
+        );
+        let (before, _) = digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
+        assert!(before.contains("waiting —"), "{before}");
+
+        crate::thread::update(&fx.project, &lane, |thread| {
+            thread.answered_waiting_event = event.clone();
+        })
+        .unwrap();
+        crate::project::refresh_page(&fx.project).unwrap();
+        let (after, _) = digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
+        assert!(!after.contains("Need a choice."), "{after}");
+    }
 
     #[test]
     fn prefix_has_the_fixed_shape_and_quotes_spaces() {
