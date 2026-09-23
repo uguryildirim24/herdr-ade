@@ -2977,6 +2977,22 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     with_box.runner.on("cargo build", ok(""));
     with_box.runner.on("cp ", ok(""));
     with_box.runner.on("mv -f", ok(""));
+    with_box.runner.on_fn(
+        |cmd| {
+            cmd.program == "ssh"
+                && cmd
+                    .args
+                    .last()
+                    .is_some_and(|arg| arg.contains("ticker start"))
+        },
+        |_| {
+            Ok(ok(&format!(
+                "HERDR_ADE_BOX_BINARY=herdr-ade {}\nHERDR_ADE_BOX_TICKER=42:{}\n",
+                crate::VERSION,
+                crate::VERSION
+            )))
+        },
+    );
     with_box.runner.on("--version", ok("installed version\n"));
     with_box.runner.on("ssh", ok(""));
     with_box.runner.on(

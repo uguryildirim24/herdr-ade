@@ -24,6 +24,9 @@ const TICK: Duration = crate::pi::doctor::READINESS_CACHE_TTL;
 const STOP_WAIT: Duration = Duration::from_secs(60);
 // A replacement never leaves a second ticker waiting behind a blocked pass.
 const REPLACE_WAIT: Duration = Duration::from_millis(500);
+// The idle loop sleeps in 500 ms slices. An install gives it time to observe
+// the stop file, but fails if a pass really is blocked instead of claiming success.
+const INSTALL_REPLACE_WAIT: Duration = Duration::from_secs(5);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
@@ -161,16 +164,28 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     if install_in_progress(ctx) {
-        return Ok(());
+        bail!("ticker start pending: a harness installation is replacing the ticker");
     }
-    start_inner(ctx).map(|_| ())
+    if start_inner(ctx)? {
+        bail!(
+            "ticker replacement pending: old ticker still holds the lock; lock state: {:?}",
+            lock_state(&ctx.root)
+        );
+    }
+    Ok(())
 }
 
 /// The installer owns the install lock, so it is the only caller allowed to
-/// replace a ticker while installing. `true` means the old pass is still
-/// holding the lock; report that fact rather than waiting for it to finish.
-pub(crate) fn start_for_install(ctx: &Ctx) -> Result<bool> {
-    start_inner(ctx)
+/// replace a ticker while installing. A blocked old pass is an install error.
+pub(crate) fn start_for_install(ctx: &Ctx) -> Result<()> {
+    if start_inner_with_wait(ctx, INSTALL_REPLACE_WAIT)? {
+        bail!(
+            "ticker replacement timed out after {} seconds; lock state: {:?}",
+            INSTALL_REPLACE_WAIT.as_secs(),
+            lock_state(&ctx.root)
+        );
+    }
+    Ok(())
 }
 
 fn install_in_progress(ctx: &Ctx) -> bool {
@@ -178,6 +193,10 @@ fn install_in_progress(ctx: &Ctx) -> bool {
 }
 
 fn start_inner(ctx: &Ctx) -> Result<bool> {
+    start_inner_with_wait(ctx, REPLACE_WAIT)
+}
+
+fn start_inner_with_wait(ctx: &Ctx, wait: Duration) -> Result<bool> {
     let root = &ctx.root;
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
         return Ok(false);
@@ -201,7 +220,7 @@ fn start_inner(ctx: &Ctx) -> Result<bool> {
             spawn(root)?;
             Ok(false)
         }
-        StartAction::StopThenSpawn => replace(root),
+        StartAction::StopThenSpawn => replace(root, wait),
     }
 }
 
@@ -256,8 +275,8 @@ fn spawn(root: &Path) -> Result<()> {
 
 /// Ask the old ticker to leave, but never start a contender behind it. A
 /// later start can replace a ticker whose pass outlasted this brief wait.
-fn replace(root: &Path) -> Result<bool> {
-    match request_stop(root, REPLACE_WAIT)? {
+fn replace(root: &Path, wait: Duration) -> Result<bool> {
+    match request_stop(root, wait)? {
         StopOutcome::Stopped => {
             spawn(root)?;
             Ok(false)
@@ -1954,7 +1973,7 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        assert!(!start_for_install(&ctx).unwrap());
+        start_for_install(&ctx).unwrap();
         assert!(!stop_path(&root).exists());
     }
 
@@ -1982,10 +2001,65 @@ mod tests {
             detached_ticker: true,
         };
         let now = Instant::now();
-        assert!(start_for_install(&ctx).unwrap());
-        assert!(now.elapsed() < Duration::from_secs(2));
+        let error = start_for_install(&ctx).unwrap_err().to_string();
+        assert!(error.contains("ticker replacement timed out"), "{error}");
+        assert!(now.elapsed() < Duration::from_secs(6));
         assert!(!stop_path(&root).exists());
         assert!(matches!(lock_state(&root), LockState::Held(info) if info.pid == 1));
+    }
+
+    #[test]
+    fn explicit_start_does_not_claim_success_with_a_stale_holder() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let mut holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(&root))
+            .unwrap();
+        holder.lock().unwrap();
+        holder
+            .write_all(br#"{"version":"old","pid":42928}"#)
+            .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: true,
+        };
+        let error = start(&ctx).unwrap_err().to_string();
+        assert!(error.contains("42928") && error.contains("old"), "{error}");
+        assert!(!stop_path(&root).exists());
+    }
+
+    #[test]
+    fn install_wait_outlasts_the_idle_tickers_sleep_slice() {
+        let root = tempfile::tempdir().unwrap();
+        let path = lock_path(root.path());
+        let holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        holder.lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(650));
+            drop(holder);
+        });
+        assert_eq!(
+            request_stop(root.path(), INSTALL_REPLACE_WAIT).unwrap(),
+            StopOutcome::Stopped
+        );
+        release.join().unwrap();
+        assert!(!stop_path(root.path()).exists());
     }
 
     #[test]
@@ -2004,7 +2078,12 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        start(&ctx).unwrap();
+        assert!(
+            start(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("installation")
+        );
         ensure(&ctx).unwrap();
         assert!(!lock_path(&root).exists());
     }
@@ -2036,11 +2115,16 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        start(&ctx).unwrap();
+        assert!(
+            start(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("installation")
+        );
         ensure(&ctx).unwrap();
         assert!(!stop_path(&root).exists());
         std::fs::write(stop_path(&root), b"").unwrap();
-        assert!(!start_for_install(&ctx).unwrap());
+        start_for_install(&ctx).unwrap();
         assert!(!stop_path(&root).exists());
         assert!(matches!(lock_state(&root), LockState::Held(info) if info.pid == 4321));
     }
