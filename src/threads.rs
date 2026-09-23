@@ -217,7 +217,9 @@ fn start_with_ticker(
             "repo_not_listed: {repo} is not listed in `repos` in PROJECT.md and is not a harness repository"
         );
     }
-    let listed = settings.repos.iter().find(|row| row.path == repo);
+    let listed = settings.repos.iter().find(|row| {
+        std::fs::canonicalize(&row.path).is_ok_and(|path| path.to_string_lossy() == repo)
+    });
     let recipe_request = match &args.recipe {
         Some(recipe) => Some(crate::launch::authorize_explicit_recipe(
             ctx,
@@ -2615,11 +2617,19 @@ fn refuse_busy_retry(herdr: &Herdr<'_>, record: &Thread) -> Result<()> {
                     && agent.cwd == record.cwd)
         })
         .map(|agent| agent.agent_status);
-    if still_starting || agent_state.as_deref() == Some("working") {
+    if still_starting
+        || agent_state.as_deref() == Some("working")
+        || (record.prompt_pending
+            && agent_state
+                .as_deref()
+                .is_some_and(crate::herdr::ready_state))
+    {
         let state = if still_starting {
             "starting"
-        } else {
+        } else if agent_state.as_deref() == Some("working") {
             "working"
+        } else {
+            "ready for its brief"
         };
         let screen = if record.pane_id.is_empty() {
             "no pane yet".into()
@@ -2650,7 +2660,10 @@ fn same_startup_screen(herdr: &Herdr<'_>, record: &Thread) -> Result<Option<Stri
     {
         return Ok(Some(screen));
     }
-    Ok(None)
+    bail!(
+        "startup_screen_changed: {} now shows: {screen}. Check the pane before replacing it",
+        record.id
+    )
 }
 
 /// A startup refusal leaves the pane visible for diagnosis and recovery. No
@@ -2707,6 +2720,7 @@ pub(crate) fn fail_start(
     let failed = thread::update(project, id, |t| {
         t.status = Status::Failed;
         t.prompt_pending = false;
+        t.startup_wait_started.clear();
         t.error = recovery_error.clone().unwrap_or_else(|| reason.to_string());
         t.failure_class = class;
         t.provider_failure_kind = provider_kind.clone();
@@ -4886,6 +4900,14 @@ mod tests {
         let screen = same_startup_screen(&herdr, &record).unwrap().unwrap();
         assert!(screen.contains("Trust this folder?"), "{screen}");
         assert_eq!(runner.count("pane read"), 1);
+
+        let changed = FakeRunner::new();
+        changed.on("pane read", ok("The helper is now ready\n"));
+        let herdr = Herdr::new("herdr", "", &changed);
+        let error = same_startup_screen(&herdr, &record)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("startup_screen_changed"), "{error}");
     }
 
     #[test]

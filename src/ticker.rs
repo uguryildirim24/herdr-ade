@@ -723,8 +723,8 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
-/// Only a still-blocked pane after the recorded ready window is a startup
-/// failure. Keep its screen visible and notify a ready local coordinator.
+/// A pane still not ready after the recorded window is a startup failure.
+/// Keep its screen visible and notify a ready local coordinator.
 fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str) -> Result<()> {
     let screen = threads::startup_screen(input.herdr, &thread.pane_id);
     let reason = format!("agent_not_ready: screen: {screen}; herdr: {detail}");
@@ -743,10 +743,9 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
             .iter()
             .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
         && let Ok(_writer) = crate::talk::writer_lock(input.project)
-        && !crate::talk::writer_suspended(input.project)
     {
         let notice = format!(
-            "{} is blocked during startup: {reason}. Read `thread show {} {}` before retrying.",
+            "{} did not become ready during startup: {reason}. Read `thread show {} {}` before retrying.",
             thread.id, input.project.slug, thread.id
         );
         if crate::talk::mark_automated_prompt(input.project, &coordinator.pane_id, &notice).is_ok()
@@ -820,6 +819,35 @@ fn thread_pass(
             live.state_secs = live.state_secs.max(thread::BLOCKED_DEBOUNCE_SECS);
         }
 
+        // Herdr drops the name when `agent start` times out, but leaves the
+        // process in its pane. Reclaim only an unnamed agent in our exact
+        // terminal before delivering the pending brief.
+        let unnamed = if !t.startup_wait_started.is_empty() && live.agent_state.is_none() {
+            agents.iter().find(|agent| {
+                agent.name.is_empty()
+                    && agent.pane_id == t.pane_id
+                    && agent.tab_id == t.tab_id
+                    && agent.workspace_id == t.workspace_id
+                    && agent.cwd == t.cwd
+            })
+        } else {
+            None
+        };
+        if let Some(agent) = unnamed {
+            if crate::herdr::ready_state(&agent.agent_status) {
+                herdr.agent_rename(&t.pane_id, &t.agent_name)?;
+                let process = herdr
+                    .pane_process_info(&t.pane_id)
+                    .ok()
+                    .and_then(|info| info.identity(&t.launch.kind));
+                let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+                thread::update(project, &t.id, |record| {
+                    thread::bind_identity(record, &socket, agent, process);
+                })?;
+            }
+            live.agent_state = Some(agent.agent_status.clone());
+        }
+        let state = live.agent_state.clone().unwrap_or_default();
         let ready = live
             .agent_state
             .as_deref()
@@ -830,11 +858,16 @@ fn thread_pass(
                     t.startup_wait_started.clear();
                     t.status = thread::Status::Open;
                 })?;
-            } else if state == "blocked"
+            } else if (state == "blocked" || (state.is_empty() && live.pane_exists))
                 && thread::seconds_since(&t.startup_wait_started, now).max(0) as u64 * 1000
                     >= agent_start_timeout(&t.launch)
             {
-                startup_failure(input, t, "still blocked at the end of its ready window")?;
+                let detail = if state == "blocked" {
+                    "still blocked at the end of its ready window"
+                } else {
+                    "agent state unknown at the end of its ready window"
+                };
+                startup_failure(input, t, detail)?;
                 continue;
             }
         }
@@ -989,7 +1022,12 @@ fn thread_pass(
         // temporarily omit agent state while the terminal and process still
         // exist (including after an interactive startup timeout); that state
         // is Unknown and must never authorize closing the pane.
-        let process_gone = !t.is_remote() && after.report_hash.is_empty() && !live.pane_exists;
+        let process_gone = !t.is_remote()
+            && (after.startup_wait_started.is_empty()
+                || thread::seconds_since(&after.startup_wait_started, now).max(0) as u64 * 1000
+                    >= agent_start_timeout(&after.launch))
+            && after.report_hash.is_empty()
+            && !live.pane_exists;
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
             if let Err(error) = threads::fail_start(
@@ -1135,7 +1173,10 @@ fn launch_pass(
             pane: &t.pane_id,
             agent_args: &t.launch.args,
             parent: parent.as_deref(),
-            ready_timeout_ms: agent_start_timeout(&t.launch),
+            // `agent start` need not hold the ticker for the whole observation
+            // window: subsequent passes watch the pane for the remaining time.
+            ready_timeout_ms: agent_start_timeout(&t.launch)
+                .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
         })
         .collect();
     let herdr = pass.herdr.on_machine(first.machine_route());
@@ -1954,6 +1995,7 @@ mod tests {
     fn a_soon_ready_agent_gets_its_brief_after_repeated_startup_blocks() {
         let fixture = fixture(false);
         let runner = FakeRunner::new();
+        runner.on("agent rename", ok(r#"{"result":{}}"#));
         runner.on("agent prompt", ok(r#"{"result":{}}"#));
         let record = thread::allocate(&fixture.project, |t| {
             t.status = thread::Status::Starting;
@@ -1989,7 +2031,13 @@ mod tests {
                 tab_id: record.tab_id.clone(),
                 workspace_id: record.workspace_id.clone(),
                 cwd: record.cwd.clone(),
-                name: record.agent_name.clone(),
+                // Herdr can drop the name on a timed-out start. The pane is
+                // still ours and must be renamed before its brief is sent.
+                name: if state == "idle" {
+                    String::new()
+                } else {
+                    record.agent_name.clone()
+                },
                 agent_status: state.into(),
                 ..Agent::default()
             };
@@ -2023,6 +2071,8 @@ mod tests {
         assert!(!saved.prompt_pending);
         assert!(saved.startup_wait_started.is_empty());
         assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(runner.count("agent rename"), 1);
+        assert_eq!(saved.identity.agent_name.as_deref(), Some("hp-demo-t-0001"));
     }
 
     #[test]
