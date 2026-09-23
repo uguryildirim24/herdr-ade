@@ -17,7 +17,7 @@ process.stdin.on('end', () => {
   const log = join(cwd, 'hooks.jsonl');
   const argv = [process.execPath, script, log];
   writeFileSync(join(cwd, '.pi/herdr-ade-hooks.json'), JSON.stringify({
-    pane: 'w1:p1', prompt: [...argv, 'prompt'], stop: [...argv, 'stop'],
+    pane: 'w1:p1', prompt: [...argv, 'prompt'], activate: [...argv, 'activate'], stop: [...argv, 'stop'],
   }));
   const handlers = new Map();
   const sent = [];
@@ -45,7 +45,7 @@ test('submitted pane text reaches the prompt hook with pi session and cwd', asyn
   try {
     await f.emit('input', {source: 'interactive', text: 'Start a Fable lane.'});
     assert.deepEqual(f.notices, []);
-    assert.deepEqual(f.lines(), [{phase: 'prompt', prompt: 'Start a Fable lane.', session_id: 'pi-session-1', cwd: f.ctx.cwd}]);
+    assert.deepEqual(f.lines(), [{phase: 'prompt', prompt: 'Start a Fable lane.', session_id: 'pi-session-1', cwd: f.ctx.cwd, queued: false}]);
   } finally { f.close(); }
 });
 
@@ -57,6 +57,22 @@ test('stop block is returned to the model without recording the correction as a 
     assert.deepEqual(f.sent, ['Run ha say before you finish']);
     await f.emit('input', {source: 'extension', text: f.sent[0]});
     assert.deepEqual(f.lines().map(row => row.phase), ['prompt', 'stop']);
+  } finally { f.close(); }
+});
+
+test('a queued request does not activate its turn until pi starts that message', async () => {
+  const f = fixture();
+  try {
+    await f.emit('input', {source: 'interactive', text: 'First'});
+    await f.emit('input', {source: 'interactive', text: 'Second', streamingBehavior: 'followUp'});
+    assert.deepEqual(f.lines().map(row => [row.phase, row.prompt, row.queued]),
+      [['prompt', 'First', false], ['prompt', 'Second', true]]);
+    await f.emit('message_start', {message: {role: 'user', content: [{type: 'text', text: 'First'}]}});
+    assert.equal(f.lines().length, 2);
+    await f.emit('message_start', {message: {role: 'user', content: [{type: 'text', text: 'Second'}]}});
+    await f.emit('agent_settled', {});
+    assert.deepEqual(f.lines().map(row => [row.phase, row.prompt]),
+      [['prompt', 'First'], ['prompt', 'Second'], ['activate', 'Second'], ['stop', 'Second']]);
   } finally { f.close(); }
 });
 

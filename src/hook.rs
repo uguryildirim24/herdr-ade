@@ -143,11 +143,14 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
         ];
         let mut prompt = argv.clone();
         prompt.extend(["--phase".into(), "prompt".into()]);
+        let mut activate = argv.clone();
+        activate.extend(["--phase".into(), "activate".into()]);
         write_json_atomic(
             &path,
             &serde_json::json!({
                 "pane": pane,
                 "prompt": prompt,
+                "activate": activate,
                 "stop": argv,
             }),
         )?;
@@ -361,7 +364,7 @@ fn verify_owned_entry(
     let value = read_json_object(path)?;
     if shape == ConfigShape::Pi {
         if value["pane"] != pane
-            || !["prompt", "stop"].iter().all(|key| {
+            || !["prompt", "activate", "stop"].iter().all(|key| {
                 value[key].as_array().is_some_and(|args| {
                     args.iter().any(|arg| arg == pane) && args.iter().any(|arg| arg == "hook")
                 })
@@ -411,8 +414,15 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
         return Ok(());
     }
     bind_current_turn_session(&project, kind, pane, session)?;
-    if phase == "prompt" {
+    if phase == "activate" {
         begin_turn(&project, kind, pane, session, &input)?;
+        return Ok(());
+    }
+    if phase == "prompt" {
+        // Pi accepts queued steering/follow-ups before their turn starts.
+        // Record Rolf's words now, but do not replace the running turn's
+        // receipt until pi actually starts that queued user message.
+        begin_prompt_turn(&project, kind, pane, session, &input)?;
         let text = prompt_text(&input).unwrap_or_default();
         if !text.trim().is_empty()
             && let Some(request) = handle_prompt(&project, pane, text)?
@@ -527,6 +537,19 @@ fn new_turn(project: &Project, kind: &str, pane: &str, session: &str, id: String
         id,
         completed: false,
     }
+}
+
+fn begin_prompt_turn(
+    project: &Project,
+    kind: &str,
+    pane: &str,
+    session: &str,
+    input: &serde_json::Value,
+) -> Result<()> {
+    if input["queued"] == true {
+        return Ok(());
+    }
+    begin_turn(project, kind, pane, session, input)
 }
 
 fn begin_turn(
@@ -1076,6 +1099,10 @@ mod tests {
             "prompt"
         );
         assert_eq!(value["stop"].as_array().unwrap().last().unwrap(), "w1:p1");
+        assert_eq!(
+            value["activate"].as_array().unwrap().last().unwrap(),
+            "activate"
+        );
         assert!(captures(&project, "w1:p1").unwrap());
         install(&ctx, &project, "pi", "w1:p1").unwrap();
         remove(&ctx, &project).unwrap();
@@ -1190,6 +1217,27 @@ plain = "the named helper"
             stop_decision(&project, "claude", "w1:p1", "session-one").unwrap(),
             StopDecision::Pass
         );
+        assert!(!current_turn_has_receipt(
+            &project,
+            "claude",
+            "w1:p1",
+            "session-one"
+        ));
+    }
+
+    #[test]
+    fn queued_pi_prompt_does_not_steal_the_running_turns_receipt() {
+        let (_root, project) = receipt_project();
+        record_receipt_for(&project, "say:s-1", "w1:p1").unwrap();
+        let queued = serde_json::json!({"prompt": "Next", "queued": true});
+        begin_prompt_turn(&project, "claude", "w1:p1", "session-one", &queued).unwrap();
+        assert!(current_turn_has_receipt(
+            &project,
+            "claude",
+            "w1:p1",
+            "session-one"
+        ));
+        begin_turn(&project, "claude", "w1:p1", "session-one", &queued).unwrap();
         assert!(!current_turn_has_receipt(
             &project,
             "claude",
