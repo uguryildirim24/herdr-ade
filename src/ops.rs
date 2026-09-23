@@ -112,22 +112,20 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
     // barrier can still be present after a fresh done, before round advance;
     // in that case retrying that fresh op must remain idempotent.
     let barriers = if report_hash.is_some() {
-        crate::round::checked_list(project)?
-            .into_iter()
-            .filter(|record| !record.phase.closed())
-            .flat_map(|record| {
-                let mut barriers = Vec::new();
-                if record.reviewer.as_deref() == Some(thread) {
-                    barriers.extend(record.reviewer_awaiting_report_after);
-                }
-                for member in record.manifest.members {
-                    if member.thread == thread {
-                        barriers.extend(member.awaiting_report_after);
-                    }
-                }
-                barriers
-            })
-            .collect::<Vec<_>>()
+        let mut barriers = correction_barriers(project, thread)?;
+        let box_path = project
+            .record_dir("corrections")
+            .join(format!("{thread}.toml"));
+        if box_path.exists() {
+            let box_record: BoxCorrections = toml::from_str(&std::fs::read_to_string(box_path)?)?;
+            if box_record.thread != thread {
+                bail!("correction_barrier_invalid: wrong thread");
+            }
+            if box_record.attempt == attempt {
+                barriers.extend(box_record.events);
+            }
+        }
+        barriers
     } else {
         Vec::new()
     };
@@ -137,7 +135,13 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
             && op.requested == requested
             && op.recipient == recipient
             && op.round == round
-            && report_hash.is_none_or(|hash| op.artifact.as_deref().is_none_or(|a| a == hash))
+            && report_hash.is_none_or(|hash| {
+                if op.state == OpState::Reserved {
+                    op.report_hash.as_deref() == Some(hash)
+                } else {
+                    op.artifact.as_deref() == Some(hash)
+                }
+            })
             && barriers.iter().all(|barrier| op_after_barrier(op, barrier))
     };
     // Only the latest done may be retried: reverting report bytes to an
@@ -185,9 +189,39 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         state: OpState::Reserved,
         created: project::now(),
         artifact: None,
+        report_hash: report_hash.map(str::to_owned),
     };
     write_op(project, &op)?;
     Ok(op)
+}
+
+/// The Mac pushes this narrow barrier before sending a correction to a box
+/// pane. Round records themselves are Mac-only; the box never infers a missing
+/// record means no correction was requested.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct BoxCorrections {
+    pub(crate) thread: String,
+    pub(crate) attempt: u32,
+    pub(crate) events: Vec<String>,
+}
+
+pub(crate) fn correction_barriers(project: &Project, thread: &str) -> Result<Vec<String>> {
+    Ok(crate::round::checked_list(project)?
+        .into_iter()
+        .filter(|record| !record.phase.closed())
+        .flat_map(|record| {
+            let mut barriers = Vec::new();
+            if record.reviewer.as_deref() == Some(thread) {
+                barriers.extend(record.reviewer_awaiting_report_after);
+            }
+            for member in record.manifest.members {
+                if member.thread == thread {
+                    barriers.extend(member.awaiting_report_after);
+                }
+            }
+            barriers
+        })
+        .collect())
 }
 
 fn op_after_barrier(op: &Op, barrier: &str) -> bool {
@@ -264,6 +298,13 @@ pub(crate) fn stage_done(
     };
     let report = resolve_report(worktree, report_path)?;
     let first = stable_read(&report)?;
+    if op
+        .report_hash
+        .as_deref()
+        .is_some_and(|hash| hash != format!("{:x}", Sha256::digest(&first)))
+    {
+        bail!("report_unstable: report changed after reservation");
+    }
     let status = runner.run(
         &Cmd::new("git", std::time::Duration::from_secs(20))
             .args(["status", "--short"])
@@ -805,6 +846,69 @@ mod tests {
             second.payload.done.as_ref().unwrap().artifact
         );
         assert_eq!(crate::round::sealed_events(&project).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn box_correction_barrier_seals_again_without_mac_round_records() {
+        let (root, project, runner, recipient) = fixture();
+        std::fs::write(root.path().join("report.md"), "unchanged\n").unwrap();
+        let first = done_again(&project, root.path(), &runner, &recipient, "t-0088");
+        assert!(crate::round::checked_list(&project).unwrap().is_empty());
+        let dir = project.record_dir("corrections");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("t-0088.toml"),
+            toml::to_string(&BoxCorrections {
+                thread: "t-0088".into(),
+                attempt: 1,
+                events: vec![first.id.clone()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let second = done_again(&project, root.path(), &runner, &recipient, "t-0088");
+        assert_eq!(second.id, "t-0088-1-2");
+        assert_eq!(
+            done_again(&project, root.path(), &runner, &recipient, "t-0088"),
+            second
+        );
+    }
+
+    #[test]
+    fn report_changed_after_reservation_is_not_sealed_under_wrong_hash() {
+        let (root, project, runner, recipient) = fixture();
+        std::fs::write(root.path().join("report.md"), "first\n").unwrap();
+        let reserve = || {
+            reserve_done(
+                &project,
+                Reservation {
+                    thread: "t-0001",
+                    attempt: 1,
+                    kind: OpKind::Done,
+                    recipient: recipient.clone(),
+                    round: None,
+                    requested: Requested::Done {
+                        sha: "abc".into(),
+                        report_path: "report.md".into(),
+                    },
+                    helper_pid: 1,
+                },
+                root.path(),
+            )
+            .unwrap()
+        };
+        let first = reserve();
+        std::fs::write(root.path().join("report.md"), "second\n").unwrap();
+        assert!(
+            stage_done(&project, &first.op, root.path(), &runner)
+                .unwrap_err()
+                .to_string()
+                .contains("report_unstable")
+        );
+        let second = reserve();
+        assert_ne!(first.op, second.op);
+        stage_done(&project, &second.op, root.path(), &runner).unwrap();
+        seal(&project, &second.op, |_| Ok(())).unwrap();
     }
 
     #[test]
