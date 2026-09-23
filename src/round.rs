@@ -3943,6 +3943,14 @@ fn finish_publication_with(
             }
         };
         if record.installed {
+            // A prior failed recheck left attention on the round. Clear it
+            // once the installer has proved the running processes again.
+            if !record.attention.is_empty() {
+                let _lock = project.lock()?;
+                let mut current = load(project, round)?;
+                current.attention.clear();
+                save(project, &current)?;
+            }
             Some(InstallationStep::Verified { outcome })
         } else {
             let _lock = project.lock()?;
@@ -5992,6 +6000,9 @@ mod tests {
             error.contains("round_install_pending") && error.contains("42928"),
             "{error}"
         );
+        assert!(load(&fx.project, "r1").unwrap().attention.contains("42928"));
+        finish_publication_with(&ctx, &fx.project, "r1", |_| Ok(install.clone())).unwrap();
+        assert!(load(&fx.project, "r1").unwrap().attention.is_empty());
     }
 
     #[test]

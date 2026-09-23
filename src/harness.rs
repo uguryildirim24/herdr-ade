@@ -934,19 +934,31 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
         .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER="))
     {
         let (pid, build) = value.split_once(':').unwrap_or(("", value));
+        let pid = pid.parse::<u32>().ok().filter(|pid| *pid != 0);
         let current = crate::build::same_commit(build, crate::VERSION);
         proofs.push(ProcessProof {
             machine: machine.id.clone(),
             process: "ticker".into(),
-            pid: pid.parse().ok(),
+            pid,
             build: Some(build.to_string()),
-            state: if current { "running" } else { "stale" }.into(),
-            reason: (!current).then(|| {
-                format!(
-                    "the box ticker does not report installed build {}",
-                    crate::VERSION
-                )
-            }),
+            state: if !current {
+                "stale"
+            } else if pid.is_some() {
+                "running"
+            } else {
+                "unknown"
+            }
+            .into(),
+            reason: if pid.is_none() {
+                Some("the box ticker did not report a valid pid".into())
+            } else {
+                (!current).then(|| {
+                    format!(
+                        "the box ticker does not report installed build {}",
+                        crate::VERSION
+                    )
+                })
+            },
         });
     } else if let Some(value) = out
         .stdout
@@ -1717,6 +1729,36 @@ mod tests {
         let proofs = box_process_proofs(&ctx, &machine);
         assert_eq!(proofs[1].state, "unknown");
         assert_eq!(proofs[1].pid, None);
+    }
+
+    #[test]
+    fn a_box_ticker_without_a_valid_pid_cannot_pass_as_running() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            ok(&format!(
+                "HERDR_ADE_BOX_BINARY=herdr-ade {}\nHERDR_ADE_BOX_TICKER=0:{}\n",
+                crate::VERSION,
+                crate::VERSION
+            )),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let machine = crate::remote::MachineDeclaration {
+            id: "oci".into(),
+            target: "box".into(),
+            ..Default::default()
+        };
+        let proofs = box_process_proofs(&ctx, &machine);
+        assert_eq!(proofs[1].state, "unknown");
+        assert!(require_running_tickers(&proofs, &["oci"]).is_err());
     }
 
     #[test]
