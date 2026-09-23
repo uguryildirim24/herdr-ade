@@ -111,6 +111,7 @@ impl Cmd {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn ledger_subject(mut self, subject: impl Into<String>) -> Self {
         self.ledger_subject = Some(subject.into());
         self
@@ -445,7 +446,7 @@ pub(crate) mod fake {
     }
 
     /// Scenario names in SPEC-ADE §1.3 for the new verbs.
-    pub(crate) const ADE_NEW_VERB_SCENARIOS: [&str; 9] = [
+    pub(crate) const ADE_NEW_VERB_SCENARIOS: [&str; 8] = [
         "thread_start_parent",
         "ha_done",
         "ha_waiting",
@@ -454,7 +455,6 @@ pub(crate) mod fake {
         "checkpoint",
         "ask",
         "say",
-        "talk",
     ];
 
     /// Needle → canned stdout for each new verb's herdr or git call (SPEC-ADE §1.3).
@@ -467,10 +467,6 @@ pub(crate) mod fake {
         (
             "HERDR_ADE_LAUNCH",
             r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
-        ),
-        (
-            "label talk",
-            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t-talk","pane_id":"w1:p-talk","cwd":"/project"}}}"#,
         ),
         ("git status --short", ""),
         (

@@ -2,7 +2,7 @@
 //! 4, item 35).
 //!
 //! `publish(HumanMessage)` is the only way text reaches Rolf's plane: the
-//! board, the plugin's notifications and the talk surface. An `Ask` is
+//! board, the plugin's notifications and the journal. An `Ask` is
 //! resolved to its stored record's exact question and ordered choices; a
 //! `Notice` is one of the fixed texts below; an arbitrary string cannot be
 //! published.
@@ -31,49 +31,16 @@ const NOTICES: &[(&str, &str)] = &[
         "The coordinator could not say this in plain words. Open its pane to read it.",
     ),
     (
-        "talk_uncertain",
-        "Your last message may not have arrived. The coordinator's own pane shows whether it did.",
-    ),
-    (
-        "needs_you_in_pane",
-        "The coordinator needs you in its own pane.",
-    ),
-    (
-        "ask_redrawn",
-        "A new question came in, so your number was not used. Read the question again and answer it.",
-    ),
-    (
         "journal_tail",
         "A half written line was found at the end of this record and was left out.",
     ),
     (
         "session_changed",
-        "The coordinator started a new chat. Its replies show here again once it is opened again.",
+        "The coordinator started a new chat. Open its pane to read its replies.",
     ),
     (
         "hook_failed",
         "A check of the last reply did not run. Open the pane of the coordinator to read it.",
-    ),
-    (
-        "native_on",
-        "You are typing in the pane of the coordinator now. Nothing there is checked.",
-    ),
-    ("native_off", "Your messages go through this tab again."),
-    (
-        "native_not_ready",
-        "The coordinator is not ready yet, so your messages still wait.",
-    ),
-    (
-        "request_waiting",
-        "Your message waits until the coordinator is ready.",
-    ),
-    (
-        "recipient_changed",
-        "The coordinator changed, so your waiting message was not sent. Type it again if you still want it.",
-    ),
-    (
-        "ask_not_found",
-        "That question is closed or was asked again, so your number was not used.",
     ),
 ];
 
@@ -247,6 +214,7 @@ fn withdrawal_path(project: &Project, id: &str, revision: u32) -> PathBuf {
     ask_dir(project, id).join(format!("r{revision}.withdrawn.toml"))
 }
 
+#[cfg(test)]
 pub(crate) fn withdrawal_of(project: &Project, id: &str, revision: u32) -> Option<Withdrawal> {
     let text = std::fs::read_to_string(withdrawal_path(project, id, revision)).ok()?;
     toml::from_str(&text).ok()
@@ -1222,8 +1190,6 @@ mod tests {
             )) == 1
         );
         assert_eq!(journal_kinds(&fx.project), ["ask a-1@1"]);
-        let shown = crate::talk::replay(&fx.world.ctx(), "demo").unwrap();
-        assert!(shown.contains("  1. keep it running another hour\n  2. stop it now\n  0. I did not understand the question"), "{shown}");
         assert!(publication_complete(
             &project::read_json::<Publication>(&publication_path(&fx.project, "ask:a-1@1"))
                 .unwrap()
@@ -1676,9 +1642,6 @@ mod tests {
             .starts_with("ask_withdrawn")
         );
         assert!(open_revision(&fx.project, &a.id, 1, &glossary::registry(&fx.project)).is_err());
-        let view =
-            crate::talk::view::Conversation::load(&fx.project, &crate::talk::read(&fx.project));
-        assert!(view.items.iter().any(|item| matches!(&item.body, crate::talk::view::Body::Notice(text) if text.contains("a-1 withdrawn"))));
         assert!(withdraw(&ctx, "demo", &a.id, "Again.", "rolf").is_err());
         // A withdrawn question does not prevent a genuinely new card.
         ask(&ctx, "demo", distinct_ask(1)).unwrap();
