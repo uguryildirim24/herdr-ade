@@ -781,6 +781,24 @@ enum TermCommand {
     },
 }
 
+fn batch_review_started(
+    slug: &str,
+    rounds: &[String],
+    branch: &str,
+    reviewer: Option<&str>,
+) -> String {
+    let names = rounds.join(", ");
+    let command = rounds.join(" ");
+    match reviewer {
+        Some(reviewer) => format!(
+            "started one integration review of {names} on {branch} with {reviewer}; finish with `ha round merge {slug} {command}`\n"
+        ),
+        None => format!(
+            "prepared one integration review of {names} on {branch}; its reviewer start will retry automatically; finish with `ha round merge {slug} {command}`\n"
+        ),
+    }
+}
+
 fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
     use crate::{ask, board, checkpoint, decide, dialogue, glossary, plan, round};
     match command {
@@ -964,19 +982,25 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         review_branch,
                         reviewer: Some(reviewer),
                     } => {
-                        message.push_str(&format!(
-                            "integration base moved; started repair review {review_branch} with {reviewer}\n"
+                        message.push_str(&batch_review_started(
+                            &slug,
+                            &rounds,
+                            review_branch,
+                            Some(reviewer),
                         ));
-                        "repair_review_started"
+                        "integration_review_started"
                     }
                     round::MergeOutcome::RepairReviewStarted {
                         review_branch,
                         reviewer: None,
                     } => {
-                        message.push_str(&format!(
-                            "integration base moved; prepared repair review {review_branch}; its reviewer start will retry automatically\n"
+                        message.push_str(&batch_review_started(
+                            &slug,
+                            &rounds,
+                            review_branch,
+                            None,
                         ));
-                        "repair_review_prepared"
+                        "integration_review_prepared"
                     }
                     round::MergeOutcome::Stopped { phase } => {
                         message.push_str(&format!(
@@ -1901,6 +1925,8 @@ enum TickerCommand {
 enum PlainCommand {
     /// Check text using the deterministic identifier and vocabulary rules
     Check {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
         #[arg(long, value_name = "FILE")]
         text_file: String,
     },
@@ -2881,9 +2907,10 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
         Command::Skill { role } => crate::lane::skill(&ctx, &role),
         Command::Close { slug } => crate::coordinator::close(&ctx, &slug),
         Command::Plain { command } => match command {
-            PlainCommand::Check { text_file } => {
+            PlainCommand::Check { slug, text_file } => {
+                let project = Project::load(&ctx.root, &slug)?;
                 let text = read_text(&text_file)?;
-                let result = crate::plain::check(&text, &crate::plain::Glossary::default());
+                let result = crate::plain::check(&text, &crate::glossary::registry(&project));
                 if result.passed() {
                     println!("pass");
                     Ok(())
@@ -3024,6 +3051,41 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn plain_check_uses_the_project_names_like_say() {
+        let fx = crate::round::testkit::fixture();
+        crate::glossary::add_term(&fx.world.ctx(), "demo", "BioFlux", None, None, true).unwrap();
+        let file = fx.world.home.path().join("message.txt");
+        std::fs::write(&file, "BioFlux helps Rolf.").unwrap();
+        let cli = Cli::try_parse_from([
+            "ha",
+            "plain",
+            "check",
+            "demo",
+            "--text-file",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Plain { command: PlainCommand::Check { ref slug, .. } } if slug == "demo")
+        );
+        assert!(dispatch(fx.world.ctx(), cli.command).is_ok());
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!crate::plain::check(&text, &crate::plain::Glossary::default()).passed());
+    }
+
+    #[test]
+    fn batch_merge_message_names_one_integration_review() {
+        let rounds = vec!["r147".to_string(), "r148".to_string()];
+        let review_branch = "review/r147-3";
+        let reviewer = "t-0402";
+        let message =
+            super::batch_review_started("adeherdr", &rounds, review_branch, Some(reviewer));
+        assert!(message.contains("one integration review of r147, r148"));
+        assert!(message.contains("t-0402"));
+        assert!(!message.contains("base moved"));
     }
 
     #[test]
