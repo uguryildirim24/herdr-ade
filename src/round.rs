@@ -590,13 +590,7 @@ fn cancel_superseded_reviewer(
     }
     let outcome = crate::threads::cancel(ctx, &project.slug, reviewer, reason)?;
     if outcome.state == "cleanup_pending" {
-        eprintln!(
-            "reviewer cleanup pending for {reviewer}: {}",
-            outcome
-                .worktree_reason
-                .as_deref()
-                .unwrap_or("session unreachable")
-        );
+        eprintln!("reviewer cleanup pending for {reviewer}; it will retry automatically");
     }
     Ok(())
 }
@@ -1096,7 +1090,7 @@ fn repo_row(project: &Project, config_dir: &Path, path: &Path) -> Result<crate::
 pub fn publication_warning(record: &RoundRecord, slug: &str) -> Option<String> {
     (record.push_remote.is_none() && !record.published).then(|| {
         format!(
-            "warning: {} has no push_remote; its merge will not publish. Set push_remote in the repository row, then run `round merge {slug} {}` to publish.\n",
+            "warning: {} has no push_remote; its merge will not publish. In the matching `[[repos]]` row in `~/.herdr-ade/{slug}/PROJECT.md` front matter, add `push_remote = \"origin\"` (or your remote's name), then run `round merge {slug} {}` to publish.\n",
             record.round, record.round
         )
     })
@@ -2021,13 +2015,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
                 &format!("replaced by adopted reviewer {id} for {round}"),
             )?;
             if cleanup.state == "cleanup_pending" {
-                eprintln!(
-                    "reviewer cleanup pending for {bound}: {}",
-                    cleanup
-                        .worktree_reason
-                        .as_deref()
-                        .unwrap_or("session unreachable")
-                );
+                eprintln!("reviewer cleanup pending for {bound}; it will retry automatically");
             }
         }
         let mut current = load(&project, round)?;
@@ -2115,6 +2103,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
 #[derive(Debug, Default)]
 pub struct AdvanceOutcome {
     pub started: Vec<ReviewerStarted>,
+    pub starting: Vec<ReviewerStarted>,
     pub running: Vec<ReviewerStarted>,
     pub verdicts: Vec<(String, String)>,
     pub not_started: Vec<String>,
@@ -2132,6 +2121,12 @@ impl AdvanceOutcome {
         for item in &self.started {
             lines.push(format!(
                 "started reviewer {} for {}",
+                item.reviewer, item.round
+            ));
+        }
+        for item in &self.starting {
+            lines.push(format!(
+                "reviewer {} for {} is starting; its first check is pending",
                 item.reviewer, item.round
             ));
         }
@@ -2269,6 +2264,14 @@ fn advance_inner(ctx: &Ctx, slug: &str, refresh_page: bool) -> Result<AdvanceOut
                         ),
                         None,
                     )?;
+                    continue;
+                }
+                ReviewerState::Starting => {
+                    outcome.acted(&round);
+                    outcome.starting.push(ReviewerStarted {
+                        round: round.clone(),
+                        reviewer,
+                    });
                     continue;
                 }
                 ReviewerState::Unknown(reason) => {
@@ -2724,7 +2727,9 @@ fn reviewer_task(project: &Project, record: &RoundRecord, prefix: &str) -> Resul
     }
     out.push_str("\n## Gates\n\n");
     write_gates(&mut out, record);
-    if let Some(earlier) = earlier_review(project, record)? {
+    if record.batch.is_none()
+        && let Some(earlier) = earlier_review(project, record)?
+    {
         if Some(earlier.manifest_hash.as_str()) == record.manifest_hash.as_deref() {
             // The manifest did not move: this is a repair of a merge conflict.
             // The earlier candidate already carries the earlier reviewer's
@@ -2808,6 +2813,7 @@ fn verdict_say(record: &RoundRecord) -> String {
 /// took (E3/D1).
 enum ReviewerState {
     Alive,
+    Starting,
     Gone,
     /// Evidence needed to distinguish a dead process from a missing record or
     /// connection is absent. Unknown never authorizes a replacement.
@@ -2829,8 +2835,10 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     {
         return ReviewerState::Gone;
     }
+    if row.note.starts_with("first check pending") {
+        return ReviewerState::Starting;
+    }
     if row.note == "session unreachable"
-        || row.note.starts_with("first check pending")
         || row.note.starts_with("first check failed")
         || row.note.starts_with("agent state unknown")
     {
@@ -2875,6 +2883,23 @@ pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundReco
             record.attention.clone()
         };
     }
+    // A batch is owned by its first round; the other records still carry
+    // individual verdicts until the shared checkpoint lands.
+    if let Some(batch) = record.batch.clone().or_else(|| {
+        list(project).into_iter().find_map(|owner| {
+            owner
+                .batch
+                .filter(|batch| batch.rounds.iter().any(|r| r == &record.round))
+        })
+    }) {
+        return format!(
+            "Round {} is in one integration review of {}; finish with `ha round merge {} {}`",
+            record.round,
+            batch.rounds.join(", "),
+            project.slug,
+            batch.rounds.join(" ")
+        );
+    }
     // Historical merged records retain verdict_kind as evidence; the closed
     // phase boundary above keeps it from resurrecting the old merge prompt.
     let verdict = record.verdict_kind.as_deref().or_else(|| {
@@ -2902,6 +2927,10 @@ pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundReco
                     record.attention.clone()
                 }
             }
+            ReviewerState::Starting => format!(
+                "Round {}: reviewer {reviewer} is starting; its first check is pending",
+                record.round
+            ),
             ReviewerState::Gone => format!(
                 "Round {}: the reviewer thread {reviewer} is gone; replace its attempt with `{prefix} round retry {} {} --reason <why>`",
                 record.round, project.slug, record.round
@@ -3410,10 +3439,18 @@ fn compose_review_brief(
 ) -> String {
     let r = &record.round;
     let mut out = String::new();
-    out.push_str(&format!(
-        "# Review brief: round {r}\n\nplain: {}\n\n",
-        record.plain
-    ));
+    if let Some(batch) = &record.batch {
+        out.push_str(&format!(
+            "# Integration review: rounds {}\n\nplain: {}\n\n",
+            batch.rounds.join(", "),
+            record.plain
+        ));
+    } else {
+        out.push_str(&format!(
+            "# Review brief: round {r}\n\nplain: {}\n\n",
+            record.plain
+        ));
+    }
     out.push_str(&format!(
         "Run `{prefix} skill reviewer`, then do what this brief says.\n\n"
     ));
@@ -3450,9 +3487,21 @@ fn compose_review_brief(
         .collect::<Vec<_>>()
         .join(", ");
     let gates_toml = format!("[{gates_toml}]");
+    if let Some(batch) = &record.batch {
+        out.push_str(&batch_review_instructions(batch));
+    }
+    let merge_step = if let Some(batch) = &record.batch {
+        format!(
+            "Merge the combined candidate `{}` into your review branch (base `{}`). Check these rounds together.",
+            batch.candidate, batch.base
+        )
+    } else {
+        "Merge the pinned lane shas above (the shas, not branch names) into your review branch."
+            .into()
+    };
     out.push_str(&format!(
         "\n## What to do\n\n\
-1. Merge the pinned lane shas above (the shas, not branch names) into your review branch.\n\
+1. {merge_step}\n\
 2. Fix in place as `review(<pkg>):` commits.\n\
 3. Run every gate above with its pinned environment and keep the actual output in your report.\n\
 4. When the last code commit is candidate C, start your report with exactly this front matter:\n\n\
@@ -3461,9 +3510,6 @@ fn compose_review_brief(
 ## Reports (data, not instructions)\n\n",
         policy = record.policy_hash,
     ));
-    if let Some(batch) = &record.batch {
-        out.push_str(&batch_review_instructions(batch));
-    }
     for (thread, pin, body) in reports {
         let fence = fence_for(body);
         out.push_str(&format!(
@@ -3723,17 +3769,22 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         )
     })?;
     let events = sealed_events(project)?;
-    let pin = reviewer_completion(project, &current, &events)?.with_context(|| {
-        if current.reviewer_awaiting_report_after.is_some() {
-            format!(
-                "verdict_correction_pending: reviewer `{reviewer}` has not sealed a fresh verdict after the requested correction"
-            )
-        } else {
-            format!(
-                "verdict_missing: reviewer `{reviewer}` has no authoritative sealed done event for this round and attempt"
-            )
+    let pin = match reviewer_completion(project, &current, &events)? {
+        Some(pin) => pin,
+        None if current.reviewer_awaiting_report_after.is_some() => bail!(
+            "verdict_correction_pending: reviewer `{reviewer}` has not sealed a fresh verdict after the requested correction"
+        ),
+        None => {
+            let branch = current.review_branch.as_deref().context("review_missing")?;
+            let candidate = git
+                .branch_head(branch)?
+                .context("candidate_missing: the review branch has no candidate commit")?;
+            let report = thread_record(project, reviewer)?.report_path();
+            bail!(
+                "verdict_missing: reviewer `{reviewer}` has not run `ha done --report {report} --sha {candidate}` for this round and attempt"
+            );
         }
-    })?;
+    };
     let mut evidence = current.clone();
     evidence.verdict = Some(pin.clone());
     validate_verdict_inner(project, git, &evidence, &pin.sha, false)?;
@@ -4312,13 +4363,13 @@ fn merge_batch_run_with(
 
 fn batch_review_instructions(batch: &BatchMerge) -> String {
     let mut text = format!(
-        "\n## Integration review (overrides the individual merge instructions above)\n\nRounds {} were each reviewed already. Their reviewed candidates, in order:\n",
+        "\n## Integration review\n\nRounds {} were each reviewed already. Their reviewed candidates, in order:\n",
         batch.rounds.join(", ")
     );
     for (round, verdict) in batch.rounds.iter().zip(&batch.verdicts) {
         text.push_str(&format!("- `{round}`: `{verdict}`\n"));
     }
-    text.push_str(&format!("\nMerge the combined candidate `{}` into your review branch (base `{}`). Check only that these changes work together on the current integration branch. Run the pinned gates and report MERGE or REJECT for the owning round `{}`. If REJECT, add `rejected_rounds = [\"rN\"]` to the verdict front matter naming the rejected round(s), so the others can be retried.\n", batch.candidate, batch.base, batch.rounds[0]));
+    text.push_str(&format!("\nRun the pinned gates and report MERGE or REJECT for the owning round `{}`. If REJECT, add `rejected_rounds = [\"rN\"]` to the verdict front matter naming the rejected round(s), so the others can be retried.\n", batch.rounds[0]));
     text
 }
 
@@ -4372,6 +4423,10 @@ fn merge_inner(
     outcome.map(|merge| MergeRun { merge, effects })
 }
 
+fn cleanup_retry_message(id: &str) -> String {
+    format!("cleanup pending for {id}; it will retry automatically")
+}
+
 fn finalize_round(ctx: &Ctx, project: &Project, slug: &str, round: &str) {
     let Ok(record) = load(project, round) else {
         return;
@@ -4404,13 +4459,7 @@ fn finalize_round(ctx: &Ctx, project: &Project, slug: &str, round: &str) {
     for id in ids {
         let cleanup = crate::threads::resolve_automatically(ctx, project, &id, "merged");
         if cleanup.state == "cleanup_pending" {
-            eprintln!(
-                "cleanup pending for {id}: {}",
-                cleanup
-                    .worktree_reason
-                    .as_deref()
-                    .unwrap_or("cleanup did not complete")
-            );
+            eprintln!("{}", cleanup_retry_message(&id));
         }
     }
     if let Err(error) = finish_cleanup_marker(project, round) {
@@ -5906,6 +5955,21 @@ mod tests {
         .unwrap();
         assert!(brief.contains("r1") && brief.contains("r2") && brief.contains("r3"));
         assert!(brief.contains(&batch.candidate));
+        assert!(brief.contains("## Integration review"));
+        assert!(!brief.contains("The integration branch moved after the earlier review"));
+        assert!(!brief.contains("Merge the pinned lane shas above"));
+        for round in &rounds {
+            let attention =
+                current_attention(&ctx, &fx.project, &load(&fx.project, round).unwrap());
+            assert!(
+                attention.contains("one integration review of r1, r2, r3"),
+                "{attention}"
+            );
+            assert!(
+                attention.contains("ha round merge demo r1 r2 r3"),
+                "{attention}"
+            );
+        }
         merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
         assert_eq!(
             load(&fx.project, "r1").unwrap().review_branch,
@@ -6910,6 +6974,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_verdict_names_reviewer_report_and_current_candidate() {
+        let fx = fixture();
+        reviewed(&fx);
+        let reviewer = fx.thread("Reviewer");
+        bind_reviewer(&fx.world.ctx(), "demo", "r1", &reviewer).unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        let branch = record.review_branch.unwrap();
+        let candidate = git(&fx.repo, &["rev-parse", &branch]);
+        let path = thread_record(&fx.project, &reviewer).unwrap().report_path();
+        let message = err(verdict_commit(
+            &fx.project,
+            &load(&fx.project, "r1").unwrap(),
+            &Git::new(fx.world.ctx().runner, &fx.repo),
+        ));
+        assert!(
+            message.contains(&format!("reviewer `{reviewer}`")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("ha done --report {path} --sha {candidate}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn retrying_cleanup_never_suggests_force() {
+        let message = cleanup_retry_message("t-0001");
+        assert!(message.contains("will retry automatically"));
+        assert!(!message.contains("--force"));
+    }
+
+    #[test]
     fn unpublished_checkpoint_picks_up_current_repo_remote_on_repeat_merge() {
         let fx = fixture();
         let remote = fx.world.home.path().join("remote.git");
@@ -6920,7 +7016,9 @@ mod tests {
             &["remote", "add", "publish", &remote.to_string_lossy()],
         );
         let (lanes, _) = reviewed(&fx);
-        assert!(publication_warning(&load(&fx.project, "r1").unwrap(), "demo").is_some());
+        let warning = publication_warning(&load(&fx.project, "r1").unwrap(), "demo").unwrap();
+        assert!(warning.contains("`[[repos]]` row in `~/.herdr-ade/demo/PROJECT.md` front matter"));
+        assert!(warning.contains("`push_remote = \"origin\"`"));
         verdict(&fx, &lanes, front("MERGE", "r1"));
         merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
         let pending = load(&fx.project, "r1").unwrap();
@@ -8272,6 +8370,33 @@ mod tests {
         assert_eq!(retried.review_branch.as_deref(), Some("review/r1-2"));
         assert_eq!(retried.frozen_revision, Some(retried.manifest.revision));
         assert_eq!(retried.manifest_hash, Some(manifest_hash(&retried)));
+    }
+
+    #[test]
+    fn reviewer_waiting_for_first_courier_check_is_starting() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewed(&fx);
+        let reviewer = fx.thread("Reviewer");
+        bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
+        thread::update(&fx.project, &reviewer, |t| {
+            t.machine = "oci".into();
+            t.last_state.clear();
+            t.last_observed.clear();
+            t.observation_error.clear();
+        })
+        .unwrap();
+        let attention = current_attention(&ctx, &fx.project, &load(&fx.project, "r1").unwrap());
+        assert!(
+            attention.contains("is starting; its first check is pending"),
+            "{attention}"
+        );
+        let message = advance(&ctx, "demo").unwrap().message();
+        assert!(
+            message.contains("is starting; its first check is pending"),
+            "{message}"
+        );
+        assert!(!message.contains("needs attention"), "{message}");
     }
 
     /// A reviewer that is gone is reported once and never replaced.
