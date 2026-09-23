@@ -3401,7 +3401,9 @@ pub(crate) enum InstallationStep {
     Completed {
         outcome: crate::harness::InstallOutcome,
     },
-    AlreadyComplete,
+    Verified {
+        outcome: crate::harness::InstallOutcome,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -3427,8 +3429,10 @@ impl MergeEffects {
                     message.push_str("installed harness repositories\n");
                     message.push_str(&outcome.message());
                 }
-                InstallationStep::AlreadyComplete => {
-                    message.push_str("installation was already complete\n");
+                InstallationStep::Verified { outcome } => {
+                    message
+                        .push_str("installation was already complete; checked running tickers\n");
+                    message.push_str(&outcome.message());
                 }
             }
         }
@@ -3437,7 +3441,9 @@ impl MergeEffects {
 
     pub(crate) fn warnings(&self) -> String {
         match &self.installation {
-            Some(InstallationStep::Completed { outcome }) => outcome.warnings(),
+            Some(
+                InstallationStep::Completed { outcome } | InstallationStep::Verified { outcome },
+            ) => outcome.warnings(),
             _ => String::new(),
         }
     }
@@ -3920,7 +3926,9 @@ fn finish_publication_with(
     }
 
     let record = load(project, round)?;
-    let installation = if record.install_required && !record.installed {
+    // A recorded installation does not prove its ticker is still running.
+    // Reinstalling the same clean build is idempotent and repairs a stale holder.
+    let installation = if record.install_required {
         let outcome = match installer(ctx) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -3934,14 +3942,16 @@ fn finish_publication_with(
                 bail!(message);
             }
         };
-        let _lock = project.lock()?;
-        let mut current = load(project, round)?;
-        current.installed = true;
-        current.attention.clear();
-        save(project, &current)?;
-        Some(InstallationStep::Completed { outcome })
-    } else if record.install_required {
-        Some(InstallationStep::AlreadyComplete)
+        if record.installed {
+            Some(InstallationStep::Verified { outcome })
+        } else {
+            let _lock = project.lock()?;
+            let mut current = load(project, round)?;
+            current.installed = true;
+            current.attention.clear();
+            save(project, &current)?;
+            Some(InstallationStep::Completed { outcome })
+        }
     } else {
         None
     };
@@ -5897,7 +5907,7 @@ mod tests {
     }
 
     #[test]
-    fn round_install_returns_the_installers_running_proof_and_does_not_repeat_it() {
+    fn round_install_rechecks_the_running_ticker_even_after_completion() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let (lanes, _) = reviewed(&fx);
@@ -5957,18 +5967,30 @@ mod tests {
         );
         assert!(load(&fx.project, "r1").unwrap().installed);
 
-        let repeated = finish_publication_with(&ctx, &fx.project, "r1", |_| {
-            panic!("an already completed installation must not run again")
-        })
-        .unwrap();
+        let repeated =
+            finish_publication_with(&ctx, &fx.project, "r1", |_| Ok(install.clone())).unwrap();
         assert_eq!(
             repeated.installation,
-            Some(InstallationStep::AlreadyComplete)
+            Some(InstallationStep::Verified { outcome: install })
         );
         assert!(
             repeated
                 .message()
                 .contains("installation was already complete")
+        );
+        assert!(
+            repeated
+                .message()
+                .contains("oci ticker pid 42: installed-head (running)")
+        );
+        let error = finish_publication_with(&ctx, &fx.project, "r1", |_| {
+            anyhow::bail!("stale ticker 42928 still holds lock")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("round_install_pending") && error.contains("42928"),
+            "{error}"
         );
     }
 
