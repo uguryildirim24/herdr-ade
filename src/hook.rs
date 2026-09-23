@@ -949,7 +949,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.starts_with("decision_basis: no message"), "{error}");
+        assert!(
+            error.starts_with("request_authority: no request"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -172,24 +172,17 @@ fn check_class(class: &str) -> Result<()> {
     Ok(())
 }
 
-/// A human message a `request:<id>` reference names.
-fn request_exists(project: &Project, id: &str) -> bool {
-    talk::request_text(project, id).is_some()
-}
-
 /// Validates a `--basis` reference and its provenance (SPEC-talk §6.6): an
-/// existing human message, or a current, nonzero answered ask. The presence of
-/// a reference is not semantic proof of permission.
+/// existing human message in this or a named project, or a current, nonzero
+/// answered ask. The presence of a reference is not semantic proof of permission.
 pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
     let reference = AuthorityRef::parse(text).with_context(|| {
-        format!("decision_basis: `{text}` is not `request:<id>` or `ask:<id>@<revision>`")
+        format!(
+            "decision_basis: `{text}` is not `request:<id>`, `request:<project>/<id>` or `ask:<id>@<revision>`"
+        )
     })?;
     match &reference {
-        AuthorityRef::Request(id) => {
-            if !request_exists(project, id) {
-                bail!("decision_basis: no message `{id}` in this project");
-            }
-        }
+        AuthorityRef::Request(_) => return Ok(talk::resolve_request(project, text)?.basis()),
         AuthorityRef::Ask { id, revision } => {
             let latest = crate::ask::latest_revision(project, id);
             if latest != *revision {
@@ -223,6 +216,22 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
         Some(basis) => Some(validate_basis(&project, basis)?),
         None => None,
     };
+    let request = new
+        .request
+        .map(|request| {
+            let reference = if request.starts_with("request:") {
+                request.to_string()
+            } else {
+                format!("request:{request}")
+            };
+            validate_basis(&project, &reference).map(|canonical| {
+                canonical
+                    .strip_prefix("request:")
+                    .expect("validated request basis")
+                    .to_string()
+            })
+        })
+        .transpose()?;
     let _replacement_lock = new
         .replaces
         .map(|_| crate::note::replacement_lock(&project))
@@ -246,22 +255,16 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
             && existing.class == new.class
             && existing.basis.as_deref() == basis.as_deref()
             && existing.replaces.as_deref() == new.replaces
-            && existing.request.as_deref() == new.request;
+            && existing.request.as_deref() == request.as_deref();
         if same {
             return Ok(existing.clone());
         }
         bail!("decision_key: key `{key}` already names different content");
     }
-    let mut request = new.request;
-    if let Some(replaces) = new.replaces {
-        request = Some(request.with_context(|| {
-            format!("decision_replacement: --request is required with --replaces (for {replaces})")
-        })?);
-    }
-    if let Some(request) = request
-        && !request_exists(&project, request)
+    if let Some(replaces) = new.replaces
+        && request.is_none()
     {
-        bail!("decision_request: no message `{request}` in this project");
+        bail!("decision_replacement: --request is required with --replaces (for {replaces})");
     }
     if let Some(replaces) = new.replaces {
         if let Some(target) = log.records.iter().find(|d| d.id == replaces) {
@@ -289,7 +292,7 @@ pub(crate) fn decide(ctx: &Ctx, slug: &str, new: NewDecision<'_>) -> Result<Deci
         key: new.key.map(str::to_string),
         basis,
         replaces: new.replaces.map(str::to_string),
-        request: request.map(str::to_string),
+        request,
         overturned: None,
     };
     append(&project, &record)?;
@@ -458,6 +461,111 @@ mod tests {
     }
 
     #[test]
+    fn cross_project_requests_back_decisions_notes_tasks_and_rendered_context() {
+        let fx = fixture();
+        let source = crate::project::create(&fx.world.root, "source", "", vec![]).unwrap();
+        talk::append(
+            &source,
+            None,
+            talk::Entry::Rolf {
+                request: "q-cross".into(),
+                text: "Keep the overnight direction in the project record.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let authority = "request:source/q-cross";
+
+        let decision = decide(
+            &fx.world.ctx(),
+            "demo",
+            NewDecision {
+                line: "I will keep the overnight direction in the project record.",
+                class: "what-you-get",
+                key: None,
+                basis: Some(authority),
+                replaces: None,
+                request: None,
+            },
+        )
+        .unwrap();
+        let note = crate::note::add(
+            &fx.project,
+            crate::note::Kind::Instruction,
+            "Keep the overnight direction in the project record.",
+            "source/q-cross",
+            None,
+            vec![],
+        )
+        .unwrap();
+        let task = crate::task::add(
+            &fx.project,
+            "Record the overnight direction",
+            vec![authority.into()],
+            vec!["The direction remains visible in context.".into()],
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(decision.basis.as_deref(), Some(authority));
+        assert_eq!(note.request, "source/q-cross");
+        assert_eq!(task.authority, vec![authority]);
+        let page = std::fs::read_to_string(fx.project.project_md()).unwrap();
+        assert!(
+            page.contains("request:source/q-cross"),
+            "cross-project provenance missing from page:\n{page}"
+        );
+        let decision_row = format!(
+            "- `{}` ({}; {authority}):",
+            decision.id,
+            &decision.at[..decision.at.len().min(10)]
+        );
+        assert!(
+            page.contains(&decision_row),
+            "decision provenance missing from page:\n{page}"
+        );
+        let rendered_task = crate::task::render(&crate::task::view(&fx.project, task));
+        assert!(rendered_task.contains(&format!("authority: {authority}")));
+        let (context, _) = crate::coordinator::digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
+        assert!(context.contains(&decision_row), "{context}");
+    }
+
+    #[test]
+    fn unknown_cross_project_requests_name_the_project_and_id_once() {
+        let fx = fixture();
+        crate::project::create(&fx.world.root, "source", "", vec![]).unwrap();
+        for (basis, expected) in [
+            (
+                "request:missing/q-lost",
+                "request_authority: no request `q-lost` in project `missing`",
+            ),
+            (
+                "request:source/q-lost",
+                "request_authority: no request `q-lost` in project `source`",
+            ),
+        ] {
+            assert_eq!(
+                validate_basis(&fx.project, basis).unwrap_err().to_string(),
+                expected
+            );
+            assert_eq!(
+                crate::task::add(
+                    &fx.project,
+                    "Do the requested work",
+                    vec![basis.into()],
+                    vec!["The requested work is complete.".into()],
+                    None,
+                    None,
+                )
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn old_peer_and_ticker_rows_are_not_rolfs_authority() {
         let fx = fixture();
         let rows = [
@@ -507,7 +615,10 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-            assert!(error.starts_with("decision_basis: no message"), "{error}");
+            assert!(
+                error.starts_with("request_authority: no request"),
+                "{error}"
+            );
         }
         assert_eq!(talk::read(&fx.project).lines.len(), 2);
         assert!(read(&fx.project).records.is_empty());
