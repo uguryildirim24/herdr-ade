@@ -876,9 +876,16 @@ fn thread_pass(
                     thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
                     Ok(())
                 })?;
+                let events_before_send = crate::round::sealed_events(project)?;
                 match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
                     Ok(()) => {
                         delivered = true;
+                        crate::threads::record_answered_wait(
+                            project,
+                            &t.id,
+                            attempt,
+                            &events_before_send,
+                        )?;
                         thread::update_checked(project, &t.id, |thread| {
                             let Some(saved) = thread.follow_ups.get(index) else {
                                 anyhow::bail!("queued follow-up disappeared during delivery");
