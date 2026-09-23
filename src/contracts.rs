@@ -607,6 +607,14 @@ pub(crate) struct BatchMerge {
     pub(crate) verdicts: Vec<String>,
     pub(crate) base: String,
     pub(crate) candidate: String,
+    /// The owner's review at selection time; distinguishes a newly selected
+    /// batch from a review created just before a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_review_branch: Option<String>,
+    /// Set once the integration review revision exists; a prior REJECT on the
+    /// owning round is not a verdict on this selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) review_branch: Option<String>,
 }
 
 /// Checkpoint intent bound to the merged candidate and sealed payload hash.
