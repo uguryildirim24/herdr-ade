@@ -1664,7 +1664,8 @@ pub fn remove(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Rou
 pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<RoundRecord> {
     let project = Project::load(&ctx.root, slug)?;
     let _operation = operation_lock(&project, round)?;
-    thread::load(&project, thread_id)?;
+    let candidate = thread::load(&project, thread_id)?;
+    require_reviewer_round(&project, round, &candidate)?;
     let _lock = project.lock()?;
     let mut record = load(&project, round)?;
     require_editable(&record)?;
@@ -1772,6 +1773,30 @@ pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Recover
         thread: reviewer,
         phase: load(&project, round)?.phase,
     })
+}
+
+fn require_reviewer_round(
+    project: &Project,
+    round: &str,
+    candidate: &thread::Thread,
+) -> Result<()> {
+    if !candidate.review_round.is_empty() && candidate.review_round != round {
+        bail!(
+            "reviewer_round_mismatch: `{}` was started for `{}`, not `{round}`",
+            candidate.id,
+            candidate.review_round
+        );
+    }
+    if let Some(other) = checked_list(project)?.into_iter().find(|record| {
+        record.round != round && record.reviewer.as_deref() == Some(candidate.id.as_str())
+    }) {
+        bail!(
+            "reviewer_bound_elsewhere: `{}` already reviews `{}`",
+            candidate.id,
+            other.round
+        );
+    }
+    Ok(())
 }
 
 fn require_reviewer_base(
@@ -2298,7 +2323,7 @@ fn start_and_bind_reviewer(
     // of that transition and never allocate a duplicate reviewer.
     let git = Git::new(ctx.runner, &load(project, round)?.repo);
     let review_head = git.branch_head(review_branch)?;
-    let reviewers_of_other_rounds: std::collections::BTreeSet<String> = list(project)
+    let reviewers_of_other_rounds: std::collections::BTreeSet<String> = checked_list(project)?
         .into_iter()
         .filter(|record| record.round != round)
         .filter_map(|record| record.reviewer)
@@ -5979,6 +6004,15 @@ mod tests {
             thread::load(&fx.project, &second).unwrap().review_round,
             "r2"
         );
+        let error = err(bind_reviewer(&ctx, "demo", "r2", &first));
+        assert!(error.starts_with("reviewer_round_mismatch"), "{error}");
+
+        thread::update(&fx.project, &first, |candidate| {
+            candidate.review_round.clear()
+        })
+        .unwrap();
+        let error = err(bind_reviewer(&ctx, "demo", "r2", &first));
+        assert!(error.starts_with("reviewer_bound_elsewhere"), "{error}");
     }
 
     #[test]
