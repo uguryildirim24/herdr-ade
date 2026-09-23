@@ -81,6 +81,10 @@ pub(crate) struct Thread {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) follow_ups: Vec<FollowUp>,
     pub(crate) launch_attempts: u32,
+    /// Submission time of an agent start awaiting readiness after an early
+    /// `agent_not_ready`. A blocked startup is not a failed attempt yet.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) startup_wait_started: String,
     pub(crate) failure_event: String,
     pub(crate) last_failure: String,
     /// Classification of the current failure evidence. Old records load as
@@ -888,10 +892,12 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
     match thread.status {
         Status::Resolved => Group::Resolved,
         Status::Failed => Group::WaitingOnYou,
+        Status::Starting if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Starting if seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS => {
             Group::WaitingOnYou
         }
         Status::Starting => Group::Working,
+        Status::Open if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Open if thread.is_remote() && thread.last_state.is_empty() => Group::Unknown,
         Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
             Group::Working
@@ -910,11 +916,18 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     }
     // 2
     if thread.status == Status::Starting {
-        return if seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS {
+        return if !thread.startup_wait_started.is_empty()
+            || seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS
+        {
             Group::Working
         } else {
             Group::WaitingOnYou
         };
+    }
+    // An early startup block is not a user-facing block until its ready
+    // window expires. The ticker makes the timed failure transition.
+    if !thread.startup_wait_started.is_empty() {
+        return Group::Working;
     }
     // 3
     let stuck_launch = thread.prompt_pending

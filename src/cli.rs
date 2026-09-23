@@ -2686,8 +2686,17 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                     Some("retried"),
                     &result,
                     &format!(
-                        "{} attempt {} is in pane {}; the ticker launches its agent\n",
-                        result.thread, result.attempt, result.pane_id
+                        "{} attempt {} is in pane {}; the ticker launches its agent{}\n",
+                        result.thread,
+                        result.attempt,
+                        result.pane_id,
+                        result
+                            .screen
+                            .as_ref()
+                            .map(|screen| format!(
+                                "; previous startup screen still showed: {screen}"
+                            ))
+                            .unwrap_or_default()
                     ),
                     "",
                 )
