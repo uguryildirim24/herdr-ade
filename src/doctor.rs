@@ -960,6 +960,23 @@ fn finished_worktrees(
             if !on_machine {
                 continue;
             }
+            // A resolved local record may intentionally outlive its removed
+            // worktree. Establish absence from the filesystem before any git
+            // completion checks, so every doctor pass does not probe a path
+            // which is already gone.
+            if remote.is_none() {
+                match std::fs::metadata(&thread.worktree_path) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        errors.push(format!(
+                            "{}: could not inspect worktree {}: {error}",
+                            thread.id, thread.worktree_path
+                        ));
+                        continue;
+                    }
+                }
+            }
             match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
                 Ok(None) => candidates.push((project.clone(), thread)),
                 Ok(Some(_)) => {}
@@ -2539,6 +2556,41 @@ recipe = "claude_fable_xhigh"
                 && check.label == "finished worktrees local"
                 && check.detail == "none whose work is done"
         }));
+    }
+
+    #[test]
+    fn a_resolved_thread_with_a_gone_worktree_is_not_probed() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let gone = home.path().join("already-removed-worktree");
+        crate::thread::allocate(&project, |thread| {
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.status = crate::thread::Status::Resolved;
+            thread.worktree_path = gone.to_string_lossy().into_owned();
+            thread.repo = "/repo".into();
+            thread.branch = "lane".into();
+        })
+        .unwrap();
+        let fake = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &fake,
+            detached_ticker: false,
+        };
+
+        let (leftovers, data, errors) = finished_worktrees(&ctx, None);
+
+        assert!(leftovers.is_empty());
+        assert!(data.is_empty());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            fake.calls.borrow().iter().all(|call| call.program != "git"),
+            "a gone worktree must not reach a git probe"
+        );
     }
 
     #[test]

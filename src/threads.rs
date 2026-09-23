@@ -1913,6 +1913,39 @@ fn awaiting_bootstrap(record: &Thread) -> bool {
         && record.bootstrap != "acknowledged"
 }
 
+fn latest_waiting_event_id(
+    events: &[crate::contracts::Event],
+    thread: &str,
+    attempt: u32,
+) -> Option<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event.thread == thread && event.attempt == attempt && event.payload.waiting.is_some()
+        })
+        .max_by(|left, right| (&left.created, &left.id).cmp(&(&right.created, &right.id)))
+        .map(|event| event.id.clone())
+}
+
+pub(crate) fn record_answered_wait(
+    project: &Project,
+    thread_id: &str,
+    attempt: u32,
+    events: &[crate::contracts::Event],
+) -> Result<()> {
+    let Some(waiting) = latest_waiting_event_id(events, thread_id, attempt) else {
+        return Ok(());
+    };
+    thread::update_checked(project, thread_id, |thread| {
+        if thread.attempt.max(1) != attempt {
+            bail!("prompt_attempt_changed: {thread_id} moved past attempt {attempt}");
+        }
+        thread.answered_waiting_event = waiting;
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutcome> {
@@ -2018,8 +2051,10 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             .agent_prompt(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    let attempt = record.attempt.max(1);
+    record_answered_wait(&project, id, attempt, &events_before_send)?;
     Ok(PromptOutcome::Sent {
-        attempt: record.attempt.max(1),
+        attempt,
         agent_state: state,
     })
 }
