@@ -566,7 +566,7 @@ mod tests {
         let fx = fixture();
         let ctx = fx.world.ctx();
         ask::say(&ctx, "demo", "The first screen is ready.", None).unwrap();
-        ask::say(&ctx, "demo", "The first screen is ready.", None).unwrap();
+        assert!(ask::say(&ctx, "demo", "The first screen is ready.", None).is_err());
         let v = Conversation::load(&fx.project, &super::super::read(&fx.project));
         let count = v
             .items

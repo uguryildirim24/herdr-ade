@@ -39,6 +39,8 @@ struct Turn {
     id: String,
     #[serde(default)]
     completed: bool,
+    #[serde(default)]
+    rolf_request: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,18 +417,27 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     }
     bind_current_turn_session(&project, kind, pane, session)?;
     if phase == "activate" {
-        begin_turn(&project, kind, pane, session, &input)?;
+        begin_turn(
+            &project,
+            kind,
+            pane,
+            session,
+            &input,
+            input["rolf_request"] == true,
+        )?;
         return Ok(());
     }
     if phase == "prompt" {
-        // Pi accepts queued steering/follow-ups before their turn starts.
-        // Record Rolf's words now, but do not replace the running turn's
-        // receipt until pi actually starts that queued user message.
-        begin_prompt_turn(&project, kind, pane, session, &input)?;
         let text = prompt_text(&input).unwrap_or_default();
-        if !text.trim().is_empty()
-            && let Some(request) = handle_prompt(&project, pane, text)?
-        {
+        let request = if text.trim().is_empty() {
+            None
+        } else {
+            handle_prompt(&project, pane, text)?
+        };
+        // A queued pi message has not begun its own turn yet, but Rolf's
+        // words also count if they arrived during the running turn.
+        begin_prompt_turn(&project, kind, pane, session, &input, request.is_some())?;
+        if let Some(request) = request {
             println!("request {request}");
         }
         return Ok(());
@@ -536,6 +547,7 @@ fn new_turn(project: &Project, kind: &str, pane: &str, session: &str, id: String
         coordinator_attempt: project.coordinator().map_or(0, |record| record.attempt()),
         id,
         completed: false,
+        rolf_request: false,
     }
 }
 
@@ -545,11 +557,25 @@ fn begin_prompt_turn(
     pane: &str,
     session: &str,
     input: &serde_json::Value,
+    rolf_request: bool,
 ) -> Result<()> {
     if input["queued"] == true {
+        if rolf_request {
+            let _lock = project.lock()?;
+            if let Some(mut turn) = project::read_json::<Turn>(&current_turn_path(project))
+                && !turn.completed
+                && turn.kind == kind
+                && turn.pane == pane
+                && turn.session == session
+                && turn.coordinator_attempt == project.coordinator().map_or(0, |c| c.attempt())
+            {
+                turn.rolf_request = true;
+                project::write_json(&current_turn_path(project), &turn)?;
+            }
+        }
         return Ok(());
     }
-    begin_turn(project, kind, pane, session, input)
+    begin_turn(project, kind, pane, session, input, rolf_request)
 }
 
 fn begin_turn(
@@ -558,12 +584,12 @@ fn begin_turn(
     pane: &str,
     session: &str,
     input: &serde_json::Value,
+    rolf_request: bool,
 ) -> Result<()> {
     let _lock = project.lock()?;
-    project::write_json(
-        &current_turn_path(project),
-        &new_turn(project, kind, pane, session, turn_id(input)),
-    )
+    let mut turn = new_turn(project, kind, pane, session, turn_id(input));
+    turn.rolf_request = rolf_request;
+    project::write_json(&current_turn_path(project), &turn)
 }
 
 /// Records that an authored `ha say` or `ha ask` ran during the current turn.
@@ -708,7 +734,15 @@ fn current_turn_has_receipt(project: &Project, kind: &str, pane: &str, session: 
 }
 
 fn stop_decision(project: &Project, kind: &str, pane: &str, session: &str) -> Result<StopDecision> {
-    if !current_turn_has_receipt(project, kind, pane, session) {
+    let needs_reply = project::read_json::<Turn>(&current_turn_path(project)).is_some_and(|turn| {
+        !turn.completed
+            && turn.kind == kind
+            && turn.pane == pane
+            && turn.session == session
+            && turn.coordinator_attempt == project.coordinator().map_or(0, |c| c.attempt())
+            && turn.rolf_request
+    });
+    if needs_reply && !current_turn_has_receipt(project, kind, pane, session) {
         return Ok(StopDecision::SendBack);
     }
     finish_turn(project)?;
@@ -1204,6 +1238,7 @@ plain = "the named helper"
             "w1:p1",
             "session-one",
             &serde_json::json!({"prompt_id": "turn-one"}),
+            true,
         )
         .unwrap();
         (root, project)
@@ -1230,14 +1265,14 @@ plain = "the named helper"
         let (_root, project) = receipt_project();
         record_receipt_for(&project, "say:s-1", "w1:p1").unwrap();
         let queued = serde_json::json!({"prompt": "Next", "queued": true});
-        begin_prompt_turn(&project, "claude", "w1:p1", "session-one", &queued).unwrap();
+        begin_prompt_turn(&project, "claude", "w1:p1", "session-one", &queued, false).unwrap();
         assert!(current_turn_has_receipt(
             &project,
             "claude",
             "w1:p1",
             "session-one"
         ));
-        begin_turn(&project, "claude", "w1:p1", "session-one", &queued).unwrap();
+        begin_turn(&project, "claude", "w1:p1", "session-one", &queued, false).unwrap();
         assert!(!current_turn_has_receipt(
             &project,
             "claude",
@@ -1258,6 +1293,7 @@ plain = "the named helper"
             "w1:p1",
             "session-one",
             &serde_json::json!({"prompt": "Hello"}),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -1269,6 +1305,40 @@ plain = "the named helper"
             stop_decision(&project, "pi", "w1:p1", "session-one").unwrap(),
             StopDecision::Pass
         );
+    }
+
+    #[test]
+    fn automated_turns_pass_but_a_queued_rolf_request_requires_a_reply() {
+        for kind in ["claude", "pi"] {
+            let (_root, project) = receipt_project();
+            for prompt in [
+                format!("{} check the project", crate::steps::TICKER_PROMPT_PREFIX),
+                "<cross-session-message from=\"coordinator\" session_id=\"other\">Peer update</cross-session-message>".into(),
+                "GONE hp-demo-t-0162".into(),
+                "<task-notification>finished</task-notification>".into(),
+            ] {
+                let request = handle_prompt(&project, "w1:p1", &prompt).unwrap();
+                assert!(request.is_none(), "{prompt}");
+                begin_prompt_turn(&project, kind, "w1:p1", "session-one", &serde_json::json!({"prompt": prompt}), false).unwrap();
+                assert_eq!(stop_decision(&project, kind, "w1:p1", "session-one").unwrap(), StopDecision::Pass);
+            }
+            let nudge = serde_json::json!({"prompt": format!("{} check the project", crate::steps::TICKER_PROMPT_PREFIX)});
+            begin_prompt_turn(&project, kind, "w1:p1", "session-one", &nudge, false).unwrap();
+            let words = "Rolf asks for the result.";
+            assert!(handle_prompt(&project, "w1:p1", words).unwrap().is_some());
+            let queued = serde_json::json!({"prompt": words, "queued": true});
+            begin_prompt_turn(&project, kind, "w1:p1", "session-one", &queued, true).unwrap();
+            assert_eq!(
+                stop_decision(&project, kind, "w1:p1", "session-one").unwrap(),
+                StopDecision::SendBack
+            );
+            // Pi's delayed activation still carries the prompt hook's classification.
+            begin_turn(&project, kind, "w1:p1", "session-one", &queued, true).unwrap();
+            assert_eq!(
+                stop_decision(&project, kind, "w1:p1", "session-one").unwrap(),
+                StopDecision::SendBack
+            );
+        }
     }
 
     #[test]

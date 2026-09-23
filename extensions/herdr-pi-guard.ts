@@ -77,7 +77,10 @@ export default function (pi) {
       queued: !!event.streamingBehavior,
     };
     try {
-      await hook(config.prompt, payload);
+      const output = await hook(config.prompt, payload);
+      // The prompt hook alone classifies Rolf's words; carry that result
+      // through pi's delayed activation of a queued message.
+      if (payload.queued) payload.rolf_request = output.startsWith("request ");
       if (payload.queued) queued.push({ config, payload });
       else {
         queued.length = 0;
