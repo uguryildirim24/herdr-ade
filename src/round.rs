@@ -5979,7 +5979,9 @@ mod tests {
             finish_publication_with(&ctx, &fx.project, "r1", |_| Ok(install.clone())).unwrap();
         assert_eq!(
             repeated.installation,
-            Some(InstallationStep::Verified { outcome: install })
+            Some(InstallationStep::Verified {
+                outcome: install.clone()
+            })
         );
         assert!(
             repeated
