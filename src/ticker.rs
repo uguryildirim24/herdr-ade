@@ -1937,6 +1937,7 @@ mod tests {
                 },
                 "ha",
                 None,
+                true,
             )
             .unwrap();
             assert_eq!(
@@ -1970,6 +1971,7 @@ mod tests {
             },
             "ha",
             None,
+            true,
         )
         .unwrap();
         let saved = thread::load(&fixture.project, &record.id).unwrap();
@@ -2063,6 +2065,7 @@ mod tests {
                 },
                 "ha",
                 None,
+                true,
             )
             .unwrap();
             let saved = thread::load(&fixture.project, &record.id).unwrap();
