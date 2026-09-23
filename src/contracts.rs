@@ -592,10 +592,10 @@ pub(crate) struct CheckpointIntent {
     pub(crate) parent: String,
     pub(crate) op: String,
     pub(crate) payload_hash: String,
-    /// Content-addressed handoff bundle in project state. Empty on rounds
-    /// checkpointed before bundles existed; their handoff is the H commit.
-    #[serde(default)]
-    pub(crate) artifact: String,
+    /// Content-addressed handoff bundle in project state. Historical rounds
+    /// checkpointed before bundles existed have no artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact: Option<String>,
 }
 
 /// Merge transaction phase (SPEC-ADE D6, item 34).
@@ -1140,7 +1140,7 @@ members = []
                 parent: "V".into(),
                 op: "merge-r1".into(),
                 payload_hash: "hh".into(),
-                artifact: "aa".into(),
+                artifact: Some("aa".into()),
             }),
             head: None,
         });
