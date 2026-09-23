@@ -96,6 +96,9 @@ pub(crate) struct Thread {
     pub(crate) branch: String,
     pub(crate) base: String,
     pub(crate) machine: String,
+    /// Why placement selected this machine for the current attempt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) placement_reason: String,
     /// The stable saved-profile id the lane resolved to (SPEC-remote §4.1).
     /// Empty on a local lane; a renamed label does not change it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
