@@ -184,6 +184,39 @@ pub(crate) fn deliver_event(
         );
     }
 
+    // A seal can overtake a queued correction. Store a stable event-bound
+    // notice even when the coordinator is offline, and say it in the wake-up.
+    let queued: Vec<_> = if event.payload.done.is_some() {
+        lane.follow_ups
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.attempt == event.attempt
+                    && (f.state == crate::thread::FollowUpState::Queued || f.after_seal == event.id)
+            })
+            .map(|(i, f)| {
+                format!(
+                    "#{} ({})",
+                    i + 1,
+                    f.text.split_whitespace().collect::<Vec<_>>().join(" ")
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !queued.is_empty() {
+        inbox::write_event(
+            project,
+            event,
+            "follow-up-pending",
+            &format!(
+                "{} sealed before follow-up {} landed; keep the lane open for its next seal",
+                event.thread,
+                queued.join("; ")
+            ),
+        )?;
+    }
     // Serialize prompts sent to the coordinator pane.
     let _writer = crate::talk::writer_lock(project)?;
     let agent = herdr.agent_list()?.into_iter().find(|agent| {
@@ -194,7 +227,13 @@ pub(crate) fn deliver_event(
     let Some(_agent) = agent else {
         return Ok(());
     };
-    let line = crate::events::typed_line(event)?;
+    let mut line = crate::events::typed_line(event)?;
+    if !queued.is_empty() {
+        line.push_str(&format!(
+            " Follow-up overtook this seal: {}. Keep this lane open until it seals again.",
+            queued.join("; ")
+        ));
+    }
     crate::talk::mark_automated_prompt(project, &event.recipient.pane, &line)?;
     herdr.agent_prompt(&event.recipient.pane, &line)?;
     crate::events::append_delivery(
@@ -1428,6 +1467,41 @@ mod tests {
             .filter(|cmd| cmd.display().contains("agent prompt"))
             .map(|cmd| cmd.display())
             .collect()
+    }
+
+    #[test]
+    fn seal_reports_a_queued_follow_up_even_if_it_lands_before_delivery() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.attempt = 1;
+            t.follow_ups.push(crate::thread::FollowUp {
+                attempt: 1,
+                text: "Check the missing gate".into(),
+                queued_at: project::now(),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        let event = sealed_done(&project, &lane.id);
+        thread::update(&project, &lane.id, |t| {
+            t.follow_ups[0].state = crate::thread::FollowUpState::Delivered;
+            t.follow_ups[0].after_seal = event.id.clone();
+            t.follow_ups[0].delivered_at = project::now();
+        })
+        .unwrap();
+        deliver_event(&world.ctx(), &project, &event).unwrap();
+        assert!(
+            typed_lines(&world)
+                .iter()
+                .any(|line| line.contains("Follow-up overtook this seal")
+                    && line.contains("Check the missing gate"))
+        );
+        assert!(
+            crate::inbox::unhandled(&project)
+                .iter()
+                .any(|item| item.kind == "follow-up-pending")
+        );
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub(crate) enum Status {
 pub(crate) enum FollowUpState {
     #[default]
     Queued,
+    Delivered,
     Uncertain,
     Superseded,
     Cancelled,
@@ -51,6 +52,11 @@ pub(crate) struct FollowUp {
     pub(crate) state: FollowUpState,
     /// Waiting event visible when this message was accepted, not when it was sent.
     pub(crate) waiting_event: String,
+    pub(crate) queued_at: String,
+    pub(crate) delivered_at: String,
+    pub(crate) closed_at: String,
+    /// Completion already sealed when this follow-up landed.
+    pub(crate) after_seal: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -408,6 +414,7 @@ pub(crate) fn update_checked(
                 && follow_up.state == FollowUpState::Queued
             {
                 follow_up.state = FollowUpState::Superseded;
+                follow_up.closed_at = project::now();
             }
         }
     }
@@ -418,8 +425,12 @@ pub(crate) fn update_checked(
             FollowUpState::Closed
         };
         for follow_up in &mut thread.follow_ups {
-            if follow_up.state == FollowUpState::Queued {
+            if matches!(
+                follow_up.state,
+                FollowUpState::Queued | FollowUpState::Delivered
+            ) {
                 follow_up.state = disposition;
+                follow_up.closed_at = project::now();
             }
         }
     }
