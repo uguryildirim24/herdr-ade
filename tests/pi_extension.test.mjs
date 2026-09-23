@@ -60,6 +60,17 @@ test('stop block is returned to the model without recording the correction as a 
   } finally { f.close(); }
 });
 
+test('provider failure never prompts a correction or invokes the stop hook', async () => {
+  const f = fixture();
+  try {
+    await f.emit('input', {source: 'interactive', text: 'Check this.'});
+    await f.emit('agent_end', {messages: [{role: 'assistant', stopReason: 'error', errorMessage: 'provider unavailable'}]});
+    await f.emit('agent_settled', {});
+    assert.deepEqual(f.sent, []);
+    assert.deepEqual(f.lines().map(row => row.phase), ['prompt']);
+  } finally { f.close(); }
+});
+
 test('unbound panes cannot invoke project hooks', async () => {
   const f = fixture();
   try {
