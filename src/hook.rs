@@ -110,7 +110,7 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
         return Ok(false);
     }
     let adapter = crate::adapters::declaration(&ctx.config_dir, kind)?;
-    if !adapter.coordinator || !adapter.talk {
+    if !adapter.coordinator {
         return Ok(false);
     }
     let Some((path, shape)) = settings_path(project, &adapter) else {
@@ -248,7 +248,7 @@ fn remove_old_pi_hooks(project: &Project, adapter: &crate::adapters::Adapter) ->
     Ok(())
 }
 
-/// True when a prompt-submit hook is bound to this pane, so the talk layer
+/// True when a prompt-submit hook is bound to this pane, so the journal
 /// knows to write prompt markers for it.
 pub(crate) fn captures(project: &Project, pane: &str) -> Result<bool> {
     let Some(binding) = read_binding(project)? else {
@@ -445,7 +445,6 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     if phase == "observe" {
         return Ok(());
     }
-    crate::talk::mark_accepted(&project)?;
     match stop_decision(&project, kind, pane, session)? {
         StopDecision::Pass => Ok(()),
         StopDecision::SendBack => correction(ctx, kind),
@@ -494,7 +493,6 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
         return Ok(None);
     }
     match crate::talk::take_pending_prompt(project, pane, text) {
-        Some(crate::talk::PendingPrompt::Delivery(request)) => Ok(Some(request)),
         Some(crate::talk::PendingPrompt::Automated) => Ok(None),
         None => {
             let text = crate::talk::take_automated_parts(project, pane, text);
@@ -1068,31 +1066,6 @@ mod tests {
             error.starts_with("request_authority: no request"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn a_talk_delivery_reuses_the_request_the_talk_tab_recorded() {
-        let temp = tempfile::tempdir().unwrap();
-        let env = Env::for_test(temp.path(), &[]);
-        let runner = FakeRunner::new();
-        let root = temp.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: temp.path().join("config"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        install(&ctx, &project, "claude", "w1:p1").unwrap();
-        crate::talk::mark_talk_delivery(&project, "w1:p1", "q-42-7", "please look at the tests")
-            .unwrap();
-        assert_eq!(
-            handle_prompt(&project, "w1:p1", "please look at the tests").unwrap(),
-            Some("q-42-7".into())
-        );
-        assert!(crate::talk::recent_requests(&project, 5).is_empty());
     }
 
     #[test]

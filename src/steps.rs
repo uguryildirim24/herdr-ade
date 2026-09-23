@@ -184,12 +184,8 @@ pub(crate) fn deliver_event(
         );
     }
 
-    // One writer types into the coordinator's pane; `!native` in talk
-    // suspends it and the event waits for the next tick (D18).
+    // Serialize prompts sent to the coordinator pane.
     let _writer = crate::talk::writer_lock(project)?;
-    if crate::talk::writer_suspended(project) {
-        return Ok(());
-    }
     let agent = herdr.agent_list()?.into_iter().find(|agent| {
         agent.pane_id == event.recipient.pane
             && agent.name == coordinator.agent_name
@@ -990,9 +986,6 @@ pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Resu
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let _writer = crate::talk::writer_lock(project)?;
-    if crate::talk::writer_suspended(project) {
-        return Ok(false);
-    }
     let ready = herdr.agent_list()?.into_iter().any(|agent| {
         agent.pane_id == record.pane_id && agent.name == record.agent_name && agent.ready()
     });
@@ -1101,9 +1094,6 @@ pub(crate) fn nudge(
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick.
         let _writer = crate::talk::writer_lock(project)?;
-        if crate::talk::writer_suspended(project) {
-            return Ok(());
-        }
         crate::talk::mark_automated_prompt(project, pane, NUDGE_TEXT)?;
         herdr.agent_prompt(pane, NUDGE_TEXT)?;
     } else {

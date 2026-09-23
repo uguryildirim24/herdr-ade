@@ -229,7 +229,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         if options.reprime {
             deliver_or_defer(&project, &herdr, &agent, &prompt)?;
         }
-        talk_tab(ctx, &project);
         ticker::start(ctx)?;
         crate::output::insert("workspace_id", record.workspace_id.clone());
         crate::output::insert("pane_id", record.pane_id.clone());
@@ -306,9 +305,9 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     };
     if !launch.kind.is_empty() {
         let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
-        if !adapter.coordinator || !adapter.talk {
+        if !adapter.coordinator {
             bail!(
-                "coordinator_unsupported: adapter `{}` does not declare coordinator and talk support",
+                "coordinator_unsupported: adapter `{}` cannot coordinate",
                 launch.kind
             );
         }
@@ -397,7 +396,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         ),
     }
     report_tokens(&herdr, slug, &record.pane_id);
-    talk_tab(ctx, &project);
     ticker::start(ctx)?;
     crate::output::insert("workspace_id", record.workspace_id.clone());
     crate::output::insert("pane_id", record.pane_id.clone());
@@ -407,14 +405,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     );
     println!("Commands: {prefix}");
     Ok(())
-}
-
-/// The talk tab beside a bound coordinator (D18). A tab that cannot be made
-/// is said once and never blocks `open`.
-fn talk_tab(ctx: &Ctx, project: &Project) {
-    if let Err(error) = crate::talk::ensure_tab(ctx, project) {
-        println!("the talk tab was not created ({error:#})");
-    }
 }
 
 /// Renames a recorded workspace whose label is not the project's display name,
