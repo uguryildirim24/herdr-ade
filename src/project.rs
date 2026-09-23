@@ -841,6 +841,55 @@ fn latest_history(project: &Project) -> Option<String> {
     names.pop().map(|name| format!(".state/history/{name}/"))
 }
 
+pub(crate) fn running_stage(
+    thread: &crate::thread::Thread,
+    events: &[crate::contracts::Event],
+) -> String {
+    use crate::thread::Status;
+    let completion = crate::round::latest_event(events, &thread.id, thread.attempt.max(1));
+    if let Some(event) = completion {
+        if let Some(failed) = &event.payload.failed {
+            return format!(
+                "failed: {}",
+                one_line(&failed.text).chars().take(120).collect::<String>()
+            );
+        }
+        if let Some(waiting) = &event.payload.waiting
+            && event.id != thread.answered_waiting_event
+        {
+            return format!(
+                "waiting: {}",
+                one_line(&waiting.text)
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+        }
+        if event.payload.done.is_some() {
+            return "done, waiting for a round".into();
+        }
+    }
+    match thread.status {
+        Status::Failed => format!(
+            "failed: {}",
+            one_line(&thread.error)
+                .chars()
+                .take(120)
+                .collect::<String>()
+        ),
+        Status::Starting => "starting".into(),
+        Status::Open if thread.prompt_pending => "starting".into(),
+        Status::Open if thread.last_state == "blocked" || thread.last_group == "idle" => {
+            "waiting at prompt".into()
+        }
+        Status::Open if thread.last_group == "working" || thread.last_state == "working" => {
+            "working".into()
+        }
+        Status::Open => "state unknown".into(),
+        Status::Resolved => "resolved".into(),
+    }
+}
+
 fn page_body(project: &Project, settings: &Settings) -> String {
     let evidence = crate::task::EvidenceSnapshot::load(project);
     let mut out = String::from("# Project\n\n");
@@ -918,7 +967,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             "- Thread `{}`: {} ({})\n",
             thread.id,
             thread.title.trim(),
-            format!("{:?}", thread.status).to_lowercase()
+            running_stage(&thread, events)
         ));
     }
     for round in rounds {
@@ -1174,6 +1223,42 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_lane_stage_uses_recorded_observation_and_sealed_events() {
+        let mut lane = crate::thread::Thread {
+            id: "t-0001".into(),
+            status: crate::thread::Status::Starting,
+            ..Default::default()
+        };
+        assert_eq!(running_stage(&lane, &[]), "starting");
+        lane.status = crate::thread::Status::Open;
+        lane.last_state = "working".into();
+        assert_eq!(running_stage(&lane, &[]), "working");
+        lane.last_state = "blocked".into();
+        assert_eq!(running_stage(&lane, &[]), "waiting at prompt");
+        let mut event = crate::contracts::Event {
+            id: "e1".into(),
+            op: "op".into(),
+            thread: lane.id.clone(),
+            attempt: 1,
+            round: None,
+            recipient: Default::default(),
+            created: "2026-01-01T00:00:00Z".into(),
+            payload: Default::default(),
+        };
+        event.payload.done = Some(Default::default());
+        assert_eq!(
+            running_stage(&lane, &[event.clone()]),
+            "done, waiting for a round"
+        );
+        event.payload.done = None;
+        event.payload.failed = Some(crate::contracts::WaitingPayload {
+            text: "Provider stopped".into(),
+            ..Default::default()
+        });
+        assert_eq!(running_stage(&lane, &[event]), "failed: Provider stopped");
+    }
 
     #[test]
     fn only_folders_with_project_md_count() {

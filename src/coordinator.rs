@@ -1,6 +1,9 @@
 //! `open` and `context`: the coordinator's pane and the digest it reads.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 
@@ -450,7 +453,279 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
     Ok(())
 }
 
-pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
+/// The last view belongs to a coordinator incarnation, not to a terminal or
+/// a global clock. Peeks never advance it.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ContextCursor {
+    generation: u32,
+    pane: String,
+    standing: String,
+    messages: BTreeMap<String, String>,
+    lanes: BTreeMap<String, String>,
+    rounds: BTreeMap<String, String>,
+    inbox: BTreeMap<String, String>,
+    failures: BTreeMap<String, String>,
+    relevant_config: BTreeMap<String, String>,
+}
+
+impl ContextCursor {
+    fn capture(ctx: &Ctx, project: &Project) -> Self {
+        let coordinator = project.coordinator().unwrap_or_default();
+        let events = crate::events::list(project);
+        let lanes = crate::thread::list(project)
+            .into_iter()
+            .map(|thread| {
+                let stage = project::running_stage(&thread, &events);
+                (thread.id, format!("{} — {stage}", thread.title.trim()))
+            })
+            .collect();
+        let rounds = crate::round::list(project)
+            .into_iter()
+            .map(|round| {
+                (
+                    round.round,
+                    format!("{:?} — {}", round.phase, round.plain.trim()),
+                )
+            })
+            .collect();
+        let messages = crate::talk::read(project)
+            .lines
+            .into_iter()
+            .filter_map(|line| {
+                if let crate::talk::Entry::Rolf { request, text, .. } = line.entry {
+                    Some((request, request_preview(&text)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let inbox = inbox::unhandled(project)
+            .into_iter()
+            .map(|item| (item.id, format!("[{}] {}", item.kind, item.summary)))
+            .collect();
+        let failures = crate::ledger::list(project)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                crate::ledger::disposition(project, entry).ok()
+                    == Some(crate::ledger::Disposition::Current)
+            })
+            .map(|entry| (entry.id.clone(), crate::ledger::summary(&entry)))
+            .collect();
+        let standing = project
+            .read_project_md()
+            .map(|(_, body)| {
+                let sections = split_sections(&body);
+                [
+                    "## Task notes in force",
+                    "## Standing instructions in force",
+                    "## Facts in force",
+                    "## Recent decisions",
+                ]
+                .iter()
+                .filter_map(|name| sections.get(*name))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+            })
+            .unwrap_or_default();
+        let relevant_config = relevant_config(ctx, project);
+        Self {
+            generation: coordinator.generation,
+            pane: coordinator.pane_id,
+            standing: crate::thread::sha256_hex(standing.as_bytes()),
+            messages,
+            lanes,
+            rounds,
+            inbox,
+            failures,
+            relevant_config,
+        }
+    }
+}
+
+fn relevant_config(ctx: &Ctx, project: &Project) -> BTreeMap<String, String> {
+    let Ok(document) = crate::config::Document::read(&ctx.config_dir) else {
+        return BTreeMap::new();
+    };
+    let mut parts = BTreeMap::new();
+    let mut used = Vec::new();
+    if let Some(coordinator) = project.coordinator() {
+        used.push(coordinator.launch.recipe_id);
+    }
+    let threads = crate::thread::list(project);
+    for thread in &threads {
+        used.push(thread.launch.recipe_id.clone());
+    }
+    used.sort();
+    used.dedup();
+    for id in used.into_iter().filter(|id| !id.is_empty()) {
+        let recipe = document.value("recipes").and_then(|v| v.get(&id));
+        parts.insert(format!("recipe:{id}"), format!("{recipe:?}"));
+    }
+    if let Ok((settings, _)) = project.read_project_md() {
+        let configured = crate::harness::repos(&ctx.config_dir).unwrap_or_default();
+        for repo in settings.repos {
+            let row = configured.iter().find(|row| row.path == repo.path);
+            parts.insert(
+                format!("project-repo:{}", repo.path),
+                format!("{repo:?}:{row:?}"),
+            );
+        }
+    }
+    for thread in threads.iter().filter(|t| t.is_remote()) {
+        let row =
+            crate::remote::box_repo_for(&ctx.config_dir, thread.machine_route(), &thread.repo)
+                .ok()
+                .flatten();
+        parts.insert(
+            format!("repo:{}:{}", thread.machine_route(), thread.repo),
+            format!("{row:?}"),
+        );
+    }
+    parts
+}
+
+fn split_sections(body: &str) -> BTreeMap<String, String> {
+    let mut sections: BTreeMap<String, String> = BTreeMap::new();
+    let mut heading = String::new();
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            heading = line.trim().to_string();
+        }
+        sections.entry(heading.clone()).or_default().push_str(line);
+    }
+    sections
+}
+
+fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> String {
+    let Some(previous) = previous else {
+        return "## Since your last context\n\nFirst read in this coordinator session; full view follows.\n\n".into();
+    };
+    let mut changes = Vec::new();
+    for (label, old, new) in [
+        ("Rolf", &previous.messages, &current.messages),
+        ("Lane", &previous.lanes, &current.lanes),
+        ("Round", &previous.rounds, &current.rounds),
+        ("Inbox", &previous.inbox, &current.inbox),
+        ("Failure", &previous.failures, &current.failures),
+    ] {
+        for (id, value) in new {
+            if old.get(id) != Some(value) {
+                changes.push(format!("- {label} {id}: {value}"));
+            }
+        }
+    }
+    if previous.standing != current.standing {
+        changes.push("- Standing notes or decisions changed.".into());
+    }
+    if current.relevant_config.iter().any(|(key, value)| {
+        previous
+            .relevant_config
+            .get(key)
+            .is_some_and(|old| old != value)
+            || (key.starts_with("project-repo:") && !previous.relevant_config.contains_key(key))
+    }) {
+        changes.push("- This project's recipe or repository configuration changed.".into());
+    }
+    let mut out = String::from("## Since your last context\n\n");
+    if changes.is_empty() {
+        out.push_str("Nothing new.\n");
+    } else {
+        for line in changes.iter().take(DIGEST_ROWS) {
+            let _ = writeln!(out, "{line}");
+        }
+        overflow_count(&mut out, changes.len());
+    }
+    out.push('\n');
+    out
+}
+
+fn recent_task(project: &Project, line: &str) -> bool {
+    let Some(id) = line
+        .strip_prefix("- `")
+        .and_then(|s| s.split_once('`'))
+        .map(|(id, _)| id)
+    else {
+        return true;
+    };
+    let Ok(task) = crate::task::load(project, id) else {
+        return true;
+    };
+    let attempts: Vec<_> = task
+        .attempts
+        .iter()
+        .filter_map(|id| crate::thread::load(project, id).ok())
+        .collect();
+    let latest = task
+        .installed
+        .iter()
+        .map(|e| e.at.as_str())
+        .chain(task.verified.iter().map(|e| e.at.as_str()))
+        .chain(task.dropped.iter().map(|e| e.at.as_str()))
+        .chain(attempts.iter().map(|t| t.updated.as_str()))
+        .max()
+        .unwrap_or(task.created.as_str());
+    let now = jiff::Timestamp::now();
+    latest
+        .parse::<jiff::Timestamp>()
+        .is_ok_and(|at| now.as_second() - at.as_second() < 86400)
+}
+
+fn filter_page(project: &Project, text: &str, collapse: bool) -> String {
+    let mut out = String::new();
+    let mut section = "";
+    let mut skip_item = false;
+    let mut standing_notice = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            section = line.trim();
+            skip_item = false;
+        }
+        let standing = matches!(
+            section,
+            "## Task notes in force"
+                | "## Standing instructions in force"
+                | "## Facts in force"
+                | "## Recent decisions"
+        );
+        if standing && collapse {
+            if !standing_notice {
+                let _ = writeln!(
+                    out,
+                    "## Standing notes and decisions\n\nUnchanged; run `ha context {} --full` to see them.\n",
+                    project.slug
+                );
+                standing_notice = true;
+            }
+            continue;
+        }
+        if line.starts_with("- ") {
+            skip_item = (standing && line.contains("(historical"))
+                || (section == "## Recently finished or dropped tasks"
+                    && !recent_task(project, line));
+        }
+        if !skip_item {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn omit_history(project: &Project, text: &str) -> String {
+    filter_page(project, text, false)
+}
+fn compact_page(
+    project: &Project,
+    text: &str,
+    before: &ContextCursor,
+    now: &ContextCursor,
+) -> String {
+    filter_page(project, text, before.standing == now.standing)
+}
+
+pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if !peek {
         crate::project::refresh_page(&project)?;
@@ -462,9 +737,28 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let prefix = current_prefix(&ctx.root)?;
     // Capture before the read so a concurrent failure is not marked as seen.
     let read_at = jiff::Timestamp::now().to_string();
-    let (text, shown, events) = digest_snapshot(ctx, &project, &prefix)?;
-    print!("{text}");
+    let current = ContextCursor::capture(ctx, &project);
+    let path = project.state_dir().join("context-cursor.json");
+    let previous: Option<ContextCursor> = crate::project::read_json(&path);
+    let same_session = previous.as_ref().is_some_and(|before| {
+        before.generation == current.generation && before.pane == current.pane
+    });
+    let (mut text, shown, events) = digest_snapshot(ctx, &project, &prefix)?;
+    if same_session && !full {
+        text = compact_page(&project, &text, previous.as_ref().unwrap(), &current);
+    }
+    if !full && !same_session {
+        text = omit_history(&project, &text);
+    }
+    let changes = changes_since(previous.as_ref().filter(|_| same_session), &current);
+    print!("{changes}{text}");
     if !peek {
+        // An external peek-like read must not move the coordinator's delta.
+        if project.coordinator().is_none_or(|record| {
+            std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
+        }) {
+            crate::project::write_json(&path, &current)?;
+        }
         crate::ledger::context_read(&project, &read_at)?;
         inbox::mark_seen(&project, &shown)?;
         if let Some(record) = project.coordinator()
@@ -944,6 +1238,99 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_context_leads_with_changes_and_collapses_unchanged_standing() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let ctx = world.ctx();
+        let before = ContextCursor::capture(&ctx, &project);
+        let body = "# Project\n\n## Standing instructions in force\n\n- `n-1` (request:q-1): Keep this.\n\n## Running now\n\nNone.\n";
+        let compact = compact_page(&project, body, &before, &before);
+        assert!(compact.contains("Unchanged; run `ha context demo --full`"));
+        assert!(!compact.contains("Keep this."));
+        assert!(body.contains("Keep this.")); // --full retains the unfiltered page
+        let mut after = ContextCursor::capture(&ctx, &project);
+        after.messages.insert("q-2".into(), "New request".into());
+        after.lanes.insert("t-0001".into(), "Fix — working".into());
+        after
+            .rounds
+            .insert("r1".into(), "Admitting — review".into());
+        after
+            .inbox
+            .insert("i1".into(), "[alert] investigate".into());
+        after.failures.insert("f1".into(), "broken build".into());
+        let summary = changes_since(Some(&before), &after);
+        for expected in [
+            "Rolf q-2",
+            "Lane t-0001",
+            "Round r1",
+            "Inbox i1",
+            "Failure f1",
+        ] {
+            assert!(summary.contains(expected), "{summary}");
+        }
+        assert!(changes_since(None, &after).contains("First read"));
+    }
+
+    #[test]
+    fn only_config_used_by_this_project_appears_as_a_change() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.launch.recipe_id = "test_claude".into())
+            .unwrap();
+        let ctx = world.ctx();
+        let before = ContextCursor::capture(&ctx, &project);
+        let path = ctx.config_dir.join("config.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{original}\n[recipes.unused]\nkind = 'pi'\n"),
+        )
+        .unwrap();
+        let unrelated = ContextCursor::capture(&ctx, &project);
+        assert_eq!(before.relevant_config, unrelated.relevant_config);
+        let mut newly_used = unrelated.relevant_config.clone();
+        newly_used.insert("recipe:another".into(), "new lane's recipe".into());
+        let mut lane_started = ContextCursor::capture(&ctx, &project);
+        lane_started.relevant_config = newly_used;
+        assert!(
+            !changes_since(Some(&unrelated), &lane_started)
+                .contains("recipe or repository configuration changed")
+        );
+        let changed = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("the quick helper", "the updated helper");
+        std::fs::write(path, changed).unwrap();
+        let after = ContextCursor::capture(&ctx, &project);
+        assert!(
+            changes_since(Some(&unrelated), &after)
+                .contains("recipe or repository configuration changed")
+        );
+    }
+
+    #[test]
+    fn default_view_hides_historical_notes_and_old_finished_tasks() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let task = crate::task::Task {
+            id: "job-9999".into(),
+            title: "Old task".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["Done.".into()],
+            created: "2020-01-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let dir = project.record_dir_for_write("tasks").unwrap();
+        std::fs::write(dir.join("job-9999.toml"), toml::to_string(&task).unwrap()).unwrap();
+        let body = "## Facts in force\n\n- `n-1` (historical; t-0001): old fact\n  long continuation\n- `n-2` (request:q-1): current fact\n\n## Recently finished or dropped tasks\n\n- `job-9999` [verified] old task\n";
+        let filtered = omit_history(&project, body);
+        assert!(!filtered.contains("old fact"), "{filtered}");
+        assert!(!filtered.contains("long continuation"), "{filtered}");
+        assert!(filtered.contains("current fact"));
+        assert!(!filtered.contains("old task"));
+    }
 
     #[test]
     fn context_reports_the_repo_not_just_the_project_records() {
