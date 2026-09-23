@@ -1052,14 +1052,31 @@ pub(crate) fn compose_for_round(
     } else {
         render(&state, &prefix)
     };
+    let label = record.batch.as_ref().map_or_else(
+        || format!("Round `{}`", record.round),
+        |batch| {
+            format!(
+                "Rounds {}",
+                batch
+                    .rounds
+                    .iter()
+                    .map(|r| format!("`{r}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    );
     section.push_str(&format!(
-        "\nRound `{}` was merged into `{}` at candidate commit `{candidate}`; this checkpoint artifact is tied to that exact code state.\n",
-        record.round, record.branch
+        "\n{label} merged into `{}` at candidate commit `{candidate}`; this checkpoint artifact is tied to that exact code state.\n",
+        record.branch
     ));
     let md = splice_herdr(&base, &section);
     let mut sidecar = state;
     sidecar["round"] =
         json!({"round": record.round, "branch": record.branch, "candidate": candidate});
+    if let Some(batch) = &record.batch {
+        sidecar["rounds"] = json!(batch.rounds);
+    }
     let json = format!("{}\n", serde_json::to_string_pretty(&sidecar)?);
     Ok((md, json))
 }
