@@ -1738,11 +1738,7 @@ enum TickerCommand {
     /// Start the ticker if it is not running (does nothing when there are no projects)
     Start,
     /// Run the ticker loop in the foreground
-    Run {
-        /// Wait for the previous ticker during an internal zero-gap handoff
-        #[arg(long, hide = true)]
-        handoff: bool,
-    },
+    Run,
     /// Ask the running ticker to exit and wait for it
     Stop,
     /// Show the running ticker's version, root and tool resolution
@@ -2757,7 +2753,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
         },
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
-            TickerCommand::Run { handoff } => ticker::run(&ctx, handoff),
+            TickerCommand::Run => ticker::run(&ctx),
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
