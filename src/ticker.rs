@@ -1619,12 +1619,6 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let now = jiff::Timestamp::now();
     let mut may_start = true;
 
-    errors.extend(
-        crate::steps::config_changed(project, &crate::project::policy_hash(&ctx.config_dir))
-            .err()
-            .map(|e| e.context("config digest")),
-    );
-
     if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
         let pane_alive = seen
             .panes
@@ -2598,6 +2592,38 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn changing_global_config_does_not_broadcast_project_inbox_items() {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on("workspace report-metadata", ok(r#"{"result":{}}"#));
+        let config_dir = f.root.join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "").unwrap();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: config_dir.clone(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let mut memory = Memory::new(&ctx);
+        assert!(tick_for_test(&ctx, &mut memory));
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[coordinator]\nidle_nudge_minutes = 21\n",
+        )
+        .unwrap();
+        assert!(tick_for_test(&ctx, &mut memory));
+        assert!(
+            !crate::inbox::unhandled(&f.project)
+                .iter()
+                .any(|item| item.kind == "config-changed")
+        );
     }
 
     #[test]

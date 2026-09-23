@@ -296,27 +296,6 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
     Ok(())
 }
 
-/// D11: records the digest of `config.toml` and `RULES.md`; when it moved
-/// since the last tick, one `config-changed` item. Best-effort, not tamper
-/// evidence.
-pub(crate) fn config_changed(project: &Project, digest: &str) -> Result<()> {
-    let path = project.state_dir().join("policy_hash");
-    let recorded = std::fs::read_to_string(&path).ok();
-    if recorded.as_deref().map(str::trim) == Some(digest) {
-        return Ok(());
-    }
-    if recorded.is_some() {
-        inbox::write(
-            project,
-            "config-changed",
-            "policy",
-            &format!("config.toml or RULES.md changed; the policy hash is now {digest}"),
-            "",
-        )?;
-    }
-    project::write_atomic(&path, digest.as_bytes())
-}
-
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
 /// failed for the threshold, one more when it recovers, nothing for blips.
 #[derive(Debug, Clone, Default)]
