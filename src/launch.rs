@@ -541,7 +541,11 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
             recipe,
         ),
         env: recipe.env.clone(),
-        ready_timeout_ms: recipe.ready_timeout_ms,
+        ready_timeout_ms: if recipe.ready_timeout_ms == 0 {
+            config.adapters[&recipe.kind].ready_timeout_ms
+        } else {
+            recipe.ready_timeout_ms
+        },
         policy_hash: config.policy_hash,
         attempt: 1,
         recipe_id: selected.recipe,
@@ -850,6 +854,7 @@ plain = "the careful helper"
         )
         .unwrap();
         assert_eq!(launch.recipe_id, "named");
+        assert_eq!(launch.ready_timeout_ms, 300_000); // omitted Claude timeout uses adapter default
         assert_eq!(launch.routing_rule, "explicit");
         assert_eq!(launch.recipe_basis, words);
         assert_eq!(launch.recipe_request, authority);
