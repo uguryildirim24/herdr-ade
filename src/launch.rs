@@ -195,32 +195,12 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
 }
 
 /// Resolve `request:<id>` or `request:<project>/<id>` for a project-level
-/// coordinator recipe choice. The canonical cross-project form is retained on
-/// the coordinator launch record.
-pub fn authorize_coordinator_recipe(ctx: &Ctx, project: &Project, basis: &str) -> Result<String> {
-    let reference = basis
-        .strip_prefix("request:")
-        .filter(|value| !value.is_empty())
-        .with_context(|| "recipe_basis: --basis must be request:<id> or request:<project>/<id>")?;
-    let (slug, request) = reference
-        .split_once('/')
-        .map_or((project.slug.as_str(), reference), |(slug, request)| {
-            (slug, request)
-        });
-    if request.is_empty() {
-        bail!("recipe_basis: request id is empty");
-    }
-    let source = Project::load(&ctx.root, slug).map_err(|_| {
-        crate::refusal::error(format!(
-            "recipe_authority: no request `{basis}` in any project"
-        ))
-    })?;
-    if crate::talk::request_text(&source, request).is_none() {
-        return Err(crate::refusal::error(format!(
-            "recipe_authority: no request `{basis}` in any project"
-        )));
-    }
-    Ok(format!("request:{slug}/{request}"))
+/// coordinator recipe choice. The portable, project-qualified form is retained
+/// on the coordinator launch record.
+pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<String> {
+    crate::talk::resolve_request(project, basis)
+        .map(|request| request.qualified_basis())
+        .map_err(|error| crate::refusal::error(error.to_string()))
 }
 
 /// Validate and record Rolf's one-off recipe choice before a lane is created.
@@ -249,10 +229,8 @@ pub fn authorize_explicit_recipe(
     let request = task
         .authority
         .iter()
-        .filter_map(|authority| authority.strip_prefix("request:"))
-        .find(|request| {
-            crate::talk::request_text(project, request).is_some_and(|words| words.contains(quote))
-        })
+        .filter_map(|authority| crate::talk::resolve_request(project, authority).ok())
+        .find(|request| request.text.contains(quote))
         .with_context(
             || "recipe_authority: --basis must quote Rolf's words from a request on this task",
         )?;
@@ -287,7 +265,7 @@ pub fn authorize_explicit_recipe(
         // Treat the choice as money rather than guessing model prices in core.
         "money"
     };
-    let authority = format!("request:{request}");
+    let authority = request.basis();
     let key = format!(
         "one-off-recipe:{task_id}:{recipe_id}:{}",
         crate::thread::sha256_hex(quote.as_bytes())
@@ -819,12 +797,13 @@ plain = "the careful helper"
         )
         .unwrap();
         let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let source = crate::project::create(&root, "source", "", vec![]).unwrap();
         let words = "start the careful helper at the same time";
-        let request = crate::talk::record_pane_request(&project, words).unwrap();
+        let request = crate::talk::record_pane_request(&source, words).unwrap();
         let task = crate::task::add(
             &project,
             "Try both helpers",
-            vec![format!("request:{request}")],
+            vec![format!("request:source/{request}")],
             vec!["The helper starts.".into()],
             None,
             None,
@@ -853,7 +832,7 @@ plain = "the careful helper"
             words,
         )
         .unwrap();
-        assert_eq!(authority, format!("request:{request}"));
+        assert_eq!(authority, format!("request:source/{request}"));
         let decision = crate::decide::current(&project).pop().unwrap();
         assert_eq!(decision.class, "money");
         assert_eq!(decision.basis.as_deref(), Some(authority.as_str()));

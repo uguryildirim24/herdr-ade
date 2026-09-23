@@ -375,13 +375,13 @@ pub(crate) fn add(
         .iter()
         .map(|condition| condition.trim().to_string())
         .collect();
-    for reference in &authority {
-        if let Err(error) = crate::decide::validate_basis(project, reference) {
-            return Err(crate::refusal::error(format!(
-                "task_authority: `{reference}` does not name existing authority: {error:#}"
-            )));
-        }
-    }
+    let authority = authority
+        .iter()
+        .map(|reference| {
+            crate::decide::validate_basis(project, reference)
+                .map_err(|error| crate::refusal::error(error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let _replacement_lock = replaces
         .as_ref()
         .map(|_| crate::note::replacement_lock(project))
@@ -1590,7 +1590,10 @@ created = "2026-09-21T00:00:00Z"
             None,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("no message `q-missing`"));
+        assert_eq!(
+            error.to_string(),
+            "request_authority: no request `q-missing` in project `demo`"
+        );
         assert!(list_with_errors(&project).0.is_empty());
     }
 
