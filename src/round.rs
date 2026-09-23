@@ -1695,8 +1695,11 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
             bail!("reviewer_already_bound: `{reviewer}` already reviews `{round}`");
         }
     }
+    let current_hash = manifest_hash(&record);
     if record.phase != RoundPhase::UnderReview
+        || !review_inputs_ready(&record)
         || record.frozen_revision != Some(record.manifest.revision)
+        || record.manifest_hash.as_deref() != Some(current_hash.as_str())
     {
         bail!(
             "reviewer_stale: `{round}` is {:?} at manifest revision {}, but its frozen review is revision {}; the reviewer was not bound",
@@ -1763,10 +1766,13 @@ pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Recover
             "round_not_complete: every lane of `{round}` must be pinned before retrying its reviewer"
         );
     }
-    let branch = reviewer_branch(ctx, slug, round, &current)?;
+    let branch = reviewer_branch(ctx, slug, round, &current)?.with_context(|| {
+        format!("round_not_complete: the review inputs for `{round}` changed while retrying")
+    })?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
-    let reviewer = start_and_bind_reviewer(ctx, &project, slug, round, &branch, &prefix)?
-        .context("reviewer_start_pending: the bounded start failed and remains recorded")?;
+    let reviewer = start_and_bind_reviewer(ctx, &project, slug, round, &branch, &prefix)?.context(
+        "reviewer_start_pending: the review inputs changed or the bounded start failure remains recorded",
+    )?;
     Ok(RecoveryOutcome {
         round: round.to_string(),
         action: "started".into(),
@@ -2115,9 +2121,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             reviewer_start_exhausted(ctx, &project, &round, "the previous starts failed")?;
             continue;
         }
-        let ready = !record.manifest.members.is_empty()
-            && record.manifest.members.iter().all(|m| m.pin.is_some());
-        if !ready {
+        if !review_inputs_ready(&record) {
             continue;
         }
         // Every pin already landed: there is nothing new to review, so never
@@ -2125,7 +2129,9 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
         if members_all_landed(ctx, &record)? {
             continue;
         }
-        let review_branch = reviewer_branch(ctx, slug, &round, &record)?;
+        let Some(review_branch) = reviewer_branch(ctx, slug, &round, &record)? else {
+            continue;
+        };
         if let Some(reviewer) =
             start_and_bind_reviewer(ctx, &project, slug, &round, &review_branch, &prefix)?
         {
@@ -2187,18 +2193,87 @@ fn advance_lock(project: &Project) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Every member currently supplies a completion to the review.
+fn review_inputs_ready(record: &RoundRecord) -> bool {
+    !record.manifest.members.is_empty()
+        && record
+            .manifest
+            .members
+            .iter()
+            .all(|member| member.pin.is_some())
+}
+
+fn review_inputs_unchanged(project: &Project, round: &str, expected_hash: &str) -> Result<bool> {
+    let current = load(project, round)?;
+    Ok(review_inputs_ready(&current) && manifest_hash(&current) == expected_hash)
+}
+
 /// The review branch a reviewer for this round starts from: the existing
 /// branch when the current manifest is already frozen, else a fresh
 /// `round review`. Never a branch made stale by a changed or missing pin.
-fn reviewer_branch(ctx: &Ctx, slug: &str, round: &str, record: &RoundRecord) -> Result<String> {
+fn reviewer_branch(
+    ctx: &Ctx,
+    slug: &str,
+    round: &str,
+    record: &RoundRecord,
+) -> Result<Option<String>> {
+    let project = Project::load(&ctx.root, slug)?;
     let current_hash = manifest_hash(record);
+    // A follow-up may have invalidated a member after `advance` selected this
+    // round. That is new work to await, not a failed review preparation.
+    if !review_inputs_unchanged(&project, round, &current_hash)? {
+        return Ok(None);
+    }
     let review_is_current = record.phase != RoundPhase::PreparingReview
         && record.frozen_revision == Some(record.manifest.revision)
         && record.manifest_hash.as_deref() == Some(current_hash.as_str());
-    match (record.review_branch.clone(), review_is_current) {
-        (Some(branch), true) => Ok(branch),
-        _ => Ok(review(ctx, slug, round)?.review_branch),
+    if let (Some(branch), true) = (record.review_branch.clone(), review_is_current) {
+        return Ok(Some(branch));
     }
+    match review(ctx, slug, round) {
+        Ok(outcome) => Ok(Some(outcome.review_branch)),
+        Err(_) if !review_inputs_unchanged(&project, round, &current_hash)? => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewLaunchSnapshot {
+    revision: u64,
+    manifest_hash: String,
+    review_branch: String,
+}
+
+/// The frozen review inputs which authorize one reviewer launch. Re-reading
+/// this at each launch boundary distinguishes a superseded readiness snapshot
+/// from an actual provider or process start failure.
+fn review_launch_snapshot(
+    project: &Project,
+    round: &str,
+    review_branch: &str,
+) -> Result<Option<ReviewLaunchSnapshot>> {
+    let record = load(project, round)?;
+    let current_hash = manifest_hash(&record);
+    let ready = review_inputs_ready(&record)
+        && record.phase == RoundPhase::UnderReview
+        && record.reviewer.is_none()
+        && record.frozen_revision == Some(record.manifest.revision)
+        && record.manifest_hash.as_deref() == Some(current_hash.as_str())
+        && record.review_branch.as_deref() == Some(review_branch)
+        && record.review_artifact.is_some();
+    Ok(ready.then(|| ReviewLaunchSnapshot {
+        revision: record.manifest.revision,
+        manifest_hash: current_hash,
+        review_branch: review_branch.to_string(),
+    }))
+}
+
+fn review_launch_unchanged(
+    project: &Project,
+    round: &str,
+    expected: &ReviewLaunchSnapshot,
+) -> Result<bool> {
+    Ok(review_launch_snapshot(project, round, &expected.review_branch)?.as_ref() == Some(expected))
 }
 
 /// The reviewer task: the review brief, the pinned members with their report
@@ -2317,6 +2392,9 @@ fn start_and_bind_reviewer(
     review_branch: &str,
     prefix: &str,
 ) -> Result<Option<String>> {
+    let Some(launch) = review_launch_snapshot(project, round, review_branch)? else {
+        return Ok(None);
+    };
     // A crash can happen after the reviewer thread record is placed but before
     // the round record is written. Placement replaces `base = review/rN` with
     // the task commit it added at that branch's head, so recognize both sides
@@ -2354,7 +2432,9 @@ fn start_and_bind_reviewer(
                 crate::ledger::recovered(project, "reviewer-start-failed", round);
                 Ok(Some(candidate.id.clone()))
             }
-            Err(error) => cancel_unbound_reviewer(ctx, project, slug, round, &candidate.id, error),
+            Err(error) => {
+                cancel_unbound_reviewer(ctx, project, slug, round, &candidate.id, &launch, error)
+            }
         };
     }
     match start_reviewer(ctx, project, round, review_branch, prefix) {
@@ -2363,10 +2443,17 @@ fn start_and_bind_reviewer(
                 crate::ledger::recovered(project, "reviewer-start-failed", round);
                 Ok(Some(thread.id))
             }
-            Err(error) => cancel_unbound_reviewer(ctx, project, slug, round, &thread.id, error),
+            Err(error) => {
+                cancel_unbound_reviewer(ctx, project, slug, round, &thread.id, &launch, error)
+            }
         },
         Err(error) => {
-            reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
+            // A follow-up can land between task preparation and thread start.
+            // Its incomplete manifest is an ordinary wait, not a launch
+            // attempt and therefore does not spend the bounded retry budget.
+            if review_launch_unchanged(project, round, &launch)? {
+                reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
+            }
             Ok(None)
         }
     }
@@ -2380,6 +2467,7 @@ fn cancel_unbound_reviewer(
     slug: &str,
     round: &str,
     reviewer: &str,
+    launch: &ReviewLaunchSnapshot,
     error: anyhow::Error,
 ) -> Result<Option<String>> {
     let reason = format!("reviewer binding failed: {error:#}");
@@ -2387,7 +2475,9 @@ fn cancel_unbound_reviewer(
     if cleanup.state == "cleanup_pending" {
         return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
     }
-    reviewer_start_failed(ctx, project, round, &reason, None)?;
+    if review_launch_unchanged(project, round, launch)? {
+        reviewer_start_failed(ctx, project, round, &reason, None)?;
+    }
     Ok(None)
 }
 
@@ -5359,7 +5449,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_lane_stops_both_bound_and_in_flight_stale_reviewers() {
+    fn removing_a_lane_stops_the_bound_reviewer_and_blocks_a_stale_launch() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         reviewer_ready(&fx);
@@ -5383,18 +5473,21 @@ mod tests {
             thread::Status::Resolved
         );
 
-        // Simulate a reviewer start that began before the removal and reached
-        // its bind only after the round returned to admission.
+        // A launch selected before the removal revalidates the round before
+        // placing anything and observes that the old review is stale.
         assert!(
             start_and_bind_reviewer(&ctx, &fx.project, "demo", "r1", &review_branch, "ha")
                 .unwrap()
                 .is_none()
         );
-        let stale = thread::list(&fx.project)
-            .into_iter()
-            .find(|candidate| candidate.role == "reviewer" && candidate.id != reviewer)
-            .expect("the in-flight reviewer was placed");
-        assert_eq!(stale.status, thread::Status::Resolved);
+        assert_eq!(
+            thread::list(&fx.project)
+                .into_iter()
+                .filter(|candidate| candidate.role == "reviewer")
+                .count(),
+            1,
+            "the stale launch does not place another reviewer"
+        );
         assert!(load(&fx.project, "r1").unwrap().reviewer.is_none());
     }
 
@@ -6051,6 +6144,49 @@ mod tests {
             load(&fx.project, "r1").unwrap().review_branch.as_deref(),
             Some("review/r1-2")
         );
+    }
+
+    /// `advance` may already have prepared a review branch when a concurrent
+    /// follow-up clears its member pin. The stale launch snapshot waits for
+    /// the replacement report without creating launch-failure evidence.
+    #[test]
+    fn a_follow_up_between_review_preparation_and_launch_is_not_a_start_failure() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (lane, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# first report\n");
+
+        let prepared = review(&ctx, "demo", "r1").unwrap();
+        let before_send = sealed_events(&fx.project).unwrap();
+        hold_for_follow_up(&ctx, &fx.project, &lane, &before_send).unwrap();
+
+        let started = start_and_bind_reviewer(
+            &ctx,
+            &fx.project,
+            "demo",
+            "r1",
+            &prepared.review_branch,
+            "ha",
+        )
+        .unwrap();
+        assert!(started.is_none());
+        let waiting = load(&fx.project, "r1").unwrap();
+        assert_eq!(waiting.phase, RoundPhase::Admitting);
+        assert!(waiting.manifest.members[0].pin.is_none());
+        assert_eq!(waiting.reviewer_start_failures, 0);
+        assert!(
+            !crate::ledger::list(&fx.project)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.kind == "reviewer-start-failed")
+        );
+
+        fx.seal_done(&lane, 1, 2, &sha, "# corrected report\n");
+        assert_eq!(advance(&ctx, "demo").unwrap().started.len(), 1);
+        assert_eq!(load(&fx.project, "r1").unwrap().reviewer_start_failures, 0);
     }
 
     #[test]
