@@ -70,6 +70,10 @@ pub(crate) struct Thread {
     pub(crate) status: Status,
     pub(crate) error: String,
     pub(crate) prompt_pending: bool,
+    /// The current attempt's sealed waiting event answered by the last
+    /// successfully delivered follow-up. A later waiting event supersedes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) answered_waiting_event: String,
     /// Attempt-bound follow-ups accepted while the first brief is pending.
     /// Terminal dispositions remain visible instead of crossing attempts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -335,8 +339,10 @@ pub(crate) fn update_checked(
     let before = thread.clone();
     change(&mut thread)?;
     if thread.attempt != before.attempt {
-        // A receipt proves one exact attempt; a replacement must earn its own.
+        // A receipt or answered wait proves one exact attempt; a replacement
+        // must earn its own.
         thread.bootstrap.clear();
+        thread.answered_waiting_event.clear();
         for follow_up in &mut thread.follow_ups {
             if follow_up.attempt == before.attempt.max(1)
                 && follow_up.state == FollowUpState::Queued
