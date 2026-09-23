@@ -72,6 +72,26 @@ fn latest_path(project: &Project) -> PathBuf {
     project.state_dir().join("checkpoint.toml")
 }
 
+/// Makes a sealed bundle the project's current checkpoint. Round merges and
+/// explicit checkpoints share this pointer so checkpoint checks use the newest
+/// handoff, while the owning round record retains the transaction proof.
+pub(crate) fn record_latest(
+    project: &Project,
+    commit: &str,
+    artifact: &str,
+    payload_hash: &str,
+) -> Result<()> {
+    crate::project::write_atomic(
+        &latest_path(project),
+        toml::to_string(&LatestCheckpoint {
+            commit: commit.to_string(),
+            artifact: artifact.to_string(),
+            payload_hash: payload_hash.to_string(),
+        })?
+        .as_bytes(),
+    )
+}
+
 fn latest(project: &Project) -> Option<LatestCheckpoint> {
     let text = std::fs::read_to_string(latest_path(project)).ok()?;
     toml::from_str(&text).ok()
@@ -1099,15 +1119,7 @@ pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<
     let json = format!("{}\n", serde_json::to_string_pretty(&st)?);
     let artifact = store_bundle(&project, &md, &json)?;
     let hash = payload_hash(&md, &json);
-    crate::project::write_atomic(
-        &latest_path(&project),
-        toml::to_string(&LatestCheckpoint {
-            commit: head.clone(),
-            artifact: artifact.clone(),
-            payload_hash: hash.clone(),
-        })?
-        .as_bytes(),
-    )?;
+    record_latest(&project, &head, &artifact, &hash)?;
     // The shared plan refresh at the checkpoint's durable completion
     // boundary; a failure is separate and never affects the commit
     // (SPEC-talk §6.5).
