@@ -2597,12 +2597,20 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
     assert_eq!(first.launch.recipe_basis, "request:authority/q-choice");
     assert_eq!(first.launch.recipe_request, "request:authority/q-choice");
 
+    std::fs::remove_file(world.home.path().join("a.sock")).unwrap();
+    world.runner.on(
+        "workspace create",
+        ok(r#"{"result":{"root_pane":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
+    );
     options.recipe = None;
     options.recipe_basis = None;
+    options.rebind = true;
+    options.session.socket = Some(world.home.path().join("b.sock"));
     crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
     let relaunched = project.coordinator().unwrap();
     assert_eq!(relaunched.launch.recipe_id, "chosen_agy");
     assert_eq!(relaunched.launch.args, first.launch.args);
+    assert_eq!(relaunched.launch.recipe_basis, first.launch.recipe_basis);
     let starts: Vec<_> = world
         .runner
         .calls
