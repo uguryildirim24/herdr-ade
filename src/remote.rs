@@ -321,19 +321,7 @@ pub(crate) fn ssh(
     stdin: Option<&str>,
     timeout: Duration,
 ) -> Result<Output> {
-    ssh_command(runner, target, script, stdin, timeout, None)
-}
-
-/// Run one recurring remote check under an identity that does not change when
-/// its shell spelling is fixed. The command bytes are still recorded as evidence.
-pub(crate) fn ssh_check(
-    runner: &dyn Runner,
-    target: &str,
-    script: &str,
-    timeout: Duration,
-    check: &str,
-) -> Result<Output> {
-    ssh_command(runner, target, script, None, timeout, Some(check))
+    ssh_command(runner, target, script, stdin, timeout)
 }
 
 fn ssh_command(
@@ -342,7 +330,6 @@ fn ssh_command(
     script: &str,
     stdin: Option<&str>,
     timeout: Duration,
-    check: Option<&str>,
 ) -> Result<Output> {
     check_target(target)?;
     let mut cmd = Cmd::new("ssh", timeout).args(SSH_OPTIONS).args([
@@ -350,9 +337,6 @@ fn ssh_command(
         target,
         &format!("sh -c {}", quote(script)),
     ]);
-    if let Some(check) = check {
-        cmd = cmd.ledger_subject(format!("check:{check}:{target}"));
-    }
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
     }

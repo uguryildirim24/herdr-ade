@@ -4717,7 +4717,7 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
 
 /// The ticker pass for rounds and everything Rolf looks at (A3's entry
 /// point). Refreshes pins, finishes lane fast-forwards after a checkpoint,
-/// reports a pending merge once, resumes ask publication, runs the talk
+/// reports a pending merge once, resumes ask publication, runs the
 /// writer and refreshes the board. Never merges on its own.
 pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     // An unreadable events folder refreshes nothing: an empty list would
@@ -4765,7 +4765,6 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
         eprintln!("round advance: {error:#}");
     }
     let _ = crate::ask::tick(ctx, project);
-    let _ = crate::talk::tick(ctx, project);
     let _ = crate::board::refresh(ctx, project);
     Ok(())
 }
