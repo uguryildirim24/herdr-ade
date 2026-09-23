@@ -493,9 +493,14 @@ pub(crate) struct RoundRecord {
     pub(crate) review_intent: Option<ReviewIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) merge: Option<MergeIntent>,
-    /// Accepted reviewer completion; later events cannot replace this pin.
+    /// Accepted reviewer completion. Before a merge intent exists, the latest
+    /// authoritative completion from this reviewer supersedes an older pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verdict: Option<CompletionPin>,
+    /// The reviewer completion which preceded a requested correction. While
+    /// present, only a later sealed `done` can become the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reviewer_awaiting_report_after: Option<String>,
     /// The validated verdict word for the accepted sealed report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verdict_kind: Option<String>,

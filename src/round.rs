@@ -439,16 +439,17 @@ fn return_to_admitting(record: &mut RoundRecord) {
     record.review_intent = None;
     record.reviewer = None;
     record.verdict = None;
+    record.reviewer_awaiting_report_after = None;
     record.verdict_kind = None;
     record.announced = None;
     record.attention.clear();
     record.reviewer_start_failures = 0;
 }
 
-/// Hold every open round containing a completed lane after that lane receives
-/// more work. The completion which existed at send time becomes a barrier: the
-/// round cannot review again until the lane seals a later `done`. Any active
-/// reviewer is unbound durably before its process is stopped.
+/// Hold every open round containing a lane or reviewer after that thread
+/// receives more work. A lane's completion becomes a new-review barrier. A
+/// reviewer's completion becomes a fresh-verdict barrier while the same
+/// reviewer handles the correction.
 pub(crate) fn hold_for_follow_up(
     ctx: &Ctx,
     project: &Project,
@@ -457,13 +458,13 @@ pub(crate) fn hold_for_follow_up(
 ) -> Result<()> {
     let mut changed = false;
     for listed in checked_list(project)? {
-        if listed.phase.closed()
-            || !listed
-                .manifest
-                .members
-                .iter()
-                .any(|member| member.thread == thread_id)
-        {
+        let is_member = listed
+            .manifest
+            .members
+            .iter()
+            .any(|member| member.thread == thread_id);
+        let is_reviewer = listed.reviewer.as_deref() == Some(thread_id);
+        if listed.phase.closed() || (!is_member && !is_reviewer) {
             continue;
         }
         let _operation = operation_lock(project, &listed.round)?;
@@ -473,47 +474,76 @@ pub(crate) fn hold_for_follow_up(
             if record.phase.closed() {
                 continue;
             }
-            let Some(index) = record
-                .manifest
-                .members
-                .iter()
-                .position(|member| member.thread == thread_id)
-            else {
-                continue;
-            };
             require_editable(&record)?;
             let attempt = thread_attempt(project, thread_id)?;
-            let existing_barrier = record.manifest.members[index].awaiting_report_after.clone();
-            let next_pin = match existing_barrier.as_deref() {
-                Some(after) => done_pin_after(
-                    events_before_send,
-                    &record.round,
-                    thread_id,
-                    attempt,
-                    Some(after),
-                )?,
-                None => done_pin(events_before_send, &record.round, thread_id, attempt),
-            };
-            let next_barrier = match next_pin {
-                Some(pin) => Some(pin.event),
-                None if existing_barrier.is_some() => continue,
-                None => match record.manifest.members[index].pin.as_ref() {
-                    Some(pin) if pin.attempt != attempt => None,
-                    Some(pin) => bail!(
-                        "follow_up_barrier_missing: pinned event `{}` is absent",
-                        pin.event
-                    ),
-                    None => continue,
-                },
-            };
-            record.manifest.members[index].pin = None;
-            record.manifest.members[index].awaiting_report_after = next_barrier;
-            record.manifest.revision += 1;
-            let reviewer = record.reviewer.clone();
-            return_to_admitting(&mut record);
-            save(project, &record)?;
-            changed = true;
-            reviewer
+            if record.reviewer.as_deref() == Some(thread_id) {
+                let existing_barrier = record.reviewer_awaiting_report_after.clone();
+                let next_pin = match existing_barrier.as_deref() {
+                    Some(after) => done_pin_after(
+                        events_before_send,
+                        &record.round,
+                        thread_id,
+                        attempt,
+                        Some(after),
+                    )?,
+                    None => done_pin(events_before_send, &record.round, thread_id, attempt),
+                };
+                let next_barrier = next_pin
+                    .map(|pin| pin.event)
+                    .or_else(|| record.verdict.as_ref().map(|pin| pin.event.clone()));
+                if next_barrier.is_none() && existing_barrier.is_some() {
+                    continue;
+                }
+                record.verdict = None;
+                record.verdict_kind = None;
+                record.reviewer_awaiting_report_after = next_barrier;
+                record.phase = RoundPhase::UnderReview;
+                record.announced = None;
+                record.attention.clear();
+                save(project, &record)?;
+                changed = true;
+                None
+            } else {
+                let Some(index) = record
+                    .manifest
+                    .members
+                    .iter()
+                    .position(|member| member.thread == thread_id)
+                else {
+                    continue;
+                };
+                let existing_barrier = record.manifest.members[index].awaiting_report_after.clone();
+                let next_pin = match existing_barrier.as_deref() {
+                    Some(after) => done_pin_after(
+                        events_before_send,
+                        &record.round,
+                        thread_id,
+                        attempt,
+                        Some(after),
+                    )?,
+                    None => done_pin(events_before_send, &record.round, thread_id, attempt),
+                };
+                let next_barrier = match next_pin {
+                    Some(pin) => Some(pin.event),
+                    None if existing_barrier.is_some() => continue,
+                    None => match record.manifest.members[index].pin.as_ref() {
+                        Some(pin) if pin.attempt != attempt => None,
+                        Some(pin) => bail!(
+                            "follow_up_barrier_missing: pinned event `{}` is absent",
+                            pin.event
+                        ),
+                        None => continue,
+                    },
+                };
+                record.manifest.members[index].pin = None;
+                record.manifest.members[index].awaiting_report_after = next_barrier;
+                record.manifest.revision += 1;
+                let reviewer = record.reviewer.clone();
+                return_to_admitting(&mut record);
+                save(project, &record)?;
+                changed = true;
+                reviewer
+            }
         };
         if let Some(reviewer) = reviewer {
             cancel_superseded_reviewer(
@@ -1465,6 +1495,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
         record.cleanup_pending = true;
         record.review_intent = None;
         record.verdict = None;
+        record.reviewer_awaiting_report_after = None;
         record.verdict_kind = None;
         record.abandoned_reason = Some(reason);
         save(&project, &record)?;
@@ -1745,6 +1776,7 @@ pub fn bind_reviewer(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Res
         );
     }
     record.verdict = None;
+    record.reviewer_awaiting_report_after = None;
     record.verdict_kind = None;
     record.phase = RoundPhase::UnderReview;
     record.reviewer = Some(thread_id.to_string());
@@ -1911,8 +1943,13 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
     let candidate = thread::load(&project, id)?;
     let events = sealed_events(&project)?;
     let attempt = candidate.attempt.max(1);
-    let pin = done_pin(&events, round, id, attempt).with_context(|| {
-        format!("adopt_completion_missing: `{id}` has no sealed done event for attempt {attempt}")
+    let pin = if candidate.role == "reviewer" && record.reviewer.as_deref() == Some(id) {
+        reviewer_completion(&project, &record, &events)?
+    } else {
+        done_pin(&events, round, id, attempt)
+    }
+    .with_context(|| {
+        format!("adopt_completion_missing: `{id}` has no authoritative sealed done event for attempt {attempt}")
     })?;
 
     if candidate.role == "reviewer" {
@@ -1958,6 +1995,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
         }
         current.reviewer = Some(id.to_string());
         current.verdict = Some(pin);
+        current.reviewer_awaiting_report_after = None;
         current.verdict_kind = Some(verdict_kind);
         current.phase = RoundPhase::VerdictIn;
         current.announced = None;
@@ -2713,6 +2751,12 @@ pub(crate) fn current_attention(ctx: &Ctx, project: &Project, record: &RoundReco
         return verdict_summary(&record.round, verdict);
     }
     if let Some(reviewer) = record.reviewer.as_deref() {
+        if record.reviewer_awaiting_report_after.is_some() {
+            return format!(
+                "Round {}: reviewer {reviewer} is handling a requested correction; waiting for its fresh sealed verdict",
+                record.round
+            );
+        }
         let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
         return match reviewer_state(ctx, project, reviewer) {
             ReviewerState::Alive => {
@@ -3161,6 +3205,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         current.phase = RoundPhase::UnderReview;
         current.review_intent = None;
         current.verdict = None;
+        current.reviewer_awaiting_report_after = None;
         current.verdict_kind = None;
         current.expected_head = Some(b.clone());
         current.frozen_revision = Some(current.manifest.revision);
@@ -3457,62 +3502,97 @@ fn parse_verdict(text: &str) -> Result<Verdict> {
     toml::from_str(front).map_err(|e| anyhow::anyhow!("verdict_unreadable: {e}"))
 }
 
-/// The reviewer's sealed completion for its current attempt.
-fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<String> {
-    if let Some(pin) = &record.verdict {
-        if record.verdict_kind.is_none() {
-            let kind = verdict_text(project, record, &pin.sha)?
-                .and_then(|text| parse_verdict(&text).ok())
-                .map(|verdict| verdict.verdict)
-                .context("verdict_unreadable: accepted verdict cannot be read")?;
-            let _lock = project.lock()?;
-            let mut current = load(project, &record.round)?;
-            if current.verdict.as_ref() == Some(pin) && current.verdict_kind.is_none() {
-                current.verdict_kind = Some(kind);
-                save(project, &current)?;
-            }
-        }
-        return Ok(pin.sha.clone());
+fn reviewer_completion(
+    project: &Project,
+    record: &RoundRecord,
+    events: &[Event],
+) -> Result<Option<CompletionPin>> {
+    let Some(reviewer) = record.reviewer.as_deref() else {
+        return Ok(None);
+    };
+    let lane = thread_record(project, reviewer)?;
+    let attempt = lane.attempt.max(1);
+    if lane.follow_ups.iter().any(|follow_up| {
+        follow_up.attempt == attempt
+            && matches!(
+                follow_up.state,
+                crate::thread::FollowUpState::Queued | crate::thread::FollowUpState::Uncertain
+            )
+    }) || ((record.verdict.is_some() || record.reviewer_awaiting_report_after.is_some())
+        && lane.last_group == crate::thread::Group::Working.token())
+    {
+        return Ok(None);
     }
+    let pin = done_pin_after(
+        events,
+        &record.round,
+        reviewer,
+        attempt,
+        record.reviewer_awaiting_report_after.as_deref(),
+    )?;
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    // Waiting or failure after a verdict is authoritative too: an earlier
+    // `done` is no longer the reviewer's current sealed result.
+    if latest_event(events, reviewer, attempt).map(|event| event.id.as_str())
+        != Some(pin.event.as_str())
+    {
+        return Ok(None);
+    }
+    Ok(Some(pin))
+}
+
+/// Accept the reviewer's exact current sealed completion. Before a merge
+/// intent exists, a later completion supersedes an accepted older verdict.
+fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<String> {
     if let Some(intent) = &record.merge {
         return Ok(intent.verdict.clone());
     }
-    let reviewer = record.reviewer.as_deref().with_context(|| {
+    let _lock = project.lock()?;
+    let mut current = load(project, &record.round)?;
+    if let Some(intent) = &current.merge {
+        return Ok(intent.verdict.clone());
+    }
+    if current.reviewer != record.reviewer
+        || current.manifest_hash != record.manifest_hash
+        || manifest_hash(&current) != manifest_hash(record)
+        || current.review_intent.is_some()
+        || current.phase.closed()
+    {
+        bail!("review_stale: the review changed while accepting its verdict; retry round advance");
+    }
+    let reviewer = current.reviewer.as_deref().with_context(|| {
         format!(
             "reviewer_unbound: no reviewer thread is recorded; run `round retry {} {} --reason <why>`",
-            project.slug, record.round
+            project.slug, current.round
         )
     })?;
-    let attempt = thread_attempt(project, reviewer)?;
     let events = sealed_events(project)?;
-    let pin = done_pin(&events, &record.round, reviewer, attempt)
-        .context("verdict_missing: the reviewer has no sealed done event for this round and attempt; finish the review and run done with its verdict report")?;
-    let mut evidence = record.clone();
+    let pin = reviewer_completion(project, &current, &events)?.with_context(|| {
+        if current.reviewer_awaiting_report_after.is_some() {
+            format!(
+                "verdict_correction_pending: reviewer `{reviewer}` has not sealed a fresh verdict after the requested correction"
+            )
+        } else {
+            format!(
+                "verdict_missing: reviewer `{reviewer}` has no authoritative sealed done event for this round and attempt"
+            )
+        }
+    })?;
+    let mut evidence = current.clone();
     evidence.verdict = Some(pin.clone());
     validate_verdict_inner(project, git, &evidence, &pin.sha, false)?;
     let verdict_kind = verdict_text(project, &evidence, &pin.sha)?
         .and_then(|text| parse_verdict(&text).ok())
         .map(|verdict| verdict.verdict)
         .context("verdict_unreadable: validated verdict disappeared")?;
-    let rejected = verdict_kind == "REJECT";
-    let _lock = project.lock()?;
-    let mut current = load(project, &record.round)?;
-    if current.reviewer != record.reviewer
-        || current.manifest_hash != record.manifest_hash
-        || manifest_hash(&current) != manifest_hash(record)
-        || current.review_intent.is_some()
-        || current.merge.is_some()
-        || current.phase.closed()
-    {
-        bail!("review_stale: the review changed while accepting its verdict; retry round advance");
-    }
-    if let Some(accepted) = current.verdict {
-        return Ok(accepted.sha);
-    }
+    let changed = current.verdict.as_ref() != Some(&pin);
     current.verdict = Some(pin.clone());
-    current.verdict_kind = Some(verdict_kind);
+    current.reviewer_awaiting_report_after = None;
+    current.verdict_kind = Some(verdict_kind.clone());
     current.phase = RoundPhase::VerdictIn;
-    if rejected {
+    if changed && verdict_kind == "REJECT" {
         *current.rejections.get_or_insert(0) += 1;
     }
     save(project, &current)?;
@@ -3645,14 +3725,10 @@ fn read_verdict_checked(
     if record.manifest_hash.as_deref() != Some(manifest_hash(record).as_str()) {
         return Ok(None);
     }
-    if record.verdict.is_none() && record.merge.is_none() {
-        let Some(reviewer) = record.reviewer.as_deref() else {
-            return Ok(None);
-        };
-        let attempt = thread_attempt(project, reviewer)?;
-        if done_pin(&sealed_events(project)?, &record.round, reviewer, attempt).is_none() {
-            return Ok(None);
-        }
+    if record.merge.is_none()
+        && reviewer_completion(project, record, &sealed_events(project)?)?.is_none()
+    {
+        return Ok(None);
     }
     let v = verdict_commit(project, record, git)?;
     let accepted = load(project, &record.round)?;
@@ -3884,6 +3960,44 @@ fn finish_publication_with(
     })
 }
 
+/// Commit the fresh merge selection at the same project-lock boundary used by
+/// local event sealing and follow-up state changes. Once this intent exists,
+/// retries resume it; before it exists, only the reviewer's exact latest
+/// completion is eligible.
+fn commit_fresh_merge_intent(
+    project: &Project,
+    snapshot: &RoundRecord,
+    git: &Git,
+    intent: &MergeIntent,
+) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut current = load(project, &snapshot.round)?;
+    require_editable(&current)?;
+    if current.reviewer != snapshot.reviewer
+        || current.expected_head != snapshot.expected_head
+        || current.manifest_hash != snapshot.manifest_hash
+        || current.frozen_revision != snapshot.frozen_revision
+        || manifest_hash(&current) != manifest_hash(snapshot)
+    {
+        bail!("review_stale: the review changed at the merge boundary; retry round merge");
+    }
+    let events = sealed_events(project)?;
+    let pin = reviewer_completion(project, &current, &events)?.context(
+        "verdict_stale: the reviewer has a pending correction or no current sealed verdict",
+    )?;
+    if current.verdict.as_ref() != Some(&pin) || pin.sha != intent.verdict {
+        bail!(
+            "verdict_stale: the reviewer's authoritative completion changed at the merge boundary; retry round merge"
+        );
+    }
+    validate_verdict_inner(project, git, &current, &pin.sha, true)?;
+    current.phase = phase_for_merge(intent);
+    current.cleanup_pending = false;
+    current.merge = Some(intent.clone());
+    current.attention.clear();
+    save(project, &current)
+}
+
 fn fresh_merge(
     ctx: &Ctx,
     project: &Project,
@@ -3943,7 +4057,7 @@ fn fresh_merge(
         checkpoint: None,
         head: None,
     };
-    write_merge(project, &round, &intent)?;
+    commit_fresh_merge_intent(project, &record, git, &intent)?;
     let mut intent = effect_merge_locked(project, &record, git, intent)?;
     if stop == Some(Stop::Ref) {
         return Ok(FreshMergeOutcome::Done(MergeOutcome::Stopped {
@@ -5230,10 +5344,10 @@ mod tests {
     }
 
     #[test]
-    fn accepted_verdict_is_not_replaced_by_a_later_done_or_reviewer() {
+    fn newer_sealed_reviewer_completion_invalidates_an_accepted_verdict() {
         let fx = fixture();
         let (lanes, _) = reviewed(&fx);
-        let (_, v) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let (_, old) = verdict(&fx, &lanes, front("MERGE", "r1"));
         let git = Git::new(fx.world.ctx().runner, &fx.repo);
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(
@@ -5241,17 +5355,113 @@ mod tests {
             Some("MERGE")
         );
         let accepted = load(&fx.project, "r1").unwrap();
-        assert_eq!(accepted.phase, RoundPhase::VerdictIn);
-        assert_eq!(accepted.verdict.as_ref().unwrap().sha, v);
+        assert_eq!(accepted.verdict.as_ref().unwrap().sha, old);
         let reviewer = accepted.reviewer.as_ref().unwrap();
-        fx.seal_done(reviewer, 1, 2, &lanes[0].1, "a later unrelated completion");
-        let replacement = fx.thread("Replacement reviewer");
-        let e = err(bind_reviewer(&fx.world.ctx(), "demo", "r1", &replacement));
-        assert!(e.starts_with("verdict_already_accepted"), "{e}");
-        merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        fx.seal_done(reviewer, 1, 2, &lanes[0].1, "a later invalid completion");
+
+        let error = err(merge(&fx.world.ctx(), "demo", "r1", None));
+        assert!(error.starts_with("verdict_unreadable"), "{error}");
+        let refused = load(&fx.project, "r1").unwrap();
+        assert!(refused.merge.is_none());
+        assert_eq!(main_head(&fx), refused.expected_head.unwrap());
+    }
+
+    #[test]
+    fn queued_reviewer_correction_requires_and_merges_the_fresh_verdict() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        let (old, _) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let git = Git::new(ctx.runner, &fx.repo);
+        let initial = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            read_verdict(&fx.project, &initial, &git).as_deref(),
+            Some("MERGE")
+        );
+        let accepted = load(&fx.project, "r1").unwrap();
+        let reviewer = accepted.reviewer.clone().unwrap();
+        let old_event = accepted.verdict.as_ref().unwrap().event.clone();
+
+        // The observed prl-8-53 shape: the correction queues while startup
+        // delivery is still pending, after the first verdict was accepted.
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.prompt_pending = true;
+        })
+        .unwrap();
+        assert!(matches!(
+            crate::threads::prompt(
+                &ctx,
+                "demo",
+                &reviewer,
+                "Add the missing access-method provenance."
+            )
+            .unwrap(),
+            crate::threads::PromptOutcome::Queued { .. }
+        ));
+        let held = load(&fx.project, "r1").unwrap();
+        assert_eq!(held.phase, RoundPhase::UnderReview);
+        assert!(held.verdict.is_none());
+        assert_eq!(
+            held.reviewer_awaiting_report_after.as_deref(),
+            Some(old_event.as_str())
+        );
+        assert!(
+            show(&ctx, "demo", "r1")
+                .unwrap()
+                .contains("handling a requested correction")
+        );
+        assert!(err(merge(&ctx, "demo", "r1", None)).starts_with("verdict_correction_pending"));
+
+        let wt = fx.repo.join(".worktrees/review-r1");
+        let corrected = commit_file(
+            &wt,
+            "review-correction.md",
+            "access method disclosed\n",
+            "correct provenance",
+        );
+        let report = front("MERGE", "r1")(&corrected, &held);
+        let fresh_event = fx.seal_done(&reviewer, 1, 2, &corrected, &report);
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.prompt_pending = false;
+            thread.follow_ups.clear();
+        })
+        .unwrap();
+        // A completion that raced ahead of the correction delivery cannot
+        // satisfy the barrier while the reviewer is still recorded as working.
+        assert!(err(merge(&ctx, "demo", "r1", None)).starts_with("verdict_correction_pending"));
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.last_group = crate::thread::Group::ReadyForReview.token().into();
+        })
+        .unwrap();
+
+        // A stale selection made before the new seal is rejected at the
+        // atomic intent boundary rather than publishing its old candidate.
+        let stale = MergeIntent {
+            op: "merge-r1".into(),
+            expected_old: main_head(&fx),
+            candidate: old.clone(),
+            verdict: old,
+            phase: MergePhase::Intent,
+            merged: None,
+            checkpoint: None,
+            head: None,
+        };
+        let snapshot = load(&fx.project, "r1").unwrap();
+        let error = err(commit_fresh_merge_intent(
+            &fx.project,
+            &snapshot,
+            &git,
+            &stale,
+        ));
+        assert!(error.starts_with("verdict_stale"), "{error}");
+        assert!(load(&fx.project, "r1").unwrap().merge.is_none());
+
+        merge(&ctx, "demo", "r1", None).unwrap();
         let merged = load(&fx.project, "r1").unwrap();
         assert_eq!(merged.phase, RoundPhase::Merged);
-        assert_eq!(merged.merge.unwrap().verdict, v);
+        assert_eq!(merged.verdict.as_ref().unwrap().event, fresh_event);
+        assert_eq!(merged.merge.as_ref().unwrap().candidate, corrected);
+        assert_eq!(main_head(&fx), corrected);
     }
 
     #[test]
