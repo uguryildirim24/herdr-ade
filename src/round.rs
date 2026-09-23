@@ -384,6 +384,20 @@ pub fn list(project: &Project) -> Vec<RoundRecord> {
     rounds
 }
 
+/// The newest round for the board. Historical rounds need not be parsed to
+/// show the current stage.
+pub(crate) fn latest(project: &Project) -> Option<RoundRecord> {
+    let entries = std::fs::read_dir(rounds_dir(project)).ok()?;
+    let mut ids: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
+        .filter(|id| validate_round_id(id).is_ok())
+        .collect();
+    ids.sort_by_key(|id| std::cmp::Reverse(round_number(id).parse::<u64>().unwrap_or(0)));
+    ids.into_iter().find_map(|id| load(project, &id).ok())
+}
+
 pub fn read_merge(project: &Project, round: &str) -> Result<Option<MergeIntent>> {
     Ok(load(project, round)?.merge)
 }
@@ -2078,6 +2092,10 @@ pub struct ReviewerStarted {
 }
 
 pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
+    advance_inner(ctx, slug, true)
+}
+
+fn advance_inner(ctx: &Ctx, slug: &str, refresh_page: bool) -> Result<AdvanceOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
     // One advance at a time, across processes (the hook and the ticker).
@@ -2212,7 +2230,9 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             outcome.started.push(ReviewerStarted { round, reviewer });
         }
     }
-    let _ = crate::project::refresh_page(&project);
+    if refresh_page {
+        let _ = crate::project::refresh_page(&project);
+    }
     Ok(outcome)
 }
 
@@ -4602,27 +4622,54 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
 /// reports a pending merge once, resumes ask publication, runs the talk
 /// writer and refreshes the board. Never merges on its own.
 pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
-    // An unreadable events folder refreshes nothing: an empty list would
-    // unpin every lane and bump every revision (D6, item 33).
-    let events = sealed_events(project).ok();
-    for listed in list(project) {
-        let round = listed.round.clone();
-        // A merging round keeps the pins it was admitted and merged with.
-        if let Some(events) = &events
-            && matches!(read_merge(project, &round), Ok(None))
+    // The directory changes whenever a round is written atomically. On an
+    // idle project, do not reparse historical rounds or run `advance` (and
+    // its per-round git and herdr probes) on every fifteen-second beat.
+    let dir = rounds_dir(project);
+    let stamp = std::fs::metadata(&dir)
+        .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+        .ok();
+    thread_local! {
+        static IDLE: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf, Option<(u64, std::time::SystemTime)>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    let unchanged_idle = IDLE.with(|cache| cache.borrow().get(&dir) == Some(&stamp));
+    if !unchanged_idle {
+        let rounds = list(project);
+        if rounds
+            .iter()
+            .all(|r| r.phase.closed() && !r.cleanup_pending)
         {
-            let _lock = project.lock()?;
-            if let Ok(mut record) = load(project, &round)
-                && refresh_pins(project, &mut record, events).unwrap_or(false)
-            {
-                save(project, &record)?;
-            }
+            IDLE.with(|cache| {
+                cache.borrow_mut().insert(dir, stamp);
+            });
+        } else {
+            IDLE.with(|cache| {
+                cache.borrow_mut().remove(&dir);
+            });
         }
-        let Ok(record) = load(project, &round) else {
-            continue;
-        };
-        match read_merge(project, &round) {
-            Ok(Some(m)) if m.phase == MergePhase::Checkpointed => {
+        tick_rounds(ctx, project, rounds)?;
+    }
+    let _ = crate::ask::tick(ctx, project);
+    let _ = crate::talk::tick(ctx, project);
+    let _ = crate::board::refresh_tick(ctx, project);
+    Ok(())
+}
+
+fn tick_rounds(ctx: &Ctx, project: &Project, rounds: Vec<RoundRecord>) -> Result<()> {
+    let active = rounds
+        .iter()
+        .any(|r| !r.phase.closed() || r.cleanup_pending);
+    // `advance` refreshes pins of open rounds under its own lock. Only
+    // checkpointed merges need the independent forward-lanes recovery here.
+    for record in rounds.into_iter().filter(|r| {
+        r.merge
+            .as_ref()
+            .is_some_and(|merge| merge.phase == MergePhase::Checkpointed)
+    }) {
+        let round = record.round.clone();
+        match record.merge.clone() {
+            Some(m) if m.phase == MergePhase::Checkpointed => {
                 let marker = merge_dir(project, &round).join("lanes-forwarded");
                 if !marker.exists() {
                     let git = Git::new(ctx.runner, &record.repo);
@@ -4642,13 +4689,11 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             _ => {}
         }
     }
-    // The safety net for a missed hook: one advance pass per tick.
-    if let Err(error) = advance(ctx, &project.slug) {
+    // The safety net for a missed hook: one advance pass when there is
+    // unfinished work. Closed rounds cannot start a reviewer.
+    if active && let Err(error) = advance_inner(ctx, &project.slug, false) {
         eprintln!("round advance: {error:#}");
     }
-    let _ = crate::ask::tick(ctx, project);
-    let _ = crate::talk::tick(ctx, project);
-    let _ = crate::board::refresh(ctx, project);
     Ok(())
 }
 
@@ -5352,6 +5397,26 @@ mod tests {
                 .unwrap()
                 .contains("abandoned because: the reviewer could not be dispatched")
         );
+    }
+
+    #[test]
+    fn idle_round_ticker_does_not_probe_git_or_herdr() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = crate::paths::Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        tick(&ctx, &project).unwrap();
+        tick(&ctx, &project).unwrap();
+        assert_eq!(runner.count("git"), 0);
+        assert_eq!(runner.count("herdr"), 0);
     }
 
     #[test]
