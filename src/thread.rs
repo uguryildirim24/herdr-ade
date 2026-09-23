@@ -81,6 +81,10 @@ pub(crate) struct Thread {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) follow_ups: Vec<FollowUp>,
     pub(crate) launch_attempts: u32,
+    /// Submission time of an agent start awaiting readiness after an early
+    /// `agent_not_ready`. A blocked startup is not a failed attempt yet.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) startup_wait_started: String,
     pub(crate) failure_event: String,
     pub(crate) last_failure: String,
     /// Classification of the current failure evidence. Old records load as
@@ -308,8 +312,59 @@ pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::E
     (threads, errors)
 }
 
+type ListStamp = Option<(u64, std::time::SystemTime)>;
+type ThreadLists = std::collections::BTreeMap<std::path::PathBuf, (ListStamp, Vec<Thread>)>;
+
+thread_local! {
+    static TICKER_LISTS: std::cell::RefCell<Option<ThreadLists>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A ticker-only cache. All normal writers replace records atomically, which
+/// changes the threads directory; ordinary CLI reads stay uncached. This
+/// avoids parsing every historical lane repeatedly inside each idle beat.
+pub(crate) struct ListCache;
+
+impl ListCache {
+    pub(crate) fn new() -> Self {
+        TICKER_LISTS.with(|cache| *cache.borrow_mut() = Some(Default::default()));
+        Self
+    }
+}
+
+impl Drop for ListCache {
+    fn drop(&mut self) {
+        TICKER_LISTS.with(|cache| *cache.borrow_mut() = None);
+    }
+}
+
 pub(crate) fn list(project: &Project) -> Vec<Thread> {
-    list_with_errors(project).0
+    let dir = threads_dir(project);
+    let stamp = std::fs::metadata(&dir)
+        .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+        .ok();
+    if let Some(found) = TICKER_LISTS.with(|cache| {
+        cache.borrow().as_ref().and_then(|rows| {
+            rows.get(&dir)
+                .filter(|(cached, _)| *cached == stamp)
+                .map(|(_, rows)| rows.clone())
+        })
+    }) {
+        return found;
+    }
+    let (rows, errors) = list_with_errors(project);
+    // An unreadable directory or record is not a stable empty/partial list.
+    // A repaired record may keep its parent's directory stamp unchanged.
+    TICKER_LISTS.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            if errors.is_empty() {
+                cache.insert(dir, (stamp, rows.clone()));
+            } else {
+                cache.remove(&dir);
+            }
+        }
+    });
+    rows
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
@@ -385,7 +440,10 @@ fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
         && after.failure_class == crate::contracts::FailureClass::Unknown
     {
         crate::ledger::observe(project, "thread-error", &after.id, &after.error);
-        if after.launch_attempts == 0 && !after.launch.kind.is_empty() {
+        if after.launch_attempts == 0
+            && before.launch_attempts == 0
+            && !after.launch.kind.is_empty()
+        {
             crate::ledger::observe(
                 project,
                 "launch-not-attempted",
@@ -458,16 +516,18 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     };
     if t.is_remote() {
         return format!(
-            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
+            "Run the shell command `{prefix} skill {role}`, then read .herdr-project/{slug}-{id}/brief.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
             t.machine
         );
     }
     let prompt = match t.kind {
         Kind::Worktree if !t.is_remote() => format!(
-            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
+            "Run the shell command `{prefix} skill {role}`, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
         ),
         Kind::Tab => {
-            format!("Run {prefix} skill {role}, then read brief.md and do what it says.")
+            format!(
+                "Run the shell command `{prefix} skill {role}`, then read brief.md and do what it says."
+            )
         }
         Kind::Adopted if t.repo.is_empty() && !t.thread_dir.is_empty() => format!(
             "Read {}/brief.md and do what it says. Work and commit in {}.",
@@ -886,10 +946,12 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
     match thread.status {
         Status::Resolved => Group::Resolved,
         Status::Failed => Group::WaitingOnYou,
+        Status::Starting if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Starting if seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS => {
             Group::WaitingOnYou
         }
         Status::Starting => Group::Working,
+        Status::Open if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Open if thread.is_remote() && thread.last_state.is_empty() => Group::Unknown,
         Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
             Group::Working
@@ -908,11 +970,18 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     }
     // 2
     if thread.status == Status::Starting {
-        return if seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS {
+        return if !thread.startup_wait_started.is_empty()
+            || seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS
+        {
             Group::Working
         } else {
             Group::WaitingOnYou
         };
+    }
+    // An early startup block is not a user-facing block until its ready
+    // window expires. The ticker makes the timed failure transition.
+    if !thread.startup_wait_started.is_empty() {
+        return Group::Working;
     }
     // 3
     let stuck_launch = thread.prompt_pending
@@ -1305,6 +1374,38 @@ mod tests {
     }
 
     #[test]
+    fn ticker_reuses_unchanged_thread_records_and_sees_atomic_updates() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        let original = allocate(&project, |t| t.title = "Original".into()).unwrap();
+        let _cache = ListCache::new();
+        assert_eq!(list(&project)[0].title, "Original");
+        // The unchanged directory is not parsed a second time.
+        let path = threads_dir(&project).join(format!("{}.toml", original.id));
+        std::fs::write(&path, "invalid = [").unwrap();
+        assert_eq!(list(&project)[0].title, "Original");
+        // Real writers use atomic replacement and invalidate the snapshot.
+        write_record(&project, &original).unwrap();
+        update(&project, &original.id, |t| t.title = "Updated".into()).unwrap();
+        assert_eq!(list(&project)[0].title, "Updated");
+    }
+
+    #[test]
+    fn ticker_retries_unreadable_records_without_directory_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        let lane = allocate(&project, |t| t.title = "Original".into()).unwrap();
+        let path = threads_dir(&project).join(format!("{}.toml", lane.id));
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "invalid = [").unwrap();
+        let _cache = ListCache::new();
+        assert!(list(&project).is_empty());
+        // Repair in place, not via the atomic writer: no directory rename.
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(list(&project)[0].title, "Original");
+    }
+
+    #[test]
     fn row2_starting_is_working_for_five_minutes() {
         let young = Thread {
             status: Status::Starting,
@@ -1631,7 +1732,7 @@ mod tests {
         };
         assert_eq!(
             launch_prompt("ha", "demo", &lane),
-            "Run ha skill reviewer, then read .herdr-project/demo-t-0001/brief.md and do what it says."
+            "Run the shell command `ha skill reviewer`, then read .herdr-project/demo-t-0001/brief.md and do what it says."
         );
     }
 
@@ -1714,6 +1815,28 @@ mod tests {
         update(&p, &t.id, |t| t.launch_attempts += 1).unwrap();
         let entries = crate::ledger::list(&p).unwrap();
         assert!(!entries.iter().any(|e| e.kind == "retry"));
+    }
+
+    #[test]
+    fn failed_relaunch_does_not_claim_the_previous_launch_never_happened() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = allocate(&project, |t| {
+            t.launch.kind = "claude".into();
+            t.launch_attempts = 1;
+            t.status = Status::Open;
+        })
+        .unwrap();
+        update(&project, &t.id, |t| {
+            t.status = Status::Failed;
+            t.attempt = 2;
+            t.launch_attempts = 0;
+            t.error = "the first agent failed after launch".into();
+        })
+        .unwrap();
+        let entries = crate::ledger::list(&project).unwrap();
+        assert!(entries.iter().any(|e| e.kind == "thread-error"));
+        assert!(!entries.iter().any(|e| e.kind == "launch-not-attempted"));
     }
 
     #[test]

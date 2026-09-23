@@ -5,9 +5,10 @@
 //! D17 item 3). A value that fails is replaced by a checked unavailable notice;
 //! old truth is never republished with a fresh lifetime.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -177,12 +178,11 @@ fn agent_states(ctx: &Ctx, project: &Project) -> Option<BTreeMap<String, String>
 /// `ade_stage`: the newest round's phase, with its birth sentence if it
 /// fits. Also the stage line of `ha overview`.
 pub(crate) fn stage(project: &Project) -> String {
-    let rounds = crate::round::list(project);
-    match rounds.last() {
+    match crate::round::latest(project).as_ref() {
         None => "no round is open yet".to_string(),
         Some(r) => {
             let n = crate::round::round_number(&r.round);
-            let merge = crate::round::read_merge(project, &r.round).ok().flatten();
+            let merge = r.merge.clone();
             let members = r.manifest.members.len();
             let done = r
                 .manifest
@@ -227,7 +227,7 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
         if t.status == thread::Status::Resolved {
             continue;
         }
-        let attempt = crate::round::thread_attempt(project, &t.id).unwrap_or(1);
+        let attempt = t.attempt.max(1);
         match crate::round::latest_event(&events, &t.id, attempt) {
             Some(e) if e.payload.done.is_some() => done += 1,
             Some(e) if e.payload.waiting.is_some() => waiting += 1,
@@ -324,6 +324,66 @@ fn checked_value_or_notice(
     }
 }
 
+// Files used by the project page and board. Atomic record writes change their
+// parent directory's mtime; append-only records change the file's length.
+// The expiry also renews tokens and the human-readable `updated at` row.
+type InputStamp = Vec<Option<(u64, SystemTime)>>;
+
+fn input_stamp(project: &Project) -> InputStamp {
+    let state = project.state_dir();
+    let mut paths: Vec<_> = ["threads", "rounds", "events", "tasks", "asks", "history"]
+        .iter()
+        .map(|name| state.join(name))
+        .collect();
+    paths.extend(
+        [
+            "plan.toml",
+            "notes.jsonl",
+            "retirements.jsonl",
+            "decisions.jsonl",
+            "project.json",
+            "board.json",
+        ]
+        .iter()
+        .map(|name| state.join(name)),
+    );
+    paths.push(project.project_md());
+    paths
+        .iter()
+        .map(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .and_then(|meta| Some((meta.len(), meta.modified().ok()?)))
+        })
+        .collect()
+}
+
+/// A ticker beat with unchanged inputs never reparses the historical page or
+/// rechecks identical board values. Explicit CLI refreshes remain immediate.
+pub(crate) fn refresh_tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    thread_local! {
+        static LAST: RefCell<BTreeMap<PathBuf, (InputStamp, Instant)>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+    let path = project.dir();
+    let stamp = input_stamp(project);
+    let unchanged = LAST.with(|cache| {
+        cache.borrow().get(&path).is_some_and(|(previous, at)| {
+            *previous == stamp && at.elapsed() < Duration::from_secs(60)
+        })
+    });
+    if unchanged {
+        return Ok(());
+    }
+    refresh(ctx, project)?;
+    LAST.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(path, (input_stamp(project), Instant::now()));
+    });
+    Ok(())
+}
+
 /// Publishes every checked row. A rejected row gets a checked unavailable
 /// notice carrying the age of its last good observation, never the old value.
 pub(crate) fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, String)>> {
@@ -350,7 +410,20 @@ pub(crate) fn refresh(ctx: &Ctx, project: &Project) -> Result<Vec<(String, Strin
             pairs.push((key, value));
         }
     }
-    if !pairs.is_empty() {
+    // Do not re-send an unchanged board on every beat. Refresh well before
+    // the five-minute TTL expires, even when the values have not changed.
+    let fresh = !previous.observed_at.is_empty()
+        && previous.observed_at.values().all(|at| {
+            at.parse::<jiff::Timestamp>()
+                .ok()
+                .is_some_and(|at| jiff::Timestamp::now().as_second() - at.as_second() < 120)
+        });
+    if !pairs.is_empty()
+        && (!fresh
+            || pairs
+                .iter()
+                .any(|(key, value)| previous.values.get(key) != Some(value)))
+    {
         send(ctx, project, &pairs)?;
         let observed = project::now();
         save_state(project, |s| {
@@ -380,6 +453,44 @@ mod tests {
         let (published, rejection) = checked_value_or_notice(&project, "README".into(), None);
         assert!(rejection.unwrap().contains("plain_identifier"));
         assert_eq!(published.unwrap(), "This board row is unavailable.");
+    }
+
+    #[test]
+    fn unchanged_ticker_page_does_not_reparse_or_replace_records() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let runner = FakeRunner::new();
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        refresh_tick(&ctx, &project).unwrap();
+        let first = std::fs::metadata(project.project_md())
+            .unwrap()
+            .modified()
+            .unwrap();
+        refresh_tick(&ctx, &project).unwrap();
+        assert_eq!(
+            first,
+            std::fs::metadata(project.project_md())
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        crate::thread::allocate(&project, |t| t.title = "A new lane".into()).unwrap();
+        refresh_tick(&ctx, &project).unwrap();
+        assert_ne!(
+            first,
+            std::fs::metadata(project.project_md())
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
     }
 
     #[test]

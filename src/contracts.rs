@@ -28,7 +28,7 @@ impl Default for Recipe {
             kind: String::new(),
             args: Vec::new(),
             env: Vec::new(),
-            ready_timeout_ms: 30_000,
+            ready_timeout_ms: 0,
             provider: String::new(),
             capabilities: Vec::new(),
             enabled: true,
