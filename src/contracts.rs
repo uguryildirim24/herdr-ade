@@ -118,7 +118,7 @@ pub(crate) struct Launch {
     /// process failures.
     #[serde(default)]
     pub(crate) same_recipe_retries: u32,
-    /// `pin`, `default`, `explicit`, or the ordered `rule[n]` that selected this recipe.
+    /// `pin`, `default`, `explicit`, `project`, or the ordered `rule[n]` that selected this recipe.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) routing_rule: String,
     /// Rolf's exact words authorizing a one-off recipe choice. Empty on routed
