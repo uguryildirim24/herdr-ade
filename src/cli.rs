@@ -817,6 +817,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     Some(gates) => gates.len().to_string(),
                 };
                 println!("opened {} on `{}` (gates: {gates})", r.round, r.branch);
+                if let Some(warning) = round::publication_warning(&r, &slug) {
+                    crate::output::insert("publication_warning", warning.clone());
+                    crate::output::write_stderr(format_args!("{warning}"));
+                }
                 Ok(())
             }
             RoundCommand::Admit {
@@ -958,7 +962,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     }
                     round::MergeOutcome::NoOp { head } => {
                         message.push_str(&format!("already checkpointed at H {head}\n"));
-                        "already_checkpointed"
+                        if run.effects.published_now {
+                            "published"
+                        } else {
+                            "already_checkpointed"
+                        }
                     }
                     round::MergeOutcome::RepairReviewStarted {
                         review_branch,
@@ -986,6 +994,11 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     }
                 };
                 message.push_str(&run.effects.message());
+                let warning = round::publication_warning(&record, &slug).unwrap_or_default();
+                if !warning.is_empty() {
+                    crate::output::insert("publication_warning", warning.clone());
+                }
+                let warnings = format!("{}{warning}", run.effects.warnings());
                 crate::output::success(
                     Some(outcome),
                     &serde_json::json!({
@@ -996,23 +1009,24 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         "installed": record.installed,
                     }),
                     &message,
-                    &run.effects.warnings(),
+                    &warnings,
                 )
             }
             RoundCommand::Advance { slug } => {
                 let outcome = round::advance(ctx, &slug)?;
-                crate::output::insert("started", serde_json::to_value(&outcome.started)?);
-                if outcome.started.is_empty() {
-                    println!("no reviewer started");
-                } else {
-                    for started in outcome.started {
-                        println!(
-                            "started reviewer {} for {}",
-                            started.reviewer, started.round
-                        );
-                    }
-                }
-                Ok(())
+                crate::output::success(
+                    Some("advanced"),
+                    &serde_json::json!({
+                        "started": outcome.started,
+                        "running": outcome.running,
+                        "verdicts": outcome.verdicts,
+                        "not_started": outcome.not_started,
+                        "attention": outcome.attention,
+                        "nothing": outcome.nothing,
+                    }),
+                    &outcome.message(),
+                    "",
+                )
             }
             RoundCommand::Show { slug, round: id } => {
                 let project = Project::load(&ctx.root, &slug)?;
