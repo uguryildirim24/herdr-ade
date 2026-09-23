@@ -1538,7 +1538,9 @@ mod tests {
             glossary::explain(&ctx, "demo", "Custombrand").unwrap(),
             "Custombrand: familiar name\n(terms.toml)\n"
         );
-        assert!(glossary::add_term(&ctx, "demo", "t-0292", None, None, true).is_err());
+        for name in ["t-0292", "config.toml", "snake_case", "~/projects/demo"] {
+            assert!(glossary::add_term(&ctx, "demo", name, None, None, true).is_err());
+        }
         crate::round::open(
             &ctx,
             "demo",
@@ -1550,6 +1552,8 @@ mod tests {
             },
         )
         .unwrap();
+        // A branch named "main" must not forbid ordinary words in a birth sentence.
+        glossary::check_birth(&fx.project, "The main folder holds work.").unwrap();
         assert!(!fx.project.dir().join("GLOSSARY.md").exists());
         assert_eq!(
             glossary::explain(&ctx, "demo", "quotient").unwrap(),
