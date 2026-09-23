@@ -876,7 +876,6 @@ fn thread_pass(
                     thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
                     Ok(())
                 })?;
-                let events_before_send = crate::round::sealed_events(project)?;
                 match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
                     Ok(()) => {
                         delivered = true;
@@ -884,7 +883,7 @@ fn thread_pass(
                             project,
                             &t.id,
                             attempt,
-                            &events_before_send,
+                            &follow_up.waiting_event,
                         )?;
                         thread::update_checked(project, &t.id, |thread| {
                             let Some(saved) = thread.follow_ups.get(index) else {
@@ -2100,6 +2099,34 @@ mod tests {
             lane.agent_name = "hp-demo-t-0001".into();
         })
         .unwrap();
+        let seal_waiting = |sequence, text: &str| {
+            use crate::contracts::{Event, EventPayload, Recipient, WaitingPayload};
+            let event = Event {
+                id: format!("{}-1-{sequence}", lane.id),
+                op: format!("test-{sequence}"),
+                thread: lane.id.clone(),
+                attempt: 1,
+                round: None,
+                recipient: Recipient::default(),
+                created: format!("2026-09-21T00:00:0{sequence}Z"),
+                payload: EventPayload {
+                    waiting: Some(WaitingPayload {
+                        text: text.into(),
+                        ..WaitingPayload::default()
+                    }),
+                    ..EventPayload::default()
+                },
+            };
+            let dir = crate::round::events_dir(&f.project);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{}.toml", event.id)),
+                toml::to_string(&event).unwrap(),
+            )
+            .unwrap();
+            event.id
+        };
+        let first_wait = seal_waiting(1, "First choice?");
 
         assert!(matches!(
             crate::threads::prompt(&ctx, "demo", &lane.id, "check the first gate").unwrap(),
@@ -2110,6 +2137,12 @@ mod tests {
             crate::threads::PromptOutcome::Queued { attempt: 1 }
         ));
         assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(
+            thread::load(&f.project, &lane.id).unwrap().follow_ups[0].waiting_event,
+            first_wait
+        );
+        // This later wait was not present when either queued response was accepted.
+        let second_wait = seal_waiting(2, "Second choice?");
 
         let agent = Agent {
             pane_id: lane.pane_id.clone(),
@@ -2181,6 +2214,8 @@ mod tests {
         let saved = thread::load(&f.project, &lane.id).unwrap();
         assert!(!saved.prompt_pending);
         assert!(saved.follow_ups.is_empty());
+        assert_eq!(saved.answered_waiting_event, first_wait);
+        assert_ne!(saved.answered_waiting_event, second_wait);
         drop(calls);
 
         // Ambiguous transport is durable before the call and is never blindly
@@ -2190,6 +2225,7 @@ mod tests {
                 attempt: 1,
                 text: "an uncertain clarification".into(),
                 state: thread::FollowUpState::Queued,
+                ..thread::FollowUp::default()
             });
         })
         .unwrap();

@@ -1931,16 +1931,16 @@ pub(crate) fn record_answered_wait(
     project: &Project,
     thread_id: &str,
     attempt: u32,
-    events: &[crate::contracts::Event],
+    waiting: &str,
 ) -> Result<()> {
-    let Some(waiting) = latest_waiting_event_id(events, thread_id, attempt) else {
+    if waiting.is_empty() {
         return Ok(());
-    };
+    }
     thread::update_checked(project, thread_id, |thread| {
         if thread.attempt.max(1) != attempt {
             bail!("prompt_attempt_changed: {thread_id} moved past attempt {attempt}");
         }
-        thread.answered_waiting_event = waiting;
+        thread.answered_waiting_event = waiting.to_string();
         Ok(())
     })?;
     Ok(())
@@ -1996,10 +1996,13 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
                 || awaiting_bootstrap(thread)
                 || awaiting_follow_up(thread)
             {
+                let attempt = thread.attempt.max(1);
                 thread.follow_ups.push(FollowUp {
-                    attempt: thread.attempt.max(1),
+                    attempt,
                     text: text.to_string(),
                     state: FollowUpState::Queued,
+                    waiting_event: latest_waiting_event_id(&events_before_send, id, attempt)
+                        .unwrap_or_default(),
                 });
                 queued = true;
             }
@@ -2052,7 +2055,8 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     let attempt = record.attempt.max(1);
-    record_answered_wait(&project, id, attempt, &events_before_send)?;
+    let waiting = latest_waiting_event_id(&events_before_send, id, attempt).unwrap_or_default();
+    record_answered_wait(&project, id, attempt, &waiting)?;
     Ok(PromptOutcome::Sent {
         attempt,
         agent_state: state,

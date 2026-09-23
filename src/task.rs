@@ -2032,11 +2032,16 @@ created = "2026-09-21T00:00:00Z"
         fx.seal_waiting(&lane, 1, 1, "Choose the final colour.");
 
         let events = crate::round::sealed_events(&fx.project).unwrap();
-        crate::threads::record_answered_wait(&fx.project, &lane, 1, &events).unwrap();
+        let answered_id = events[0].id.as_str();
+        crate::threads::record_answered_wait(&fx.project, &lane, 1, answered_id).unwrap();
 
         let answered = view(&fx.project, load(&fx.project, "job-0001").unwrap());
         assert_eq!(answered.state, State::Working);
         assert_eq!(answered.next, "finish the current attempt");
+
+        fx.seal_waiting(&lane, 1, 2, "Choose the final shape.");
+        let later = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(later.next, "wait for Rolf: Choose the final shape.");
     }
 
     fn task_with_pinned_round_and_newer_failure() -> (crate::round::testkit::Fx, String) {

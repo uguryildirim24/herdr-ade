@@ -49,6 +49,8 @@ pub(crate) struct FollowUp {
     pub(crate) attempt: u32,
     pub(crate) text: String,
     pub(crate) state: FollowUpState,
+    /// Waiting event visible when this message was accepted, not when it was sent.
+    pub(crate) waiting_event: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -1658,6 +1660,7 @@ mod tests {
                 attempt: 1,
                 text: "old attempt".into(),
                 state: FollowUpState::Queued,
+                ..FollowUp::default()
             });
         })
         .unwrap();
@@ -1669,6 +1672,7 @@ mod tests {
                 attempt: 2,
                 text: "cancel this".into(),
                 state: FollowUpState::Queued,
+                ..FollowUp::default()
             });
             lane.status = Status::Resolved;
             lane.resolved_reason = "cancelled".into();
