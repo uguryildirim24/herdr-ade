@@ -193,7 +193,7 @@ pub(crate) fn prune_done(project: &Project, days: u64) {
     }
 }
 
-/// Unhandled items, oldest first (ids start with a UTC timestamp).
+/// Unhandled items, oldest first. Event ids do not start with a timestamp.
 pub(crate) fn unhandled(project: &Project) -> Vec<Item> {
     let Ok(entries) = std::fs::read_dir(inbox_dir(project)) else {
         return Vec::new();
@@ -204,7 +204,7 @@ pub(crate) fn unhandled(project: &Project) -> Vec<Item> {
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .filter_map(|text| parse(&text))
         .collect();
-    items.sort_by(|a, b| a.id.cmp(&b.id));
+    items.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
     items
 }
 
@@ -427,6 +427,23 @@ mod tests {
             1
         );
         assert!(unhandled(&project).is_empty());
+    }
+
+    #[test]
+    fn lists_event_items_by_creation_time_not_id_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir_all(inbox_dir(&project)).unwrap();
+        for (id, created) in [
+            ("event-t-0001-1-1", "2026-09-17T00:00:00Z"),
+            ("20260917T000100Z-routine-r-1", "2026-09-17T00:01:00Z"),
+        ] {
+            let text = format!(
+                "+++\nid = \"{id}\"\nkind = \"routine\"\ncreated = \"{created}\"\nsummary = \"due\"\n+++\n"
+            );
+            std::fs::write(inbox_dir(&project).join(format!("{id}.md")), text).unwrap();
+        }
+        assert_eq!(unhandled(&project)[0].id, "event-t-0001-1-1");
     }
 
     #[test]
