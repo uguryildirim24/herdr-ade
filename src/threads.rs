@@ -3529,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn ade_start_uses_git_worktree_and_tab_env_then_parent_launch() {
+    fn ade_start_with_a_job_keeps_the_lead_brief_across_retry() {
         use crate::runner::fake::ok;
         use crate::scenarios::{World, pane_json};
 
@@ -3570,6 +3570,26 @@ mod tests {
         )
         .unwrap();
 
+        crate::talk::append(
+            &project,
+            None,
+            crate::talk::Entry::Rolf {
+                request: "q-brief".into(),
+                text: "Keep the complete lead brief with the task.".into(),
+                answer: None,
+            },
+        )
+        .unwrap();
+        let stable_task = crate::task::add(
+            &project,
+            "Fix the saved login.",
+            vec!["request:q-brief".into()],
+            vec!["The saved login works after a restart.".into()],
+            Some(repo_s.clone()),
+            None,
+        )
+        .unwrap();
+        let lead_brief = "FULL LEAD BRIEF: preserve this exact repair instruction.\n\n## Required detail\n\nKeep `--exact` intact.\n";
         let split = GitReal {
             fake: &world.runner,
         };
@@ -3588,12 +3608,14 @@ mod tests {
                 repo: Some(repo_s.clone()),
                 machine: None,
                 base: None,
-                task: "Do the thing.".into(),
+                // The CLI maps `--task-file` to this verbatim field.
+                task: lead_brief.into(),
                 plain: "The lane does the work.".into(),
                 workflow: None,
                 recipe: None,
                 recipe_basis: None,
-                task_id: String::new(),
+                // The CLI maps `--job` to this stable task id.
+                task_id: stable_task.id.clone(),
             },
         )
         .unwrap();
@@ -3620,7 +3642,16 @@ mod tests {
         assert_eq!(git_out(&["rev-parse", "main"]), started.base);
         assert!(git_out(&["ls-tree", "-r", "--name-only", "main", "--", "tasks"]).is_empty());
         let artifact = crate::thread::artifact(&project, &started.launch.brief_hash).unwrap();
-        assert!(String::from_utf8_lossy(&artifact).starts_with("plain: The lane does the work."));
+        let brief = String::from_utf8_lossy(&artifact);
+        assert!(brief.starts_with("plain: The lane does the work."));
+        assert!(
+            brief.contains(&format!("# Task\n\n## Lead brief\n\n{lead_brief}")),
+            "{brief}"
+        );
+        assert!(
+            brief.contains(&format!("## {} — Fix the saved login.", stable_task.id)),
+            "{brief}"
+        );
         assert_eq!(
             std::fs::read(Path::new(&started.thread_dir).join("brief.md")).unwrap(),
             artifact
@@ -3703,6 +3734,9 @@ mod tests {
         assert_eq!(retried.launch.attempt, 2);
         assert_eq!(retried.launch.escalations, 0);
         assert_eq!(retried.launch.same_recipe_retries, 1);
+        assert_eq!(retried.launch.brief_hash, started.launch.brief_hash);
+        let retried_brief = crate::thread::artifact(&project, &retried.launch.brief_hash).unwrap();
+        assert!(String::from_utf8_lossy(&retried_brief).contains(lead_brief));
         let calls = world.runner.calls.borrow();
         assert!(!calls.iter().any(|c| c.display().contains("worktree open")));
         let tabs = calls
