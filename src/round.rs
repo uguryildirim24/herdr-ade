@@ -2252,28 +2252,29 @@ fn review_launch_snapshot(
     round: &str,
     review_branch: &str,
 ) -> Result<Option<ReviewLaunchSnapshot>> {
-    let record = load(project, round)?;
-    let current_hash = manifest_hash(&record);
-    let ready = review_inputs_ready(&record)
+    Ok(review_launch_snapshot_from_record(
+        &load(project, round)?,
+        review_branch,
+    ))
+}
+
+fn review_launch_snapshot_from_record(
+    record: &RoundRecord,
+    review_branch: &str,
+) -> Option<ReviewLaunchSnapshot> {
+    let current_hash = manifest_hash(record);
+    let ready = review_inputs_ready(record)
         && record.phase == RoundPhase::UnderReview
         && record.reviewer.is_none()
         && record.frozen_revision == Some(record.manifest.revision)
         && record.manifest_hash.as_deref() == Some(current_hash.as_str())
         && record.review_branch.as_deref() == Some(review_branch)
         && record.review_artifact.is_some();
-    Ok(ready.then(|| ReviewLaunchSnapshot {
+    ready.then(|| ReviewLaunchSnapshot {
         revision: record.manifest.revision,
         manifest_hash: current_hash,
         review_branch: review_branch.to_string(),
-    }))
-}
-
-fn review_launch_unchanged(
-    project: &Project,
-    round: &str,
-    expected: &ReviewLaunchSnapshot,
-) -> Result<bool> {
-    Ok(review_launch_snapshot(project, round, &expected.review_branch)?.as_ref() == Some(expected))
+    })
 }
 
 /// The reviewer task: the review brief, the pinned members with their report
@@ -2451,9 +2452,13 @@ fn start_and_bind_reviewer(
             // A follow-up can land between task preparation and thread start.
             // Its incomplete manifest is an ordinary wait, not a launch
             // attempt and therefore does not spend the bounded retry budget.
-            if review_launch_unchanged(project, round, &launch)? {
-                reviewer_start_failed(ctx, project, round, &format!("{error:#}"), None)?;
-            }
+            reviewer_start_failed_if_launch_unchanged(
+                ctx,
+                project,
+                round,
+                &format!("{error:#}"),
+                &launch,
+            )?;
             Ok(None)
         }
     }
@@ -2475,9 +2480,7 @@ fn cancel_unbound_reviewer(
     if cleanup.state == "cleanup_pending" {
         return Err(anyhow::anyhow!("reviewer_bind_cleanup_pending: {reason}"));
     }
-    if review_launch_unchanged(project, round, launch)? {
-        reviewer_start_failed(ctx, project, round, &reason, None)?;
-    }
+    reviewer_start_failed_if_launch_unchanged(ctx, project, round, &reason, launch)?;
     Ok(None)
 }
 
@@ -2763,13 +2766,53 @@ fn reviewer_start_failed(
         announce_once(ctx, project, round, key, &summary, None)?;
         return Ok(failures);
     }
-    let failures = {
-        let _lock = project.lock()?;
-        let mut record = load(project, round)?;
-        record.reviewer_start_failures += 1;
-        save(project, &record)?;
-        record.reviewer_start_failures
+    let failures = increment_reviewer_start_failures(project, round, None)?
+        .expect("an unconditional reviewer failure is always recorded");
+    publish_reviewer_start_failure(ctx, project, round, reason, failures)?;
+    Ok(failures)
+}
+
+/// Charge a pre-binding failure only if the same frozen review still owns the
+/// launch. The comparison and increment share the project lock so a follow-up
+/// cannot invalidate the inputs between revalidation and the write.
+fn reviewer_start_failed_if_launch_unchanged(
+    ctx: &Ctx,
+    project: &Project,
+    round: &str,
+    reason: &str,
+    expected: &ReviewLaunchSnapshot,
+) -> Result<()> {
+    let Some(failures) = increment_reviewer_start_failures(project, round, Some(expected))? else {
+        return Ok(());
     };
+    publish_reviewer_start_failure(ctx, project, round, reason, failures)
+}
+
+fn increment_reviewer_start_failures(
+    project: &Project,
+    round: &str,
+    expected: Option<&ReviewLaunchSnapshot>,
+) -> Result<Option<u32>> {
+    let _lock = project.lock()?;
+    let mut record = load(project, round)?;
+    if let Some(expected) = expected
+        && review_launch_snapshot_from_record(&record, &expected.review_branch).as_ref()
+            != Some(expected)
+    {
+        return Ok(None);
+    }
+    record.reviewer_start_failures += 1;
+    save(project, &record)?;
+    Ok(Some(record.reviewer_start_failures))
+}
+
+fn publish_reviewer_start_failure(
+    ctx: &Ctx,
+    project: &Project,
+    round: &str,
+    reason: &str,
+    failures: u32,
+) -> Result<()> {
     crate::ledger::observe(project, "reviewer-start-failed", round, reason);
     eprintln!("round {round}: the reviewer did not start ({reason})");
     let retry = "it is retried on the next pass";
@@ -2783,7 +2826,7 @@ fn reviewer_start_failed(
         ),
         None,
     )?;
-    Ok(failures)
+    Ok(())
 }
 
 /// The retry bound was reached: say so once and leave the round for a human.
