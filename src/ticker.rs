@@ -728,6 +728,39 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
+/// A pane still not ready after the recorded window is a startup failure.
+/// Keep its screen visible and notify a ready local coordinator.
+fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str) -> Result<()> {
+    let screen = threads::startup_screen(input.herdr, &thread.pane_id);
+    let reason = format!("agent_not_ready: screen: {screen}; herdr: {detail}");
+    thread::update(input.project, &thread.id, |t| {
+        t.status = thread::Status::Failed;
+        t.prompt_pending = false;
+        t.startup_wait_started.clear();
+        t.error = reason.clone();
+        t.failure_class = crate::contracts::FailureClass::Unknown;
+        t.last_group = thread::Group::WaitingOnYou.token().into();
+    })?;
+    if !thread.is_remote()
+        && let Some(coordinator) = input.project.coordinator()
+        && input
+            .agents
+            .iter()
+            .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
+        && let Ok(_writer) = crate::talk::writer_lock(input.project)
+    {
+        let notice = format!(
+            "{} did not become ready during startup: {reason}. Read `thread show {} {}` before retrying.",
+            thread.id, input.project.slug, thread.id
+        );
+        if crate::talk::mark_automated_prompt(input.project, &coordinator.pane_id, &notice).is_ok()
+        {
+            let _ = input.herdr.agent_prompt(&coordinator.pane_id, &notice);
+        }
+    }
+    Ok(())
+}
+
 fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
@@ -764,7 +797,7 @@ fn thread_pass(
             thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
         });
     for t in threads {
-        if t.status == thread::Status::Starting {
+        if t.status == thread::Status::Starting && t.startup_wait_started.is_empty() {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
                 threads::fail_start(
                     ctx,
@@ -792,10 +825,58 @@ fn thread_pass(
             live.state_secs = live.state_secs.max(thread::BLOCKED_DEBOUNCE_SECS);
         }
 
+        // Herdr drops the name when `agent start` times out, but leaves the
+        // process in its pane. Reclaim only an unnamed agent in our exact
+        // terminal before delivering the pending brief.
+        let unnamed = if !t.startup_wait_started.is_empty() && live.agent_state.is_none() {
+            agents.iter().find(|agent| {
+                agent.name.is_empty()
+                    && agent.pane_id == t.pane_id
+                    && agent.tab_id == t.tab_id
+                    && agent.workspace_id == t.workspace_id
+                    && agent.cwd == t.cwd
+            })
+        } else {
+            None
+        };
+        if let Some(agent) = unnamed {
+            if crate::herdr::ready_state(&agent.agent_status) {
+                herdr.agent_rename(&t.pane_id, &t.agent_name)?;
+                let process = herdr
+                    .pane_process_info(&t.pane_id)
+                    .ok()
+                    .and_then(|info| info.identity(&t.launch.kind));
+                let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+                thread::update(project, &t.id, |record| {
+                    thread::bind_identity(record, &socket, agent, process);
+                })?;
+            }
+            live.agent_state = Some(agent.agent_status.clone());
+        }
+        let state = live.agent_state.clone().unwrap_or_default();
         let ready = live
             .agent_state
             .as_deref()
             .is_some_and(crate::herdr::ready_state);
+        if !t.startup_wait_started.is_empty() {
+            if ready {
+                thread::update(project, &t.id, |t| {
+                    t.startup_wait_started.clear();
+                    t.status = thread::Status::Open;
+                })?;
+            } else if (state == "blocked" || (state.is_empty() && live.pane_exists))
+                && thread::seconds_since(&t.startup_wait_started, now).max(0) as u64 * 1000
+                    >= agent_start_timeout(&t.launch)
+            {
+                let detail = if state == "blocked" {
+                    "still blocked at the end of its ready window"
+                } else {
+                    "agent state unknown at the end of its ready window"
+                };
+                startup_failure(input, t, detail)?;
+                continue;
+            }
+        }
         let mut delivered = false;
         if t.prompt_pending && ready {
             match herdr.agent_prompt_wait_started(
@@ -947,7 +1028,12 @@ fn thread_pass(
         // temporarily omit agent state while the terminal and process still
         // exist (including after an interactive startup timeout); that state
         // is Unknown and must never authorize closing the pane.
-        let process_gone = !t.is_remote() && after.report_hash.is_empty() && !live.pane_exists;
+        let process_gone = !t.is_remote()
+            && (after.startup_wait_started.is_empty()
+                || thread::seconds_since(&after.startup_wait_started, now).max(0) as u64 * 1000
+                    >= agent_start_timeout(&after.launch))
+            && after.report_hash.is_empty()
+            && !live.pane_exists;
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
             if let Err(error) = threads::fail_start(
@@ -1063,7 +1149,10 @@ fn launch_pass(
             );
             continue;
         }
-        match thread::update(pass.project, &t.id, |t| t.launch_attempts += 1) {
+        match thread::update(pass.project, &t.id, |t| {
+            t.launch_attempts += 1;
+            t.startup_wait_started = project::now();
+        }) {
             Ok(_) => {
                 pending.push(t);
                 if one_at_a_time {
@@ -1090,7 +1179,10 @@ fn launch_pass(
             pane: &t.pane_id,
             agent_args: &t.launch.args,
             parent: parent.as_deref(),
-            ready_timeout_ms: agent_start_timeout(&t.launch),
+            // `agent start` need not hold the ticker for the whole observation
+            // window: subsequent passes watch the pane for the remaining time.
+            ready_timeout_ms: agent_start_timeout(&t.launch)
+                .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
         })
         .collect();
     let herdr = pass.herdr.on_machine(first.machine_route());
@@ -1107,7 +1199,25 @@ fn launch_pass(
                 .ok()
                 .and_then(|info| info.identity(&t.launch.kind));
             thread::update(pass.project, &t.id, |record| {
-                thread::bind_identity(record, &socket, &agent, process);
+                let mut bound = agent.clone();
+                if bound.workspace_id.is_empty() {
+                    bound.workspace_id = record.workspace_id.clone();
+                }
+                if bound.tab_id.is_empty() {
+                    bound.tab_id = record.tab_id.clone();
+                }
+                if bound.pane_id.is_empty() {
+                    bound.pane_id = record.pane_id.clone();
+                }
+                if bound.cwd.is_empty() {
+                    bound.cwd = record.cwd.clone();
+                }
+                record.workspace_id = bound.workspace_id.clone();
+                record.tab_id = bound.tab_id.clone();
+                record.pane_id = bound.pane_id.clone();
+                record.cwd = bound.cwd.clone();
+                record.startup_wait_started.clear();
+                thread::bind_identity(record, &socket, &bound, process);
             })?;
             if !t.launch.compact_reason.is_empty() {
                 let _ = crate::board::publish_value(
@@ -1119,11 +1229,24 @@ fn launch_pass(
             }
             Ok(())
         });
-        errors.extend(
-            launched
-                .err()
-                .map(|error| error.context(format!("{}: launch", t.id))),
-        );
+        if let Err(error) = launched {
+            if error.to_string().contains("agent_not_ready") {
+                if let Err(e) =
+                    thread::update(pass.project, &t.id, |t| t.status = thread::Status::Starting)
+                {
+                    errors.push(e.context(format!("{}: startup record", t.id)));
+                }
+                // This can clear by itself. The pane and pending brief remain
+                // bound until the recipe's ready window has elapsed.
+                continue;
+            }
+            errors.extend(
+                thread::update(pass.project, &t.id, |t| t.startup_wait_started.clear())
+                    .err()
+                    .map(|e| e.context(format!("{}: launch record", t.id))),
+            );
+            errors.push(error.context(format!("{}: launch", t.id)));
+        }
     }
     true
 }
@@ -1680,6 +1803,7 @@ mod tests {
                 record.agent = "claude".into();
                 record.agent_name = format!("hp-demo-{id}");
                 record.launch.kind = "claude".into();
+                record.attempt = 2;
             })
             .unwrap();
             panes.push(Pane {
@@ -1719,6 +1843,246 @@ mod tests {
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
+        let rebound = thread::load(&fixture.project, "t-0001").unwrap();
+        assert_eq!(
+            rebound.identity.socket,
+            fixture.project.coordinator().unwrap().socket
+        );
+        assert_eq!(rebound.identity.pane_id, rebound.pane_id);
+        assert_eq!(rebound.identity.cwd, rebound.cwd);
+        assert!(!rebound.identity.pane_id.is_empty());
+    }
+
+    #[test]
+    fn startup_block_keeps_the_screen_in_the_record_and_failure_list() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            ok(r#"{"error":{"code":"agent_not_ready","message":"blocked during startup"}}"#),
+        );
+        runner.on("pane read", ok("Trust this folder?\n  1. Yes\n  2. No\n"));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Open;
+            t.prompt_pending = true;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/repo".into();
+            t.agent_name = "hp-demo-t-0001".into();
+            t.launch.kind = "claude".into();
+        })
+        .unwrap();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let panes = [Pane {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+        }];
+        let records = [record.clone()];
+        let coordinator = Agent {
+            pane_id: fixture.project.coordinator().unwrap().pane_id,
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let mut start = true;
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: &records,
+                agents: std::slice::from_ref(&coordinator),
+                panes: &panes,
+            },
+            &mut start,
+            true,
+            &mut errors,
+        );
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Starting);
+        assert!(saved.prompt_pending);
+        assert!(!saved.startup_wait_started.is_empty());
+        assert!(errors.is_empty());
+        assert!(crate::ledger::list(&fixture.project).unwrap().is_empty());
+        for _ in 0..2 {
+            let blocked = Agent {
+                pane_id: record.pane_id.clone(),
+                tab_id: record.tab_id.clone(),
+                workspace_id: record.workspace_id.clone(),
+                cwd: record.cwd.clone(),
+                name: record.agent_name.clone(),
+                agent_status: "blocked".into(),
+                ..Agent::default()
+            };
+            let current = thread::load(&fixture.project, &record.id).unwrap();
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &fixture.project,
+                    herdr: &herdr,
+                    threads: &[current],
+                    agents: &[blocked],
+                    panes: &panes,
+                },
+                "ha",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                thread::load(&fixture.project, &record.id).unwrap().status,
+                thread::Status::Starting
+            );
+            assert!(crate::ledger::list(&fixture.project).unwrap().is_empty());
+        }
+        thread::update(&fixture.project, &record.id, |t| {
+            t.startup_wait_started = "2020-01-01T00:00:00Z".into()
+        })
+        .unwrap();
+        let blocked = Agent {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+            name: record.agent_name.clone(),
+            agent_status: "blocked".into(),
+            ..Agent::default()
+        };
+        let current = thread::load(&fixture.project, &record.id).unwrap();
+        thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: &[current],
+                agents: &[blocked, coordinator],
+                panes: &panes,
+            },
+            "ha",
+            None,
+        )
+        .unwrap();
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Failed);
+        assert_eq!(saved.launch_attempts, 1);
+        assert!(
+            saved.error.contains("Trust this folder? | 1. Yes | 2. No"),
+            "{}",
+            saved.error
+        );
+        let failures = crate::ledger::list(&fixture.project).unwrap();
+        assert!(
+            failures
+                .iter()
+                .any(|e| e.kind == "thread-error" && e.detail.contains("Trust this folder?")),
+            "{failures:?}"
+        );
+        assert!(!failures.iter().any(|e| e.kind == "launch-not-attempted"));
+        assert!(errors.is_empty());
+        assert_eq!(runner.count("agent start"), 1);
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("Trust this folder?")
+                    && call.display().contains("agent prompt"))
+        );
+    }
+
+    #[test]
+    fn a_soon_ready_agent_gets_its_brief_after_repeated_startup_blocks() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("agent rename", ok(r#"{"result":{}}"#));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Starting;
+            t.prompt_pending = true;
+            t.startup_wait_started = project::now();
+            t.launch_attempts = 1;
+            t.launch.kind = "claude".into();
+            t.launch.ready_timeout_ms = 300_000;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/repo".into();
+            t.agent_name = "hp-demo-t-0001".into();
+        })
+        .unwrap();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let panes = [Pane {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+        }];
+        for state in ["blocked", "blocked", "idle"] {
+            let agent = Agent {
+                pane_id: record.pane_id.clone(),
+                tab_id: record.tab_id.clone(),
+                workspace_id: record.workspace_id.clone(),
+                cwd: record.cwd.clone(),
+                // Herdr can drop the name on a timed-out start. The pane is
+                // still ours and must be renamed before its brief is sent.
+                name: if state == "idle" {
+                    String::new()
+                } else {
+                    record.agent_name.clone()
+                },
+                agent_status: state.into(),
+                ..Agent::default()
+            };
+            let current = thread::load(&fixture.project, &record.id).unwrap();
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &fixture.project,
+                    herdr: &herdr,
+                    threads: &[current],
+                    agents: &[agent],
+                    panes: &panes,
+                },
+                "ha",
+                None,
+            )
+            .unwrap();
+            let saved = thread::load(&fixture.project, &record.id).unwrap();
+            assert_eq!(
+                saved.status,
+                if state == "idle" {
+                    thread::Status::Open
+                } else {
+                    thread::Status::Starting
+                }
+            );
+            assert_eq!(saved.last_group, "working");
+            assert!(crate::ledger::list(&fixture.project).unwrap().is_empty());
+        }
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert!(!saved.prompt_pending);
+        assert!(saved.startup_wait_started.is_empty());
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(runner.count("agent rename"), 1);
+        assert_eq!(saved.identity.agent_name.as_deref(), Some("hp-demo-t-0001"));
     }
 
     #[test]

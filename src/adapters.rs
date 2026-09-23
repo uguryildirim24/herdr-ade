@@ -153,6 +153,10 @@ fn builtin() -> BTreeMap<String, Adapter> {
             "--no-session-persistence",
         ],
     );
+    // Claude can report an interactive startup block immediately and still
+    // become ready without intervention. Keep its observation window long
+    // enough for that path instead of inheriting the command driver's 30s.
+    claude.ready_timeout_ms = 300_000;
     claude
         .required_flags
         .push("--dangerously-skip-permissions".into());
