@@ -528,7 +528,7 @@ enum RoundCommand {
     Merge {
         #[arg(value_name = "PROJECT")]
         slug: String,
-        round: String,
+        rounds: Vec<String>,
         /// Test-only fault injection: stop after ref, merged, intent or commit
         #[arg(long, hide = true, value_name = "PHASE")]
         stop_after: Option<String>,
@@ -941,12 +941,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             }
             RoundCommand::Merge {
                 slug,
-                round: id,
+                rounds,
                 stop_after,
             } => {
                 let stop = stop_after.map(|s| s.parse()).transpose()?;
-                let run = round::merge_run(ctx, &slug, &id, stop)?;
-                let record = round::load(&Project::load(&ctx.root, &slug)?, &id)?;
+                let run = round::merge_batch_run(ctx, &slug, &rounds, stop)?;
+                let id = rounds
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("round_missing: supply at least one round"))?;
+                let record = round::load(&Project::load(&ctx.root, &slug)?, id)?;
                 let mut message = String::new();
                 let outcome = match &run.merge {
                     round::MergeOutcome::Checkpointed { head, lanes } => {
@@ -990,6 +993,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     Some(outcome),
                     &serde_json::json!({
                         "merge": run.merge,
+                        "rounds": rounds,
                         "effects": run.effects,
                         "phase": record.phase,
                         "published": record.published,

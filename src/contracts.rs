@@ -496,6 +496,10 @@ pub(crate) struct RoundRecord {
     pub(crate) review_intent: Option<ReviewIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) merge: Option<MergeIntent>,
+    /// A multi-round merge is owned by its first round. The original verdicts
+    /// remain pinned while its integration review replaces that round's verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) batch: Option<BatchMerge>,
     /// Accepted reviewer completion. Before a merge intent exists, the latest
     /// authoritative completion from this reviewer supersedes an older pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,6 +598,15 @@ impl RoundRecord {
                 .iter()
                 .any(|member| member.thread == thread)
     }
+}
+
+/// Durable selection for one integration review and one publication.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BatchMerge {
+    pub(crate) rounds: Vec<String>,
+    pub(crate) verdicts: Vec<String>,
+    pub(crate) base: String,
+    pub(crate) candidate: String,
 }
 
 /// Checkpoint intent bound to the merged candidate and sealed payload hash.
