@@ -85,6 +85,12 @@ export default function (pi) {
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (!activeHook) return;
+    // A failed provider call cannot publish a receipt. Do not turn its
+    // failure into a corrective model prompt (and another provider call).
+    if (pendingError) {
+      activeHook = null;
+      return;
+    }
     const { config, payload } = activeHook;
     try {
       const output = await hook(config.stop, payload);
