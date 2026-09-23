@@ -554,7 +554,10 @@ fn relevant_config(ctx: &Ctx, project: &Project) -> BTreeMap<String, String> {
     if let Some(coordinator) = project.coordinator() {
         used.push(coordinator.launch.recipe_id);
     }
-    let threads = crate::thread::list(project);
+    let threads: Vec<_> = crate::thread::list(project)
+        .into_iter()
+        .filter(|thread| thread.status != crate::thread::Status::Resolved)
+        .collect();
     for thread in &threads {
         used.push(thread.launch.recipe_id.clone());
     }
@@ -752,18 +755,17 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     }
     let changes = changes_since(previous.as_ref().filter(|_| same_session), &current);
     print!("{changes}{text}");
-    if !peek {
-        // An external peek-like read must not move the coordinator's delta.
-        if project.coordinator().is_none_or(|record| {
-            std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
-        }) {
-            crate::project::write_json(&path, &current)?;
-        }
+    let coordinator = project.coordinator();
+    let owns_read = coordinator.as_ref().is_none_or(|record| {
+        std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
+    });
+    if !peek && owns_read {
+        // An external read is a peek: it cannot consume the coordinator's
+        // delta, failure reminder or inbox nudge.
+        crate::project::write_json(&path, &current)?;
         crate::ledger::context_read(&project, &read_at)?;
         inbox::mark_seen(&project, &shown)?;
-        if let Some(record) = project.coordinator()
-            && std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
-        {
+        if let Some(record) = coordinator {
             inbox::acknowledge_events(&project, &shown, &record.pane_id, record.attempt())?;
             for event in events {
                 if event.recipient.pane == record.pane_id

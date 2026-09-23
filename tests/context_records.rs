@@ -96,7 +96,13 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     context(home.path(), "w9:p9", false);
     assert!(!receipt.exists(), "another pane never acknowledges");
     assert!(!failed_receipt.exists());
-    context(home.path(), "w1:p1", false);
+    let cursor = project.join(".state/context-cursor.json");
+    assert!(!cursor.exists(), "another pane must not consume the delta");
+    assert!(context(home.path(), "w1:p1", false).contains("First read"));
+    assert!(cursor.exists());
+    let before = std::fs::read(&cursor).unwrap();
+    context(home.path(), "w9:p9", false);
+    assert_eq!(std::fs::read(&cursor).unwrap(), before);
     let deliveries = project.join(".state/deliveries");
     assert!(
         std::fs::read_to_string(deliveries.join("t-0003-2-1.jsonl"))
