@@ -953,12 +953,11 @@ fn thread_pass(
         } else {
             thread::group(&after, &live, now)
         };
-        let process_gone = !t.is_remote()
-            && after.report_hash.is_empty()
-            && (!live.pane_exists
-                || (live.agent_state.is_none()
-                    && !after.prompt_pending
-                    && !t.last_state.is_empty()));
+        // Only absence of the pane proves a local process is gone. Herdr may
+        // temporarily omit agent state while the terminal and process still
+        // exist (including after an interactive startup timeout); that state
+        // is Unknown and must never authorize closing the pane.
+        let process_gone = !t.is_remote() && after.report_hash.is_empty() && !live.pane_exists;
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
             if let Err(error) = threads::fail_start(
@@ -1039,23 +1038,9 @@ fn launch_pass(
             continue;
         }
         if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
-            let reason = format!(
-                "no `{}` agent appeared in the pane after {} launch attempts",
-                t.agent,
-                thread::MAX_LAUNCH_ATTEMPTS
-            );
-            errors.extend(
-                threads::fail_start(
-                    pass.ctx,
-                    pass.project,
-                    &t.id,
-                    &reason,
-                    crate::contracts::FailureClass::ProcessGone,
-                    false,
-                )
-                .err()
-                .map(|error| error.context(format!("{}: failed-start cleanup", t.id))),
-            );
+            // The pane is listed but agent state is absent. Bounded launch
+            // attempts stop here; no evidence says the process is gone, and a
+            // late agent registration can still receive the pending brief.
             continue;
         }
         if one_at_a_time && !*may_start {
@@ -1746,6 +1731,58 @@ mod tests {
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
+    }
+
+    #[test]
+    fn a_listed_pane_without_agent_state_stays_open_and_unknown() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        let record = thread::allocate(&fixture.project, |record| {
+            record.status = thread::Status::Open;
+            record.workspace_id = "w1".into();
+            record.tab_id = "w1:t2".into();
+            record.pane_id = "w1:p2".into();
+            record.cwd = "/work/lane".into();
+            record.agent = "agy".into();
+            record.agent_name = "hp-demo-t-0001".into();
+            record.last_state = "idle".into();
+            record.last_group = "working".into();
+        })
+        .unwrap();
+        let pane = Pane {
+            workspace_id: record.workspace_id.clone(),
+            tab_id: record.tab_id.clone(),
+            pane_id: record.pane_id.clone(),
+            cwd: record.cwd.clone(),
+        };
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&record),
+                agents: &[],
+                panes: &[pane],
+            },
+            "ha",
+            Some(&std::collections::BTreeMap::new()),
+        )
+        .unwrap();
+
+        assert!(pass.error.is_none());
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Open);
+        assert_eq!(saved.failure_class, crate::contracts::FailureClass::Unknown);
+        assert_eq!(saved.last_group, thread::Group::Unknown.token());
+        assert_eq!(runner.count("tab close"), 0);
     }
 
     #[test]

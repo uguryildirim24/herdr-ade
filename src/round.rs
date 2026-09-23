@@ -2496,6 +2496,7 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     if row.note == "session unreachable"
         || row.note.starts_with("first check pending")
         || row.note.starts_with("first check failed")
+        || row.note.starts_with("agent state unknown")
     {
         return ReviewerState::Unknown(row.note.clone());
     }

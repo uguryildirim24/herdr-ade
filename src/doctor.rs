@@ -2059,6 +2059,7 @@ recipe = "claude_fable_xhigh"
                 "--model",
                 "gemini-3.8-flash-high",
                 "--dangerously-skip-permissions",
+                "--new-project",
                 "-p",
                 "Reply only OK.",
                 "--print-timeout",
