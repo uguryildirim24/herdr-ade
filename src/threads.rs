@@ -184,17 +184,6 @@ fn start_with_ticker(
     let view = require_session(ctx, &project)?;
 
     check_birth_plain(&args.plain)?;
-    // A box lane needs a repository: no repository means a tab in this Mac's
-    // project workspace, which is local (SPEC-remote §4.2).
-    let explicit_remote = args
-        .machine
-        .as_deref()
-        .is_some_and(|m| !m.is_empty() && m != crate::contracts::MACHINE_LOCAL);
-    if args.repo.is_none() && explicit_remote {
-        bail!(
-            "a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"
-        );
-    }
     let role = args
         .workflow
         .as_deref()
@@ -209,24 +198,26 @@ fn start_with_ticker(
     // A box lane still commits and pushes from the Mac clone, so every
     // explicit repository is a local path and follows the same allowlist,
     // local and box lanes alike (SPEC-remote §4.2).
-    let repo = match &args.repo {
-        None => String::new(),
-        Some(repo) => {
-            let path = std::fs::canonicalize(repo)
-                .with_context(|| format!("repository {repo} does not exist"))?
-                .to_string_lossy()
-                .into_owned();
-            if !crate::harness::allowed_repo(&settings, &ctx.config_dir, &path)? {
-                bail!(
-                    "repo_not_listed: {path} is not listed in `repos` in PROJECT.md and is not a harness repository"
-                );
-            }
-            path
-        }
+    let requested_repo = match args.repo.as_deref() {
+        Some(repo) => repo,
+        None => match settings.repos.as_slice() {
+            [only] => &only.path,
+            [] => bail!(
+                "repo_required: this project has no listed repository; pass --repo after listing one"
+            ),
+            _ => bail!("repo_ambiguous: this project lists several repositories; pass --repo"),
+        },
     };
-    let listed = (!repo.is_empty())
-        .then(|| settings.repos.iter().find(|row| row.path == repo))
-        .flatten();
+    let repo = std::fs::canonicalize(requested_repo)
+        .with_context(|| format!("repository {requested_repo} does not exist"))?
+        .to_string_lossy()
+        .into_owned();
+    if !crate::harness::allowed_repo(&settings, &ctx.config_dir, &repo)? {
+        bail!(
+            "repo_not_listed: {repo} is not listed in `repos` in PROJECT.md and is not a harness repository"
+        );
+    }
+    let listed = settings.repos.iter().find(|row| row.path == repo);
     let recipe_request = match &args.recipe {
         Some(recipe) => Some(crate::launch::authorize_explicit_recipe(
             ctx,
@@ -264,7 +255,7 @@ fn start_with_ticker(
         explicit_machine,
         role,
         &launch,
-        (!repo.is_empty()).then_some(repo.as_str()),
+        Some(repo.as_str()),
         listed,
     ) {
         Ok(placement) => placement,
@@ -297,11 +288,7 @@ fn start_with_ticker(
     let machine_id = placement.machine_id.clone();
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
-        t.kind = if repo.is_empty() {
-            Kind::Tab
-        } else {
-            Kind::Worktree
-        };
+        t.kind = Kind::Worktree;
         t.repo = repo.clone();
         t.machine = machine.clone();
         t.placement_reason = placement.reason.clone();
@@ -1325,6 +1312,7 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
         t.agent_name = thread::agent_name(&project.slug, &t.id);
         t.prompt_pending = true;
         t.launch_attempts = 0;
+        t.startup_wait_started.clear();
         t.escalation_pending = false;
         t.status = Status::Open;
         t.error.clear();
@@ -1407,6 +1395,10 @@ pub struct RetryOutcome {
     pub attempt: u32,
     pub pane_id: String,
     pub recipe: String,
+    /// The pane was still showing the old startup block when the ready
+    /// window had expired. Keep this visible on the recovery result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen: Option<String>,
 }
 
 /// Start the same task as a new bounded recovery attempt. Unlike the removed
@@ -1449,6 +1441,7 @@ fn retry_with_ticker(
             attempt: placed.attempt,
             pane_id: placed.pane_id,
             recipe: placed.launch.recipe_id,
+            screen: None,
         });
     }
     if record.kind == Kind::Adopted {
@@ -1461,6 +1454,16 @@ fn retry_with_ticker(
     if reason.is_empty() {
         bail!("retry_reason_missing: say why the attempt is being replaced");
     }
+    let view = require_session(ctx, &project)?;
+    let herdr = view.herdr.on_machine(record.machine_route());
+    refuse_busy_retry(&herdr, &record)?;
+    let screen = if record.error.starts_with("agent_not_ready:") {
+        same_startup_screen(&herdr, &record)?
+    } else if !record.startup_wait_started.is_empty() {
+        Some(startup_screen(&herdr, &record.pane_id))
+    } else {
+        None
+    };
     let task =
         std::fs::read_to_string(thread::task_path(&project, id)).context("retry_brief_missing")?;
     // Select before stopping anything: an exhausted policy leaves the current
@@ -1506,6 +1509,7 @@ fn retry_with_ticker(
         t.status = Status::Failed;
         t.prompt_pending = false;
         t.launch_attempts = 0;
+        t.startup_wait_started.clear();
         t.bootstrap.clear();
         t.error.clear();
         t.last_failure = reason.to_string();
@@ -1523,6 +1527,7 @@ fn retry_with_ticker(
         attempt: placed.attempt,
         pane_id: placed.pane_id,
         recipe: selected_recipe,
+        screen,
     })
 }
 
@@ -2591,6 +2596,80 @@ pub(crate) fn remove_scratch_session(ctx: &Ctx, record: &Thread) -> Result<()> {
     Ok(())
 }
 
+fn refuse_busy_retry(herdr: &Herdr<'_>, record: &Thread) -> Result<()> {
+    let still_starting = (record.status == Status::Starting
+        || !record.startup_wait_started.is_empty())
+        && (record.startup_wait_started.is_empty()
+            || (thread::seconds_since(&record.startup_wait_started, jiff::Timestamp::now()).max(0)
+                as u64
+                * 1000)
+                < record.launch.ready_timeout_ms);
+    let agent_state = herdr
+        .agent_list()?
+        .into_iter()
+        .find(|agent| {
+            thread::agent_matches(record, agent)
+                || (agent.pane_id == record.pane_id
+                    && agent.tab_id == record.tab_id
+                    && agent.workspace_id == record.workspace_id
+                    && agent.cwd == record.cwd)
+        })
+        .map(|agent| agent.agent_status);
+    if still_starting || agent_state.as_deref() == Some("working") {
+        let state = if still_starting {
+            "starting"
+        } else {
+            "working"
+        };
+        let screen = if record.pane_id.is_empty() {
+            "no pane yet".into()
+        } else {
+            startup_screen(herdr, &record.pane_id)
+        };
+        bail!(
+            "retry_refused: {} is still {state}; screen: {screen}. Wait for it to finish or become stuck before retrying",
+            record.id
+        );
+    }
+    Ok(())
+}
+
+fn same_startup_screen(herdr: &Herdr<'_>, record: &Thread) -> Result<Option<String>> {
+    let screen = startup_screen(herdr, &record.pane_id);
+    if screen.starts_with("screen unavailable:") {
+        bail!(
+            "startup_screen_unknown: cannot tell whether {} is still blocked: {screen}",
+            record.id
+        );
+    }
+    if record
+        .error
+        .strip_prefix("agent_not_ready: screen: ")
+        .and_then(|text| text.rsplit_once("; herdr: "))
+        .is_some_and(|(previous, _)| previous == screen)
+    {
+        return Ok(Some(screen));
+    }
+    Ok(None)
+}
+
+/// A startup refusal leaves the pane visible for diagnosis and recovery. No
+/// automatic relaunch should erase an interactive question before it is read.
+pub(crate) fn startup_screen(herdr: &Herdr<'_>, pane: &str) -> String {
+    match herdr.pane_read_text(pane, "visible") {
+        Ok(text) => {
+            let lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+            let excerpt = lines.take(12).collect::<Vec<_>>().join(" | ");
+            if excerpt.is_empty() {
+                "no readable screen".into()
+            } else {
+                excerpt.chars().take(800).collect()
+            }
+        }
+        Err(error) => format!("screen unavailable: {error}"),
+    }
+}
+
 /// Marks a start failed, removes its Working metadata, and closes everything
 /// the attempt opened. The failed state is durable even when cleanup itself
 /// reports an error, so no view can keep presenting the attempt as Working.
@@ -2636,7 +2715,8 @@ pub(crate) fn fail_start(
             selected.attempt = t.attempt;
             selected.brief_hash = t.launch.brief_hash.clone();
             t.launch = selected;
-            t.launch_attempts = 0;
+            // This transition is still evidence about the attempt that just
+            // launched. Placement resets the counter for the next attempt.
             t.escalation_pending = true;
         }
         t.last_group = Group::WaitingOnYou.token().to_string();
@@ -3302,7 +3382,11 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
         return Row {
             thread: t.clone(),
             group: recorded,
-            note,
+            note: if t.startup_wait_started.is_empty() {
+                note
+            } else {
+                format!("starting (checking agent readiness), on {}", t.machine)
+            },
         };
     }
     let live = thread::live_state(t, &view.agents, &view.panes, now);
@@ -3314,6 +3398,8 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     let group = thread::group(&fresh, &live, now);
     let note = if t.status == Status::Failed {
         format!("{}: {}", t.failure_class.plain(), t.error)
+    } else if !t.startup_wait_started.is_empty() {
+        "starting (checking agent readiness)".to_string()
     } else if !live.pane_exists {
         "process gone: pane or agent is gone without a report".to_string()
     } else {
@@ -3866,7 +3952,7 @@ mod tests {
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(
             prompts[0].ends_with(&format!(
-                " skill lane, then read .herdr-project/demo-{}/brief.md and do what it says.",
+                " skill lane`, then read .herdr-project/demo-{}/brief.md and do what it says.",
                 started.id
             )),
             "{}",
@@ -4719,127 +4805,87 @@ mod tests {
     }
 
     #[test]
-    fn a_task_with_no_repo_finishes_delivers_and_resolves_its_git_folder() {
-        use crate::round::testkit::git;
-        use crate::runner::fake::ok;
-        use crate::scenarios::{agent_json, pane_json};
-
-        let (fx, _remote) = box_fixture();
+    fn omitted_repo_uses_only_listed_repo_and_refuses_ambiguity() {
+        let (fx, _) = box_fixture();
         write_config(&fx, &lane_config());
         stub_box(&fx);
-        fx.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        fx.world.runner.on("tab close", ok(r#"{"result":{}}"#));
-        fx.world
-            .runner
-            .on("session list --json", ok(r#"{"result":{"sessions":[]}}"#));
-        *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
-        let split = GitReal {
-            fake: &fx.world.runner,
-        };
-        let ctx = crate::paths::Ctx {
-            env: &fx.world.env,
-            root: fx.world.root.clone(),
-            config_dir: fx.world.home.path().join("cfg"),
-            runner: &split,
-            detached_ticker: false,
-        };
-        let started = start(&ctx, "demo", start_args(None, None)).unwrap();
-        assert_eq!(started.kind, Kind::Tab);
-        assert!(started.machine.is_empty());
-        let folder = Path::new(&started.worktree_path);
-        assert_eq!(
-            folder,
-            std::fs::canonicalize(thread::threads_dir(&fx.project).join(&started.id))
-                .unwrap()
-                .as_path()
-        );
-        assert!(folder.join(".git").is_dir());
-        assert_eq!(
-            git(folder, &["show", "--format=", "--name-only", "HEAD"]),
-            "brief.md"
-        );
-        assert_eq!(started.thread_dir, started.worktree_path);
-        assert!(!folder.join("library").exists());
-
-        std::fs::write(folder.join("report.md"), "no-repo result\n").unwrap();
-        git(folder, &["add", "report.md"]);
-        git(
-            folder,
-            &[
-                "-c",
-                "user.name=Lane",
-                "-c",
-                "user.email=lane@example.com",
-                "commit",
-                "-m",
-                "finish report",
-            ],
-        );
-        let done_sha = git(folder, &["rev-parse", "HEAD"]);
-        let coordinator = fx.project.coordinator().unwrap();
-        let op = crate::ops::reserve(
-            &fx.project,
-            crate::ops::Reservation {
-                thread: &started.id,
-                attempt: 1,
-                kind: crate::contracts::OpKind::Done,
-                recipient: crate::contracts::Recipient {
-                    pane: coordinator.pane_id.clone(),
-                    coordinator_attempt: coordinator.attempt(),
-                },
-                round: None,
-                requested: crate::contracts::Requested::Done {
-                    sha: done_sha,
-                    report_path: "report.md".into(),
-                },
-                helper_pid: std::process::id(),
-            },
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let started = start(&fx.world.ctx(), "demo", start_args(None, None)).unwrap();
+        assert_eq!(started.repo, repo);
+        assert_eq!(started.kind, Kind::Worktree);
+        assert_ne!(started.cwd, fx.project.dir().to_string_lossy());
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos.push(crate::project::Repo {
+            path: "/another/repo".into(),
+            ..Default::default()
+        });
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
         )
         .unwrap();
-        crate::ops::stage_done(&fx.project, &op.op, folder, ctx.runner).unwrap();
-        crate::ops::seal(&fx.project, &op.op, |_| Ok(())).unwrap();
-        let coordinator_cwd = fx.project.canonical_dir().to_string_lossy().into_owned();
-        *fx.world.agents.borrow_mut() = format!(
-            "[{}]",
-            agent_json(
-                &coordinator.workspace_id,
-                &coordinator.tab_id,
-                &coordinator.pane_id,
-                &coordinator_cwd,
-                &coordinator.agent_name,
-                "idle"
-            )
-        );
-        crate::steps::deliver_events(&ctx, &fx.project).unwrap();
-        assert!(fx.world.runner.calls.borrow().iter().any(|call| {
-            let line = call.display();
-            line.contains("agent prompt") && line.contains(&format!("DONE {}", started.id))
-        }));
+        let error = start(&fx.world.ctx(), "demo", start_args(None, None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repo_ambiguous"), "{error}");
+    }
 
-        let cwd = started.cwd.clone();
-        *fx.world.panes.borrow_mut() = format!(
-            "[{},{}]",
-            fx.world.coordinator_pane(&fx.project),
-            pane_json("w1", &started.tab_id, &started.pane_id, &cwd)
-        );
-        *fx.world.agents.borrow_mut() = format!(
-            "[{}]",
-            agent_json(
-                "w1",
-                &started.tab_id,
-                &started.pane_id,
-                &cwd,
-                &started.agent_name,
-                "done"
-            )
-        );
-        let outcome = resolve(&ctx, "demo", &started.id, &ResolveArgs::default()).unwrap();
-        assert_eq!(outcome.final_copy, "complete");
-        assert_eq!(outcome.worktree, "removed");
-        assert!(!folder.exists());
-        assert!(!thread::home_report_path(&fx.project, &started.id).exists());
-        let stored = thread::final_report_path(&fx.project, &started).unwrap();
-        assert_eq!(std::fs::read_to_string(stored).unwrap(), "no-repo result\n");
+    #[test]
+    fn retry_refuses_a_starting_or_working_agent_with_its_visible_screen() {
+        use crate::runner::fake::{FakeRunner, ok};
+        for (state, starting) in [("blocked", true), ("working", false)] {
+            let runner = FakeRunner::new();
+            runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/repo","name":"hp-demo-t-0001","agent_status":"{state}"}}]}}}}"#)));
+            runner.on("pane read", ok("Trust this folder?\n"));
+            let herdr = Herdr::new("herdr", "", &runner);
+            let record = Thread {
+                id: "t-0001".into(),
+                pane_id: "w1:p2".into(),
+                tab_id: "w1:t2".into(),
+                workspace_id: "w1".into(),
+                cwd: "/repo".into(),
+                agent_name: "hp-demo-t-0001".into(),
+                status: Status::Open,
+                startup_wait_started: if starting {
+                    project::now()
+                } else {
+                    String::new()
+                },
+                launch: crate::contracts::Launch {
+                    ready_timeout_ms: 300_000,
+                    ..Default::default()
+                },
+                ..Thread::default()
+            };
+            let error = refuse_busy_retry(&herdr, &record).unwrap_err().to_string();
+            assert!(
+                error.contains(if starting {
+                    "still starting"
+                } else {
+                    "still working"
+                }),
+                "{error}"
+            );
+            assert!(error.contains("Trust this folder?"), "{error}");
+            assert_eq!(runner.count("pane read"), 1);
+        }
+    }
+
+    #[test]
+    fn expired_startup_retry_reports_the_same_screen() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on("pane read", ok("Trust this folder?\n  1. Yes\n"));
+        let herdr = Herdr::new("herdr", "", &runner);
+        let record = Thread {
+            id: "t-0001".into(),
+            pane_id: "w1:p2".into(),
+            error: "agent_not_ready: screen: Trust this folder? | 1. Yes; herdr: blocked".into(),
+            ..Thread::default()
+        };
+        let screen = same_startup_screen(&herdr, &record).unwrap().unwrap();
+        assert!(screen.contains("Trust this folder?"), "{screen}");
+        assert_eq!(runner.count("pane read"), 1);
     }
 
     #[test]
