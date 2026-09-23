@@ -1,0 +1,41 @@
+phase = "merged"
+round = "r118"
+branch = "main"
+plain = "The finished one-time conversions are deleted, and an install no longer stops the ticker."
+gates = [{ command = "cargo fmt --check", env = {} }, { command = "cargo test", env = {} }, { command = "cargo clippy --all-targets -- -D warnings", env = {} }, { command = "git diff --check", env = {} }]
+policy_hash = "7d013b92516df0434273f0f2ae57e9ec661dd6ba01b7b9a588a327b3cc724425"
+expected_head = "779767ebfb0a7803e1b30a3f44e57ef0998121a4"
+manifest_hash = "7d409282a466df2fb29922eacfc49e5116168f083caf14cde8422951e3e7c122"
+opened = "2026-09-22T23:06:00Z"
+repo = "/Users/rolfie/projects/herdr-ade"
+frozen_revision = 1
+review_branch = "review/r118"
+reviewer = "t-0323"
+announced = "verdict:MERGE"
+reviewer_start_failures = 0
+
+[manifest]
+revision = 1
+
+[[manifest.members]]
+thread = "t-0322"
+
+[manifest.members.pin]
+event = "t-0322-1-1"
+attempt = 1
+sha = "3bbe95158b90afec10f14ac62eef3f9efc6d6704"
+artifact = "31d361dd9bf87239ddffe108d8a4006d6ef00f1e53c66a956fcdd8198e5acef1"
+
+[merge]
+op = "merge-r118"
+expected_old = "3e44ec824ca76e3d5e41c93e41d8713866f3a671"
+candidate = "a20714e55471c6559e6e9c1466514784ca9582e3"
+verdict = "69b8014a111969bc0db33299a980d2f9732a7c2a"
+phase = "checkpointed"
+merged = "69b8014a111969bc0db33299a980d2f9732a7c2a"
+head = "23728d63146b0508738c9f0aaf3192385cd9a2c3"
+
+[merge.checkpoint]
+parent = "69b8014a111969bc0db33299a980d2f9732a7c2a"
+op = "merge-r118"
+payload_hash = "d9ba925545eed97abb5fd622ca5057708b4c58f27e8407464e40fdf2d515d43e"
