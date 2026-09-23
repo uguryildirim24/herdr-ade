@@ -301,22 +301,16 @@ fn skill_behind(repo: &Path, role: &str, recorded: &str) -> bool {
     thread::sha256_hex(text.as_bytes()) != recorded
 }
 
-/// A worktree reads `tasks/<id>.md`; a tab reads its fixed `brief.md`. Remote
-/// worktree paths are on the box, so their committed copy is read in the Mac
-/// checkout that created the brief.
+/// Local lanes read their frozen runtime `brief.md`. A remote brief lives on
+/// its box and its bootstrap receipt is checked by the courier instead.
 fn brief_behind(lane: &thread::Thread) -> bool {
     if lane.launch.brief_hash.is_empty() {
         return false;
     }
-    let path = match lane.kind {
-        thread::Kind::Tab => PathBuf::from(&lane.thread_dir).join("brief.md"),
-        _ if lane.is_remote() => PathBuf::from(&lane.repo)
-            .join("tasks")
-            .join(format!("{}.md", lane.id)),
-        _ => PathBuf::from(&lane.worktree_path)
-            .join("tasks")
-            .join(format!("{}.md", lane.id)),
-    };
+    if lane.is_remote() {
+        return false;
+    }
+    let path = PathBuf::from(&lane.thread_dir).join("brief.md");
     std::fs::read(&path)
         .ok()
         .is_some_and(|text| thread::sha256_hex(&text) != lane.launch.brief_hash)
@@ -450,11 +444,11 @@ mod tests {
     #[test]
     fn a_changed_lane_brief_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("tasks")).unwrap();
-        std::fs::write(dir.path().join("tasks/t-0001.md"), "new").unwrap();
+        std::fs::write(dir.path().join("brief.md"), "new").unwrap();
         let lane = thread::Thread {
             id: "t-0001".into(),
             worktree_path: dir.path().to_string_lossy().into_owned(),
+            thread_dir: dir.path().to_string_lossy().into_owned(),
             launch: crate::contracts::Launch {
                 brief_hash: thread::sha256_hex(b"old"),
                 ..crate::contracts::Launch::default()

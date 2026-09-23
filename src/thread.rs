@@ -426,10 +426,10 @@ pub(crate) fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 
 /// The one line the agent is prompted with. Nothing from outside is ever
 /// placed in a prompt. A launched lane's first instruction is its role skill,
-/// which is also the bootstrap receipt (D12, D14); its brief is the committed
-/// `tasks/<id>.md` in a code worktree (D9) or `brief.md` in a project-owned git
-/// folder. An adopted pane has no launch receipt and a remote one no `ha`
-/// (D13): they read `brief.md`, which carries the lane skill.
+/// which is also the bootstrap receipt. Code lanes read the frozen brief from
+/// their ignored `.herdr-project` folder; it is a content-addressed project
+/// artifact rather than a commit in the product repository. Project-owned
+/// lanes keep `brief.md` in their own git folder.
 pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     let id = &t.id;
     let role = if t.role.is_empty() { "lane" } else { &t.role };
@@ -443,14 +443,14 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     };
     if t.is_remote() {
         return format!(
-            "Run {prefix} skill {role}, then read tasks/{id}.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
+            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
             t.machine
         );
     }
     let prompt = match t.kind {
-        Kind::Worktree if !t.is_remote() => {
-            format!("Run {prefix} skill {role}, then read tasks/{id}.md and do what it says.")
-        }
+        Kind::Worktree if !t.is_remote() => format!(
+            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
+        ),
         Kind::Tab => {
             format!("Run {prefix} skill {role}, then read brief.md and do what it says.")
         }
@@ -467,6 +467,34 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
 
 /// The line that opens every thread skill: the skills write `hp`, and this
 /// names the prefix `hp` stands for.
+/// Stores immutable prose alongside the project's machine records. The hash
+/// is both its filename and the receipt carried by the thread record.
+pub(crate) fn store_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
+    let hash = sha256_hex(bytes);
+    let dir = project.state_dir().join("artifacts");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(&hash);
+    match std::fs::read(&path) {
+        Ok(existing) if existing == bytes => {}
+        Ok(_) => bail!("artifact_conflict: {} has different bytes", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::project::write_atomic(&path, bytes)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(hash)
+}
+
+pub(crate) fn artifact(project: &Project, hash: &str) -> Result<Vec<u8>> {
+    let path = project.state_dir().join("artifacts").join(hash);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("brief_artifact_missing: {}", path.display()))?;
+    if sha256_hex(&bytes) != hash {
+        bail!("brief_artifact_mismatch: {}", path.display());
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn commands_line(prefix: &str) -> String {
     format!("Commands: `{prefix}`. Every `hp` command below means that prefix.\n\n")
 }
@@ -1548,7 +1576,7 @@ mod tests {
         };
         assert_eq!(
             launch_prompt("ha", "demo", &lane),
-            "Run ha skill reviewer, then read tasks/t-0001.md and do what it says."
+            "Run ha skill reviewer, then read .herdr-project/demo-t-0001/brief.md and do what it says."
         );
     }
 

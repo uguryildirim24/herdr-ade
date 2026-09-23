@@ -80,7 +80,7 @@ pub(crate) struct LaneCard {
     /// The box clone and checkout paths; never derived from the Mac path.
     pub(crate) box_repo: String,
     pub(crate) box_worktree: String,
-    /// The brief commit `B` the box fetch verified as `FETCH_HEAD`.
+    /// The exact code base the box fetch verified as `FETCH_HEAD`.
     pub(crate) brief_commit: String,
     /// The lane branch and the URL-matched remote it publishes to
     /// (SPEC-remote §4.2 step 7). `ha done` checks the published ref.
@@ -93,8 +93,8 @@ pub(crate) struct LaneCard {
 }
 
 /// The thread record's `launch` object: the chosen recipe's full D2 row.
-/// `brief_hash` is filled after the brief commit; `attempt` is 1 at resolve
-/// time (D2, D9).
+/// `brief_hash` names the frozen project artifact; `attempt` is 1 at resolve
+/// time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub(crate) struct Launch {
@@ -446,7 +446,7 @@ impl RoundPhase {
     }
 }
 
-/// Planned review outputs, saved before any branch or brief commit is written.
+/// Planned review outputs retained for historical in-flight records.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReviewIntent {
     pub(crate) head: String,
@@ -517,9 +517,13 @@ pub(crate) struct RoundRecord {
     /// Repository the integration branch lives in, fixed at open (A3).
     #[serde(default)]
     pub(crate) repo: String,
-    /// Manifest revision frozen at the review brief commit `B` (SPEC-ADE D6).
+    /// Manifest revision frozen for the current review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) frozen_revision: Option<u64>,
+    /// Content-addressed review brief in the project artifact store. The
+    /// checked-out review branch is separately pinned by `expected_head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) review_artifact: Option<String>,
     /// `review/r<n>`, created from `B` (SPEC-ADE D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) review_branch: Option<String>,
@@ -580,6 +584,10 @@ pub(crate) struct CheckpointIntent {
     pub(crate) parent: String,
     pub(crate) op: String,
     pub(crate) payload_hash: String,
+    /// Content-addressed handoff bundle in project state. Historical records
+    /// have no artifact and are verified from their old commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact: Option<String>,
 }
 
 /// Merge transaction phase (SPEC-ADE D6, item 34).
@@ -1124,6 +1132,7 @@ members = []
                 parent: "V".into(),
                 op: "merge-r1".into(),
                 payload_hash: "hh".into(),
+                artifact: None,
             }),
             head: None,
         });

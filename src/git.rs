@@ -19,6 +19,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// run. Keyed by `git rev-parse --git-common-dir`.
 pub(crate) struct RepoLock {
     _file: File,
+    #[allow(dead_code)]
     pub(crate) common_dir: PathBuf,
 }
 

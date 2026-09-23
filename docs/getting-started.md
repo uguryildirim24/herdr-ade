@@ -47,7 +47,7 @@ Edit only the front matter of the new `PROJECT.md` for repositories and project 
 
 Tell the coordinator what you want. In the default `auto` mode it starts the lanes the work needs and tells you what it started. Set a project's `start_threads` safety row to `propose` if you want it to describe lanes and wait for your go-ahead. Each repository lane gets:
 
-- a committed task file under `tasks/`;
+- a content-addressed brief in project state, tied to the exact starting commit and materialized only in the ignored runtime folder;
 - a branch and worktree under `<repo>/.worktrees/`;
 - a tab under the coordinator workspace; and
 - the project's instructions and bounded memory.

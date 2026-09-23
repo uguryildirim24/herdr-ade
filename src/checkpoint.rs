@@ -2,7 +2,7 @@
 //! skill's `state.py` `snapshot`, `check` and `restore`.
 //!
 //! - `snapshot` (here `compose`): the generated `## Herdr` section of
-//!   `HANDOFF.md` plus the machine-readable `HANDOFF.json`, read-only against
+//!   a handoff document plus its machine-readable twin, read-only against
 //!   herdr and git.
 //! - `check`: every pane id, tab id, agent name, branch, repo path and
 //!   session id a handoff mentions must exist now; required sections present;
@@ -11,14 +11,15 @@
 //!   through the pane metadata path and prints start lines for gone workers
 //!   from the launch recipe on their records. It never starts or prompts.
 //!
-//! `ha checkpoint` writes both HANDOFF files as one commit `H` through D9's
-//! commit mechanics under the repository lock.
+//! `ha checkpoint` seals both documents as one content-addressed project
+//! artifact tied to the exact integration commit. It never changes code git.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::contracts::RoundRecord;
@@ -26,18 +27,54 @@ use crate::herdr::Herdr;
 use crate::paths::Ctx;
 use crate::project::Project;
 use crate::round::Git;
-use crate::round::repo::{commit_files_on_branch, repo_lock};
 use crate::thread::{self, sha256_hex};
 
 const CALL: Duration = Duration::from_secs(15);
 
-/// The hash the checkpoint intent binds: both files' exact bytes (item 34).
+#[derive(Serialize, Deserialize)]
+struct HandoffBundle {
+    markdown: String,
+    json: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LatestCheckpoint {
+    commit: String,
+    artifact: String,
+    payload_hash: String,
+}
+
+/// The hash the checkpoint intent binds: both documents' exact bytes.
 pub(crate) fn payload_hash(md: &str, json: &str) -> String {
     let mut bytes = b"HANDOFF.md\0".to_vec();
     bytes.extend_from_slice(md.as_bytes());
     bytes.extend_from_slice(b"\0HANDOFF.json\0");
     bytes.extend_from_slice(json.as_bytes());
     sha256_hex(&bytes)
+}
+
+pub(crate) fn store_bundle(project: &Project, md: &str, json: &str) -> Result<String> {
+    let bytes = serde_json::to_vec(&HandoffBundle {
+        markdown: md.to_string(),
+        json: json.to_string(),
+    })?;
+    thread::store_artifact(project, &bytes)
+}
+
+pub(crate) fn load_bundle(project: &Project, artifact: &str) -> Result<(String, String)> {
+    let bytes = thread::artifact(project, artifact)?;
+    let bundle: HandoffBundle =
+        serde_json::from_slice(&bytes).context("handoff artifact is not a valid bundle")?;
+    Ok((bundle.markdown, bundle.json))
+}
+
+fn latest_path(project: &Project) -> PathBuf {
+    project.state_dir().join("checkpoint.toml")
+}
+
+fn latest(project: &Project) -> Option<LatestCheckpoint> {
+    let text = std::fs::read_to_string(latest_path(project)).ok()?;
+    toml::from_str(&text).ok()
 }
 
 fn by_key(items: &[Value], key: &str) -> BTreeMap<String, Value> {
@@ -1036,7 +1073,12 @@ pub(crate) fn compose_for_round(
     v: &str,
 ) -> Result<(String, String)> {
     let git = Git::new(ctx.runner, &record.repo);
-    let base = git.show_file(v, "HANDOFF.md")?.unwrap_or_else(skeleton);
+    let base = latest(project)
+        .and_then(|checkpoint| load_bundle(project, &checkpoint.artifact).ok())
+        .map(|(markdown, _)| markdown)
+        // Historical projects may only have the old committed pair.
+        .or_else(|| git.show_file(v, "HANDOFF.md").ok().flatten())
+        .unwrap_or_else(skeleton);
     let prefix =
         crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "herdr-ade".into());
     let state = match coordinator_where(ctx, project, None) {
@@ -1061,7 +1103,7 @@ pub(crate) fn compose_for_round(
         render(&state, &prefix)
     };
     section.push_str(&format!(
-        "\nRound `{}` was merged into `{}` at verdict commit `{v}`; this checkpoint is its child.\n",
+        "\nRound `{}` was merged into `{}` at candidate commit `{v}`; this handoff artifact is tied to that exact code state.\n",
         record.round, record.branch
     ));
     let md = splice_herdr(&base, &section);
@@ -1085,7 +1127,8 @@ pub(crate) struct CheckpointArgs {
     pub(crate) check_only: bool,
 }
 
-/// `ha checkpoint <slug>`: snapshot, check, commit both files as `H`.
+/// `ha checkpoint <slug>`: snapshot and store the handoff pair as one
+/// content-addressed project artifact tied to the current code commit.
 pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let (repo, branch) = integration(ctx, &project, args.repo.as_deref(), args.branch.as_deref())?;
@@ -1108,12 +1151,12 @@ pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<
     let head = git
         .branch_head(&branch)?
         .with_context(|| format!("branch_missing: `{branch}`"))?;
-    let checkout = git.checkout_of(&branch)?;
-    let current = match &checkout {
-        Some(dir) => std::fs::read_to_string(dir.join("HANDOFF.md")).ok(),
-        None => git.show_file(&head, "HANDOFF.md")?,
-    }
-    .unwrap_or_else(skeleton);
+    let current = latest(&project)
+        .and_then(|checkpoint| load_bundle(&project, &checkpoint.artifact).ok())
+        .map(|(markdown, _)| markdown)
+        // Historical projects may only have the old committed pair.
+        .or_else(|| git.show_file(&head, "HANDOFF.md").ok().flatten())
+        .unwrap_or_else(skeleton);
     if args.check_only {
         let problems = check_document(&current, &st, &repo);
         return report(&problems, "HANDOFF.md", &st);
@@ -1125,17 +1168,17 @@ pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<
         bail!("checkpoint_check_failed: nothing was committed\n{text:#}");
     }
     let json = format!("{}\n", serde_json::to_string_pretty(&st)?);
-    let commit = {
-        let _repo = repo_lock(&git)?;
-        commit_files_on_branch(
-            &git,
-            &branch,
-            &[("HANDOFF.md", md.as_str()), ("HANDOFF.json", json.as_str())],
-            "checkpoint: HANDOFF",
-            &head,
-            &project.state_dir().join("tmp"),
-        )?
-    };
+    let artifact = store_bundle(&project, &md, &json)?;
+    let hash = payload_hash(&md, &json);
+    crate::project::write_atomic(
+        &latest_path(&project),
+        toml::to_string(&LatestCheckpoint {
+            commit: head.clone(),
+            artifact: artifact.clone(),
+            payload_hash: hash.clone(),
+        })?
+        .as_bytes(),
+    )?;
     // The shared plan refresh at the checkpoint's durable completion
     // boundary; a failure is separate and never affects the commit
     // (SPEC-talk §6.5).
@@ -1143,8 +1186,7 @@ pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<
         eprintln!("note: the plan refresh failed: {e:#}");
     }
     Ok(format!(
-        "checkpoint H {commit} on `{branch}` (payload {})\n",
-        payload_hash(&md, &json)
+        "checkpoint at {head} on `{branch}` (artifact {artifact}, payload {hash})\n"
     ))
 }
 
@@ -1602,18 +1644,16 @@ mod tests {
         let out = checkpoint(&ctx, "demo", args(&fx)).unwrap();
         let h = git(&fx.repo, &["rev-parse", "main"]);
         assert!(
-            out.starts_with(&format!("checkpoint H {h} on `main`")),
+            out.starts_with(&format!("checkpoint at {h} on `main`")),
             "{out}"
         );
-        assert_eq!(git(&fx.repo, &["rev-parse", "main^"]), before);
-        assert_eq!(
-            git(&fx.repo, &["diff", "--name-only", &before, &h]),
-            "HANDOFF.json\nHANDOFF.md"
-        );
-        let md = git(&fx.repo, &["show", "main:HANDOFF.md"]);
+        assert_eq!(h, before, "checkpointing must not change the code ref");
+        let saved = latest(&fx.project).expect("checkpoint record");
+        assert_eq!(saved.commit, h);
+        let (md, json) = load_bundle(&fx.project, &saved.artifact).unwrap();
+        assert_eq!(payload_hash(&md, &json), saved.payload_hash);
         assert!(md.contains("## Herdr (generated ") && md.contains("## Traps"));
-        let sidecar: Value =
-            serde_json::from_str(&git(&fx.repo, &["show", "main:HANDOFF.json"])).unwrap();
+        let sidecar: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(sidecar["coordinator"]["pane_id"], "w1:p1");
         assert_eq!(sidecar["workers"][0]["name"], "lane-one");
         let checked = checkpoint(
