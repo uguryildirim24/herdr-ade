@@ -2641,9 +2641,16 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 crate::output::insert("kind", serde_json::to_value(thread.kind)?);
                 crate::output::insert("branch", thread.branch.clone());
                 crate::output::insert("pane_id", thread.pane_id.clone());
+                let machine = if thread.machine.is_empty() {
+                    "local"
+                } else {
+                    &thread.machine
+                };
+                crate::output::insert("machine", machine);
+                crate::output::insert("placement_reason", thread.placement_reason.clone());
                 println!(
                     "{}",
-                    serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id })
+                    serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason })
                 );
                 Ok(())
             }
