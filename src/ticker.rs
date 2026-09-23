@@ -1101,7 +1101,24 @@ fn launch_pass(
                 .ok()
                 .and_then(|info| info.identity(&t.launch.kind));
             thread::update(pass.project, &t.id, |record| {
-                thread::bind_identity(record, &socket, &agent, process);
+                let mut bound = agent.clone();
+                if bound.workspace_id.is_empty() {
+                    bound.workspace_id = record.workspace_id.clone();
+                }
+                if bound.tab_id.is_empty() {
+                    bound.tab_id = record.tab_id.clone();
+                }
+                if bound.pane_id.is_empty() {
+                    bound.pane_id = record.pane_id.clone();
+                }
+                if bound.cwd.is_empty() {
+                    bound.cwd = record.cwd.clone();
+                }
+                record.workspace_id = bound.workspace_id.clone();
+                record.tab_id = bound.tab_id.clone();
+                record.pane_id = bound.pane_id.clone();
+                record.cwd = bound.cwd.clone();
+                thread::bind_identity(record, &socket, &bound, process);
             })?;
             if !t.launch.compact_reason.is_empty() {
                 let _ = crate::board::publish_value(
@@ -1113,11 +1130,50 @@ fn launch_pass(
             }
             Ok(())
         });
-        errors.extend(
-            launched
-                .err()
-                .map(|error| error.context(format!("{}: launch", t.id))),
-        );
+        if let Err(error) = launched {
+            let detail = format!("{error:#}");
+            if detail.contains("agent_not_ready") {
+                let screen = threads::startup_screen(&herdr, &t.pane_id);
+                let reason = format!("agent_not_ready: screen: {screen}; herdr: {detail}");
+                if let Err(save) = thread::update(pass.project, &t.id, |record| {
+                    record.status = thread::Status::Failed;
+                    record.prompt_pending = false;
+                    record.error = reason.clone();
+                    record.failure_class = crate::contracts::FailureClass::Unknown;
+                    record.last_group = thread::Group::WaitingOnYou.token().into();
+                }) {
+                    errors.push(save.context(format!("{}: startup evidence", t.id)));
+                }
+                // A failed attempt remains in the next context digest even if
+                // the coordinator cannot receive a prompt right now.
+                if !t.is_remote()
+                    && let Some(coordinator) = pass.project.coordinator()
+                    && pass
+                        .agents
+                        .iter()
+                        .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
+                    && let Ok(_writer) = crate::talk::writer_lock(pass.project)
+                    && !crate::talk::writer_suspended(pass.project)
+                {
+                    let notice = format!(
+                        "{} is blocked during startup: {reason}. Read `thread show {} {}` before retrying.",
+                        t.id, pass.project.slug, t.id
+                    );
+                    if crate::talk::mark_automated_prompt(
+                        pass.project,
+                        &coordinator.pane_id,
+                        &notice,
+                    )
+                    .is_ok()
+                    {
+                        let _ = pass.herdr.agent_prompt(&coordinator.pane_id, &notice);
+                    }
+                }
+                errors.push(anyhow::anyhow!("{}: {reason}", t.id));
+            } else {
+                errors.push(error.context(format!("{}: launch", t.id)));
+            }
+        }
     }
     true
 }
@@ -1676,6 +1732,7 @@ mod tests {
                 record.agent = "claude".into();
                 record.agent_name = format!("hp-demo-{id}");
                 record.launch.kind = "claude".into();
+                record.attempt = 2;
             })
             .unwrap();
             panes.push(Pane {
@@ -1715,6 +1772,103 @@ mod tests {
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
+        let rebound = thread::load(&fixture.project, "t-0001").unwrap();
+        assert_eq!(
+            rebound.identity.socket,
+            fixture.project.coordinator().unwrap().socket
+        );
+        assert_eq!(rebound.identity.pane_id, rebound.pane_id);
+        assert_eq!(rebound.identity.cwd, rebound.cwd);
+        assert!(!rebound.identity.pane_id.is_empty());
+    }
+
+    #[test]
+    fn startup_block_keeps_the_screen_in_the_record_and_failure_list() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            ok(r#"{"error":{"code":"agent_not_ready","message":"blocked during startup"}}"#),
+        );
+        runner.on("pane read", ok("Trust this folder?\n  1. Yes\n  2. No\n"));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Open;
+            t.prompt_pending = true;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/repo".into();
+            t.agent_name = "hp-demo-t-0001".into();
+            t.launch.kind = "claude".into();
+        })
+        .unwrap();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let panes = [Pane {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+        }];
+        let records = [record.clone()];
+        let coordinator = Agent {
+            pane_id: fixture.project.coordinator().unwrap().pane_id,
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let mut start = true;
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: &records,
+                agents: &[coordinator],
+                panes: &panes,
+            },
+            &mut start,
+            true,
+            &mut errors,
+        );
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Failed);
+        assert_eq!(saved.launch_attempts, 1);
+        assert!(
+            saved.error.contains("Trust this folder? | 1. Yes | 2. No"),
+            "{}",
+            saved.error
+        );
+        let failures = crate::ledger::list(&fixture.project).unwrap();
+        assert!(
+            failures
+                .iter()
+                .any(|e| e.kind == "thread-error" && e.detail.contains("Trust this folder?")),
+            "{failures:?}"
+        );
+        assert!(!failures.iter().any(|e| e.kind == "launch-not-attempted"));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("Trust this folder?"))
+        );
+        assert_eq!(runner.count("agent start"), 1);
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("Trust this folder?")
+                    && call.display().contains("agent prompt"))
+        );
     }
 
     #[test]

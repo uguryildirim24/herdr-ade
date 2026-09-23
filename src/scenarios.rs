@@ -2229,7 +2229,7 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
 }
 
 #[test]
-fn a_remote_thread_without_a_repo_is_refused() {
+fn a_thread_without_any_listed_repo_is_refused() {
     let world = World::new();
     world.project("demo", "a.sock");
     let args = StartArgs {
@@ -2249,7 +2249,7 @@ fn a_remote_thread_without_a_repo_is_refused() {
         threads::start(&world.ctx(), "demo", args)
             .unwrap_err()
             .to_string()
-            .contains("needs --repo")
+            .contains("repo_required")
     );
 }
 
