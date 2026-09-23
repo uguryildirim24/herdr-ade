@@ -1056,6 +1056,18 @@ fn repo_row(project: &Project, config_dir: &Path, path: &Path) -> Result<crate::
         })
 }
 
+/// Explain a round that cannot publish, without mistaking a local checkpoint
+/// for a published ref. A later `round merge` can pick up a newly configured
+/// remote from the current repository row.
+pub fn publication_warning(record: &RoundRecord, slug: &str) -> Option<String> {
+    (record.push_remote.is_none() && !record.published).then(|| {
+        format!(
+            "warning: {} has no push_remote; its merge will not publish. Set push_remote in the repository row, then run `round merge {slug} {}` to publish.\n",
+            record.round, record.round
+        )
+    })
+}
+
 /// The gate policy pinned from one repository row. Hash only typed policy
 /// inputs; unrelated edits elsewhere in PROJECT.md do not change a round.
 pub fn policy(
@@ -2069,6 +2081,51 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
 #[derive(Debug, Default)]
 pub struct AdvanceOutcome {
     pub started: Vec<ReviewerStarted>,
+    pub running: Vec<ReviewerStarted>,
+    pub verdicts: Vec<(String, String)>,
+    pub not_started: Vec<String>,
+    pub attention: Vec<(String, String)>,
+    pub nothing: Vec<String>,
+}
+
+impl AdvanceOutcome {
+    fn acted(&mut self, round: &str) {
+        self.nothing.retain(|id| id != round);
+    }
+
+    pub fn message(&self) -> String {
+        let mut lines = Vec::new();
+        for item in &self.started {
+            lines.push(format!(
+                "started reviewer {} for {}",
+                item.reviewer, item.round
+            ));
+        }
+        for item in &self.running {
+            lines.push(format!(
+                "reviewer {} already running for {}",
+                item.reviewer, item.round
+            ));
+        }
+        for (round, verdict) in &self.verdicts {
+            lines.push(format!("verdict moved in for {round}: {verdict}"));
+        }
+        for round in &self.not_started {
+            lines.push(format!(
+                "reviewer start due for {round}, but no reviewer started"
+            ));
+        }
+        for (round, reason) in &self.attention {
+            lines.push(format!("reviewer for {round} needs attention: {reason}"));
+        }
+        for round in &self.nothing {
+            lines.push(format!("nothing to do for {round}"));
+        }
+        if lines.is_empty() {
+            lines.push("nothing to do".into());
+        }
+        format!("{}\n", lines.join("\n"))
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2097,6 +2154,7 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             );
         }
         let round = listed.round.clone();
+        outcome.nothing.push(round.clone());
         if read_merge(&project, &round)?.is_some() {
             continue;
         }
@@ -2133,6 +2191,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             let state = reviewer_state(ctx, &project, &reviewer);
             let git = Git::new(ctx.runner, &record.repo);
             if let Some(verdict) = read_verdict_checked(&project, &record, &git)? {
+                if record.phase != RoundPhase::VerdictIn {
+                    outcome.acted(&round);
+                    outcome.verdicts.push((round.clone(), verdict.clone()));
+                }
                 announce_once(
                     ctx,
                     &project,
@@ -2148,10 +2210,16 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                 // final state: count it, drop the dead binding and replace it
                 // in this pass while the retry budget allows.
                 ReviewerState::Unstarted(reason) => {
+                    outcome.acted(&round);
+                    outcome.not_started.push(round.clone());
                     reviewer_start_failed(ctx, &project, &round, &reason, Some(&reviewer))?;
                     continue;
                 }
                 ReviewerState::Gone => {
+                    outcome.acted(&round);
+                    outcome
+                        .attention
+                        .push((round.clone(), format!("{reviewer} is gone")));
                     announce_once(
                         ctx,
                         &project,
@@ -2165,6 +2233,11 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                     continue;
                 }
                 ReviewerState::Unknown(reason) => {
+                    outcome.acted(&round);
+                    outcome.attention.push((
+                        round.clone(),
+                        format!("{reviewer} state unknown ({reason})"),
+                    ));
                     announce_once(
                         ctx,
                         &project,
@@ -2178,6 +2251,11 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
                     continue;
                 }
                 ReviewerState::Alive => {
+                    outcome.acted(&round);
+                    outcome.running.push(ReviewerStarted {
+                        round: round.clone(),
+                        reviewer,
+                    });
                     crate::ledger::recovered(&project, "round-reviewer-attention", &round);
                     continue;
                 }
@@ -2192,6 +2270,10 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
         // after a REJECT and the state a failed start leaves. Never start
         // from a branch made stale by a changed or missing pin.
         if record.reviewer_start_failures >= MAX_REVIEWER_START_FAILURES {
+            outcome.acted(&round);
+            outcome
+                .attention
+                .push((round.clone(), "reviewer starts exhausted".into()));
             reviewer_start_exhausted(ctx, &project, &round, "the previous starts failed")?;
             continue;
         }
@@ -2209,7 +2291,11 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
         if let Some(reviewer) =
             start_and_bind_reviewer(ctx, &project, slug, &round, &review_branch, &prefix)?
         {
+            outcome.acted(&round);
             outcome.started.push(ReviewerStarted { round, reviewer });
+        } else {
+            outcome.acted(&round);
+            outcome.not_started.push(round);
         }
     }
     let _ = crate::project::refresh_page(&project);
@@ -2250,7 +2336,13 @@ pub fn advance_event(ctx: &Ctx) -> Result<AdvanceOutcome> {
     let targets = if matched.is_empty() { slugs } else { matched };
     let mut outcome = AdvanceOutcome::default();
     for slug in targets {
-        outcome.started.extend(advance(ctx, &slug)?.started);
+        let next = advance(ctx, &slug)?;
+        outcome.started.extend(next.started);
+        outcome.running.extend(next.running);
+        outcome.verdicts.extend(next.verdicts);
+        outcome.not_started.extend(next.not_started);
+        outcome.attention.extend(next.attention);
+        outcome.nothing.extend(next.nothing);
     }
     Ok(outcome)
 }
@@ -3410,6 +3502,7 @@ pub(crate) enum InstallationStep {
 pub(crate) struct MergeEffects {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) publication: Option<PublishedRef>,
+    pub(crate) published_now: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) installation: Option<InstallationStep>,
 }
@@ -3419,8 +3512,14 @@ impl MergeEffects {
         let mut message = String::new();
         if let Some(publication) = &self.publication {
             message.push_str(&format!(
-                "pushed {} to {}\n",
-                publication.branch, publication.remote
+                "{} {} to {}\n",
+                if self.published_now {
+                    "pushed"
+                } else {
+                    "already published"
+                },
+                publication.branch,
+                publication.remote
             ));
         }
         if let Some(installation) = &self.installation {
@@ -3524,9 +3623,9 @@ fn reviewer_completion(
                 follow_up.state,
                 crate::thread::FollowUpState::Queued | crate::thread::FollowUpState::Uncertain
             )
-    }) || ((record.verdict.is_some() || record.reviewer_awaiting_report_after.is_some())
-        && lane.last_group == crate::thread::Group::Working.token())
-    {
+    }) {
+        // A queued correction is not yet delivered. Once it is delivered,
+        // the sealed event (not the ticker's cached group) is authoritative.
         return Ok(None);
     }
     let pin = done_pin_after(
@@ -3892,12 +3991,29 @@ fn finish_publication_with(
     round: &str,
     installer: impl FnOnce(&Ctx) -> Result<crate::harness::InstallOutcome>,
 ) -> Result<MergeEffects> {
-    let record = load(project, round)?;
-    if record.push_remote.is_some() && !record.published {
-        let remote = record
-            .push_remote
-            .as_deref()
-            .context("round_publish_pending: the merged round has no allowed push remote")?;
+    let mut record = load(project, round)?;
+    if !record.published && record.push_remote.is_none() {
+        // A round opened before the repo row gained a remote may already be
+        // checkpointed. A repeat merge uses the current row only for this
+        // missing publication destination; frozen gates and policy stay put.
+        let remote = match repo_row(project, &ctx.config_dir, Path::new(&record.repo)) {
+            Ok(row) => row.push_remote,
+            Err(error) if error.to_string().starts_with("repo_not_listed:") => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(remote) = remote {
+            let _lock = project.lock()?;
+            let mut current = load(project, round)?;
+            if current.push_remote.is_none() && !current.published {
+                current.push_remote = Some(remote);
+                save(project, &current)?;
+            }
+            record = current;
+        }
+    }
+    let published_now = record.push_remote.is_some() && !record.published;
+    if published_now {
+        let remote = record.push_remote.as_deref().expect("checked above");
         let refspec = format!("refs/heads/{0}:refs/heads/{0}", record.branch);
         let command = crate::runner::Cmd::new("git", Duration::from_secs(300))
             .arg("-C")
@@ -3974,6 +4090,7 @@ fn finish_publication_with(
     };
     Ok(MergeEffects {
         publication,
+        published_now,
         installation,
     })
 }
@@ -5369,6 +5486,73 @@ mod tests {
     }
 
     #[test]
+    fn advance_reports_running_reviewer_then_new_verdict_instead_of_no_start() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = fx.thread("Reviewer");
+        let cwd = fx.project.canonical_dir().to_string_lossy().into_owned();
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.workspace_id = "w1".into();
+            thread.tab_id = "w1:t9".into();
+            thread.cwd = cwd.clone();
+            thread.agent_name = "reviewer-agent".into();
+        })
+        .unwrap();
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json("w1", "w1:t9", "w1:p9", &cwd, "reviewer-agent", "working")
+        );
+        bind_reviewer(&fx.world.ctx(), "demo", "r1", &reviewer).unwrap();
+        let running = advance(&fx.world.ctx(), "demo").unwrap();
+        assert_eq!(running.running[0].reviewer, reviewer);
+        assert!(running.message().contains("already running"));
+        assert!(!running.message().contains("no reviewer started"));
+
+        let record = load(&fx.project, "r1").unwrap();
+        let wt = fx.repo.join(".worktrees/review-r1");
+        git(&wt, &["merge", "-q", "--no-edit", &lanes[0].1, &lanes[1].1]);
+        let candidate = git(&wt, &["rev-parse", "HEAD"]);
+        fx.seal_done(
+            &reviewer,
+            1,
+            1,
+            &candidate,
+            &front("MERGE", "r1")(&candidate, &record),
+        );
+        let arrived = advance(&fx.world.ctx(), "demo").unwrap();
+        assert_eq!(arrived.verdicts, vec![("r1".into(), "MERGE".into())]);
+        assert!(arrived.message().contains("verdict moved in"));
+        assert!(!arrived.message().contains("no reviewer started"));
+        assert_eq!(
+            advance(&fx.world.ctx(), "demo").unwrap().message(),
+            "nothing to do for r1\n"
+        );
+    }
+
+    #[test]
+    fn immediate_merge_accepts_sealed_verdict_before_ticker_updates_reviewer_group() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let (candidate, _) = verdict(&fx, &lanes, front("MERGE", "r1"));
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        thread::update(&fx.project, &reviewer, |thread| {
+            thread.last_group = crate::thread::Group::Working.token().into();
+        })
+        .unwrap();
+        // Simulate a verdict already accepted on an earlier read but no tick
+        // after the seal. The current completion must win over last_group.
+        let git = Git::new(fx.world.ctx().runner, &fx.repo);
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            read_verdict(&fx.project, &record, &git).as_deref(),
+            Some("MERGE")
+        );
+        let outcome = merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        assert!(matches!(outcome, MergeOutcome::Checkpointed { .. }));
+        assert_eq!(main_head(&fx), candidate);
+    }
+
+    #[test]
     fn newer_sealed_reviewer_completion_invalidates_an_accepted_verdict() {
         let fx = fixture();
         let (lanes, _) = reviewed(&fx);
@@ -5451,13 +5635,8 @@ mod tests {
             thread.follow_ups.clear();
         })
         .unwrap();
-        // A completion that raced ahead of the correction delivery cannot
-        // satisfy the barrier while the reviewer is still recorded as working.
-        assert!(err(merge(&ctx, "demo", "r1", None)).starts_with("verdict_correction_pending"));
-        thread::update(&fx.project, &reviewer, |thread| {
-            thread.last_group = crate::thread::Group::ReadyForReview.token().into();
-        })
-        .unwrap();
+        // The correction has been delivered and sealed; the ticker has not
+        // yet changed last_group. The sealed event is authoritative now.
 
         // A stale selection made before the new seal is rejected at the
         // atomic intent boundary rather than publishing its old candidate.
@@ -5874,6 +6053,47 @@ mod tests {
         });
         let error = err(advance(&fx.world.ctx(), "demo"));
         assert!(error.starts_with("verdict_gate_coverage"), "{error}");
+    }
+
+    #[test]
+    fn unpublished_checkpoint_picks_up_current_repo_remote_on_repeat_merge() {
+        let fx = fixture();
+        let remote = fx.world.home.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        git(
+            &fx.repo,
+            &["remote", "add", "publish", &remote.to_string_lossy()],
+        );
+        let (lanes, _) = reviewed(&fx);
+        assert!(publication_warning(&load(&fx.project, "r1").unwrap(), "demo").is_some());
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        let pending = load(&fx.project, "r1").unwrap();
+        assert!(!pending.published);
+        assert!(
+            publication_warning(&pending, "demo")
+                .unwrap()
+                .contains("will not publish")
+        );
+        let policy_hash = pending.policy_hash;
+        assert_eq!(fx.world.runner.count("push publish"), 0);
+
+        update_repo(&fx, |repo| repo.push_remote = Some("publish".into()));
+        let retried = merge_run(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        assert!(matches!(retried.merge, MergeOutcome::NoOp { .. }));
+        let finished = load(&fx.project, "r1").unwrap();
+        assert!(finished.published);
+        assert_eq!(finished.push_remote.as_deref(), Some("publish"));
+        assert_eq!(finished.policy_hash, policy_hash);
+        assert!(publication_warning(&finished, "demo").is_none());
+        assert_eq!(fx.world.runner.count("push publish"), 1);
+        assert_eq!(
+            git(&remote, &["rev-parse", "refs/heads/main"]),
+            main_head(&fx)
+        );
+        merge(&fx.world.ctx(), "demo", "r1", None).unwrap();
+        assert_eq!(fx.world.runner.count("push publish"), 1);
     }
 
     #[test]
