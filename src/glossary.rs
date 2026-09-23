@@ -272,7 +272,7 @@ pub(crate) fn check_birth(project: &Project, sentence: &str) -> Result<()> {
         problems.push("plain_birth: write exactly one sentence".to_string());
     }
     for name in glossary.names.keys().chain(glossary.terms.keys()) {
-        if contains_name(sentence, name) {
+        if !glossary.is_plain_name(name) && contains_name(sentence, name) {
             problems.push(format!(
                 "plain_birth: \"{name}\": a birth sentence cannot contain a name; say what it does in words"
             ));

@@ -639,23 +639,25 @@ fn tokens(text: &str) -> Vec<Token<'_>> {
             i += 1;
         }
         let (core_start, core_end) = trim_punct(text, start, i);
-        if core_start < core_end
-            && (text[start..i].starts_with("--") || text[start..i].starts_with("q-…"))
-        {
-            // Keep flag dashes and the ellipsis in a shortened request ID.
-            let end = if text[start..i].starts_with("q-…") {
-                i
+        // Wrappers must not hide the leading dashes of a flag or the
+        // ellipsis in a shortened request ID.
+        let wrapped = text[start..i]
+            .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '~' && c != '.');
+        let code_start = i - wrapped.len();
+        if wrapped.starts_with("--") || wrapped.starts_with("q-…") {
+            let end = if wrapped.starts_with("q-…") {
+                code_start + "q-…".len()
             } else {
                 core_end
             };
-            out.push(Token {
-                raw: &text[start..end],
-                start,
-                end,
-            });
-            continue;
-        }
-        if core_start < core_end {
+            if code_start < end {
+                out.push(Token {
+                    raw: &text[code_start..end],
+                    start: code_start,
+                    end,
+                });
+            }
+        } else if core_start < core_end {
             out.push(Token {
                 raw: &text[core_start..core_end],
                 start: core_start,
@@ -699,7 +701,10 @@ fn trim_punct(text: &str, start: usize, end: usize) -> (usize, usize) {
 }
 
 fn is_code(token: &str) -> bool {
-    token.starts_with("--")
+    is_path_token(token)
+        || is_file_token(token)
+        || is_snake_case(token)
+        || token.starts_with("--")
         || token.starts_with("q-")
         || token
             .strip_prefix('r')
@@ -709,15 +714,23 @@ fn is_code(token: &str) -> bool {
 }
 
 pub(crate) fn is_identifier_shaped(token: &str) -> bool {
-    is_code(token)
-        || is_path_token(token)
-        || is_snake_case(token)
-        || is_camel_case(token)
-        || is_all_caps(token)
+    is_code(token) || is_camel_case(token) || is_all_caps(token)
 }
 
 fn is_path_token(token: &str) -> bool {
     token.contains('/') || token.starts_with("~/") || token.starts_with("./")
+}
+
+fn is_file_token(token: &str) -> bool {
+    token.split_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && !extension.is_empty()
+            && extension.chars().all(|c| c.is_ascii_alphanumeric())
+            && extension.chars().any(|c| c.is_ascii_alphabetic())
+    })
 }
 
 fn is_snake_case(token: &str) -> bool {
@@ -937,6 +950,9 @@ mod tests {
             ("a1b2c3d4", Rule::Identifier, "a1b2c3d4"),
             ("snake_case", Rule::Identifier, "snake_case"),
             ("--flags", Rule::Identifier, "--flags"),
+            ("`--flags`", Rule::Identifier, "--flags"),
+            ("`q-…`", Rule::Identifier, "q-…"),
+            ("config.toml", Rule::Identifier, "config.toml"),
             (
                 "~/projects/somebody",
                 Rule::Identifier,
