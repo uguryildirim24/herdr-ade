@@ -384,6 +384,20 @@ pub fn list(project: &Project) -> Vec<RoundRecord> {
     rounds
 }
 
+/// The newest round for the board. Historical rounds need not be parsed to
+/// show the current stage.
+pub(crate) fn latest(project: &Project) -> Option<RoundRecord> {
+    let entries = std::fs::read_dir(rounds_dir(project)).ok()?;
+    let mut ids: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
+        .filter(|id| validate_round_id(id).is_ok())
+        .collect();
+    ids.sort_by_key(|id| std::cmp::Reverse(round_number(id).parse::<u64>().unwrap_or(0)));
+    ids.into_iter().find_map(|id| load(project, &id).ok())
+}
+
 pub fn read_merge(project: &Project, round: &str) -> Result<Option<MergeIntent>> {
     Ok(load(project, round)?.merge)
 }
@@ -2155,6 +2169,10 @@ pub struct ReviewerStarted {
 }
 
 pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
+    advance_inner(ctx, slug, true)
+}
+
+fn advance_inner(ctx: &Ctx, slug: &str, refresh_page: bool) -> Result<AdvanceOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let _scope = crate::ledger::Scope::new(&[&project]);
     // One advance at a time, across processes (the hook and the ticker).
@@ -2319,7 +2337,9 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             outcome.not_started.push(round);
         }
     }
-    let _ = crate::project::refresh_page(&project);
+    if refresh_page {
+        let _ = crate::project::refresh_page(&project);
+    }
     Ok(outcome)
 }
 
@@ -5150,35 +5170,84 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
 
 /// The ticker pass for rounds and everything Rolf looks at (A3's entry
 /// point). Refreshes pins, finishes lane fast-forwards after a checkpoint,
-/// reports a pending merge once, resumes ask publication, runs the
-/// writer and refreshes the board. Never merges on its own.
+/// reports a pending merge once, resumes ask publication, and refreshes the board.
+/// Never merges on its own.
 pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
-    // An unreadable events folder refreshes nothing: an empty list would
-    // unpin every lane and bump every revision (D6, item 33).
-    let events = sealed_events(project).ok();
-    for listed in list(project) {
-        let round = listed.round.clone();
-        // A merging round keeps the pins it was admitted and merged with.
-        if let Some(events) = &events
-            && matches!(read_merge(project, &round), Ok(None))
-        {
-            let _lock = project.lock()?;
-            if let Ok(mut record) = load(project, &round)
-                && refresh_pins(project, &mut record, events).unwrap_or(false)
-            {
-                save(project, &record)?;
+    // The directory changes whenever a round is written atomically. On an
+    // idle project, do not reparse historical rounds or run `advance` (and
+    // its per-round git and herdr probes) on every fifteen-second beat.
+    let dir = rounds_dir(project);
+    let stamp = std::fs::metadata(&dir)
+        .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+        .ok();
+    thread_local! {
+        static IDLE: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf, Option<(u64, std::time::SystemTime)>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    let unchanged_idle = IDLE.with(|cache| cache.borrow().get(&dir) == Some(&stamp));
+    if !unchanged_idle {
+        // Do not memorize an empty display list if a round is unreadable:
+        // repairing a record in place need not change the directory stamp.
+        let rounds = match checked_list(project) {
+            Ok(rounds) => Some(rounds),
+            Err(error) => {
+                eprintln!("round tick: {error:#}");
+                IDLE.with(|cache| {
+                    cache.borrow_mut().remove(&dir);
+                });
+                None
             }
-        }
-        let Ok(record) = load(project, &round) else {
-            continue;
         };
-        match read_merge(project, &round) {
-            Ok(Some(m)) if m.phase == MergePhase::Checkpointed => {
+        if let Some(rounds) = rounds {
+            tick_rounds(ctx, project, &rounds)?;
+            // A checkpointed merge may still need to forward a lane. A failed
+            // attempt does not change the round record, so keep retrying until
+            // its durable marker exists (even if the round itself is closed).
+            let idle = rounds.iter().all(|r| {
+                r.phase.closed()
+                    && !r.cleanup_pending
+                    && (r
+                        .merge
+                        .as_ref()
+                        .is_none_or(|merge| merge.phase != MergePhase::Checkpointed)
+                        || merge_dir(project, &r.round)
+                            .join("lanes-forwarded")
+                            .exists())
+            });
+            IDLE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if idle {
+                    cache.insert(dir, stamp);
+                } else {
+                    cache.remove(&dir);
+                }
+            });
+        }
+    }
+    let _ = crate::ask::tick(ctx, project);
+    let _ = crate::board::refresh_tick(ctx, project);
+    Ok(())
+}
+
+fn tick_rounds(ctx: &Ctx, project: &Project, rounds: &[RoundRecord]) -> Result<()> {
+    let active = rounds
+        .iter()
+        .any(|r| !r.phase.closed() || r.cleanup_pending);
+    // `advance` refreshes pins of open rounds under its own lock. Only
+    // checkpointed merges need the independent forward-lanes recovery here.
+    for record in rounds.iter().filter(|r| {
+        r.merge
+            .as_ref()
+            .is_some_and(|merge| merge.phase == MergePhase::Checkpointed)
+    }) {
+        let round = record.round.clone();
+        match record.merge.clone() {
+            Some(m) if m.phase == MergePhase::Checkpointed => {
                 let marker = merge_dir(project, &round).join("lanes-forwarded");
                 if !marker.exists() {
                     let git = Git::new(ctx.runner, &record.repo);
                     let h = m.head.clone().unwrap_or_default();
-                    let lanes = forward_lanes(ctx, project, &record, &git, &h);
+                    let lanes = forward_lanes(ctx, project, record, &git, &h);
                     let settled = lanes.iter().all(|l| {
                         l.ends_with("already at merged head")
                             || l.ends_with("fast-forwarded to merged head")
@@ -5193,12 +5262,11 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             _ => {}
         }
     }
-    // The safety net for a missed hook: one advance pass per tick.
-    if let Err(error) = advance(ctx, &project.slug) {
+    // The safety net for a missed hook: one advance pass when there is
+    // unfinished work. Closed rounds cannot start a reviewer.
+    if active && let Err(error) = advance_inner(ctx, &project.slug, false) {
         eprintln!("round advance: {error:#}");
     }
-    let _ = crate::ask::tick(ctx, project);
-    let _ = crate::board::refresh(ctx, project);
     Ok(())
 }
 
@@ -6224,6 +6292,26 @@ mod tests {
                 .unwrap()
                 .contains("abandoned because: the reviewer could not be dispatched")
         );
+    }
+
+    #[test]
+    fn idle_round_ticker_does_not_probe_git_or_herdr() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = crate::paths::Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        tick(&ctx, &project).unwrap();
+        tick(&ctx, &project).unwrap();
+        assert_eq!(runner.count("git"), 0);
+        assert_eq!(runner.count("herdr"), 0);
     }
 
     #[test]
@@ -7358,6 +7446,91 @@ mod tests {
             }),
             "the background round tick probed a finished or missing checkout"
         );
+    }
+
+    #[test]
+    fn ticker_retries_a_repaired_round_without_directory_changes() {
+        use crate::contracts::{MergeIntent, MergePhase};
+
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let head = git(&fx.repo, &["rev-parse", "HEAD"]);
+        write_merge(
+            &fx.project,
+            "r1",
+            &MergeIntent {
+                op: "test".into(),
+                expected_old: head.clone(),
+                candidate: head.clone(),
+                verdict: head.clone(),
+                phase: MergePhase::Checkpointed,
+                merged: Some(head.clone()),
+                checkpoint: None,
+                head: Some(head),
+            },
+        )
+        .unwrap();
+        let mut record = load(&fx.project, "r1").unwrap();
+        record.cleanup_pending = false;
+        save(&fx.project, &record).unwrap();
+        let marker = merge_dir(&fx.project, "r1").join("lanes-forwarded");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let path = round_path(&fx.project, "r1");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "invalid = [").unwrap();
+        tick(&ctx, &fx.project).unwrap();
+        assert!(!marker.exists());
+        std::fs::write(&path, original).unwrap();
+        tick(&ctx, &fx.project).unwrap();
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn closed_checkpoint_retries_forwarding_without_round_record_changes() {
+        use crate::contracts::{MergeIntent, MergePhase};
+
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        let head = git(&fx.repo, &["rev-parse", "HEAD"]);
+        write_merge(
+            &fx.project,
+            "r1",
+            &MergeIntent {
+                op: "test".into(),
+                expected_old: head.clone(),
+                candidate: head.clone(),
+                verdict: head.clone(),
+                phase: MergePhase::Checkpointed,
+                merged: Some(head.clone()),
+                checkpoint: None,
+                head: Some(head),
+            },
+        )
+        .unwrap();
+        let mut record = load(&fx.project, "r1").unwrap();
+        record.cleanup_pending = false;
+        save(&fx.project, &record).unwrap();
+        let marker = merge_dir(&fx.project, "r1").join("lanes-forwarded");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let lane_dir = thread::load(&fx.project, &id).unwrap().worktree_path;
+        std::fs::write(Path::new(&lane_dir).join("scratch.txt"), "uncommitted\n").unwrap();
+
+        // A dirty live checkout cannot be forwarded yet.
+        tick(&ctx, &fx.project).unwrap();
+        assert!(!marker.exists());
+        // Resolution changes the lane record, not the round directory. A
+        // later tick must retry the checkpoint rather than treating it idle.
+        thread::update(&fx.project, &id, |lane| {
+            lane.status = thread::Status::Resolved
+        })
+        .unwrap();
+        tick(&ctx, &fx.project).unwrap();
+        assert!(marker.exists());
     }
 
     #[test]
