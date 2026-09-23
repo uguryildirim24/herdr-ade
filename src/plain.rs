@@ -890,7 +890,18 @@ mod tests {
 
     #[test]
     fn w79_plain_words_names_and_limits() {
-        let mut g = Glossary::default();
+        let world = crate::scenarios::World::new();
+        let local = world.project("local-demo", "local.sock");
+        let other = world.project("aegis-27", "other.sock");
+        let (mut settings, body) = other.read_project_md().unwrap();
+        settings.name = "Auroria".into();
+        std::fs::write(
+            other.project_md(),
+            format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        crate::glossary::add_term(&world.ctx(), "aegis-27", "Zorbulon", None, None, true).unwrap();
+        let mut g = crate::glossary::registry(&local);
         // A registry collision must not turn an English word into a bare name.
         g.names.insert(
             "main".into(),
@@ -927,6 +938,9 @@ mod tests {
             "prl",
             "prl-8-53",
             "custombrand",
+            "aegis-27",
+            "Auroria's round is done.",
+            "Zorbulon's round is done.",
             "rented-GPU",
             "CPU-only",
             "long-running",
@@ -939,6 +953,8 @@ mod tests {
                 assert!(form.is_empty(), "{text}: {form:?}");
             }
         }
+        crate::board::check_value(&local, "Auroria's round is done.").unwrap();
+        crate::board::check_value(&local, "The aegis-27 round is done.").unwrap();
         let long = (0..26).map(|_| "the").collect::<Vec<_>>().join(" ");
         let refusals = [
             ("t-0369", Rule::Identifier, "t-0369"),

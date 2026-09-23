@@ -1,10 +1,11 @@
 # Plain-language word lists
 
 These files are inputs to the pure checker in `src/plain.rs` (SPEC-ADE D17).
-The checker does not write them. The project slug and familiar product names pass
-without a definition; a coordinator can add another with
-`ha term add <project> <name> --name`. Names added this way live in the project's
-existing terms file. Codes and paths cannot be added as familiar names.
+The checker does not write them. Every project slug under the same root, its
+recorded one-word display name, and familiar names pass without a definition;
+a coordinator can record another with `ha term add <project> <name> --name`.
+Names added this way live in the project's existing terms file and pass across
+projects under that root. Codes and paths cannot be added as familiar names.
 
 ## `words.txt`
 
