@@ -3958,7 +3958,7 @@ fn checkpoint_phase(
                 .unwrap_or_else(|| intent.verdict.clone()),
             op: intent.op.clone(),
             payload_hash: crate::checkpoint::payload_hash(&md, &json),
-            artifact,
+            artifact: Some(artifact),
         });
         write_merge(project, &record.round, &intent)?;
         if stop == Some(Stop::Intent) {
@@ -3968,11 +3968,15 @@ fn checkpoint_phase(
         }
     }
     let cp = intent.checkpoint.clone().context("checkpoint_missing")?;
+    let artifact = cp
+        .artifact
+        .as_deref()
+        .context("checkpoint_bundle_missing: this checkpoint predates sealed bundles")?;
     let head = git.branch_head(&record.branch)?.context("branch_missing")?;
     if !is_recorded_checkpoint(project, &head, &cp)? {
         return diverged(project, record, intent, &head);
     }
-    crate::checkpoint::record_latest(project, &head, &cp.artifact, &cp.payload_hash)?;
+    crate::checkpoint::record_latest(project, &head, artifact, &cp.payload_hash)?;
     let h = head;
     if stop == Some(Stop::Commit) {
         return Ok(MergeOutcome::Stopped {
@@ -3993,7 +3997,10 @@ fn is_recorded_checkpoint(project: &Project, x: &str, cp: &CheckpointIntent) -> 
     if x != cp.parent {
         return Ok(false);
     }
-    let (md, json) = crate::checkpoint::load_bundle(project, &cp.artifact)?;
+    let Some(artifact) = cp.artifact.as_deref() else {
+        return Ok(false);
+    };
+    let (md, json) = crate::checkpoint::load_bundle(project, artifact)?;
     Ok(crate::checkpoint::payload_hash(&md, &json) == cp.payload_hash)
 }
 
@@ -4826,6 +4833,34 @@ mod tests {
             .replace("phase = \"admitting\"", "phase = \"merged\"");
         std::fs::write(path, text).unwrap();
         assert!(err(load(&fx.project, "r1")).starts_with("round_state_mismatch"));
+    }
+
+    #[test]
+    fn a_pre_bundle_merged_record_supports_round_show_and_list() {
+        let fx = fixture();
+        std::fs::create_dir_all(rounds_dir(&fx.project)).unwrap();
+        std::fs::write(
+            round_path(&fx.project, "r118"),
+            include_str!("../tests/fixtures/rounds/r118.toml"),
+        )
+        .unwrap();
+
+        let shown = show(&fx.world.ctx(), "demo", "r118").unwrap();
+        assert!(shown.contains("r118 on `main`"), "{shown}");
+        assert!(shown.contains("merge: phase Checkpointed"), "{shown}");
+
+        let records = list(&fx.project);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].round, "r118");
+        assert_eq!(records[0].phase, RoundPhase::Merged);
+        assert_eq!(
+            records[0]
+                .merge
+                .as_ref()
+                .and_then(|merge| merge.checkpoint.as_ref())
+                .and_then(|checkpoint| checkpoint.artifact.as_deref()),
+            None
+        );
     }
 
     #[test]
@@ -5664,10 +5699,7 @@ mod tests {
         assert_eq!(latest["commit"].as_str(), Some(merged_head.as_str()));
         let intent = read_merge(&fx.project, "r1").unwrap().unwrap();
         let checkpoint = intent.checkpoint.unwrap();
-        assert_eq!(
-            latest["artifact"].as_str(),
-            Some(checkpoint.artifact.as_str())
-        );
+        assert_eq!(latest["artifact"].as_str(), checkpoint.artifact.as_deref());
         assert_eq!(
             latest["payload_hash"].as_str(),
             Some(checkpoint.payload_hash.as_str())
