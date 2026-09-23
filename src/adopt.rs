@@ -346,6 +346,7 @@ pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
             },
             reprime: false,
             rebind: false,
+            recipe: None,
         },
     )?;
     let adopted = adopt(

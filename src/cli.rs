@@ -94,6 +94,9 @@ enum Command {
         /// Move the project to this session when its recorded socket no longer exists
         #[arg(long)]
         rebind: bool,
+        /// Use this configured recipe when starting the project coordinator
+        #[arg(long, value_name = "ID")]
+        recipe: Option<String>,
         #[command(flatten)]
         session: SessionArgs,
     },
@@ -2048,6 +2051,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             slug,
             reprime,
             rebind,
+            recipe,
             session,
         } => coordinator::open(
             &ctx,
@@ -2056,6 +2060,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 session: session.into(),
                 reprime,
                 rebind,
+                recipe,
             },
         ),
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
