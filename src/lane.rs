@@ -407,18 +407,6 @@ pub(crate) fn skill_text(role: &str) -> &'static str {
     }
 }
 
-/// The repository file that carries a role's skill text.
-pub(crate) fn skill_file(role: &str) -> &'static str {
-    match role {
-        "coordinator" => "COORDINATOR.md",
-        "reviewer" => "REVIEWER.md",
-        "critic" => "CRITIC.md",
-        "drafter" => "DRAFTER.md",
-        "pickup" => "PICKUP.md",
-        _ => "LANE.md",
-    }
-}
-
 /// Prints the selected role skill and runtime-only rules. A lane call also
 /// records the bootstrap receipt from `HERDR_ADE_LAUNCH` when its binding
 /// matches. A box lane prints the fixed box prefix, never the Mac's path.

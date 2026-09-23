@@ -1175,10 +1175,7 @@ fn nudge_idle_coordinator(
     coordinator: &crate::project::Coordinator,
     agent: Option<&Agent>,
 ) -> Result<()> {
-    if coordinator.prime_pending
-        || agent.is_none_or(|agent| agent.agent_status != "idle")
-        || crate::talk::has_waiting_request(project)
-    {
+    if coordinator.prime_pending || agent.is_none_or(|agent| agent.agent_status != "idle") {
         return Ok(());
     }
     let current = open_work_next_steps(project);
@@ -1205,9 +1202,6 @@ fn nudge_idle_coordinator(
         next.join("; ")
     );
     let _writer = crate::talk::writer_lock(project)?;
-    if crate::talk::writer_suspended(project) {
-        return Ok(());
-    }
     crate::talk::mark_automated_prompt(project, &coordinator.pane_id, &text)?;
     // Keep the send start, not the return time: the prompted turn can read
     // context before a fast transport call returns, and that turn must count.
@@ -1605,7 +1599,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             ));
         }
     }
-    // D5 recovery and delivery (X1 to X5), then rounds, asks, talk and the
+    // D5 recovery and delivery (X1 to X5), then rounds, asks and the
     // board (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.
     errors.extend(
@@ -2464,41 +2458,6 @@ mod tests {
 
         state.idle_nudge_last = "2026-01-01T00:06:00Z".into();
         assert!(!idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
-    }
-
-    #[test]
-    fn pending_rolf_message_prevents_a_work_nudge() {
-        let f = fixture(false);
-        write_task(&f.project, Vec::new());
-        let runner = FakeRunner::new();
-        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
-        runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        let ctx = Ctx {
-            env: &f.env,
-            root: f.root.clone(),
-            config_dir: f.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        crate::talk::handle(&ctx, &f.project, "Please choose red or blue.").unwrap();
-        assert!(crate::talk::has_waiting_request(&f.project));
-
-        let coordinator = f.project.coordinator().unwrap();
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, &runner);
-        let agent = Agent {
-            agent_status: "idle".into(),
-            ..Agent::default()
-        };
-        nudge_idle_coordinator(
-            &ctx,
-            &f.project,
-            &mut steps::State::default(),
-            &herdr,
-            &coordinator,
-            Some(&agent),
-        )
-        .unwrap();
-        assert_eq!(runner.count("agent prompt"), 1);
     }
 
     #[test]

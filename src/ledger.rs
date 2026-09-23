@@ -280,16 +280,6 @@ pub(crate) enum Disposition {
     Resolved,
 }
 
-impl Disposition {
-    pub(crate) fn word(self) -> &'static str {
-        match self {
-            Self::Current => "current",
-            Self::Unknown => "unknown",
-            Self::Resolved => "resolved",
-        }
-    }
-}
-
 fn disposition_at(entry: &Entry, context_read: &str) -> Disposition {
     if entry.closed {
         Disposition::Resolved
@@ -305,6 +295,7 @@ pub(crate) fn disposition(project: &Project, entry: &Entry) -> Result<Dispositio
     Ok(disposition_at(entry, &load(project)?.context_read))
 }
 
+#[cfg(test)]
 pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
     let _lock = lock(project)?;
     let state = load(project)?;

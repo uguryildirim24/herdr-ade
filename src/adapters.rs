@@ -2,7 +2,7 @@
 //!
 //! The engine treats an agent kind as data. Built-in rows describe the
 //! harnesses shipped with ADE and `[adapters.<kind>]` rows may replace or add
-//! declarations without changing dispatch, hooks, talk, or doctor code.
+//! declarations without changing dispatch, hooks, or doctor code.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,6 @@ pub(crate) struct Adapter {
     pub(crate) launch_flags: Vec<String>,
     pub(crate) ready_timeout_ms: u64,
     pub(crate) coordinator: bool,
-    pub(crate) talk: bool,
     /// A blocked process with a recorded lane error resumes when prompted.
     pub(crate) blocked_error_resumable: bool,
     pub(crate) capabilities: Vec<String>,
@@ -79,9 +78,6 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
     if kind.trim().is_empty() || row.binary.trim().is_empty() {
         bail!("adapter_invalid: `{kind}` needs a binary");
     }
-    if row.coordinator && !row.talk {
-        bail!("adapter_invalid: coordinator adapter `{kind}` must support talk");
-    }
     if row.coordinator
         && (row.hook.prompt_event.is_empty() || !row.hook.events.contains(&row.hook.prompt_event))
     {
@@ -94,11 +90,6 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
             "adapter_invalid: `{kind}` has unknown hook shape `{}`",
             row.hook.shape
         );
-    }
-    if row.talk
-        && (row.hook.shape == "none" || row.hook.path.is_empty() || row.hook.events.is_empty())
-    {
-        bail!("adapter_invalid: talk adapter `{kind}` needs a hook path and events");
     }
     if !matches!(row.hook.block.as_str(), "none" | "block" | "followup") {
         bail!(
@@ -133,7 +124,6 @@ fn native(binary: &str, hook: HookAdapter, doctor: &[&str]) -> Adapter {
         binary: binary.into(),
         ready_timeout_ms: 30_000,
         coordinator: true,
-        talk: true,
         hook,
         doctor: DoctorAdapter {
             readiness: "command".into(),
@@ -189,7 +179,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
     // run lanes, but claiming coordinator support would silently lose text
     // typed directly into their panes.
     codex.coordinator = false;
-    codex.talk = false;
     rows.insert("codex".into(), codex);
 
     let mut cursor = native(
@@ -205,7 +194,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
     );
     cursor.required_flags.push("--force".into());
     cursor.coordinator = false;
-    cursor.talk = false;
     rows.insert("cursor".into(), cursor);
 
     let mut agy = native(
@@ -238,7 +226,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             binary: "pi".into(),
             ready_timeout_ms: 30_000,
             coordinator: true,
-            talk: true,
             blocked_error_resumable: true,
             hook: hook(
                 "pi",
@@ -308,19 +295,6 @@ pub(crate) fn correction(adapter: &Adapter, reason: &str) -> Option<serde_json::
     }
 }
 
-pub(crate) fn capability_label(project: &crate::project::Project, kind: &str) -> &'static str {
-    let qualified = project
-        .state_dir()
-        .join("capabilities")
-        .join(format!("{kind}.qualified"))
-        .is_file();
-    if qualified {
-        "surface mediated; native chat checked after display"
-    } else {
-        "capability: unqualified; chat: shown only through say and ask"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +307,6 @@ mod tests {
             r#"[adapters.acme]
 binary = "acme-agent"
 coordinator = true
-talk = true
 launch_flags = ["--yes"]
 capabilities = ["pictures"]
 doctor.readiness = "command"

@@ -6,7 +6,6 @@
 //! listing it in `PROJECT.md`.
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -665,160 +664,7 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Result<Vec<P
             Err(error) => bail!("harness_ticker_failed: local ticker did not take the lock: {error:#}; lock state: {:?}", crate::ticker::lock_state(&ctx.root)),
         });
     }
-    proofs.extend(talk_process_proofs(ctx, plugin_version));
     Ok(proofs)
-}
-
-fn same_executable_image(running_inode: u64, installed_inode: u64) -> bool {
-    running_inode == installed_inode
-}
-
-fn executable_inode(ctx: &Ctx, pid: u32) -> Result<u64> {
-    let out = ctx.runner.run(&Cmd::new("lsof", VERSION_TIMEOUT).args([
-        "-a".to_string(),
-        "-p".to_string(),
-        pid.to_string(),
-        "-d".to_string(),
-        "txt".to_string(),
-        "-Fpi".to_string(),
-    ]))?;
-    if !out.success() {
-        bail!("lsof failed: {}", out.error_text());
-    }
-    out.stdout
-        .lines()
-        .find_map(|line| line.strip_prefix('i')?.parse::<u64>().ok())
-        .context("lsof did not report the executable inode")
-}
-
-fn talk_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessProof> {
-    let installed = ctx.env.home.join(".local/bin/herdr-ade");
-    let installed_inode = std::fs::metadata(&installed)
-        .map(|metadata| metadata.ino())
-        .map_err(|error| error.to_string());
-    let mut proofs = Vec::new();
-    for slug in crate::project::list_slugs(&ctx.root) {
-        let Ok(project) = crate::project::Project::load(&ctx.root, &slug) else {
-            continue;
-        };
-        if !crate::talk::enabled(&project) {
-            continue;
-        }
-        let Some(coordinator) = project.coordinator() else {
-            continue;
-        };
-        let herdr = crate::herdr::Herdr::new(
-            ctx.env.herdr_bin(),
-            PathBuf::from(&coordinator.socket),
-            ctx.runner,
-        );
-        let tabs = match herdr.tab_list() {
-            Ok(tabs) => tabs,
-            Err(error) => {
-                proofs.push(ProcessProof {
-                    machine: "local".into(),
-                    process: format!("talk:{slug}"),
-                    pid: None,
-                    build: None,
-                    state: "unknown".into(),
-                    reason: Some(format!("could not list the talk tab: {error}")),
-                });
-                continue;
-            }
-        };
-        let talk_tabs: BTreeSet<String> = tabs
-            .into_iter()
-            .filter(|tab| tab.workspace_id == coordinator.workspace_id && tab.label == "talk")
-            .map(|tab| tab.tab_id)
-            .collect();
-        let panes = match herdr.pane_list() {
-            Ok(panes) => panes,
-            Err(error) => {
-                proofs.push(ProcessProof {
-                    machine: "local".into(),
-                    process: format!("talk:{slug}"),
-                    pid: None,
-                    build: None,
-                    state: "unknown".into(),
-                    reason: Some(format!("could not list the talk pane: {error}")),
-                });
-                continue;
-            }
-        };
-        for pane in panes
-            .into_iter()
-            .filter(|pane| talk_tabs.contains(&pane.tab_id))
-        {
-            let process = herdr.pane_process_info(&pane.pane_id);
-            let pid = process.ok().and_then(|info| {
-                info.foreground_processes
-                    .into_iter()
-                    .find(|process| {
-                        process.name.contains("herdr-ade")
-                            || process
-                                .argv0
-                                .as_deref()
-                                .is_some_and(|arg| arg.contains("herdr-ade"))
-                    })
-                    .map(|process| process.pid)
-            });
-            let Some(pid) = pid else {
-                proofs.push(ProcessProof {
-                    machine: "local".into(),
-                    process: format!("talk:{slug}"),
-                    pid: None,
-                    build: None,
-                    state: "unknown".into(),
-                    reason: Some("the talk pane did not report its herdr-ade process".into()),
-                });
-                continue;
-            };
-            let running_inode = executable_inode(ctx, pid);
-            proofs.push(
-                match (running_inode, installed_inode.clone(), plugin_version) {
-                    (Ok(running), Ok(installed), Some(version))
-                        if same_executable_image(running, installed) =>
-                    {
-                        ProcessProof {
-                            machine: "local".into(),
-                            process: format!("talk:{slug}"),
-                            pid: Some(pid),
-                            build: Some(version.to_string()),
-                            state: "running".into(),
-                            reason: None,
-                        }
-                    }
-                    (Ok(running), Ok(installed), _) => ProcessProof {
-                        machine: "local".into(),
-                        process: format!("talk:{slug}"),
-                        pid: Some(pid),
-                        build: None,
-                        state: "stale".into(),
-                        reason: Some(format!(
-                            "executable inode {running} does not match installed inode {installed}"
-                        )),
-                    },
-                    (Err(error), _, _) => ProcessProof {
-                        machine: "local".into(),
-                        process: format!("talk:{slug}"),
-                        pid: Some(pid),
-                        build: None,
-                        state: "unknown".into(),
-                        reason: Some(format!("{error:#}")),
-                    },
-                    (_, Err(error), _) => ProcessProof {
-                        machine: "local".into(),
-                        process: format!("talk:{slug}"),
-                        pid: Some(pid),
-                        build: None,
-                        state: "unknown".into(),
-                        reason: Some(format!("could not stat {}: {error}", installed.display())),
-                    },
-                },
-            );
-        }
-    }
-    proofs
 }
 
 fn box_process_script(
@@ -1334,6 +1180,7 @@ mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1897,12 +1744,6 @@ mod tests {
         let sibling = dir.path().join("herdr-pi");
         std::fs::write(&sibling, b"new image").unwrap();
         assert!(!replaced_self(&sibling, &running).unwrap());
-    }
-
-    #[test]
-    fn a_talk_screen_on_the_old_inode_is_reported_as_stale() {
-        assert!(same_executable_image(41, 41));
-        assert!(!same_executable_image(40, 41));
     }
 
     #[test]
