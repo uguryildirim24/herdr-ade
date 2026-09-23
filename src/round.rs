@@ -2178,7 +2178,7 @@ fn reviewer_branch(ctx: &Ctx, slug: &str, round: &str, record: &RoundRecord) -> 
 
 /// The reviewer task: the review brief, the pinned members with their report
 /// paths, the round's gates, and, for a re-review, one line naming the
-/// earlier verdict and its review file. No project-specific prose.
+/// earlier sealed verdict. No project-specific prose.
 fn start_reviewer(
     ctx: &Ctx,
     project: &Project,
@@ -3250,7 +3250,7 @@ fn parse_verdict(text: &str) -> Result<Verdict> {
     let front = text
         .strip_prefix("+++\n")
         .and_then(|rest| rest.split_once("\n+++").map(|(f, _)| f))
-        .context("verdict_unreadable: the verdict file has no `+++` front matter")?;
+        .context("verdict_unreadable: the verdict report has no `+++` front matter")?;
     toml::from_str(front).map_err(|e| anyhow::anyhow!("verdict_unreadable: {e}"))
 }
 
@@ -3971,6 +3971,7 @@ fn checkpoint_phase(
     if !is_recorded_checkpoint(project, &head, &cp)? {
         return diverged(project, record, intent, &head);
     }
+    crate::checkpoint::record_latest(project, &head, &cp.artifact, &cp.payload_hash)?;
     let h = head;
     if stop == Some(Stop::Commit) {
         return Ok(MergeOutcome::Stopped {
@@ -5655,6 +5656,21 @@ mod tests {
         merge(&ctx, "demo", "r1", Some(Stop::Commit)).unwrap();
         let merged_head = main_head(&fx);
         assert_eq!(phase(&fx), MergePhase::Merged);
+        let latest: toml::Value = toml::from_str(
+            &std::fs::read_to_string(fx.project.state_dir().join("checkpoint.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest["commit"].as_str(), Some(merged_head.as_str()));
+        let intent = read_merge(&fx.project, "r1").unwrap().unwrap();
+        let checkpoint = intent.checkpoint.unwrap();
+        assert_eq!(
+            latest["artifact"].as_str(),
+            Some(checkpoint.artifact.as_str())
+        );
+        assert_eq!(
+            latest["payload_hash"].as_str(),
+            Some(checkpoint.payload_hash.as_str())
+        );
         let out = merge(&ctx, "demo", "r1", None).unwrap();
         assert!(
             matches!(out, MergeOutcome::Checkpointed { ref head, .. } if *head == merged_head),
@@ -6114,7 +6130,7 @@ mod tests {
 
     /// A REJECT is repaired with `round review`; the next `advance` starts
     /// and binds a reviewer on the new review branch, and its task names the
-    /// earlier verdict and review file. A second `advance` is a no-op.
+    /// earlier sealed verdict. A second `advance` is a no-op.
     #[test]
     fn advance_starts_the_re_review_after_a_reject() {
         let fx = fixture();
