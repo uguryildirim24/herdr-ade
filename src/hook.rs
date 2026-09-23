@@ -60,6 +60,21 @@ fn binding_path(project: &Project) -> PathBuf {
     project.state_dir().join("plain").join("hook-binding.json")
 }
 
+fn read_binding(project: &Project) -> Result<Option<Binding>> {
+    let path = binding_path(project);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("hook_binding_unreadable: {}", path.display()));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("hook_binding_unreadable: {} does not parse", path.display()))
+        .map(Some)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigShape {
     ClaudeLike,
@@ -104,24 +119,24 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     write_json_atomic(&path, &value)?;
     let dir = project.state_dir().join("plain");
     std::fs::create_dir_all(&dir)?;
-    project::write_json(
-        &binding_path(project),
-        &Binding {
-            kind: kind.to_string(),
-            project: project.slug.clone(),
-            pane: pane.to_string(),
-            session_id: String::new(),
-            adapter: adapter.clone(),
-        },
-    )?;
+    let binding = Binding {
+        kind: kind.to_string(),
+        project: project.slug.clone(),
+        pane: pane.to_string(),
+        session_id: String::new(),
+        adapter: adapter.clone(),
+    };
+    project::write_json(&binding_path(project), &binding)?;
+    if read_binding(project)?.as_ref() != Some(&binding) {
+        bail!("hook_install_failed: hook binding did not verify");
+    }
     verify_owned_entry(&path, pane, shape, &adapter)?;
     Ok(true)
 }
 
 pub(crate) fn remove(project: &Project) -> Result<()> {
     let _lock = project.lock()?;
-    let binding: Option<Binding> = project::read_json(&binding_path(project));
-    if let Some(binding) = binding
+    if let Some(binding) = read_binding(project)?
         && let Some((path, shape)) = settings_path(project, &binding.adapter)
         && path.exists()
     {
@@ -135,21 +150,21 @@ pub(crate) fn remove(project: &Project) -> Result<()> {
 
 /// True when a prompt-submit hook is bound to this pane, so the talk layer
 /// knows to write prompt markers for it.
-pub(crate) fn captures(project: &Project, pane: &str) -> bool {
-    let Some(binding) = project::read_json::<Binding>(&binding_path(project)) else {
-        return false;
+pub(crate) fn captures(project: &Project, pane: &str) -> Result<bool> {
+    let Some(binding) = read_binding(project)? else {
+        return Ok(false);
     };
     if binding.pane != pane {
-        return false;
+        return Ok(false);
     }
-    settings_path(project, &binding.adapter).is_some_and(|_| {
+    Ok(settings_path(project, &binding.adapter).is_some_and(|_| {
         !binding.adapter.hook.prompt_event.is_empty()
             && binding
                 .adapter
                 .hook
                 .events
                 .contains(&binding.adapter.hook.prompt_event)
-    })
+    }))
 }
 
 fn event_phase<'a>(adapter: &'a crate::adapters::Adapter, event: &str) -> Option<&'a str> {
@@ -291,7 +306,7 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     let input: serde_json::Value =
         serde_json::from_slice(&bytes).context("hook input is not JSON")?;
     let session = input["session_id"].as_str().unwrap_or_default();
-    if !scope_binding(&project, kind, pane, session)? {
+    if !scope_binding(&project, kind, pane, session, phase)? {
         return Ok(());
     }
     bind_current_turn_session(&project, kind, pane, session)?;
@@ -315,19 +330,29 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     }
 }
 
-fn scope_binding(project: &Project, kind: &str, pane: &str, session: &str) -> Result<bool> {
+fn scope_binding(
+    project: &Project,
+    kind: &str,
+    pane: &str,
+    session: &str,
+    phase: &str,
+) -> Result<bool> {
     let _lock = project.lock()?;
-    let Some(mut binding) = project::read_json::<Binding>(&binding_path(project)) else {
+    let Some(mut binding) = read_binding(project)? else {
         return Ok(false);
     };
     if binding.kind != kind || binding.pane != pane || binding.project != project.slug {
         return Ok(false);
     }
-    if binding.session_id.is_empty() && !session.is_empty() {
+    if binding.session_id != session {
+        // A relaunch or native session reset changes the harness session while
+        // keeping ADE's pane binding. Only its next submitted prompt may claim
+        // the new session; a late Stop from the old process cannot take it back.
+        if phase != "prompt" || session.is_empty() {
+            return Ok(false);
+        }
         binding.session_id = session.to_string();
         project::write_json(&binding_path(project), &binding)?;
-    } else if binding.session_id != session {
-        return Ok(false);
     }
     Ok(true)
 }
@@ -426,7 +451,7 @@ pub(crate) fn record_receipt(project: &Project, publication: &str) -> Result<()>
 
 fn record_receipt_for(project: &Project, publication: &str, pane: &str) -> Result<()> {
     let _lock = project.lock()?;
-    let Some(binding) = project::read_json::<Binding>(&binding_path(project)) else {
+    let Some(binding) = read_binding(project)? else {
         return Ok(());
     };
     let Some(coordinator) = project.coordinator() else {
@@ -979,7 +1004,18 @@ mod tests {
     }
 
     #[test]
-    fn cursor_and_codex_use_their_project_hook_shapes() {
+    fn an_unreadable_binding_is_a_failure_not_an_uncaptured_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir_all(binding_path(&project).parent().unwrap()).unwrap();
+        std::fs::write(binding_path(&project), b"not json").unwrap();
+
+        let error = captures(&project, "w1:p1").unwrap_err().to_string();
+        assert!(error.contains("hook_binding_unreadable"), "{error}");
+    }
+
+    #[test]
+    fn a_relaunched_session_is_claimed_by_its_prompt_not_an_old_stop() {
         let temp = tempfile::tempdir().unwrap();
         let env = Env::for_test(temp.path(), &[]);
         let runner = FakeRunner::new();
@@ -993,43 +1029,11 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
+        install(&ctx, &project, "claude", "w1:p1").unwrap();
 
-        install(&ctx, &project, "cursor", "w1:p1").unwrap();
-        install(&ctx, &project, "cursor", "w1:p1").unwrap();
-        let cursor = read_json_object(&project.dir().join(".cursor/hooks.json")).unwrap();
-        assert_eq!(cursor["version"], 1);
-        assert_eq!(
-            cursor["hooks"]["afterAgentResponse"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(
-            cursor["hooks"]["afterAgentResponse"][0]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("--phase observe")
-        );
-        assert!(
-            cursor["hooks"]["stop"][0]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("--phase stop")
-        );
-        remove(&project).unwrap();
-
-        install(&ctx, &project, "codex", "w1:p1").unwrap();
-        let codex = read_json_object(&project.dir().join(".codex/hooks.json")).unwrap();
-        assert_eq!(codex["hooks"]["Stop"].as_array().unwrap().len(), 1);
-        assert!(
-            codex["hooks"]["Stop"][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains("--kind codex")
-        );
-        remove(&project).unwrap();
-        let codex = read_json_object(&project.dir().join(".codex/hooks.json")).unwrap();
-        assert!(codex["hooks"]["Stop"].as_array().unwrap().is_empty());
+        assert!(scope_binding(&project, "claude", "w1:p1", "one", "prompt").unwrap());
+        assert!(!scope_binding(&project, "claude", "w1:p1", "two", "stop").unwrap());
+        assert!(scope_binding(&project, "claude", "w1:p1", "two", "prompt").unwrap());
+        assert!(!scope_binding(&project, "claude", "w1:p1", "one", "stop").unwrap());
     }
 }

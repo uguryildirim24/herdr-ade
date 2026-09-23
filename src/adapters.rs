@@ -82,6 +82,13 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
     if row.coordinator && !row.talk {
         bail!("adapter_invalid: coordinator adapter `{kind}` must support talk");
     }
+    if row.coordinator
+        && (row.hook.prompt_event.is_empty() || !row.hook.events.contains(&row.hook.prompt_event))
+    {
+        bail!(
+            "adapter_invalid: coordinator adapter `{kind}` needs a prompt-submit hook so Rolf's typed messages are recorded"
+        );
+    }
     if !matches!(row.hook.shape.as_str(), "none" | "claude" | "cursor") {
         bail!(
             "adapter_invalid: `{kind}` has unknown hook shape `{}`",
@@ -166,21 +173,24 @@ fn builtin() -> BTreeMap<String, Adapter> {
     claude.capabilities.push("native-chat".into());
     rows.insert("claude".into(), claude);
 
-    rows.insert(
-        "codex".into(),
-        native(
-            "codex",
-            hook("claude", ".codex/hooks.json", &["Stop"], "", "block"),
-            &[
-                "exec",
-                "{args}",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "Reply only OK.",
-            ],
-        ),
+    let mut codex = native(
+        "codex",
+        hook("claude", ".codex/hooks.json", &["Stop"], "", "block"),
+        &[
+            "exec",
+            "{args}",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "Reply only OK.",
+        ],
     );
+    // These installed hook grammars expose no prompt-submit event. They may
+    // run lanes, but claiming coordinator support would silently lose text
+    // typed directly into their panes.
+    codex.coordinator = false;
+    codex.talk = false;
+    rows.insert("codex".into(), codex);
 
     let mut cursor = native(
         "cursor-agent",
@@ -194,6 +204,8 @@ fn builtin() -> BTreeMap<String, Adapter> {
         &["{args}", "-p", "Reply only OK."],
     );
     cursor.required_flags.push("--force".into());
+    cursor.coordinator = false;
+    cursor.talk = false;
     rows.insert("cursor".into(), cursor);
 
     let mut agy = native(
@@ -332,6 +344,28 @@ hook.block = "block"
         let row = declaration(dir.path(), "acme").unwrap();
         assert_eq!(row.binary, "acme-agent");
         assert_eq!(launch_args(&row, &Recipe::default()), ["--yes"]);
+    }
+
+    #[test]
+    fn a_coordinator_without_a_prompt_hook_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"[adapters.silent]
+binary = "silent"
+coordinator = true
+talk = true
+doctor.readiness = "command"
+doctor.args = ["check"]
+hook.shape = "claude"
+hook.path = ".silent/hooks.json"
+hook.events = ["Stop"]
+hook.block = "block"
+"#,
+        )
+        .unwrap();
+        let error = declaration(dir.path(), "silent").unwrap_err().to_string();
+        assert!(error.contains("needs a prompt-submit hook"), "{error}");
     }
 
     #[test]

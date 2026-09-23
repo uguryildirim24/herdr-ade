@@ -2258,6 +2258,7 @@ fn open_alive(world: &World, project: &Project) -> anyhow::Result<()> {
         },
         reprime: false,
         rebind: false,
+        recipe: None,
     };
     crate::coordinator::open(&world.ctx(), &project.slug, &options)
 }
@@ -2539,6 +2540,61 @@ fn open_accepts_a_non_claude_coordinator_recipe() {
         ok(r#"{"result":{"workspace":{"workspace_id":"w1","label":"Demo"}}}"#),
     );
     open_alive(&world, &project).unwrap();
+}
+
+#[test]
+fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
+    let world = World::new();
+    let config = world.home.path().join("cfg/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[recipes.chosen_agy]\nkind = \"agy\"\nargs = [\"--dangerously-skip-permissions\", \"--model\", \"chosen\"]\nplain = \"Rolf's chosen coordinator\"\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on(
+        "agent start hp-demo-coordinator",
+        fail(
+            1,
+            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
+        ),
+    );
+
+    let mut options = crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags {
+            session: None,
+            socket: Some(world.home.path().join("a.sock")),
+        },
+        reprime: false,
+        rebind: false,
+        recipe: Some("chosen_agy".into()),
+    };
+    crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
+    let first = project.coordinator().unwrap();
+    assert_eq!(first.launch.recipe_id, "chosen_agy");
+    assert_eq!(first.launch.routing_rule, "project");
+
+    options.recipe = None;
+    crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
+    let relaunched = project.coordinator().unwrap();
+    assert_eq!(relaunched.launch.recipe_id, "chosen_agy");
+    assert_eq!(relaunched.launch.args, first.launch.args);
+    let starts: Vec<_> = world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.display().contains("agent start hp-demo-coordinator"))
+        .map(Cmd::display)
+        .collect();
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert!(
+        starts
+            .iter()
+            .all(|start| start.contains("--kind agy") && start.contains("--model chosen")),
+        "{starts:?}"
+    );
 }
 
 #[test]
