@@ -127,6 +127,9 @@ pub(crate) fn import_box_event(
     let text = std::str::from_utf8(box_bytes).context("box event is not UTF-8")?;
     let event: Event = toml::from_str(text).context("box event does not parse")?;
     validate_id(&event.id)?;
+    // Use the same boundary as local sealing so a fresh merge intent cannot
+    // race an imported completion into existence after its final check.
+    let _lock = project.lock()?;
     let event_hash = hash_bytes(box_bytes);
     if let Some(existing) = load_import(project, machine, &event.id) {
         if existing.event_hash == event_hash {

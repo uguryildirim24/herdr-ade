@@ -1959,7 +1959,24 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             Ok(())
         })?;
         if queued {
-            crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)?;
+            if let Err(error) =
+                crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)
+            {
+                // The merge intent may have won just before this queue write.
+                // Remove the message so the ticker cannot deliver work against
+                // an already committed historical verdict.
+                let attempt = record.attempt.max(1);
+                thread::update(&project, id, |thread| {
+                    if let Some(index) = thread.follow_ups.iter().rposition(|follow_up| {
+                        follow_up.attempt == attempt
+                            && follow_up.text == text
+                            && follow_up.state == FollowUpState::Queued
+                    }) {
+                        thread.follow_ups.remove(index);
+                    }
+                })?;
+                return Err(error);
+            }
             return Ok(PromptOutcome::Queued {
                 attempt: record.attempt.max(1),
             });
@@ -1977,6 +1994,20 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     let state = prompt_state(&record, &agents, resumable)?;
     let herdr = view.herdr.on_machine(record.machine_route());
     let events_before_send = crate::round::sealed_events(&project)?;
+    // Mark the work before invalidating earlier round evidence. The merge
+    // boundary sees either this working state or the durable hold. If an
+    // already committed intent refuses the hold, restore the prior projection
+    // and never deliver the text.
+    let previous_group = record.last_group.clone();
+    thread::update(&project, id, |thread| {
+        thread.last_group = Group::Working.token().to_string();
+    })?;
+    if let Err(error) = crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send) {
+        thread::update(&project, id, |thread| {
+            thread.last_group = previous_group;
+        })?;
+        return Err(error);
+    }
     // Herdr rejects `agent prompt` for every blocked pane. An adapter-owned
     // error screen is different from an approval dialog: submit through the
     // pane so the adapter's input hook clears its block. A blocked lane with
@@ -1991,13 +2022,6 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             .agent_prompt(&record.pane_id, text)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
-    // The next observation may already be idle if the answer was immediate.
-    // Mark this successful delivery as work first, so the round can distinguish
-    // that later idle observation from the lane's pre-prompt idle state.
-    thread::update(&project, id, |thread| {
-        thread.last_group = Group::Working.token().to_string();
-    })?;
-    crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)?;
     Ok(PromptOutcome::Sent {
         attempt: record.attempt.max(1),
         agent_state: state,
