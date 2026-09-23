@@ -55,7 +55,12 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
             sha,
         )?;
     }
-    let op = ops::reserve(
+    let git_folder = if crate::threads::managed_git_folder(&binding.project, &binding.thread) {
+        &binding.thread.worktree_path
+    } else {
+        &binding.thread.cwd
+    };
+    let op = ops::reserve_done(
         &binding.project,
         ops::Reservation {
             thread: &binding.thread.id,
@@ -69,12 +74,8 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
             },
             helper_pid: std::process::id(),
         },
+        Path::new(git_folder),
     )?;
-    let git_folder = if crate::threads::managed_git_folder(&binding.project, &binding.thread) {
-        &binding.thread.worktree_path
-    } else {
-        &binding.thread.cwd
-    };
     ops::stage_done(&binding.project, &op.op, Path::new(git_folder), ctx.runner)?;
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
