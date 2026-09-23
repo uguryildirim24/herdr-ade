@@ -552,7 +552,35 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     Ok(record)
 }
 
-/// `ha ask answer <id> --revision <r> <n>`.
+/// Accept the exact displayed sentence as well as its number.
+pub(crate) fn answer_text(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    revision: u32,
+    choice: &str,
+    by: &str,
+) -> Result<Answer> {
+    let n = if let Ok(n) = choice.parse::<u32>() {
+        n
+    } else if choice == NOT_UNDERSTOOD {
+        0
+    } else {
+        let project = Project::load(&ctx.root, slug)?;
+        let record = load_revision(&project, id, revision)?.context("ask_unknown")?;
+        record
+            .choices
+            .iter()
+            .position(|text| text == choice)
+            .map(|index| index as u32 + 1)
+            .with_context(|| {
+                format!("ask_choice_unknown: `{choice}` is not an exact choice sentence")
+            })?
+    };
+    answer(ctx, slug, id, revision, n, by)
+}
+
+/// `ha ask answer <id> --revision <r> <number-or-exact-sentence>`.
 pub(crate) fn answer(
     ctx: &Ctx,
     slug: &str,
@@ -1094,6 +1122,56 @@ mod tests {
                 "plain_question_form: \"Three changes to your settings.\": each choice must be a sentence with a verb"
             ),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn answer_accepts_exact_sentence_or_number() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let first = ask(&ctx, "demo", keep_or_stop()).unwrap();
+        let answer = answer_text(
+            &ctx,
+            "demo",
+            &first.id,
+            first.revision,
+            &first.choices[1],
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            (answer.choice, answer.text.as_str()),
+            (2, first.choices[1].as_str())
+        );
+        assert!(
+            answer_text(
+                &ctx,
+                "demo",
+                &first.id,
+                first.revision,
+                "not a choice",
+                "test"
+            )
+            .is_err()
+        );
+        let second = ask(
+            &ctx,
+            "demo",
+            NewAsk {
+                question: "should I leave the screen open or close it now?".into(),
+                choices: vec![
+                    "leave the screen open".into(),
+                    "close the screen now".into(),
+                ],
+                ..keep_or_stop()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            answer_text(&ctx, "demo", &second.id, second.revision, "1", "test")
+                .unwrap()
+                .choice,
+            1
         );
     }
 

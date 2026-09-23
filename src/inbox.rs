@@ -291,6 +291,20 @@ impl DoneOutcome {
     }
 }
 
+/// Handle all unhandled items of a kind using the same binding checks as id-based handling.
+pub(crate) fn done_kind_bound(
+    project: &Project,
+    kind: &str,
+    binding: Option<(&str, u32)>,
+) -> Result<DoneOutcome> {
+    let ids = unhandled(project)
+        .into_iter()
+        .filter(|item| item.kind == kind)
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    done_bound(project, &ids, false, binding)
+}
+
 pub(crate) fn done_bound(
     project: &Project,
     ids: &[String],
@@ -413,6 +427,21 @@ mod tests {
             1
         );
         assert!(unhandled(&project).is_empty());
+    }
+
+    #[test]
+    fn done_kind_only_moves_matching_items() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let first = write(&project, "routine", "first", "due", "").unwrap();
+        write(&project, "outage", "box", "offline", "").unwrap();
+        let second = write(&project, "routine", "second", "due", "").unwrap();
+        assert_eq!(
+            done_kind_bound(&project, "routine", None).unwrap().moved,
+            [first, second]
+        );
+        assert_eq!(unhandled(&project).len(), 1);
+        assert_eq!(unhandled(&project)[0].kind, "outage");
     }
 
     #[test]
