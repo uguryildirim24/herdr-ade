@@ -95,8 +95,11 @@ enum Command {
         #[arg(long)]
         rebind: bool,
         /// Use this configured recipe when starting the project coordinator
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", requires = "basis")]
         recipe: Option<String>,
+        /// Request that records Rolf's choice; may be request:<project>/<id>
+        #[arg(long, value_name = "REQUEST", requires = "recipe")]
+        basis: Option<String>,
         #[command(flatten)]
         session: SessionArgs,
     },
@@ -2052,6 +2055,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             reprime,
             rebind,
             recipe,
+            basis,
             session,
         } => coordinator::open(
             &ctx,
@@ -2061,6 +2065,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 reprime,
                 rebind,
                 recipe,
+                recipe_basis: basis,
             },
         ),
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),

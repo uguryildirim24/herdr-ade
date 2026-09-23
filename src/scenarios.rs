@@ -2259,6 +2259,7 @@ fn open_alive(world: &World, project: &Project) -> anyhow::Result<()> {
         reprime: false,
         rebind: false,
         recipe: None,
+        recipe_basis: None,
     };
     crate::coordinator::open(&world.ctx(), &project.slug, &options)
 }
@@ -2551,6 +2552,17 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
         "\n[recipes.chosen_agy]\nkind = \"agy\"\nargs = [\"--dangerously-skip-permissions\", \"--model\", \"chosen\"]\nplain = \"Rolf's chosen coordinator\"\n",
     );
     std::fs::write(&config, text).unwrap();
+    let authority = project::create(&world.root, "authority", "", vec![]).unwrap();
+    crate::talk::append(
+        &authority,
+        None,
+        crate::talk::Entry::Rolf {
+            request: "q-choice".into(),
+            text: "Use the chosen coordinator recipe for demo.".into(),
+            answer: None,
+        },
+    )
+    .unwrap();
     let project = world.project("demo", "a.sock");
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on(
@@ -2569,13 +2581,24 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
         reprime: false,
         rebind: false,
         recipe: Some("chosen_agy".into()),
+        recipe_basis: Some("request:authority/q-choice".into()),
     };
+    options.recipe_basis = Some("request:authority/q-missing".into());
+    let error = crate::coordinator::open(&world.ctx(), "demo", &options)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no request"), "{error}");
+
+    options.recipe_basis = Some("request:authority/q-choice".into());
     crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
     let first = project.coordinator().unwrap();
     assert_eq!(first.launch.recipe_id, "chosen_agy");
     assert_eq!(first.launch.routing_rule, "project");
+    assert_eq!(first.launch.recipe_basis, "request:authority/q-choice");
+    assert_eq!(first.launch.recipe_request, "request:authority/q-choice");
 
     options.recipe = None;
+    options.recipe_basis = None;
     crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
     let relaunched = project.coordinator().unwrap();
     assert_eq!(relaunched.launch.recipe_id, "chosen_agy");

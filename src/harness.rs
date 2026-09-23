@@ -149,6 +149,7 @@ pub(crate) struct InstallOutcome {
     pub(crate) live_handoff_required: bool,
     pub(crate) processes: Vec<ProcessProof>,
     pub(crate) tasks: Vec<TaskInstallProof>,
+    pub(crate) coordinator_hooks: Vec<String>,
     #[serde(skip)]
     pub(crate) warnings: Vec<String>,
 }
@@ -161,6 +162,9 @@ impl InstallOutcome {
             .flat_map(|repo| repo.binaries.iter())
             .map(|binary| format!("{}\n", binary.version))
             .collect::<String>();
+        for hook in &self.coordinator_hooks {
+            message.push_str(&format!("coordinator hook rebound: {hook}\n"));
+        }
         for process in &self.processes {
             match (&process.build, &process.reason) {
                 (Some(build), _) => message.push_str(&format!(
@@ -1248,6 +1252,7 @@ pub(crate) fn install_with_reexec(
             refresh_box_guard(ctx, target, machine)?;
         }
     }
+    let coordinator_hooks = crate::hook::reinstall_open(ctx)?;
     let plugin_version = installed
         .iter()
         .flat_map(|repo| &repo.binaries)
@@ -1265,6 +1270,7 @@ pub(crate) fn install_with_reexec(
         live_handoff_required: fork,
         processes,
         tasks,
+        coordinator_hooks,
         warnings,
     })
 }

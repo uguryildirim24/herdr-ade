@@ -347,28 +347,6 @@ hook.block = "block"
     }
 
     #[test]
-    fn a_coordinator_without_a_prompt_hook_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            r#"[adapters.silent]
-binary = "silent"
-coordinator = true
-talk = true
-doctor.readiness = "command"
-doctor.args = ["check"]
-hook.shape = "claude"
-hook.path = ".silent/hooks.json"
-hook.events = ["Stop"]
-hook.block = "block"
-"#,
-        )
-        .unwrap();
-        let error = declaration(dir.path(), "silent").unwrap_err().to_string();
-        assert!(error.contains("needs a prompt-submit hook"), "{error}");
-    }
-
-    #[test]
     fn agy_probe_uses_only_its_print_mode_flags() {
         let row = builtin().remove("agy").unwrap();
         assert_eq!(

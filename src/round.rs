@@ -5876,6 +5876,7 @@ mod tests {
                 build: "installed-head".into(),
                 running_processes: true,
             }],
+            coordinator_hooks: Vec::new(),
             warnings: vec!["note: one optional step was skipped".into()],
         };
 
