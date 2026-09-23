@@ -171,7 +171,18 @@ impl View {
         if matches!(self.state, State::Cancelled | State::Dropped) {
             return true;
         }
-        required_states(project, &self.record)
+        self.terminal_with_evidence(project, &EvidenceSnapshot::load(project))
+    }
+
+    pub(crate) fn terminal_with_evidence(
+        &self,
+        project: &Project,
+        evidence: &EvidenceSnapshot,
+    ) -> bool {
+        if matches!(self.state, State::Cancelled | State::Dropped) {
+            return true;
+        }
+        required_states_with_events(project, &self.record, &evidence.events)
             .ok()
             .and_then(|states| states.last().cloned())
             .is_some_and(|last| last == self.state.word())
@@ -429,12 +440,20 @@ fn update(
     id: &str,
     change: impl FnOnce(&mut Task) -> Result<()>,
 ) -> Result<Task> {
+    let task = update_deferred(project, id, change)?;
+    project::refresh_page(project)?;
+    Ok(task)
+}
+
+fn update_deferred(
+    project: &Project,
+    id: &str,
+    change: impl FnOnce(&mut Task) -> Result<()>,
+) -> Result<Task> {
     let _lock = project.lock()?;
     let mut task = load(project, id)?;
     change(&mut task)?;
     write(project, &task)?;
-    drop(_lock);
-    project::refresh_page(project)?;
     Ok(task)
 }
 
@@ -639,7 +658,17 @@ fn has_commit_changes(project: &Project, task: &Task) -> Result<bool> {
     if task.attempts.is_empty() {
         return Ok(false);
     }
-    let events = crate::events::list(project);
+    has_commit_changes_with_events(project, task, &crate::events::list(project))
+}
+
+fn has_commit_changes_with_events(
+    project: &Project,
+    task: &Task,
+    events: &[crate::contracts::Event],
+) -> Result<bool> {
+    if task.attempts.is_empty() {
+        return Ok(false);
+    }
     for attempt in &task.attempts {
         let thread = crate::thread::load(project, attempt)?;
         let done: Vec<_> = events
@@ -661,6 +690,25 @@ pub(crate) fn required_states(project: &Project, task: &Task) -> Result<Vec<Stri
     if task.repo.is_none() {
         return Ok(vec!["finished".into(), "verified".into()]);
     }
+    required_states_with_events(project, task, &crate::events::list(project))
+}
+
+pub(crate) fn required_states_with_evidence(
+    project: &Project,
+    task: &Task,
+    evidence: &EvidenceSnapshot,
+) -> Result<Vec<String>> {
+    required_states_with_events(project, task, &evidence.events)
+}
+
+fn required_states_with_events(
+    project: &Project,
+    task: &Task,
+    events: &[crate::contracts::Event],
+) -> Result<Vec<String>> {
+    if task.repo.is_none() {
+        return Ok(vec!["finished".into(), "verified".into()]);
+    }
     let settings = project.read_project_md()?.0;
     let mut states = task
         .repo
@@ -670,7 +718,7 @@ pub(crate) fn required_states(project: &Project, task: &Task) -> Result<Vec<Stri
         .map(|row| row.task_states.clone())
         .unwrap_or(settings.task_states);
     validate_states(&states)?;
-    if !has_commit_changes(project, task)? {
+    if !has_commit_changes_with_events(project, task, events)? {
         states.retain(|state| !matches!(state.as_str(), "reviewed" | "merged" | "installed"));
     }
     Ok(states)
@@ -735,7 +783,31 @@ fn next_for(state: State, required: &[String], task: &Task) -> String {
     }
 }
 
+pub(crate) struct EvidenceSnapshot {
+    events: Vec<crate::contracts::Event>,
+    readable: bool,
+}
+
+impl EvidenceSnapshot {
+    pub(crate) fn load(project: &Project) -> Self {
+        let (events, readable) = crate::events::list_checked(project);
+        Self { events, readable }
+    }
+
+    pub(crate) fn events(&self) -> &[crate::contracts::Event] {
+        &self.events
+    }
+}
+
 pub(crate) fn view(project: &Project, task: Task) -> View {
+    view_with_evidence(project, task, &EvidenceSnapshot::load(project))
+}
+
+pub(crate) fn view_with_evidence(
+    project: &Project,
+    task: Task,
+    evidence: &EvidenceSnapshot,
+) -> View {
     if !task.dropped.is_empty() {
         return View {
             record: task,
@@ -745,7 +817,7 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             provider_kind: None,
         };
     }
-    let required = match required_states(project, &task) {
+    let required = match required_states_with_events(project, &task, &evidence.events) {
         Ok(required) => required,
         Err(_) => {
             return View {
@@ -801,21 +873,7 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             };
         }
     };
-    let event_dir = project.record_dir("events");
-    let events_readable = std::fs::read_dir(&event_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
-                .all(|entry| {
-                    std::fs::read_to_string(entry.path())
-                        .ok()
-                        .and_then(|text| toml::from_str::<crate::contracts::Event>(&text).ok())
-                        .is_some()
-                })
-        })
-        .unwrap_or_else(|error| error.kind() == std::io::ErrorKind::NotFound);
-    if !events_readable {
+    if !evidence.readable {
         return View {
             record: task,
             state: State::Unknown,
@@ -824,9 +882,9 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             provider_kind: None,
         };
     }
-    let events = crate::events::list(project);
+    let events = &evidence.events;
     let attempt = thread.attempt.max(1);
-    let event = crate::round::latest_event(&events, current, attempt);
+    let event = crate::round::latest_event(events, current, attempt);
     let done = events
         .iter()
         .filter(|event| event.thread == *current && event.attempt == attempt)
@@ -1060,9 +1118,19 @@ pub(crate) fn attestation(project: &Project, task: &Task) -> Option<crate::contr
 }
 
 pub(crate) fn views(project: &Project) -> (Vec<View>, Vec<anyhow::Error>) {
+    views_with_evidence(project, &EvidenceSnapshot::load(project))
+}
+
+pub(crate) fn views_with_evidence(
+    project: &Project,
+    evidence: &EvidenceSnapshot,
+) -> (Vec<View>, Vec<anyhow::Error>) {
     let (tasks, errors) = list_with_errors(project);
     (
-        tasks.into_iter().map(|task| view(project, task)).collect(),
+        tasks
+            .into_iter()
+            .map(|task| view_with_evidence(project, task, evidence))
+            .collect(),
         errors,
     )
 }
@@ -1152,13 +1220,25 @@ pub(crate) fn record_evidence(
 
 /// Record one machine's installed build without asking the coordinator to
 /// translate a successful install back into task state.
+#[cfg(test)]
 pub(crate) fn record_installed(
     project: &Project,
     id: &str,
     machine: &str,
     build: &str,
 ) -> Result<Task> {
-    update(project, id, |task| {
+    let task = record_installed_deferred(project, id, machine, build)?;
+    project::refresh_page(project)?;
+    Ok(task)
+}
+
+pub(crate) fn record_installed_deferred(
+    project: &Project,
+    id: &str,
+    machine: &str,
+    build: &str,
+) -> Result<Task> {
+    update_deferred(project, id, |task| {
         task.installed.push(Evidence {
             at: project::now(),
             command: "ha harness install".into(),
@@ -1170,13 +1250,25 @@ pub(crate) fn record_installed(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn record_running(
     project: &Project,
     id: &str,
     machines: Vec<String>,
     processes: Vec<String>,
 ) -> Result<Task> {
-    update(project, id, |task| {
+    let task = record_running_deferred(project, id, machines, processes)?;
+    project::refresh_page(project)?;
+    Ok(task)
+}
+
+pub(crate) fn record_running_deferred(
+    project: &Project,
+    id: &str,
+    machines: Vec<String>,
+    processes: Vec<String>,
+) -> Result<Task> {
+    update_deferred(project, id, |task| {
         task.running.push(RunningEvidence {
             at: project::now(),
             command: "ha harness install".into(),
