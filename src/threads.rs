@@ -3781,6 +3781,87 @@ mod tests {
     }
 
     #[test]
+    fn start_during_install_is_recorded_and_launched_by_the_next_ticker() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, pane_json};
+
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let repo = std::fs::canonicalize(repo)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        world.add_repo(&project, &repo);
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        world.runner.on(
+            "HERDR_ADE_LAUNCH",
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#),
+        );
+        world.runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"hp-demo-t-0001"}}}"#),
+        );
+        let split = GitReal {
+            fake: &world.runner,
+        };
+        let ctx = Ctx {
+            env: &world.env,
+            root: world.root.clone(),
+            config_dir: world.home.path().join("cfg"),
+            runner: &split,
+            // The fake runner drives the ticker pass below, not a subprocess.
+            detached_ticker: false,
+        };
+        let install = crate::harness::lock(&ctx.config_dir).unwrap();
+        let started = start(
+            &ctx,
+            "demo",
+            StartArgs {
+                title: "Repair".into(),
+                repo: Some(repo.clone()),
+                machine: None,
+                base: None,
+                task: "Repair the lane.".into(),
+                plain: "The lane repairs the project.".into(),
+                workflow: None,
+                recipe: None,
+                recipe_basis: None,
+                task_id: String::new(),
+                review_round: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(started.prompt_pending);
+        assert!(Path::new(&started.thread_dir).join("brief.md").exists());
+        assert_eq!(
+            thread::load(&project, &started.id).unwrap().status,
+            Status::Open
+        );
+        assert!(!world.runner.calls.borrow().iter().any(|cmd| {
+            cmd.display().contains("agent start") && !cmd.display().contains("--help")
+        }));
+
+        drop(install);
+        let wt = started.worktree_path.clone();
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w1", "w1:t2", "w1:p2", &wt)
+        );
+        crate::ticker::tick_project(&ctx, &project).unwrap();
+        assert!(world.runner.calls.borrow().iter().any(|cmd| {
+            cmd.display().contains("agent start") && cmd.display().contains("hp-demo-t-0001")
+        }));
+        assert_eq!(
+            thread::load(&project, &started.id).unwrap().launch_attempts,
+            1
+        );
+    }
+
+    #[test]
     fn ade_start_with_a_job_keeps_the_lead_brief_across_retry() {
         use crate::runner::fake::ok;
         use crate::scenarios::{World, pane_json};
@@ -3980,7 +4061,11 @@ mod tests {
             thread.failure_class = crate::contracts::FailureClass::ProcessGone;
         })
         .unwrap();
+        // Recovery must not refuse a recorded replacement while an install
+        // owns the ticker: the install's ticker launches this attempt too.
+        let install = crate::harness::lock(&ctx.config_dir).unwrap();
         retry(&ctx, "demo", &started.id, "the first process disappeared").unwrap();
+        drop(install);
         let retried = thread::load(&project, &started.id).unwrap();
         assert_eq!(retried.attempt, 2);
         assert_eq!(retried.launch.kind, kind);
