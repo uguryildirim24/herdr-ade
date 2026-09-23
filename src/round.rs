@@ -4012,11 +4012,11 @@ fn merge_batch_run_with(
             let tree = git.merge_tree(&combined, candidate).map_err(|error| {
                 let earlier = (0..index)
                     .find(|&i| git.merge_tree(&candidates[i], candidate).is_err())
-                    .unwrap_or(index - 1);
+                    .map(|i| rounds[i].as_str())
+                    .unwrap_or(owner.branch.as_str());
                 anyhow::anyhow!(
-                    "batch_conflict: `{}` conflicts with `{}`: {error:#}",
-                    rounds[index],
-                    rounds[earlier]
+                    "batch_conflict: `{}` conflicts with `{earlier}`: {error:#}",
+                    rounds[index]
                 )
             })?;
             combined = git.commit_tree(
@@ -4040,6 +4040,8 @@ fn merge_batch_run_with(
             verdicts: candidates,
             base: head,
             candidate: combined,
+            selection_review_branch: current.review_branch.clone(),
+            review_branch: None,
         });
         save(&project, &current)?;
         drop(repo);
@@ -4056,15 +4058,24 @@ fn merge_batch_run_with(
     // The selection is durable before reviewer startup. Review creation itself
     // has an intent and can recover after a worktree/ref crash.
     if owner.merge.is_none() {
-        if owner.verdict_kind.as_deref() == Some("REJECT")
-            || owner.verdict.as_ref().map(|p| p.sha.as_str())
-                == batch.verdicts.first().map(String::as_str)
-            || owner.review_intent.is_some()
-            || owner.review_branch.is_none()
+        if batch.review_branch.is_none()
+            && owner.review_branch == batch.selection_review_branch
+            && (owner.verdict_kind.as_deref() == Some("REJECT")
+                || owner.verdict.as_ref().map(|p| p.sha.as_str())
+                    == batch.verdicts.first().map(String::as_str)
+                || owner.review_intent.is_some()
+                || owner.review_branch.is_none())
         {
             // Release the round operation lock before review takes it.
             drop(_operation);
             let output = review(ctx, slug, first)?;
+            {
+                let _lock = project.lock()?;
+                let mut current = load(&project, first)?;
+                let selected = current.batch.as_mut().context("batch_missing")?;
+                selected.review_branch = Some(output.review_branch.clone());
+                save(&project, &current)?;
+            }
             let _advance = advance_lock(&project)?;
             let prefix =
                 crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
@@ -4087,6 +4098,20 @@ fn merge_batch_run_with(
                 },
                 effects: MergeEffects::default(),
             });
+        }
+        if batch.review_branch.is_none() && owner.review_branch != batch.selection_review_branch {
+            // Review creation completed but we died before sealing the batch
+            // marker. The new branch is already in the round record, even if
+            // advance has since accepted its verdict.
+            let _lock = project.lock()?;
+            let mut current = load(&project, first)?;
+            let branch = current.review_branch.clone().context("review_missing")?;
+            current
+                .batch
+                .as_mut()
+                .context("batch_missing")?
+                .review_branch = Some(branch);
+            save(&project, &current)?;
         }
         if owner.reviewer.is_none() {
             drop(_operation);
@@ -4189,9 +4214,12 @@ fn merge_batch_run_with(
         None => match fresh_merge(ctx, &project, owner.clone(), &git, stop)? {
             FreshMergeOutcome::Done(outcome) => outcome,
             FreshMergeOutcome::BaseMoved { from, to } => {
-                bail!(
-                    "batch_base_moved: `{first}` integration review was for {from}, now {to}; restart the integration review"
-                );
+                drop(_operation);
+                let repair = start_moved_base_repair(ctx, &project, slug, first, &from, &to)?;
+                return Ok(MergeRun {
+                    merge: repair,
+                    effects: MergeEffects::default(),
+                });
             }
         },
     };
@@ -5861,6 +5889,85 @@ mod tests {
             "{error}"
         );
         assert!(load(&fx.project, "r1").unwrap().batch.is_none());
+    }
+
+    #[test]
+    fn batch_repairs_a_base_move_after_its_integration_review() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        finish_batch_review(&fx, &rounds, "MERGE", "");
+        let moved = commit_file(&fx.repo, "later.txt", "later\n", "later round landed");
+        let repair = merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        assert!(matches!(
+            repair.merge,
+            MergeOutcome::RepairReviewStarted { .. }
+        ));
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().expected_head.as_deref(),
+            Some(moved.as_str())
+        );
+        finish_batch_review(&fx, &rounds, "MERGE", "");
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        assert_eq!(load(&fx.project, "r2").unwrap().phase, RoundPhase::Merged);
+    }
+
+    #[test]
+    fn already_accepted_batch_rejection_does_not_start_another_review() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 3);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        finish_batch_review(&fx, &rounds, "REJECT", "r2");
+        let record = load(&fx.project, "r1").unwrap();
+        verdict_commit(&fx.project, &record, &Git::new(ctx.runner, &record.repo)).unwrap();
+        let error = err(merge_batch_run(&ctx, "demo", &rounds, None));
+        assert!(error.contains("batch_rejected: "), "{error}");
+        assert!(load(&fx.project, "r1").unwrap().batch.is_none());
+    }
+
+    #[test]
+    fn batch_recovers_review_marker_after_accepted_rejection() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        let mut owner = load(&fx.project, "r1").unwrap();
+        owner.batch.as_mut().unwrap().review_branch = None;
+        save(&fx.project, &owner).unwrap();
+        finish_batch_review(&fx, &rounds, "REJECT", "r2");
+        let record = load(&fx.project, "r1").unwrap();
+        verdict_commit(&fx.project, &record, &Git::new(ctx.runner, &record.repo)).unwrap();
+        let error = err(merge_batch_run(&ctx, "demo", &rounds, None));
+        assert!(error.contains("batch_rejected: "), "{error}");
+    }
+
+    #[test]
+    fn batch_first_candidate_conflict_reports_branch_instead_of_panicking() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        let record = load(&fx.project, "r1").unwrap();
+        let wt = fx
+            .repo
+            .join(".worktrees")
+            .join(record.review_branch.as_deref().unwrap().replace('/', "-"));
+        commit_file(&wt, "shared.txt", "reviewed\n", "reviewed fix");
+        let sha = git(&wt, &["rev-parse", "HEAD"]);
+        fx.seal_done(
+            record.reviewer.as_ref().unwrap(),
+            1,
+            2,
+            &sha,
+            &front("MERGE", "r1")(&sha, &record),
+        );
+        commit_file(&fx.repo, "shared.txt", "on main\n", "integration change");
+        let error = err(merge_batch_run(&ctx, "demo", &rounds, None));
+        assert!(
+            error.contains("batch_conflict") && error.contains("r1") && error.contains("main"),
+            "{error}"
+        );
     }
 
     #[test]
