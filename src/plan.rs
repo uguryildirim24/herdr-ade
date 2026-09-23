@@ -104,13 +104,24 @@ fn check_task_refs(project: &Project, tasks: &[String]) -> Result<()> {
 /// The whole candidate card, including preserved text and generated
 /// sentences. Refuses invalid language, duplicate identifiers and excess
 /// steps before anything is written (SPEC-talk §6.5).
+fn plan_kind_error(kind: &str) -> String {
+    format!(
+        "plan_kind: `{kind}` is not a result kind (possible values: {})",
+        crate::contracts::PLAN_KINDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn validate(project: &Project, plan: &Plan) -> Result<()> {
     if plan.schema != 1 {
         bail!("plan_schema: expected schema 1, got {}", plan.schema);
     }
     if !plan.kind.is_empty() {
-        let sentence = plan_kind_sentence(&plan.kind)
-            .with_context(|| format!("plan_kind: `{}` is not one of the seven kinds", plan.kind))?;
+        let sentence =
+            plan_kind_sentence(&plan.kind).with_context(|| plan_kind_error(&plan.kind))?;
         if plan.what_you_get != sentence {
             bail!("plan_result: what_you_get must be \"{sentence}\"");
         }
@@ -151,12 +162,15 @@ fn validate(project: &Project, plan: &Plan) -> Result<()> {
 /// One revision-guarded, validated, atomic mutation.
 fn with_plan<T>(
     project: &Project,
-    expect: u64,
+    expect: impl Into<Option<u64>>,
     change: impl FnOnce(&mut Plan) -> Result<T>,
 ) -> Result<(Plan, T)> {
     let _lock = plan_lock(project)?;
     let mut plan = load(project)?.unwrap_or_default();
-    if plan.revision != expect {
+    if expect
+        .into()
+        .is_some_and(|revision| plan.revision != revision)
+    {
         bail!(
             "plan_revision_stale: the plan is at revision {}; pass --expect {}",
             plan.revision,
@@ -190,12 +204,17 @@ fn project_goal(project: &Project) -> String {
         .unwrap_or_default()
 }
 
-/// `ha plan set --kind <kind> --does "<sentence>" --expect <revision>`.
+/// `ha plan set --kind <kind> --does "<sentence>" [--expect <revision>]`.
 /// Preserves the steps and refreshes the goal from `PROJECT.md`.
-pub(crate) fn set(ctx: &Ctx, slug: &str, kind: &str, does: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn set(
+    ctx: &Ctx,
+    slug: &str,
+    kind: &str,
+    does: &str,
+    expect: impl Into<Option<u64>>,
+) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let sentence = plan_kind_sentence(kind)
-        .with_context(|| format!("plan_kind: `{kind}` is not one of the seven kinds"))?;
+    let sentence = plan_kind_sentence(kind).with_context(|| plan_kind_error(kind))?;
     let does = glossary::check_sentence(&project, "does", does)?;
     let goal = project_goal(&project);
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -213,7 +232,7 @@ pub(crate) fn step_add(
     slug: &str,
     text: &str,
     tasks: Vec<String>,
-    expect: u64,
+    expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let text = glossary::check_sentence(&project, "step", text)?;
@@ -244,7 +263,13 @@ pub(crate) fn step_add(
     Ok(plan)
 }
 
-pub(crate) fn step_edit(ctx: &Ctx, slug: &str, id: &str, text: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn step_edit(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    text: &str,
+    expect: impl Into<Option<u64>>,
+) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let text = glossary::check_sentence(&project, "step", text)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -260,7 +285,7 @@ pub(crate) fn step_link(
     slug: &str,
     id: &str,
     tasks: Vec<String>,
-    expect: u64,
+    expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     if tasks.is_empty() {
@@ -285,7 +310,7 @@ pub(crate) fn step_unlink(
     id: &str,
     tasks: Vec<String>,
     why: &str,
-    expect: u64,
+    expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     if tasks.is_empty() {
@@ -300,7 +325,13 @@ pub(crate) fn step_unlink(
     Ok(plan)
 }
 
-pub(crate) fn step_remove(ctx: &Ctx, slug: &str, id: &str, why: &str, expect: u64) -> Result<Plan> {
+pub(crate) fn step_remove(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    why: &str,
+    expect: impl Into<Option<u64>>,
+) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     glossary::check_sentence(&project, "why", why)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -321,7 +352,7 @@ pub(crate) fn step_move(
     slug: &str,
     id: &str,
     before: &str,
-    expect: u64,
+    expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -655,6 +686,34 @@ mod tests {
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.what_you_get, "A command you run.");
         assert_eq!(plan.revision, 3);
+    }
+
+    #[test]
+    fn omitted_expect_uses_locked_revision_and_json_shows_it() {
+        let fx = fixture();
+        set(
+            &fx.world.ctx(),
+            "demo",
+            "screen",
+            "It shows the result.",
+            None,
+        )
+        .unwrap();
+        let plan = step_add(&fx.world.ctx(), "demo", "Build the screen.", vec![], None).unwrap();
+        assert_eq!(plan.revision, 2);
+        let json: serde_json::Value =
+            serde_json::from_str(&show(&fx.world.ctx(), "demo", true).unwrap()).unwrap();
+        assert_eq!(json["revision"], 2);
+        assert!(
+            set(
+                &fx.world.ctx(),
+                "demo",
+                "command",
+                "It runs the task.",
+                Some(0)
+            )
+            .is_err()
+        );
     }
 
     #[test]
