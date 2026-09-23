@@ -574,6 +574,34 @@ pub fn checked_list(project: &Project) -> Result<Vec<RoundRecord>> {
     Ok(records)
 }
 
+fn require_lane_available(
+    project: &Project,
+    thread_id: &str,
+    except_round: Option<&str>,
+) -> Result<()> {
+    let mut records = checked_list(project)?;
+    records.sort_by_key(|record| {
+        round_number(&record.round)
+            .parse::<u64>()
+            .unwrap_or(u64::MAX)
+    });
+    if let Some(record) = records.into_iter().find(|record| {
+        !record.phase.closed()
+            && Some(record.round.as_str()) != except_round
+            && record
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.thread == thread_id)
+    }) {
+        return Err(crate::refusal::error(format!(
+            "round_lane_busy: `{thread_id}` already belongs to open round `{}`; merge or cancel that round before adding the lane to another round",
+            record.round
+        )));
+    }
+    Ok(())
+}
+
 /// Called under the repository lock before a fresh merge intent is written.
 /// Reviews may overlap, but a durable merge transaction owns its integration
 /// ref until checkpointed so another round cannot strand its crash recovery.
@@ -1225,6 +1253,9 @@ pub fn open_with_lanes(
             existing.join(", ")
         );
     }
+    for lane in &lanes {
+        require_lane_available(&project, &lane.id, None)?;
+    }
     let states = if row.task_states.is_empty() {
         settings.task_states
     } else {
@@ -1269,6 +1300,9 @@ pub fn open_with_lanes(
                 "round_exists: `{round}` cannot open because round record `{}` already exists",
                 round_path(&project, &round).display()
             );
+        }
+        for lane in &lanes {
+            require_lane_available(&project, &lane.id, None)?;
         }
         let mut record = record;
         refresh_pins(&project, &mut record, &events)?;
@@ -1325,6 +1359,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
     let lane = thread::load(&project, thread_id)?;
     let record = load(&project, round)?;
     require_editable(&record)?;
+    require_lane_available(&project, thread_id, Some(round))?;
     // Refuse a pin that already landed before any record changes, and never
     // run git under the project lock (D4).
     if !record.repo.is_empty() {
@@ -1340,6 +1375,7 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_editable(&record)?;
+        require_lane_available(&project, thread_id, Some(round))?;
         let before = record.manifest.clone();
         if !record
             .manifest
@@ -4836,6 +4872,56 @@ mod tests {
         ));
         assert!(error.starts_with("round_repo_ambiguous"), "{error}");
         assert!(!round_path(&fx.project, "r2").exists());
+    }
+
+    #[test]
+    fn open_and_admit_refuse_a_lane_owned_by_another_open_round() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lane, _) = fx.lane(1);
+        open_with_lanes(
+            &ctx,
+            "demo",
+            Some("r1".into()),
+            Some("main".into()),
+            Some(PLAIN.into()),
+            Some(fx.repo.to_string_lossy().into_owned()),
+            vec![lane.clone()],
+        )
+        .unwrap();
+
+        let open_error = err(open_with_lanes(
+            &ctx,
+            "demo",
+            Some("r2".into()),
+            Some("main".into()),
+            Some(PLAIN.into()),
+            Some(fx.repo.to_string_lossy().into_owned()),
+            vec![lane.clone()],
+        ));
+        assert!(open_error.starts_with("round_lane_busy"), "{open_error}");
+        assert!(open_error.contains("`r1`"), "{open_error}");
+        assert!(!round_path(&fx.project, "r2").exists());
+
+        open(
+            &ctx,
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        let admit_error = err(admit(&ctx, "demo", "r2", &lane));
+        assert!(admit_error.starts_with("round_lane_busy"), "{admit_error}");
+        assert!(admit_error.contains("`r1`"), "{admit_error}");
+        assert!(load(&fx.project, "r2").unwrap().manifest.members.is_empty());
+
+        cancel(&ctx, "demo", "r1", "the lane will move to the next round").unwrap();
+        let admitted = admit(&ctx, "demo", "r2", &lane).unwrap();
+        assert_eq!(admitted.manifest.members[0].thread, lane);
     }
 
     #[test]
