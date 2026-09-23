@@ -87,6 +87,7 @@ fn read_binding(project: &Project) -> Result<Option<Binding>> {
 enum ConfigShape {
     ClaudeLike,
     Cursor,
+    Pi,
 }
 
 fn settings_path(
@@ -96,6 +97,7 @@ fn settings_path(
     let shape = match adapter.hook.shape.as_str() {
         "claude" => ConfigShape::ClaudeLike,
         "cursor" => ConfigShape::Cursor,
+        "pi" => ConfigShape::Pi,
         _ => return None,
     };
     crate::adapters::settings_path(&project.dir(), adapter).map(|path| (path, shape))
@@ -122,9 +124,38 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
         quote(pane)
     );
     let _lock = project.lock()?;
-    let mut value = read_json_object(&path)?;
-    install_entry(&mut value, shape, &adapter, &command)?;
-    write_json_atomic(&path, &value)?;
+    if shape == ConfigShape::Pi {
+        // pi does not load hooks.json. Remove our old inert entries while
+        // leaving unrelated project settings alone.
+        remove_old_pi_hooks(project, &adapter)?;
+        let argv = vec![
+            binary.to_string_lossy().to_string(),
+            "--root".into(),
+            ctx.root.to_string_lossy().to_string(),
+            "plain".into(),
+            "hook".into(),
+            "--kind".into(),
+            kind.into(),
+            "--project".into(),
+            project.slug.clone(),
+            "--binding".into(),
+            pane.into(),
+        ];
+        let mut prompt = argv.clone();
+        prompt.extend(["--phase".into(), "prompt".into()]);
+        write_json_atomic(
+            &path,
+            &serde_json::json!({
+                "pane": pane,
+                "prompt": prompt,
+                "stop": argv,
+            }),
+        )?;
+    } else {
+        let mut value = read_json_object(&path)?;
+        install_entry(&mut value, shape, &adapter, &command)?;
+        write_json_atomic(&path, &value)?;
+    }
     let dir = project.state_dir().join("plain");
     std::fs::create_dir_all(&dir)?;
     let binding = Binding {
@@ -176,15 +207,39 @@ pub(crate) fn remove(ctx: &Ctx, project: &Project) -> Result<()> {
     let _lock = project.lock()?;
     if let Some(binding) = read_binding(project)? {
         let adapter = crate::adapters::declaration(&ctx.config_dir, &binding.kind)?;
-        if let Some((path, shape)) = settings_path(project, &adapter)
-            && path.exists()
-        {
-            let mut value = read_json_object(&path)?;
-            remove_entries(&mut value, shape, &adapter);
-            write_json_atomic(&path, &value)?;
+        if let Some((path, shape)) = settings_path(project, &adapter) {
+            if shape == ConfigShape::Pi {
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                }
+                remove_old_pi_hooks(project, &adapter)?;
+            } else if path.exists() {
+                let mut value = read_json_object(&path)?;
+                remove_entries(&mut value, shape, &adapter);
+                write_json_atomic(&path, &value)?;
+            }
         }
     }
     let _ = std::fs::remove_file(binding_path(project));
+    Ok(())
+}
+
+fn remove_old_pi_hooks(project: &Project, adapter: &crate::adapters::Adapter) -> Result<()> {
+    let old = project.dir().join(".pi/hooks.json");
+    if old.exists() {
+        let mut value = read_json_object(&old)?;
+        remove_entries(&mut value, ConfigShape::ClaudeLike, adapter);
+        if value["hooks"].as_object().is_some_and(|hooks| {
+            value.as_object().is_some_and(|root| root.len() == 1)
+                && hooks
+                    .values()
+                    .all(|entries| entries.as_array().is_some_and(Vec::is_empty))
+        }) {
+            std::fs::remove_file(old)?;
+        } else {
+            write_json_atomic(&old, &value)?;
+        }
+    }
     Ok(())
 }
 
@@ -276,6 +331,7 @@ fn install_entry(
                 }));
             }
         }
+        ConfigShape::Pi => bail!("pi hooks are written as extension commands"),
     }
     Ok(())
 }
@@ -299,10 +355,22 @@ fn remove_entries(
 fn verify_owned_entry(
     path: &Path,
     pane: &str,
-    _shape: ConfigShape,
+    shape: ConfigShape,
     adapter: &crate::adapters::Adapter,
 ) -> Result<()> {
     let value = read_json_object(path)?;
+    if shape == ConfigShape::Pi {
+        if value["pane"] != pane
+            || !["prompt", "stop"].iter().all(|key| {
+                value[key].as_array().is_some_and(|args| {
+                    args.iter().any(|arg| arg == pane) && args.iter().any(|arg| arg == "hook")
+                })
+            })
+        {
+            bail!("hook_install_failed: pi extension commands did not verify");
+        }
+        return Ok(());
+    }
     let names = &adapter.hook.events;
     let found: usize = names
         .iter()
@@ -980,6 +1048,109 @@ mod tests {
         assert!(crate::talk::recent_requests(&project, 5).is_empty());
     }
 
+    #[test]
+    fn pi_installs_executable_extension_commands_and_removes_inert_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: temp.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let old = project.dir().join(".pi/hooks.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, r#"{"hooks":{"Stop":[{"hooks":[{"command":"ha plain hook --kind pi"}]}],"UserPromptSubmit":[{"hooks":[{"command":"ha plain hook --kind pi --phase prompt"}]}]}}"#).unwrap();
+        install(&ctx, &project, "pi", "w1:p1").unwrap();
+        assert!(!old.exists(), "pi never reads hooks.json");
+        let path = project.dir().join(".pi/herdr-ade-hooks.json");
+        let value = read_json_object(&path).unwrap();
+        assert_eq!(value["pane"], "w1:p1");
+        assert_eq!(
+            value["prompt"].as_array().unwrap().last().unwrap(),
+            "prompt"
+        );
+        assert_eq!(value["stop"].as_array().unwrap().last().unwrap(), "w1:p1");
+        assert!(captures(&project, "w1:p1").unwrap());
+        install(&ctx, &project, "pi", "w1:p1").unwrap();
+        remove(&ctx, &project).unwrap();
+        assert!(!path.exists());
+        assert!(!captures(&project, "w1:p1").unwrap());
+    }
+
+    #[test]
+    fn pi_pane_words_authorize_the_named_recipe_on_that_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r#"[routing]
+default = "named"
+[recipes.named]
+kind = "claude"
+args = ["--dangerously-skip-permissions"]
+plain = "the named helper"
+"#,
+        )
+        .unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            crate::runner::fake::ok("[possible values: pi, claude, agy, cursor-agent, codex]"),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        install(&ctx, &project, "pi", "w1:p1").unwrap();
+        let words = "start a Fable lane";
+        let request = handle_prompt(&project, "w1:p1", words).unwrap().unwrap();
+        let task = crate::task::add(
+            &project,
+            "Run the helper",
+            vec![format!("request:{request}")],
+            vec!["Helper started".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::launch::authorize_explicit_recipe(
+                &ctx,
+                &project,
+                &task.id,
+                "Do the work.",
+                "lane",
+                "named",
+                words
+            )
+            .unwrap(),
+            format!("request:{request}")
+        );
+        crate::talk::mark_automated_prompt(&project, "w1:p1", "Automated priming").unwrap();
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", "Automated priming").unwrap(),
+            None
+        );
+        assert_eq!(
+            handle_prompt(&project, "w1:p1", "<cross-session-message from=\"coordinator\" session_id=\"other\">automated relay</cross-session-message>").unwrap(),
+            None
+        );
+        assert_eq!(crate::talk::recent_requests(&project, 5).len(), 1);
+    }
+
     fn receipt_project() -> (tempfile::TempDir, Project) {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -1025,6 +1196,50 @@ mod tests {
             "w1:p1",
             "session-one"
         ));
+    }
+
+    #[test]
+    fn pi_stop_requires_a_say_then_passes_after_the_receipt() {
+        let (_root, project) = receipt_project();
+        let mut binding = read_binding(&project).unwrap().unwrap();
+        binding.kind = "pi".into();
+        project::write_json(&binding_path(&project), &binding).unwrap();
+        begin_turn(
+            &project,
+            "pi",
+            "w1:p1",
+            "session-one",
+            &serde_json::json!({"prompt": "Hello"}),
+        )
+        .unwrap();
+        assert_eq!(
+            stop_decision(&project, "pi", "w1:p1", "session-one").unwrap(),
+            StopDecision::SendBack
+        );
+        record_receipt_for(&project, "say:s-1", "w1:p1").unwrap();
+        assert_eq!(
+            stop_decision(&project, "pi", "w1:p1", "session-one").unwrap(),
+            StopDecision::Pass
+        );
+    }
+
+    #[test]
+    fn pi_extension_runs_its_prompt_and_stop_handlers() {
+        let result = std::process::Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                "--test",
+                "tests/pi_extension.test.mjs",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("pi requires Node >= 22.19");
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]
