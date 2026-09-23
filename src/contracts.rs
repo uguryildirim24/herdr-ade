@@ -82,8 +82,8 @@ pub(crate) struct LaneCard {
     pub(crate) box_worktree: String,
     /// The exact code base the box fetch verified as `FETCH_HEAD`.
     pub(crate) brief_commit: String,
-    /// The lane branch and the URL-matched remote it publishes to
-    /// (SPEC-remote §4.2 step 7). `ha done` checks the published ref.
+    /// The lane branch and URL-matched remote that `ha done` publishes to
+    /// (SPEC-remote §4.2 step 7).
     pub(crate) branch: String,
     pub(crate) publish_url: String,
     pub(crate) recipient: Recipient,

@@ -96,7 +96,7 @@ The Mac login does not count. Rolf signs each provider in once on the box
 box gates the start, and `herdr-pi doctor` shows the per-machine rows. Never
 copy `auth.json` or any Mac credential to the box.
 
-A box pi lane publishes its branch, seals with `ha done` on the box, and is
+On the box, `ha done` publishes a pi lane's branch and seals its event. The lane is
 restarted from the brief after a reboot or resize like any other box lane.
 
 ## What a pi lane must not do

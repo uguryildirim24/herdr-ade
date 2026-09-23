@@ -4,7 +4,7 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 
 - Continue the current attempt. A repeated skill call does not restart the task.
 - Do the task in your recorded git folder. A code task gets a worktree; a task with no code repository gets a project-owned git folder. If something is missing, report exactly what is missing instead of guessing.
-- `round merge` pushes the integration branch to its configured remote; a lane never pushes it or `main`. A cloud-box lane publishes only its own lane branch before `done` (see *On the cloud box*, below).
+- `round merge` publishes the integration branch. On the cloud box, `ha done` publishes only your lane branch; on the Mac, `done` does not publish.
 - Keep agent-plane names and technical detail in reports. Messages meant for Rolf use the plugin's plain-language commands.
 - Do not edit project memory. Put durable lessons in your report for the coordinator to decide.
 - Never add a throwaway tab or pane to your lane workspace or to the watched session. Run visual checks and probes in the isolated session `herdr --session scratch-<lane id> ...` on your lane's machine. When done, run `herdr session stop scratch-<lane id>` and `herdr session delete scratch-<lane id>`; resolve also removes a leftover session.
@@ -53,6 +53,6 @@ A brief that says you run on the cloud box named `oci` runs on a saved machine, 
 
 - The code branch is pinned to an exact Mac commit. The frozen brief arrives separately in `.herdr-project/<project>-<id>/brief.md`; it is never committed to the code repository.
 - Every kind logs in once per machine. If your kind is not signed in on the box, stop and run `ha waiting "<kind> is not signed in on the box"`; never copy a Mac credential across.
-- Publish before done: commit your code, push the lane branch to the URL-matched remote, then run `ha done`. A `done` without the published ref is refused.
+- Commit your code, then run `ha done`. It publishes your lane branch to the recorded remote and verifies the ref before sealing. If publishing fails, it tells you what went wrong; retry `ha done` after the issue is resolved.
 - `ha done`, `ha waiting` and `ha failed` seal locally on the box. They do not deliver to the coordinator; the Mac courier carries the sealed event home.
 - After a reboot or a resize the old attempt is GONE. The coordinator restarts you from the exact start line in the brief; never resume a cold shell.
