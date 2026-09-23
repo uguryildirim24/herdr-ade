@@ -2444,6 +2444,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                         recipe,
                         recipe_basis: basis,
                         task_id: task_id.clone(),
+                        review_round: String::new(),
                     },
                 )?;
                 if !task_id.is_empty() {
