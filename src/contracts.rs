@@ -592,7 +592,9 @@ pub(crate) struct CheckpointIntent {
     pub(crate) parent: String,
     pub(crate) op: String,
     pub(crate) payload_hash: String,
-    /// Content-addressed handoff bundle in project state.
+    /// Content-addressed handoff bundle in project state. Empty on rounds
+    /// checkpointed before bundles existed; their handoff is the H commit.
+    #[serde(default)]
     pub(crate) artifact: String,
 }
 
