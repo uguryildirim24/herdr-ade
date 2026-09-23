@@ -1392,6 +1392,23 @@ fn date(timestamp: &str) -> &str {
     &timestamp[..timestamp.len().min(10)]
 }
 
+/// A held task is a single row in the list; `task show` retains its full evidence.
+pub(crate) fn render_list(project: &Project, view: &View) -> String {
+    let Some(wait) = active_wait(project, &view.record) else {
+        return render(project, view);
+    };
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "{} [{}] {} — next: {} — waits on {}: {}\n",
+        view.record.id,
+        view.status(),
+        one_line(&view.record.title),
+        one_line(&view.next),
+        wait.kind,
+        one_line(&wait.target)
+    )
+}
+
 pub(crate) fn render(project: &Project, view: &View) -> String {
     let mut out = format!(
         "{} [{}] {}\n",

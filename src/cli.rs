@@ -2558,7 +2558,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 }
                 let message = views
                     .iter()
-                    .map(|view| crate::task::render(&project, view))
+                    .map(|view| crate::task::render_list(&project, view))
                     .collect::<Vec<_>>()
                     .join("");
                 crate::output::success(
