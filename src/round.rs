@@ -2191,7 +2191,8 @@ pub fn advance(ctx: &Ctx, slug: &str) -> Result<AdvanceOutcome> {
             let state = reviewer_state(ctx, &project, &reviewer);
             let git = Git::new(ctx.runner, &record.repo);
             if let Some(verdict) = read_verdict_checked(&project, &record, &git)? {
-                if record.phase != RoundPhase::VerdictIn {
+                let accepted = load(&project, &round)?;
+                if record.verdict != accepted.verdict {
                     outcome.acted(&round);
                     outcome.verdicts.push((round.clone(), verdict.clone()));
                 }
@@ -5527,6 +5528,17 @@ mod tests {
             advance(&fx.world.ctx(), "demo").unwrap().message(),
             "nothing to do for r1\n"
         );
+        // A second seal can replace a verdict without resetting the phase.
+        // Advance must report the newly accepted completion, not "nothing".
+        fx.seal_done(
+            &reviewer,
+            1,
+            2,
+            &candidate,
+            &front("MERGE", "r1")(&candidate, &record),
+        );
+        let newer = advance(&fx.world.ctx(), "demo").unwrap();
+        assert_eq!(newer.verdicts, vec![("r1".into(), "MERGE".into())]);
     }
 
     #[test]
