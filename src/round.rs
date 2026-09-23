@@ -4430,11 +4430,18 @@ pub fn forward_lanes(
             out.push(format!("{}: record unreadable, skipped", m.thread));
             continue;
         };
-        if t.worktree_path.is_empty() || t.is_remote() {
+        // A resolved lane is finished: its record, not a checkout probe,
+        // decides that there is nothing left to forward. Resolve may have
+        // kept a path after removing the folder.
+        if t.status == thread::Status::Resolved || t.worktree_path.is_empty() || t.is_remote() {
             out.push(format!("{}: no local worktree", m.thread));
             continue;
         }
         let dir = PathBuf::from(&t.worktree_path);
+        if !dir.is_dir() {
+            out.push(format!("{}: no local worktree", m.thread));
+            continue;
+        }
         let latest = latest_event(&events, &m.thread, pin.attempt).map(|e| e.id.clone());
         if latest.as_deref() != Some(pin.event.as_str()) {
             out.push(format!("{}: not released (a newer event exists)", m.thread));
@@ -6258,6 +6265,78 @@ mod tests {
             }
         });
         assert!(free, "the lock is released when the holder drops it");
+    }
+
+    #[test]
+    fn checkpoint_tick_never_probes_resolved_or_missing_lane_folders() {
+        use crate::contracts::{MergeIntent, MergePhase};
+
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (resolved, resolved_sha) = fx.lane(1);
+        let (missing, missing_sha) = fx.lane(2);
+        for (id, sha) in [(&resolved, &resolved_sha), (&missing, &missing_sha)] {
+            fx.seal_done(id, 1, 1, sha, "# report\n");
+            admit(&ctx, "demo", "r1", id).unwrap();
+        }
+        let resolved_path = thread::load(&fx.project, &resolved).unwrap().worktree_path;
+        let missing_path = thread::load(&fx.project, &missing).unwrap().worktree_path;
+        thread::update(&fx.project, &resolved, |t| {
+            t.status = thread::Status::Resolved
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&missing_path).unwrap();
+        let head = git(&fx.repo, &["rev-parse", "HEAD"]);
+        write_merge(
+            &fx.project,
+            "r1",
+            &MergeIntent {
+                op: "test".into(),
+                expected_old: head.clone(),
+                candidate: head.clone(),
+                verdict: head.clone(),
+                phase: MergePhase::Checkpointed,
+                merged: Some(head.clone()),
+                checkpoint: None,
+                head: Some(head.clone()),
+            },
+        )
+        .unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        std::fs::create_dir_all(merge_dir(&fx.project, "r1")).unwrap();
+        let repo = Git::new(ctx.runner, &record.repo);
+        fx.world.runner.calls.borrow_mut().clear();
+        let result = forward_lanes(&ctx, &fx.project, &record, &repo, &head);
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .all(|line| line.ends_with("no local worktree"))
+        );
+        assert!(
+            fx.world.runner.calls.borrow().iter().all(|call| {
+                call.program != "git"
+                    || !call.display().contains(&resolved_path)
+                        && !call.display().contains(&missing_path)
+            }),
+            "forward_lanes probed a finished or missing checkout"
+        );
+        fx.world.runner.calls.borrow_mut().clear();
+        tick(&ctx, &fx.project).unwrap();
+        assert!(
+            merge_dir(&fx.project, "r1")
+                .join("lanes-forwarded")
+                .exists()
+        );
+        assert!(
+            fx.world.runner.calls.borrow().iter().all(|call| {
+                call.program != "git"
+                    || !call.display().contains(&resolved_path)
+                        && !call.display().contains(&missing_path)
+            }),
+            "the background round tick probed a finished or missing checkout"
+        );
     }
 
     #[test]
