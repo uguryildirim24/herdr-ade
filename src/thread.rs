@@ -345,10 +345,16 @@ pub(crate) fn list(project: &Project) -> Vec<Thread> {
     }) {
         return found;
     }
-    let rows = list_with_errors(project).0;
+    let (rows, errors) = list_with_errors(project);
+    // An unreadable directory or record is not a stable empty/partial list.
+    // A repaired record may keep its parent's directory stamp unchanged.
     TICKER_LISTS.with(|cache| {
         if let Some(cache) = cache.borrow_mut().as_mut() {
-            cache.insert(dir, (stamp, rows.clone()));
+            if errors.is_empty() {
+                cache.insert(dir, (stamp, rows.clone()));
+            } else {
+                cache.remove(&dir);
+            }
         }
     });
     rows
@@ -1361,6 +1367,21 @@ mod tests {
         write_record(&project, &original).unwrap();
         update(&project, &original.id, |t| t.title = "Updated".into()).unwrap();
         assert_eq!(list(&project)[0].title, "Updated");
+    }
+
+    #[test]
+    fn ticker_retries_unreadable_records_without_directory_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        let lane = allocate(&project, |t| t.title = "Original".into()).unwrap();
+        let path = threads_dir(&project).join(format!("{}.toml", lane.id));
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "invalid = [").unwrap();
+        let _cache = ListCache::new();
+        assert!(list(&project).is_empty());
+        // Repair in place, not via the atomic writer: no directory rename.
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(list(&project)[0].title, "Original");
     }
 
     #[test]
