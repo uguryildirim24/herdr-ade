@@ -1072,72 +1072,79 @@ fn record_task_proofs(
         let project = crate::project::Project::load(&ctx.root, &slug)?;
         let mut changed = false;
         let evidence = crate::task::EvidenceSnapshot::load(&project);
-        for task in crate::task::list_with_errors(&project).0 {
-            if !task.dropped.is_empty() {
-                continue;
-            }
-            if !crate::task::required_states_with_evidence(&project, &task, &evidence)?
-                .iter()
-                .any(|state| state == "installed")
-            {
-                continue;
-            }
-            let rounds: Vec<_> = task
-                .rounds
-                .iter()
-                .filter_map(|id| crate::round::load(&project, id).ok())
-                .filter(|round| round.phase == crate::contracts::RoundPhase::Merged)
-                .collect();
-            let mut task_builds = Vec::new();
-            for build in builds {
-                let mut carried = false;
-                for round in &rounds {
-                    let same_repo = canonical_or(&round.repo) == canonical_or(&build.repo);
-                    let head = round.merge.as_ref().and_then(|merge| merge.head.as_deref());
-                    if same_repo
-                        && let Some(head) = head
-                        && round_in_build(ctx, &build.repo, head, &build.head)?
-                    {
-                        carried = true;
-                        break;
+        let writes = (|| -> Result<()> {
+            for task in crate::task::list_with_errors(&project).0 {
+                if !task.dropped.is_empty() {
+                    continue;
+                }
+                if !crate::task::required_states_with_evidence(&project, &task, &evidence)?
+                    .iter()
+                    .any(|state| state == "installed")
+                {
+                    continue;
+                }
+                let rounds: Vec<_> = task
+                    .rounds
+                    .iter()
+                    .filter_map(|id| crate::round::load(&project, id).ok())
+                    .filter(|round| round.phase == crate::contracts::RoundPhase::Merged)
+                    .collect();
+                let mut task_builds = Vec::new();
+                for build in builds {
+                    let mut carried = false;
+                    for round in &rounds {
+                        let same_repo = canonical_or(&round.repo) == canonical_or(&build.repo);
+                        let head = round.merge.as_ref().and_then(|merge| merge.head.as_deref());
+                        if same_repo
+                            && let Some(head) = head
+                            && round_in_build(ctx, &build.repo, head, &build.head)?
+                        {
+                            carried = true;
+                            break;
+                        }
+                    }
+                    if carried {
+                        crate::task::record_installed_deferred(
+                            &project,
+                            &task.id,
+                            &build.machine,
+                            &build.head,
+                        )?;
+                        changed = true;
+                        task_builds.push(build.clone());
+                        recorded.push(TaskInstallProof {
+                            project: slug.clone(),
+                            task: task.id.clone(),
+                            machine: build.machine.clone(),
+                            build: build.head.clone(),
+                            running_processes: processes_pass,
+                        });
                     }
                 }
-                if carried {
-                    crate::task::record_installed_deferred(
+                if processes_pass && !task_builds.is_empty() {
+                    let task_machines = task_builds
+                        .iter()
+                        .map(|build| build.machine.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    crate::task::record_running_deferred(
                         &project,
                         &task.id,
-                        &build.machine,
-                        &build.head,
+                        task_machines,
+                        process_lines.clone(),
                     )?;
-                    changed = true;
-                    task_builds.push(build.clone());
-                    recorded.push(TaskInstallProof {
-                        project: slug.clone(),
-                        task: task.id.clone(),
-                        machine: build.machine.clone(),
-                        build: build.head.clone(),
-                        running_processes: processes_pass,
-                    });
                 }
             }
-            if processes_pass && !task_builds.is_empty() {
-                let task_machines = task_builds
-                    .iter()
-                    .map(|build| build.machine.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                crate::task::record_running_deferred(
-                    &project,
-                    &task.id,
-                    task_machines,
-                    process_lines.clone(),
-                )?;
-            }
-        }
-        if changed {
-            crate::project::refresh_page(&project)?;
-        }
+            Ok(())
+        })();
+        let refreshed = if changed {
+            crate::project::refresh_page(&project)
+        } else {
+            Ok(())
+        };
+        writes?;
+        refreshed?;
     }
     Ok(recorded)
 }
@@ -2029,6 +2036,32 @@ mod tests {
                 .unwrap()
                 .installed
                 .is_empty()
+        );
+
+        // If a later ancestry check fails, the first deferred write must
+        // still be reflected in the page before the error is returned.
+        world.runner.on("yes-head broken-head", ok(""));
+        world.runner.on("no-head broken-head", fail(128, "bad git"));
+        let mut result = None;
+        let reads = crate::events::count_event_reads(|| {
+            result = Some(record_task_proofs(
+                &world.ctx(),
+                &[InstalledBuild {
+                    repo: repo.to_string_lossy().into_owned(),
+                    machine: "oci".into(),
+                    head: "broken-head".into(),
+                }],
+                &[],
+            ));
+        });
+        assert!(result.unwrap().is_err());
+        assert_eq!(reads, 2, "the partial write still gets one page rebuild");
+        assert_eq!(
+            crate::task::load(&project, "job-0001")
+                .unwrap()
+                .installed
+                .len(),
+            2
         );
     }
 }
