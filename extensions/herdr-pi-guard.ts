@@ -1,4 +1,4 @@
-// herdr-pi-guard:version=3
+// herdr-pi-guard:version=4
 // Plugin-owned pi extension (SPEC-pi v2 §3.7, §3.10). Written by
 // setup and every harness install; doctor compares the complete file.
 //
@@ -10,6 +10,46 @@
 // It never runs a login, never retries, and never runs `ha done`.
 // @ts-nocheck
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { spawn } from "node:child_process";
+
+// pi has no hooks.json. ADE installs these commands in the coordinator's
+// project; the global extension runs them only in its bound pane.
+function commands(ctx) {
+  const pane = process.env.HERDR_PANE_ID;
+  // ADE owns this file, not pi's project-local extension loader; pi's normal
+  // defaultProjectTrust is `never` for ADE projects.
+  if (!pane) return null;
+  try {
+    const value = JSON.parse(readFileSync(join(ctx.cwd, ".pi/herdr-ade-hooks.json"), "utf8"));
+    if (value.pane !== pane) return null;
+    if (![value.prompt, value.stop].every((argv) =>
+      Array.isArray(argv) && argv.length > 1 && argv.every((arg) => typeof arg === "string"))) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function hook(argv, payload) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill(), 10000);
+    child.on("error", reject);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) reject(new Error(`ADE hook exited ${code}: ${stderr.trim()}`));
+      else resolve(stdout);
+    });
+    child.stdin.end(JSON.stringify(payload));
+  });
+}
+
 const CLASSES = ["limit", "login", "unreachable", "error"];
 const THROTTLE_MS = 10 * 60 * 1000;
 const DETAIL_MAX = 120;
@@ -20,6 +60,53 @@ export default function (pi) {
   let pendingError = null; // { message, status }
   let lastStatus = null;
   const lastSentAt = new Map(); // class -> epoch ms
+  let activeHook = null;
+  let corrections = 0;
+
+  pi.on("input", async (event, ctx) => {
+    // sendUserMessage corrections are extension delivery, not Rolf's words.
+    if (event.source === "extension") return;
+    const config = commands(ctx);
+    if (!config) return;
+    const payload = {
+      prompt: event.text,
+      session_id: ctx.sessionManager.getSessionId(),
+      cwd: ctx.cwd,
+    };
+    try {
+      await hook(config.prompt, payload);
+      activeHook = { config, payload };
+      corrections = 0;
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(`ADE prompt check failed: ${error}`, "error");
+      return { action: "handled" }; // never let an unrecorded request through
+    }
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!activeHook) return;
+    const { config, payload } = activeHook;
+    try {
+      const output = await hook(config.stop, payload);
+      const response = JSON.parse(output || "null");
+      if (response?.decision === "block" && typeof response.reason === "string") {
+        // Unlike Claude's native Stop hook, pi needs an explicit next message.
+        // Bound the retry just as the native hook does; keep the failed turn
+        // visible if the coordinator still does not publish a receipt.
+        if (++corrections <= 3) pi.sendUserMessage(response.reason, { deliverAs: "followUp" });
+        else {
+          activeHook = null;
+          if (ctx.hasUI) ctx.ui.notify(response.reason, "error");
+        }
+      } else {
+        activeHook = null;
+      }
+    } catch (error) {
+      activeHook = null;
+      if (ctx.hasUI) ctx.ui.notify(`ADE stop check failed: ${error}`, "error");
+      throw error;
+    }
+  });
 
   function first120(text) {
     const one = String(text ?? "").replace(/\s+/g, " ").trim();
