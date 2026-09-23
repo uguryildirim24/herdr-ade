@@ -504,6 +504,78 @@ pub(crate) fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(Stri
     Ok((text, items))
 }
 
+/// One bounded git query per configured repo; never confuse absent upstream
+/// tracking with an up-to-date remote. Document names come from that repo's
+/// root, not from ADE's project folder.
+fn repo_snapshot(runner: &dyn crate::runner::Runner, path: &str) -> String {
+    use crate::runner::Cmd;
+    use std::time::Duration;
+
+    if !std::path::Path::new(path).is_dir() {
+        return format!("{path}: missing or unreadable repository");
+    }
+    let output = runner.run(&Cmd::new("git", Duration::from_secs(5)).args([
+        "-C",
+        path,
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        "--ahead-behind",
+        "--untracked-files=normal",
+    ]));
+    let status = match output {
+        Ok(result) if result.success() => result.stdout,
+        _ => return format!("{path}: missing or unreadable repository"),
+    };
+    let mut lines = status.lines();
+    let header = lines.next().unwrap_or("");
+    let Some(header) = header.strip_prefix("## ") else {
+        return format!("{path}: unreadable repository status");
+    };
+    let branch = header
+        .split_once("...")
+        .map(|(branch, _)| branch)
+        .unwrap_or(header)
+        .split([' ', '['])
+        .next()
+        .unwrap_or("unknown");
+    let state = if lines.next().is_some() {
+        "dirty"
+    } else {
+        "clean"
+    };
+    let remote = if let Some((_, tracking)) = header.split_once("...") {
+        let upstream = tracking.split([' ', '[']).next().unwrap_or("");
+        let ahead = tracking
+            .split("ahead ")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .unwrap_or("0");
+        let behind = tracking
+            .split("behind ")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .unwrap_or("0");
+        format!("ahead {ahead}, behind {behind} {upstream}")
+    } else {
+        "no tracking remote".to_string()
+    };
+    let docs: Vec<_> = ["STATE.md", "HANDOFF.md", "README.md"]
+        .into_iter()
+        .filter(|name| {
+            std::fs::metadata(std::path::Path::new(path).join(name)).is_ok_and(|m| m.is_file())
+        })
+        .collect();
+    format!(
+        "{path}: {branch}, {state}, {remote}; documents: {}",
+        if docs.is_empty() {
+            "none".to_string()
+        } else {
+            docs.join(", ")
+        }
+    )
+}
+
 fn digest_snapshot(
     ctx: &Ctx,
     project: &Project,
@@ -517,6 +589,15 @@ fn digest_snapshot(
         }
         Err(error) => {
             let _ = writeln!(out, "# Project\n\nconfig-error: PROJECT.md: {error:#}");
+        }
+    }
+
+    if let Ok((settings, _)) = project.read_project_md()
+        && !settings.repos.is_empty()
+    {
+        let _ = writeln!(out, "\n## Repositories");
+        for repo in &settings.repos {
+            let _ = writeln!(out, "- {}", repo_snapshot(ctx.runner, &repo.path));
         }
     }
 
@@ -866,6 +947,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_reports_the_repo_not_just_the_project_records() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("STATE.md"), "history").unwrap();
+        std::fs::write(repo.join("HANDOFF.md"), "handoff").unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        world.runner.on(
+            "status --porcelain=v1 --branch",
+            crate::runner::fake::ok("## main...origin/main [ahead 6, behind 2]\n M file\n"),
+        );
+        let (text, _) = digest(&world.ctx(), &project, "ha").unwrap();
+        assert!(
+            text.contains(&format!(
+                "{}: main, dirty, ahead 6, behind 2 origin/main; documents: STATE.md, HANDOFF.md",
+                repo.display()
+            )),
+            "{text}"
+        );
+        assert!(repo_snapshot(&world.runner, "/missing").contains("missing or unreadable"));
+    }
+
+    #[test]
     fn merged_round_with_a_removed_member_worktree_does_not_probe_it_in_context() {
         use crate::contracts::{MergeIntent, MergePhase, RoundPhase};
         use crate::round::testkit::fixture;
@@ -914,12 +1019,9 @@ mod tests {
         let (text, _) = digest(&ctx, &fx.project, "ha").unwrap();
         assert!(text.contains("# Project"), "{text}");
         assert!(
-            fx.world
-                .runner
-                .calls
-                .borrow()
-                .iter()
-                .all(|call| call.program != "git"),
+            fx.world.runner.calls.borrow().iter().all(|call| !call
+                .display()
+                .contains(&missing.to_string_lossy().to_string())),
             "context probed a resolved round member's removed checkout"
         );
     }

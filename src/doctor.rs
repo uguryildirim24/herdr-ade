@@ -598,11 +598,45 @@ fn report_with_checks(
         }
     }
 
+    if let Ok(repos) = crate::harness::repos(config_dir) {
+        for repo in repos {
+            if repo.box_path.is_some()
+                && repo
+                    .publish_url
+                    .as_deref()
+                    .is_none_or(|url| url.trim().is_empty())
+            {
+                check(
+                    &mut out,
+                    Some(false),
+                    &format!("harness repo {}", repo.path),
+                    "box_path has no publish_url; add the URL of the remote that publishes the lane branch".into(),
+                );
+            }
+        }
+    }
     for slug in project::list_slugs(root) {
         let Ok(project) = project::Project::load(root, &slug) else {
             continue;
         };
         let label = format!("project {slug}");
+        if let Ok((settings, _)) = project.read_project_md() {
+            for repo in &settings.repos {
+                if repo.box_path.is_some()
+                    && repo
+                        .publish_url
+                        .as_deref()
+                        .is_none_or(|url| url.trim().is_empty())
+                {
+                    check(
+                        &mut out,
+                        Some(false),
+                        &format!("{label} repo {}", repo.path),
+                        "box_path has no publish_url; add the URL of the remote that publishes the lane branch".into(),
+                    );
+                }
+            }
+        }
         if let Some(warning) = crate::thread::memory_use(&project).warning() {
             check(&mut out, None, &format!("{label} memory"), warning);
         }
@@ -3103,6 +3137,37 @@ recipe = "claude_fable_xhigh"
         );
         assert!(text.contains("[ok  ] box oci pi openai-codex"), "{text}");
         assert!(!text.contains("box oci login"), "{text}");
+    }
+
+    #[test]
+    fn doctor_flags_unpublishable_project_repo_even_without_a_coordinator() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        crate::project::create(
+            &root,
+            "demo",
+            "",
+            vec![crate::project::Repo {
+                path: "/repo".into(),
+                box_path: Some("/box/repo".into()),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy);
+        assert!(
+            text.contains("[FAIL] project demo repo /repo: box_path has no publish_url"),
+            "{text}"
+        );
     }
 
     #[test]

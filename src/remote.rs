@@ -270,10 +270,14 @@ pub(crate) fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Resu
 /// every trailing `/` and every trailing `.git` removed. `https://…/repo` and
 /// `https://…/repo.git` are the same remote, however it was written down.
 fn normalize_url(url: &str) -> String {
-    url.trim()
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_string()
+    let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    if let Some(repo) = url.strip_prefix("git@github.com:") {
+        format!("https://github.com/{repo}")
+    } else if let Some(repo) = url.strip_prefix("ssh://git@github.com/") {
+        format!("https://github.com/{repo}")
+    } else {
+        url.to_string()
+    }
 }
 
 fn same_url(a: &str, b: &str) -> bool {
@@ -290,6 +294,10 @@ while [ \"${u#[[:space:]]}\" != \"$u\" ]; do u=${u#[[:space:]]}; done\n\
 while [ \"${u%[[:space:]]}\" != \"$u\" ]; do u=${u%[[:space:]]}; done\n\
 while [ \"${u%/}\" != \"$u\" ]; do u=${u%/}; done\n\
 while [ \"${u%.git}\" != \"$u\" ]; do u=${u%.git}; done\n\
+case \"$u\" in\n\
+  git@github.com:*) u=\"https://github.com/${u#git@github.com:}\" ;;\n\
+  ssh://git@github.com/*) u=\"https://github.com/${u#ssh://git@github.com/}\" ;;\n\
+esac\n\
 printf '%s' \"$u\"\n\
 }\n";
 
@@ -761,7 +769,7 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
         let runner = FakeRunner::new();
         runner.on(
             "git -C /repo remote get-url fork",
-            ok("https://github.com/uguryildirim24/herdr.git\n"),
+            ok("git@github.com:uguryildirim24/herdr.git\n"),
         );
         runner.on(
             "git -C /repo remote get-url origin",
@@ -803,6 +811,14 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
 
     #[test]
     fn the_box_shell_url_normalization_matches_the_mac_rule() {
+        assert!(same_url(
+            "git@github.com:user/repo.git",
+            "https://github.com/user/repo.git"
+        ));
+        assert!(!same_url(
+            "git@github.com:user/other.git",
+            "https://github.com/user/repo.git"
+        ));
         let urls = [
             "https://github.com/user/repo",
             "https://github.com/user/repo.git",
@@ -811,6 +827,7 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
             "https://github.com/user/repo.git.git",
             "  https://github.com/user/repo.git  ",
             "git@github.com:user/repo.git",
+            "ssh://git@github.com/user/repo.git",
             "a/b/.git",
         ];
         for url in urls {

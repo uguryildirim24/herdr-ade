@@ -304,6 +304,7 @@ fn start_with_ticker(
         };
         t.repo = repo.clone();
         t.machine = machine.clone();
+        t.placement_reason = placement.reason.clone();
         t.machine_id = machine_id.clone();
         t.agent = launch.kind.clone();
         t.base = args.base.clone().unwrap_or_default();
@@ -3315,6 +3316,18 @@ pub fn print_list(ctx: &Ctx, slug: &str) -> Result<()> {
     Ok(())
 }
 
+fn placement_summary(record: &Thread) -> String {
+    let machine = if record.machine.is_empty() {
+        "local"
+    } else {
+        &record.machine
+    };
+    format!(
+        "runs_on = {machine:?}\nplacement = {:?}\n",
+        record.placement_reason
+    )
+}
+
 pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -3322,6 +3335,7 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let row = row(&record, view.as_ref(), jiff::Timestamp::now());
     println!("group = {:?}", row.group.label());
     println!("live = {:?}", row.note);
+    print!("{}", placement_summary(&record));
     print!("{}", toml::to_string(&record)?);
     if let Some(attestation) = done_attestation(&project, &record) {
         println!(
@@ -4453,6 +4467,10 @@ mod tests {
         .unwrap();
         assert!(started.machine.is_empty());
         assert_eq!(started.launch.machine, "local");
+        assert!(started.placement_reason.contains("box_publish_url_missing"));
+        let summary = placement_summary(&thread::load(&fx.project, &started.id).unwrap());
+        assert!(summary.contains("runs_on = \"local\""), "{summary}");
+        assert!(summary.contains("box_publish_url_missing"), "{summary}");
         assert!(
             started
                 .worktree_path
