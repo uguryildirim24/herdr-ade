@@ -112,6 +112,27 @@ pub(crate) fn registry(project: &Project) -> Glossary {
     }
     let stored = terms(project);
     let mut familiar_names = std::collections::BTreeSet::new();
+    // A coordinator may talk about any project under this root, not only its
+    // own. PROJECT.md's single-word name and --name terms are recorded short
+    // forms; a broken project record must not hide its valid slug.
+    for slug in project::list_slugs(&project.root) {
+        familiar_names.insert(slug.to_ascii_lowercase());
+        if let Ok(other) = Project::load(&project.root, &slug) {
+            if let Ok((settings, _)) = other.read_project_md() {
+                let short = settings.name.trim();
+                if !short.is_empty() && short.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                {
+                    familiar_names.insert(short.to_ascii_lowercase());
+                }
+            }
+            familiar_names.extend(
+                terms(&other)
+                    .into_iter()
+                    .filter(|t| t.familiar)
+                    .map(|t| t.name.to_ascii_lowercase()),
+            );
+        }
+    }
     familiar_names.insert(project.slug.to_ascii_lowercase());
     familiar_names.extend(
         stored
