@@ -2691,7 +2691,6 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
             "checkpoint",
             "ask",
             "say",
-            "talk",
         ]
     );
     let runner = FakeRunner::new();
@@ -2810,25 +2809,6 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
         ]))
         .unwrap();
     assert!(ask.success());
-
-    // talk (SPEC-ADE D18)
-    let talk = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "tab",
-            "create",
-            "--workspace",
-            "w1",
-            "--cwd",
-            "/project",
-            "--label",
-            "talk",
-            "--no-focus",
-        ]))
-        .unwrap();
-    assert_eq!(
-        parse_json_stdout(&talk)["result"]["root_pane"]["pane_id"],
-        "w1:p-talk"
-    );
 }
 
 // ---------------------------------------------------------- harness (t-0054)
