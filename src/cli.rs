@@ -111,6 +111,9 @@ enum Command {
         /// Print without recording the inbox items as seen
         #[arg(long)]
         peek: bool,
+        /// Include unchanged standing notes and historical work
+        #[arg(long)]
+        full: bool,
     },
     /// Print threads grouped by what needs you
     Overview {
@@ -2219,7 +2222,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 recipe_basis: basis,
             },
         ),
-        Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
+        Command::Context { slug, peek, full } => coordinator::context(&ctx, &slug, peek, full),
         Command::Overview {
             slug,
             history,
