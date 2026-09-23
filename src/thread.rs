@@ -895,6 +895,17 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     if thread.status == Status::Failed || stuck_launch || pane_gone_without_report || blocked_long {
         return Group::WaitingOnYou;
     }
+    // A listed pane without a matching agent is evidence only that the agent
+    // state is unknown. While the first bounded launch attempts are still
+    // pending it remains Working; after that it waits for evidence or a
+    // coordinator action without being declared gone.
+    if live.pane_exists
+        && state.is_none()
+        && !has_report
+        && (!thread.prompt_pending || thread.launch_attempts >= MAX_LAUNCH_ATTEMPTS)
+    {
+        return Group::Unknown;
+    }
     // 4
     if matches!(state, Some("working") | Some("blocked")) || thread.prompt_pending {
         return Group::Working;
@@ -944,18 +955,24 @@ pub(crate) fn live_state(
     now: jiff::Timestamp,
 ) -> Live {
     let agent = agents.iter().find(|a| agent_matches(thread, a));
-    let pane_exists = agent.is_some() || panes.iter().any(|p| pane_matches(thread, p));
-    // A pane whose ids match but which holds someone else's agent is not ours.
-    let foreign = agent.is_none()
-        && agents.iter().any(|a| a.pane_id == thread.pane_id)
-        && thread.kind != Kind::Adopted;
+    // The matching pane list row, or any agent row with the same terminal
+    // identity, proves the pane still exists. A different/missing agent name
+    // makes agent state unknown; it does not make the pane disappear.
+    let pane_exists = agent.is_some()
+        || panes.iter().any(|p| pane_matches(thread, p))
+        || agents.iter().any(|a| {
+            a.pane_id == thread.pane_id
+                && a.workspace_id == thread.workspace_id
+                && a.tab_id == thread.tab_id
+                && a.cwd == thread.cwd
+        });
     let agent_state = agent.map(|a| a.agent_status.clone());
     let state_secs = match &agent_state {
         Some(state) if *state == thread.last_state => seconds_since(&thread.last_state_change, now),
         _ => 0,
     };
     Live {
-        pane_exists: pane_exists && !foreign,
+        pane_exists,
         agent_state,
         state_secs,
     }
@@ -1350,6 +1367,14 @@ mod tests {
             ..open_thread()
         };
         assert_eq!(group(&pending, &live(None, 0), now()), Group::Working);
+        let attempts_exhausted = Thread {
+            launch_attempts: MAX_LAUNCH_ATTEMPTS,
+            ..pending.clone()
+        };
+        assert_eq!(
+            group(&attempts_exhausted, &live(None, 0), now()),
+            Group::Unknown
+        );
         assert_eq!(
             group(&pending, &live(Some("unknown"), 59), now()),
             Group::Working
@@ -1488,10 +1513,12 @@ mod tests {
         assert!(agent_matches(&t, &agent("hp-demo-t-0001", "/wt")));
         assert!(!agent_matches(&t, &agent("hp-demo-t-0002", "/wt")));
         assert!(!agent_matches(&t, &agent("hp-demo-t-0001", "/other")));
-        // Same ids but someone else's agent: treated as gone.
+        // Same terminal ids but someone else's agent prove the pane exists;
+        // they do not prove our agent's state.
         let state = live_state(&t, &[agent("other", "/wt")], &[], now());
-        assert!(!state.pane_exists);
+        assert!(state.pane_exists);
         assert_eq!(state.agent_state, None);
+        assert_eq!(group(&t, &state, now()), Group::Unknown);
     }
 
     #[test]

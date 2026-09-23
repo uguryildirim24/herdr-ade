@@ -240,7 +240,7 @@ fn start_with_ticker(
         }
         None => None,
     };
-    let launch = crate::launch::resolve_launch(
+    let mut launch = crate::launch::resolve_launch(
         ctx,
         &project,
         &crate::launch::ResolveInput {
@@ -285,6 +285,10 @@ fn start_with_ticker(
         fallback_say(ctx, slug, &placement)?;
     }
     let machine = placement.machine.clone();
+    // Selection initially carries the configured dispatch candidate because
+    // placement needs it. The durable lane launch names where this attempt was
+    // actually placed, including an explicit or fallback local placement.
+    launch.machine = placement.ledger_machine().to_string();
 
     // Recipe and repository readiness both ran on the selected machine
     // during placement, before a thread record exists.
@@ -3181,7 +3185,8 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     } else if !live.pane_exists {
         "process gone: pane or agent is gone without a report".to_string()
     } else {
-        live.agent_state.unwrap_or_else(|| "no agent".into())
+        live.agent_state
+            .unwrap_or_else(|| "agent state unknown; pane still exists".into())
     };
     Row {
         thread: t.clone(),
@@ -4039,6 +4044,7 @@ mod tests {
         .unwrap();
         assert_eq!(started.machine, "oci");
         assert_eq!(started.machine_id, "oci-id");
+        assert_eq!(started.launch.machine, "oci");
         assert!(
             started
                 .worktree_path
@@ -4093,12 +4099,15 @@ mod tests {
         let claude = start(&fx.world.ctx(), "demo", start_args(repo.clone(), None)).unwrap();
         assert_eq!(claude.launch.recipe_id, "test_claude");
         assert!(claude.machine.is_empty());
+        assert_eq!(claude.launch.machine, "local");
 
         let mut args = start_args(repo, None);
         args.task = "+++\nproduct = \"web-research\"\n+++\nCompare the published results.".into();
         let agy = start(&fx.world.ctx(), "demo", args).unwrap();
         assert_eq!(agy.launch.recipe_id, "agy_gemini_flash");
         assert!(agy.machine.is_empty());
+        assert_eq!(agy.launch.machine, "local");
+        assert!(agy.launch.args.iter().any(|arg| arg == "--new-project"));
 
         let ledger =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
@@ -4299,6 +4308,7 @@ mod tests {
         )
         .unwrap();
         assert!(started.machine.is_empty());
+        assert_eq!(started.launch.machine, "local");
         assert!(
             started
                 .worktree_path
@@ -4345,6 +4355,7 @@ mod tests {
         .unwrap();
         assert!(started.machine.is_empty());
         assert!(started.machine_id.is_empty());
+        assert_eq!(started.launch.machine, "local");
         assert!(
             started
                 .worktree_path

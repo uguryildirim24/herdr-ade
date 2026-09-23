@@ -137,7 +137,9 @@ pub(crate) struct Launch {
     /// diff that the agent reads from its checkout). Escalations retain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_truncation: Option<serde_json::Value>,
-    /// Default machine from `[dispatch]`; empty keeps the launch local.
+    /// Machine selected for this launch (`local` or its saved-machine label).
+    /// During routing, before lane placement, this temporarily carries the
+    /// `[dispatch]` candidate.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) machine: String,
 }

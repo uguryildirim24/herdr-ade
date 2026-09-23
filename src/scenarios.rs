@@ -267,7 +267,7 @@ fn socket_of(cmd: &Cmd) -> String {
 }
 
 #[test]
-fn one_agent_start_per_project_per_tick_and_three_failures_give_failed() {
+fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().to_path_buf();
@@ -307,14 +307,19 @@ fn one_agent_start_per_project_per_tick_and_three_failures_give_failed() {
             "one start per tick"
         );
     }
-    // Six starts: three each. The next ticks mark them failed and start nothing.
+    // Six starts: three each. The listed panes remain intact after the bound;
+    // absent agent state is unknown, not evidence that either process is gone.
     let _ = ticker::tick_project(&ctx, &project);
     let _ = ticker::tick_project(&ctx, &project);
     assert_eq!(world.runner.count("agent start"), 6);
+    assert_eq!(world.runner.count("tab close"), 0);
     for id in ["t-0001", &second.id] {
         let t = thread::load(&project, id).unwrap();
-        assert_eq!(t.status, Status::Failed, "{id}");
-        assert!(t.error.contains("after 3 launch attempts"));
+        assert_eq!(t.status, Status::Open, "{id}");
+        assert_eq!(t.launch_attempts, thread::MAX_LAUNCH_ATTEMPTS, "{id}");
+        assert!(t.prompt_pending, "{id}");
+        assert!(t.error.is_empty(), "{id}: {}", t.error);
+        assert_eq!(t.last_group, thread::Group::Unknown.token(), "{id}");
     }
 }
 
