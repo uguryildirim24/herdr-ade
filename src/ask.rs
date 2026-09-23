@@ -1562,7 +1562,7 @@ mod tests {
         let ctx = fx.world.ctx();
         let e = format!(
             "{:#}",
-            glossary::add_term(&ctx, "demo", "quotient", None, None).unwrap_err()
+            glossary::add_term(&ctx, "demo", "quotient", None, None, false).unwrap_err()
         );
         assert!(e.starts_with("plain_missing"), "{e}");
         glossary::add_term(
@@ -1571,6 +1571,7 @@ mod tests {
             "quotient",
             Some("The smaller model that keeps the same answers."),
             Some("tasks/spec.md"),
+            false,
         )
         .unwrap();
         let e = format!(
@@ -1580,11 +1581,21 @@ mod tests {
                 "demo",
                 "quotient",
                 Some("Another sentence for it."),
-                None
+                None,
+                false,
             )
             .unwrap_err()
         );
         assert!(e.starts_with("term_exists"), "{e}");
+        glossary::add_term(&ctx, "demo", "Custombrand", None, None, true).unwrap();
+        assert!(glossary::gate(&fx.project, "Custombrand is here.").is_ok());
+        assert_eq!(
+            glossary::explain(&ctx, "demo", "Custombrand").unwrap(),
+            "Custombrand: familiar name\n(terms.toml)\n"
+        );
+        for name in ["t-0292", "config.toml", "snake_case", "~/projects/demo"] {
+            assert!(glossary::add_term(&ctx, "demo", name, None, None, true).is_err());
+        }
         crate::round::open(
             &ctx,
             "demo",
@@ -1596,6 +1607,8 @@ mod tests {
             },
         )
         .unwrap();
+        // A branch named "main" must not forbid ordinary words in a birth sentence.
+        glossary::check_birth(&fx.project, "The main folder holds work.").unwrap();
         assert!(!fx.project.dir().join("GLOSSARY.md").exists());
         assert_eq!(
             glossary::explain(&ctx, "demo", "quotient").unwrap(),
