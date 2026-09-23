@@ -259,7 +259,8 @@ fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text.lines().next(), Some("# Project"));
+    assert_eq!(text.lines().next(), Some("## Since your last context"));
+    assert!(text.contains("# Project"));
     let prefix = text
         .lines()
         .find_map(|line| line.strip_prefix("Commands: "))
@@ -300,7 +301,8 @@ fn context_uses_ha_for_the_default_root_and_keeps_recipe_commands_in_the_skill()
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text.lines().next(), Some("# Project"));
+    assert_eq!(text.lines().next(), Some("## Since your last context"));
+    assert!(text.contains("# Project"));
     assert!(text.contains("\nCommands: ha\n"), "{text}");
     let recipes = text
         .split("## Recipes\n")
@@ -313,6 +315,49 @@ fn context_uses_ha_for_the_default_root_and_keeps_recipe_commands_in_the_skill()
     assert!(!recipes.contains("thread start"), "{recipes}");
     assert!(!recipes.contains("herdr-pro start"), "{recipes}");
     assert!(recipes.contains("Rolf's one-off choice"), "{recipes}");
+}
+
+#[test]
+fn context_repeats_compactly_and_full_restores_standing_sections() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let args = ["--root", root.to_str().unwrap(), "context", "demo"];
+    assert!(
+        hp(
+            home.path(),
+            &["--root", root.to_str().unwrap(), "new", "demo"]
+        )
+        .status
+        .success()
+    );
+    let first = String::from_utf8(hp(home.path(), &args).stdout).unwrap();
+    assert!(first.contains("First read"));
+    assert!(first.contains("## Standing instructions in force"));
+    let repeat = String::from_utf8(hp(home.path(), &args).stdout).unwrap();
+    assert!(
+        repeat.starts_with("## Since your last context\n\nNothing new."),
+        "{repeat}"
+    );
+    assert!(
+        repeat.contains("Unchanged; run `ha context demo --full`"),
+        "{repeat}"
+    );
+    assert!(!repeat.contains("## Standing instructions in force"));
+    let full = String::from_utf8(
+        hp(
+            home.path(),
+            &[
+                "--root",
+                root.to_str().unwrap(),
+                "context",
+                "demo",
+                "--full",
+            ],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(full.contains("## Standing instructions in force"), "{full}");
 }
 
 #[test]
@@ -564,7 +609,12 @@ fn successful_commands_keep_human_text_and_return_one_machine_record() {
     assert_eq!(result["outcome"], "shown");
     assert_eq!(result["command"], "context");
     assert_eq!(result["data"]["slug"], "demo");
-    assert!(result["message"].as_str().unwrap().starts_with("# Project"));
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("## Since your last context")
+    );
 }
 
 #[test]
