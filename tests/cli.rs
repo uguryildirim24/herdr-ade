@@ -147,6 +147,98 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
 }
 
 #[test]
+fn notes_decisions_and_tasks_accept_a_request_from_another_project() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let run = |args: &[&str]| {
+        let output = hp(home.path(), &[&["--root", root_arg], args].concat());
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run(&["new", "demo"]);
+    run(&["new", "source"]);
+    let talk = root.join("source/.state/talk");
+    std::fs::create_dir_all(&talk).unwrap();
+    std::fs::write(
+        talk.join("journal.jsonl"),
+        concat!(
+            "{\"seq\":1,\"at\":\"2026-09-23T00:00:00Z\",\"rolf\":{",
+            "\"request\":\"q-cross\",",
+            "\"text\":\"Keep the overnight direction in the project record.\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    run(&[
+        "note",
+        "add",
+        "demo",
+        "Keep the overnight direction in the project record.",
+        "--kind",
+        "instruction",
+        "--request",
+        "source/q-cross",
+    ]);
+    run(&[
+        "decide",
+        "demo",
+        "I will keep the overnight direction in the project record.",
+        "--class",
+        "what-you-get",
+        "--basis",
+        "request:source/q-cross",
+    ]);
+    run(&[
+        "task",
+        "add",
+        "demo",
+        "--title",
+        "Record the overnight direction",
+        "--request",
+        "source/q-cross",
+        "--acceptance",
+        "The direction remains visible in context.",
+    ]);
+
+    let notes = std::fs::read_to_string(root.join("demo/.state/notes.jsonl")).unwrap();
+    let decisions = std::fs::read_to_string(root.join("demo/.state/decisions.jsonl")).unwrap();
+    let task = std::fs::read_to_string(root.join("demo/.state/tasks/job-0001.toml")).unwrap();
+    assert!(notes.contains("\"request\":\"source/q-cross\""), "{notes}");
+    assert!(
+        decisions.contains("\"basis\":\"request:source/q-cross\""),
+        "{decisions}"
+    );
+    assert!(task.contains("request:source/q-cross"), "{task}");
+
+    let missing = hp(
+        home.path(),
+        &[
+            "--root",
+            root_arg,
+            "note",
+            "add",
+            "demo",
+            "This request is missing.",
+            "--kind",
+            "memory",
+            "--request",
+            "missing/q-lost",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr).trim(),
+        "herdr-ade: request_authority: no request `q-lost` in project `missing`"
+    );
+}
+
+#[test]
 fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("my root");

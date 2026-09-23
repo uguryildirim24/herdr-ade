@@ -656,6 +656,59 @@ pub(crate) fn request_text(project: &Project, id: &str) -> Option<String> {
         })
 }
 
+/// A request resolved against either the current project or an explicitly
+/// named project in the same ADE root.
+pub(crate) struct ResolvedRequest {
+    pub(crate) project: String,
+    pub(crate) id: String,
+    pub(crate) text: String,
+    qualified: bool,
+}
+
+impl ResolvedRequest {
+    /// Keep local shorthand local, but retain an explicitly qualified source.
+    pub(crate) fn basis(&self) -> String {
+        if self.qualified {
+            format!("request:{}/{}", self.project, self.id)
+        } else {
+            format!("request:{}", self.id)
+        }
+    }
+
+    /// Coordinator recipe records are always portable across projects.
+    pub(crate) fn qualified_basis(&self) -> String {
+        format!("request:{}/{}", self.project, self.id)
+    }
+}
+
+/// Resolve `request:<id>` or `request:<project>/<id>` once for every writer
+/// and reader of request authority.
+pub(crate) fn resolve_request(project: &Project, basis: &str) -> Result<ResolvedRequest> {
+    let reference = basis
+        .strip_prefix("request:")
+        .filter(|value| !value.is_empty())
+        .with_context(|| {
+            format!("request_authority: `{basis}` is not request:<id> or request:<project>/<id>")
+        })?;
+    let (slug, id, qualified) = match reference.split_once('/') {
+        Some((slug, id)) => (slug, id, true),
+        None => (project.slug.as_str(), reference, false),
+    };
+    if slug.is_empty() || id.is_empty() || id.contains('/') {
+        bail!("request_authority: no request `{id}` in project `{slug}`");
+    }
+    let source = Project::load(&project.root, slug)
+        .map_err(|_| anyhow::anyhow!("request_authority: no request `{id}` in project `{slug}`"))?;
+    let text = request_text(&source, id)
+        .with_context(|| format!("request_authority: no request `{id}` in project `{slug}`"))?;
+    Ok(ResolvedRequest {
+        project: slug.to_string(),
+        id: id.to_string(),
+        text,
+        qualified,
+    })
+}
+
 /// The most recent messages Rolf sent, oldest first, with the request id to
 /// cite. The coordinator digest prints them so an id is always findable.
 pub(crate) fn has_waiting_request(project: &Project) -> bool {

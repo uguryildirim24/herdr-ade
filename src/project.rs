@@ -1033,11 +1033,15 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             ),
             None => decision.line.clone(),
         };
-        out.push_str(&markdown_item(
-            &decision.id,
-            &decision.at[..decision.at.len().min(10)],
-            &text,
-        ));
+        let date = &decision.at[..decision.at.len().min(10)];
+        let authority = decision
+            .request
+            .as_ref()
+            .map(|request| format!("request:{request}"))
+            .or_else(|| decision.basis.clone());
+        let provenance =
+            authority.map_or_else(|| date.to_string(), |basis| format!("{date}; {basis}"));
+        out.push_str(&markdown_item(&decision.id, &provenance, &text));
     }
 
     out.push_str("\n## Recently finished or dropped tasks\n\n");
