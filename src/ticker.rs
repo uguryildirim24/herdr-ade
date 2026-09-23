@@ -453,6 +453,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     };
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
+    let _thread_records = thread::ListCache::new();
 
     // Publish only after acquiring the lock, before the first pass: that
     // pass may block, but this process is already running the new image.
@@ -506,7 +507,11 @@ pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         if project.status() != Status::Active {
             continue;
         }
-        match tick_cheap(ctx, &project) {
+        match tick_cheap(
+            ctx,
+            &project,
+            memory.tick == 1 || memory.tick.is_multiple_of(8),
+        ) {
             Ok(Some(seen)) => reachable.push((project, seen)),
             Ok(None) => {}
             Err(error) => log.line(&format!("{slug}: {error:#}")),
@@ -697,7 +702,7 @@ pub(crate) fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 #[cfg(test)]
 pub(crate) fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
     memory.machine_views.clear();
-    match tick_cheap(ctx, project)? {
+    match tick_cheap(ctx, project, true)? {
         Some(seen) => {
             let log = Log {
                 path: std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id())),
@@ -727,6 +732,7 @@ fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
     hashes: Option<&std::collections::BTreeMap<String, String>>,
+    refresh_tokens: bool,
 ) -> Result<Pass> {
     let ctx = input.ctx;
     let project = input.project;
@@ -978,7 +984,7 @@ fn thread_pass(
                 t.last_group = group.token().to_string();
             })?;
         }
-        if live.pane_exists {
+        if live.pane_exists && (refresh_tokens || group.token() != t.last_group) {
             threads::report_thread_tokens(herdr, t, slug, group);
         }
     }
@@ -1220,7 +1226,7 @@ fn nudge_idle_coordinator(
 
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
-fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
+fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Option<Seen>> {
     let _scope = crate::ledger::Scope::new(&[project]);
     let Some(record) = project.coordinator() else {
         return Ok(None);
@@ -1269,7 +1275,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
                 Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
             }
         }
-        coordinator::report_tokens(&herdr, slug, &record.pane_id);
+        if refresh_tokens {
+            coordinator::report_tokens(&herdr, slug, &record.pane_id);
+        }
     }
 
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
@@ -1289,6 +1297,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         },
         &prefix,
         None,
+        refresh_tokens,
     )?;
     first_error = first_error.or(pass.error);
     if let Err(error) = crate::threads::tick(project, &herdr, &agents) {
@@ -1372,7 +1381,8 @@ fn remote_pass(
         agents: &agents,
         panes: &panes,
     };
-    let state_pass = thread_pass(&state_input, &prefix, None).map_err(|e| format!("{e:#}"))?;
+    let state_pass =
+        thread_pass(&state_input, &prefix, None, true).map_err(|e| format!("{e:#}"))?;
     errors.extend(state_pass.error);
     let launched = launch_pass(
         &LaunchPass {
@@ -1758,6 +1768,7 @@ mod tests {
             },
             "ha",
             Some(&std::collections::BTreeMap::new()),
+            true,
         )
         .unwrap();
 
@@ -2208,6 +2219,34 @@ mod tests {
     }
 
     #[test]
+    fn idle_pass_only_polls_live_herdr_state() {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on("workspace report-metadata", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let mut memory = Memory::new(&ctx);
+        assert!(tick_for_test(&ctx, &mut memory));
+        let (agents, panes, metadata) = (
+            runner.count("agent list"),
+            runner.count("pane list"),
+            runner.count("report-metadata"),
+        );
+        assert!(tick_for_test(&ctx, &mut memory));
+        assert_eq!(runner.count("agent list") - agents, 1);
+        assert_eq!(runner.count("pane list") - panes, 1);
+        assert_eq!(runner.count("report-metadata"), metadata);
+        assert_eq!(runner.count("git"), 0);
+    }
+
+    #[test]
     fn follow_ups_queued_during_start_arrive_after_the_brief_in_order() {
         let f = fixture(false);
         let runner = FakeRunner::new();
@@ -2305,6 +2344,7 @@ mod tests {
                 },
                 "ha",
                 None,
+                true,
             )
             .unwrap()
         };
@@ -2384,6 +2424,7 @@ mod tests {
                 },
                 "ha",
                 None,
+                true,
             )
             .unwrap()
         };

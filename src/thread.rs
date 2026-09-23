@@ -305,8 +305,53 @@ pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::E
     (threads, errors)
 }
 
+type ListStamp = Option<(u64, std::time::SystemTime)>;
+type ThreadLists = std::collections::BTreeMap<std::path::PathBuf, (ListStamp, Vec<Thread>)>;
+
+thread_local! {
+    static TICKER_LISTS: std::cell::RefCell<Option<ThreadLists>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A ticker-only cache. All normal writers replace records atomically, which
+/// changes the threads directory; ordinary CLI reads stay uncached. This
+/// avoids parsing every historical lane repeatedly inside each idle beat.
+pub(crate) struct ListCache;
+
+impl ListCache {
+    pub(crate) fn new() -> Self {
+        TICKER_LISTS.with(|cache| *cache.borrow_mut() = Some(Default::default()));
+        Self
+    }
+}
+
+impl Drop for ListCache {
+    fn drop(&mut self) {
+        TICKER_LISTS.with(|cache| *cache.borrow_mut() = None);
+    }
+}
+
 pub(crate) fn list(project: &Project) -> Vec<Thread> {
-    list_with_errors(project).0
+    let dir = threads_dir(project);
+    let stamp = std::fs::metadata(&dir)
+        .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+        .ok();
+    if let Some(found) = TICKER_LISTS.with(|cache| {
+        cache.borrow().as_ref().and_then(|rows| {
+            rows.get(&dir)
+                .filter(|(cached, _)| *cached == stamp)
+                .map(|(_, rows)| rows.clone())
+        })
+    }) {
+        return found;
+    }
+    let rows = list_with_errors(project).0;
+    TICKER_LISTS.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(dir, (stamp, rows.clone()));
+        }
+    });
+    rows
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
@@ -1299,6 +1344,23 @@ mod tests {
             group(&t, &live(Some("blocked"), 999), now()),
             Group::Resolved
         );
+    }
+
+    #[test]
+    fn ticker_reuses_unchanged_thread_records_and_sees_atomic_updates() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        let original = allocate(&project, |t| t.title = "Original".into()).unwrap();
+        let _cache = ListCache::new();
+        assert_eq!(list(&project)[0].title, "Original");
+        // The unchanged directory is not parsed a second time.
+        let path = threads_dir(&project).join(format!("{}.toml", original.id));
+        std::fs::write(&path, "invalid = [").unwrap();
+        assert_eq!(list(&project)[0].title, "Original");
+        // Real writers use atomic replacement and invalidate the snapshot.
+        write_record(&project, &original).unwrap();
+        update(&project, &original.id, |t| t.title = "Updated".into()).unwrap();
+        assert_eq!(list(&project)[0].title, "Updated");
     }
 
     #[test]
