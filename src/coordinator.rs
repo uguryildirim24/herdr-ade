@@ -532,13 +532,22 @@ fn repo_snapshot(runner: &dyn crate::runner::Runner, path: &str) -> String {
     let Some(header) = header.strip_prefix("## ") else {
         return format!("{path}: unreadable repository status");
     };
-    let branch = header
-        .split_once("...")
-        .map(|(branch, _)| branch)
-        .unwrap_or(header)
-        .split([' ', '['])
-        .next()
-        .unwrap_or("unknown");
+    let branch = if let Some(branch) = header
+        .strip_prefix("No commits yet on ")
+        .or_else(|| header.strip_prefix("Initial commit on "))
+    {
+        branch
+    } else if header.starts_with("HEAD (no branch)") {
+        "detached HEAD"
+    } else {
+        header
+            .split_once("...")
+            .map(|(branch, _)| branch)
+            .unwrap_or(header)
+            .split([' ', '['])
+            .next()
+            .unwrap_or("unknown")
+    };
     let state = if lines.next().is_some() {
         "dirty"
     } else {
@@ -968,6 +977,18 @@ mod tests {
             "{text}"
         );
         assert!(repo_snapshot(&world.runner, "/missing").contains("missing or unreadable"));
+        for (status, expected) in [
+            ("## No commits yet on main\n", ": main, clean"),
+            ("## HEAD (no branch)\n", "detached HEAD"),
+        ] {
+            let runner = crate::runner::fake::FakeRunner::new();
+            runner.on(
+                "status --porcelain=v1 --branch",
+                crate::runner::fake::ok(status),
+            );
+            let snapshot = repo_snapshot(&runner, repo.to_str().unwrap());
+            assert!(snapshot.contains(expected), "{snapshot}");
+        }
     }
 
     #[test]
