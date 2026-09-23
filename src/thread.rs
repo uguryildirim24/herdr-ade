@@ -382,7 +382,10 @@ fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
         && after.failure_class == crate::contracts::FailureClass::Unknown
     {
         crate::ledger::observe(project, "thread-error", &after.id, &after.error);
-        if after.launch_attempts == 0 && !after.launch.kind.is_empty() {
+        if after.launch_attempts == 0
+            && before.launch_attempts == 0
+            && !after.launch.kind.is_empty()
+        {
             crate::ledger::observe(
                 project,
                 "launch-not-attempted",
@@ -455,16 +458,18 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     };
     if t.is_remote() {
         return format!(
-            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
+            "Run the shell command `{prefix} skill {role}`, then read .herdr-project/{slug}-{id}/brief.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
             t.machine
         );
     }
     let prompt = match t.kind {
         Kind::Worktree if !t.is_remote() => format!(
-            "Run {prefix} skill {role}, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
+            "Run the shell command `{prefix} skill {role}`, then read .herdr-project/{slug}-{id}/brief.md and do what it says."
         ),
         Kind::Tab => {
-            format!("Run {prefix} skill {role}, then read brief.md and do what it says.")
+            format!(
+                "Run the shell command `{prefix} skill {role}`, then read brief.md and do what it says."
+            )
         }
         Kind::Adopted if t.repo.is_empty() && !t.thread_dir.is_empty() => format!(
             "Read {}/brief.md and do what it says. Work and commit in {}.",
@@ -1628,7 +1633,7 @@ mod tests {
         };
         assert_eq!(
             launch_prompt("ha", "demo", &lane),
-            "Run ha skill reviewer, then read .herdr-project/demo-t-0001/brief.md and do what it says."
+            "Run the shell command `ha skill reviewer`, then read .herdr-project/demo-t-0001/brief.md and do what it says."
         );
     }
 
@@ -1711,6 +1716,28 @@ mod tests {
         update(&p, &t.id, |t| t.launch_attempts += 1).unwrap();
         let entries = crate::ledger::list(&p).unwrap();
         assert!(!entries.iter().any(|e| e.kind == "retry"));
+    }
+
+    #[test]
+    fn failed_relaunch_does_not_claim_the_previous_launch_never_happened() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = allocate(&project, |t| {
+            t.launch.kind = "claude".into();
+            t.launch_attempts = 1;
+            t.status = Status::Open;
+        })
+        .unwrap();
+        update(&project, &t.id, |t| {
+            t.status = Status::Failed;
+            t.attempt = 2;
+            t.launch_attempts = 0;
+            t.error = "the first agent failed after launch".into();
+        })
+        .unwrap();
+        let entries = crate::ledger::list(&project).unwrap();
+        assert!(entries.iter().any(|e| e.kind == "thread-error"));
+        assert!(!entries.iter().any(|e| e.kind == "launch-not-attempted"));
     }
 
     #[test]
