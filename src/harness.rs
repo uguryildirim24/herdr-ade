@@ -641,6 +641,7 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
             let deadline = Instant::now() + PROCESS_WAIT;
             loop {
                 if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
+                    && info.pid != 0
                     && crate::build::same_commit(&info.version, crate::VERSION)
                 {
                     break Ok(info);
@@ -853,6 +854,8 @@ fn box_process_script(
          pid=\n\
          n=0\n\
          while [ $n -lt {attempts} ]; do\n\
+           seen=\n\
+           pid=\n\
            if [ -r \"$root/.ticker.lock\" ] && ! ( flock -n 9 ) 9<>\"$root/.ticker.lock\"; then\n\
              snapshot=$(cat \"$root/.ticker.lock\" 2>/dev/null) || snapshot=\n\
              candidate_seen=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"version\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\n\
@@ -1623,6 +1626,12 @@ mod tests {
             format!("{{\n  \"version\": \"{box_build}\",\n  \"pid\": 42\n}}"),
         )
         .unwrap();
+        let holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(box_root.join(".ticker.lock"))
+            .unwrap();
+        holder.lock().unwrap();
         let runner = FakeRunner::new();
         runner.on_fn(
             |cmd| cmd.program == "ssh",
@@ -1658,6 +1667,11 @@ mod tests {
         assert_eq!(proofs[1].state, "running");
         assert_eq!(proofs[1].pid, Some(42));
         assert_eq!(proofs[1].build.as_deref(), Some(box_build.as_str()));
+
+        drop(holder);
+        let proofs = box_process_proofs(&ctx, &machine);
+        assert_eq!(proofs[1].state, "unknown");
+        assert_eq!(proofs[1].pid, None);
     }
 
     #[test]
