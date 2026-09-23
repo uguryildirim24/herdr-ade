@@ -44,17 +44,6 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     let binding = current_lane(ctx)?;
     let recipient = binding.recipient()?;
     let attempt = binding.thread.attempt.max(1);
-    // A box lane publishes its branch before `done`; the published ref is part
-    // of the completion validation (SPEC-remote §4.3).
-    if let Some(card) = &binding.card {
-        ops::check_published_ref(
-            ctx.runner,
-            Path::new(&binding.thread.cwd),
-            &card.branch,
-            &card.publish_url,
-            sha,
-        )?;
-    }
     let git_folder = if crate::threads::managed_git_folder(&binding.project, &binding.thread) {
         &binding.thread.worktree_path
     } else {
@@ -76,7 +65,17 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
         },
         Path::new(git_folder),
     )?;
-    ops::stage_done(&binding.project, &op.op, Path::new(git_folder), ctx.runner)?;
+    if let Some(card) = &binding.card {
+        ops::stage_box_done(
+            &binding.project,
+            &op.op,
+            Path::new(git_folder),
+            ctx.runner,
+            card,
+        )?;
+    } else {
+        ops::stage_done(&binding.project, &op.op, Path::new(git_folder), ctx.runner)?;
+    }
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
     })?;

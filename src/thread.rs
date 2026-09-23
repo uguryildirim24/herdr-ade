@@ -1879,21 +1879,21 @@ mod tests {
     }
 
     #[test]
-    fn the_lane_skill_carries_the_push_rule_in_its_standing_rules() {
+    fn the_lane_skill_says_done_publishes_on_the_box() {
         let lane = include_str!("../skill/LANE.md");
         let rules_end = lane.find("## Pictures").expect("the pictures heading");
         let standing = &lane[..rules_end];
         assert!(
-            standing.contains("`round merge` pushes the integration branch"),
+            standing.contains("`round merge` publishes the integration branch"),
             "{standing}"
         );
         assert!(
-            standing.contains("a lane never pushes it or `main`"),
+            standing.contains("`ha done` publishes only your lane branch"),
             "{standing}"
         );
         let box_section = lane.find("## On the cloud box").expect("the box heading");
         assert!(
-            lane[box_section..].contains("push the lane branch to the URL-matched remote"),
+            lane[box_section..].contains("It publishes your lane branch to the recorded remote"),
             "{}",
             &lane[box_section..]
         );
