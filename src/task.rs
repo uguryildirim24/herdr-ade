@@ -30,6 +30,14 @@ pub(crate) struct DatedNote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskWait {
+    pub(crate) kind: String,
+    pub(crate) target: String,
+    pub(crate) snapshot: String,
+    pub(crate) since: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DropEvidence {
     pub(crate) at: String,
     pub(crate) reason: String,
@@ -78,6 +86,9 @@ pub(crate) struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) replaces: Option<String>,
     pub(crate) notes: Vec<DatedNote>,
+    /// Coordinator hold; the snapshot is captured when the hold is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) wait: Option<TaskWait>,
     #[serde(default)]
     pub(crate) dropped: Vec<DropEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -107,6 +118,7 @@ impl Default for Task {
             acceptance: Vec::new(),
             replaces: None,
             notes: Vec::new(),
+            wait: None,
             dropped: Vec::new(),
             withdrawn: Vec::new(),
             attempts: Vec::new(),
@@ -290,6 +302,85 @@ fn validate_record(task: &Task) -> Result<()> {
         bail!("task_withdrawn: acceptance {index} also has verification evidence");
     }
     Ok(())
+}
+
+/// A missing or unreadable target is not a resolved hold. Never nudge on missing evidence.
+fn wait_snapshot(project: &Project, kind: &str, target: &str) -> Result<String> {
+    match kind {
+        "round" => Ok(format!("{:?}", crate::round::load(project, target)?.phase)),
+        "ask" => {
+            let latest = crate::ask::latest(project, target)?
+                .with_context(|| format!("task_wait_target: ask `{target}` is missing"))?;
+            let open = crate::ask::open_asks(project)
+                .iter()
+                .any(|ask| ask.id == target);
+            Ok(format!(
+                "{}:{}",
+                if open { "open" } else { "closed" },
+                latest.revision
+            ))
+        }
+        "lane" => {
+            let lane = crate::thread::load(project, target)?;
+            let event = crate::round::latest_event(
+                &crate::events::list(project),
+                target,
+                lane.attempt.max(1),
+            )
+            .map(|event| event.id.clone())
+            .unwrap_or_default();
+            Ok(format!("{:?}:{}:{event}", lane.status, lane.attempt))
+        }
+        "event" => Ok(String::new()),
+        _ => bail!("task_wait_kind: expected round, ask, lane or event"),
+    }
+}
+
+pub(crate) fn set_wait(project: &Project, id: &str, kind: &str, target: &str) -> Result<Task> {
+    let target = target.trim();
+    if target.is_empty() || target.chars().any(char::is_control) {
+        bail!("task_wait_target: describe what the task is waiting on");
+    }
+    if kind == "ask"
+        && !crate::ask::open_asks(project)
+            .iter()
+            .any(|ask| ask.id == target)
+    {
+        bail!("task_wait_target: ask `{target}` is not open");
+    }
+    let snapshot = wait_snapshot(project, kind, target)?;
+    if view(project, load(project, id)?).terminal(project) {
+        bail!("task_wait_terminal: `{id}` is already complete");
+    }
+    update(project, id, |task| {
+        if !task.dropped.is_empty() {
+            bail!("task_wait_dropped: task is dropped");
+        }
+        task.wait = Some(TaskWait {
+            kind: kind.into(),
+            target: target.into(),
+            snapshot,
+            since: project::now(),
+        });
+        Ok(())
+    })
+}
+
+pub(crate) fn clear_wait(project: &Project, id: &str) -> Result<Task> {
+    update(project, id, |task| {
+        task.wait = None;
+        Ok(())
+    })
+}
+
+/// Returns None once the target changes state; an event remains held, with a
+/// daily reminder controlled by the ticker rather than an invented event state.
+pub(crate) fn active_wait<'a>(project: &Project, task: &'a Task) -> Option<&'a TaskWait> {
+    task.wait.as_ref().filter(|wait| {
+        wait.kind == "event"
+            || wait_snapshot(project, &wait.kind, &wait.target)
+                .map_or(true, |current| current == wait.snapshot)
+    })
 }
 
 fn write(project: &Project, task: &Task) -> Result<()> {
@@ -975,7 +1066,7 @@ pub(crate) fn view_with_evidence(
         return View {
             record: task,
             state: State::Working,
-            next: format!("wait for Rolf: {}", waiting.text.trim()),
+            next: format!("answer the lane wait: {}", waiting.text.trim()),
             failure_class: None,
             provider_kind: None,
         };
@@ -987,6 +1078,24 @@ pub(crate) fn view_with_evidence(
             next: "retry or cancel the current attempt".into(),
             failure_class: Some(thread.failure_class),
             provider_kind: thread.provider_failure_kind.clone(),
+        };
+    }
+    if !round_proves_completion
+        && thread.follow_ups.iter().any(|follow_up| {
+            follow_up.attempt == attempt
+                && (matches!(
+                    follow_up.state,
+                    crate::thread::FollowUpState::Queued | crate::thread::FollowUpState::Uncertain
+                ) || follow_up.state == crate::thread::FollowUpState::Delivered
+                    && done.is_some_and(|done| follow_up.after_seal == done.id))
+        })
+    {
+        return View {
+            record: task,
+            state: State::Working,
+            next: "wait for the queued follow-up to land and the lane to seal again".into(),
+            failure_class: None,
+            provider_kind: None,
         };
     }
     if done.is_none() && !round_proves_completion {
@@ -1283,7 +1392,7 @@ fn date(timestamp: &str) -> &str {
     &timestamp[..timestamp.len().min(10)]
 }
 
-pub(crate) fn render(view: &View) -> String {
+pub(crate) fn render(project: &Project, view: &View) -> String {
     let mut out = format!(
         "{} [{}] {}\n",
         view.record.id,
@@ -1295,6 +1404,17 @@ pub(crate) fn render(view: &View) -> String {
     }
     if !view.next.is_empty() {
         out.push_str(&format!("next: {}\n", view.next));
+    }
+    if let Some(wait) = &view.record.wait {
+        let label = if active_wait(project, &view.record).is_some() {
+            "wait"
+        } else {
+            "hold resolved"
+        };
+        out.push_str(&format!(
+            "{label}: {} {} (since {})\n",
+            wait.kind, wait.target, wait.since
+        ));
     }
     out.push_str(&format!(
         "authority: {}\n",
@@ -1539,8 +1659,12 @@ created = "2026-09-21T00:00:00Z"
         assert_eq!(view.state, State::Dropped);
         assert!(view.next.is_empty());
         assert!(view.terminal(&project));
-        assert!(render(&view).contains("dropped: The premise was wrong."));
-        let listed = views(&project).0.iter().map(render).collect::<String>();
+        assert!(render(&project, &view).contains("dropped: The premise was wrong."));
+        let listed = views(&project)
+            .0
+            .iter()
+            .map(|view| render(&project, view))
+            .collect::<String>();
         assert!(listed.contains("dropped: The premise was wrong."));
         let page = std::fs::read_to_string(project.project_md()).unwrap();
         assert!(page.contains("`job-0001` [dropped] Ship the checked change."));
@@ -1594,7 +1718,7 @@ created = "2026-09-21T00:00:00Z"
         assert_eq!(view.state, State::Verified);
         assert!(view.terminal(&fx.project));
         assert_eq!(view.next, "none");
-        assert!(render(&view).contains(&format!(
+        assert!(render(&fx.project, &view).contains(&format!(
             "2. [withdrawn {withdrawn_date}: The newer cleanup choice replaced it.]"
         )));
 
@@ -1921,7 +2045,7 @@ created = "2026-09-21T00:00:00Z"
             "verified; latest process check unknown"
         );
         assert!(
-            render(&still_verified)
+            render(&fx.project, &still_verified)
                 .contains("running processes: latest check unknown; earlier verification remains")
         );
         project::refresh_page(&fx.project).unwrap();
@@ -2056,7 +2180,10 @@ created = "2026-09-21T00:00:00Z"
 
         let waiting = view(&fx.project, load(&fx.project, "job-0001").unwrap());
         assert_eq!(waiting.state, State::Working);
-        assert_eq!(waiting.next, "wait for Rolf: Choose the final colour.");
+        assert_eq!(
+            waiting.next,
+            "answer the lane wait: Choose the final colour."
+        );
     }
 
     #[test]
@@ -2078,7 +2205,7 @@ created = "2026-09-21T00:00:00Z"
 
         fx.seal_waiting(&lane, 1, 2, "Choose the final shape.");
         let later = view(&fx.project, load(&fx.project, "job-0001").unwrap());
-        assert_eq!(later.next, "wait for Rolf: Choose the final shape.");
+        assert_eq!(later.next, "answer the lane wait: Choose the final shape.");
     }
 
     fn task_with_pinned_round_and_newer_failure() -> (crate::round::testkit::Fx, String) {

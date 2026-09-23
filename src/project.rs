@@ -878,23 +878,6 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             ask.choices.join(" / ")
         ));
     }
-    for thread in crate::thread::list(project)
-        .into_iter()
-        .filter(|thread| thread.status != crate::thread::Status::Resolved)
-    {
-        let attempt = thread.attempt.max(1);
-        if let Some(event) = crate::round::latest_event(events, &thread.id, attempt)
-            && event.id != thread.answered_waiting_event
-            && let Some(evidence) = &event.payload.waiting
-        {
-            waiting.push(format!(
-                "- `{}` {} — {}\n",
-                thread.id,
-                thread.title.trim(),
-                evidence.text.trim()
-            ));
-        }
-    }
     if waiting.is_empty() {
         out.push_str("None.\n");
     } else {
@@ -915,11 +898,28 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     }
     for thread in threads {
         out.push_str(&format!(
-            "- Thread `{}`: {} ({})\n",
+            "- Thread `{}`: {} ({}){}\n",
             thread.id,
             thread.title.trim(),
-            format!("{:?}", thread.status).to_lowercase()
+            format!("{:?}", thread.status).to_lowercase(),
+            if thread.follow_ups.iter().any(|follow_up| follow_up.state
+                == crate::thread::FollowUpState::Queued
+                && follow_up.attempt == thread.attempt.max(1))
+            {
+                " — follow-up queued"
+            } else {
+                ""
+            }
         ));
+        if let Some(event) = crate::round::latest_event(events, &thread.id, thread.attempt.max(1))
+            && event.id != thread.answered_waiting_event
+            && let Some(waiting) = &event.payload.waiting
+        {
+            out.push_str(&format!(
+                "  waiting on coordinator: {}\n",
+                one_line(&waiting.text)
+            ));
+        }
     }
     for round in rounds {
         out.push_str(&format!(
@@ -962,6 +962,13 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             one_line(&view.record.title),
             one_line(&view.next)
         ));
+        if let Some(wait) = crate::task::active_wait(project, &view.record) {
+            out.push_str(&format!(
+                "  waits on {}: {}\n",
+                wait.kind,
+                one_line(&wait.target)
+            ));
+        }
     }
     for error in errors {
         out.push_str(&format!("- Unreadable task: {error:#}\n"));
@@ -1295,6 +1302,48 @@ mod tests {
         assert!(body.starts_with("# Project"));
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
+    }
+
+    #[test]
+    fn lane_waits_belong_to_the_lane_not_waiting_on_rolf() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let lane = crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Open;
+            thread.attempt = 1;
+            thread.title = "Check deployment".into();
+        })
+        .unwrap();
+        crate::events::seal_create_if_absent(
+            &project,
+            &crate::contracts::Event {
+                id: "wait-1".into(),
+                op: "wait-1".into(),
+                thread: lane.id.clone(),
+                attempt: 1,
+                round: None,
+                recipient: crate::contracts::Recipient::default(),
+                created: now(),
+                payload: crate::contracts::EventPayload {
+                    waiting: Some(crate::contracts::WaitingPayload {
+                        text: "Coordinator, choose a build".into(),
+                        ..crate::contracts::WaitingPayload::default()
+                    }),
+                    ..crate::contracts::EventPayload::default()
+                },
+            },
+        )
+        .unwrap();
+        let page = page_body(&project, &Settings::default());
+        let rolf = page
+            .split_once("## Waiting on Rolf\n\n")
+            .unwrap()
+            .1
+            .split_once("\n## Running now")
+            .unwrap()
+            .0;
+        assert_eq!(rolf, "None.\n");
+        assert!(page.contains("waiting on coordinator: Coordinator, choose a build"));
     }
 
     #[test]

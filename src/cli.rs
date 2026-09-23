@@ -1619,6 +1619,22 @@ enum TaskCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
     },
+    /// Hold a task until a round, ask or lane changes state, or a named live event
+    Wait {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+        #[arg(long, value_name = "ROUND|ASK|LANE|EVENT")]
+        on: String,
+        #[arg(long)]
+        target: String,
+    },
+    /// Clear a task hold
+    Unwait {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        id: String,
+    },
     /// Drop a task, or withdraw acceptance conditions replaced by a newer choice
     Drop {
         #[arg(value_name = "PROJECT")]
@@ -2447,7 +2463,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                         Some(serde_json::json!({ "thread": id, "path": path, "sealed": sealed }))
                     })
                     .collect();
-                let mut message = crate::task::render(&view);
+                let mut message = crate::task::render(&project, &view);
                 for report in &reports {
                     message.push_str(&format!(
                         "{} ({}): {}\n",
@@ -2481,13 +2497,44 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 }
                 let message = views
                     .iter()
-                    .map(crate::task::render)
+                    .map(|view| crate::task::render(&project, view))
                     .collect::<Vec<_>>()
                     .join("");
                 crate::output::success(
                     Some("listed"),
                     &serde_json::json!({ "tasks": views }),
                     &message,
+                    "",
+                )
+            }
+            TaskCommand::Wait {
+                slug,
+                id,
+                on,
+                target,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::task::set_wait(&project, &id, &on, &target)?;
+                let mut state = crate::steps::load_state(&project);
+                state.idle_nudge_next.remove(&id);
+                crate::steps::save_state(&project, &state)?;
+                crate::output::success(
+                    Some("waiting"),
+                    &serde_json::json!({ "task": record }),
+                    &format!("{id} waits on {on} {target}\n"),
+                    "",
+                )
+            }
+            TaskCommand::Unwait { slug, id } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let record = crate::task::clear_wait(&project, &id)?;
+                let mut state = crate::steps::load_state(&project);
+                state.idle_nudge_next.remove(&id);
+                crate::steps::save_state(&project, &state)?;
+                crate::output::success(
+                    Some("open"),
+                    &serde_json::json!({ "task": record }),
+                    &format!("{id} hold cleared\n"),
                     "",
                 )
             }

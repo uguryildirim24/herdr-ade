@@ -908,9 +908,8 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
             events,
             barrier.as_deref(),
         )?;
-        // A follow-up can be only a question. Once its delivery has made the
-        // lane work and the courier later observes it idle/done, no new report
-        // means the old completion still stands.
+        // An older completion may stand after a follow-up only if delivery
+        // did not overtake that seal. Otherwise the next seal must replace it.
         if pin.is_none()
             && let Some(barrier) = barrier.as_deref()
             && let attempt = thread_attempt(project, &member.thread)?
@@ -918,6 +917,12 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
                 event.id == barrier && event.thread == member.thread && event.attempt == attempt
             })
             && !follow_up_still_running(project, &member.thread)?
+            && !thread_record(project, &member.thread)?
+                .follow_ups
+                .iter()
+                .any(|f| {
+                    f.state == crate::thread::FollowUpState::Delivered && f.after_seal == barrier
+                })
         {
             pin = events
                 .iter()
@@ -979,8 +984,21 @@ fn member_pin_after(
     events: &[Event],
     after: Option<&str>,
 ) -> Result<Option<CompletionPin>> {
-    let attempt = thread_attempt(project, thread)?;
-    done_pin_after(events, round, thread, attempt, after)
+    let lane = thread_record(project, thread)?;
+    let attempt = lane.attempt.max(1);
+    Ok(
+        done_pin_after(events, round, thread, attempt, after)?.filter(|pin| {
+            !lane.follow_ups.iter().any(|f| {
+                f.attempt == attempt
+                    && (matches!(
+                        f.state,
+                        crate::thread::FollowUpState::Queued
+                            | crate::thread::FollowUpState::Uncertain
+                    ) || f.state == crate::thread::FollowUpState::Delivered
+                        && f.after_seal == pin.event)
+            })
+        }),
+    )
 }
 
 /// True when `sha` is already reachable from the integration branch `branch`.
@@ -1992,7 +2010,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
     let pin = if candidate.role == "reviewer" && record.reviewer.as_deref() == Some(id) {
         reviewer_completion(&project, &record, &events)?
     } else {
-        done_pin(&events, round, id, attempt)
+        member_pin_after(&project, round, id, &events, None)?
     }
     .with_context(|| {
         format!("adopt_completion_missing: `{id}` has no authoritative sealed done event for attempt {attempt}")
@@ -3687,6 +3705,13 @@ fn reviewer_completion(
     let Some(pin) = pin else {
         return Ok(None);
     };
+    if lane.follow_ups.iter().any(|f| {
+        f.attempt == attempt
+            && f.state == crate::thread::FollowUpState::Delivered
+            && f.after_seal == pin.event
+    }) {
+        return Ok(None);
+    }
     // Waiting or failure after a verdict is authoritative too: an earlier
     // `done` is no longer the reviewer's current sealed result.
     if latest_event(events, reviewer, attempt).map(|event| event.id.as_str())
@@ -7747,6 +7772,16 @@ mod tests {
             thread::Status::Resolved
         );
         assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+        thread::update(&fx.project, &lane, |thread| {
+            thread.follow_ups[0].state = crate::thread::FollowUpState::Delivered;
+            thread.follow_ups[0].after_seal = format!("{lane}-1-1");
+            thread.follow_ups[0].delivered_at = crate::project::now();
+        })
+        .unwrap();
+        assert!(
+            advance(&ctx, "demo").unwrap().started.is_empty(),
+            "the first seal must not feed a review after the follow-up lands"
+        );
 
         fx.seal_done(&lane, 1, 2, &sha, "# second report\n");
         let advanced = advance(&ctx, "demo").unwrap();
