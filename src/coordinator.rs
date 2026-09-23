@@ -779,6 +779,7 @@ fn compact_tasks(
             out.push_str(heading);
             out.push_str("\n\n");
             let mut waits: BTreeMap<(String, String), usize> = BTreeMap::new();
+            let mut verifying_waits = 0;
             let mut skip_wait_detail = false;
             for line in body.lines() {
                 if let Some(id) = line
@@ -789,20 +790,34 @@ fn compact_tasks(
                     skip_wait_detail = false;
                     if let Some(view) = views.get(id)
                         && let Some(wait) = crate::task::active_wait(project, &view.record)
-                        && ((view.state == crate::task::State::Open
-                            && view.record.attempts.is_empty())
-                            || view.next.starts_with("wait "))
                     {
-                        *waits
-                            .entry((wait.kind.clone(), wait.target.clone()))
-                            .or_default() += 1;
-                        skip_wait_detail = true;
+                        let verifying = view.next.starts_with("verify ")
+                            && view.next.ends_with(" acceptance condition(s)");
+                        if verifying {
+                            verifying_waits += 1;
+                            skip_wait_detail = true;
+                        } else if (view.state == crate::task::State::Open
+                            && view.record.attempts.is_empty())
+                            || view.next.starts_with("wait ")
+                        {
+                            *waits
+                                .entry((wait.kind.clone(), wait.target.clone()))
+                                .or_default() += 1;
+                            skip_wait_detail = true;
+                        }
                     }
                 }
                 if !skip_wait_detail && !line.is_empty() {
                     out.push_str(line);
                     out.push('\n');
                 }
+            }
+            if verifying_waits > 0 {
+                let _ = writeln!(
+                    out,
+                    "- {verifying_waits} task(s) wait to verify acceptance conditions; list with `ha task list {}`",
+                    project.slug
+                );
             }
             for ((kind, target), count) in waits {
                 let _ = writeln!(
