@@ -70,7 +70,20 @@ fn context_starts_with_the_complete_project_page_without_duplicate_tours() {
     let text = p.context(false);
     let page = std::fs::read_to_string(p.dir.join("PROJECT.md")).unwrap();
     assert!(text.starts_with("## Since your last context"), "{text}");
-    assert!(text.contains(page_body(&page)), "{text}");
+    assert!(
+        text.contains(
+            page_body(&page)
+                .split("## Recently finished or dropped tasks")
+                .next()
+                .unwrap()
+                .trim_end()
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("## Recently finished or dropped tasks"),
+        "{text}"
+    );
     assert!(text.contains("## Threads needing action"), "{text}");
     assert!(text.contains("compiler failure"), "{text}");
     assert!(!text.contains("## Memory notes and standing instructions"));
