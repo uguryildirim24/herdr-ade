@@ -22,7 +22,8 @@ use crate::{inbox, thread, threads};
 
 const TICK: Duration = crate::pi::doctor::READINESS_CACHE_TTL;
 const STOP_WAIT: Duration = Duration::from_secs(60);
-const HANDOFF_READY_WAIT: Duration = Duration::from_secs(10);
+// A replacement never leaves a second ticker waiting behind a blocked pass.
+const REPLACE_WAIT: Duration = Duration::from_millis(500);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
@@ -36,10 +37,6 @@ fn stop_path(root: &Path) -> PathBuf {
 
 fn log_path(root: &Path) -> PathBuf {
     root.join(".ticker.log")
-}
-
-fn handoff_path(root: &Path) -> PathBuf {
-    root.join(".ticker.handoff")
 }
 
 fn wake_path(root: &Path) -> PathBuf {
@@ -130,15 +127,12 @@ enum StopOutcome {
     Pending,
 }
 
-/// The `ticker start` decision. A healthy ticker of the same version is never
-/// replaced; a different version, or a stop in progress, is stopped first so
-/// `open` never ends with no ticker.
-fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> StartAction {
+/// A healthy ticker of the same version is never replaced. A different
+/// version must release the lock before a new ticker may start.
+fn decide_start(lock: &LockState, my_version: &str) -> StartAction {
     match lock {
         LockState::Free => StartAction::Spawn,
-        LockState::Held(info)
-            if crate::build::same_commit(&info.version, my_version) && !stop_file_exists =>
-        {
+        LockState::Held(info) if crate::build::same_commit(&info.version, my_version) => {
             StartAction::Nothing
         }
         LockState::Held(_) => StartAction::StopThenSpawn,
@@ -149,10 +143,10 @@ fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) -> S
 /// `round advance` must not block while replacing a ticker: the ticker's own
 /// pass calls `advance`, so waiting here would deadlock against the ticker
 /// waiting on `advance`'s lock. Ordinary thread starts and explicit `ticker
-/// start` calls still replace a stale-version ticker.
+/// start` calls attempt to replace a stale-version ticker when it can stop.
 pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
-    if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
+    if !ctx.detached_ticker || project::list_slugs(root).is_empty() || install_in_progress(ctx) {
         return Ok(());
     }
     if lock_state(root) == LockState::Free {
@@ -166,17 +160,46 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
-    let root = &ctx.root;
-    if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
+    if install_in_progress(ctx) {
         return Ok(());
     }
-    let stop_exists = stop_path(root).exists();
-    match decide_start(&lock_state(root), crate::VERSION, stop_exists) {
-        StartAction::Nothing => Ok(()),
+    start_inner(ctx).map(|_| ())
+}
+
+/// The installer owns the install lock, so it is the only caller allowed to
+/// replace a ticker while installing. `true` means the old pass is still
+/// holding the lock; report that fact rather than waiting for it to finish.
+pub(crate) fn start_for_install(ctx: &Ctx) -> Result<bool> {
+    start_inner(ctx)
+}
+
+fn install_in_progress(ctx: &Ctx) -> bool {
+    crate::harness::install_in_progress(&ctx.config_dir)
+}
+
+fn start_inner(ctx: &Ctx) -> Result<bool> {
+    let root = &ctx.root;
+    if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
+        return Ok(false);
+    }
+    let state = lock_state(root);
+    // A newly acquired lock is published just after initialization. Do not
+    // mistake its as-yet-empty record for an old build and stop the winner.
+    if matches!(&state, LockState::Held(info) if info.pid == 0 || info.version.is_empty()) {
+        return Ok(false);
+    }
+    match decide_start(&state, crate::VERSION) {
+        StartAction::Nothing => {
+            // A concurrent starter may have won just after the old holder's
+            // stop request. Keep the new holder alive.
+            let _ = std::fs::remove_file(stop_path(root));
+            Ok(false)
+        }
         StartAction::Spawn => {
             // A leftover stop file would make the new ticker exit at once.
             let _ = std::fs::remove_file(stop_path(root));
-            spawn(root)
+            spawn(root)?;
+            Ok(false)
         }
         StartAction::StopThenSpawn => replace(root),
     }
@@ -188,12 +211,9 @@ unsafe extern "C" {
 
 /// `ticker run`, detached: null stdio and a new session, so it does not die
 /// with the process group of whatever started it (an agent's shell tool).
-fn spawn_command(binary: &Path, root: &Path, handoff: bool) -> Command {
+fn spawn_command(binary: &Path, root: &Path) -> Command {
     let mut command = Command::new(binary);
     command.arg("--root").arg(root).args(["ticker", "run"]);
-    if handoff {
-        command.arg("--handoff");
-    }
     command
         .current_dir(root)
         .stdin(Stdio::null())
@@ -213,10 +233,10 @@ fn spawn_command(binary: &Path, root: &Path, handoff: bool) -> Command {
     command
 }
 
-fn detached_command(root: &Path, handoff: bool) -> Result<Command> {
+fn detached_command(root: &Path) -> Result<Command> {
     use std::os::unix::process::CommandExt;
     let binary = std::env::current_exe().context("could not find this binary's own path")?;
-    let mut command = spawn_command(&binary, root, handoff);
+    let mut command = spawn_command(&binary, root);
     // SAFETY: setsid is async-signal-safe and touches no memory.
     unsafe {
         command.pre_exec(|| {
@@ -228,68 +248,32 @@ fn detached_command(root: &Path, handoff: bool) -> Result<Command> {
 }
 
 fn spawn(root: &Path) -> Result<()> {
-    detached_command(root, false)?
+    detached_command(root)?
         .spawn()
         .context("could not start the ticker")?;
     Ok(())
 }
 
-/// Start the replacement far enough to prove that it can initialize before
-/// asking the current ticker to leave. The initialized child waits for the
-/// parent's release marker, so there is always one viable ticker throughout
-/// the handoff. Once asked, the old ticker is always allowed to finish its
-/// current pass and the replacement is never withdrawn.
-fn replace(root: &Path) -> Result<()> {
-    let ready = handoff_path(root);
-    let _ = std::fs::remove_file(&ready);
-    let mut child = detached_command(root, true)?
-        .spawn()
-        .context("could not start the replacement ticker")?;
-    let deadline = Instant::now() + HANDOFF_READY_WAIT;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("could not inspect the replacement ticker")?
-        {
-            let _ = std::fs::remove_file(&ready);
-            bail!("replacement ticker exited before handoff readiness ({status})");
+/// Ask the old ticker to leave, but never start a contender behind it. A
+/// later start can replace a ticker whose pass outlasted this brief wait.
+fn replace(root: &Path) -> Result<bool> {
+    match request_stop(root, REPLACE_WAIT)? {
+        StopOutcome::Stopped => {
+            spawn(root)?;
+            Ok(false)
         }
-        if std::fs::read(&ready).is_ok_and(|value| value == b"ready") {
-            break;
+        StopOutcome::Pending => {
+            if matches!(lock_state(root), LockState::Held(info) if crate::build::same_commit(&info.version, crate::VERSION))
+            {
+                let _ = std::fs::remove_file(stop_path(root));
+                Ok(false)
+            } else {
+                // No successor exists. Keep the busy old ticker alive rather
+                // than letting it exit later and leaving the root unwatched.
+                let _ = std::fs::remove_file(stop_path(root));
+                Ok(true)
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("replacement ticker did not become ready before the handoff");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let _outcome = request_stop(root, STOP_WAIT)?;
-    if let Err(error) = std::fs::write(&ready, b"go") {
-        // The stop request remains in place. Do not kill the only initialized
-        // replacement after the old ticker has been asked to leave.
-        return Err(error).context("could not release the replacement ticker");
-    }
-    let deadline = Instant::now() + HANDOFF_READY_WAIT;
-    loop {
-        if matches!(lock_state(root), LockState::Held(ref info) if crate::build::same_commit(&info.version, crate::VERSION))
-        {
-            return Ok(());
-        }
-        if let Some(status) = child
-            .try_wait()
-            .context("could not inspect the replacement ticker")?
-        {
-            let _ = std::fs::remove_file(&ready);
-            bail!("replacement ticker exited during handoff ({status})");
-        }
-        if Instant::now() >= deadline {
-            // The old ticker may still be inside a long pass, or the new one
-            // may be completing its first pass. Both processes now own their
-            // side of the handoff, so the caller need not keep waiting.
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -319,35 +303,6 @@ pub(crate) fn stop(root: &Path) -> Result<()> {
             "ticker stop pending: the current pass exceeded {} seconds; the stop request remains active",
             STOP_WAIT.as_secs()
         ),
-    }
-}
-
-pub(crate) fn handoff_pending(root: &Path) -> bool {
-    handoff_path(root).exists()
-}
-
-fn take_handoff_lock(
-    lock: &File,
-    marker: &Path,
-    stop: &Path,
-    release_wait: Duration,
-) -> Result<()> {
-    std::fs::write(marker, b"ready")?;
-    let release_deadline = Instant::now() + release_wait;
-    loop {
-        // Once the parent writes `go`, the durable stop request guarantees
-        // that the old ticker will release the lock at its next check. A pass
-        // may take arbitrarily longer than the parent's wait.
-        let released = std::fs::read(marker).is_ok_and(|value| value == b"go");
-        if released && lock.try_lock().is_ok() {
-            let _ = std::fs::remove_file(stop);
-            return Ok(());
-        }
-        if !released && Instant::now() >= release_deadline {
-            let _ = std::fs::remove_file(marker);
-            bail!("ticker handoff timed out waiting for its release marker");
-        }
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -413,7 +368,7 @@ impl Log {
 
 /// The loop. Exits when another ticker holds the lock, when the stop file
 /// appears, or when no project has had a reachable session for five minutes.
-pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
+pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     if project::list_slugs(&ctx.root).is_empty() {
         return Ok(());
     }
@@ -442,15 +397,7 @@ pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
         .read(true)
         .write(true)
         .open(lock_path(root))?;
-    let marker = handoff.then(|| handoff_path(root));
-    if let Some(marker) = &marker {
-        take_handoff_lock(
-            &lock,
-            marker,
-            &stop_path(root),
-            STOP_WAIT + HANDOFF_READY_WAIT,
-        )?;
-    } else if lock.try_lock().is_err() {
+    if lock.try_lock().is_err() {
         return Ok(());
     }
     let path_var = ctx.env.var("PATH").unwrap_or("").to_string();
@@ -478,22 +425,18 @@ pub(crate) fn run(ctx: &Ctx, handoff: bool) -> Result<()> {
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
 
-    // Publish this process only after it has completed one pass. Install proof
-    // can then never mistake an initialized-but-waiting replacement, or a new
-    // ticker still in its first pass, for the running worker.
-    if tick(ctx, &log, &mut memory) {
-        last_reachable = Instant::now();
-    }
+    // Publish only after acquiring the lock, before the first pass: that
+    // pass may block, but this process is already running the new image.
     lock.set_len(0)?;
     lock.write_all(serde_json::to_string_pretty(&info)?.as_bytes())?;
     lock.flush()?;
-    if let Some(marker) = &marker {
-        let _ = std::fs::remove_file(marker);
-    }
     log.line(&format!(
         "ticker {} started (pid {})",
         info.version, info.pid
     ));
+    if tick(ctx, &log, &mut memory) {
+        last_reachable = Instant::now();
+    }
 
     loop {
         // Sleep in short slices so a stop request is honoured promptly.
@@ -1852,32 +1795,20 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("projects-root");
         std::fs::create_dir(&root).unwrap();
-        let command = spawn_command(Path::new("/bin/true"), &root, false);
+        let command = spawn_command(Path::new("/bin/true"), &root);
         assert_eq!(command.get_current_dir(), Some(root.as_path()));
     }
 
     #[test]
     fn start_decisions() {
         let mine = "0.1.0+abcdef0.20";
+        assert_eq!(decide_start(&LockState::Free, mine), StartAction::Spawn);
         assert_eq!(
-            decide_start(&LockState::Free, mine, false),
-            StartAction::Spawn
-        );
-        assert_eq!(
-            decide_start(&LockState::Free, mine, true),
-            StartAction::Spawn
-        );
-        assert_eq!(
-            decide_start(&held("0.1.0+abcdef0.10"), mine, false),
+            decide_start(&held("0.1.0+abcdef0.10"), mine),
             StartAction::Nothing
         );
         assert_eq!(
-            decide_start(&held("0.1.0+1234567.10"), mine, false),
-            StartAction::StopThenSpawn
-        );
-        // A stop in progress: finish it, then spawn.
-        assert_eq!(
-            decide_start(&held("0.1.0+abcdef0.10"), mine, true),
+            decide_start(&held("0.1.0+1234567.10"), mine),
             StartAction::StopThenSpawn
         );
     }
@@ -1928,12 +1859,12 @@ mod tests {
         };
         start(&ctx).unwrap();
         assert!(!missing.exists());
-        run(&ctx, false).unwrap();
+        run(&ctx).unwrap();
         assert!(!missing.exists());
 
         std::fs::create_dir(&missing).unwrap();
         start(&ctx).unwrap();
-        run(&ctx, false).unwrap();
+        run(&ctx).unwrap();
         assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
     }
 
@@ -1972,63 +1903,146 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_outlasting_stop_wait_still_hands_off_to_its_replacement() {
-        let root = tempfile::tempdir().unwrap();
+    fn a_contender_exits_immediately_without_waiting_for_the_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
         let mut old = File::options()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(lock_path(root.path()))
+            .open(lock_path(&root))
             .unwrap();
         old.lock().unwrap();
         old.write_all(br#"{"version":"old","pid":1}"#).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: true,
+        };
+        let start = Instant::now();
+        run(&ctx).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!stop_path(&root).exists());
+        assert!(matches!(lock_state(&root), LockState::Held(info) if info.pid == 1));
+    }
 
-        assert_eq!(
-            request_stop(root.path(), Duration::from_millis(20)).unwrap(),
-            StopOutcome::Pending
-        );
-        assert!(stop_path(root.path()).exists());
+    #[test]
+    fn unpublished_lock_holder_is_not_stopped_as_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(&root))
+            .unwrap();
+        holder.lock().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: true,
+        };
+        assert!(!start_for_install(&ctx).unwrap());
+        assert!(!stop_path(&root).exists());
+    }
 
-        let marker = handoff_path(root.path());
-        let lock_path = lock_path(root.path());
-        let stop_file = stop_path(root.path());
-        let marker_path = marker.clone();
-        let (acquired, acquired_rx) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        let replacement = std::thread::spawn(move || {
-            let mut lock = File::options()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(lock_path)
-                .unwrap();
-            take_handoff_lock(&lock, &marker_path, &stop_file, Duration::from_secs(1)).unwrap();
-            lock.set_len(0).unwrap();
-            lock.write_all(br#"{"version":"new","pid":2}"#).unwrap();
-            acquired.send(()).unwrap();
-            release_rx.recv().unwrap();
-        });
-        let ready_deadline = Instant::now() + Duration::from_secs(1);
-        while !std::fs::read(&marker).is_ok_and(|value| value == b"ready") {
-            assert!(Instant::now() < ready_deadline);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        std::fs::write(&marker, b"go").unwrap();
+    #[test]
+    fn a_blocked_old_pass_leaves_no_waiting_successor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let mut holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(&root))
+            .unwrap();
+        holder.lock().unwrap();
+        holder.write_all(br#"{"version":"old","pid":1}"#).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: true,
+        };
+        let now = Instant::now();
+        assert!(start_for_install(&ctx).unwrap());
+        assert!(now.elapsed() < Duration::from_secs(2));
+        assert!(!stop_path(&root).exists());
+        assert!(matches!(lock_state(&root), LockState::Held(info) if info.pid == 1));
+    }
 
-        // The replacement is initialized but cannot do work while the old
-        // ticker's deliberately long pass still owns the lock.
-        assert!(acquired_rx.recv_timeout(Duration::from_millis(30)).is_err());
-        drop(old);
-        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(!stop_path(root.path()).exists());
-        assert!(matches!(
-            lock_state(root.path()),
-            LockState::Held(info) if info.version == "new" && info.pid == 2
-        ));
-        release.send(()).unwrap();
-        replacement.join().unwrap();
+    #[test]
+    fn ordinary_starts_are_suspended_while_install_owns_the_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let config = home.path().join("cfg");
+        let _install = crate::harness::lock(&config).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: config,
+            runner: &runner,
+            detached_ticker: true,
+        };
+        start(&ctx).unwrap();
+        ensure(&ctx).unwrap();
+        assert!(!lock_path(&root).exists());
+    }
+
+    #[test]
+    fn install_does_not_start_another_ticker_or_wait_behind_a_new_holder() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let config = home.path().join("cfg");
+        let _install = crate::harness::lock(&config).unwrap();
+        let mut holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(&root))
+            .unwrap();
+        holder.lock().unwrap();
+        holder
+            .write_all(format!(r#"{{"version":"{}","pid":4321}}"#, crate::VERSION).as_bytes())
+            .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root: root.clone(),
+            config_dir: config,
+            runner: &runner,
+            detached_ticker: true,
+        };
+        start(&ctx).unwrap();
+        ensure(&ctx).unwrap();
+        assert!(!stop_path(&root).exists());
+        std::fs::write(stop_path(&root), b"").unwrap();
+        assert!(!start_for_install(&ctx).unwrap());
+        assert!(!stop_path(&root).exists());
+        assert!(matches!(lock_state(&root), LockState::Held(info) if info.pid == 4321));
     }
 
     const AGENT_READY: &str = r#"{"result":{"agents":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle","cwd":"CWD"}]}}"#;

@@ -25,7 +25,7 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const BOX_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_WAIT: Duration = Duration::from_secs(40);
+const PROCESS_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
 
 /// The `[harness]` table of `config.toml`.
@@ -166,17 +166,24 @@ impl InstallOutcome {
             message.push_str(&format!("coordinator hook rebound: {hook}\n"));
         }
         for process in &self.processes {
+            let identity = process
+                .pid
+                .map_or_else(String::new, |pid| format!(" pid {pid}"));
             match (&process.build, &process.reason) {
-                (Some(build), _) => message.push_str(&format!(
-                    "{} {}: {} ({})\n",
+                (Some(build), Some(reason)) => message.push_str(&format!(
+                    "{} {}{identity}: {} ({}; {reason})\n",
+                    process.machine, process.process, build, process.state
+                )),
+                (Some(build), None) => message.push_str(&format!(
+                    "{} {}{identity}: {} ({})\n",
                     process.machine, process.process, build, process.state
                 )),
                 (None, Some(reason)) => message.push_str(&format!(
-                    "{} {}: {} ({reason})\n",
+                    "{} {}{identity}: {} ({reason})\n",
                     process.machine, process.process, process.state
                 )),
                 (None, None) => message.push_str(&format!(
-                    "{} {}: {}\n",
+                    "{} {}{identity}: {}\n",
                     process.machine, process.process, process.state
                 )),
             }
@@ -498,6 +505,17 @@ pub(crate) struct InstallLock {
     _file: std::fs::File,
 }
 
+/// Ordinary commands must not race the installer's ticker replacement.
+pub(crate) fn install_in_progress(config_dir: &Path) -> bool {
+    let Ok(file) = std::fs::File::options()
+        .write(true)
+        .open(config_dir.join(".harness-install.lock"))
+    else {
+        return false;
+    };
+    file.try_lock().is_err()
+}
+
 pub(crate) fn lock(config_dir: &Path) -> Result<InstallLock> {
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join(".harness-install.lock");
@@ -616,7 +634,10 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
     }
 
     if !crate::project::list_slugs(&ctx.root).is_empty() {
-        let ticker = crate::ticker::start(ctx).and_then(|()| {
+        let ticker = crate::ticker::start_for_install(ctx).and_then(|pending| {
+            if pending {
+                bail!("old ticker is busy; replacement was not started; retry ticker start after its pass");
+            }
             let deadline = Instant::now() + PROCESS_WAIT;
             loop {
                 if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
@@ -642,25 +663,20 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Vec<ProcessP
                 state: "running".into(),
                 reason: None,
             },
-            Err(_error) if crate::ticker::handoff_pending(&ctx.root) => ProcessProof {
-                machine: "local".into(),
-                process: "ticker".into(),
-                pid: None,
-                build: None,
-                state: "pending handoff".into(),
-                reason: Some(
-                    "the old ticker is finishing its current pass; the initialized replacement is waiting"
-                        .into(),
-                ),
-            },
-            Err(error) => ProcessProof {
-                machine: "local".into(),
-                process: "ticker".into(),
-                pid: None,
-                build: None,
-                state: "unknown".into(),
-                reason: Some(format!("{error:#}")),
-            },
+            Err(error) => {
+                let holder = match crate::ticker::lock_state(&ctx.root) {
+                    crate::ticker::LockState::Held(info) if info.pid != 0 => Some(info),
+                    _ => None,
+                };
+                ProcessProof {
+                    machine: "local".into(),
+                    process: "ticker".into(),
+                    pid: holder.as_ref().map(|info| info.pid),
+                    build: holder.as_ref().map(|info| info.version.clone()),
+                    state: if holder.is_some() { "stale" } else { "unknown" }.into(),
+                    reason: Some(format!("{error:#}")),
+                }
+            }
         });
     }
     proofs.extend(talk_process_proofs(ctx, plugin_version));
@@ -837,7 +853,7 @@ fn box_process_script(
          pid=\n\
          n=0\n\
          while [ $n -lt {attempts} ]; do\n\
-           if [ -r \"$root/.ticker.lock\" ]; then\n\
+           if [ -r \"$root/.ticker.lock\" ] && ! ( flock -n 9 ) 9<>\"$root/.ticker.lock\"; then\n\
              snapshot=$(cat \"$root/.ticker.lock\" 2>/dev/null) || snapshot=\n\
              candidate_seen=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"version\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\n\
              candidate_pid=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"pid\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')\n\
@@ -854,9 +870,7 @@ fn box_process_script(
            fi\n\
            n=$((n+1)); sleep {delay_seconds}\n\
          done\n\
-         if [ -e \"$root/.ticker.handoff\" ]; then\n\
-           printf 'HERDR_ADE_BOX_TICKER_PENDING=the old ticker is finishing its current pass; the initialized replacement is waiting\\n'\n\
-         elif [ -n \"$seen\" ] && [ -n \"$pid\" ]; then\n\
+         if [ -n \"$seen\" ] && [ -n \"$pid\" ]; then\n\
            printf 'HERDR_ADE_BOX_TICKER_STALE=%s:%s\\n' \"$pid\" \"$seen\"\n\
          else\n\
            printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker lock did not contain a complete build record\\n'\n\
@@ -870,7 +884,7 @@ fn box_process_script(
 }
 
 fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) -> Vec<ProcessProof> {
-    let script = box_process_script(machine, 80, "0.5");
+    let script = box_process_script(machine, 30, "0.1");
     let target = &machine.target;
     let out = match remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(140)) {
         Ok(out) if out.success() => out,
@@ -945,19 +959,6 @@ fn box_process_proofs(ctx: &Ctx, machine: &crate::remote::MachineDeclaration) ->
                     crate::VERSION
                 )
             }),
-        });
-    } else if let Some(reason) = out
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER_PENDING="))
-    {
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "ticker".into(),
-            pid: None,
-            build: None,
-            state: "pending handoff".into(),
-            reason: Some(reason.to_string()),
         });
     } else if let Some(value) = out
         .stdout
@@ -1281,6 +1282,106 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn install_proof_names_the_lock_holder_not_an_installers_child() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let config_dir = home.path().join("cfg");
+        let _install = lock(&config_dir).unwrap();
+        let path = crate::ticker::lock_path(&root);
+        let mut holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        holder.lock().unwrap();
+        use std::io::Write;
+        holder
+            .write_all(format!(r#"{{"pid":4321,"version":"{}"}}"#, crate::VERSION).as_bytes())
+            .unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir,
+            runner: &runner,
+            detached_ticker: true,
+        };
+        let proof = local_process_proofs(&ctx, Some(crate::VERSION));
+        let ticker = proof
+            .iter()
+            .find(|proof| proof.process == "ticker")
+            .unwrap();
+        assert_eq!(ticker.pid, Some(4321));
+        assert_eq!(ticker.build.as_deref(), Some(crate::VERSION));
+        assert_eq!(ticker.state, "running");
+        let message = InstallOutcome {
+            repositories: vec![],
+            box_target: None,
+            box_settings_installed: false,
+            live_handoff_required: false,
+            processes: proof,
+            tasks: vec![],
+            coordinator_hooks: vec![],
+            warnings: vec![],
+        }
+        .message();
+        assert!(message.contains(&format!(
+            "local ticker pid 4321: {} (running)",
+            crate::VERSION
+        )));
+    }
+
+    #[test]
+    fn blocked_old_ticker_is_reported_without_waiting_for_a_successor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let mut holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(crate::ticker::lock_path(&root))
+            .unwrap();
+        holder.lock().unwrap();
+        use std::io::Write;
+        holder
+            .write_all(br#"{"pid":5678,"version":"old"}"#)
+            .unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: true,
+        };
+        let start = Instant::now();
+        let proof = local_process_proofs(&ctx, Some(crate::VERSION));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let ticker = proof
+            .iter()
+            .find(|proof| proof.process == "ticker")
+            .unwrap();
+        assert_eq!(
+            (ticker.pid, ticker.build.as_deref(), ticker.state.as_str()),
+            (Some(5678), Some("old"), "stale")
+        );
+        assert!(
+            ticker
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("replacement was not started")
+        );
+    }
 
     #[test]
     fn an_unreadable_config_is_not_an_empty_repository_list() {
