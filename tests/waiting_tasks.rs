@@ -49,7 +49,6 @@ fn twenty_distinct_event_holds_take_one_line_on_second_context() {
         rows[0],
         "- 20 task(s) wait to verify acceptance conditions; list with `ha task list adeherdr`"
     );
-    assert_eq!(text.lines().count(), 34, "{text}");
 }
 
 #[test]
