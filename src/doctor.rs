@@ -977,17 +977,14 @@ fn finished_worktrees(
                     }
                 }
             }
-            match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
-                Ok(None) => candidates.push((project.clone(), thread)),
-                Ok(Some(_)) => {}
-                Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
-            }
+            candidates.push((project.clone(), thread));
         }
     }
-    // Existence on a box is one read-only fact call for every candidate. The
-    // shell always exits zero after printing each yes/no answer, so a healthy
-    // "gone" result cannot enter the command-failure ledger and a transport
-    // failure remains distinguishable from a negative answer.
+    // Check existence on the box before any completion probe. A merged
+    // round can retain a resolved member long after its checkout is removed.
+    // The shell always exits zero after printing each yes/no answer, so a
+    // healthy "gone" result cannot enter the command-failure ledger and a
+    // transport failure remains distinguishable from a negative answer.
     let remote_exists = remote.map(|profile| {
         let script = candidates
             .iter()
@@ -1055,6 +1052,14 @@ fn finished_worktrees(
             .map_or_else(|| Path::new(path).is_dir(), |answers| answers[index]);
         if !exists {
             continue;
+        }
+        match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
+            Ok(None) => {}
+            Ok(Some(_)) => continue,
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", thread.id));
+                continue;
+            }
         }
         match crate::threads::inspect_worktree_for_removal(ctx, &project, &thread) {
             Ok(inspection) if !inspection.dirty.is_empty() => leftovers.push(path.clone()),
@@ -2451,9 +2456,8 @@ recipe = "claude_fable_xhigh"
         let env = Env::for_test(home.path(), &[]);
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let mut ids = Vec::new();
         for number in 1..=2 {
-            let thread = crate::thread::allocate(&project, |thread| {
+            crate::thread::allocate(&project, |thread| {
                 thread.kind = crate::thread::Kind::Worktree;
                 thread.status = crate::thread::Status::Resolved;
                 thread.machine = "oci".into();
@@ -2463,32 +2467,9 @@ recipe = "claude_fable_xhigh"
                 thread.branch = format!("lane-{number}");
             })
             .unwrap();
-            ids.push(thread.id);
         }
-        let rounds = project.state_dir().join("rounds");
-        std::fs::create_dir_all(&rounds).unwrap();
-        let record = crate::contracts::RoundRecord {
-            phase: crate::contracts::RoundPhase::Abandoned,
-            round: "r1".into(),
-            branch: "main".into(),
-            plain: "The work is closed.".into(),
-            policy_hash: "policy".into(),
-            manifest: crate::contracts::AdmissionManifest {
-                revision: 1,
-                members: ids
-                    .into_iter()
-                    .map(|thread| crate::contracts::ManifestMember {
-                        thread,
-                        pin: None,
-                        awaiting_report_after: None,
-                    })
-                    .collect(),
-            },
-            repo: "/repo".into(),
-            abandoned_reason: Some("not needed".into()),
-            ..crate::contracts::RoundRecord::default()
-        };
-        std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
+        // Without round completion evidence the old code probed git in each
+        // absent worktree before asking the box whether the path existed.
         let fake = FakeRunner::new();
         fake.on("ssh", ok("0\t0\n1\t0\n"));
         let recording = crate::ledger::RecordingRunner(&fake);
@@ -2513,6 +2494,7 @@ recipe = "claude_fable_xhigh"
         assert!(data.is_empty());
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(fake.count("ssh"), 1);
+        assert!(fake.calls.borrow().iter().all(|call| call.program != "git"));
         assert!(crate::ledger::list(&project).unwrap().is_empty());
         assert!(!project.state_dir().join("ledger.jsonl").exists());
     }
