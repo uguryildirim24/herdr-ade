@@ -241,8 +241,7 @@ fn op_after_barrier(op: &Op, barrier: &str) -> bool {
     }
 }
 
-/// The published lane ref must equal `sha` before a box `done` stages
-/// (SPEC-remote §4.3): one `git ls-remote` against the URL-matched remote.
+/// Verify the URL-matched remote after publishing a box lane's own ref.
 pub(crate) fn check_published_ref(
     runner: &dyn Runner,
     worktree: &Path,
@@ -256,35 +255,50 @@ pub(crate) fn check_published_ref(
             .args(["ls-remote", publish_url, &format!("refs/heads/{branch}")]),
     )?;
     if !out.success() {
-        bail!("published_ref_check_failed: {}", out.error_text());
-    }
-    let found = out.stdout.split_whitespace().next().unwrap_or("");
-    let publish = format!(
-        "git -C {} push {} {}",
-        crate::remote::quote(&worktree.to_string_lossy()),
-        crate::remote::quote(publish_url),
-        crate::remote::quote(&format!("{sha}:refs/heads/{branch}")),
-    );
-    if found.is_empty() {
         return Err(crate::refusal::error(format!(
-            "lane_ref_not_published: `{branch}` is not on {publish_url}; run `{publish}`, then retry `ha done`"
+            "published_ref_check_failed: {}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote",
+            out.error_text()
         )));
     }
+    let found = out.stdout.split_whitespace().next().unwrap_or("");
     if found != sha {
         return Err(crate::refusal::error(format!(
-            "published_ref_mismatch: `{branch}` is {found} on {publish_url}, not {sha}; run `{publish}`, then retry `ha done`"
+            "published_ref_mismatch: `{branch}` is {} on {publish_url}, not {sha}; retry `ha done`. If it still differs, ask the coordinator to check the remote",
+            if found.is_empty() { "missing" } else { found }
         )));
     }
     Ok(())
 }
 
-/// Stage a `done` without the project lock. Git is invoked only here, then the
+/// Stage a Mac `done` without publishing. Git is invoked only here, then the
 /// revision-1 marker is advanced under the lock.
 pub(crate) fn stage_done(
     project: &Project,
     id: &str,
     worktree: &Path,
     runner: &dyn Runner,
+) -> Result<Op> {
+    stage_done_inner(project, id, worktree, runner, None)
+}
+
+/// Box `done`: publish only the branch and URL from the validated lane card.
+/// Do this before staging, so recovery cannot seal an unpublished operation.
+pub(crate) fn stage_box_done(
+    project: &Project,
+    id: &str,
+    worktree: &Path,
+    runner: &dyn Runner,
+    card: &crate::contracts::LaneCard,
+) -> Result<Op> {
+    stage_done_inner(project, id, worktree, runner, Some(card))
+}
+
+fn stage_done_inner(
+    project: &Project,
+    id: &str,
+    worktree: &Path,
+    runner: &dyn Runner,
+    card: Option<&crate::contracts::LaneCard>,
 ) -> Result<Op> {
     let op = load(project, id)?;
     if op.state == OpState::Staged || op.state == OpState::Sealed {
@@ -367,8 +381,38 @@ pub(crate) fn stage_done(
     if first != second {
         bail!("report_unstable: report bytes changed while staging");
     }
+    if let Some(card) = card {
+        if card.thread != op.thread || card.attempt != op.attempt || card.recipient != op.recipient
+        {
+            bail!("bootstrap_mismatch: done operation does not match the lane card");
+        }
+        publish_lane_ref(runner, worktree, &card.branch, &card.publish_url, sha)?;
+    }
     let artifact = write_artifact(project, &first)?;
     advance_staged(project, id, Some(artifact))
+}
+
+fn publish_lane_ref(
+    runner: &dyn Runner,
+    worktree: &Path,
+    branch: &str,
+    publish_url: &str,
+    sha: &str,
+) -> Result<()> {
+    let out = runner.run(
+        &Cmd::new("git", std::time::Duration::from_secs(60))
+            .args(["-C", &worktree.to_string_lossy()])
+            .args(["push", publish_url, &format!("{sha}:refs/heads/{branch}")]),
+    ).map_err(|error| crate::refusal::error(format!(
+        "lane_publish_failed: {error}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote"
+    )))?;
+    if !out.success() {
+        return Err(crate::refusal::error(format!(
+            "lane_publish_failed: {}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote",
+            out.error_text()
+        )));
+    }
+    check_published_ref(runner, worktree, branch, publish_url, sha)
 }
 
 pub(crate) fn stage_waiting(project: &Project, id: &str) -> Result<Op> {
@@ -717,46 +761,109 @@ mod tests {
         (root, project, runner, recipient)
     }
 
-    #[test]
-    fn unpublished_ref_refusals_name_the_exact_safe_repair_command() {
-        let worktree = Path::new("/box/reviewer's worktree");
-        let branch = "hp/demo/reviewer";
-        let url = "/remotes/publish repo.git";
-        let repair = "git -C '/box/reviewer'\\''s worktree' push '/remotes/publish repo.git' new:refs/heads/hp/demo/reviewer";
-        for (remote_output, reason) in [
-            (
-                "",
-                "lane_ref_not_published: `hp/demo/reviewer` is not on /remotes/publish repo.git",
-            ),
-            (
-                "old\trefs/heads/hp/demo/reviewer\n",
-                "published_ref_mismatch: `hp/demo/reviewer` is old on /remotes/publish repo.git, not new",
-            ),
-        ] {
-            let runner = FakeRunner::new();
-            runner.on("ls-remote", ok(remote_output));
-            let error = check_published_ref(&runner, worktree, branch, url, "new").unwrap_err();
-            assert!(crate::refusal::is(&error));
-            assert_eq!(
-                error.to_string(),
-                format!("{reason}; run `{repair}`, then retry `ha done`")
-            );
-            let calls = runner.calls.borrow();
-            assert_eq!(calls.len(), 1, "a refusal must never push implicitly");
-            assert_eq!(
-                calls[0].args,
-                [
-                    "-C",
-                    "/box/reviewer's worktree",
-                    "ls-remote",
-                    url,
-                    "refs/heads/hp/demo/reviewer"
-                ]
-            );
+    fn reserved_box_done(project: &Project, worktree: &Path, recipient: &Recipient) -> Op {
+        std::fs::write(worktree.join("report.md"), "ready\n").unwrap();
+        reserve_done(
+            project,
+            Reservation {
+                thread: "t-0088",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient: recipient.clone(),
+                round: None,
+                requested: Requested::Done {
+                    sha: "abc".into(),
+                    report_path: "report.md".into(),
+                },
+                helper_pid: 1,
+            },
+            worktree,
+        )
+        .unwrap()
+    }
+
+    fn box_card(recipient: &Recipient) -> crate::contracts::LaneCard {
+        crate::contracts::LaneCard {
+            thread: "t-0088".into(),
+            attempt: 1,
+            branch: "hp/demo/t-0088".into(),
+            publish_url: "/remotes/publish repo.git".into(),
+            recipient: recipient.clone(),
+            ..Default::default()
         }
-        let runner = FakeRunner::new();
-        runner.on("ls-remote", ok("new\trefs/heads/hp/demo/reviewer\n"));
-        check_published_ref(&runner, worktree, branch, url, "new").unwrap();
+    }
+
+    #[test]
+    fn box_done_pushes_only_its_own_ref_then_checks_before_staging() {
+        let (root, project, runner, recipient) = fixture();
+        let card = box_card(&recipient);
+        let op = reserved_box_done(&project, root.path(), &recipient);
+        runner
+            .on("ls-remote", ok("abc\trefs/heads/hp/demo/t-0088\n"))
+            .on("git -C", ok(""));
+        stage_box_done(&project, &op.op, root.path(), &runner, &card).unwrap();
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[3].args,
+            [
+                "-C",
+                root.path().to_str().unwrap(),
+                "push",
+                "/remotes/publish repo.git",
+                "abc:refs/heads/hp/demo/t-0088",
+            ]
+        );
+        assert_eq!(
+            calls[4].args,
+            [
+                "-C",
+                root.path().to_str().unwrap(),
+                "ls-remote",
+                "/remotes/publish repo.git",
+                "refs/heads/hp/demo/t-0088",
+            ]
+        );
+        assert_eq!(load(&project, &op.op).unwrap().state, OpState::Staged);
+    }
+
+    #[test]
+    fn rejected_box_push_refuses_with_git_error_and_next_step() {
+        let (root, project, runner, recipient) = fixture();
+        let op = reserved_box_done(&project, root.path(), &recipient);
+        runner.on("git -C", fail(1, "! [rejected] non-fast-forward"));
+        let error = stage_box_done(
+            &project,
+            &op.op,
+            root.path(),
+            &runner,
+            &box_card(&recipient),
+        )
+        .unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert!(error.to_string().contains("non-fast-forward"), "{error}");
+        assert!(error.to_string().contains("retry `ha done`"), "{error}");
+        assert_eq!(
+            runner.calls.borrow().len(),
+            4,
+            "do not check or stage after rejection"
+        );
+        assert_eq!(load(&project, &op.op).unwrap().state, OpState::Reserved);
+    }
+
+    #[test]
+    fn mac_done_never_pushes() {
+        let (root, project, runner, recipient) = fixture();
+        let op = reserved_box_done(&project, root.path(), &recipient);
+        stage_done(&project, &op.op, root.path(), &runner).unwrap();
+        assert_eq!(runner.calls.borrow().len(), 3);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|cmd| !cmd.args.contains(&"push".into()))
+        );
     }
 
     fn done_again(
