@@ -525,7 +525,7 @@ mod tests {
             page.contains(&decision_row),
             "decision provenance missing from page:\n{page}"
         );
-        let rendered_task = crate::task::render(&crate::task::view(&fx.project, task));
+        let rendered_task = crate::task::render(&fx.project, &crate::task::view(&fx.project, task));
         assert!(rendered_task.contains(&format!("authority: {authority}")));
         let (context, _) = crate::coordinator::digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
         assert!(context.contains(&decision_row), "{context}");
