@@ -1507,7 +1507,7 @@ mod tests {
         let ctx = fx.world.ctx();
         let e = format!(
             "{:#}",
-            glossary::add_term(&ctx, "demo", "quotient", None, None).unwrap_err()
+            glossary::add_term(&ctx, "demo", "quotient", None, None, false).unwrap_err()
         );
         assert!(e.starts_with("plain_missing"), "{e}");
         glossary::add_term(
@@ -1516,6 +1516,7 @@ mod tests {
             "quotient",
             Some("The smaller model that keeps the same answers."),
             Some("tasks/spec.md"),
+            false,
         )
         .unwrap();
         let e = format!(
@@ -1525,11 +1526,19 @@ mod tests {
                 "demo",
                 "quotient",
                 Some("Another sentence for it."),
-                None
+                None,
+                false,
             )
             .unwrap_err()
         );
         assert!(e.starts_with("term_exists"), "{e}");
+        glossary::add_term(&ctx, "demo", "Custombrand", None, None, true).unwrap();
+        assert!(glossary::gate(&fx.project, "Custombrand is here.").is_ok());
+        assert_eq!(
+            glossary::explain(&ctx, "demo", "Custombrand").unwrap(),
+            "Custombrand: familiar name\n(terms.toml)\n"
+        );
+        assert!(glossary::add_term(&ctx, "demo", "t-0292", None, None, true).is_err());
         crate::round::open(
             &ctx,
             "demo",

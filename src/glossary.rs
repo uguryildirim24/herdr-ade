@@ -26,6 +26,9 @@ pub(crate) struct Entry {
 pub(crate) struct Term {
     pub(crate) name: String,
     pub(crate) sentence: String,
+    /// A familiar name needs no explanation on Rolf's board.
+    #[serde(default)]
+    pub(crate) familiar: bool,
     #[serde(default)]
     pub(crate) path: String,
     #[serde(default)]
@@ -107,13 +110,20 @@ pub(crate) fn registry(project: &Project) -> Glossary {
     for e in names(project) {
         names_map.entry(e.name).or_insert(e.sentence);
     }
-    let terms_map = terms(project)
-        .into_iter()
-        .map(|t| (t.name, t.sentence))
-        .collect();
+    let stored = terms(project);
+    let mut familiar_names = std::collections::BTreeSet::new();
+    familiar_names.insert(project.slug.to_ascii_lowercase());
+    familiar_names.extend(
+        stored
+            .iter()
+            .filter(|t| t.familiar)
+            .map(|t| t.name.to_ascii_lowercase()),
+    );
+    let terms_map = stored.into_iter().map(|t| (t.name, t.sentence)).collect();
     Glossary {
         names: names_map,
         terms: terms_map,
+        familiar_names,
         max_sentence_words: max_sentence_words(project),
     }
 }
@@ -176,7 +186,8 @@ pub(crate) fn check_sentence(project: &Project, field: &str, text: &str) -> Resu
         .count();
     if sentences != 1 {
         return Err(crate::refusal::error(format!(
-            "plain_refused: {field}: write one sentence of at most 25 words"
+            "plain_refused: {field}: \"{trimmed}\": write one sentence; the limit is {} words",
+            registry(project).max_words()
         )));
     }
     Ok(trimmed.to_string())
@@ -191,7 +202,7 @@ pub(crate) fn check_internal_sentence(field: &str, text: &str) -> Result<String>
     }
     if plain::sentence_count(trimmed) != 1 {
         return Err(crate::refusal::error(format!(
-            "plain_refused: {field}: write one sentence"
+            "plain_refused: {field}: \"{trimmed}\": write one sentence; the limit is one sentence"
         )));
     }
     Ok(trimmed.to_string())
@@ -213,11 +224,17 @@ pub(crate) fn gate(project: &Project, text: &str) -> Result<()> {
 /// The first born name or term `text` carries, even in gloss form. Board
 /// values carry none (item 14).
 pub(crate) fn name_in(project: &Project, text: &str) -> Option<String> {
+    let glossary = registry(project);
     names(project)
         .into_iter()
         .map(|e| e.name)
-        .chain(terms(project).into_iter().map(|t| t.name))
-        .find(|name| !name.is_empty() && contains_name(text, name))
+        .chain(
+            terms(project)
+                .into_iter()
+                .filter(|t| !t.familiar)
+                .map(|t| t.name),
+        )
+        .find(|name| !name.is_empty() && !glossary.is_plain_name(name) && contains_name(text, name))
 }
 
 fn contains_name(sentence: &str, name: &str) -> bool {
@@ -307,27 +324,39 @@ pub(crate) fn add_term(
     name: &str,
     plain: Option<&str>,
     path: Option<&str>,
+    familiar: bool,
 ) -> Result<Term> {
     let project = Project::load(&ctx.root, slug)?;
     validate_term_name(name)?;
-    let Some(sentence) = plain.map(str::trim).filter(|p| !p.is_empty()) else {
-        bail!(
-            "plain_missing: `term add` needs --plain \"<one sentence that says what {name} is>\""
-        );
+    if familiar && plain.is_some() {
+        bail!("term_name: use either --name or --plain, not both");
+    }
+    if familiar && plain::is_identifier_shaped(name) && !plain::is_camel_case(name) {
+        bail!("term_name: `{name}` is a code or path, not a familiar name");
+    }
+    let sentence = if familiar {
+        ""
+    } else {
+        plain.map(str::trim).filter(|p| !p.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!("plain_missing: `term add` needs --plain \"<one sentence that says what {name} is>\" or --name")
+        })?
     };
     let glossary = registry(&project);
     if glossary.names.contains_key(name) || glossary.terms.contains_key(name) {
         bail!("term_exists: `{name}` already has a sentence; see `explain {name}`");
     }
-    if contains_name(sentence, name) {
-        bail!(
-            "plain_birth_refused:\nplain_birth: \"{name}\": the sentence cannot use the name it explains"
-        );
+    if !familiar {
+        if contains_name(sentence, name) {
+            bail!(
+                "plain_birth_refused:\nplain_birth: \"{sentence}\": the sentence cannot use the name {name} it explains"
+            );
+        }
+        check_birth(&project, sentence)?;
     }
-    check_birth(&project, sentence)?;
     let term = Term {
         name: name.to_string(),
         sentence: sentence.to_string(),
+        familiar,
         path: path.unwrap_or("").to_string(),
         added: project::now(),
     };
@@ -371,6 +400,13 @@ pub(crate) fn explain(ctx: &Ctx, slug: &str, name: &str) -> Result<String> {
     match found {
         Some(e) if !e.sentence.is_empty() => {
             Ok(format!("{}: {}\n({})\n", e.name, e.sentence, e.path))
+        }
+        Some(e)
+            if terms(&project)
+                .iter()
+                .any(|t| t.name == e.name && t.familiar) =>
+        {
+            Ok(format!("{}: familiar name\n({})\n", e.name, e.path))
         }
         Some(e) => bail!(
             "term_unborn: `{}` has no recorded sentence (a record from before the plain layer)",

@@ -646,7 +646,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            two_sentences.contains("write one sentence"),
+            two_sentences.contains("\"I changed config.toml. Then I checked it.\"")
+                && two_sentences.contains("limit is one sentence"),
             "{two_sentences}"
         );
 
