@@ -164,8 +164,12 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
+    // The installer replaces the ticker before releasing its lock. Commands
+    // may record pending work during that window; they must not compete with
+    // the replacement or refuse the work. After a failed install, the next
+    // ordinary start reaches start_inner and starts a free ticker as usual.
     if install_in_progress(ctx) {
-        bail!("ticker start pending: a harness installation is replacing the ticker");
+        return Ok(());
     }
     if start_inner(ctx)? {
         bail!(
@@ -2469,7 +2473,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_starts_are_suspended_while_install_owns_the_lock() {
+    fn ordinary_starts_defer_to_install_without_refusing() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         project::create(&root, "demo", "", vec![]).unwrap();
@@ -2484,12 +2488,7 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        assert!(
-            start(&ctx)
-                .unwrap_err()
-                .to_string()
-                .contains("installation")
-        );
+        start(&ctx).unwrap();
         ensure(&ctx).unwrap();
         assert!(!lock_path(&root).exists());
     }
@@ -2521,12 +2520,7 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        assert!(
-            start(&ctx)
-                .unwrap_err()
-                .to_string()
-                .contains("installation")
-        );
+        start(&ctx).unwrap();
         ensure(&ctx).unwrap();
         assert!(!stop_path(&root).exists());
         std::fs::write(stop_path(&root), b"").unwrap();

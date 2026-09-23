@@ -2646,19 +2646,33 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 };
                 crate::output::insert("machine", machine);
                 crate::output::insert("placement_reason", thread.placement_reason.clone());
-                println!(
-                    "{}",
-                    serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason })
-                );
+                let installing = crate::harness::install_in_progress(&ctx.config_dir);
+                let mut result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
+                if installing {
+                    let note =
+                        "the lane is recorded and launches when the harness install finishes";
+                    result["note"] = note.into();
+                    crate::output::insert("note", note);
+                }
+                println!("{result}");
                 Ok(())
             }
             ThreadCommand::Retry { slug, id, reason } => {
                 let result = threads::retry(&ctx, &slug, &id, &reason)?;
+                let installing = crate::harness::install_in_progress(&ctx.config_dir);
+                let launch = if installing {
+                    "the lane is recorded and launches when the harness install finishes"
+                } else {
+                    "the ticker launches its agent"
+                };
+                if installing {
+                    crate::output::insert("note", launch);
+                }
                 crate::output::success(
                     Some("retried"),
                     &result,
                     &format!(
-                        "{} attempt {} is in pane {}; the ticker launches its agent{}\n",
+                        "{} attempt {} is in pane {}; {launch}{}\n",
                         result.thread,
                         result.attempt,
                         result.pane_id,
