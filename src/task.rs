@@ -1,7 +1,7 @@
 //! Stable project tasks and their evidence-derived state.
 //!
 //! Task records contain intent and links, never a writable status. Every view
-//! calls [`view`] so the project page, context, plans and talk use the same
+//! calls [`view`] so the project page, context and plans use the same
 //! projection.
 
 use std::collections::BTreeSet;
@@ -1283,26 +1283,6 @@ fn date(timestamp: &str) -> &str {
     &timestamp[..timestamp.len().min(10)]
 }
 
-pub(crate) fn withdrawal_summary(task: &Task) -> String {
-    if task.withdrawn.is_empty() {
-        return String::new();
-    }
-    let details = task
-        .withdrawn
-        .iter()
-        .map(|evidence| {
-            format!(
-                "Acceptance {} withdrawn {}: {}",
-                evidence.acceptance,
-                date(&evidence.at),
-                evidence.reason
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!(" — {details}")
-}
-
 pub(crate) fn render(view: &View) -> String {
     let mut out = format!(
         "{} [{}] {}\n",
@@ -1618,28 +1598,6 @@ created = "2026-09-21T00:00:00Z"
             "2. [withdrawn {withdrawn_date}: The newer cleanup choice replaced it.]"
         )));
 
-        let summary = format!(
-            "Acceptance 2 withdrawn {withdrawn_date}: The newer cleanup choice replaced it."
-        );
-        let overview = crate::talk::overview::Overview::load(
-            &fx.project,
-            &crate::talk::Journal::default(),
-            &crate::talk::view::Conversation::default(),
-            &crate::talk::overview::Live::default(),
-        );
-        assert!(
-            overview
-                .tasks
-                .iter()
-                .any(|row| row.full_text().contains(&summary)),
-            "{:?}",
-            overview
-                .tasks
-                .iter()
-                .map(|row| row.full_text())
-                .collect::<Vec<_>>()
-        );
-
         let error = record_evidence(
             &fx.project,
             "job-0001",
@@ -1936,19 +1894,6 @@ created = "2026-09-21T00:00:00Z"
                 .unwrap()
                 .contains("done    s-1")
         );
-        let overview = crate::talk::overview::Overview::load(
-            &fx.project,
-            &crate::talk::Journal::default(),
-            &crate::talk::view::Conversation::default(),
-            &crate::talk::overview::Live::default(),
-        );
-        assert!(
-            overview
-                .tasks
-                .iter()
-                .any(|row| row.prefix == "verified" && row.marker == "job-0001")
-        );
-
         project::refresh_page(&fx.project).unwrap();
         let page = std::fs::read_to_string(fx.project.project_md()).unwrap();
         assert!(page.contains("`job-0001` [verified] Ship the checked change."));

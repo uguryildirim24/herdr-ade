@@ -174,11 +174,6 @@ pub(crate) struct Settings {
     pub(crate) name: String,
     pub(crate) goal: String,
     pub(crate) nudge: bool,
-    /// Plugin-owned conversation surface (SPEC-ADE D18). Absent means the
-    /// default of item 24: on for a `claude` coordinator, off otherwise
-    /// (`talk::enabled`). Never written by `new`, so the default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) talk: Option<bool>,
     /// Ordered task milestones used when a repository has no override.
     #[serde(default = "default_task_states")]
     pub(crate) task_states: Vec<String>,
@@ -203,7 +198,6 @@ impl Default for Settings {
             // prompt merges with, and submits, text the user has half-typed;
             // the project setting is the way out.
             nudge: true,
-            talk: None,
             task_states: default_task_states(),
             repos: Vec::new(),
         }
@@ -1579,7 +1573,7 @@ mod tests {
         assert!(!front.contains("max_parallel_threads"), "{front}");
         assert!(!front.contains("talk"), "{front}");
         let (settings, _) = parse_project_md(&text).unwrap();
-        assert_eq!(settings.talk, None);
+        assert_eq!(settings.name, "Demo");
     }
 
     #[test]

@@ -398,7 +398,7 @@ enum Command {
         #[arg(long, value_name = "REQUEST_ID")]
         request: Option<String>,
     },
-    /// Tell Rolf one checked line on the board and the talk tab
+    /// Tell Rolf one checked line on the board and in the journal
     Say {
         /// Project slug
         #[arg(value_name = "PROJECT")]
@@ -422,20 +422,6 @@ enum Command {
     Term {
         #[command(subcommand)]
         command: TermCommand,
-    },
-    /// The talk tab: Rolf's checked conversation with the coordinator (SPEC-ADE D18)
-    Talk {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        /// Print the journal once and exit; sends nothing
-        #[arg(long, conflicts_with_all = ["accepted", "open_tab"])]
-        replay: bool,
-        /// Record that the coordinator's turn ended after a submission (the correction hook)
-        #[arg(long, hide = true, conflicts_with = "open_tab")]
-        accepted: bool,
-        /// Create the talk tab in the coordinator workspace when talk is on
-        #[arg(long)]
-        open_tab: bool,
     },
     /// Publish the board rows now, or print them
     Board {
@@ -544,7 +530,7 @@ enum RoundCommand {
         slug: String,
         round: Option<String>,
     },
-    /// Run the ticker's pass for rounds, asks, talk and the board once
+    /// Run the ticker's pass for rounds, asks and the board once
     Tick {
         #[arg(value_name = "PROJECT")]
         slug: String,
@@ -796,7 +782,7 @@ enum TermCommand {
 }
 
 fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
-    use crate::{ask, board, checkpoint, decide, dialogue, glossary, plan, round, talk};
+    use crate::{ask, board, checkpoint, decide, dialogue, glossary, plan, round};
     match command {
         Command::Round { command } => match command {
             RoundCommand::Open {
@@ -1490,30 +1476,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
         },
-        Command::Talk {
-            slug,
-            replay,
-            accepted,
-            open_tab,
-        } => {
-            if replay {
-                print!("{}", talk::replay(ctx, &slug)?);
-                Ok(())
-            } else if accepted {
-                let project = Project::load(&ctx.root, &slug)?;
-                println!("{} request(s) accepted", talk::mark_accepted(&project)?);
-                Ok(())
-            } else if open_tab {
-                let project = Project::load(&ctx.root, &slug)?;
-                match talk::ensure_tab(ctx, &project)? {
-                    Some(tab) => println!("talk tab {} (pane {})", tab.tab_id, tab.pane_id),
-                    None => println!("talk is off for this project"),
-                }
-                Ok(())
-            } else {
-                talk::screen::run(ctx, &slug)
-            }
-        }
         Command::Board {
             slug,
             thread,
@@ -2069,7 +2031,6 @@ pub fn run() -> Result<()> {
         || command_name == "delete" && flag("preview")
         || command_name == "checkpoint" && (flag("print") || flag("check"))
         || command_name == "pickup" && flag("dry_run")
-        || command_name == "talk" && flag("replay")
         || command_name == "board" && flag("print");
     // Identify the object of a refusal/retry, not just its verb. Do not copy
     // task text, prompts, flags or environment into the CLI-level subject.
@@ -2947,7 +2908,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
         | Command::Say { .. }
         | Command::Explain { .. }
         | Command::Term { .. }
-        | Command::Talk { .. }
         | Command::Board { .. }) => run_rounds(&ctx, command),
         Command::Harness { command } => match command {
             HarnessCommand::Install => {

@@ -383,19 +383,6 @@ mod tests {
         .unwrap();
 
         assert!(crate::decide::current(&fx.project).is_empty());
-        let overview = crate::talk::overview::Overview::load(
-            &fx.project,
-            &crate::talk::Journal::default(),
-            &crate::talk::view::Conversation::default(),
-            &crate::talk::overview::Live::default(),
-        );
-        assert!(
-            overview
-                .sections
-                .iter()
-                .flatten()
-                .all(|row| !row.full_text().contains("I kept the old instruction."))
-        );
         let error = crate::decide::decide(
             &fx.world.ctx(),
             "demo",
