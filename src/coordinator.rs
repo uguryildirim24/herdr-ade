@@ -467,6 +467,10 @@ struct ContextCursor {
     inbox: BTreeMap<String, String>,
     failures: BTreeMap<String, String>,
     relevant_config: BTreeMap<String, String>,
+    /// Completion evidence already seen by this coordinator incarnation.
+    completed: BTreeMap<String, String>,
+    /// Old cursors have no completion receipt; do not replay their whole history.
+    completion_receipt: bool,
 }
 
 impl ContextCursor {
@@ -531,6 +535,41 @@ impl ContextCursor {
             })
             .unwrap_or_default();
         let relevant_config = relevant_config(ctx, project);
+        let evidence = crate::task::EvidenceSnapshot::load(project);
+        let completed = crate::task::views_with_evidence(project, &evidence)
+            .0
+            .into_iter()
+            .filter(|view| {
+                matches!(
+                    view.state,
+                    crate::task::State::Finished
+                        | crate::task::State::Reviewed
+                        | crate::task::State::Merged
+                        | crate::task::State::Installed
+                        | crate::task::State::Verified
+                        | crate::task::State::Dropped
+                )
+            })
+            .map(|view| {
+                let task = &view.record;
+                let done = evidence
+                    .events()
+                    .iter()
+                    .filter(|event| {
+                        task.attempts.contains(&event.thread) && event.payload.done.is_some()
+                    })
+                    .map(|event| event.id.as_str())
+                    .max()
+                    .unwrap_or("");
+                // Review, merge and install are not new completion notices.
+                let signature = format!(
+                    "{done}:{:?}:{:?}",
+                    task.verified.last().map(|e| &e.at),
+                    task.dropped.last().map(|e| &e.at)
+                );
+                (task.id.clone(), signature)
+            })
+            .collect();
         Self {
             generation: coordinator.generation,
             pane: coordinator.pane_id,
@@ -541,6 +580,8 @@ impl ContextCursor {
             inbox,
             failures,
             relevant_config,
+            completed,
+            completion_receipt: true,
         }
     }
 }
@@ -645,37 +686,6 @@ fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> S
     out
 }
 
-fn recent_task(project: &Project, line: &str) -> bool {
-    let Some(id) = line
-        .strip_prefix("- `")
-        .and_then(|s| s.split_once('`'))
-        .map(|(id, _)| id)
-    else {
-        return true;
-    };
-    let Ok(task) = crate::task::load(project, id) else {
-        return true;
-    };
-    let attempts: Vec<_> = task
-        .attempts
-        .iter()
-        .filter_map(|id| crate::thread::load(project, id).ok())
-        .collect();
-    let latest = task
-        .installed
-        .iter()
-        .map(|e| e.at.as_str())
-        .chain(task.verified.iter().map(|e| e.at.as_str()))
-        .chain(task.dropped.iter().map(|e| e.at.as_str()))
-        .chain(attempts.iter().map(|t| t.updated.as_str()))
-        .max()
-        .unwrap_or(task.created.as_str());
-    let now = jiff::Timestamp::now();
-    latest
-        .parse::<jiff::Timestamp>()
-        .is_ok_and(|at| now.as_second() - at.as_second() < 86400)
-}
-
 fn filter_page(project: &Project, text: &str, collapse: bool) -> String {
     let mut out = String::new();
     let mut section = "";
@@ -705,9 +715,7 @@ fn filter_page(project: &Project, text: &str, collapse: bool) -> String {
             continue;
         }
         if line.starts_with("- ") {
-            skip_item = (standing && line.contains("(historical"))
-                || (section == "## Recently finished or dropped tasks"
-                    && !recent_task(project, line));
+            skip_item = standing && line.contains("(historical");
         }
         if !skip_item {
             out.push_str(line);
@@ -716,16 +724,132 @@ fn filter_page(project: &Project, text: &str, collapse: bool) -> String {
     out
 }
 
-fn omit_history(project: &Project, text: &str) -> String {
-    filter_page(project, text, false)
+/// Keep task history on the project page and in --full, not in every context read.
+fn compact_tasks(
+    project: &Project,
+    text: &str,
+    before: Option<&ContextCursor>,
+    now: &ContextCursor,
+) -> String {
+    let mut out = String::new();
+    let mut section = String::new();
+    let mut body = String::new();
+    let evidence = crate::task::EvidenceSnapshot::load(project);
+    let views: BTreeMap<_, _> = crate::task::views_with_evidence(project, &evidence)
+        .0
+        .into_iter()
+        .map(|view| (view.record.id.clone(), view))
+        .collect();
+    let flush = |out: &mut String, heading: &str, body: &str| match heading {
+        "## Recently finished or dropped tasks" => {
+            // The project page lists only terminal tasks. A newly finished lane
+            // still awaiting review belongs here too, without the report path.
+            let mut rows: Vec<_> = views
+                .values()
+                .filter(|view| {
+                    now.completed.get(&view.record.id).is_some_and(|signature| {
+                        before.is_some_and(|previous| {
+                            previous.completion_receipt
+                                && previous.completed.get(&view.record.id) != Some(signature)
+                        })
+                    })
+                })
+                .collect();
+            rows.sort_by(|a, b| b.record.created.cmp(&a.record.created));
+            if !rows.is_empty() {
+                out.push_str(heading);
+                out.push_str("\n\n");
+                for view in rows {
+                    let _ = writeln!(
+                        out,
+                        "- `{}` [{}] {}",
+                        view.record.id,
+                        view.state.word(),
+                        view.record
+                            .title
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+                out.push('\n');
+            }
+        }
+        "## Open tasks" => {
+            out.push_str(heading);
+            out.push_str("\n\n");
+            let mut waits: BTreeMap<(String, String), usize> = BTreeMap::new();
+            let mut skip_wait_detail = false;
+            for line in body.lines() {
+                if let Some(id) = line
+                    .strip_prefix("- `")
+                    .and_then(|s| s.split_once('`'))
+                    .map(|(id, _)| id)
+                {
+                    skip_wait_detail = false;
+                    if let Some(view) = views.get(id)
+                        && let Some(wait) = crate::task::active_wait(project, &view.record)
+                        && ((view.state == crate::task::State::Open
+                            && view.record.attempts.is_empty())
+                            || view.next.starts_with("wait "))
+                    {
+                        *waits
+                            .entry((wait.kind.clone(), wait.target.clone()))
+                            .or_default() += 1;
+                        skip_wait_detail = true;
+                    }
+                }
+                if !skip_wait_detail && !line.is_empty() {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            for ((kind, target), count) in waits {
+                let _ = writeln!(
+                    out,
+                    "- {count} task(s) wait on {kind}: {target}; list with `ha task list {}`",
+                    project.slug
+                );
+            }
+            out.push('\n');
+        }
+        _ => {
+            out.push_str(heading);
+            if !heading.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(body);
+        }
+    };
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            flush(&mut out, &section, &body);
+            section = line.trim_end().into();
+            body.clear();
+        } else {
+            body.push_str(line);
+        }
+    }
+    flush(&mut out, &section, &body);
+    out
 }
+
 fn compact_page(
     project: &Project,
     text: &str,
-    before: &ContextCursor,
+    before: Option<&ContextCursor>,
     now: &ContextCursor,
 ) -> String {
-    filter_page(project, text, before.standing == now.standing)
+    compact_tasks(
+        project,
+        &filter_page(
+            project,
+            text,
+            before.is_some_and(|previous| previous.standing == now.standing),
+        ),
+        before,
+        now,
+    )
 }
 
 pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<()> {
@@ -747,11 +871,13 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
         before.generation == current.generation && before.pane == current.pane
     });
     let (mut text, shown, events) = digest_snapshot(ctx, &project, &prefix)?;
-    if same_session && !full {
-        text = compact_page(&project, &text, previous.as_ref().unwrap(), &current);
-    }
-    if !full && !same_session {
-        text = omit_history(&project, &text);
+    if !full {
+        text = compact_page(
+            &project,
+            &text,
+            previous.as_ref().filter(|_| same_session),
+            &current,
+        );
     }
     let changes = changes_since(previous.as_ref().filter(|_| same_session), &current);
     print!("{changes}{text}");
@@ -1248,7 +1374,7 @@ mod tests {
         let ctx = world.ctx();
         let before = ContextCursor::capture(&ctx, &project);
         let body = "# Project\n\n## Standing instructions in force\n\n- `n-1` (request:q-1): Keep this.\n\n## Running now\n\nNone.\n";
-        let compact = compact_page(&project, body, &before, &before);
+        let compact = compact_page(&project, body, Some(&before), &before);
         assert!(compact.contains("Unchanged; run `ha context demo --full`"));
         assert!(!compact.contains("Keep this."));
         assert!(body.contains("Keep this.")); // --full retains the unfiltered page
@@ -1327,11 +1453,134 @@ mod tests {
         let dir = project.record_dir_for_write("tasks").unwrap();
         std::fs::write(dir.join("job-9999.toml"), toml::to_string(&task).unwrap()).unwrap();
         let body = "## Facts in force\n\n- `n-1` (historical; t-0001): old fact\n  long continuation\n- `n-2` (request:q-1): current fact\n\n## Recently finished or dropped tasks\n\n- `job-9999` [verified] old task\n";
-        let filtered = omit_history(&project, body);
+        let cursor = ContextCursor::default();
+        let filtered = compact_page(&project, body, None, &cursor);
         assert!(!filtered.contains("old fact"), "{filtered}");
         assert!(!filtered.contains("long continuation"), "{filtered}");
         assert!(filtered.contains("current fact"));
         assert!(!filtered.contains("old task"));
+    }
+
+    #[test]
+    fn completion_rows_only_show_changes_since_read_without_reports() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let body = "# Project\n\n## Recently finished or dropped tasks\n\n- `job-0001` [dropped] Old\n  Final report (`t-0001`): `secret`\n- `job-0002` [dropped] New\n  Final report (`t-0002`): `secret`\n\n---\n";
+        let dir = project.record_dir_for_write("tasks").unwrap();
+        for (id, title) in [("job-0001", "Old"), ("job-0002", "New")] {
+            let task = crate::task::Task {
+                id: id.into(),
+                title: title.into(),
+                authority: vec!["request:q-1".into()],
+                acceptance: vec!["Done".into()],
+                created: "2020-01-01T00:00:00Z".into(),
+                dropped: vec![crate::task::DropEvidence {
+                    at: "2020-01-02T00:00:00Z".into(),
+                    reason: "superseded".into(),
+                }],
+                ..Default::default()
+            };
+            std::fs::write(
+                dir.join(format!("{id}.toml")),
+                toml::to_string(&task).unwrap(),
+            )
+            .unwrap();
+        }
+        let now = ContextCursor::capture(&world.ctx(), &project);
+        let mut before = ContextCursor {
+            completion_receipt: true,
+            ..Default::default()
+        };
+        before
+            .completed
+            .insert("job-0001".into(), now.completed["job-0001"].clone());
+        assert!(
+            !compact_page(&project, body, Some(&ContextCursor::default()), &now)
+                .contains("## Recently finished or dropped tasks")
+        );
+        let text = compact_page(&project, body, Some(&before), &now);
+        assert!(text.contains("- `job-0002` [dropped] New"), "{text}");
+        assert!(!text.contains("job-0001"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(
+            !compact_page(&project, body, Some(&now), &now)
+                .contains("## Recently finished or dropped tasks")
+        );
+        assert!(body.contains("Final report")); // --full keeps the whole list
+    }
+
+    #[test]
+    fn active_holds_collapse_but_resolved_holds_and_actions_remain() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let dir = project.record_dir_for_write("tasks").unwrap();
+        for (id, kind) in [
+            ("job-0001", "event"),
+            ("job-0002", "event"),
+            ("job-0003", "round"),
+        ] {
+            let task = crate::task::Task {
+                id: id.into(),
+                title: id.into(),
+                authority: vec!["request:q-1".into()],
+                acceptance: vec!["Done".into()],
+                repo: Some("/tmp/repo".into()),
+                created: "2020-01-01T00:00:00Z".into(),
+                wait: Some(crate::task::TaskWait {
+                    kind: kind.into(),
+                    target: if kind == "round" { "r1" } else { "release" }.into(),
+                    snapshot: "stale".into(),
+                    since: "2020-01-01T00:00:00Z".into(),
+                }),
+                ..Default::default()
+            };
+            std::fs::write(
+                dir.join(format!("{id}.toml")),
+                toml::to_string(&task).unwrap(),
+            )
+            .unwrap();
+        }
+        let actionable = crate::task::Task {
+            id: "job-0004".into(),
+            title: "Needs repair".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["Done".into()],
+            created: "2020-01-01T00:00:00Z".into(),
+            attempts: vec!["t-missing".into()],
+            wait: Some(crate::task::TaskWait {
+                kind: "event".into(),
+                target: "release".into(),
+                snapshot: String::new(),
+                since: "2020-01-01T00:00:00Z".into(),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.join("job-0004.toml"),
+            toml::to_string(&actionable).unwrap(),
+        )
+        .unwrap();
+        let round = crate::contracts::RoundRecord {
+            round: "r1".into(),
+            phase: crate::contracts::RoundPhase::Abandoned,
+            ..Default::default()
+        };
+        std::fs::create_dir_all(crate::round::rounds_dir(&project)).unwrap();
+        std::fs::write(
+            crate::round::round_path(&project, "r1"),
+            toml::to_string(&round).unwrap(),
+        )
+        .unwrap();
+        let body = "## Open tasks\n\n- `job-0001` [open] One — next: start an attempt\n  waits on event: release\n- `job-0002` [open] Two — next: start an attempt\n  waits on event: release\n- `job-0003` [open] Three — next: start an attempt\n  waits on round: r1\n- `job-0004` [unknown] Needs repair — next: repair the missing attempt record\n  waits on event: release\n";
+        let text = compact_page(&project, body, None, &ContextCursor::default());
+        assert!(
+            text.contains("2 task(s) wait on event: release; list with `ha task list demo`"),
+            "{text}"
+        );
+        assert!(!text.contains("job-0001"), "{text}");
+        assert!(!text.contains("job-0002"), "{text}");
+        assert!(text.contains("job-0003"), "{text}");
+        assert!(text.contains("job-0004"), "{text}");
     }
 
     #[test]
