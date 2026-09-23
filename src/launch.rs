@@ -194,6 +194,35 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
         .collect()
 }
 
+/// Resolve `request:<id>` or `request:<project>/<id>` for a project-level
+/// coordinator recipe choice. The canonical cross-project form is retained on
+/// the coordinator launch record.
+pub fn authorize_coordinator_recipe(ctx: &Ctx, project: &Project, basis: &str) -> Result<String> {
+    let reference = basis
+        .strip_prefix("request:")
+        .filter(|value| !value.is_empty())
+        .with_context(|| "recipe_basis: --basis must be request:<id> or request:<project>/<id>")?;
+    let (slug, request) = reference
+        .split_once('/')
+        .map_or((project.slug.as_str(), reference), |(slug, request)| {
+            (slug, request)
+        });
+    if request.is_empty() {
+        bail!("recipe_basis: request id is empty");
+    }
+    let source = Project::load(&ctx.root, slug).map_err(|_| {
+        crate::refusal::error(format!(
+            "recipe_authority: no request `{basis}` in any project"
+        ))
+    })?;
+    if crate::talk::request_text(&source, request).is_none() {
+        return Err(crate::refusal::error(format!(
+            "recipe_authority: no request `{basis}` in any project"
+        )));
+    }
+    Ok(format!("request:{slug}/{request}"))
+}
+
 /// Validate and record Rolf's one-off recipe choice before a lane is created.
 /// The quote must occur verbatim in a request attached to the stable task.
 pub fn authorize_explicit_recipe(
@@ -318,6 +347,9 @@ pub struct ResolveInput<'a> {
     pub workflow: &'a str,
     /// One recipe Rolf named for this lane. Ordinary starts leave this empty.
     pub recipe: Option<&'a str>,
+    /// A recipe selected for the project's coordinator. Unlike a lane's
+    /// one-off choice, it is retained on the coordinator binding itself.
+    pub project_recipe: Option<&'a str>,
     /// Rolf's verbatim words and their task-bound request, validated before
     /// dispatch and persisted on the launch record.
     pub recipe_basis: Option<&'a str>,
@@ -448,8 +480,20 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     {
         bail!("recovery_failure_missing");
     }
-    let selected = match input.recipe {
-        Some(recipe) => {
+    let selected = match (input.project_recipe, input.recipe) {
+        (Some(recipe), None) => {
+            if input.previous.is_some() {
+                bail!(
+                    "recipe_override_recovery: a project recipe is chosen only when its coordinator starts"
+                );
+            }
+            crate::routing::Selection {
+                recipe: recipe.to_string(),
+                rule: "project".into(),
+                pinned: true,
+            }
+        }
+        (None, Some(recipe)) => {
             if input.previous.is_some() {
                 bail!(
                     "recipe_override_recovery: a one-off recipe is chosen only when the lane starts"
@@ -472,7 +516,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
                 pinned: true,
             }
         }
-        None => config.routing.select(&hash, &work, recovery)?,
+        (None, None) => config.routing.select(&hash, &work, recovery)?,
+        (Some(_), Some(_)) => bail!("recipe_choice_ambiguous"),
     };
     let recipe = config
         .recipes

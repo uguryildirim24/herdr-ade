@@ -27,10 +27,6 @@ struct Binding {
     pane: String,
     #[serde(default)]
     session_id: String,
-    /// The declaration used at install time, so removal and capture checks do
-    /// not depend on mutable global configuration.
-    #[serde(default)]
-    adapter: crate::adapters::Adapter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +54,33 @@ struct Receipt {
 
 fn binding_path(project: &Project) -> PathBuf {
     project.state_dir().join("plain").join("hook-binding.json")
+}
+
+fn binding_failure(project: &Project, path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+    let detail = format!("hook_binding_unreadable: {}: {error}", path.display());
+    crate::ledger::observe(
+        project,
+        "hook-binding-unreadable",
+        &path.to_string_lossy(),
+        &detail,
+    );
+    anyhow::anyhow!(detail)
+}
+
+fn read_binding(project: &Project) -> Result<Option<Binding>> {
+    let path = binding_path(project);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(binding_failure(project, &path, error)),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(binding) => {
+            crate::ledger::recovered(project, "hook-binding-unreadable", &path.to_string_lossy());
+            Ok(Some(binding))
+        }
+        Err(error) => Err(binding_failure(project, &path, error)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,30 +127,62 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     write_json_atomic(&path, &value)?;
     let dir = project.state_dir().join("plain");
     std::fs::create_dir_all(&dir)?;
-    project::write_json(
-        &binding_path(project),
-        &Binding {
-            kind: kind.to_string(),
-            project: project.slug.clone(),
-            pane: pane.to_string(),
-            session_id: String::new(),
-            adapter: adapter.clone(),
-        },
-    )?;
+    let binding = Binding {
+        kind: kind.to_string(),
+        project: project.slug.clone(),
+        pane: pane.to_string(),
+        session_id: String::new(),
+    };
+    project::write_json(&binding_path(project), &binding)?;
+    if read_binding(project)?.as_ref() != Some(&binding) {
+        bail!("hook_install_failed: hook binding did not verify");
+    }
     verify_owned_entry(&path, pane, shape, &adapter)?;
     Ok(true)
 }
 
-pub(crate) fn remove(project: &Project) -> Result<()> {
+/// Rewrites every open project's hook settings and small binding through the
+/// newly installed binary's current adapter declarations.
+pub(crate) fn reinstall_open(ctx: &Ctx) -> Result<Vec<String>> {
+    let mut rebound = Vec::new();
+    for slug in crate::project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        let Some(coordinator) = project.coordinator() else {
+            continue;
+        };
+        if coordinator.pane_id.is_empty() || coordinator.launch.kind.is_empty() {
+            continue;
+        }
+        if !install(
+            ctx,
+            &project,
+            &coordinator.launch.kind,
+            &coordinator.pane_id,
+        )? {
+            bail!(
+                "coordinator_hook_unsupported: open project `{slug}` uses `{}` without a prompt-submit hook",
+                coordinator.launch.kind
+            );
+        }
+        rebound.push(format!(
+            "{slug} ({}, pane {})",
+            coordinator.launch.kind, coordinator.pane_id
+        ));
+    }
+    Ok(rebound)
+}
+
+pub(crate) fn remove(ctx: &Ctx, project: &Project) -> Result<()> {
     let _lock = project.lock()?;
-    let binding: Option<Binding> = project::read_json(&binding_path(project));
-    if let Some(binding) = binding
-        && let Some((path, shape)) = settings_path(project, &binding.adapter)
-        && path.exists()
-    {
-        let mut value = read_json_object(&path)?;
-        remove_entries(&mut value, shape, &binding.adapter);
-        write_json_atomic(&path, &value)?;
+    if let Some(binding) = read_binding(project)? {
+        let adapter = crate::adapters::declaration(&ctx.config_dir, &binding.kind)?;
+        if let Some((path, shape)) = settings_path(project, &adapter)
+            && path.exists()
+        {
+            let mut value = read_json_object(&path)?;
+            remove_entries(&mut value, shape, &adapter);
+            write_json_atomic(&path, &value)?;
+        }
     }
     let _ = std::fs::remove_file(binding_path(project));
     Ok(())
@@ -135,21 +190,14 @@ pub(crate) fn remove(project: &Project) -> Result<()> {
 
 /// True when a prompt-submit hook is bound to this pane, so the talk layer
 /// knows to write prompt markers for it.
-pub(crate) fn captures(project: &Project, pane: &str) -> bool {
-    let Some(binding) = project::read_json::<Binding>(&binding_path(project)) else {
-        return false;
+pub(crate) fn captures(project: &Project, pane: &str) -> Result<bool> {
+    let Some(binding) = read_binding(project)? else {
+        return Ok(false);
     };
     if binding.pane != pane {
-        return false;
+        return Ok(false);
     }
-    settings_path(project, &binding.adapter).is_some_and(|_| {
-        !binding.adapter.hook.prompt_event.is_empty()
-            && binding
-                .adapter
-                .hook
-                .events
-                .contains(&binding.adapter.hook.prompt_event)
-    })
+    Ok(true)
 }
 
 fn event_phase<'a>(adapter: &'a crate::adapters::Adapter, event: &str) -> Option<&'a str> {
@@ -291,7 +339,7 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     let input: serde_json::Value =
         serde_json::from_slice(&bytes).context("hook input is not JSON")?;
     let session = input["session_id"].as_str().unwrap_or_default();
-    if !scope_binding(&project, kind, pane, session)? {
+    if !scope_binding(&project, kind, pane, session, phase)? {
         return Ok(());
     }
     bind_current_turn_session(&project, kind, pane, session)?;
@@ -315,19 +363,29 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
     }
 }
 
-fn scope_binding(project: &Project, kind: &str, pane: &str, session: &str) -> Result<bool> {
+fn scope_binding(
+    project: &Project,
+    kind: &str,
+    pane: &str,
+    session: &str,
+    phase: &str,
+) -> Result<bool> {
     let _lock = project.lock()?;
-    let Some(mut binding) = project::read_json::<Binding>(&binding_path(project)) else {
+    let Some(mut binding) = read_binding(project)? else {
         return Ok(false);
     };
     if binding.kind != kind || binding.pane != pane || binding.project != project.slug {
         return Ok(false);
     }
-    if binding.session_id.is_empty() && !session.is_empty() {
+    if binding.session_id != session {
+        // A relaunch or native session reset changes the harness session while
+        // keeping ADE's pane binding. Only its next submitted prompt may claim
+        // the new session; a late Stop from the old process cannot take it back.
+        if phase != "prompt" || session.is_empty() {
+            return Ok(false);
+        }
         binding.session_id = session.to_string();
         project::write_json(&binding_path(project), &binding)?;
-    } else if binding.session_id != session {
-        return Ok(false);
     }
     Ok(true)
 }
@@ -426,7 +484,7 @@ pub(crate) fn record_receipt(project: &Project, publication: &str) -> Result<()>
 
 fn record_receipt_for(project: &Project, publication: &str, pane: &str) -> Result<()> {
     let _lock = project.lock()?;
-    let Some(binding) = project::read_json::<Binding>(&binding_path(project)) else {
+    let Some(binding) = read_binding(project)? else {
         return Ok(());
     };
     let Some(coordinator) = project.coordinator() else {
@@ -644,7 +702,7 @@ mod tests {
                 .unwrap()
                 .ends_with("--phase prompt")
         );
-        remove(&project).unwrap();
+        remove(&ctx, &project).unwrap();
         let value = read_json_object(&path).unwrap();
         assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert!(
@@ -936,7 +994,6 @@ mod tests {
                 project: "demo".into(),
                 pane: "w1:p1".into(),
                 session_id: "session-one".into(),
-                adapter: crate::adapters::Adapter::default(),
             },
         )
         .unwrap();
@@ -979,13 +1036,19 @@ mod tests {
     }
 
     #[test]
-    fn cursor_and_codex_use_their_project_hook_shapes() {
+    fn install_rebinds_open_hooks_and_binding_failures_stay_visible() {
         let temp = tempfile::tempdir().unwrap();
         let env = Env::for_test(temp.path(), &[]);
         let runner = FakeRunner::new();
         let root = temp.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let project = project::create(&root, "demo", "", vec![]).unwrap();
+        project
+            .update_coordinator(|record| {
+                record.pane_id = "w1:p1".into();
+                record.launch.kind = "claude".into();
+            })
+            .unwrap();
         let ctx = Ctx {
             env: &env,
             root,
@@ -993,43 +1056,25 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
+        std::fs::create_dir_all(binding_path(&project).parent().unwrap()).unwrap();
+        std::fs::write(
+            binding_path(&project),
+            r#"{"kind":"claude","project":"demo","pane":"w1:p1","session_id":"old","adapter":{"future_field":true}}"#,
+        )
+        .unwrap();
 
-        install(&ctx, &project, "cursor", "w1:p1").unwrap();
-        install(&ctx, &project, "cursor", "w1:p1").unwrap();
-        let cursor = read_json_object(&project.dir().join(".cursor/hooks.json")).unwrap();
-        assert_eq!(cursor["version"], 1);
-        assert_eq!(
-            cursor["hooks"]["afterAgentResponse"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(
-            cursor["hooks"]["afterAgentResponse"][0]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("--phase observe")
-        );
-        assert!(
-            cursor["hooks"]["stop"][0]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("--phase stop")
-        );
-        remove(&project).unwrap();
+        assert_eq!(reinstall_open(&ctx).unwrap(), ["demo (claude, pane w1:p1)"]);
+        let rewritten = std::fs::read_to_string(binding_path(&project)).unwrap();
+        assert!(!rewritten.contains("adapter"), "{rewritten}");
+        assert!(scope_binding(&project, "claude", "w1:p1", "one", "prompt").unwrap());
+        assert!(!scope_binding(&project, "claude", "w1:p1", "two", "stop").unwrap());
+        assert!(scope_binding(&project, "claude", "w1:p1", "two", "prompt").unwrap());
 
-        install(&ctx, &project, "codex", "w1:p1").unwrap();
-        let codex = read_json_object(&project.dir().join(".codex/hooks.json")).unwrap();
-        assert_eq!(codex["hooks"]["Stop"].as_array().unwrap().len(), 1);
-        assert!(
-            codex["hooks"]["Stop"][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains("--kind codex")
-        );
-        remove(&project).unwrap();
-        let codex = read_json_object(&project.dir().join(".codex/hooks.json")).unwrap();
-        assert!(codex["hooks"]["Stop"].as_array().unwrap().is_empty());
+        std::fs::write(binding_path(&project), b"not json").unwrap();
+        let error = captures(&project, "w1:p1").unwrap_err().to_string();
+        assert!(error.contains("hook_binding_unreadable"), "{error}");
+        let digest = crate::coordinator::digest(&ctx, &project, "ha").unwrap().0;
+        assert!(digest.contains("hook-binding-unreadable"), "{digest}");
+        assert!(digest.contains("hook-binding.json"), "{digest}");
     }
 }

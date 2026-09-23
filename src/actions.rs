@@ -192,6 +192,8 @@ fn run_on_slug(ctx: &Ctx, command: &str, slug: &str) -> Result<()> {
                 },
                 reprime: false,
                 rebind: false,
+                recipe: None,
+                recipe_basis: None,
             },
         ),
         "pause" => lifecycle::set_status(ctx, slug, Status::Paused),

@@ -149,6 +149,8 @@ pub(crate) struct OpenOptions {
     pub(crate) session: SessionFlags,
     pub(crate) reprime: bool,
     pub(crate) rebind: bool,
+    pub(crate) recipe: Option<String>,
+    pub(crate) recipe_basis: Option<String>,
 }
 
 pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
@@ -157,21 +159,17 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
     }
     let (settings, _) = project.read_project_md()?;
-    let selected = crate::launch::resolve_launch(
-        ctx,
-        &project,
-        &crate::launch::ResolveInput {
-            task: "Project coordinator.",
-            workflow: "coordinator",
-            ..Default::default()
-        },
-    )?;
-    let spec = crate::contracts::RoleSpec {
-        kind: selected.kind,
-        args: selected.args,
-        env: selected.env,
-        ready_timeout_ms: selected.ready_timeout_ms,
-    };
+    let selected_basis = options
+        .recipe
+        .as_ref()
+        .map(|_| {
+            crate::launch::authorize_coordinator_recipe(
+                ctx,
+                &project,
+                options.recipe_basis.as_deref().unwrap_or_default(),
+            )
+        })
+        .transpose()?;
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
 
@@ -194,7 +192,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             );
         }
         println!("rebinding `{slug}` from {} to {socket}", record.socket);
-        crate::hook::remove(&project)?;
+        crate::hook::remove(ctx, &project)?;
         previous = None;
     }
 
@@ -213,6 +211,16 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if let Some(record) = &previous
         && let Some(agent) = restore_agent_name(&project, &herdr, record, &agents)?
     {
+        if options
+            .recipe
+            .as_deref()
+            .is_some_and(|recipe| recipe != record.launch.recipe_id)
+        {
+            bail!(
+                "coordinator_recipe_running: `{slug}` is already running recipe `{}`; stop that coordinator before choosing another",
+                record.launch.recipe_id
+            );
+        }
         crate::hook::install(ctx, &project, &record.launch.kind, &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
@@ -248,15 +256,51 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         .unwrap_or_default();
     let brief_hash =
         crate::thread::sha256_hex(&std::fs::read(project.project_md()).unwrap_or_default());
-    let launch = match reusable {
-        Some(record) => record.launch.clone(),
-        None => project::launch_recipe(
-            &spec,
-            previous_launch.attempt + 1,
-            brief_hash,
-            project::policy_hash(&ctx.config_dir),
-            "coordinator",
-        ),
+    let mut launch = if let Some(recipe) = options.recipe.as_deref() {
+        let basis = selected_basis
+            .as_deref()
+            .expect("a selected recipe has validated authority");
+        crate::launch::resolve_launch(
+            ctx,
+            &project,
+            &crate::launch::ResolveInput {
+                task: "Project coordinator.",
+                workflow: "coordinator",
+                project_recipe: Some(recipe),
+                recipe_basis: Some(basis),
+                recipe_request: Some(basis),
+                ..Default::default()
+            },
+        )?
+    } else if !previous_launch.kind.is_empty() {
+        // Relaunches keep the exact recipe stored on the project binding,
+        // even when mutable routing has changed since it first opened.
+        previous_launch.clone()
+    } else {
+        crate::launch::resolve_launch(
+            ctx,
+            &project,
+            &crate::launch::ResolveInput {
+                task: "Project coordinator.",
+                workflow: "coordinator",
+                ..Default::default()
+            },
+        )?
+    };
+    if let Some(record) = reusable {
+        launch.attempt = record.launch.attempt;
+        launch.brief_hash = record.launch.brief_hash.clone();
+    } else {
+        launch.attempt = previous_launch.attempt + 1;
+        launch.brief_hash = brief_hash;
+    }
+    launch.skill_hash =
+        crate::thread::sha256_hex(crate::lane::skill_text("coordinator").as_bytes());
+    let spec = crate::contracts::RoleSpec {
+        kind: launch.kind.clone(),
+        args: launch.args.clone(),
+        env: launch.env.clone(),
+        ready_timeout_ms: launch.ready_timeout_ms,
     };
     if !launch.kind.is_empty() {
         let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
@@ -758,7 +802,7 @@ fn digest_snapshot(
 /// Retires the coordinator binding and removes only this plugin's hook entry.
 pub(crate) fn close(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    crate::hook::remove(&project)?;
+    crate::hook::remove(ctx, &project)?;
     project.update_coordinator(|record| *record = Coordinator::default())?;
     println!("closed coordinator binding for `{slug}`");
     Ok(())

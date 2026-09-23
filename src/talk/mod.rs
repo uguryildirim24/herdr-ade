@@ -411,7 +411,7 @@ fn mark_pending_prompt(
     text: &str,
     delivery: Option<&str>,
 ) -> Result<()> {
-    if !crate::hook::captures(project, pane) {
+    if !crate::hook::captures(project, pane)? {
         return Ok(());
     }
     project.record_dir_for_write("talk")?;

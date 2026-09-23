@@ -66,7 +66,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | --- | --- |
 | `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder with its one current page. |
 | `list [--all]` | Projects with status and thread counts by group. |
-| `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
+| `open <project> [--recipe ID --basis request:<id>] [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. A basis may name another project's request as `request:<project>/<id>`. The binding keeps the chosen recipe and basis when its process relaunches. |
 | `context <project> [--peek]` | The `PROJECT.md` body followed by new messages from Rolf, unhandled inbox items, current failures, work needing action and the compact recipe list. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
 | `task add`, `task show`, `task list`, `task evidence`, `task drop` | Create and inspect stable tasks and record per-condition verification. Each `--acceptance` value stays one condition even when it contains several short sentences, which are checked separately. When a newer choice replaces one condition, withdraw it with `task drop --acceptance N --reason` and name that choice in the reason. State is derived from linked events and rounds. A task without a repository needs only `finished` and `verified`, and may go straight to verification without an attempt. |
@@ -88,7 +88,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `round open <project> [<round>] [<thread>...] [--repo DIR] [--branch BRANCH] --plain S` | Open one round past the highest number already used by a record, local review branch, or committed review file, and admit the supplied lanes at once. Lanes infer their single repository; an open without lanes refuses an ambiguous project. |
 | `round merge <project> <round>` | Merge, checkpoint, push to the repository's allowed remote, install when required, and close the round. Retry resumes a pending push or install without merging twice. |
 | `round show <project> [<round>]` | Show one round; without a round, list every round in the project. |
-| `harness install` | Standalone repair: build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. |
+| `harness install` | Standalone repair: build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. It rewrites every open coordinator's hook binding and names each one. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--preview] [--github]` | Project lifecycle. `delete` stops project-owned processes and sends owned local files to the macOS Trash; shared resources stay. GitHub deletion is explicit. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 
@@ -139,7 +139,7 @@ A round is a set of lanes that are reviewed and merged together. Its selected re
 
 ## Agent and machine adapters
 
-Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `talk`, `capabilities`, required flags and effort names, a doctor readiness driver and argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events, prompt event and block response. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
+Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `talk`, `capabilities`, required flags and effort names, a doctor readiness driver and argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events, prompt event and block response. A kind may coordinate only when its native hooks expose prompt submission, so text Rolf types into its pane cannot disappear. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
 
 Machine facts live in `[machines.<name>]`: `target`, `session`, `home`, `root`, `worktrees`, `build`, `path`, `ade_bin`, `pi_bin`, `kinds`, and `repos`. `kinds` is the list of adapter kinds the machine runs, such as `kinds = ["pi"]`; an empty list runs no agent jobs there. Omitting `kinds` leaves an existing user machine unrestricted, so every adapter kind may run there. Each repo row names `path`, `box_path`, and `publish_url`. Placement, doctor probes, lane environment, start lines, courier paths and cleanup resolve the selected machine row; another box does not add a code branch.
 
@@ -149,7 +149,7 @@ Machine facts live in `[machines.<name>]`: `target`, `session`, `home`, `root`, 
 
 Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table and flags an enabled recipe with neither a route nor a command. `context` prints one line per recipe with its plain use, capabilities and the rule or choice that reaches it; command syntax stays in the coordinator skill. Disabled recipes have no route.
 
-A coordinator still never chooses a model. When Rolf names one for a single lane, the task must cite his request and the start uses `--recipe <id> --basis "<Rolf's exact words>"`. The launch record, context and decision log keep the recipe, quote and request. A non-default exact choice is recorded as a money decision rather than guessing prices in core logic. Pro is command-only and Mac-only: run `herdr-pro start --name <n> --cwd <dir> &`, then `herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]`; never type into its pane.
+A coordinator still never chooses a model. When Rolf names the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When Rolf names one for a single lane, the task must cite his request and the start uses `--recipe <id> --basis "<Rolf's exact words>"`. The lane launch record, context and decision log keep the recipe, quote and request. A non-default exact lane choice is recorded as a money decision rather than guessing prices in core logic. Pro is command-only and Mac-only: run `herdr-pro start --name <n> --cwd <dir> &`, then `herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]`; never type into its pane.
 
 The starting table is:
 
