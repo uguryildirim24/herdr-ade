@@ -5225,7 +5225,6 @@ pub fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
         }
     }
     let _ = crate::ask::tick(ctx, project);
-    let _ = crate::talk::tick(ctx, project);
     let _ = crate::board::refresh_tick(ctx, project);
     Ok(())
 }
