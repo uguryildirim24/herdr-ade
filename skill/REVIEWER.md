@@ -34,6 +34,4 @@ Give one gate row per pinned command, in the brief's order, with its actual exit
 
 ## Done
 
-On the cloud box, publish C on **your own lane branch** to the URL-matched remote before sealing. This is the cloud exception to the no-push rule, including any project instructions: the coordinator publishes the starting commit, but C does not exist yet at start. Never push `main`, the integration branch, or another lane's branch.
-
-Run `hp done --report <the report path from your brief> --sha <C>`. The report path may be absolute or relative to the worktree, but must name a file inside it. On the Mac, the coordinator does all pushing. You never merge into or move the integration branch yourself.
+Run `hp done --report <the report path from your brief> --sha <C>`. The report path may be absolute or relative to the worktree, but must name a file inside it. On the cloud box, `ha done` publishes C on your own reviewer branch and verifies the remote before sealing; on the Mac it does not publish. You never merge into or move the integration branch yourself.

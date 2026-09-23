@@ -5026,10 +5026,7 @@ mod tests {
         )
         .unwrap();
         let skill = crate::lane::skill_text(&started.role);
-        assert!(skill.contains("publish C on **your own lane branch**"));
-        assert!(
-            skill.contains("Never push `main`, the integration branch, or another lane's branch")
-        );
+        assert!(skill.contains("`ha done` publishes C on your own reviewer branch"));
         let brief = String::from_utf8(
             thread::artifact(&fx.project, record.review_artifact.as_deref().unwrap()).unwrap(),
         )
@@ -5076,32 +5073,6 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.starts_with("published_ref_mismatch:"), "{error}");
-        // The reviewer follows the refusal's command. No coordinator push,
-        // force, integration branch update or direct event fixture is needed.
-        let repair = error
-            .split("; run `")
-            .nth(1)
-            .unwrap()
-            .split('`')
-            .next()
-            .unwrap();
-        let repaired = std::process::Command::new("sh")
-            .args(["-c", repair])
-            .output()
-            .unwrap();
-        assert!(
-            repaired.status.success(),
-            "{}",
-            String::from_utf8_lossy(&repaired.stderr)
-        );
-        ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &candidate)
-            .unwrap();
-        assert_eq!(git(&fx.repo, &["rev-parse", &started.branch]), started.base);
-        assert_eq!(
-            git(&fx.repo, &["ls-remote", &remote, "refs/heads/main"]),
-            ""
-        );
-
         let box_root = fx.world.home.path().join("box-root");
         let box_project = project::create(&box_root, "demo", "", vec![]).unwrap();
         let op = ops::reserve(
@@ -5123,7 +5094,28 @@ mod tests {
             },
         )
         .unwrap();
-        ops::stage_done(&box_project, &op.op, &box_repo, ctx.runner).unwrap();
+        ops::stage_box_done(
+            &box_project,
+            &op.op,
+            &box_repo,
+            ctx.runner,
+            &crate::contracts::LaneCard {
+                thread: started.id.clone(),
+                attempt: started.attempt,
+                branch: started.branch.clone(),
+                publish_url: remote.clone(),
+                recipient: op.recipient.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &candidate)
+            .unwrap();
+        assert_eq!(git(&fx.repo, &["rev-parse", &started.branch]), started.base);
+        assert_eq!(
+            git(&fx.repo, &["ls-remote", &remote, "refs/heads/main"]),
+            ""
+        );
         let event = ops::seal(&box_project, &op.op, |_| Ok(())).unwrap();
         assert_eq!(event.payload.done.unwrap().sha, candidate);
         assert_eq!(crate::events::list(&box_project).len(), 1);
