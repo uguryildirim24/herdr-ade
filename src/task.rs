@@ -832,61 +832,11 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
         .filter(|event| event.thread == *current && event.attempt == attempt)
         .filter(|event| event.payload.done.is_some())
         .max_by(|left, right| (&left.created, &left.id).cmp(&(&right.created, &right.id)));
-    if thread.status == crate::thread::Status::Resolved && !thread.cancellation_reason.is_empty() {
-        return View {
-            record: task,
-            state: State::Cancelled,
-            next: "none".into(),
-            failure_class: None,
-            provider_kind: None,
-        };
-    }
-    if thread.status == crate::thread::Status::Resolved && done.is_none() {
-        return View {
-            record: task,
-            state: State::Unknown,
-            next: "the lane ended without `done`, so retry it or attest its stored report".into(),
-            failure_class: None,
-            provider_kind: None,
-        };
-    }
-    if let Some(failed) = event.and_then(|event| event.payload.failed.as_ref()) {
-        return View {
-            record: task,
-            state: State::Failed,
-            next: "retry or cancel the current attempt".into(),
-            failure_class: Some(failed.class),
-            provider_kind: failed.provider_kind.clone(),
-        };
-    }
-    if let Some(waiting) = event.and_then(|event| event.payload.waiting.as_ref()) {
-        return View {
-            record: task,
-            state: State::Working,
-            next: format!("wait for Rolf: {}", waiting.text.trim()),
-            failure_class: None,
-            provider_kind: None,
-        };
-    }
-    if thread.status == crate::thread::Status::Failed {
-        return View {
-            record: task,
-            state: State::Failed,
-            next: "retry or cancel the current attempt".into(),
-            failure_class: Some(thread.failure_class),
-            provider_kind: thread.provider_failure_kind.clone(),
-        };
-    }
-    if done.is_none() {
-        return View {
-            record: task,
-            state: State::Working,
-            next: "finish the current attempt".into(),
-            failure_class: None,
-            provider_kind: None,
-        };
-    }
 
+    // A round's completion pin is later, stronger evidence than the event that
+    // originally fed it. In particular, a merged round must not be hidden by
+    // an older failed event, and an open round must remain visible as the
+    // current place where the attempt is waiting.
     let mut relevant = Vec::new();
     for id in &task.rounds {
         let round = match crate::round::load(project, id) {
@@ -910,7 +860,88 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             relevant.push(round);
         }
     }
-    if relevant.iter().any(|round| {
+    let pins_current_attempt = |round: &&crate::contracts::RoundRecord| {
+        round.phase != RoundPhase::Abandoned
+            && round.manifest.members.iter().any(|member| {
+                member.thread == *current
+                    && member
+                        .pin
+                        .as_ref()
+                        .is_some_and(|pin| pin.attempt == attempt)
+            })
+    };
+    let pinned_round = relevant.iter().rev().find(pins_current_attempt);
+    let round_proves_completion = pinned_round.is_some();
+
+    if thread.status == crate::thread::Status::Resolved && !thread.cancellation_reason.is_empty() {
+        return View {
+            record: task,
+            state: State::Cancelled,
+            next: "none".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    if thread.status == crate::thread::Status::Resolved
+        && done.is_none()
+        && !round_proves_completion
+    {
+        return View {
+            record: task,
+            state: State::Unknown,
+            next: "the lane ended without `done`, so retry it or attest its stored report".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    if !round_proves_completion
+        && let Some(failed) = event.and_then(|event| event.payload.failed.as_ref())
+    {
+        return View {
+            record: task,
+            state: State::Failed,
+            next: "retry or cancel the current attempt".into(),
+            failure_class: Some(failed.class),
+            provider_kind: failed.provider_kind.clone(),
+        };
+    }
+    if !round_proves_completion
+        && let Some(waiting_event) = event.filter(|event| event.payload.waiting.is_some())
+        && thread.answered_waiting_event != waiting_event.id
+    {
+        let waiting = waiting_event
+            .payload
+            .waiting
+            .as_ref()
+            .expect("waiting event checked");
+        return View {
+            record: task,
+            state: State::Working,
+            next: format!("wait for Rolf: {}", waiting.text.trim()),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+    if !round_proves_completion && thread.status == crate::thread::Status::Failed {
+        return View {
+            record: task,
+            state: State::Failed,
+            next: "retry or cancel the current attempt".into(),
+            failure_class: Some(thread.failure_class),
+            provider_kind: thread.provider_failure_kind.clone(),
+        };
+    }
+    if done.is_none() && !round_proves_completion {
+        return View {
+            record: task,
+            state: State::Working,
+            next: "finish the current attempt".into(),
+            failure_class: None,
+            provider_kind: None,
+        };
+    }
+
+    if relevant.iter().filter(pins_current_attempt).any(|round| {
         round.verdict.is_some()
             && round.phase == RoundPhase::VerdictIn
             && round.verdict_kind.is_none()
@@ -923,15 +954,18 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             provider_kind: None,
         };
     }
-    let reviewed = relevant.iter().any(|round| {
-        round.verdict_kind.as_deref() == Some("MERGE")
-            || matches!(
-                round.phase,
-                RoundPhase::Merging | RoundPhase::Checkpointing | RoundPhase::Merged
-            )
+    let reviewed = relevant.iter().filter(pins_current_attempt).any(|round| {
+        matches!(
+            round.verdict_kind.as_deref(),
+            Some("MERGE" | "MERGE-AFTER-DECISION")
+        ) || matches!(
+            round.phase,
+            RoundPhase::Merging | RoundPhase::Checkpointing | RoundPhase::Merged
+        )
     });
     let merged = relevant
         .iter()
+        .filter(pins_current_attempt)
         .any(|round| round.phase == RoundPhase::Merged);
     let verified: BTreeSet<usize> = task
         .verified
@@ -967,7 +1001,41 @@ pub(crate) fn view(project: &Project, task: Task) -> View {
             _ => State::Unknown,
         };
     }
-    let next = next_for(state, &required, &task);
+    let active_round = pinned_round.filter(|round| !round.phase.closed());
+    let next = match active_round {
+        Some(round)
+            if round.phase == RoundPhase::VerdictIn
+                && round.verdict_kind.as_deref() == Some("MERGE-AFTER-DECISION") =>
+        {
+            format!(
+                "wait for Rolf: round {} has a MERGE-AFTER-DECISION verdict",
+                round.round
+            )
+        }
+        Some(round) if round.phase == RoundPhase::VerdictIn => format!(
+            "round {} has a {} verdict; decide its outcome",
+            round.round,
+            round.verdict_kind.as_deref().unwrap_or("recorded")
+        ),
+        Some(round) => match round.phase {
+            RoundPhase::Admitting => {
+                format!("round {} is waiting for completed attempts", round.round)
+            }
+            RoundPhase::PreparingReview => format!("round {} is preparing review", round.round),
+            RoundPhase::UnderReview => {
+                format!("round {} is waiting for its review verdict", round.round)
+            }
+            RoundPhase::Merging => format!("round {} is merging", round.round),
+            RoundPhase::Checkpointing => {
+                format!("round {} is waiting for its merge checkpoint", round.round)
+            }
+            RoundPhase::Diverged => format!("repair diverged round {}", round.round),
+            RoundPhase::VerdictIn | RoundPhase::Merged | RoundPhase::Abandoned => {
+                unreachable!("handled verdict or closed phase")
+            }
+        },
+        None => next_for(state, &required, &task),
+    };
     View {
         record: task,
         state,
@@ -1952,6 +2020,113 @@ created = "2026-09-21T00:00:00Z"
         let waiting = view(&fx.project, load(&fx.project, "job-0001").unwrap());
         assert_eq!(waiting.state, State::Working);
         assert_eq!(waiting.next, "wait for Rolf: Choose the final colour.");
+    }
+
+    #[test]
+    fn delivered_prompt_clears_the_waiting_line() {
+        use crate::round::testkit::fixture;
+        let fx = fixture();
+        record(&fx.project, "job-0001");
+        let (lane, _) = fx.lane(1);
+        link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        fx.seal_waiting(&lane, 1, 1, "Choose the final colour.");
+
+        let events = crate::round::sealed_events(&fx.project).unwrap();
+        crate::threads::record_answered_wait(&fx.project, &lane, 1, &events).unwrap();
+
+        let answered = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(answered.state, State::Working);
+        assert_eq!(answered.next, "finish the current attempt");
+    }
+
+    fn task_with_pinned_round_and_newer_failure() -> (crate::round::testkit::Fx, String) {
+        use crate::contracts::{Event, EventPayload, Recipient, WaitingPayload};
+        let fx = crate::round::testkit::fixture();
+        let ctx = fx.world.ctx();
+        let mut task = record(&fx.project, "job-0001");
+        task.repo = Some(fx.repo.to_string_lossy().into_owned());
+        write(&fx.project, &task).unwrap();
+        let (lane, sha) = fx.lane(1);
+        link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        crate::round::open(
+            &ctx,
+            "demo",
+            crate::round::OpenArgs {
+                round: "r1".into(),
+                branch: "main".into(),
+                plain: Some("The checked change is ready.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
+        let failure = Event {
+            id: format!("{lane}-1-2"),
+            op: format!("{lane}-1-2"),
+            thread: lane,
+            attempt: 1,
+            round: None,
+            recipient: Recipient::default(),
+            created: "9999-12-31T23:59:59Z".into(),
+            payload: EventPayload {
+                failed: Some(WaitingPayload {
+                    text: "old provider failure".into(),
+                    class: FailureClass::Provider,
+                    provider_kind: Some("pi".into()),
+                }),
+                ..EventPayload::default()
+            },
+        };
+        std::fs::write(
+            crate::round::events_dir(&fx.project).join(format!("{}.toml", failure.id)),
+            toml::to_string(&failure).unwrap(),
+        )
+        .unwrap();
+        (fx, sha)
+    }
+
+    #[test]
+    fn verdict_in_round_is_the_current_task_action() {
+        let (fx, _) = task_with_pinned_round_and_newer_failure();
+        let round_path = crate::round::rounds_dir(&fx.project).join("r1.toml");
+        let mut round = crate::round::load(&fx.project, "r1").unwrap();
+        round.phase = RoundPhase::VerdictIn;
+        round.verdict = round.manifest.members[0].pin.clone();
+        round.verdict_kind = Some("MERGE-AFTER-DECISION".into());
+        std::fs::write(&round_path, toml::to_string(&round).unwrap()).unwrap();
+
+        let held = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(held.state, State::Reviewed);
+        assert_eq!(
+            held.next,
+            "wait for Rolf: round r1 has a MERGE-AFTER-DECISION verdict"
+        );
+    }
+
+    #[test]
+    fn merged_round_supersedes_an_older_failure() {
+        use crate::contracts::{MergeIntent, MergePhase};
+        let (fx, sha) = task_with_pinned_round_and_newer_failure();
+        let round_path = crate::round::rounds_dir(&fx.project).join("r1.toml");
+        let mut round = crate::round::load(&fx.project, "r1").unwrap();
+        round.phase = RoundPhase::Merged;
+        round.merge = Some(MergeIntent {
+            op: "test-merge".into(),
+            expected_old: sha.clone(),
+            candidate: sha.clone(),
+            verdict: sha.clone(),
+            phase: MergePhase::Checkpointed,
+            merged: Some(sha),
+            checkpoint: None,
+            head: None,
+        });
+        std::fs::write(&round_path, toml::to_string(&round).unwrap()).unwrap();
+
+        let merged = view(&fx.project, load(&fx.project, "job-0001").unwrap());
+        assert_eq!(merged.state, State::Merged);
+        assert_eq!(merged.next, "none");
+        assert_eq!(merged.failure_class, None);
     }
 
     #[test]
