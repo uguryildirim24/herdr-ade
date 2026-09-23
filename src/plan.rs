@@ -557,7 +557,7 @@ fn derive_state(project: &Project, step: &PlanStep) -> StepState {
 mod tests {
     use super::*;
     use crate::contracts::MergePhase;
-    use crate::round::testkit::{Fx, commit_file, fixture, git};
+    use crate::round::testkit::{Fx, fixture, git};
 
     fn goal(fx: &Fx, text: &str) {
         let path = fx.project.project_md();
@@ -605,14 +605,8 @@ mod tests {
             record.manifest_hash.clone().unwrap(),
             record.policy_hash
         );
-        let v = commit_file(
-            &wt,
-            &crate::round::verdict_path(round),
-            &front,
-            &format!("verdict {round}"),
-        );
         let reviewer = fx.thread("Reviewer");
-        fx.seal_done(&reviewer, 1, 1, &v, "# verdict report\n");
+        fx.seal_done(&reviewer, 1, 1, &c, &front);
         crate::round::bind_reviewer(&ctx, "demo", round, &reviewer).unwrap();
         let out = crate::round::merge(&ctx, "demo", round, None).unwrap();
         assert!(matches!(

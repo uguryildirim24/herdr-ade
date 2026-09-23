@@ -585,13 +585,8 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
     if placed.kind == Kind::Worktree {
         let path = Path::new(&placed.thread_dir).join("brief.md");
         if !path.is_file() {
-            match thread::artifact(project, &placed.launch.brief_hash) {
-                Ok(bytes) => project::write_atomic(&path, &bytes)?,
-                Err(_) if placed.launch.brief_hash.len() != 64 => {
-                    // Historical code lanes received their brief from git.
-                }
-                Err(error) => return Err(error),
-            }
+            let bytes = thread::artifact(project, &placed.launch.brief_hash)?;
+            project::write_atomic(&path, &bytes)?;
         }
     }
     Ok(())

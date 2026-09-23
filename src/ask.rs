@@ -1470,7 +1470,7 @@ mod tests {
         );
         assert_eq!(
             glossary::explain(&ctx, "demo", "r1").unwrap(),
-            "r1: The first round lands the shared types.\n(tasks/review-r1.md)\n"
+            "r1: The first round lands the shared types.\n(.state/rounds/r1.toml)\n"
         );
         assert!(
             format!("{:#}", glossary::explain(&ctx, "demo", "nope").unwrap_err())
