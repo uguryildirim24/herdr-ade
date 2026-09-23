@@ -12,6 +12,7 @@ function fixture() {
   writeFileSync(script, `let data = ''; process.stdin.on('data', c => data += c);
 process.stdin.on('end', () => {
   require('fs').appendFileSync(process.argv[2], JSON.stringify({phase: process.argv[3], ...JSON.parse(data)}) + '\\n');
+  if (process.argv[3] === 'prompt' && JSON.parse(data).prompt === 'Second') console.log('request q-2');
   if (process.argv[3] === 'stop') console.log(JSON.stringify({decision: 'block', reason: 'Run ha say before you finish'}));
 });`);
   const log = join(cwd, 'hooks.jsonl');
@@ -73,6 +74,7 @@ test('a queued request does not activate its turn until pi starts that message',
     await f.emit('agent_settled', {});
     assert.deepEqual(f.lines().map(row => [row.phase, row.prompt]),
       [['prompt', 'First'], ['prompt', 'Second'], ['activate', 'Second'], ['stop', 'Second']]);
+    assert.equal(f.lines()[2].rolf_request, true);
   } finally { f.close(); }
 });
 

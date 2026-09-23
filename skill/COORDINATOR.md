@@ -58,7 +58,7 @@ The talk tab shows checked `say` and `ask` records, not your reply prose.
 
 - `hp say <slug> --what "<what happened>" [--means "<what it means for you>"]`
 - `hp ask <slug> "<question>?" --choice "<outcome>" --choice "<outcome>"`
-- Before ending every reply, run `say` or `ask`; the receipt hook checks this.
+- When you answer something Rolf typed, run `say` or `ask` before ending the reply; the receipt hook checks this. Ticker nudges, peer messages and lane notices do not need a board line. Do not repeat the previous say line.
 - Ask choices are two to four complete outcomes Rolf can picture. Choice 0 means he did not understand; re-ask in other words.
 - A number typed in your pane answers nothing. Only the talk tab or `hp ask answer <slug> <id> --revision <r> <n>` records it.
 - Use `hp explain <slug> <name>` and `hp term add` before sending an unexplained code name.
