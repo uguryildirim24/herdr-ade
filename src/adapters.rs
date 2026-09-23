@@ -15,7 +15,7 @@ use crate::contracts::Recipe;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct HookAdapter {
-    /// `claude`, `cursor`, or `none`: the on-disk hook JSON grammar.
+    /// `claude`, `cursor`, `pi`, or `none`: the on-disk hook JSON grammar.
     pub(crate) shape: String,
     /// Project-relative settings file.
     pub(crate) path: String,
@@ -89,7 +89,7 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
             "adapter_invalid: coordinator adapter `{kind}` needs a prompt-submit hook so Rolf's typed messages are recorded"
         );
     }
-    if !matches!(row.hook.shape.as_str(), "none" | "claude" | "cursor") {
+    if !matches!(row.hook.shape.as_str(), "none" | "claude" | "cursor" | "pi") {
         bail!(
             "adapter_invalid: `{kind}` has unknown hook shape `{}`",
             row.hook.shape
@@ -241,8 +241,8 @@ fn builtin() -> BTreeMap<String, Adapter> {
             talk: true,
             blocked_error_resumable: true,
             hook: hook(
-                "claude",
-                ".pi/hooks.json",
+                "pi",
+                ".pi/herdr-ade-hooks.json",
                 &["Stop", "UserPromptSubmit"],
                 "UserPromptSubmit",
                 "block",
