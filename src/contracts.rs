@@ -280,6 +280,9 @@ pub(crate) struct Op {
     pub(crate) created: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) artifact: Option<String>,
+    /// Report bytes read at reservation; absent in historical operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) report_hash: Option<String>,
 }
 
 /// A coordinator's explicit acceptance of a resolved lane's stored report.
@@ -846,6 +849,7 @@ mod tests {
             state: OpState::Staged,
             created: "2026-09-18T00:00:00Z".into(),
             artifact: Some("deadbeef".into()),
+            report_hash: None,
         };
         both(&op);
         both(&Event {
