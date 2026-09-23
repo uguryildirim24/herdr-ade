@@ -602,6 +602,9 @@ pub(crate) fn memory_use(project: &Project) -> MemoryUse {
 
 pub(crate) struct BriefInput<'a> {
     pub(crate) task: &'a str,
+    /// The lead's complete supplied brief when this lane is linked to a
+    /// stable task. Unlinked lanes already carry this text as `task`.
+    pub(crate) supplied_task: Option<&'a str>,
     pub(crate) instructions: &'a str,
     /// (note id, rendered note), in the order they should be included.
     pub(crate) facts: &'a [(String, String)],
@@ -621,6 +624,14 @@ fn compose_brief(input: &BriefInput) -> String {
         );
     }
     brief.push_str("# Task\n\n");
+    if let Some(supplied) = input.supplied_task {
+        brief.push_str("## Lead brief\n\n");
+        brief.push_str(supplied);
+        if !supplied.ends_with('\n') {
+            brief.push('\n');
+        }
+        brief.push('\n');
+    }
     brief.push_str(input.task.trim());
     brief.push_str("\n\n# Instructions in force\n\n");
     if input.instructions.trim().is_empty() {
@@ -736,6 +747,7 @@ pub(crate) fn brief_for(
         .as_ref()
         .map(|record| render_task(record, &active))
         .unwrap_or_else(|| supplied_task.trim().to_string());
+    let supplied_task = task_record.as_ref().map(|_| supplied_task);
     let (settings, _) = project.read_project_md()?;
     let repo = settings.repos.iter().find(|repo| repo.path == thread.repo);
     let gates = repo.and_then(|repo| repo.gates.as_deref());
@@ -746,6 +758,7 @@ pub(crate) fn brief_for(
     };
     Ok(compose_brief(&BriefInput {
         task: &task,
+        supplied_task,
         instructions: &instructions,
         facts: &facts.notes,
         repository: &thread.repo,
@@ -1692,6 +1705,7 @@ mod tests {
         }];
         let brief = compose_brief(&BriefInput {
             task: "Do the thing.",
+            supplied_task: None,
             instructions: "Always run the tests.",
             facts: &notes,
             repository: "/repo",
@@ -1723,6 +1737,7 @@ mod tests {
 
         let fresh = compose_brief(&BriefInput {
             task: "t",
+            supplied_task: None,
             instructions: "",
             facts: &[],
             repository: "",
@@ -1807,7 +1822,7 @@ mod tests {
             brief.contains("The command reports the new result."),
             "{brief}"
         );
-        assert!(!brief.contains("Do the task."), "{brief}");
+        assert!(brief.contains("## Lead brief\n\nDo the task."), "{brief}");
         assert!(brief.contains("Dated instruction marker."), "{brief}");
         assert!(brief.contains("Applicable dated marker."), "{brief}");
         assert!(!brief.contains("Other task marker"), "{brief}");
