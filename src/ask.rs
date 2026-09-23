@@ -834,6 +834,30 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     let key = publication_key(msg)?;
     let journal_key = journal_key(msg, &key);
     let path = publication_path(project, &key);
+    // Check the last authored line, not the board's shortened token. Keep
+    // retrying the same publication id possible after a partial sink failure.
+    let journal = crate::talk::read(project);
+    if let HumanMessage::Say { what, means, .. } = msg
+        && !journal
+            .lines
+            .iter()
+            .any(|line| line.key.as_deref() == Some(&journal_key))
+        && let Some((previous_what, previous_means)) =
+            journal
+                .lines
+                .iter()
+                .rev()
+                .find_map(|line| match &line.entry {
+                    crate::talk::Entry::Say { what, means, .. } => Some((what, means)),
+                    _ => None,
+                })
+        && previous_what == what
+        && previous_means == means
+    {
+        return Err(crate::refusal::error(
+            "say_repeated: your previous board line already says this; write a new line only when something changed",
+        ));
+    }
     let mut state = project::read_json::<Publication>(&path).unwrap_or(Publication {
         key: key.clone(),
         message: msg.clone(),
@@ -1282,6 +1306,37 @@ mod tests {
                 .count("--token ade_last=The first lane is done.")
                 == 1
         );
+    }
+
+    #[test]
+    fn say_refuses_the_previous_line_with_the_same_what_and_means() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        say(
+            &ctx,
+            "demo",
+            "The first lane is done.",
+            Some("You can read it now."),
+        )
+        .unwrap();
+        let error = say(
+            &ctx,
+            "demo",
+            "The first lane is done.",
+            Some("You can read it now."),
+        )
+        .unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert!(format!("{error:#}").contains("previous board line"));
+        assert_eq!(journal_kinds(&fx.project), ["say"]);
+        say(
+            &ctx,
+            "demo",
+            "The first lane is done.",
+            Some("It is ready to merge."),
+        )
+        .unwrap();
+        assert_eq!(journal_kinds(&fx.project), ["say", "say"]);
     }
 
     #[test]

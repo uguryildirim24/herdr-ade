@@ -532,6 +532,22 @@ fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
     } else {
         "the box was not ready, so this lane runs here"
     };
+    let project = Project::load(&ctx.root, slug)?;
+    if crate::talk::read(&project)
+        .lines
+        .iter()
+        .rev()
+        .find_map(|line| {
+            if let crate::talk::Entry::Say { what, means, .. } = &line.entry {
+                Some((what.as_str(), means.as_deref()))
+            } else {
+                None
+            }
+        })
+        == Some((what, None))
+    {
+        return Ok(());
+    }
     crate::ask::say(ctx, slug, what, None).map(|_| ())
 }
 
