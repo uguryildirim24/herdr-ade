@@ -56,7 +56,11 @@ pub(crate) fn names(project: &Project) -> Vec<Entry> {
     let mut out = Vec::new();
     for t in thread::list(project) {
         let sentence = crate::round::thread_plain(project, &t.id);
-        let path = format!("tasks/{}.md", t.id);
+        let path = if t.launch.brief_hash.is_empty() {
+            format!(".state/threads/{}.toml", t.id)
+        } else {
+            format!(".state/artifacts/{}", t.launch.brief_hash)
+        };
         out.push(Entry {
             name: t.id.clone(),
             sentence: sentence.clone(),

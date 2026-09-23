@@ -603,9 +603,9 @@ mod tests {
             &RealRunner,
             &repo_s,
             "main",
-            "tasks/t-0001.md",
-            b"# brief\n",
-            "docs(tasks): t-0001",
+            "notes/example.md",
+            b"# note\n",
+            "test: note",
         )
         .unwrap();
         assert_eq!(sha.len(), 40);
@@ -618,11 +618,11 @@ mod tests {
                 "-C",
                 &repo_s,
                 "show",
-                &format!("{sha}:tasks/t-0001.md"),
+                &format!("{sha}:notes/example.md"),
             ]))
             .unwrap();
         assert!(show.success());
-        assert_eq!(show.stdout, "# brief\n");
+        assert_eq!(show.stdout, "# note\n");
     }
 
     #[test]
@@ -647,9 +647,9 @@ mod tests {
             &RealRunner,
             &repo_s,
             "main",
-            "tasks/t-0001.md",
+            "notes/example.md",
             b"x\n",
-            "docs(tasks): t-0001",
+            "test: note",
         )
         .unwrap_err()
         .to_string();

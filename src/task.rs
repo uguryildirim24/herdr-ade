@@ -1667,7 +1667,7 @@ created = "2026-09-21T00:00:00Z"
 
     #[test]
     fn one_record_drives_every_milestone_and_skips_install_when_not_configured() {
-        use crate::round::testkit::{commit_file, fixture, git};
+        use crate::round::testkit::{fixture, git};
         let fx = fixture();
         let ctx = fx.world.ctx();
         crate::plan::set(&ctx, "demo", "command", "It reports the checked result.", 0).unwrap();
@@ -1723,14 +1723,8 @@ created = "2026-09-21T00:00:00Z"
             round.manifest_hash.unwrap(),
             round.policy_hash
         );
-        let verdict = commit_file(
-            &review.worktree,
-            &crate::round::verdict_path("r1"),
-            &verdict_text,
-            "verdict",
-        );
         let reviewer = fx.thread("Reviewer");
-        fx.seal_done(&reviewer, 1, 1, &verdict, "# verdict\n");
+        fx.seal_done(&reviewer, 1, 1, &candidate, &verdict_text);
         crate::round::bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
         crate::round::advance(&ctx, "demo").unwrap();
         assert_eq!(

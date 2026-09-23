@@ -46,9 +46,9 @@ struct LatestCheckpoint {
 
 /// The hash the checkpoint intent binds: both documents' exact bytes.
 pub(crate) fn payload_hash(md: &str, json: &str) -> String {
-    let mut bytes = b"HANDOFF.md\0".to_vec();
+    let mut bytes = b"checkpoint-markdown\0".to_vec();
     bytes.extend_from_slice(md.as_bytes());
-    bytes.extend_from_slice(b"\0HANDOFF.json\0");
+    bytes.extend_from_slice(b"\0checkpoint-json\0");
     bytes.extend_from_slice(json.as_bytes());
     sha256_hex(&bytes)
 }
@@ -274,47 +274,6 @@ fn git_state(git: &Git) -> Option<Value> {
     }))
 }
 
-fn record_files(repo: &Path) -> Value {
-    let pats: [(&str, &str, &str); 4] = [
-        ("briefs", "tasks", ".md"),
-        ("verdicts", "tasks/reviews", ".md"),
-        ("reports", ".reports", ".md"),
-        ("handoff", "", "HANDOFF.md"),
-    ];
-    let mut found = serde_json::Map::new();
-    for (k, dir, suffix) in pats {
-        let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
-        if k == "handoff" {
-            if repo.join("HANDOFF.md").is_file() {
-                files.push((std::time::SystemTime::UNIX_EPOCH, "HANDOFF.md".into()));
-            }
-        } else if let Ok(entries) = std::fs::read_dir(repo.join(dir)) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(suffix) && e.path().is_file() {
-                    let t = e
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    files.push((t, format!("{dir}/{name}")));
-                }
-            }
-        }
-        files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        found.insert(
-            k.to_string(),
-            Value::Array(
-                files
-                    .into_iter()
-                    .take(12)
-                    .map(|(_, f)| Value::String(f))
-                    .collect(),
-            ),
-        );
-    }
-    Value::Object(found)
-}
-
 // ----------------------------------------------------------------- collect
 
 pub(crate) struct Where<'a> {
@@ -434,7 +393,6 @@ pub(crate) fn collect(ctx: &Ctx, at: &Where) -> Result<Value> {
         "unlinked_agents": unlinked,
         "other_workspaces": other_ws,
         "git": gstate,
-        "files": record_files(&repo),
         "repo": repo.to_string_lossy(),
     }))
 }
@@ -675,23 +633,6 @@ pub(crate) fn render(st: &Value, prefix: &str) -> String {
             ));
         }
     }
-    if let Some(files) = st.get("files").and_then(Value::as_object) {
-        o.push_str("\n### Record files (newest first)\n\n");
-        for k in ["handoff", "briefs", "verdicts", "reports"] {
-            let list: Vec<String> = files
-                .get(k)
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|f| f.as_str().map(|f| format!("`{f}`")))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !list.is_empty() {
-                o.push_str(&format!("- {k}: {}\n", list.join(", ")));
-            }
-        }
-    }
     o.push_str("\n### Pickup\n\n");
     o.push_str("Run from the coordinator pane after a server restart, or from the fresh coordinator pane that takes over:\n\n```bash\n");
     o.push_str(&format!("{prefix} pickup <slug>\n"));
@@ -801,17 +742,9 @@ fn check_document(text: &str, st: &Value, repo: &Path) -> BTreeMap<String, BTree
         }
     }
     for (start, end, p) in backticked(text) {
-        let path_like = [
-            "tasks/",
-            "docs/",
-            ".reports/",
-            ".worktrees/",
-            "src/",
-            "scripts/",
-        ]
-        .iter()
-        .any(|pre| p.starts_with(pre))
-            || p == "HANDOFF.md"
+        let path_like = ["docs/", ".reports/", ".worktrees/", "src/", "scripts/"]
+            .iter()
+            .any(|pre| p.starts_with(pre))
             || p == "SPEC.md";
         if path_like && !p.contains(char::is_whitespace) {
             if p.contains('<') {
@@ -1064,20 +997,17 @@ fn integration(
     Ok((repo, branch))
 }
 
-/// The HANDOFF pair for an automatic checkpoint after a round merge: the
-/// handoff at `V` (or a skeleton) with a fresh `## Herdr` section.
+/// The sealed checkpoint pair after a round merge, with a fresh generated
+/// process section.
 pub(crate) fn compose_for_round(
     ctx: &Ctx,
     project: &Project,
     record: &RoundRecord,
-    v: &str,
+    candidate: &str,
 ) -> Result<(String, String)> {
-    let git = Git::new(ctx.runner, &record.repo);
     let base = latest(project)
         .and_then(|checkpoint| load_bundle(project, &checkpoint.artifact).ok())
         .map(|(markdown, _)| markdown)
-        // Historical projects may only have the old committed pair.
-        .or_else(|| git.show_file(v, "HANDOFF.md").ok().flatten())
         .unwrap_or_else(skeleton);
     let prefix =
         crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "herdr-ade".into());
@@ -1103,18 +1033,19 @@ pub(crate) fn compose_for_round(
         render(&state, &prefix)
     };
     section.push_str(&format!(
-        "\nRound `{}` was merged into `{}` at candidate commit `{v}`; this handoff artifact is tied to that exact code state.\n",
+        "\nRound `{}` was merged into `{}` at candidate commit `{candidate}`; this checkpoint artifact is tied to that exact code state.\n",
         record.round, record.branch
     ));
     let md = splice_herdr(&base, &section);
     let mut sidecar = state;
-    sidecar["round"] = json!({"round": record.round, "branch": record.branch, "verdict": v});
+    sidecar["round"] =
+        json!({"round": record.round, "branch": record.branch, "candidate": candidate});
     let json = format!("{}\n", serde_json::to_string_pretty(&sidecar)?);
     Ok((md, json))
 }
 
 fn skeleton() -> String {
-    "# HANDOFF\n\n## Goal\n\n## Authority\n\n## Settled\n\n## In flight\n\n## Open\n\n## Next\n\n## Traps\n\n".into()
+    "# Checkpoint\n\n## Goal\n\n## Authority\n\n## Settled\n\n## In flight\n\n## Open\n\n## Next\n\n## Traps\n\n".into()
 }
 
 pub(crate) struct CheckpointArgs {
@@ -1123,7 +1054,7 @@ pub(crate) struct CheckpointArgs {
     pub(crate) branch: Option<String>,
     /// Print the generated section only; write nothing.
     pub(crate) print: bool,
-    /// Check the committed handoff only; write nothing.
+    /// Check the latest sealed checkpoint only; write nothing.
     pub(crate) check_only: bool,
 }
 
@@ -1154,17 +1085,15 @@ pub(crate) fn checkpoint(ctx: &Ctx, slug: &str, args: CheckpointArgs) -> Result<
     let current = latest(&project)
         .and_then(|checkpoint| load_bundle(&project, &checkpoint.artifact).ok())
         .map(|(markdown, _)| markdown)
-        // Historical projects may only have the old committed pair.
-        .or_else(|| git.show_file(&head, "HANDOFF.md").ok().flatten())
         .unwrap_or_else(skeleton);
     if args.check_only {
         let problems = check_document(&current, &st, &repo);
-        return report(&problems, "HANDOFF.md", &st);
+        return report(&problems, "checkpoint", &st);
     }
     let md = splice_herdr(&current, &section);
     let problems = check_document(&md, &st, &repo);
     if !problems.is_empty() {
-        let text = report(&problems, "HANDOFF.md", &st).unwrap_err();
+        let text = report(&problems, "checkpoint", &st).unwrap_err();
         bail!("checkpoint_check_failed: nothing was committed\n{text:#}");
     }
     let json = format!("{}\n", serde_json::to_string_pretty(&st)?);
@@ -1512,10 +1441,10 @@ fn launch_of(project: &Project, id: &str) -> LaunchSeen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::round::testkit::{Fx, commit_file, fixture, git};
+    use crate::round::testkit::{Fx, fixture, git};
     use crate::runner::fake::{fail, ok};
 
-    const HANDOFF: &str = "# HANDOFF\n\n## Goal\n\nShip the rounds.\n\n## Authority\n\nRolf.\n\n## Settled\n\n## In flight\n\nThe worker lane-one writes `src/lane1.rs` (expected).\n\n## Open\n\n## Next\n\n- Review round one.\n\n## Traps\n\n";
+    const CHECKPOINT: &str = "# Checkpoint\n\n## Goal\n\nShip the rounds.\n\n## Authority\n\nRolf.\n\n## Settled\n\n## In flight\n\nThe worker lane-one writes `src/lane1.rs` (expected).\n\n## Open\n\n## Next\n\n- Review round one.\n\n## Traps\n\n";
 
     fn snapshot(fx: &Fx) {
         let repo = fx.repo.display();
@@ -1575,11 +1504,11 @@ mod tests {
             "git": {"branches": ["main", "lane/1"]},
         });
         let good = format!(
-            "{HANDOFF}## Herdr\n\nPane w1:p1 and lane-one in w1:p11, pane w1:p5 is closed. Branch `lane/1`, `README.md`.\n"
+            "{CHECKPOINT}## Herdr\n\nPane w1:p1 and lane-one in w1:p11, pane w1:p5 is closed. Branch `lane/1`, `README.md`.\n"
         );
         let problems = check_document(&good, &st, &fx.repo);
         assert!(problems.is_empty(), "{problems:?}");
-        let bad = "# H\n\n## Next\n\n- one\n- two\n\nPane w1:p5 and `tasks/nope.md`, `lane/9`, <fill me>.\n";
+        let bad = "# H\n\n## Next\n\n- one\n- two\n\nPane w1:p5 and `docs/nope.md`, `lane/9`, <fill me>.\n";
         let problems = check_document(bad, &st, &fx.repo);
         let classes: Vec<&str> = problems.keys().map(String::as_str).collect();
         assert_eq!(
@@ -1598,17 +1527,24 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_commits_both_files_as_one_commit_or_nothing() {
+    fn checkpoint_seals_both_documents_without_changing_code() {
         let fx = fixture();
         snapshot(&fx);
         let ctx = fx.world.ctx();
-        commit_file(
-            &fx.repo,
-            "HANDOFF.md",
-            "# HANDOFF\n\n## Next\n\n- a\n- b\n",
-            "bad handoff",
-        );
+        let bad = "# Checkpoint\n\n## Next\n\n- a\n- b\n";
+        let artifact = store_bundle(&fx.project, bad, "{}\n").unwrap();
         let before = git(&fx.repo, &["rev-parse", "main"]);
+        crate::project::write_atomic(
+            &latest_path(&fx.project),
+            toml::to_string(&LatestCheckpoint {
+                commit: before.clone(),
+                artifact,
+                payload_hash: payload_hash(bad, "{}\n"),
+            })
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
         let e = format!("{:#}", checkpoint(&ctx, "demo", args(&fx)).unwrap_err());
         assert!(
             e.starts_with("checkpoint_check_failed")
@@ -1621,8 +1557,18 @@ mod tests {
             "nothing was committed"
         );
 
-        commit_file(&fx.repo, "HANDOFF.md", HANDOFF, "handoff");
-        let before = git(&fx.repo, &["rev-parse", "main"]);
+        let artifact = store_bundle(&fx.project, CHECKPOINT, "{}\n").unwrap();
+        crate::project::write_atomic(
+            &latest_path(&fx.project),
+            toml::to_string(&LatestCheckpoint {
+                commit: before.clone(),
+                artifact,
+                payload_hash: payload_hash(CHECKPOINT, "{}\n"),
+            })
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
         let printed = checkpoint(
             &ctx,
             "demo",
@@ -1666,7 +1612,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            checked.starts_with("OK HANDOFF.md: 1 nested workers"),
+            checked.starts_with("OK checkpoint: 1 nested workers"),
             "{checked}"
         );
     }

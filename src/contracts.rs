@@ -494,8 +494,7 @@ pub(crate) struct RoundRecord {
     /// Accepted reviewer completion; later events cannot replace this pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verdict: Option<CompletionPin>,
-    /// The validated verdict word. Historical records without it remain
-    /// readable; a merged round itself proves a MERGE verdict.
+    /// The validated verdict word for the accepted sealed report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verdict_kind: Option<String>,
     pub(crate) round: String,
@@ -524,10 +523,20 @@ pub(crate) struct RoundRecord {
     /// checked-out review branch is separately pinned by `expected_head`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) review_artifact: Option<String>,
-    /// `review/r<n>`, created from `B` (SPEC-ADE D6).
+    /// The prior review retained while a repair review is running. Its report
+    /// artifact and candidate commit remain one sealed proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_verdict: Option<CompletionPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_verdict_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_review_branch: Option<String>,
+    /// `review/r<n>`, created from the recorded review base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) review_branch: Option<String>,
-    /// The reviewer thread whose sealed `done` sha is `V` (SPEC-ADE D6).
+    /// The reviewer thread whose sealed `done` names candidate C.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reviewer: Option<String>,
     /// What `round advance` last announced for this round (a verdict or a
@@ -577,17 +586,14 @@ impl RoundRecord {
     }
 }
 
-/// Checkpoint intent bound to `V` and the HANDOFF payload hash
-/// (SPEC-ADE D6, item 34).
+/// Checkpoint intent bound to the merged candidate and sealed payload hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct CheckpointIntent {
     pub(crate) parent: String,
     pub(crate) op: String,
     pub(crate) payload_hash: String,
-    /// Content-addressed handoff bundle in project state. Historical records
-    /// have no artifact and are verified from their old commit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) artifact: Option<String>,
+    /// Content-addressed handoff bundle in project state.
+    pub(crate) artifact: String,
 }
 
 /// Merge transaction phase (SPEC-ADE D6, item 34).
@@ -608,9 +614,9 @@ pub(crate) struct MergeIntent {
     pub(crate) candidate: String,
     pub(crate) verdict: String,
     pub(crate) phase: MergePhase,
-    /// The commit the integration branch held after merging V in: `V` on a
-    /// fast-forward, otherwise a merge commit whose first parent is the moved
-    /// head (SPEC-ADE D6, item 34). The checkpoint commits on top of it.
+    /// The commit the integration branch held after merging the candidate: C
+    /// on a fast-forward, otherwise a merge commit whose first parent is the
+    /// moved head. The checkpoint artifact is bound to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) merged: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1132,7 +1138,7 @@ members = []
                 parent: "V".into(),
                 op: "merge-r1".into(),
                 payload_hash: "hh".into(),
-                artifact: None,
+                artifact: "aa".into(),
             }),
             head: None,
         });
