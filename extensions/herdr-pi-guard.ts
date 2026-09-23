@@ -24,7 +24,7 @@ function commands(ctx) {
   try {
     const value = JSON.parse(readFileSync(join(ctx.cwd, ".pi/herdr-ade-hooks.json"), "utf8"));
     if (value.pane !== pane) return null;
-    if (![value.prompt, value.stop].every((argv) =>
+    if (![value.prompt, value.activate, value.stop].every((argv) =>
       Array.isArray(argv) && argv.length > 1 && argv.every((arg) => typeof arg === "string"))) return null;
     return value;
   } catch {
@@ -62,6 +62,8 @@ export default function (pi) {
   const lastSentAt = new Map(); // class -> epoch ms
   let activeHook = null;
   let corrections = 0;
+  let firstMessagePending = false;
+  const queued = []; // prompts submitted during streaming, not yet active turns
 
   pi.on("input", async (event, ctx) => {
     // sendUserMessage corrections are extension delivery, not Rolf's words.
@@ -72,14 +74,39 @@ export default function (pi) {
       prompt: event.text,
       session_id: ctx.sessionManager.getSessionId(),
       cwd: ctx.cwd,
+      queued: !!event.streamingBehavior,
     };
     try {
       await hook(config.prompt, payload);
-      activeHook = { config, payload };
-      corrections = 0;
+      if (payload.queued) queued.push({ config, payload });
+      else {
+        queued.length = 0;
+        firstMessagePending = true;
+        activeHook = { config, payload };
+        corrections = 0;
+      }
     } catch (error) {
       if (ctx.hasUI) ctx.ui.notify(`ADE prompt check failed: ${error}`, "error");
       return { action: "handled" }; // never let an unrecorded request through
+    }
+  });
+
+  pi.on("message_start", async (event, ctx) => {
+    if (event.message?.role !== "user") return;
+    if (firstMessagePending) {
+      firstMessagePending = false;
+      return;
+    }
+    if (!queued.length) return;
+    const next = queued.shift();
+    try {
+      await hook(next.config.activate, next.payload);
+      activeHook = next;
+      corrections = 0;
+    } catch (error) {
+      activeHook = null;
+      if (ctx.hasUI) ctx.ui.notify(`ADE queued turn check failed: ${error}`, "error");
+      throw error;
     }
   });
 
