@@ -848,6 +848,7 @@ fn latest_history(project: &Project) -> Option<String> {
 }
 
 fn page_body(project: &Project, settings: &Settings) -> String {
+    let evidence = crate::task::EvidenceSnapshot::load(project);
     let mut out = String::from("# Project\n\n");
     out.push_str("## Goal and what Rolf gets\n\n");
     if settings.goal.trim().is_empty() {
@@ -857,7 +858,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     }
     let mut plan = crate::plan::load(project).ok().flatten();
     if let Some(plan) = &mut plan {
-        crate::plan::project_states(project, plan);
+        crate::plan::project_states_with_evidence(project, plan, &evidence);
         if plan.what_you_get.is_empty() && plan.does.is_empty() {
             out.push_str("What Rolf gets: not written down.\n");
         } else {
@@ -873,7 +874,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
 
     out.push_str("\n## Waiting on Rolf\n\n");
     let asks = crate::ask::open_asks(project);
-    let events = crate::events::list(project);
+    let events = evidence.events();
     let mut waiting = Vec::new();
     for ask in asks {
         waiting.push(format!(
@@ -888,7 +889,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         .filter(|thread| thread.status != crate::thread::Status::Resolved)
     {
         let attempt = thread.attempt.max(1);
-        if let Some(event) = crate::round::latest_event(&events, &thread.id, attempt)
+        if let Some(event) = crate::round::latest_event(events, &thread.id, attempt)
             && event.id != thread.answered_waiting_event
             && let Some(evidence) = &event.payload.waiting
         {
@@ -950,11 +951,11 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         _ => out.push_str("No steps are written down.\n"),
     }
 
-    let (views, errors) = crate::task::views(project);
+    let (views, errors) = crate::task::views_with_evidence(project, &evidence);
     out.push_str("\n## Open tasks\n\n");
     let open: Vec<_> = views
         .iter()
-        .filter(|view| !view.terminal(project))
+        .filter(|view| !view.terminal_with_evidence(project, &evidence))
         .collect();
     if open.is_empty() && errors.is_empty() {
         out.push_str("None.\n");
@@ -1046,7 +1047,10 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     }
 
     out.push_str("\n## Recently finished or dropped tasks\n\n");
-    let mut finished: Vec<_> = views.iter().filter(|view| view.terminal(project)).collect();
+    let mut finished: Vec<_> = views
+        .iter()
+        .filter(|view| view.terminal_with_evidence(project, &evidence))
+        .collect();
     finished.sort_by(|a, b| b.record.created.cmp(&a.record.created));
     if finished.is_empty() {
         out.push_str("None.\n");
@@ -1347,6 +1351,68 @@ mod tests {
         assert!(open.contains(" — next: verify 1 acceptance condition(s)"));
         assert!(!open.contains("detailed acceptance condition"));
         assert!(page.contains("Keep this task-specific instruction on the current page."));
+    }
+
+    #[test]
+    fn page_reads_each_event_once_even_with_plan_and_multiple_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let tasks = project.record_dir_for_write("tasks").unwrap();
+        let events = project.record_dir_for_write("events").unwrap();
+        let mut ids = Vec::new();
+        for index in 1..=3 {
+            let thread = crate::thread::allocate(&project, |thread| {
+                thread.repo = "/repo".into();
+                thread.base = "base".into();
+            })
+            .unwrap();
+            let id = format!("job-{index:04}");
+            ids.push(id.clone());
+            let task = crate::task::Task {
+                id: id.clone(),
+                title: format!("Task {index}"),
+                authority: vec!["request:q-1".into()],
+                acceptance: vec!["Done".into()],
+                repo: Some("/repo".into()),
+                attempts: vec![thread.id.clone()],
+                ..crate::task::Task::default()
+            };
+            std::fs::write(
+                tasks.join(format!("{id}.toml")),
+                toml::to_string(&task).unwrap(),
+            )
+            .unwrap();
+            let event = crate::contracts::Event {
+                id: format!("{}-1-1", thread.id),
+                op: format!("{}-1-1", thread.id),
+                thread: thread.id,
+                attempt: 1,
+                round: None,
+                recipient: crate::contracts::Recipient::default(),
+                created: now(),
+                payload: crate::contracts::EventPayload::default(),
+            };
+            std::fs::write(
+                events.join(format!("{}.toml", event.id)),
+                toml::to_string(&event).unwrap(),
+            )
+            .unwrap();
+        }
+        let plan = crate::contracts::Plan {
+            steps: vec![crate::contracts::PlanStep {
+                id: "s-1".into(),
+                tasks: ids,
+                ..crate::contracts::PlanStep::default()
+            }],
+            ..crate::contracts::Plan::default()
+        };
+        std::fs::write(
+            crate::plan::plan_path(&project),
+            toml::to_string(&plan).unwrap(),
+        )
+        .unwrap();
+        let reads = crate::events::count_event_reads(|| refresh_page(&project).unwrap());
+        assert_eq!(reads, 3, "page must load each of the three events once");
     }
 
     #[test]

@@ -1070,11 +1070,13 @@ fn record_task_proofs(
     let mut recorded = Vec::new();
     for slug in crate::project::list_slugs(&ctx.root) {
         let project = crate::project::Project::load(&ctx.root, &slug)?;
+        let mut changed = false;
+        let evidence = crate::task::EvidenceSnapshot::load(&project);
         for task in crate::task::list_with_errors(&project).0 {
             if !task.dropped.is_empty() {
                 continue;
             }
-            if !crate::task::required_states(&project, &task)?
+            if !crate::task::required_states_with_evidence(&project, &task, &evidence)?
                 .iter()
                 .any(|state| state == "installed")
             {
@@ -1101,7 +1103,13 @@ fn record_task_proofs(
                     }
                 }
                 if carried {
-                    crate::task::record_installed(&project, &task.id, &build.machine, &build.head)?;
+                    crate::task::record_installed_deferred(
+                        &project,
+                        &task.id,
+                        &build.machine,
+                        &build.head,
+                    )?;
+                    changed = true;
                     task_builds.push(build.clone());
                     recorded.push(TaskInstallProof {
                         project: slug.clone(),
@@ -1119,13 +1127,16 @@ fn record_task_proofs(
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                crate::task::record_running(
+                crate::task::record_running_deferred(
                     &project,
                     &task.id,
                     task_machines,
                     process_lines.clone(),
                 )?;
             }
+        }
+        if changed {
+            crate::project::refresh_page(&project)?;
         }
     }
     Ok(recorded)
@@ -1957,32 +1968,56 @@ mod tests {
             )
             .unwrap();
         }
-        world.runner.on("yes-head installed-head", ok(""));
-        world.runner.on("no-head installed-head", fail(1, ""));
-        let proofs = record_task_proofs(
-            &world.ctx(),
-            &[
-                InstalledBuild {
-                    repo: repo.to_string_lossy().into_owned(),
-                    machine: "local".into(),
-                    head: "installed-head".into(),
-                },
-                InstalledBuild {
-                    repo: "/unrelated/repository".into(),
-                    machine: "oci".into(),
-                    head: "other-head".into(),
-                },
-            ],
-            &[ProcessProof {
-                machine: "local".into(),
-                process: "ticker".into(),
-                pid: Some(42),
-                build: Some("installed-head".into()),
-                state: "running".into(),
-                reason: None,
-            }],
+        // One ledger read selects the tasks, and one refresh renders all proofs.
+        let events = project.record_dir_for_write("events").unwrap();
+        let event = crate::contracts::Event {
+            id: "t-0001-1-1".into(),
+            op: "t-0001-1-1".into(),
+            thread: "t-0001".into(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient::default(),
+            created: crate::project::now(),
+            payload: crate::contracts::EventPayload::default(),
+        };
+        std::fs::write(
+            events.join("t-0001-1-1.toml"),
+            toml::to_string(&event).unwrap(),
         )
         .unwrap();
+        world.runner.on("yes-head installed-head", ok(""));
+        world.runner.on("no-head installed-head", fail(1, ""));
+        let mut proofs = None;
+        let reads = crate::events::count_event_reads(|| {
+            proofs = Some(
+                record_task_proofs(
+                    &world.ctx(),
+                    &[
+                        InstalledBuild {
+                            repo: repo.to_string_lossy().into_owned(),
+                            machine: "local".into(),
+                            head: "installed-head".into(),
+                        },
+                        InstalledBuild {
+                            repo: "/unrelated/repository".into(),
+                            machine: "oci".into(),
+                            head: "other-head".into(),
+                        },
+                    ],
+                    &[ProcessProof {
+                        machine: "local".into(),
+                        process: "ticker".into(),
+                        pid: Some(42),
+                        build: Some("installed-head".into()),
+                        state: "running".into(),
+                        reason: None,
+                    }],
+                )
+                .unwrap(),
+            )
+        });
+        assert_eq!(reads, 2, "one scan for selection and one for the page");
+        let proofs = proofs.unwrap();
 
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].task, "job-0001");

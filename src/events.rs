@@ -412,23 +412,64 @@ pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
 
 pub(crate) fn load(project: &Project, id: &str) -> Result<Event> {
     let path = event_path(project, id)?;
+    #[cfg(test)]
+    EVENT_READS.with(|count| count.set(count.get() + 1));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("could not read event {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
-pub(crate) fn list(project: &Project) -> Vec<Event> {
-    let Ok(entries) = std::fs::read_dir(events_dir(project)) else {
-        return Vec::new();
+#[cfg(test)]
+thread_local! {
+    static EVENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_event_reads(f: impl FnOnce()) -> usize {
+    EVENT_READS.with(|count| {
+        let previous = count.replace(0);
+        f();
+        count.replace(previous)
+    })
+}
+
+/// Load the event ledger once, retaining the unreadable-evidence signal used
+/// by task projections. Missing event directories represent an empty ledger.
+pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
+    let entries = match std::fs::read_dir(events_dir(project)) {
+        Ok(entries) => entries,
+        Err(error) => return (Vec::new(), error.kind() == std::io::ErrorKind::NotFound),
     };
-    let mut events: Vec<Event> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_owned))
-        .filter_map(|id| load(project, &id).ok())
-        .collect();
+    let mut events = Vec::new();
+    let mut readable = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            readable = false;
+            continue;
+        };
+        if !entry.path().extension().is_some_and(|ext| ext == "toml") {
+            continue;
+        }
+        let Some(id) = entry
+            .file_name()
+            .into_string()
+            .ok()
+            .and_then(|name| name.strip_suffix(".toml").map(str::to_owned))
+        else {
+            readable = false;
+            continue;
+        };
+        match load(project, &id) {
+            Ok(event) => events.push(event),
+            Err(_) => readable = false,
+        }
+    }
     events.sort_by(|a, b| a.id.cmp(&b.id));
-    events
+    (events, readable)
+}
+
+pub(crate) fn list(project: &Project) -> Vec<Event> {
+    list_checked(project).0
 }
 
 /// Appends a fact once. Re-running acknowledgement or handling is idempotent;
