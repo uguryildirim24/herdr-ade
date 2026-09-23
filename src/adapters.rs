@@ -221,6 +221,11 @@ fn builtin() -> BTreeMap<String, Adapter> {
     );
     agy.required_flags
         .push("--dangerously-skip-permissions".into());
+    // Agy stores workspace trust per exact folder. Every lane gets a fresh
+    // worktree, so declare it as a new project instead of leaving the agent at
+    // the interactive "trust this folder" screen before ADE can send its
+    // brief.
+    agy.launch_flags.push("--new-project".into());
     agy.efforts = ["low", "medium", "high"]
         .into_iter()
         .map(str::to_string)
@@ -347,7 +352,7 @@ hook.block = "block"
     }
 
     #[test]
-    fn agy_probe_uses_only_its_print_mode_flags() {
+    fn agy_starts_each_fresh_lane_as_a_new_project() {
         let row = builtin().remove("agy").unwrap();
         assert_eq!(
             row.doctor.args,
@@ -355,5 +360,14 @@ hook.block = "block"
         );
         assert!(!row.doctor.args.iter().any(|arg| arg == "--max-turns"));
         assert!(!row.doctor.args.iter().any(|arg| arg == "--tools"));
+
+        let args = launch_args(
+            &row,
+            &Recipe {
+                args: vec!["--dangerously-skip-permissions".into()],
+                ..Recipe::default()
+            },
+        );
+        assert_eq!(args, ["--dangerously-skip-permissions", "--new-project"]);
     }
 }

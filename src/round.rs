@@ -2263,6 +2263,7 @@ fn start_reviewer(
         recipe: None,
         recipe_basis: None,
         task_id: String::new(),
+        review_round: round.to_string(),
     };
     if omitted_sources.is_empty() {
         crate::threads::start_during_advance(ctx, &project.slug, args)
@@ -2297,10 +2298,17 @@ fn start_and_bind_reviewer(
     // of that transition and never allocate a duplicate reviewer.
     let git = Git::new(ctx.runner, &load(project, round)?.repo);
     let review_head = git.branch_head(review_branch)?;
+    let reviewers_of_other_rounds: std::collections::BTreeSet<String> = list(project)
+        .into_iter()
+        .filter(|record| record.round != round)
+        .filter_map(|record| record.reviewer)
+        .collect();
     let unbound: Vec<thread::Thread> = thread::list(project)
         .into_iter()
         .filter(|candidate| {
             candidate.role == "reviewer"
+                && !reviewers_of_other_rounds.contains(&candidate.id)
+                && (candidate.review_round.is_empty() || candidate.review_round == round)
                 && (candidate.base == review_branch
                     || review_head.as_deref() == Some(candidate.base.as_str()))
                 && matches!(
@@ -2496,6 +2504,7 @@ fn reviewer_state(ctx: &Ctx, project: &Project, reviewer: &str) -> ReviewerState
     if row.note == "session unreachable"
         || row.note.starts_with("first check pending")
         || row.note.starts_with("first check failed")
+        || row.note.starts_with("agent state unknown")
     {
         return ReviewerState::Unknown(row.note.clone());
     }
@@ -5932,6 +5941,44 @@ mod tests {
             .filter(|t| t.role == "reviewer")
             .count();
         assert_eq!(reviewers, 1, "one reviewer per round, ever");
+    }
+
+    #[test]
+    fn rounds_opened_on_the_same_head_never_share_a_reviewer() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        open(
+            &ctx,
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some("The second round lands another change.".into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        for (n, round) in [(1, "r1"), (2, "r2")] {
+            let (lane, sha) = fx.lane(n);
+            admit(&ctx, "demo", round, &lane).unwrap();
+            fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        }
+
+        let advanced = advance(&ctx, "demo").unwrap();
+        assert_eq!(advanced.started.len(), 2);
+        let first = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let second = load(&fx.project, "r2").unwrap().reviewer.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            thread::load(&fx.project, &first).unwrap().review_round,
+            "r1"
+        );
+        assert_eq!(
+            thread::load(&fx.project, &second).unwrap().review_round,
+            "r2"
+        );
     }
 
     #[test]
