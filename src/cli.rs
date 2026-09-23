@@ -781,6 +781,17 @@ enum TermCommand {
     },
 }
 
+fn repair_review_started(slug: &str, round: &str, branch: &str, reviewer: Option<&str>) -> String {
+    match reviewer {
+        Some(reviewer) => format!(
+            "integration base moved; started repair review {branch} with {reviewer}; after its verdict, run `ha round merge {slug} {round}`\n"
+        ),
+        None => format!(
+            "integration base moved; prepared repair review {branch}; its reviewer start will retry automatically; after its verdict, run `ha round merge {slug} {round}`\n"
+        ),
+    }
+}
+
 fn batch_review_started(
     slug: &str,
     rounds: &[String],
@@ -982,25 +993,45 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         review_branch,
                         reviewer: Some(reviewer),
                     } => {
-                        message.push_str(&batch_review_started(
-                            &slug,
-                            &rounds,
-                            review_branch,
-                            Some(reviewer),
-                        ));
-                        "integration_review_started"
+                        if record.batch.is_some() {
+                            message.push_str(&batch_review_started(
+                                &slug,
+                                &rounds,
+                                review_branch,
+                                Some(reviewer),
+                            ));
+                            "integration_review_started"
+                        } else {
+                            message.push_str(&repair_review_started(
+                                &slug,
+                                id,
+                                review_branch,
+                                Some(reviewer),
+                            ));
+                            "repair_review_started"
+                        }
                     }
                     round::MergeOutcome::RepairReviewStarted {
                         review_branch,
                         reviewer: None,
                     } => {
-                        message.push_str(&batch_review_started(
-                            &slug,
-                            &rounds,
-                            review_branch,
-                            None,
-                        ));
-                        "integration_review_prepared"
+                        if record.batch.is_some() {
+                            message.push_str(&batch_review_started(
+                                &slug,
+                                &rounds,
+                                review_branch,
+                                None,
+                            ));
+                            "integration_review_prepared"
+                        } else {
+                            message.push_str(&repair_review_started(
+                                &slug,
+                                id,
+                                review_branch,
+                                None,
+                            ));
+                            "repair_review_prepared"
+                        }
                     }
                     round::MergeOutcome::Stopped { phase } => {
                         message.push_str(&format!(
@@ -3086,6 +3117,11 @@ mod tests {
         assert!(message.contains("one integration review of r147, r148"));
         assert!(message.contains("t-0402"));
         assert!(!message.contains("base moved"));
+        let repair =
+            super::repair_review_started("adeherdr", "r147", review_branch, Some(reviewer));
+        assert!(repair.contains("integration base moved; started repair review"));
+        assert!(repair.contains("ha round merge adeherdr r147"));
+        assert!(!repair.contains("one integration review"));
     }
 
     #[test]
