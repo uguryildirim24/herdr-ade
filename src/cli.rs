@@ -1066,6 +1066,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     Some("advanced"),
                     &serde_json::json!({
                         "started": outcome.started,
+                        "starting": outcome.starting,
                         "running": outcome.running,
                         "verdicts": outcome.verdicts,
                         "not_started": outcome.not_started,
