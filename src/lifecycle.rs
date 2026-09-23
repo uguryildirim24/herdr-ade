@@ -1071,6 +1071,7 @@ mod tests {
         let second_repo = world.home.path().join("second-repo");
         std::fs::create_dir_all(&first_repo).unwrap();
         std::fs::create_dir_all(&second_repo).unwrap();
+        let expected_first_repo = std::fs::canonicalize(&first_repo).unwrap();
         crate::project::create(
             &world.root,
             "first",
@@ -1103,7 +1104,7 @@ mod tests {
                 && call
                     .args
                     .iter()
-                    .any(|arg| arg == &first_repo.display().to_string())
+                    .any(|arg| arg == &expected_first_repo.display().to_string())
         }));
     }
 
