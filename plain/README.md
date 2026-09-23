@@ -1,11 +1,14 @@
 # Plain-language word lists
 
 These files are inputs to the pure checker in `src/plain.rs` (SPEC-ADE D17).
-The checker does not write them.
+The checker does not write them. The project slug and familiar product names pass
+without a definition; a coordinator can add another with
+`ha term add <project> <name> --name`. Names added this way live in the project's
+existing terms file. Codes and paths cannot be added as familiar names.
 
 ## `words.txt`
 
-Everyday English, 292747 words, lowercase, unique, sorted.
+Everyday English and the quoted fragment `wa` from Rolf, lowercase, unique, sorted.
 
 - Source: SCOWL (Spell Checker Oriented Word Lists),
   <https://github.com/en-wl/wordlist> and <http://wordlist.aspell.net/>.

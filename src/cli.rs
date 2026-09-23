@@ -786,6 +786,9 @@ enum TermCommand {
         name: String,
         #[arg(long)]
         plain: Option<String>,
+        /// Admit a familiar name without a definition
+        #[arg(long = "name")]
+        familiar: bool,
         /// Where the term is explained (brief or spec path)
         #[arg(long)]
         path: Option<String>,
@@ -1465,9 +1468,25 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 name,
                 plain,
                 path,
+                familiar,
             } => {
-                let t = glossary::add_term(ctx, &slug, &name, plain.as_deref(), path.as_deref())?;
-                println!("- {}: {}", t.name, t.sentence);
+                let t = glossary::add_term(
+                    ctx,
+                    &slug,
+                    &name,
+                    plain.as_deref(),
+                    path.as_deref(),
+                    familiar,
+                )?;
+                println!(
+                    "- {}: {}",
+                    t.name,
+                    if t.familiar {
+                        "familiar name"
+                    } else {
+                        &t.sentence
+                    }
+                );
                 Ok(())
             }
         },
