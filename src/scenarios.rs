@@ -1281,6 +1281,35 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
         )
     );
 
+    thread::update(&project, &lane.id, |record| {
+        record.follow_ups.push(thread::FollowUp {
+            attempt: 1,
+            text: "Check the report".into(),
+            ..Default::default()
+        });
+    })
+    .unwrap();
+    threads::resolve_report_only(&world.ctx(), &project);
+    assert_eq!(
+        thread::load(&project, &lane.id).unwrap().status,
+        Status::Open
+    );
+
+    thread::update(&project, &lane.id, |record| {
+        record.follow_ups[0].state = thread::FollowUpState::Delivered;
+        record.follow_ups[0].after_seal = event.id.clone();
+    })
+    .unwrap();
+    threads::resolve_report_only(&world.ctx(), &project);
+    assert_eq!(
+        thread::load(&project, &lane.id).unwrap().status,
+        Status::Open
+    );
+
+    let mut second = event.clone();
+    second.id = "t-0001-1-done-2".into();
+    second.op = second.id.clone();
+    crate::events::seal_create_if_absent(&project, &second).unwrap();
     threads::resolve_report_only(&world.ctx(), &project);
 
     let closed = thread::load(&project, &lane.id).unwrap();

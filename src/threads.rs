@@ -1910,13 +1910,13 @@ pub(crate) fn resolve_report_only(ctx: &Ctx, project: &Project) {
         {
             continue;
         }
-        let unchanged = events
-            .iter()
-            .filter(|event| event.thread == record.id && event.attempt == record.attempt.max(1))
-            .max_by(|left, right| (&left.created, &left.id).cmp(&(&right.created, &right.id)))
+        let latest = crate::round::latest_event(&events, &record.id, record.attempt.max(1));
+        let unchanged = latest
             .and_then(|event| event.payload.done.as_ref())
             .is_some_and(|done| done.sha == record.base);
-        if unchanged {
+        // Report-only lanes have no round pin to hold them open. A queued
+        // correction or one delivered after this seal still needs a new seal.
+        if unchanged && !follow_up_pending_for_seal(&record, latest) {
             resolve_automatically(ctx, project, &record.id, "report-only");
         }
     }
@@ -1927,6 +1927,16 @@ pub(crate) fn resolve_report_only(ctx: &Ctx, project: &Project) {
 pub enum PromptOutcome {
     Queued { attempt: u32 },
     Sent { attempt: u32, agent_state: String },
+}
+
+fn follow_up_pending_for_seal(record: &Thread, latest: Option<&crate::contracts::Event>) -> bool {
+    record.follow_ups.iter().any(|f| {
+        f.attempt == record.attempt.max(1)
+            && (matches!(f.state, FollowUpState::Queued | FollowUpState::Uncertain)
+                || f.state == FollowUpState::Delivered
+                    && !f.after_seal.is_empty()
+                    && latest.is_some_and(|event| event.id == f.after_seal))
+    })
 }
 
 fn awaiting_follow_up(record: &Thread) -> bool {
@@ -2136,8 +2146,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     let attempt = record.attempt.max(1);
     let waiting = latest_waiting_event_id(&events_before_send, id, attempt).unwrap_or_default();
     record_answered_wait(&project, id, attempt, &waiting)?;
-    let after_seal = crate::round::latest_event(&events_before_send, id, attempt)
-        .filter(|event| event.payload.done.is_some())
+    let after_seal = crate::round::latest_done_event(&events_before_send, id, attempt)
         .map(|event| event.id.clone())
         .unwrap_or_default();
     thread::update(&project, id, |thread| {
@@ -2428,18 +2437,11 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     if args.skip_copy && args.discard_uncopied {
         bail!("--skip-copy cannot be combined with --discard-uncopied");
     }
-    if record.follow_ups.iter().any(|f| {
-        f.attempt == record.attempt.max(1)
-            && (matches!(f.state, FollowUpState::Queued | FollowUpState::Uncertain)
-                || f.state == FollowUpState::Delivered
-                    && !f.after_seal.is_empty()
-                    && crate::round::latest_event(
-                        &crate::events::list(&project),
-                        id,
-                        record.attempt.max(1),
-                    )
-                    .is_some_and(|event| event.id == f.after_seal))
-    }) {
+    let events = crate::events::list(&project);
+    if follow_up_pending_for_seal(
+        &record,
+        crate::round::latest_done_event(&events, id, record.attempt.max(1)),
+    ) {
         bail!(
             "follow_up_pending: {id} must finish the queued follow-up and seal again before resolution"
         );

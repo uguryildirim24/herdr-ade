@@ -946,8 +946,7 @@ fn thread_pass(
                     Ok(())
                 })?;
                 let after_seal =
-                    crate::round::latest_event(&crate::events::list(project), &t.id, attempt)
-                        .filter(|event| event.payload.done.is_some())
+                    crate::round::latest_done_event(&crate::events::list(project), &t.id, attempt)
                         .map(|event| event.id.clone())
                         .unwrap_or_default();
                 match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
