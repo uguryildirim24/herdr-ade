@@ -1516,12 +1516,25 @@ mod tests {
             format!("{{\n  \"version\": \"{box_build}\",\n  \"pid\": 42\n}}"),
         )
         .unwrap();
-        let holder = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(box_root.join(".ticker.lock"))
+        // Hold the lock in a separate process: a lock owned by this test
+        // process leaks to its concurrently forked children until exec.
+        let mut holder = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "exec 9<> \"$1\"; flock 9; echo locked; cat >/dev/null",
+                "sh",
+            ])
+            .arg(box_root.join(".ticker.lock"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
-        holder.lock().unwrap();
+        use std::io::BufRead as _;
+        let mut ready = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "locked\n");
         let runner = FakeRunner::new();
         runner.on_fn(
             |cmd| cmd.program == "ssh",
@@ -1558,7 +1571,8 @@ mod tests {
         assert_eq!(proofs[1].pid, Some(42));
         assert_eq!(proofs[1].build.as_deref(), Some(box_build.as_str()));
 
-        drop(holder);
+        drop(holder.stdin.take());
+        assert!(holder.wait().unwrap().success());
         let proofs = box_process_proofs(&ctx, &machine);
         assert_eq!(proofs[1].state, "unknown");
         assert_eq!(proofs[1].pid, None);
