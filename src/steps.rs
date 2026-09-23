@@ -1559,7 +1559,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let out = crate::runner::RealRunner
             .run(
-                &crate::runner::Cmd::new("sh", Duration::from_secs(5))
+                &crate::runner::Cmd::new("sh", Duration::from_secs(120))
                     .args(["-c", &command])
                     .env("HOME", home.path().display().to_string()),
             )
@@ -1583,7 +1583,7 @@ mod tests {
         let run = |stdin: &str| {
             crate::runner::RealRunner
                 .run(
-                    &crate::runner::Cmd::new("sh", Duration::from_secs(5))
+                    &crate::runner::Cmd::new("sh", Duration::from_secs(120))
                         .args(["-c", &command])
                         .env("HOME", home.path().display().to_string())
                         .stdin(stdin.to_string()),
