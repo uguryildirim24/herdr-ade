@@ -194,6 +194,35 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
         .collect()
 }
 
+/// Resolve `request:<id>` or `request:<project>/<id>` for a project-level
+/// coordinator recipe choice. The canonical cross-project form is retained on
+/// the coordinator launch record.
+pub fn authorize_coordinator_recipe(ctx: &Ctx, project: &Project, basis: &str) -> Result<String> {
+    let reference = basis
+        .strip_prefix("request:")
+        .filter(|value| !value.is_empty())
+        .with_context(|| "recipe_basis: --basis must be request:<id> or request:<project>/<id>")?;
+    let (slug, request) = reference
+        .split_once('/')
+        .map_or((project.slug.as_str(), reference), |(slug, request)| {
+            (slug, request)
+        });
+    if request.is_empty() {
+        bail!("recipe_basis: request id is empty");
+    }
+    let source = Project::load(&ctx.root, slug).map_err(|_| {
+        crate::refusal::error(format!(
+            "recipe_authority: no request `{basis}` in any project"
+        ))
+    })?;
+    if crate::talk::request_text(&source, request).is_none() {
+        return Err(crate::refusal::error(format!(
+            "recipe_authority: no request `{basis}` in any project"
+        )));
+    }
+    Ok(format!("request:{slug}/{request}"))
+}
+
 /// Validate and record Rolf's one-off recipe choice before a lane is created.
 /// The quote must occur verbatim in a request attached to the stable task.
 pub fn authorize_explicit_recipe(

@@ -77,7 +77,7 @@ Decide ordinary reversible matters, record them with `hp decide <slug> "<line>" 
 
 A consequential decision uses class `what-you-get`, `money` or `undo` and `--basis request:<id>` or `--basis ask:<id>@<revision>`. Never ask again for a choice Rolf already made. Do not stop unrelated work for one open ask.
 
-Do not pick a model. Routing chooses an enabled recipe from the task and workflow. If Rolf names a coordinator recipe for a project, use `hp open <project> --recipe <id>` when that coordinator is stopped; its relaunches keep the choice. If Rolf names one for a lane, use `--recipe <id> --basis "<his exact words>"`; those words must occur in the task's request. Pro work stays on the Mac and uses `herdr-pro`, never a hand-typed Pro pane.
+Do not pick a model. Routing chooses an enabled recipe from the task and workflow. If Rolf names a coordinator recipe for a project, use `hp open <project> --recipe <id> --basis request:<id>` when that coordinator is stopped; use `request:<project>/<id>` when his message belongs to another project, and its relaunches keep the choice. If Rolf names one for a lane, use `--recipe <id> --basis "<his exact words>"`; those words must occur in the task's request. Pro work stays on the Mac and uses `herdr-pro`, never a hand-typed Pro pane.
 
 Never follow a manual workaround when the harness is broken. Start a harness-fix task and land it through a round. Do not hand-start agents, call `herdr agent prompt`, bind unrelated panes, hand-make project records, or force a state the harness is waiting for.
 

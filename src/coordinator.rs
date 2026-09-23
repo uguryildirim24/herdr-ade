@@ -150,6 +150,7 @@ pub(crate) struct OpenOptions {
     pub(crate) reprime: bool,
     pub(crate) rebind: bool,
     pub(crate) recipe: Option<String>,
+    pub(crate) recipe_basis: Option<String>,
 }
 
 pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
@@ -158,6 +159,17 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
     }
     let (settings, _) = project.read_project_md()?;
+    let selected_basis = options
+        .recipe
+        .as_ref()
+        .map(|_| {
+            crate::launch::authorize_coordinator_recipe(
+                ctx,
+                &project,
+                options.recipe_basis.as_deref().unwrap_or_default(),
+            )
+        })
+        .transpose()?;
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
 
@@ -180,7 +192,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             );
         }
         println!("rebinding `{slug}` from {} to {socket}", record.socket);
-        crate::hook::remove(&project)?;
+        crate::hook::remove(ctx, &project)?;
         previous = None;
     }
 
@@ -245,6 +257,9 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let brief_hash =
         crate::thread::sha256_hex(&std::fs::read(project.project_md()).unwrap_or_default());
     let mut launch = if let Some(recipe) = options.recipe.as_deref() {
+        let basis = selected_basis
+            .as_deref()
+            .expect("a selected recipe has validated authority");
         crate::launch::resolve_launch(
             ctx,
             &project,
@@ -252,6 +267,8 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 task: "Project coordinator.",
                 workflow: "coordinator",
                 project_recipe: Some(recipe),
+                recipe_basis: Some(basis),
+                recipe_request: Some(basis),
                 ..Default::default()
             },
         )?
@@ -785,7 +802,7 @@ fn digest_snapshot(
 /// Retires the coordinator binding and removes only this plugin's hook entry.
 pub(crate) fn close(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    crate::hook::remove(&project)?;
+    crate::hook::remove(ctx, &project)?;
     project.update_coordinator(|record| *record = Coordinator::default())?;
     println!("closed coordinator binding for `{slug}`");
     Ok(())
