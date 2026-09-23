@@ -421,6 +421,33 @@ pub(crate) fn provision(runner: &dyn Runner, target: &str, req: &Provision<'_>) 
     Ok(())
 }
 
+/// Writes one ignored runtime file on a saved machine and verifies its exact
+/// content hash there. This is the out-of-band path for frozen code-lane
+/// briefs; no product commit carries the bytes.
+pub(crate) fn write_runtime_file(
+    runner: &dyn Runner,
+    target: &str,
+    path: &str,
+    contents: &str,
+    hash: &str,
+) -> Result<()> {
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    let script = format!(
+        "set -e\nmkdir -p \"$(dirname {path})\"\ncat > {tmp}\ngot=$(sha256sum {tmp} | awk '{{print $1}}')\ntest \"$got\" = {hash} || {{ rm -f {tmp}; echo runtime_file_hash_mismatch >&2; exit 8; }}\nmv {tmp} {path}",
+        path = quote(path),
+        tmp = quote(&tmp),
+        hash = quote(hash),
+    );
+    let out = ssh(runner, target, &script, Some(contents), SSH_START_TIMEOUT)?;
+    if !out.success() {
+        bail!(
+            "could not write runtime file on {target}: {}",
+            out.error_text()
+        );
+    }
+    Ok(())
+}
+
 /// The box's lane card: created after the pane id exists (SPEC-remote §4.2
 /// step 5). One SSH call, card bytes on stdin. A minimal `PROJECT.md` is
 /// written when the box has none, so the box's own `ha` can resolve it.

@@ -278,7 +278,7 @@ enum Command {
         #[command(subcommand)]
         command: DialogueCommand,
     },
-    /// Write HANDOFF.md and HANDOFF.json as one commit (the save-state port)
+    /// Seal the handoff pair as a project artifact tied to the current commit
     Checkpoint {
         slug: String,
         /// The coordinator pane (default: $HERDR_PANE_ID, then the record)
@@ -291,7 +291,7 @@ enum Command {
         /// Print the generated Herdr section; write nothing
         #[arg(long, conflicts_with = "check")]
         print: bool,
-        /// Check the current HANDOFF.md; write nothing
+        /// Check the current sealed handoff; write nothing
         #[arg(long)]
         check: bool,
     },
@@ -840,7 +840,10 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 crate::output::insert("brief_commit", o.brief_commit.clone());
                 crate::output::insert("review_branch", o.review_branch.clone());
                 crate::output::insert("manifest_hash", o.manifest_hash.clone());
-                println!("brief commit B {} ({})", o.brief_commit, o.brief_path);
+                println!(
+                    "review base {} (brief artifact {})",
+                    o.brief_commit, o.brief_path
+                );
                 println!(
                     "review branch {} at {}",
                     o.review_branch,

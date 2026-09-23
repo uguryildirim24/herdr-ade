@@ -51,7 +51,7 @@ Both commands create a durable event. Do not type a separate DONE or WAITING lin
 
 A brief that says you run on the cloud box named `oci` runs on a saved machine, not on this Mac. The box's default-root command is `ha`; run the birth line's skill call first.
 
-- The brief was committed on the Mac's integration branch as `B` and reaches the box through your lane branch. Read `tasks/<id>.md` in your checkout; there is no `brief.md`.
+- The code branch is pinned to an exact Mac commit. The frozen brief arrives separately in `.herdr-project/<project>-<id>/brief.md`; it is never committed to the code repository.
 - Every kind logs in once per machine. If your kind is not signed in on the box, stop and run `ha waiting "<kind> is not signed in on the box"`; never copy a Mac credential across.
 - Publish before done: commit your code, push the lane branch to the URL-matched remote, then run `ha done`. A `done` without the published ref is refused.
 - `ha done`, `ha waiting` and `ha failed` seal locally on the box. They do not deliver to the coordinator; the Mac courier carries the sealed event home.
