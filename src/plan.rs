@@ -515,9 +515,17 @@ pub(crate) fn refresh(_ctx: &Ctx, project: &Project) -> Result<bool> {
 
 /// Flips every step's persisted state to the state its bindings derive.
 pub(crate) fn project_states(project: &Project, plan: &mut Plan) -> bool {
+    project_states_with_evidence(project, plan, &crate::task::EvidenceSnapshot::load(project))
+}
+
+pub(crate) fn project_states_with_evidence(
+    project: &Project,
+    plan: &mut Plan,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> bool {
     let mut changed = false;
     for step in &mut plan.steps {
-        let state = derive_state(project, step);
+        let state = derive_state(project, step, evidence);
         if step.state != state {
             step.state = state;
             changed = true;
@@ -530,14 +538,18 @@ pub(crate) fn project_states(project: &Project, plan: &mut Plan) -> bool {
 /// one binding exists and every binding is positively satisfied, else
 /// `running` when any required work has started or partially landed, else
 /// `left`.
-fn derive_state(project: &Project, step: &PlanStep) -> StepState {
+fn derive_state(
+    project: &Project,
+    step: &PlanStep,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> StepState {
     let linked_tasks: Vec<_> = crate::task::list_with_errors(project)
         .0
         .into_iter()
         .filter(|task| {
             task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
         })
-        .map(|task| crate::task::view(project, task))
+        .map(|task| crate::task::view_with_evidence(project, task, evidence))
         .filter(|view| view.state != crate::task::State::Dropped)
         .collect();
     if linked_tasks.is_empty() && step.threads.is_empty() && step.rounds.is_empty() {
@@ -546,7 +558,7 @@ fn derive_state(project: &Project, step: &PlanStep) -> StepState {
     let mut all_satisfied = true;
     let mut any_started = false;
     for view in linked_tasks {
-        if !view.terminal(project) {
+        if !view.terminal_with_evidence(project, evidence) {
             all_satisfied = false;
         }
         if view.state != crate::task::State::Open {
