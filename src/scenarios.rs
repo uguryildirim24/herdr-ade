@@ -361,7 +361,8 @@ fn two_projects_in_two_sockets_sharing_a_pane_id_do_not_mix() {
         .collect();
     assert_eq!(prompts.len(), 1);
     assert_eq!(socket_of(prompts[0]), b_socket);
-    assert!(prompts[0].display().contains("tasks/t-0001.md"));
+    assert!(prompts[0].display().contains(".herdr-project/"));
+    assert!(prompts[0].display().contains("/brief.md"));
     drop(calls);
     assert!(thread::load(&a, "t-0001").unwrap().prompt_pending);
     assert!(!thread::load(&b, "t-0001").unwrap().prompt_pending);
@@ -571,6 +572,7 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().to_string_lossy().into_owned();
+    let brief_hash = thread::store_artifact(&project, b"The frozen brief.").unwrap();
     world.thread(&project, world.home.path(), |t| {
         t.status = Status::Failed;
         t.error = "openai-codex unreachable: fetch failed".into();
@@ -579,7 +581,7 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
         t.attempt = 1;
         t.launch.kind = "claude".into();
         t.launch.recipe_id = "test_claude".into();
-        t.launch.brief_hash = "h1".into();
+        t.launch.brief_hash = brief_hash.clone();
     });
     std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();
     let pending = world.home.path().join("uncommitted-work.txt");
@@ -648,7 +650,8 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
     let calls = world.runner.calls.borrow();
     assert!(calls.iter().any(|c| {
         let line = c.display();
-        line.contains("tab create") && line.contains("HERDR_ADE_LAUNCH=demo/t-0001/2/h1")
+        line.contains("tab create")
+            && line.contains(&format!("HERDR_ADE_LAUNCH=demo/t-0001/2/{brief_hash}"))
     }));
 }
 

@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn handed_in_closed_work_stays_until_real_merge_and_only_landings_finish() {
-        use crate::round::testkit::{commit_file, git};
+        use crate::round::testkit::git;
         let fx = fixture();
         let ctx = fx.world.ctx();
         let (lane, sha) = fx.lane(1);
@@ -852,14 +852,8 @@ mod tests {
             r.manifest_hash.unwrap(),
             r.policy_hash
         );
-        let verdict = commit_file(
-            &review.worktree,
-            &round::verdict_path("r1"),
-            &front,
-            "verdict",
-        );
         let reviewer = fx.thread("Reviewer");
-        fx.seal_done(&reviewer, 1, 1, &verdict, "# verdict report\n");
+        fx.seal_done(&reviewer, 1, 1, &candidate, &front);
         round::bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
         round::merge(&ctx, "demo", "r1", None).unwrap();
         // Even stale unresolved process state cannot bring landed work back.
