@@ -164,7 +164,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         .as_ref()
         .map(|_| {
             crate::launch::authorize_coordinator_recipe(
-                ctx,
                 &project,
                 options.recipe_basis.as_deref().unwrap_or_default(),
             )

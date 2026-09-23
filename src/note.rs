@@ -185,8 +185,15 @@ pub(crate) fn add(
     if text.trim().is_empty() {
         return Err(crate::refusal::error("note_text: a note is required"));
     }
-    let request = request.strip_prefix("request:").unwrap_or(request);
-    crate::decide::validate_basis(project, &format!("request:{request}"))?;
+    let reference = if request.starts_with("request:") {
+        request.to_string()
+    } else {
+        format!("request:{request}")
+    };
+    let request = crate::decide::validate_basis(project, &reference)?;
+    let request = request
+        .strip_prefix("request:")
+        .expect("validated request basis");
     for task in &tasks {
         crate::task::load(project, task)?;
     }

@@ -1497,6 +1497,7 @@ enum TaskCommand {
         slug: String,
         #[arg(long)]
         title: String,
+        /// Request id, optionally qualified as <project>/<id>
         #[arg(long = "request", required = true)]
         requests: Vec<String>,
         #[arg(long = "acceptance", required = true)]
@@ -1546,7 +1547,7 @@ enum NoteCommand {
         text: String,
         #[arg(long, value_enum)]
         kind: crate::note::Kind,
-        /// Request id behind this note
+        /// Request id behind this note, optionally qualified as <project>/<id>
         #[arg(long)]
         request: String,
         /// Note or instruction this explicitly replaces
