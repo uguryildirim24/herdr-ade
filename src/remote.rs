@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::{MACHINE_LOCAL, MachineProfile};
 use crate::runner::{Cmd, Output, Runner};
 
+#[cfg(test)]
+pub(crate) const TEST_MACHINE: &str = "\n[machines.buildbox]\nlabel = \"buildbox\"\ntarget = \"buildbox-pi\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [\"pi\"]\n";
+
 const SSH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SSH_START_TIMEOUT: Duration = Duration::from_secs(25);
 const COPY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -80,12 +83,6 @@ impl MachineDeclaration {
     }
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct MachineConfig {
-    machines: BTreeMap<String, MachineDeclaration>,
-}
-
 fn configured_machine_declarations(
     config_dir: &Path,
 ) -> Result<BTreeMap<String, MachineDeclaration>> {
@@ -96,11 +93,10 @@ fn configured_machine_declarations(
 pub(crate) fn machine_declarations(
     config_dir: &Path,
 ) -> Result<BTreeMap<String, MachineDeclaration>> {
-    let mut rows: MachineConfig = toml::from_str(include_str!("../assets/default-machines.toml"))
-        .context("shipped machine declarations do not parse")?;
-    rows.machines
-        .extend(configured_machine_declarations(config_dir)?);
-    for (id, row) in &mut rows.machines {
+    // Machines are user-specific. An example ships for reference, but is never
+    // installed as a default: a machine must be declared in config.toml.
+    let mut rows = configured_machine_declarations(config_dir)?;
+    for (id, row) in &mut rows {
         if row.id.is_empty() {
             row.id = id.clone();
         }
@@ -119,7 +115,7 @@ pub(crate) fn machine_declarations(
             bail!("machine_declaration_invalid: `{id}` is missing target, session, or paths");
         }
     }
-    Ok(rows.machines)
+    Ok(rows)
 }
 
 pub(crate) fn machine_declaration(config_dir: &Path, machine: &str) -> Result<MachineDeclaration> {
@@ -729,23 +725,40 @@ publish_url = "https://example.test/repo.git"
     }
 
     #[test]
+    fn no_machine_is_shipped_as_a_default() {
+        let config = tempfile::tempdir().unwrap();
+        assert!(machine_declarations(config.path()).unwrap().is_empty());
+        assert!(machine_declaration(config.path(), "buildbox").is_err());
+    }
+
+    #[test]
     fn the_box_repo_map_is_path_exact_and_the_url_remote_is_chosen_by_url() {
         let config = tempfile::tempdir().unwrap();
         std::fs::write(
             config.path().join("config.toml"),
-            r#"[[harness.repos]]
-path = "/home/agent/projects/herdr"
+            r#"[machines.buildbox]
+target = "box"
+session = "default"
+home = "/home/agent"
+root = "/home/agent/.herdr-ade"
+worktrees = "/home/agent/projects"
+build = "/home/agent/build"
+path = "/usr/bin:/bin"
+ade_bin = "/usr/bin/herdr-ade"
+pi_bin = "/usr/bin/herdr-pi"
+[[harness.repos]]
+path = "/Users/agent/projects/herdr"
 box_path = "/srv/herdr"
 publish_url = "https://github.com/uguryildirim24/herdr.git"
 "#,
         )
         .unwrap();
-        let row = box_repo_for(config.path(), "oci", "/home/agent/projects/herdr")
+        let row = box_repo_for(config.path(), "buildbox", "/Users/agent/projects/herdr")
             .unwrap()
             .unwrap();
         assert_eq!(row.box_path.as_deref(), Some("/srv/herdr"));
         assert!(
-            box_repo_for(config.path(), "oci", "/home/agent/projects/other")
+            box_repo_for(config.path(), "buildbox", "/Users/agent/projects/other")
                 .unwrap()
                 .is_none()
         );
@@ -777,8 +790,8 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
         runner.on("ssh", ok("b0b0\n"));
         let req = Provision {
             path: "/custom/bin:/usr/bin:/bin",
-            box_repo: "/home/ubuntu/projects/herdr",
-            worktree: "/home/ubuntu/projects/herdr/.worktrees/t-0001",
+            box_repo: "/home/agent/projects/herdr",
+            worktree: "/home/agent/projects/herdr/.worktrees/t-0001",
             branch: "hp/demo/t-0001",
             base: "b0b0",
             publish_url: "https://github.com/uguryildirim24/herdr.git",

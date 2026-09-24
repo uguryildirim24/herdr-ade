@@ -6765,7 +6765,7 @@ mod tests {
         open_r1(&fx);
         let id = fx.thread("Remote");
         thread::update(&fx.project, &id, |t| {
-            t.machine = "oci".into();
+            t.machine = "buildbox".into();
             t.machine_id = "abc".into();
         })
         .unwrap();
@@ -7145,11 +7145,11 @@ mod tests {
         save(&fx.project, &record).unwrap();
         let install = crate::harness::InstallOutcome {
             repositories: Vec::new(),
-            box_target: Some("remote-host".into()),
+            box_target: Some("buildbox-pi".into()),
             box_settings_installed: true,
             live_handoff_required: false,
             processes: vec![crate::harness::ProcessProof {
-                machine: "oci".into(),
+                machine: "buildbox".into(),
                 process: "ticker".into(),
                 pid: Some(42),
                 build: Some("installed-head".into()),
@@ -7159,7 +7159,7 @@ mod tests {
             tasks: vec![crate::harness::TaskInstallProof {
                 project: "demo".into(),
                 task: "job-0001".into(),
-                machine: "oci".into(),
+                machine: "buildbox".into(),
                 build: "installed-head".into(),
                 running_processes: true,
             }],
@@ -7208,7 +7208,7 @@ mod tests {
         assert!(
             repeated
                 .message()
-                .contains("oci ticker pid 42: installed-head (running)")
+                .contains("buildbox ticker pid 42: installed-head (running)")
         );
         let error = finish_publication_with(&ctx, &fx.project, "r1", |_| {
             anyhow::bail!("stale ticker 42928 still holds lock")
@@ -8434,7 +8434,7 @@ mod tests {
         let reviewer = fx.thread("Reviewer");
         bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
         thread::update(&fx.project, &reviewer, |t| {
-            t.machine = "oci".into();
+            t.machine = "buildbox".into();
             t.last_state.clear();
             t.last_observed.clear();
             t.observation_error.clear();

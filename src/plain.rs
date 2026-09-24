@@ -975,9 +975,9 @@ mod tests {
                 "~/projects/somebody",
             ),
             (
-                "/home/agent/projects",
+                "/Users/agent/projects",
                 Rule::Identifier,
-                "/home/agent/projects",
+                "/Users/agent/projects",
             ),
             (long.as_str(), Rule::LongSentence, long.as_str()),
         ];

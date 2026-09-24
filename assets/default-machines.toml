@@ -1,24 +1,19 @@
-# Current saved-machine path declaration. Additional machines are ordinary
-# `[machines.<id>]` rows in config.toml.
-[machines.oci]
-label = "oci"
-target = "remote-host"
+# Example only: copy a row into ~/.config/herdr-ade/config.toml and replace
+# these paths with your own. No remote machine is enabled by default.
+[machines.buildbox]
+label = "buildbox"
+target = "buildbox.example"
 session = "default"
-home = "/home/ubuntu"
-root = "/home/ubuntu/.herdr-ade"
-worktrees = "/home/ubuntu/projects"
-build = "/home/ubuntu/build/lanes"
-path = "/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-ade_bin = "/home/ubuntu/.local/bin/herdr-ade"
-pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
+home = "/home/agent"
+root = "/home/agent/.herdr-ade"
+worktrees = "/home/agent/projects"
+build = "/home/agent/build/lanes"
+path = "/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ade_bin = "/home/agent/.local/bin/herdr-ade"
+pi_bin = "/home/agent/.local/bin/herdr-pi"
 kinds = ["pi"]
 
-[[machines.oci.repos]]
-path = "/home/agent/projects/herdr"
-box_path = "/home/ubuntu/projects/herdr"
-publish_url = "https://github.com/uguryildirim24/herdr.git"
-
-[[machines.oci.repos]]
-path = "/home/agent/projects/herdr-ade"
-box_path = "/home/ubuntu/projects/herdr-ade"
-publish_url = "https://github.com/uguryildirim24/herdr-ade.git"
+[[machines.buildbox.repos]]
+path = "/home/agent/projects/example"
+box_path = "/home/agent/projects/example"
+publish_url = "https://github.com/example/example.git"

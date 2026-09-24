@@ -1077,7 +1077,7 @@ mod tests {
             reason: "this task runs on the web research helper, the usual choice.".into(),
             compact_reason: "this task runs on the web research helper".into(),
             source_truncation: None,
-            machine: "oci".into(),
+            machine: "buildbox".into(),
         });
     }
 

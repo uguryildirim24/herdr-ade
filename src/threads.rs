@@ -608,8 +608,8 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
 /// The box clone path and publish URL a box start needs for `repo`, each
 /// reported by name when it is missing. A row in `PROJECT.md` whose
 /// `box_path` is set but whose `publish_url` is not names the missing URL; a
-/// repo with neither falls back to the built-in harness map, or keeps the
-/// mapping message (t-0070).
+/// repo with neither uses a configured harness or machine mapping, or reports
+/// that no mapping exists.
 fn box_repo_candidate(
     config_dir: &Path,
     machine: &str,
@@ -4256,12 +4256,12 @@ mod tests {
     #[test]
     fn a_held_machine_refuses_a_new_box_start() {
         let root = tempfile::tempdir().unwrap();
-        assert!(!project::machine_held(root.path(), "oci"));
-        project::machine_hold(root.path(), "oci").unwrap();
-        assert!(project::machine_held(root.path(), "oci"));
-        assert!(project::machine_release(root.path(), "oci").unwrap());
-        assert!(!project::machine_held(root.path(), "oci"));
-        assert!(!project::machine_release(root.path(), "oci").unwrap());
+        assert!(!project::machine_held(root.path(), "buildbox"));
+        project::machine_hold(root.path(), "buildbox").unwrap();
+        assert!(project::machine_held(root.path(), "buildbox"));
+        assert!(project::machine_release(root.path(), "buildbox").unwrap());
+        assert!(!project::machine_held(root.path(), "buildbox"));
+        assert!(!project::machine_release(root.path(), "buildbox").unwrap());
     }
 
     #[test]
@@ -4337,7 +4337,7 @@ mod tests {
         let (mut settings, body) = fx.project.read_project_md().unwrap();
         settings.repos = vec![crate::project::Repo {
             path: fx.repo.to_string_lossy().into_owned(),
-            box_path: Some("/home/ubuntu/projects/repo".into()),
+            box_path: Some("/home/agent/projects/repo".into()),
             publish_url: Some(remote.clone()),
             ..Default::default()
         }];
@@ -4357,7 +4357,7 @@ mod tests {
         use crate::runner::fake::ok;
         fx.world.runner.on(
             "machine list --json",
-            ok(r#"[{"id":"oci-id","label":"oci","target":"remote-host","session":"default","enabled":true}]"#),
+            ok(r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#),
         );
         fx.world.runner.on(
             "agent start --help",
@@ -4404,12 +4404,12 @@ mod tests {
         );
     }
 
-    const SHIPPED_MACHINE_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"oci\"\n";
+    const ROUTED_BOX_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"buildbox\"\n";
 
-    const NATIVE_BOX: &str = "\n[machines.oci]\nlabel = \"oci\"\ntarget = \"remote-host\"\nsession = \"default\"\nhome = \"/home/ubuntu\"\nroot = \"/home/ubuntu/.herdr-ade\"\nworktrees = \"/home/ubuntu/projects\"\nbuild = \"/home/ubuntu/build/lanes\"\npath = \"/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/ubuntu/.local/bin/herdr-ade\"\npi_bin = \"/home/ubuntu/.local/bin/herdr-pi\"\nkinds = [\"pi\", \"claude\", \"agy\"]\n";
+    const NATIVE_BOX: &str = "\n[machines.buildbox]\nlabel = \"buildbox\"\ntarget = \"buildbox-pi\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [\"pi\", \"claude\", \"agy\"]\n";
 
     fn lane_config() -> String {
-        format!("{SHIPPED_MACHINE_CONFIG}{NATIVE_BOX}")
+        format!("{ROUTED_BOX_CONFIG}{NATIVE_BOX}")
     }
 
     fn start_args(repo: Option<String>, machine: Option<String>) -> StartArgs {
@@ -4442,16 +4442,16 @@ mod tests {
     #[test]
     fn only_lane_and_reviewer_default_to_the_box() {
         assert_eq!(
-            default_machine("lane", "oci", Some("/r")),
-            Some("oci".into())
+            default_machine("lane", "buildbox", Some("/r")),
+            Some("buildbox".into())
         );
         assert_eq!(
-            default_machine("reviewer", "oci", Some("/r")),
-            Some("oci".into())
+            default_machine("reviewer", "buildbox", Some("/r")),
+            Some("buildbox".into())
         );
-        assert_eq!(default_machine("research", "oci", Some("/r")), None);
+        assert_eq!(default_machine("research", "buildbox", Some("/r")), None);
         assert_eq!(default_machine("lane", "", Some("/r")), None);
-        assert_eq!(default_machine("lane", "oci", None), None);
+        assert_eq!(default_machine("lane", "buildbox", None), None);
     }
 
     #[test]
@@ -4465,13 +4465,13 @@ mod tests {
             start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
         )
         .unwrap();
-        assert_eq!(started.machine, "oci");
-        assert_eq!(started.machine_id, "oci-id");
-        assert_eq!(started.launch.machine, "oci");
+        assert_eq!(started.machine, "buildbox");
+        assert_eq!(started.machine_id, "buildbox-id");
+        assert_eq!(started.launch.machine, "buildbox");
         assert!(
             started
                 .worktree_path
-                .starts_with("/home/ubuntu/projects/repo/.worktrees/")
+                .starts_with("/home/agent/projects/repo/.worktrees/")
         );
         assert!(
             say_lines(&fx.project).is_empty(),
@@ -4516,7 +4516,10 @@ mod tests {
     #[test]
     fn claude_and_agy_picks_use_the_mac_without_box_readiness_checks() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, SHIPPED_MACHINE_CONFIG);
+        write_config(
+            &fx,
+            &format!("{ROUTED_BOX_CONFIG}{}", crate::remote::TEST_MACHINE),
+        );
         stub_box(&fx);
         let repo = Some(fx.repo.to_string_lossy().into_owned());
         let claude = start(&fx.world.ctx(), "demo", start_args(repo.clone(), None)).unwrap();
@@ -4556,7 +4559,10 @@ mod tests {
     #[test]
     fn pi_lanes_and_reviewers_still_use_a_ready_box() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, SHIPPED_MACHINE_CONFIG);
+        write_config(
+            &fx,
+            &format!("{ROUTED_BOX_CONFIG}{}", crate::remote::TEST_MACHINE),
+        );
         let task = "Run the bounded coding task.";
         let config_path = fx.world.home.path().join("cfg/config.toml");
         let config = std::fs::read_to_string(&config_path).unwrap();
@@ -4573,19 +4579,22 @@ mod tests {
             args.workflow = role.map(str::to_string);
             let started = start(&fx.world.ctx(), "demo", args).unwrap();
             assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
-            assert_eq!(started.machine, "oci");
-            assert_eq!(started.machine_id, "oci-id");
+            assert_eq!(started.machine, "buildbox");
+            assert_eq!(started.machine_id, "buildbox-id");
         }
     }
 
     #[test]
     fn an_explicit_machine_that_excludes_the_pick_is_refused_without_ssh() {
         let (fx, _remote) = box_fixture();
-        write_config(&fx, SHIPPED_MACHINE_CONFIG);
+        write_config(
+            &fx,
+            &format!("{ROUTED_BOX_CONFIG}{}", crate::remote::TEST_MACHINE),
+        );
         stub_box(&fx);
         let mut args = start_args(
             Some(fx.repo.to_string_lossy().into_owned()),
-            Some("oci".into()),
+            Some("buildbox".into()),
         );
         args.task = "+++\nproduct = \"web-research\"\n+++\nCompare the published results.".into();
         let error = start(&fx.world.ctx(), "demo", args)
@@ -4593,7 +4602,7 @@ mod tests {
             .to_string();
         assert!(error.contains("recipe_unavailable"), "{error}");
         assert!(error.contains("agy_gemini_flash"), "{error}");
-        assert!(error.contains("oci"), "{error}");
+        assert!(error.contains("buildbox"), "{error}");
         assert!(error.contains("does not run adapter kind `agy`"), "{error}");
         assert!(thread::list(&fx.project).is_empty());
         let ledger =
@@ -4618,7 +4627,7 @@ mod tests {
         runner.on(
             "machine list --json",
             crate::runner::fake::ok(
-                r#"[{"id":"oci-id","label":"oci","target":"remote-host","session":"default","enabled":true}]"#,
+                r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#,
             ),
         );
         runner.on_fn(
@@ -4647,7 +4656,7 @@ mod tests {
         let launch = crate::contracts::Launch {
             kind: "agy".into(),
             recipe_id: "agy_gemini_flash".into(),
-            machine: "oci".into(),
+            machine: "buildbox".into(),
             ready_timeout_ms: 30_000,
             ..Default::default()
         };
@@ -4661,7 +4670,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("agy_gemini_flash"), "{error}");
-        assert!(error.contains("oci") && error.contains("local"), "{error}");
+        assert!(
+            error.contains("buildbox") && error.contains("local"),
+            "{error}"
+        );
         assert!(
             error.contains("lane PATH") && error.contains("not signed in"),
             "{error}"
@@ -4670,6 +4682,12 @@ mod tests {
 
     #[test]
     fn box_repo_row_names_each_missing_piece() {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("config.toml"),
+            crate::remote::TEST_MACHINE,
+        )
+        .unwrap();
         let mut settings = crate::project::Settings {
             repos: vec![crate::project::Repo {
                 path: "/r".into(),
@@ -4679,7 +4697,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let e = box_repo_row(Path::new(""), &settings, "oci", "/r")
+        let e = box_repo_row(config.path(), &settings, "buildbox", "/r")
             .unwrap_err()
             .to_string();
         assert!(
@@ -4689,7 +4707,7 @@ mod tests {
 
         settings.repos[0].box_path = None;
         settings.repos[0].publish_url = Some("https://example/r.git".into());
-        let e = box_repo_row(Path::new(""), &settings, "oci", "/r")
+        let e = box_repo_row(config.path(), &settings, "buildbox", "/r")
             .unwrap_err()
             .to_string();
         assert!(
@@ -4697,22 +4715,21 @@ mod tests {
             "{e}"
         );
 
-        // A repo with neither, and not in the built-in list, keeps the
-        // mapping message; a built-in harness repo resolves from the map.
+        // A repo with neither, and no configured mapping, stays unmapped.
         settings.repos[0].publish_url = None;
-        let e = box_repo_row(Path::new(""), &settings, "oci", "/other")
+        let e = box_repo_row(config.path(), &settings, "buildbox", "/other")
             .unwrap_err()
             .to_string();
         assert!(e.contains("box_repo_unmapped"), "{e}");
-        let (box_path, url) = box_repo_row(
-            Path::new(""),
+        let e = box_repo_row(
+            config.path(),
             &settings,
-            "oci",
-            "/home/agent/projects/herdr",
+            "buildbox",
+            "/Users/agent/projects/herdr",
         )
-        .unwrap();
-        assert_eq!(box_path, "/home/ubuntu/projects/herdr");
-        assert!(url.ends_with("herdr.git"), "{url}");
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("box_repo_unmapped"), "{e}");
     }
 
     #[test]
@@ -4760,7 +4777,7 @@ mod tests {
             "demo",
             start_args(
                 Some(fx.repo.to_string_lossy().into_owned()),
-                Some("oci".into()),
+                Some("buildbox".into()),
             ),
         )
         .unwrap_err()
@@ -4950,7 +4967,7 @@ mod tests {
         assert!(!cleanup.display().contains("rm -rf --"));
         assert!(calls.iter().any(|call| {
             call.display()
-                .contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001")
+                .contains("rm -rf -- /home/agent/build/lanes/demo-t-0001")
         }));
     }
 
@@ -5052,7 +5069,7 @@ mod tests {
         write_config(&fx, &lane_config());
         stub_box(&fx);
         let ctx = fx.world.ctx();
-        project::machine_hold(&ctx.root, "oci-id").unwrap();
+        project::machine_hold(&ctx.root, "buildbox-id").unwrap();
         let started = start(
             &ctx,
             "demo",
@@ -5100,13 +5117,13 @@ mod tests {
         write_config(&fx, &lane_config());
         stub_box(&fx);
         let ctx = fx.world.ctx();
-        project::machine_hold(&ctx.root, "oci-id").unwrap();
+        project::machine_hold(&ctx.root, "buildbox-id").unwrap();
         let error = start(
             &ctx,
             "demo",
             start_args(
                 Some(fx.repo.to_string_lossy().into_owned()),
-                Some("oci".into()),
+                Some("buildbox".into()),
             ),
         )
         .unwrap_err()
@@ -5124,7 +5141,7 @@ mod tests {
         write_config(
             &fx,
             &format!(
-                "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"oci\"\n{NATIVE_BOX}"
+                "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"buildbox\"\n{NATIVE_BOX}"
             ),
         );
         stub_box(&fx);
@@ -5149,8 +5166,8 @@ mod tests {
         let reviewer = record.reviewer.clone().expect("reviewer bound");
         let started = thread::load(&fx.project, &reviewer).unwrap();
         assert_eq!(started.role, "reviewer");
-        assert_eq!(started.machine, "oci");
-        assert_eq!(started.machine_id, "oci-id");
+        assert_eq!(started.machine, "buildbox");
+        assert_eq!(started.machine_id, "buildbox-id");
 
         // advance already publishes the starting commit, before V exists.
         ops::check_published_ref(
