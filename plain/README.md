@@ -1,6 +1,6 @@
 # Plain-language word lists
 
-These files are inputs to the pure checker in `src/plain.rs` (SPEC-ADE D17).
+These files are inputs to the pure checker in [`src/plain.rs`](../src/plain.rs).
 The checker does not write them. Every project slug under the same root, its
 recorded one-word display name, and familiar names pass without a definition;
 a coordinator can record another with `ha term add <project> <name> --name`.
@@ -43,10 +43,10 @@ The Google 10,000-word frequency dump was not used: its GitHub licence
 metadata is `NOASSERTION`, so it is not a passing redistribution source.
 
 A pass on this list is form compliance, never a proof that the text is
-understandable (SPEC-ADE D17, item 29).
+understandable.
 
 ## `vocabulary.txt`
 
-Plugin nouns named by SPEC-ADE D17 R4: lane, round, reviewer, build, branch,
+Plugin nouns: lane, round, reviewer, build, branch,
 merge, report, checkpoint, and the rest of the plugin's own nouns. Lowercase,
 unique, sorted. Not a second everyday list.

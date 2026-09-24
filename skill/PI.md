@@ -2,7 +2,7 @@
 
 A pi lane runs many model services through one program. The harness owns the
 install, the settings folder, and the logins. Start a pi lane through
-`hp thread start` like any other lane. The wrapper supplies the folder, so
+`ha thread start` like any other lane. The wrapper supplies the folder, so
 the launch record carries no path and no secret.
 
 ## Launch record
@@ -66,14 +66,14 @@ event. Its provider kind is `limit`, `login`, `unreachable` or `error`.
 
 The event starts bounded recovery automatically. Every provider failure starts
 the same task as a new process on the same recipe; it never selects a fallback.
-An explicit `hp thread retry <slug> <id> --reason "<evidence>"` does the same and
+An explicit `ha thread retry <slug> <id> --reason "<evidence>"` does the same and
 consumes the next bounded retry. It refuses after the limit is exhausted and
 waits for the coordinator. Never re-prompt or type recovery into the pane.
 
 - `limit`: wait.
 - `login`: tell Rolf to run `herdr-pi login` again.
 - `unreachable` or `error`: let the bounded recovery run.
-- The guard never sends `DONE`. Only `hp done` does.
+- The guard never sends `DONE`. Only `ha done` does.
 
 If you see the trust question or the missing-folder question on screen, type
 nothing. Report the broken start through thread recovery. A trusted folder
@@ -88,8 +88,8 @@ come back by themselves. Do not replay `--provider`, `--model` or
 
 ## On the cloud box
 
-A pi lane on the box runs the box's own pi at `/home/ubuntu/.local/bin/pi`
-(the guarded wrapper) against the box's own `~/.herdr-ade/pi` login store.
+A pi lane on the box runs the guarded wrapper at its configured pi path
+against the box's own `~/.herdr-ade/pi` login store.
 The Mac login does not count. Rolf signs each provider in once on the box
 (the coordinator opens a terminal for it): `herdr-pi login openai-codex`,
 `login opencode-go`, `login kimi-coding`. `herdr-pi check <provider>` on the

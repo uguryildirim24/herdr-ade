@@ -56,8 +56,7 @@ dropped.
   `Result<bool>` using the same decoder as the ledger.
   Missing tools, signals, and timeouts are failures under either contract.
   Optional Git branches/files use successful presence queries, not a blanket
-  nonzero exemption. See the [subprocess audit](subprocess-audit.md) for counts
-  and the mixed probes deliberately left eligible for recording. Child evidence
+  nonzero exemption. Child evidence
   includes argv, exit status, stdout and stderr, but not environment or stdin.
 - Failed reviewer starts in `round advance`, even when advance returns success.
 - Unexpected merge failures, including subprocess errors and conflicts. A

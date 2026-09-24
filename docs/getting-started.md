@@ -20,15 +20,16 @@ Herdr clones the repository, runs its locked release build, and registers the pl
 For terminal use, link the built binary shown by `herdr plugin list`:
 
 ```bash
+mkdir -p ~/.local/bin ~/.config/herdr-ade
 ln -s <plugin-root>/target/release/herdr-ade ~/.local/bin/herdr-ade
-mkdir -p ~/.config/herdr-ade
+ln -s <plugin-root>/target/release/herdr-pi ~/.local/bin/herdr-pi
 $EDITOR ~/.config/herdr-ade/config.toml
 herdr-ade doctor
 ```
 
-Add the starting routing table shown in [Task-based routing](operations.md#task-based-routing) to `config.toml`. It defaults to `pi_codex_sol_high`, routes coordinator, spec, web-research and Claude-required work with ordered rules, and allows one retry with no fallback. Executable recipes and machine placement live in the same file. `herdr-ade context <project>` lists every recipe, what it is for, its capabilities and the exact command or rule that reaches it.
+Add the starting routing table shown in [Task-based routing](operations.md#task-based-routing) to `config.toml`. The example selects `pi_codex_sol_high` by default, routes coordinator, spec, web-research and native-chat work with ordered rules, and allows one retry with no fallback. Executable recipes and machine placement live in the same file. `herdr-ade context <project>` lists every recipe, what it is for, its capabilities and the exact command or rule that reaches it.
 
-If you use pi recipes, run `herdr-pi setup`, complete each required login with `herdr-pi login`, then run `herdr-pi doctor`. A login is local to that machine; do not copy its credential store to another machine.
+If you use pi recipes, run `herdr-pi setup`, complete each required login with `herdr-pi login`, then run `herdr-pi doctor`. If you want lanes on another machine, add a complete machine declaration to your config using the [neutral example](../assets/default-machines.toml); none is active by default. A login is local to that machine; do not copy its credential store to another machine.
 
 ## 3. Create and open a project
 

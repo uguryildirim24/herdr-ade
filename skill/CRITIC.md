@@ -12,7 +12,7 @@ TURN <topic>-<nn>: write your turn to <repo>/tasks/<topic>/turns/<nn>-<critic>.m
 2. Write your turn to exactly the path the line names, as a new file. Never edit an earlier turn and never write a turn number you were not given.
 3. Reply with exactly the `DONE <topic>-<nn> <path> -` line from the prompt, nothing else on that line.
 
-The coordinator commits your file with `hp dialogue commit` after checking that it exists and is not empty; a late reply for an old turn never completes a newer one.
+The coordinator commits your file with `ha dialogue commit` after checking that it exists and is not empty; a late reply for an old turn never completes a newer one.
 
 ## What a good turn holds
 

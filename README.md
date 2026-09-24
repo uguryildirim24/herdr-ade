@@ -51,7 +51,7 @@ A thread that waits on a permission prompt for more than 30 seconds moves to Wai
 <table>
 <tr>
 <td align="center" valign="top" width="33%"><h3>1️⃣</h3><b>Install the plugin</b><br /><sub>Run <code>herdr plugin install uguryildirim24/herdr-ade</code>. The plugin builds itself with Cargo. You'll need access to the private repository.</sub></td>
-<td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Create and open a project</b><br /><sub>Run the <b>Projects: new project</b> action, or <code>herdr-ade new "Billing" --repo ~/dev/app</code> then <code>herdr-ade open billing</code>. A coordinator agent starts in its own workspace.</sub></td>
+<td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Configure and open a project</b><br /><sub>Set up <a href="docs/getting-started.md#2-install-the-plugin">routing and an agent CLI</a>, then run <code>herdr-ade new "Billing" --repo ~/dev/app</code> and <code>herdr-ade open billing</code>. A coordinator agent starts in its own workspace.</sub></td>
 <td align="center" valign="top" width="33%"><h3>3️⃣</h3><b>Tell it what you want</b><br /><sub>Describe the work in the coordinator's pane. It suggests threads, you say go ahead, and the sidebar shows each thread's group as it works.</sub></td>
 </tr>
 </table>
@@ -89,7 +89,7 @@ It runs the `herdr-ade` binary every turn, so you'll want to allow-list it in yo
 
 ### Does the plugin send my project to a hosted service?
 
-Project files and lane work stay on your machines. Dispatch reads the local routing table; only the selected agent CLI uses its configured service. Remote lanes use your own SSH machines, and each `[machines.<name>]` declaration lists the adapter `kinds` it runs. The shipped `oci` machine runs `pi`; Claude and agy jobs stay on the Mac and need no box sign-in.
+Project files and lane work stay on your machines. Dispatch reads the local routing table; only the selected agent CLI uses its configured service. Remote lanes use your own SSH machines, and each `[machines.<name>]` declaration lists the adapter `kinds` it runs. No remote machine is enabled by default; configure one in `config.toml` before placing a lane there.
 
 ### Will it touch my branches or worktrees on its own?
 
@@ -114,11 +114,3 @@ They are soft. By default the coordinator starts needed threads, thread agents k
 ### What does it cost?
 
 Herdr ADE is free and [MIT licensed](LICENSE). You need access to the private repository to install it. Your agent CLI's usual usage charges still apply: every thread is a full agent session, and the coordinator spends tokens each turn reading its digest.
-
-## Open your first project in three steps
-
-<p align="center">Your first project starts with an install, a name, and one sentence about what you want. Herdr ADE starts the threads and keeps them in view. You choose what to review and what to merge.</p>
-
-<p align="center"><a href="https://github.com/uguryildirim24/herdr-ade/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></p>
-
-<p align="center"><sub>✓&nbsp;Free,&nbsp;MIT&nbsp;licensed &nbsp; ✓&nbsp;Lane&nbsp;work&nbsp;runs&nbsp;on&nbsp;your&nbsp;machines &nbsp; ✓&nbsp;macOS&nbsp;and&nbsp;Linux,&nbsp;Herdr&nbsp;0.9.1+</sub></p>

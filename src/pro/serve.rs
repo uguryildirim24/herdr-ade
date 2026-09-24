@@ -43,8 +43,13 @@ pub(crate) const MODEL_ID: &str = super::provider::MODEL_ID;
 /// Read timeout while waiting for a request header block.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The folders the model may read even without `--read-root`.
-const DEFAULT_READ_ROOT: &str = "/Users/rolfie/projects";
+/// The user's projects folder is readable without `--read-root`.
+fn default_read_roots() -> Vec<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("projects"))
+        .into_iter()
+        .collect()
+}
 /// One refused path's answer line, whatever the reason.
 const REFUSED: &str = "refused: outside the readable folders";
 /// Request rounds served per pi request before the last answer is returned.
@@ -228,7 +233,7 @@ pub(crate) fn start(layout: &Layout, read_roots: &[PathBuf]) -> Result<bool> {
 /// resolved so a symlinked root and a canonical path still match. Duplicates
 /// are dropped.
 fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(DEFAULT_READ_ROOT)];
+    let mut roots = default_read_roots();
     roots.extend(extra.iter().cloned());
     let mut resolved: Vec<PathBuf> = Vec::new();
     for root in roots {
@@ -245,7 +250,7 @@ fn effective_read_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
 pub(crate) fn readable_roots(layout: &Layout) -> Vec<PathBuf> {
     match ServeState::read(layout) {
         Some(state) if !state.read_roots.is_empty() => state.read_roots,
-        _ => vec![PathBuf::from(DEFAULT_READ_ROOT)],
+        _ => effective_read_roots(&[]),
     }
 }
 
@@ -2162,7 +2167,7 @@ mod tests {
 
     #[test]
     fn credential_names_and_git_objects_are_forbidden() {
-        let root = Path::new("/Users/rolfie/projects");
+        let root = Path::new("/Users/agent/projects");
         for name in ["auth.json", ".env", "id_rsa", "key.pem", "token.txt"] {
             assert!(forbidden_path(&root.join(name)), "{name} was not refused");
         }
