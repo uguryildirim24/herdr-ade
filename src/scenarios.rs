@@ -1060,6 +1060,10 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         },
     );
     record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
+    world
+        .runner
+        .on("for-each-ref --format=%(objectname) %(refname)", ok(""));
+    world.runner.on("ls-remote --heads", ok(""));
     world.runner.on(
         "machine list --json",
         ok(r#"[{"id":"oci-id","label":"oci","target":"remote-host","session":"default","enabled":true}]"#),
@@ -1105,6 +1109,15 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     );
     assert!(!command.contains("cd /home/agent"), "{command}");
     assert!(!command.contains("rm -rf --"), "{command}");
+    assert!(calls.iter().any(|call| {
+        call.program == "ssh"
+            && call
+                .display()
+                .contains("git branch -D -- hp/demo/t-0001-task")
+            && call
+                .display()
+                .contains("cd /home/ubuntu/projects/herdr-ade")
+    }));
     assert!(calls.iter().any(|call| {
         call.display()
             .contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001")
