@@ -2818,6 +2818,11 @@ fn dispatch_with_start(
                     crate::output::insert("queued", true);
                 }
                 let mut result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
+                if crate::harness::install_in_progress(&ctx.config_dir) {
+                    let note = "the lane is recorded and launches when the harness install finishes";
+                    result["note"] = note.into();
+                    crate::output::insert("note", note);
+                }
                 if thread.queued_for_load {
                     result["queued"] = true.into();
                     result["note"] =
@@ -2829,7 +2834,9 @@ fn dispatch_with_start(
             ThreadCommand::Retry { slug, id, reason } => {
                 let result = threads::retry(&ctx, &slug, &id, &reason)?;
                 let current = crate::thread::load(&Project::load(&ctx.root, &slug)?, &id)?;
-                let launch = if current.prompt_pending {
+                let launch = if crate::harness::install_in_progress(&ctx.config_dir) {
+                    "the lane is recorded and launches when the harness install finishes"
+                } else if current.prompt_pending {
                     "startup is still pending; the ticker resumes it"
                 } else {
                     "its brief was delivered"
