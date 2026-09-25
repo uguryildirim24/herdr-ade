@@ -588,6 +588,7 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
         t.launch.kind = "claude".into();
         t.launch.recipe_id = "test_claude".into();
         t.launch.brief_hash = brief_hash.clone();
+        t.launch.same_recipe_retries = 100; // Automatic recovery has long since stopped.
     });
     std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();
     let pending = world.home.path().join("uncommitted-work.txt");
@@ -642,7 +643,7 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
     assert_eq!(t.worktree_path, cwd);
     assert_eq!(std::fs::read_to_string(pending).unwrap(), "keep me");
     assert_eq!(t.launch.recipe_id, "test_claude");
-    assert_eq!(t.launch.same_recipe_retries, 1);
+    assert_eq!(t.launch.same_recipe_retries, 101);
     let dispatch = std::fs::read_to_string(project.state_dir().join("dispatch.jsonl")).unwrap();
     let decision: serde_json::Value =
         serde_json::from_str(dispatch.lines().last().unwrap()).unwrap();
