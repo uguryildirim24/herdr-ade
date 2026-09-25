@@ -1380,9 +1380,7 @@ pub fn open_with_lanes(
         validate_round_id(round)?;
     }
     let Some(plain) = plain.filter(|p| !p.trim().is_empty()) else {
-        bail!(
-            "plain_missing: `round open` needs --plain \"<one sentence that says what this round does>\""
-        );
+        bail!("plain_missing: `round open` needs --plain \"<what this round does>\"");
     };
 
     // Resolve and validate every lane before writing the round record.

@@ -132,15 +132,10 @@ pub struct StartArgs {
     pub review_round: String,
 }
 
-/// Internal birth sentence: required and structurally one sentence. Exact and
-/// long technical details are retained; the screen wraps or collapses them.
+/// Internal birth description: required, with no vocabulary or length gate.
 pub fn check_birth_plain(text: &str) -> Result<()> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if text.trim().is_empty() {
         bail!("plain_missing");
-    }
-    if trimmed.is_empty() {
-        bail!("write one sentence");
     }
     Ok(())
 }
