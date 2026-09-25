@@ -4500,6 +4500,10 @@ fn finalize_round(ctx: &Ctx, project: &Project, slug: &str, round: &str) {
             eprintln!("{}", cleanup_retry_message(&id));
         }
     }
+    if let Err(error) = crate::branches::closed_round(ctx, project, &record) {
+        eprintln!("branch cleanup pending for {round}: {error:#}");
+        return;
+    }
     if let Err(error) = finish_cleanup_marker(project, round) {
         eprintln!("cleanup marker pending for {round}: {error:#}");
     }

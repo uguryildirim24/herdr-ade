@@ -1879,10 +1879,10 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         let mut ids: Vec<_> = round
             .manifest
             .members
-            .into_iter()
-            .map(|member| member.thread)
+            .iter()
+            .map(|member| member.thread.clone())
             .collect();
-        if let Some(reviewer) = round.reviewer
+        if let Some(reviewer) = round.reviewer.clone()
             && !ids.contains(&reviewer)
         {
             ids.push(reviewer);
@@ -1891,6 +1891,10 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             if thread::load(project, &id).is_ok_and(|record| record.status != Status::Resolved) {
                 resolve_automatically(ctx, project, &id, reason);
             }
+        }
+        if let Err(error) = crate::branches::closed_round(ctx, project, &round) {
+            eprintln!("branch cleanup pending for {}: {error:#}", round.round);
+            continue;
         }
         crate::round::finish_cleanup_marker(project, &round.round)?;
     }
@@ -2512,6 +2516,9 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             thread::update(&project, id, |t| t.worktree_path.clear())?;
             worktree_removed = true;
         }
+    }
+    if worktree_removed {
+        crate::branches::resolved_thread(ctx, &project, &record)?;
     }
     let resolved = thread::update(&project, id, |t| {
         t.status = Status::Resolved;
