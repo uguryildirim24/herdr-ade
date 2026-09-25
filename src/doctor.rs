@@ -856,6 +856,23 @@ fn report_with_checks(
             continue;
         };
         let label = format!("project {slug}");
+        if let Some(record) = project.coordinator() {
+            let herdr = Herdr::new(&bin, &record.socket, runner);
+            if let Ok(line) = crate::ticker::idle_nudge_line(&project, config_dir, &herdr) {
+                let _ = writeln!(out, "[{label}] {line}");
+            }
+        } else {
+            let state = crate::steps::load_state(&project);
+            let _ = writeln!(
+                out,
+                "[{label}] last idle nudge: {}; agent working",
+                if state.idle_nudge_last.is_empty() {
+                    "never"
+                } else {
+                    &state.idle_nudge_last
+                }
+            );
+        }
         if let Ok((settings, _)) = project.read_project_md() {
             for repo in &settings.repos {
                 if repo.box_path.is_some()
@@ -3527,6 +3544,10 @@ recipe = "claude_fable_xhigh"
         );
         assert!(!healthy, "{text}");
         assert!(text.contains("does not resolve"), "{text}");
+        assert!(
+            text.contains("last idle nudge: never; agent working"),
+            "{text}"
+        );
     }
 
     #[test]
