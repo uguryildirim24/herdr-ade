@@ -188,6 +188,12 @@ impl Output {
 }
 
 pub(crate) trait Runner {
+    /// Only the production runner may be used by doctor's independent box
+    /// snapshot worker; scripted runners preserve their deterministic calls.
+    fn is_real(&self) -> bool {
+        false
+    }
+
     /// `Err` means the command could not be spawned at all (for example the
     /// program is missing). A non-zero exit or a timeout is an `Ok(Output)`.
     fn run(&self, cmd: &Cmd) -> Result<Output>;
@@ -231,6 +237,10 @@ impl<'a> CwdRunner<'a> {
 }
 
 impl Runner for CwdRunner<'_> {
+    fn is_real(&self) -> bool {
+        self.inner.is_real()
+    }
+
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         self.inner.run(&self.rooted(cmd))
     }
@@ -250,6 +260,10 @@ pub(crate) struct RealRunner;
 const POLL: Duration = Duration::from_millis(20);
 
 impl Runner for RealRunner {
+    fn is_real(&self) -> bool {
+        true
+    }
+
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         let mut command = Command::new(&cmd.program);
         command.args(&cmd.args);
