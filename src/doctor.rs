@@ -1610,23 +1610,32 @@ fn finished_worktrees_impl(
     // A checked round inventory is per project, not per checkout. The old
     // path re-read every round (including its manifest) for each candidate.
     let mut round_done = BTreeSet::new();
+    let mut round_errors = BTreeMap::new();
     let projects: BTreeMap<_, _> = candidates
         .iter()
         .map(|(project, _)| (project.slug.clone(), project))
         .collect();
     for (slug, project) in projects {
-        if let Ok(rounds) = crate::round::checked_list(project) {
-            for round in rounds {
-                if round.phase.closed() {
-                    for member in &round.manifest.members {
-                        round_done.insert((slug.clone(), member.thread.clone()));
+        match crate::round::checked_list(project) {
+            Ok(rounds) => {
+                for round in rounds {
+                    if round.phase.closed() {
+                        for member in &round.manifest.members {
+                            round_done.insert((slug.clone(), member.thread.clone()));
+                        }
+                    }
+                    if (round.verdict.is_some() || round.phase.closed())
+                        && let Some(reviewer) = round.reviewer
+                    {
+                        round_done.insert((slug.clone(), reviewer));
                     }
                 }
-                if (round.verdict.is_some() || round.phase.closed())
-                    && let Some(reviewer) = round.reviewer
-                {
-                    round_done.insert((slug.clone(), reviewer));
-                }
+            }
+            Err(error) => {
+                // A corrupt round record must not be treated as a missing
+                // membership: neither a merged branch nor a size cache is
+                // evidence that this checkout is safe to offer for removal.
+                round_errors.insert(slug, format!("{error:#}"));
             }
         }
     }
@@ -1673,6 +1682,13 @@ fn finished_worktrees_impl(
             .as_ref()
             .map_or_else(|| Path::new(path).is_dir(), |answers| answers[index]);
         if !exists {
+            continue;
+        }
+        if let Some(error) = round_errors.get(&project.slug) {
+            errors.push(format!(
+                "{}: could not inspect round records: {error}",
+                thread.id
+            ));
             continue;
         }
         let reason = if round_done.contains(&(project.slug.clone(), thread.id.clone()))
