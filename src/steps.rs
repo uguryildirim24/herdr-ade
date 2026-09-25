@@ -3,7 +3,6 @@
 //! without a thread or round home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -245,7 +244,7 @@ pub(crate) fn deliver_event(
 /// The configured publish URL for a repository (SPEC-remote §4.1): the
 /// project's own row wins, then the committed Mac→box map.
 fn publish_url_for(
-    config_dir: &Path,
+    ctx: &Ctx,
     project: &Project,
     machine: &str,
     repo: &str,
@@ -256,7 +255,14 @@ fn publish_url_for(
     {
         return Ok(Some(url.clone()));
     }
-    Ok(crate::remote::box_repo_for(config_dir, machine, repo)?.and_then(|row| row.publish_url))
+    Ok(crate::remote::box_repo_for_route(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        machine,
+        repo,
+    )?
+    .and_then(|row| row.publish_url))
 }
 
 /// Before a box lane's DONE is typed, the Mac fetches the lane branch from the
@@ -270,7 +276,7 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
     if lane.branch.is_empty() {
         bail!("published_branch_missing: {} has no lane branch", lane.id);
     }
-    let url = publish_url_for(&ctx.config_dir, project, &lane.machine, &lane.repo)?
+    let url = publish_url_for(ctx, project, lane.machine_route(), &lane.repo)?
         .with_context(|| format!("box_repo_unmapped: {} has no publish URL", lane.repo))?;
     let remote = crate::remote::remote_for_url(ctx.runner, &lane.repo, &url)?;
     let git = |args: &[&str]| {
