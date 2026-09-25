@@ -1333,7 +1333,7 @@ export -f inspect
     // bound; a slow tree cannot consume a separate six seconds per checkout.
     bash.push_str("for doctor_job in $doctor_jobs; do wait \"$doctor_job\" || :; done\nfor ((doctor_i=0; doctor_i<doctor_index; doctor_i++)); do cat \"$doctor_tmp/$doctor_i\"; printf '\\n'; done\n");
     format!(
-        "timeout -k 1s 12s bash -c {} || printf 'doctor_worktrees_timeout\\t1\\n'\n",
+        "timeout -k 1s 12s bash -c {}; doctor_status=$?; case $doctor_status in 0) ;; 124|137) printf 'doctor_worktrees_timeout\\t1\\n' ;; *) printf 'doctor_worktrees_failed\\t%s\\n' \"$doctor_status\" ;; esac\n",
         crate::remote::quote(&bash)
     )
 }
@@ -1426,11 +1426,22 @@ fn finished_worktrees_impl(
     // healthy "gone" result cannot enter the command-failure ledger and a
     // transport failure remains distinguishable from a negative answer.
     let remote_exists = remote.map(|profile| {
-        if snapshot.is_some_and(|text| text.contains("doctor_worktrees_timeout\t1")) {
-            errors.push(format!(
-                "{}: box worktree inspection exceeded 12s",
-                profile.label
-            ));
+        if let Some(snapshot) = snapshot {
+            if snapshot.contains("doctor_worktrees_timeout\t1") {
+                errors.push(format!(
+                    "{}: box worktree inspection exceeded 12s",
+                    profile.label
+                ));
+            }
+            if let Some(status) = snapshot
+                .lines()
+                .find_map(|line| line.strip_prefix("doctor_worktrees_failed\t"))
+            {
+                errors.push(format!(
+                    "{}: box worktree inspection failed (exit {status})",
+                    profile.label
+                ));
+            }
         }
         let Some(snapshot) = snapshot else {
             errors.push(format!("{}: box snapshot missing", profile.label));
