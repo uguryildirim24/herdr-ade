@@ -257,8 +257,28 @@ mod tests {
             workspace_id: saved.workspace_id.clone(),
             cwd: saved.cwd.clone(),
         };
-        assert!(!answer(&live_ctx, &project, &saved, &herdr, &[], &[pane.clone()]).unwrap());
-        assert!(!answer(&live_ctx, &project, &saved, &herdr, &[agent.clone()], &[]).unwrap());
+        assert!(
+            !answer(
+                &live_ctx,
+                &project,
+                &saved,
+                &herdr,
+                &[],
+                std::slice::from_ref(&pane)
+            )
+            .unwrap()
+        );
+        assert!(
+            !answer(
+                &live_ctx,
+                &project,
+                &saved,
+                &herdr,
+                std::slice::from_ref(&agent),
+                &[]
+            )
+            .unwrap()
+        );
         let wrong_pane = FakeRunner::new();
         wrong_pane.on("pane get", ok(&format!(r#"{{"result":{{"pane":{{"pane_id":"w1:other","tab_id":"w1:t2","workspace_id":"w1","cwd":"{}"}}}}}}"#, worktree.display())));
         let wrong_herdr = Herdr::new("herdr", "", &wrong_pane);
@@ -268,8 +288,8 @@ mod tests {
                 &project,
                 &saved,
                 &wrong_herdr,
-                &[agent.clone()],
-                &[pane.clone()]
+                std::slice::from_ref(&agent),
+                std::slice::from_ref(&pane)
             )
             .unwrap()
         );
@@ -280,8 +300,8 @@ mod tests {
                 &project,
                 &saved,
                 &herdr,
-                &[agent.clone()],
-                &[pane.clone()]
+                std::slice::from_ref(&agent),
+                std::slice::from_ref(&pane)
             )
             .unwrap()
         );
