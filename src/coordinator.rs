@@ -1323,6 +1323,7 @@ fn digest_snapshot(
                 && (matches!(
                     round.phase,
                     crate::contracts::RoundPhase::Admitting
+                        | crate::contracts::RoundPhase::UnderReview
                         | crate::contracts::RoundPhase::VerdictIn
                         | crate::contracts::RoundPhase::Merging
                         | crate::contracts::RoundPhase::Checkpointing
@@ -1359,6 +1360,7 @@ fn digest_snapshot(
                 .join(", ")
         );
         overflow_count(&mut out, round.manifest.members.len());
+        let _ = write!(out, "{}", crate::round::gate_summary(round));
         if let Some(reviewer) = &round.reviewer {
             let _ = writeln!(out, "  reviewer: {reviewer}");
         }
