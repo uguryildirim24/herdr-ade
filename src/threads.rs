@@ -740,6 +740,52 @@ pub(crate) fn box_repo_row(
     )
 }
 
+/// Put the authoritative round and all named review sources on the box before
+/// the reviewer process starts. Each transferred file is verified remotely.
+fn stage_box_review(
+    ctx: &Ctx,
+    project: &Project,
+    reviewer: &Thread,
+    box_root: &str,
+    target: &str,
+) -> Result<()> {
+    let record = crate::round::load(project, &reviewer.review_round)?;
+    let state = format!("{}/{}/.state", box_root, project.slug);
+    let manifest = crate::round::round_path(project, &reviewer.review_round);
+    let text = std::fs::read_to_string(&manifest)?;
+    remote::write_runtime_file(
+        ctx.runner,
+        target,
+        &format!("{state}/rounds/{}.toml", reviewer.review_round),
+        &text,
+        &thread::sha256_hex(text.as_bytes()),
+    )?;
+    let mut hashes = std::collections::BTreeSet::new();
+    if let Some(hash) = &record.review_artifact {
+        hashes.insert(hash.clone());
+    }
+    for member in &record.manifest.members {
+        if let Some(pin) = &member.pin {
+            hashes.insert(pin.artifact.clone());
+        }
+    }
+    if let Some(pin) = &record.previous_verdict {
+        hashes.insert(pin.artifact.clone());
+    }
+    for hash in hashes {
+        let bytes = thread::artifact(project, &hash)?;
+        let text = String::from_utf8(bytes).context("review source artifact is not UTF-8")?;
+        remote::write_runtime_file(
+            ctx.runner,
+            target,
+            &format!("{state}/artifacts/{hash}"),
+            &text,
+            &hash,
+        )?;
+    }
+    Ok(())
+}
+
 /// The box start side: freeze the brief as a project artifact, branch from an
 /// exact integration commit, provision the checkout, and materialize the brief
 /// only in the checkout's ignored runtime folder.
@@ -772,6 +818,7 @@ fn place_box_worktree(
         record.branch.clone()
     };
     let dir = thread::thread_dir(&box_worktree, &project.slug, &record.id);
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
 
     // A restart reuses the exact frozen artifact and code base. A first start
     // records both before any remote process exists.
@@ -789,6 +836,16 @@ fn place_box_worktree(
             ..record.clone()
         };
         let brief = thread::brief_for(project, &stub, &task, restart)?;
+        // A review task contains absolute artifact paths. Freeze paths for the
+        // machine that will read them, not the coordinator's filesystem.
+        let brief = if record.role == "reviewer" && !record.review_round.is_empty() {
+            brief.replace(
+                &project.state_dir().to_string_lossy().to_string(),
+                &format!("{}/{}/.state", machine.root, project.slug),
+            )
+        } else {
+            brief
+        };
         let frozen = format!("plain: {}\n\n{brief}", record.plain);
         let brief_hash = thread::store_artifact(project, frozen.as_bytes())?;
         let integration = integration_branch(runner, record)?;
@@ -818,7 +875,6 @@ fn place_box_worktree(
     // step 3).
     let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
 
-    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     // Verify the selected executable and user scope before creating a box
     // worktree. A broken user manager cannot leave a provisioned but idle lane.
     remote::prepare_project_slice(runner, &machine, &project.slug, &record.launch.kind)?;
@@ -835,6 +891,9 @@ fn place_box_worktree(
                 publish_url: &publish_url,
             },
         )?;
+    }
+    if record.role == "reviewer" && !record.review_round.is_empty() {
+        stage_box_review(ctx, project, record, &machine.root, &target)?;
     }
     let frozen = thread::artifact(project, &brief_hash)?;
     remote::write_runtime_file(
@@ -1501,7 +1560,7 @@ pub struct RetryOutcome {
 /// process. Its durable failure class decides whether recovery stays on the
 /// same recipe, advances failed-work fallback routing, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::start, true)
+    retry_with_ticker(ctx, slug, id, reason, ticker::start)
 }
 
 /// Round recovery already holds the advance lock, so it must not replace and
@@ -1512,7 +1571,9 @@ pub(crate) fn retry_during_advance(
     id: &str,
     reason: &str,
 ) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, false)
+    // A manual round retry is the same coordinator decision as `thread
+    // retry`; only its ticker handling differs because advance_lock is held.
+    retry_with_ticker(ctx, slug, id, reason, ticker::ensure)
 }
 
 fn retry_with_ticker(
@@ -1521,7 +1582,6 @@ fn retry_with_ticker(
     id: &str,
     reason: &str,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
-    coordinator_unknown: bool,
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -1586,12 +1646,8 @@ fn retry_with_ticker(
         source_truncation: record.launch.source_truncation.as_ref(),
         ..Default::default()
     };
-    let selected = if coordinator_unknown {
-        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)
-    } else {
-        crate::launch::resolve_failure(ctx, &project, &input, record.failure_class)
-    };
-    let mut launch = selected?;
+    let mut launch =
+        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?;
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
@@ -5672,6 +5728,87 @@ mod tests {
         assert_eq!(started.role, "reviewer");
         assert_eq!(started.machine, "buildbox");
         assert_eq!(started.machine_id, "buildbox-id");
+        let box_root = fx.world.home.path().join("review box root");
+        let box_project = project::create(&box_root, "demo", "", vec![]).unwrap();
+        let mac_show = crate::round::show(&ctx, "demo", "r1").unwrap();
+        let mut sources = vec![(
+            "/rounds/r1.toml".to_string(),
+            crate::round::round_path(&fx.project, "r1"),
+        )];
+        let mut hashes = vec![record.review_artifact.clone().unwrap()];
+        hashes.extend(
+            record
+                .manifest
+                .members
+                .iter()
+                .map(|m| m.pin.as_ref().unwrap().artifact.clone()),
+        );
+        for hash in hashes {
+            sources.push((
+                format!("/artifacts/{hash}"),
+                crate::events::artifact_path(&fx.project, &hash),
+            ));
+        }
+        for (suffix, source) in sources {
+            let expected = std::fs::read_to_string(source).unwrap();
+            let transfers: Vec<_> = fx
+                .world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| {
+                    call.program == "ssh"
+                        && call.display().contains("runtime_file_hash_mismatch")
+                        && call.display().contains(&format!("/demo/.state{suffix}"))
+                })
+                .map(|call| call.stdin.clone().unwrap())
+                .collect();
+            assert_eq!(
+                transfers.len(),
+                1,
+                "missing or duplicate box source: {suffix}"
+            );
+            if suffix.starts_with("/artifacts/") {
+                assert_eq!(transfers[0], expected);
+            } // Binding the reviewer adds its id to the Mac manifest after transfer.
+            let dest = box_project.state_dir().join(suffix.trim_start_matches('/'));
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(&dest, &transfers[0]).unwrap();
+            if suffix.starts_with("/artifacts/") {
+                assert_eq!(
+                    thread::sha256_hex(&std::fs::read(&dest).unwrap()),
+                    suffix.trim_start_matches("/artifacts/")
+                );
+            }
+        }
+        assert!(
+            crate::round::show(
+                &crate::paths::Ctx {
+                    root: box_root,
+                    env: ctx.env,
+                    config_dir: ctx.config_dir.clone(),
+                    runner: ctx.runner,
+                    detached_ticker: false
+                },
+                "demo",
+                "r1"
+            )
+            .unwrap()
+            .contains(&format!(
+                "manifest hash: {}",
+                crate::round::manifest_hash(&record)
+            ))
+        );
+        assert!(mac_show.contains(&format!(
+            "manifest hash: {}",
+            crate::round::manifest_hash(&record)
+        )));
+        let frozen =
+            String::from_utf8(thread::artifact(&fx.project, &started.launch.brief_hash).unwrap())
+                .unwrap();
+        assert!(frozen.contains("/home/agent/.herdr-ade/demo/.state/artifacts/"));
+        assert!(!frozen.contains(&fx.project.state_dir().to_string_lossy().to_string()));
 
         // advance already publishes the starting commit, before V exists.
         ops::check_published_ref(
