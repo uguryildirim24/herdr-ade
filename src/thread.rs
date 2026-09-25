@@ -78,6 +78,8 @@ pub(crate) struct Thread {
     pub(crate) status: Status,
     pub(crate) error: String,
     pub(crate) prompt_pending: bool,
+    /// A sealed completion whose pane was closed; its branch and attempt remain live.
+    pub(crate) parked: bool,
     /// The current attempt's sealed waiting event answered by the last
     /// successfully delivered follow-up. A later waiting event supersedes it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -883,6 +885,7 @@ pub(crate) fn brief_for(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Group {
     ReadyForReview,
+    Parked,
     WaitingOnYou,
     Unknown,
     Working,
@@ -897,18 +900,20 @@ impl Group {
     pub(crate) fn rank(self) -> u8 {
         match self {
             Group::ReadyForReview => 1,
-            Group::WaitingOnYou => 2,
-            Group::Unknown => 3,
-            Group::Working => 4,
-            Group::Landing => 5,
-            Group::Idle => 6,
-            Group::Resolved => 7,
+            Group::Parked => 2,
+            Group::WaitingOnYou => 3,
+            Group::Unknown => 4,
+            Group::Working => 5,
+            Group::Landing => 6,
+            Group::Idle => 7,
+            Group::Resolved => 8,
         }
     }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Group::ReadyForReview => "Ready for review",
+            Group::Parked => "Parked",
             Group::WaitingOnYou => "Waiting on you",
             Group::Unknown => "Unknown",
             Group::Working => "Working",
@@ -922,6 +927,7 @@ impl Group {
     pub(crate) fn token(self) -> &'static str {
         match self {
             Group::ReadyForReview => "ready-for-review",
+            Group::Parked => "parked",
             Group::WaitingOnYou => "waiting-on-you",
             Group::Unknown => "unknown",
             Group::Working => "working",
@@ -934,6 +940,7 @@ impl Group {
     pub(crate) fn from_token(token: &str) -> Option<Group> {
         [
             Group::ReadyForReview,
+            Group::Parked,
             Group::WaitingOnYou,
             Group::Unknown,
             Group::Working,
@@ -945,8 +952,9 @@ impl Group {
         .find(|g| g.token() == token)
     }
 
-    pub(crate) const DISPLAY_ORDER: [Group; 7] = [
+    pub(crate) const DISPLAY_ORDER: [Group; 8] = [
         Group::ReadyForReview,
+        Group::Parked,
         Group::WaitingOnYou,
         Group::Unknown,
         Group::Working,
@@ -985,6 +993,7 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
             Group::WaitingOnYou
         }
         Status::Starting => Group::Working,
+        Status::Open if thread.parked => Group::Parked,
         Status::Open if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Open if thread.is_remote() && thread.last_state.is_empty() => Group::Unknown,
         Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
@@ -1001,6 +1010,9 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     // 1
     if thread.status == Status::Resolved {
         return Group::Resolved;
+    }
+    if thread.parked {
+        return Group::Parked;
     }
     // 2
     if thread.status == Status::Starting {
@@ -1639,7 +1651,7 @@ mod tests {
     #[test]
     fn display_order_and_rank_digits() {
         let ranks: Vec<u8> = Group::DISPLAY_ORDER.iter().map(|g| g.rank()).collect();
-        assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(Group::ReadyForReview.token(), "ready-for-review");
         assert_eq!(Group::WaitingOnYou.token(), "waiting-on-you");
         assert_eq!(Group::from_token("landing"), Some(Group::Landing));
