@@ -1129,9 +1129,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
             && call
                 .display()
                 .contains("git branch -D -- hp/demo/t-0001-task")
-            && call
-                .display()
-                .contains("cd /home/ubuntu/projects/herdr-ade")
+            && call.display().contains("cd /home/agent/projects/herdr-ade")
     }));
     assert!(calls.iter().any(|call| {
         call.display()
