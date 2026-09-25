@@ -61,8 +61,7 @@ pub(crate) fn save_state(project: &Project, state: &State) -> Result<()> {
 
 /// Delivers every sealed event whose transport submission is not yet in its
 /// journal. The event, not the typed line or report hash, is authoritative.
-/// Each event is independent: one that cannot be delivered never holds back
-/// the others. An event whose journal already holds `submitted` is not typed
+/// A held notice holds later notices, preserving their seal order. An event whose journal already holds `submitted` is not typed
 /// again; one read before its line went out (`acknowledged` or `handled` with
 /// no `submitted`) is still typed once, so the wake-up always happens. An
 /// event for a superseded lane attempt is left as it is, sealed and
@@ -118,6 +117,13 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         }
         if let Err(error) = deliver_event(ctx, project, &event) {
             first.get_or_insert(error.context(format!("event {}", event.id)));
+            break;
+        }
+        // A held notice must not be overtaken by a later one.
+        if !crate::events::states(project, &event.id)?
+            .contains(&crate::contracts::DeliveryState::Submitted)
+        {
+            break;
         }
     }
     first.map_or(Ok(()), Err)
@@ -225,6 +231,9 @@ pub(crate) fn deliver_event(
     let Some(_agent) = agent else {
         return Ok(());
     };
+    if !crate::talk::coordinator_prompt_clear(project, &herdr, &event.recipient.pane)? {
+        return Ok(());
+    }
     let mut line = crate::events::typed_line(event)?;
     if !queued.is_empty() {
         line.push_str(&format!(
@@ -923,6 +932,7 @@ pub(crate) fn remote_attention(
     if boot_changed {
         state.gone.clear();
         state.missing.clear();
+        state.pending_gone = threads.iter().map(|lane| lane.id.clone()).collect();
     }
     enum Signal {
         Blocked(String),
@@ -967,7 +977,8 @@ pub(crate) fn remote_attention(
             *count += 1;
         }
         let missing = *state.missing.get(&lane.id).unwrap_or(&0);
-        if (boot_changed || missing >= 2) && !state.gone.contains(&lane.id) {
+        if (state.pending_gone.contains(&lane.id) || missing >= 2) && !state.gone.contains(&lane.id)
+        {
             signals.push(Signal::Gone(lane.id.clone()));
         }
     }
@@ -979,6 +990,7 @@ pub(crate) fn remote_attention(
                     state.blocked.insert(lane);
                 }
                 Signal::Gone(lane) => {
+                    state.pending_gone.remove(&lane);
                     state.gone.insert(lane.clone());
                     if let Some(record) = threads.iter().find(|record| record.id == lane) {
                         let recover = !record.launch.recipe_id.is_empty();
@@ -997,8 +1009,11 @@ pub(crate) fn remote_attention(
             },
             // A suspended or busy writer has not consumed the transition. Do
             // not mark it: the next successful pass must try again.
-            Ok(false) => {}
-            Err(error) => errors.push(error.context(format!("remote line `{line}`"))),
+            Ok(false) => break,
+            Err(error) => {
+                errors.push(error.context(format!("remote line `{line}`")));
+                break;
+            }
         }
     }
     if let Err(error) = events::save_remote_state(project, machine_id, &state) {
@@ -1023,6 +1038,9 @@ pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Resu
         agent.pane_id == record.pane_id && agent.name == record.agent_name && agent.ready()
     });
     if !ready {
+        return Ok(false);
+    }
+    if !crate::talk::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
         return Ok(false);
     }
     crate::talk::mark_automated_prompt(project, &record.pane_id, text)?;
@@ -1127,6 +1145,9 @@ pub(crate) fn nudge(
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick.
         let _writer = crate::talk::writer_lock(project)?;
+        if !crate::talk::coordinator_prompt_clear(project, herdr, pane)? {
+            return Ok(());
+        }
         crate::talk::mark_automated_prompt(project, pane, NUDGE_TEXT)?;
         herdr.agent_prompt(pane, NUDGE_TEXT)?;
     } else {
@@ -1568,6 +1589,44 @@ mod tests {
     }
 
     #[test]
+    fn typed_draft_holds_inbox_nudge_and_ordered_lane_notices() {
+        let (world, project) = delivery_world();
+        let screen = std::rc::Rc::new(std::cell::RefCell::new("❯ Rolf is typing\n".to_string()));
+        let read = screen.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("pane read") && cmd.display().contains("--source visible"),
+            move |_| Ok(crate::runner::fake::ok(&read.borrow())),
+        );
+        let first = thread::allocate(&project, |t| t.status = Status::Open).unwrap();
+        let second = thread::allocate(&project, |t| t.status = Status::Open).unwrap();
+        let a = sealed_done(&project, &first.id);
+        let b = sealed_done(&project, &second.id);
+        inbox::write(&project, "note", "test", "new inbox item", "").unwrap();
+        let ctx = world.ctx();
+        let herdr = Herdr::new(
+            ctx.env.herdr_bin(),
+            &project.coordinator().unwrap().socket,
+            ctx.runner,
+        );
+        let mut state = State::default();
+        let settings = Settings::default();
+        nudge(&project, &mut state, &settings, &herdr, Some("w1:p1")).unwrap();
+        deliver_events(&ctx, &project).unwrap();
+        assert!(typed_lines(&world).is_empty());
+        assert!(state.nudged.is_empty());
+        assert!(events::states(&project, &a.id).unwrap().is_empty());
+        assert!(events::states(&project, &b.id).unwrap().is_empty());
+        *screen.borrow_mut() = "❯ \n".into();
+        deliver_events(&ctx, &project).unwrap();
+        let lines = typed_lines(&world);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains(&first.id));
+        assert!(lines[1].contains(&second.id));
+        nudge(&project, &mut state, &settings, &herdr, Some("w1:p1")).unwrap();
+        assert_eq!(typed_lines(&world).len(), 3);
+    }
+
+    #[test]
     fn a_normal_event_is_typed_once_and_not_retyped() {
         let (world, project) = delivery_world();
         thread::allocate(&project, |t| {
@@ -1833,6 +1892,24 @@ mod tests {
         let state = events::remote_state(&project, "abc");
         assert_eq!(state.boot_id, "boot-2");
         assert!(!state.gone.contains(&lane.id));
+        assert!(state.pending_gone.contains(&lane.id));
+        remote_attention(
+            &ctx,
+            &project,
+            RemoteView {
+                machine_id: "abc",
+                threads: &threads,
+                agents: &[],
+                panes: &[],
+                boot_id: "boot-2",
+                now,
+            },
+        );
+        assert!(
+            events::remote_state(&project, "abc")
+                .pending_gone
+                .contains(&lane.id)
+        );
     }
 
     #[test]
