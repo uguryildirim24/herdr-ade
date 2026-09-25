@@ -217,9 +217,21 @@ const PAD: usize = 3;
 /// to-do list joined by a thin line. `note` is a quiet line under the panel
 /// (for example when the last refresh failed).
 pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Vec<String> {
+    // Too narrow for the frame and its progress count: show just the name
+    // rather than printing a frame wider than the terminal.
+    if width < 28 {
+        return vec![cut(
+            if card.title.is_empty() {
+                "Rundown"
+            } else {
+                &card.title
+            },
+            width,
+        )];
+    }
     let mut panel = width.saturating_sub(4).clamp(28, MAX_PANEL);
-    // Equal margins left and right.
-    if panel > 28 && (width.saturating_sub(panel)) % 2 == 1 {
+    // Equal margins left and right, including at 29 and 31 columns.
+    if (width - panel) % 2 == 1 {
         panel -= 1;
     }
     let inner = panel - 2 - PAD * 2;
@@ -375,10 +387,13 @@ fn len(text: &str) -> usize {
 /// `text` on one line of at most `width` characters: cut at a word boundary
 /// and ended with "…" when it is too long.
 fn cut(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if len(text) <= width {
         return text.to_string();
     }
-    let room = width.saturating_sub(1);
+    let room = width - 1;
     let mut out = String::new();
     for word in text.split_whitespace() {
         let next = if out.is_empty() {
@@ -555,7 +570,7 @@ mod tests {
                 &[("left", long), ("done", "Last")],
             ),
         );
-        for width in [40, 80, 90, 160, 200] {
+        for width in [29, 31, 40, 80, 90, 160, 200] {
             let lines: Vec<String> = render(&card, width, 0, "")
                 .iter()
                 .map(|l| visible(l))
@@ -564,12 +579,14 @@ mod tests {
                 lines.iter().all(|l| l.chars().count() <= width),
                 "{width}: {lines:#?}"
             );
-            let step = lines.iter().find(|l| l.contains("Make the")).unwrap();
+            let step = lines.iter().find(|l| l.contains("Make")).unwrap();
             assert!(!step.contains(long), "{step}");
             assert!(step.trim_end_matches([' ', '│']).ends_with('…'), "{step}");
         }
         assert_eq!(cut("One reviewer for the pile", 14), "One reviewer…");
         assert_eq!(cut("Short", 14), "Short");
+        assert_eq!(visible(&render(&card, 16, 20, "")[0]), "Demo");
+        assert_eq!(render(&card, 0, 20, ""), [""]);
         let six = Card::from_plan(
             "Demo",
             &reply(

@@ -154,8 +154,12 @@ fn run() -> Result<()> {
                 }
                 Err(_) => note = "Getting the plan…".into(),
             }
-            seen = Some(print);
-            fetched = Some(Instant::now());
+            // A failed read must retry on the next tick even if no record
+            // changed; the minute-long refresh is for healthy cards only.
+            if note.is_empty() {
+                seen = Some(print);
+                fetched = Some(Instant::now());
+            }
         }
         let screen = size();
         let state = (card.clone(), note.clone(), screen);
