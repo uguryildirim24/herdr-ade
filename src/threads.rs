@@ -1696,7 +1696,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         t.resolved_reason = "cancelled".into();
         t.cancellation_reason = recorded_reason.clone();
         t.prompt_pending = false;
-        t.cleanup_pending = !t.tab_id.is_empty();
+        t.cleanup_pending = true;
         t.cleanup_reason = "cancelled".into();
     })?;
     if let Some(view) = session_view(ctx, &project) {
@@ -1712,13 +1712,6 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             Err(error) => ("cleanup_pending".to_string(), Some(format!("{error:#}"))),
         }
     };
-    if close_error.is_none() {
-        thread::update(&project, id, |t| {
-            t.cleanup_pending = false;
-            t.cleanup_reason.clear();
-        })?;
-    }
-
     let mut worktree = "not_applicable".to_string();
     let mut worktree_reason = close_error;
     if removable_folder(&project, &record) {
@@ -1756,8 +1749,15 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         }
     }
     if pane != "cleanup_pending" {
+        if worktree == "removed" {
+            crate::branches::resolved_thread(ctx, &project, &record)?;
+        }
         remove_finished_build_folder(ctx, &project, &record)?;
         remove_scratch_session(ctx, &record)?;
+        thread::update(&project, id, |t| {
+            t.cleanup_pending = false;
+            t.cleanup_reason.clear();
+        })?;
     }
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
@@ -1891,6 +1891,9 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             if thread::load(project, &id).is_ok_and(|record| record.status != Status::Resolved) {
                 resolve_automatically(ctx, project, &id, reason);
             }
+        }
+        for line in crate::round::cleanup_review_worktrees(ctx, project, &round) {
+            println!("{line}");
         }
         if let Err(error) = crate::branches::closed_round(ctx, project, &round) {
             eprintln!("branch cleanup pending for {}: {error:#}", round.round);
@@ -2400,8 +2403,8 @@ impl ResolveOutcome {
             "not_recorded" => message
                 .push_str("No worktree was recorded for it, so there is nothing to remove.\n"),
             "removed" => message.push_str(&format!(
-                "The worktree {} was removed; the branch {} was kept.\n",
-                self.worktree_path, self.branch
+                "The worktree {} was removed.\n",
+                self.worktree_path
             )),
             "kept" => message.push_str(&format!(
                 "The worktree {} was kept: {}.\n",
