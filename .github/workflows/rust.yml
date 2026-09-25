@@ -7,10 +7,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
-      - run: git diff --check
+      - name: Check changed lines for whitespace errors
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            git diff --check "$PR_BASE...HEAD"
+          elif [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check "$BEFORE" HEAD
+          fi
