@@ -301,6 +301,9 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         launch.attempt = previous_launch.attempt + 1;
         launch.brief_hash = brief_hash;
     }
+    // Coordinator panes are created on this machine's herdr server, not on
+    // the dispatch machine selected for work lanes by the launch recipe.
+    launch.machine = "local".into();
     launch.skill_hash =
         crate::thread::sha256_hex(crate::lane::skill_text("coordinator").as_bytes());
     let spec = crate::contracts::RoleSpec {
@@ -386,6 +389,29 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             name_restored: previous.as_ref().map_or(0, |r| r.name_restored),
         }
     })?;
+
+    // Preserve the old pane as the ticker's re-link trigger. A fresh project
+    // has no existing lanes to carry; reopening a closed binding may have
+    // lanes even though the old coordinator record was cleared.
+    let mut ticker_state = crate::steps::load_state(&project);
+    if ticker_state.lanes_parented_to.is_empty() {
+        ticker_state.lanes_parented_to = previous
+            .as_ref()
+            .map(|old| old.pane_id.clone())
+            .filter(|pane| !pane.is_empty())
+            .unwrap_or_else(|| {
+                if crate::thread::list(&project).iter().any(|lane| {
+                    lane.status != crate::thread::Status::Resolved
+                        && !lane.parked
+                        && !lane.pane_id.is_empty()
+                }) {
+                    "pending".into()
+                } else {
+                    record.pane_id.clone()
+                }
+            });
+        crate::steps::save_state(&project, &ticker_state)?;
+    }
 
     // Hook installation and verification precede the coordinator launch. An
     // unsupported kind remains honestly unqualified and installs nothing.
@@ -924,7 +950,7 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     });
     if !peek && owns_read {
         // An external read is a peek: it cannot consume the coordinator's
-        // delta, failure reminder or inbox nudge.
+        // delta or failure reminder.
         crate::project::write_json(&path, &current)?;
         crate::ledger::context_read(&project, &read_at)?;
         inbox::mark_seen(&project, &shown)?;
@@ -1050,9 +1076,6 @@ fn digest_snapshot(
         }
     }
 
-    if project.finished() {
-        out.push_str("\nProject finished. Idle nudges are off until Rolf writes again.\n");
-    }
     if project
         .coordinator()
         .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
@@ -1062,29 +1085,6 @@ fn digest_snapshot(
     if crate::talk::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending; finish or clear the draft when ready.\n");
     }
-    if let Some(record) = project.coordinator() {
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-        match crate::ticker::idle_nudge_line(project, &ctx.config_dir, &herdr) {
-            Ok(line) => {
-                let _ = writeln!(out, "\n{line}");
-            }
-            Err(error) => {
-                let _ = writeln!(out, "\nidle nudge status unavailable: {error:#}");
-            }
-        }
-    } else {
-        let state = crate::steps::load_state(project);
-        let _ = writeln!(
-            out,
-            "\nlast idle nudge: {}; no coordinator",
-            if state.idle_nudge_last.is_empty() {
-                "never"
-            } else {
-                &state.idle_nudge_last
-            }
-        );
-    }
-
     if let Ok((settings, _)) = project.read_project_md()
         && !settings.repos.is_empty()
     {
@@ -1684,7 +1684,6 @@ mod tests {
             crate::runner::fake::ok("## main...origin/main [ahead 6, behind 2]\n M file\n"),
         );
         let (text, _) = digest(&world.ctx(), &project, "ha").unwrap();
-        assert!(text.contains("last idle nudge: never"), "{text}");
         assert!(
             text.contains(&format!(
                 "{}: main, dirty, ahead 6, behind 2 origin/main; documents: STATE.md, HANDOFF.md",

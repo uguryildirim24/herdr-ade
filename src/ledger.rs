@@ -47,7 +47,6 @@ enum Line {
 struct State {
     entries: BTreeMap<String, Entry>,
     context_read: String,
-    coordinator_command: String,
     pending: BTreeSet<(String, String)>,
 }
 
@@ -103,12 +102,10 @@ fn load(project: &Project) -> Result<State> {
             Line::Recovered { kind, subject } => {
                 state.pending.remove(&(kind, subject));
             }
-            Line::CoordinatorCommand { at } => {
-                if time_cmp(&at, &state.coordinator_command).is_gt() {
-                    state.coordinator_command = at;
-                }
-            }
-            Line::CoordinatorNudge { .. } | Line::CoordinatorRelaunch { .. } => {}
+            // Historical rows still deserialize; neither prompt is produced now.
+            Line::CoordinatorCommand { .. }
+            | Line::CoordinatorNudge { .. }
+            | Line::CoordinatorRelaunch { .. } => {}
         }
     }
     Ok(state)
@@ -334,41 +331,6 @@ pub(crate) fn recent(project: &Project) -> Result<Vec<Entry>> {
 pub(crate) fn context_read(project: &Project, at: &str) -> Result<()> {
     let _lock = lock(project)?;
     append(project, &Line::ContextRead { at: at.into() })
-}
-
-pub(crate) fn latest_coordinator_turn(project: &Project) -> Result<String> {
-    let _lock = lock(project)?;
-    let state = load(project)?;
-    Ok(
-        if time_cmp(&state.context_read, &state.coordinator_command).is_gt() {
-            state.context_read
-        } else {
-            state.coordinator_command
-        },
-    )
-}
-
-pub(crate) fn coordinator_command(project: &Project) -> Result<()> {
-    let _lock = lock(project)?;
-    append(
-        project,
-        &Line::CoordinatorCommand {
-            at: jiff::Timestamp::now().to_string(),
-        },
-    )
-}
-
-/// Records a successful automated continue prompt without turning it into a
-/// harness failure.
-pub(crate) fn coordinator_nudge(project: &Project, next: &[String]) -> Result<()> {
-    let _lock = lock(project)?;
-    append(
-        project,
-        &Line::CoordinatorNudge {
-            at: jiff::Timestamp::now().to_string(),
-            next: next.to_vec(),
-        },
-    )
 }
 
 pub(crate) fn coordinator_relaunch(project: &Project, pane: &str) -> Result<()> {
