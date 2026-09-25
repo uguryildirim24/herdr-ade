@@ -2727,7 +2727,6 @@ mod tests {
     const ROUTING_CONFIG: &str = r#"[routing]
 default = "pi_codex_sol_high"
 retries = 1
-fallback = []
 
 [[routing.rules]]
 workflow = "coordinator"
@@ -4406,7 +4405,7 @@ recipe = "claude_fable_xhigh"
         std::fs::write(
             config.join("config.toml"),
             format!(
-                "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\nfallback = []\n\n{}{}",
+                "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\n\n{}{}",
                 toml::to_string(&BTreeMap::from([("recipes", recipes)])).unwrap(),
                 crate::remote::TEST_MACHINE
             ),
@@ -4528,7 +4527,7 @@ recipe = "claude_fable_xhigh"
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(
             config.join("config.toml"),
-            "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\nfallback = []\n\n[dispatch]\nmachine = \"dispatch-box\"\n",
+            "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\n\n[dispatch]\nmachine = \"dispatch-box\"\n",
         )
         .unwrap();
         let project = project::create(
