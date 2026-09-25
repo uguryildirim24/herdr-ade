@@ -5593,6 +5593,7 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
             .unwrap_or_default()
     );
     out.push_str(&format!("phase: {:?}\n", record.phase));
+    out.push_str(&format!("manifest hash: {}\n", manifest_hash(&record)));
     if record.phase == RoundPhase::Merged && record.push_remote.is_some() && !record.published {
         out.push_str("publish: pending\n");
     }
