@@ -553,27 +553,37 @@ pub(crate) fn coordinator_prompt_clear(
     let dir = talk_dir(project).join("prompts");
     let entries = std::fs::read_dir(dir).ok();
     let now = jiff::Timestamp::now().as_second();
-    let tail = styled_lines(&screen)
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .take(8)
-        .map(|line| line.text)
-        .collect::<Vec<_>>();
-    for entry in entries.into_iter().flatten().flatten() {
-        let Some(record) = project::read_json::<PendingPromptRecord>(&entry.path()) else {
-            continue;
-        };
-        if record.pane == pane
-            && now - record.at <= PENDING_PROMPT_SECS
-            && !record.text.is_empty()
-            && tail.iter().any(|line| {
-                let input = line.trim().trim_start_matches(['❯', '›', '>', '⟩']).trim();
-                input == record.text
-            })
-        {
-            clear_input_hold(project);
-            return Ok(true);
+    let lines = styled_lines(&screen).unwrap_or_default();
+    // A marker in scrollback does not own a newer draft. Only the last editor
+    // line can be a leftover, with no other text following it.
+    let editor = lines.iter().enumerate().rev().find(|(_, line)| {
+        ['❯', '›', '>', '⟩']
+            .iter()
+            .any(|mark| line.text.trim_start().starts_with(*mark))
+    });
+    if let Some((_, line)) = editor.filter(|(index, _)| {
+        lines.len() - index <= 8
+            && lines[index + 1..]
+                .iter()
+                .all(|following| following.text.trim().is_empty())
+    }) {
+        let input = line
+            .text
+            .trim()
+            .trim_start_matches(['❯', '›', '>', '⟩'])
+            .trim();
+        for entry in entries.into_iter().flatten().flatten() {
+            let Some(record) = project::read_json::<PendingPromptRecord>(&entry.path()) else {
+                continue;
+            };
+            if record.pane == pane
+                && now - record.at <= PENDING_PROMPT_SECS
+                && !record.text.is_empty()
+                && input == record.text
+            {
+                clear_input_hold(project);
+                return Ok(true);
+            }
         }
     }
     hold_input(project)?;
@@ -870,11 +880,18 @@ mod tests {
             },
         )
         .unwrap();
-        fx.world
-            .runner
-            .on("pane read", ok(&format!("❯ {prompt}\n")));
+        let screen = std::rc::Rc::new(std::cell::RefCell::new(format!("❯ {prompt}\n")));
+        let read = screen.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("pane read"),
+            move |_| Ok(ok(&read.borrow())),
+        );
         let herdr = crate::herdr::Herdr::new("herdr", "/missing.sock", &fx.world.runner);
         assert!(coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
+        *screen.borrow_mut() = format!("❯ {prompt}\n❯ Rolf's draft\n");
+        assert!(!coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
+        *screen.borrow_mut() = format!("❯ {prompt}\ncontinued draft\n");
+        assert!(!coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
         assert!(fx.world.runner.calls.borrow().iter().any(|call| {
             call.display()
                 .contains("pane read w1:p1 --source visible --format ansi")
