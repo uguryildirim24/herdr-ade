@@ -626,8 +626,12 @@ fn tick_with_steps(
         if !step(&format!("slow project {}", project.slug)) {
             return None;
         }
-        for error in tick_slow(ctx, project, seen, memory) {
+        let (errors, completed) = tick_slow_with_steps(ctx, project, seen, memory, step);
+        for error in errors {
             log.line(&format!("{}: {error:#}", project.slug));
+        }
+        if !completed {
+            return None;
         }
     }
     Some(!reachable.is_empty())
@@ -1750,14 +1754,33 @@ fn clean_managed_project_tabs(
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
 /// routines and housekeeping.
+#[cfg(test)]
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
+    tick_slow_with_steps(ctx, project, seen, memory, &mut |_| true).0
+}
+
+// Each boundary prevents a stop received during a slow operation from
+// starting the next independent operation in the same project's pass.
+fn tick_slow_with_steps(
+    ctx: &Ctx,
+    project: &Project,
+    seen: &Seen,
+    memory: &mut Memory,
+    step: &mut impl FnMut(&str) -> bool,
+) -> (Vec<anyhow::Error>, bool) {
     let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
+    if !step("escalation") {
+        return (errors, false);
+    }
     errors.extend(crate::escalation::tick(ctx, project).err());
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
     let mut may_start = true;
 
+    if !step("coordinator launch") {
+        return (errors, false);
+    }
     if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
         let pane_alive = seen
             .panes
@@ -1792,6 +1815,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
     for t in local.iter().filter(|t| t.status == thread::Status::Open) {
+        if !step(&format!("local report {}", t.id)) {
+            return (errors, false);
+        }
         if let Some(hash) = thread::local_report_hash(t)
             && hash != t.report_hash
         {
@@ -1815,6 +1841,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             }
         }
     }
+    if !step("local launches") {
+        return (errors, false);
+    }
     launch_pass(
         &LaunchPass {
             ctx,
@@ -1833,6 +1862,18 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // A machine with no view was not due this tick (SPEC-remote §4.3).
     let mut state = steps::load_state(project);
     let before = state.clone();
+    // A stop after a stateful slow stage must still persist that stage's
+    // completed work; otherwise the next ticker replays it.
+    macro_rules! stop_after_state {
+        ($name:expr) => {
+            if !step($name) {
+                if state != before {
+                    errors.extend(steps::save_state(project, &state).err());
+                }
+                return (errors, false);
+            }
+        };
+    }
     let remote_threads = open_threads(project, true);
     let mut machines: Vec<String> = remote_threads
         .iter()
@@ -1841,6 +1882,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     machines.sort();
     machines.dedup();
     for machine in machines {
+        if !step(&format!("remote state {machine}")) {
+            return (errors, false);
+        }
         let Some(view) = memory.machine_views.get(&machine) else {
             continue;
         };
@@ -1875,8 +1919,11 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         }
     }
 
+    stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
+    stop_after_state!("pull requests");
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
+    stop_after_state!("routines");
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {
         Ok((_settings, _)) => {
@@ -1899,11 +1946,13 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // D5 recovery and delivery (X1 to X5), then rounds, asks and the
     // board (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.
+    stop_after_state!("ops");
     errors.extend(
         crate::ops::tick(ctx, project)
             .err()
             .map(|e| e.context("ops")),
     );
+    stop_after_state!("rounds");
     errors.extend(
         crate::round::tick(ctx, project)
             .err()
@@ -1913,7 +1962,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
     }
-    errors
+    (errors, true)
 }
 
 #[cfg(test)]
@@ -2703,6 +2752,39 @@ mod tests {
         assert_eq!(result, None);
         assert!(start.elapsed() < Duration::from_millis(200));
         assert_eq!(runner.agent_lists.get(), 1);
+    }
+
+    #[test]
+    fn stop_during_a_slow_project_skips_its_remaining_work() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let seen = Seen {
+            socket: String::new(),
+            agents: vec![],
+            panes: vec![],
+            session_lost: false,
+        };
+        let mut memory = Memory::new(&ctx);
+        let mut steps = Vec::new();
+        let (errors, completed) =
+            tick_slow_with_steps(&ctx, &fixture.project, &seen, &mut memory, &mut |name| {
+                steps.push(name.to_string());
+                if name == "escalation" {
+                    std::fs::write(stop_path(&fixture.root), b"").unwrap();
+                }
+                !stop_path(&fixture.root).exists() || name == "escalation"
+            });
+        assert!(!completed);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(steps, ["escalation", "coordinator launch"]);
+        assert_eq!(runner.count("agent start"), 0);
     }
 
     #[test]
