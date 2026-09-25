@@ -1819,7 +1819,7 @@ mod tests {
                 record.id = id.clone();
                 record.status = thread::Status::Open;
                 record.prompt_pending = true;
-                record.machine = "oci".into();
+                record.machine = "buildbox".into();
                 record.machine_id = "machine-1".into();
                 record.workspace_id = "w2".into();
                 record.tab_id = tab_id.clone();
@@ -2181,7 +2181,7 @@ mod tests {
         let fixture = fixture(false);
         thread::allocate(&fixture.project, |record| {
             record.status = thread::Status::Resolved;
-            record.machine = "oci".into();
+            record.machine = "buildbox".into();
             record.machine_id = "machine-1".into();
             record.workspace_id = "w2".into();
             record.tab_id = "w2:t1".into();

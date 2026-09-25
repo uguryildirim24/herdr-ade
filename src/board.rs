@@ -500,7 +500,7 @@ mod tests {
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         crate::thread::allocate(&project, |t| {
             t.status = crate::thread::Status::Open;
-            t.machine = "oci".into();
+            t.machine = "buildbox".into();
             t.machine_id = "1".into();
             t.last_group = "working".into();
         })
@@ -546,7 +546,7 @@ mod tests {
             values["ade_lanes"]
         );
         assert!(
-            values["ade_last"].contains("on machine `oci`"),
+            values["ade_last"].contains("on machine `buildbox`"),
             "{}",
             values["ade_last"]
         );

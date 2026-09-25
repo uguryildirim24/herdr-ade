@@ -1486,7 +1486,7 @@ mod tests {
                 role: "lane".into(),
                 kind: "pi".into(),
                 pane_id: "w2:p1".into(),
-                machine_label: "oci".into(),
+                machine_label: "buildbox".into(),
                 machine_id: "1".into(),
                 box_repo: "/box/repo".into(),
                 box_worktree: "/box/wt".into(),

@@ -1241,19 +1241,19 @@ mod tests {
     fn box_stale_ticker_is_an_install_failure_not_a_warning() {
         let error = require_running_tickers(
             &[ProcessProof {
-                machine: "oci".into(),
+                machine: "buildbox".into(),
                 process: "ticker".into(),
                 pid: Some(42928),
                 build: Some("0.1.0+4083d1b.1".into()),
                 state: "stale".into(),
                 reason: Some("old ticker did not release the lock".into()),
             }],
-            &["oci"],
+            &["buildbox"],
         )
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("oci") && error.contains("42928") && error.contains("4083d1b"),
+            error.contains("buildbox") && error.contains("42928") && error.contains("4083d1b"),
             "{error}"
         );
     }
@@ -1262,14 +1262,14 @@ mod tests {
     fn box_connection_failure_cannot_pass_without_a_ticker_proof() {
         let error = require_running_tickers(
             &[ProcessProof {
-                machine: "oci".into(),
+                machine: "buildbox".into(),
                 process: "box binary and ticker".into(),
                 pid: None,
                 build: None,
                 state: "unknown".into(),
                 reason: Some("connection refused".into()),
             }],
-            &["oci"],
+            &["buildbox"],
         )
         .unwrap_err()
         .to_string();
@@ -1319,11 +1319,17 @@ mod tests {
     #[test]
     fn install_resolves_a_saved_machine_declaration_and_its_kinds_by_label() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/config.toml"),
+            crate::remote::TEST_MACHINE,
+        )
+        .unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = FakeRunner::new();
         runner.on(
             "machine list --json",
-            ok(r#"[{"id":"example-machine","label":"oci","target":"saved-box","session":"default","enabled":true}]"#),
+            ok(r#"[{"id":"example-machine","label":"buildbox","target":"saved-box","session":"default","enabled":true}]"#),
         );
         let ctx = Ctx {
             env: &env,
@@ -1333,14 +1339,14 @@ mod tests {
             detached_ticker: false,
         };
 
-        let (profile, declaration) = install_box(&ctx, "oci").unwrap().unwrap();
+        let (profile, declaration) = install_box(&ctx, "buildbox").unwrap().unwrap();
 
         assert_eq!(profile.id, "example-machine");
-        assert_eq!(profile.label, "oci");
+        assert_eq!(profile.label, "buildbox");
         assert_eq!(profile.target, "saved-box");
-        assert_eq!(declaration.id, "oci");
-        assert_eq!(declaration.label, "oci");
-        assert_eq!(declaration.build, "/home/ubuntu/build/lanes");
+        assert_eq!(declaration.id, "buildbox");
+        assert_eq!(declaration.label, "buildbox");
+        assert_eq!(declaration.build, "/home/agent/build/lanes");
         assert!(declaration.runs_kind("pi"));
         assert!(!declaration.runs_kind("claude"));
         assert!(!declaration.runs_kind("agy"));
@@ -1441,7 +1447,7 @@ mod tests {
             &ctx,
             "box",
             &machine,
-            "/home/ubuntu/projects/herdr",
+            "/home/agent/projects/herdr",
             Kind::Fork,
         )
         .unwrap();
@@ -1453,7 +1459,7 @@ mod tests {
         assert!(script.contains("harness_box_zig_version"), "{script}");
         assert!(script.contains("export ZIG"), "{script}");
         assert!(
-            !script.contains("ZIG=/home/ubuntu/projects/herdr/.target"),
+            !script.contains("ZIG=/home/agent/projects/herdr/.target"),
             "{script}"
         );
     }
@@ -1554,7 +1560,7 @@ mod tests {
             detached_ticker: false,
         };
         let machine = crate::remote::MachineDeclaration {
-            id: "oci".into(),
+            id: "buildbox".into(),
             target: "box".into(),
             root: box_root.to_string_lossy().into_owned(),
             path: "/usr/bin:/bin".into(),
@@ -1599,13 +1605,13 @@ mod tests {
             detached_ticker: false,
         };
         let machine = crate::remote::MachineDeclaration {
-            id: "oci".into(),
+            id: "buildbox".into(),
             target: "box".into(),
             ..Default::default()
         };
         let proofs = box_process_proofs(&ctx, &machine);
         assert_eq!(proofs[1].state, "unknown");
-        assert!(require_running_tickers(&proofs, &["oci"]).is_err());
+        assert!(require_running_tickers(&proofs, &["buildbox"]).is_err());
     }
 
     #[test]
@@ -1862,7 +1868,7 @@ mod tests {
                         },
                         InstalledBuild {
                             repo: "/unrelated/repository".into(),
-                            machine: "oci".into(),
+                            machine: "buildbox".into(),
                             head: "other-head".into(),
                         },
                     ],
@@ -1903,7 +1909,7 @@ mod tests {
                 &world.ctx(),
                 &[InstalledBuild {
                     repo: repo.to_string_lossy().into_owned(),
-                    machine: "oci".into(),
+                    machine: "buildbox".into(),
                     head: "broken-head".into(),
                 }],
                 &[],

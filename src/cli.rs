@@ -164,7 +164,7 @@ enum Command {
         #[command(subcommand)]
         command: ThreadCommand,
     },
-    /// Hold or release new box-lane starts on a saved machine (SPEC-remote §2.4)
+    /// Hold or release new box-lane starts on a saved machine
     Machine {
         #[command(subcommand)]
         command: MachineCommand,
@@ -212,7 +212,7 @@ enum Command {
         name: String,
         #[arg(long, default_value = "")]
         goal: String,
-        /// The adopted thread's birth sentence (SPEC-ADE D17 item 6)
+        /// The adopted thread's birth sentence
         #[arg(long)]
         plain: Option<String>,
         /// The agent pane to adopt
@@ -298,7 +298,7 @@ enum Command {
         #[command(subcommand)]
         command: HarnessCommand,
     },
-    /// The spec dialogue between a drafter and a critic (SPEC-ADE D7)
+    /// The spec dialogue between a drafter and a critic
     Dialogue {
         #[command(subcommand)]
         command: DialogueCommand,
@@ -367,12 +367,12 @@ enum Command {
         #[arg(long, value_name = "ASK_ID")]
         reask: Option<String>,
     },
-    /// The plan card: goal, end result and steps (SPEC-talk §6.5)
+    /// The plan card: goal, end result and steps
     Plan {
         #[command(subcommand)]
         command: PlanCommand,
     },
-    /// The choices the coordinator made for Rolf (SPEC-talk §6.6)
+    /// The choices the coordinator made for Rolf
     #[command(
         args_conflicts_with_subcommands = true,
         allow_missing_positional = true
@@ -430,7 +430,7 @@ enum Command {
     Board {
         #[arg(value_name = "PROJECT")]
         slug: String,
-        /// Print one lane's board line (names its machine, SPEC-remote §5)
+        /// Print one lane's board line (names its machine)
         #[arg(long, value_name = "THREAD")]
         thread: Option<String>,
         #[arg(long)]
@@ -1860,12 +1860,12 @@ enum ThreadCommand {
         /// Optional task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: Option<String>,
-        /// Birth sentence (SPEC-ADE D17 item 6)
+        /// Birth sentence
         #[arg(long)]
         plain: Option<String>,
         #[arg(long, value_name = "ROLE")]
         role: Option<String>,
-        /// Do not send a primer (SPEC-ADE D7)
+        /// Do not send a primer
         #[arg(long)]
         passive: bool,
     },
@@ -3194,7 +3194,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "ha",
             "--root",
-            "/home/agent/.herdr-ade",
+            "/Users/agent/.herdr-ade",
             "plain",
             "hook",
             "--kind",

@@ -1926,6 +1926,13 @@ recipe = "claude_fable_xhigh"
         std::fs::write(config.join("config.toml"), ROUTING_CONFIG).unwrap();
     }
 
+    fn write_machine_config(config: &Path) {
+        std::fs::create_dir_all(config).unwrap();
+        let path = config.join("config.toml");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        std::fs::write(path, format!("{existing}{}", crate::remote::TEST_MACHINE)).unwrap();
+    }
+
     fn machine_config(kinds: &[&str]) -> tempfile::TempDir {
         let config = tempfile::tempdir().unwrap();
         let kinds = kinds
@@ -1936,7 +1943,7 @@ recipe = "claude_fable_xhigh"
         std::fs::write(
             config.path().join("config.toml"),
             format!(
-                "[machines.oci]\nlabel = \"oci\"\ntarget = \"remote-host\"\nsession = \"default\"\nhome = \"/home/ubuntu\"\nroot = \"/home/ubuntu/.herdr-ade\"\nworktrees = \"/home/ubuntu/projects\"\nbuild = \"/home/ubuntu/build/lanes\"\npath = \"/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/ubuntu/.local/bin/herdr-ade\"\npi_bin = \"/home/ubuntu/.local/bin/herdr-pi\"\nkinds = [{kinds}]\n"
+                "[machines.buildbox]\nlabel = \"buildbox\"\ntarget = \"buildbox-pi\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [{kinds}]\n[[machines.buildbox.repos]]\npath = \"/local/herdr\"\nbox_path = \"/home/agent/projects/herdr\"\npublish_url = \"https://example.test/herdr.git\"\n[[machines.buildbox.repos]]\npath = \"/local/herdr-ade\"\nbox_path = \"/home/agent/projects/herdr-ade\"\npublish_url = \"https://example.test/herdr-ade.git\"\n"
             ),
         )
         .unwrap();
@@ -2143,7 +2150,7 @@ recipe = "claude_fable_xhigh"
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         crate::thread::allocate(&project, |thread| {
             thread.status = crate::thread::Status::Open;
-            thread.machine = "oci".into();
+            thread.machine = "buildbox".into();
             thread.machine_id = "abc".into();
             thread.workspace_id = "w3".into();
         })
@@ -2166,7 +2173,14 @@ recipe = "claude_fable_xhigh"
             let _ = writeln!(out, "{label}: {detail}");
         };
 
-        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+        check_workspace_leaks(
+            &mut text,
+            &mut check,
+            &root,
+            "abc",
+            "machine buildbox",
+            &herdr,
+        );
 
         assert!(!healthy);
         assert!(
@@ -2195,7 +2209,14 @@ recipe = "claude_fable_xhigh"
             let _ = writeln!(out, "{label}: {detail}");
         };
 
-        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+        check_workspace_leaks(
+            &mut text,
+            &mut check,
+            &root,
+            "abc",
+            "machine buildbox",
+            &herdr,
+        );
 
         assert!(!healthy);
         assert!(
@@ -2227,7 +2248,14 @@ recipe = "claude_fable_xhigh"
             let _ = writeln!(out, "{label}: {detail}");
         };
 
-        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+        check_workspace_leaks(
+            &mut text,
+            &mut check,
+            &root,
+            "abc",
+            "machine buildbox",
+            &herdr,
+        );
 
         assert!(!healthy);
         assert!(text.contains("duplicate labels: Demo (2)"), "{text}");
@@ -2261,7 +2289,14 @@ recipe = "claude_fable_xhigh"
             let _ = writeln!(out, "{label}: {detail}");
         };
 
-        check_workspace_leaks(&mut text, &mut check, &root, "abc", "machine oci", &herdr);
+        check_workspace_leaks(
+            &mut text,
+            &mut check,
+            &root,
+            "abc",
+            "machine buildbox",
+            &herdr,
+        );
 
         assert!(healthy, "{text}");
         assert!(
@@ -2494,7 +2529,7 @@ recipe = "claude_fable_xhigh"
             crate::thread::allocate(&project, |thread| {
                 thread.kind = crate::thread::Kind::Worktree;
                 thread.status = crate::thread::Status::Resolved;
-                thread.machine = "oci".into();
+                thread.machine = "buildbox".into();
                 thread.machine_id = "box-1".into();
                 thread.worktree_path = format!("/box/worktree-{number}");
                 thread.repo = "/repo".into();
@@ -2518,7 +2553,7 @@ recipe = "claude_fable_xhigh"
 
         let profile = crate::contracts::MachineProfile {
             id: "box-1".into(),
-            label: "oci".into(),
+            label: "buildbox".into(),
             target: "me@box".into(),
             session: "default".into(),
         };
@@ -2881,7 +2916,8 @@ recipe = "claude_fable_xhigh"
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         write_routing_config(&home.path().join("cfg"));
-        let machines = r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#;
+        write_machine_config(&home.path().join("cfg"));
+        let machines = r#"[{"id":"buildbox-id","label":"buildbox","target":"me@box","session":"default","enabled":true}]"#;
         let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
         runner.on(
             "agent start --help",
@@ -2898,10 +2934,10 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(
-            text.contains("[ok  ] machine oci: ssh target me@box"),
+            text.contains("[ok  ] machine buildbox: ssh target me@box"),
             "{text}"
         );
-        assert!(text.contains("[ok  ] box oci capacity"), "{text}");
+        assert!(text.contains("[ok  ] box buildbox capacity"), "{text}");
     }
 
     #[test]
@@ -2909,9 +2945,10 @@ recipe = "claude_fable_xhigh"
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         write_routing_config(&home.path().join("cfg"));
+        write_machine_config(&home.path().join("cfg"));
         let runner = runner_with_machine_list(
             "herdr 0.9.1\n",
-            r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#,
+            r#"[{"id":"buildbox-id","label":"buildbox","target":"me@box","session":"default","enabled":true}]"#,
         );
         runner.on(
             "agent start --help",
@@ -2919,7 +2956,7 @@ recipe = "claude_fable_xhigh"
         );
         let facts = box_facts().replace(
             "__HERDR_BUILDS_DONE__",
-            "2662400\t/home/ubuntu/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__",
+            "2662400\t/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__",
         );
         runner.on("ssh", ok(&facts));
         probe_fakes(&runner);
@@ -2933,11 +2970,14 @@ recipe = "claude_fable_xhigh"
         );
 
         assert!(!healthy, "{text}");
-        assert!(text.contains("[FAIL] finished worktrees oci"), "{text}");
+        assert!(
+            text.contains("[FAIL] finished worktrees buildbox"),
+            "{text}"
+        );
         assert!(text.contains("demo-t-0099 (2.5 GiB)"), "{text}");
         assert!(checks.iter().any(|check| {
             check.status == "failed"
-                && check.label == "finished worktrees oci"
+                && check.label == "finished worktrees buildbox"
                 && check.detail.contains("demo-t-0099 (2.5 GiB)")
         }));
     }
@@ -2945,13 +2985,14 @@ recipe = "claude_fable_xhigh"
     #[test]
     fn open_box_threads_keep_their_build_folders_out_of_orphan_results() {
         let home = tempfile::tempdir().unwrap();
+        write_machine_config(&home.path().join("cfg"));
         let env = Env::for_test(home.path(), &[]);
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         let thread = crate::thread::allocate(&project, |thread| {
             thread.status = crate::thread::Status::Open;
-            thread.machine = "oci".into();
-            thread.machine_id = "oci-id".into();
+            thread.machine = "buildbox".into();
+            thread.machine_id = "buildbox-id".into();
             thread.title = "Review r1".into();
         })
         .unwrap();
@@ -2959,7 +3000,7 @@ recipe = "claude_fable_xhigh"
         runner.on(
             "ssh",
             ok(&format!(
-                "__HERDR_BUILDS__\n1\t/home/ubuntu/build/lanes/demo-{}\n__HERDR_BUILDS_DONE__\n",
+                "__HERDR_BUILDS__\n1\t/home/agent/build/lanes/demo-{}\n__HERDR_BUILDS_DONE__\n",
                 thread.id
             )),
         );
@@ -2972,8 +3013,8 @@ recipe = "claude_fable_xhigh"
         };
 
         let profile = crate::contracts::MachineProfile {
-            id: "oci-id".into(),
-            label: "oci".into(),
+            id: "buildbox-id".into(),
+            label: "buildbox".into(),
             target: "me@box".into(),
             session: "default".into(),
         };
@@ -2986,6 +3027,7 @@ recipe = "claude_fable_xhigh"
     #[test]
     fn unreadable_thread_ownership_does_not_turn_a_build_folder_into_an_orphan() {
         let home = tempfile::tempdir().unwrap();
+        write_machine_config(&home.path().join("cfg"));
         let env = Env::for_test(home.path(), &[]);
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
@@ -2998,7 +3040,7 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
-            ok("__HERDR_BUILDS__\n1\t/home/ubuntu/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__\n"),
+            ok("__HERDR_BUILDS__\n1\t/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__\n"),
         );
         let ctx = Ctx {
             env: &env,
@@ -3009,8 +3051,8 @@ recipe = "claude_fable_xhigh"
         };
 
         let profile = crate::contracts::MachineProfile {
-            id: "oci-id".into(),
-            label: "oci".into(),
+            id: "buildbox-id".into(),
+            label: "buildbox".into(),
             target: "me@box".into(),
             session: "default".into(),
         };
@@ -3112,15 +3154,16 @@ recipe = "claude_fable_xhigh"
         std::fs::write(
             config.join("config.toml"),
             format!(
-                "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\nfallback = []\n\n{}",
-                toml::to_string(&BTreeMap::from([("recipes", recipes)])).unwrap()
+                "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\nfallback = []\n\n{}{}",
+                toml::to_string(&BTreeMap::from([("recipes", recipes)])).unwrap(),
+                crate::remote::TEST_MACHINE
             ),
         )
         .unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = runner_with_machine_list(
             "herdr 0.9.1\n",
-            r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#,
+            r#"[{"id":"buildbox-id","label":"buildbox","target":"me@box","session":"default","enabled":true}]"#,
         );
         runner.on(
             "agent start --help",
@@ -3135,8 +3178,11 @@ recipe = "claude_fable_xhigh"
             &SessionFlags::default(),
             &runner,
         );
-        assert!(text.contains("[ok  ] box oci pi openai-codex"), "{text}");
-        assert!(!text.contains("box oci login"), "{text}");
+        assert!(
+            text.contains("[ok  ] box buildbox pi openai-codex"),
+            "{text}"
+        );
+        assert!(!text.contains("box buildbox login"), "{text}");
     }
 
     #[test]
@@ -3208,7 +3254,8 @@ recipe = "claude_fable_xhigh"
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         write_routing_config(&home.path().join("cfg"));
-        let machines = r#"[{"id":"oci-id","label":"oci","target":"me@box","session":"default","enabled":true}]"#;
+        write_machine_config(&home.path().join("cfg"));
+        let machines = r#"[{"id":"buildbox-id","label":"buildbox","target":"me@box","session":"default","enabled":true}]"#;
         let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
         runner.on(
             "agent start --help",
@@ -3225,7 +3272,7 @@ recipe = "claude_fable_xhigh"
         );
         assert!(!healthy, "{text}");
         assert!(
-            text.contains("[FAIL] box oci: unreachable: ssh: connect timed out"),
+            text.contains("[FAIL] box buildbox: unreachable: ssh: connect timed out"),
             "{text}"
         );
     }
@@ -3240,13 +3287,17 @@ recipe = "claude_fable_xhigh"
 
     #[test]
     fn pi_only_codex_access_is_ready_without_a_codex_binary_or_login() {
+        let config = machine_config(&["pi"]);
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
             ok(&(box_facts() + "pi_openai-codex/gpt-6-astra\tok\n")
                 .replace("login_codex\tok", "login_codex\tmissing")),
         );
-        runner.on("pane read", ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
+        runner.on(
+            "pane read",
+            ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"),
+        );
         probe_fakes(&runner);
         let mut recipes = default_recipes();
         recipes.retain(|_, recipe| recipe.kind == "pi" && recipe.provider == "openai-codex");
@@ -3257,7 +3308,7 @@ recipe = "claude_fable_xhigh"
         let rows = box_rows(
             &runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &recipes,
             12.0,
@@ -3265,7 +3316,7 @@ recipe = "claude_fable_xhigh"
         assert!(rows.iter().all(|row| row.0 == Some(true)), "{rows:?}");
         assert_eq!(
             rows.iter()
-                .filter(|row| row.1.starts_with("box oci pi openai-codex/"))
+                .filter(|row| row.1.starts_with("box buildbox pi openai-codex/"))
                 .count(),
             2
         );
@@ -3293,7 +3344,7 @@ recipe = "claude_fable_xhigh"
                     &format!("login_{kind}\tmissing"),
                 )),
             );
-            runner.on("pane read", ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
+            runner.on("pane read", ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
             probe_fakes(&runner);
             let recipes = BTreeMap::from([(
                 "not_a_runtime_name".into(),
@@ -3312,10 +3363,13 @@ recipe = "claude_fable_xhigh"
             );
             let login = rows
                 .iter()
-                .find(|row| row.1 == format!("box oci login {kind}"))
+                .find(|row| row.1 == format!("box buildbox login {kind}"))
                 .unwrap();
             assert_eq!(login.0, Some(false), "{rows:?}");
-            let tools = rows.iter().find(|row| row.1 == "box oci tools").unwrap();
+            let tools = rows
+                .iter()
+                .find(|row| row.1 == "box buildbox tools")
+                .unwrap();
             assert_eq!(tools.0, Some(false));
             assert!(tools.2.contains(kind));
             let calls = runner.calls.borrow();
@@ -3331,6 +3385,7 @@ recipe = "claude_fable_xhigh"
 
     #[test]
     fn no_login_row_outlives_its_enabled_recipe() {
+        let config = machine_config(&["pi"]);
         let mut recipes = default_recipes();
         for recipe in recipes.values_mut() {
             recipe.enabled = false;
@@ -3342,7 +3397,7 @@ recipe = "claude_fable_xhigh"
             let rows = box_rows(
                 &runner,
                 "herdr",
-                Path::new(""),
+                config.path(),
                 &box_profile(),
                 &recipes,
                 12.0,
@@ -3399,7 +3454,7 @@ recipe = "claude_fable_xhigh"
         for id in ["unknown", "mismatch"] {
             assert_eq!(
                 rows.iter()
-                    .find(|row| row.1 == format!("box oci recipe {id}"))
+                    .find(|row| row.1 == format!("box buildbox recipe {id}"))
                     .unwrap()
                     .0,
                 Some(false)
@@ -3429,8 +3484,8 @@ recipe = "claude_fable_xhigh"
             "login_claude\tok",
             "login_codex\tok",
             "login_agy\tok",
-            "repo /home/ubuntu/projects/herdr\tok",
-            "repo /home/ubuntu/projects/herdr-ade\tok",
+            "repo /home/agent/projects/herdr\tok",
+            "repo /home/agent/projects/herdr-ade\tok",
         ]
         .into_iter()
         .map(String::from)
@@ -3449,12 +3504,12 @@ recipe = "claude_fable_xhigh"
     fn probe_fakes(runner: &FakeRunner) {
         runner.on(
             "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/agent"}}}"#),
         );
         runner.on("pane run", ok(r#"{"result":{}}"#));
         runner.on(
             "pane read",
-            ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/home/ubuntu/.local/bin/claude\n/home/ubuntu/.local/bin/codex\n/home/ubuntu/.local/bin/agy\n/usr/local/bin/node\n@@done\n"),
+            ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/home/agent/.cargo/bin/cargo\n/home/agent/.cargo/bin/just\n/home/agent/.local/bin/claude\n/home/agent/.local/bin/codex\n/home/agent/.local/bin/agy\n/usr/local/bin/node\n@@done\n"),
         );
         runner.on("workspace close", ok(r#"{"result":{}}"#));
     }
@@ -3462,7 +3517,7 @@ recipe = "claude_fable_xhigh"
     fn box_profile() -> crate::contracts::MachineProfile {
         crate::contracts::MachineProfile {
             id: "abc".into(),
-            label: "oci".into(),
+            label: "buildbox".into(),
             target: "me@box".into(),
             session: "default".into(),
         }
@@ -3470,13 +3525,14 @@ recipe = "claude_fable_xhigh"
 
     #[test]
     fn box_rows_obey_machine_kinds_and_gate_on_free_disk() {
+        let config = machine_config(&["pi"]);
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
         probe_fakes(&runner);
         let rows = box_rows(
             &runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,
@@ -3487,24 +3543,28 @@ recipe = "claude_fable_xhigh"
                 .map(|(ok, _, detail)| (*ok, detail.clone()))
                 .unwrap_or_else(|| panic!("no row {label}"))
         };
-        assert_eq!(find("box oci boot").0, Some(true));
-        assert_eq!(find("box oci wrapper").0, Some(true));
+        assert_eq!(find("box buildbox boot").0, Some(true));
+        assert_eq!(find("box buildbox wrapper").0, Some(true));
         assert!(
-            find("box oci wrapper")
+            find("box buildbox wrapper")
                 .1
-                .contains("/home/ubuntu/.local/bin/pi")
+                .contains("/home/agent/.local/bin/pi")
         );
-        assert_eq!(find("box oci tools").0, Some(true));
+        assert_eq!(find("box buildbox tools").0, Some(true));
         assert_eq!(
-            find("box oci repo /home/ubuntu/projects/herdr").0,
+            find("box buildbox repo /home/agent/projects/herdr").0,
             Some(true)
         );
-        assert_eq!(find("box oci capacity").0, Some(true));
-        assert!(find("box oci capacity").1.contains("refuses below 12 GB"));
+        assert_eq!(find("box buildbox capacity").0, Some(true));
+        assert!(
+            find("box buildbox capacity")
+                .1
+                .contains("refuses below 12 GB")
+        );
         let configured = box_rows(
             &runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &default_recipes(),
             120.0,
@@ -3512,7 +3572,7 @@ recipe = "claude_fable_xhigh"
         assert_eq!(
             configured
                 .iter()
-                .find(|row| row.1 == "box oci capacity")
+                .find(|row| row.1 == "box buildbox capacity")
                 .unwrap()
                 .0,
             Some(false)
@@ -3548,7 +3608,7 @@ recipe = "claude_fable_xhigh"
             ok(&box_facts().replace("df_free\t100000000000", "df_free\t5000000000")),
         );
         probe_fakes(&runner);
-        assert_eq!(find_row(&runner, "box oci capacity").0, Some(false));
+        assert_eq!(find_row(&runner, "box buildbox capacity").0, Some(false));
 
         let runner = FakeRunner::new();
         runner.on(
@@ -3556,7 +3616,7 @@ recipe = "claude_fable_xhigh"
             ok(&box_facts().replace("df_free\t100000000000", "df_free\tunknown")),
         );
         probe_fakes(&runner);
-        let capacity = find_row(&runner, "box oci capacity");
+        let capacity = find_row(&runner, "box buildbox capacity");
         assert_eq!(capacity.0, None);
         assert!(capacity.2.contains("unknown GB disk free"), "{capacity:?}");
 
@@ -3565,7 +3625,7 @@ recipe = "claude_fable_xhigh"
         let rows = box_rows(
             &runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,
@@ -3585,12 +3645,12 @@ recipe = "claude_fable_xhigh"
         runner.on("ssh", ok(&facts));
         runner.on(
             "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/agent"}}}"#),
         );
         runner.on("pane run", ok(r#"{"result":{}}"#));
         runner.on(
             "pane read",
-            ok("@@pi /home/ubuntu/.local/bin/pi\n@@cmd\n/home/ubuntu/.cargo/bin/cargo\n/home/ubuntu/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
+            ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/home/agent/.cargo/bin/cargo\n/home/agent/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
         );
         runner.on("workspace close", ok(r#"{"result":{}}"#));
         let rows = box_rows(
@@ -3606,11 +3666,11 @@ recipe = "claude_fable_xhigh"
                 .find(|(_, name, _)| name == label)
                 .unwrap_or_else(|| panic!("no row {label}"))
         };
-        assert_eq!(find("box oci login agy").0, Some(false));
-        assert_eq!(find("box oci tools").0, Some(false));
-        assert!(find("box oci tools").2.contains("agy claude"));
-        assert!(!find("box oci tools").2.contains("codex"));
-        assert_eq!(find("box oci pi pro/pro").0, Some(false));
+        assert_eq!(find("box buildbox login agy").0, Some(false));
+        assert_eq!(find("box buildbox tools").0, Some(false));
+        assert!(find("box buildbox tools").2.contains("agy claude"));
+        assert!(!find("box buildbox tools").2.contains("codex"));
+        assert_eq!(find("box buildbox pi pro/pro").0, Some(false));
     }
 
     #[test]
@@ -3619,21 +3679,22 @@ recipe = "claude_fable_xhigh"
         runner.on("ssh", ok(&box_facts()));
         runner.on(
             "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/ubuntu"}}}"#),
+            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/agent"}}}"#),
         );
         runner.on("pane run", ok(r#"{"result":{}}"#));
         runner.on("pane read", ok("@@pi /usr/local/bin/pi\n@@cmd\n@@done\n"));
         runner.on("workspace close", ok(r#"{"result":{}}"#));
-        let row = find_row(&runner, "box oci wrapper");
+        let row = find_row(&runner, "box buildbox wrapper");
         assert_eq!(row.0, Some(false));
         assert!(row.2.contains("/usr/local/bin/pi"), "{}", row.2);
     }
 
     fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
+        let config = machine_config(&["pi"]);
         box_rows(
             runner,
             "herdr",
-            Path::new(""),
+            config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,

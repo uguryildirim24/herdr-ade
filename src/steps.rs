@@ -1663,7 +1663,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let lane = thread::allocate(&project, |t| {
-            t.machine = "oci".into();
+            t.machine = "buildbox".into();
             t.machine_id = "abc".into();
             t.pane_id = "w9:p9".into();
             t.workspace_id = "w9".into();
@@ -1814,13 +1814,13 @@ mod tests {
             r#"[machines.box]
 target = "me@box"
 session = "default"
-home = "/home/ubuntu"
-root = "/home/ubuntu/.herdr-ade"
-worktrees = "/home/ubuntu/projects"
-build = "/home/ubuntu/build/lanes"
-path = "/home/ubuntu/.local/bin:/usr/bin:/bin"
-ade_bin = "/home/ubuntu/.local/bin/herdr-ade"
-pi_bin = "/home/ubuntu/.local/bin/herdr-pi"
+home = "/home/agent"
+root = "/home/agent/.herdr-ade"
+worktrees = "/home/agent/projects"
+build = "/home/agent/build/lanes"
+path = "/home/agent/.local/bin:/usr/bin:/bin"
+ade_bin = "/home/agent/.local/bin/herdr-ade"
+pi_bin = "/home/agent/.local/bin/herdr-pi"
 "#,
         )
         .unwrap();
