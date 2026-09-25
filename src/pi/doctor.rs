@@ -790,20 +790,28 @@ pub(crate) fn doctor_rows_with_models(
         return rows;
     }
     for (provider_id, model) in models {
-        if *provider_id == "pro" && !provider::has_provider(&layout.models(), "pro") {
-            rows.push(Row::ok("provider pro", "not on this machine (no relay)"));
-            continue;
-        }
-        let label = format!("provider {provider_id}/{model}");
-        match auth_check_model(runner, layout, provider_id, Some(model)) {
-            Ok(()) => rows.push(Row::ok(label, "login ready")),
-            Err(error) if error.evidence == FailureEvidence::Provider => {
-                rows.push(Row::provider_fail(format!("{label} login"), error.detail));
-            }
-            Err(error) => rows.push(Row::fail(format!("{label} readiness"), error.detail)),
-        }
+        rows.push(provider_row(runner, layout, provider_id, model));
     }
     rows
+}
+
+pub(crate) fn provider_row(
+    runner: &dyn sh::Runner,
+    layout: &Layout,
+    provider_id: &str,
+    model: &str,
+) -> Row {
+    if provider_id == "pro" && !provider::has_provider(&layout.models(), "pro") {
+        return Row::ok("provider pro", "not on this machine (no relay)");
+    }
+    let label = format!("provider {provider_id}/{model}");
+    match auth_check_model(runner, layout, provider_id, Some(model)) {
+        Ok(()) => Row::ok(label, "login ready"),
+        Err(error) if error.evidence == FailureEvidence::Provider => {
+            Row::provider_fail(format!("{label} login"), error.detail)
+        }
+        Err(error) => Row::fail(format!("{label} readiness"), error.detail),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
