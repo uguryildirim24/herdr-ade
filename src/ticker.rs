@@ -2000,10 +2000,12 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     let missing_panes = pass.missing_panes + coordinator_missing;
 
     if coordinator_recorded == 1 && project.status() == project::Status::Active {
+        // Other projects may already have opened panes on the new server.
+        // Only the bound pane must be absent for this to be a lost binding.
         let restarted = record.server_socket_inode != 0
             && inode != 0
             && record.server_socket_inode != inode
-            && panes.is_empty();
+            && !pane_alive;
         if !pane_alive && agent.is_none() && !record.reopen_requested && !restarted {
             if record.closed_by_rolf_at.is_empty() {
                 project.update_coordinator(|c| {
@@ -4715,6 +4717,43 @@ mod tests {
         assert_eq!(
             f.project.coordinator().unwrap().launch.recipe_id,
             "recorded-recipe"
+        );
+    }
+
+    #[test]
+    fn restarted_server_with_other_projects_panes_recovers_coordinator() {
+        let f = fixture(false);
+        let socket = f.project.coordinator().unwrap().socket;
+        let replacement = f._home.path().join("new.sock");
+        std::fs::write(&replacement, b"").unwrap();
+        std::fs::rename(replacement, socket).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on(
+            "pane list",
+            ok(r#"{"result":{"panes":[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/other"}]}}"#),
+        );
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let _ = tick_project(&ctx, &f.project);
+        assert!(
+            f.project
+                .coordinator()
+                .unwrap()
+                .closed_by_rolf_at
+                .is_empty()
+        );
+        // The fixture has no coordinator recipe, so open can fail after the
+        // retry is recorded; it must not be mistaken for a manual closure.
+        assert!(
+            !steps::load_state(&f.project)
+                .coordinator_relaunch_last
+                .is_empty()
         );
     }
 
