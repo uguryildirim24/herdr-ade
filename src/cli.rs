@@ -292,6 +292,9 @@ enum Command {
         /// Remove only the exact leftover refs printed by the last doctor run
         #[arg(long)]
         prune_branches: Option<String>,
+        /// Show wall time per check and duration of outside commands
+        #[arg(long)]
+        timings: bool,
     },
     /// Rounds: open, review and merge related lanes
     #[command(
@@ -3058,12 +3061,13 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
         Command::Doctor {
             session,
             prune_branches,
+            timings,
         } => {
             if let Some(plan) = prune_branches {
                 println!("{}", crate::branches::doctor(&ctx, Some(&plan))?);
                 return Ok(());
             }
-            let result = doctor::run(&ctx, &session.into())?;
+            let result = doctor::run_timed(&ctx, &session.into(), timings)?;
             crate::output::success(
                 Some(if result.healthy {
                     "healthy"
@@ -3502,6 +3506,7 @@ mod tests {
             Command::Doctor {
                 session: SessionArgs::default(),
                 prune_branches: None,
+                timings: false,
             },
         );
         let error = result.as_ref().unwrap_err();
