@@ -1753,7 +1753,12 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         // The round may already be held when a superseded reviewer reaches
         // here. Keep cleanup retryable instead of failing its worker's prompt.
         let cleanup = (|| -> Result<()> {
-            if worktree == "removed" {
+            // The worktree path is cleared before branch retirement. If that
+            // retirement failed, the retry has no path left but still owes the
+            // owned-ref deletion.
+            if worktree == "removed"
+                || (record.kind == Kind::Worktree && record.worktree_path.is_empty())
+            {
                 crate::branches::resolved_thread(ctx, &project, &record)?;
             }
             remove_finished_build_folder(ctx, &project, &record)?;

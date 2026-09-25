@@ -8065,6 +8065,7 @@ mod tests {
             retired.cleanup_pending,
             "failed cleanup must remain retryable"
         );
+        assert!(retired.worktree_path.is_empty());
         assert!(git(&fx.repo, &["branch", "--list", "hp/unrelated"]).contains("hp/unrelated"));
         crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
         assert!(
@@ -8072,11 +8073,21 @@ mod tests {
                 .unwrap()
                 .cleanup_pending
         );
-        assert!(fx.world.runner.calls.borrow().iter().any(|call| {
-            call.program == "ssh"
-                && call.display().contains("/box/repo")
-                && call.display().contains("git branch -D")
-        }));
+        assert_eq!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| {
+                    call.program == "ssh"
+                        && call.display().contains("/box/repo")
+                        && call.display().contains("git branch -D")
+                })
+                .count(),
+            2,
+            "branch retirement must actually run again before clearing cleanup_pending"
+        );
         // A retry after the round was already held queues another message
         // without incrementing its revision or reviving the old verdict.
         crate::threads::prompt(&ctx, "demo", &lane, "One more correction.").unwrap();
