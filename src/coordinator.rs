@@ -429,6 +429,15 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// leaves `prime_pending` set so the ticker delivers it. One delivery path.
 fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &str) -> Result<()> {
     let sent = agent.ready() && {
+        let _writer = crate::talk::writer_lock(project)?;
+        if !crate::talk::coordinator_prompt_clear(project, herdr, &agent.pane_id)? {
+            return project
+                .update_coordinator(|c| {
+                    c.prime_pending = true;
+                    c.prime_sent = false;
+                })
+                .map(|_| ());
+        }
         crate::talk::mark_automated_prompt(project, &agent.pane_id, prompt)?;
         match herdr.agent_prompt(&agent.pane_id, prompt) {
             Ok(()) => true,
@@ -1036,6 +1045,9 @@ fn digest_snapshot(
 
     if project.finished() {
         out.push_str("\nProject finished. Idle nudges are off until Rolf writes again.\n");
+    }
+    if crate::talk::long_input_hold(project) {
+        out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending; finish or clear the draft when ready.\n");
     }
 
     if let Ok((settings, _)) = project.read_project_md()

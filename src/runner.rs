@@ -520,6 +520,11 @@ pub(crate) mod fake {
                     return answer(cmd);
                 }
             }
+            // Fake coordinator panes start with an empty editor unless a test
+            // scripts a visible terminal frame explicitly.
+            if cmd.display().contains("pane read ") && cmd.display().contains("--source visible") {
+                return Ok(ok("❯ \n"));
+            }
             anyhow::bail!("FakeRunner: no rule for `{}`", cmd.display())
         }
 

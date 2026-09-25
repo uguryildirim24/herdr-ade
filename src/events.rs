@@ -260,6 +260,8 @@ pub(crate) struct RemoteState {
     pub(crate) taken: BTreeMap<String, String>,
     pub(crate) missing: BTreeMap<String, u32>,
     pub(crate) gone: BTreeSet<String>,
+    /// Boot-change GONE notices that still owe a coordinator wake-up.
+    pub(crate) pending_gone: BTreeSet<String>,
     pub(crate) blocked: BTreeSet<String>,
 }
 
