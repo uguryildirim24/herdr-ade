@@ -42,7 +42,7 @@ ha round merge <slug> <round>
 
 The hook and ticker also advance ready rounds. `round merge` checkpoints, publishes, installs when configured, and closes the round. It resumes an interrupted publish or install without merging twice.
 
-Keep the plan outcome-based. `plan step link` and `unlink` take repeatable `--task <job-NNNN>`; one task may support several steps. Historical thread and round links remain visible but new links always name tasks.
+Keep the plan outcome-based. Plan steps are to-do items of a few words ("Cut unused parts", "One reviewer for the pile"), not sentences; the Rundown tab shows each as one short label. `plan step link` and `unlink` take repeatable `--task <job-NNNN>`; one task may support several steps. Historical thread and round links remain visible but new links always name tasks.
 
 Record durable facts only with:
 

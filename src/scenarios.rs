@@ -3007,6 +3007,16 @@ fn harness_install_builds_and_installs_each_repo_kind() {
         "{installs:?}"
     );
     assert!(
+        installs.iter().any(|p| p.ends_with("herdr-rundown")),
+        "{installs:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c
+            .display()
+            .contains(&format!("plugin link {plugin}/rundown"))),
+        "the install links the Rundown tab plugin"
+    );
+    assert!(
         installs.iter().any(|p| p.ends_with("herdr")),
         "{installs:?}"
     );
@@ -3015,7 +3025,7 @@ fn harness_install_builds_and_installs_each_repo_kind() {
             .iter()
             .filter(|c| c.display().contains("--version"))
             .count(),
-        12,
+        15,
         "each binary is compared before installation, then the installed version is recorded"
     );
     assert_eq!(
