@@ -1285,12 +1285,40 @@ fn box_agent_process(
         "cursor" => "cursor-agent",
         kind => kind,
     };
-    herdr
-        .pane_process_info(&thread.pane_id)
-        .ok()?
-        .identities()
-        .into_iter()
-        .find(|process| process.argv0.rsplit('/').next() == Some(executable))
+    let info = herdr.pane_process_info(&thread.pane_id).ok()?;
+    let process = info.foreground_processes.iter().find(|process| {
+        if process
+            .argv0
+            .as_deref()
+            .unwrap_or(&process.name)
+            .rsplit('/')
+            .next()
+            == Some(executable)
+        {
+            return true;
+        }
+        // Linux reports shebang-launched pi as node without argv0. Match its
+        // CLI script, not an unrelated node process in the foreground job.
+        thread.launch.kind == "pi"
+            && process.argv.as_ref().is_some_and(|argv| {
+                let [runtime, script, ..] = argv.as_slice() else {
+                    return false;
+                };
+                matches!(runtime.rsplit('/').next(), Some("node" | "bun"))
+                    && (script
+                        .ends_with("/node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
+                        || script.ends_with(
+                            "/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                        ))
+            })
+    })?;
+    Some(crate::contracts::ProcessIdentity {
+        pid: process.pid,
+        argv0: process
+            .argv0
+            .clone()
+            .unwrap_or_else(|| process.name.clone()),
+    })
 }
 
 /// Launches pending threads whose pane is at a shell prompt. Local starts stay
@@ -2232,6 +2260,20 @@ mod tests {
         assert_eq!(rebound.identity.cwd, rebound.cwd);
         assert_eq!(rebound.checked_slice, "herdr-ade-demo.slice");
         assert!(!rebound.identity.pane_id.is_empty());
+    }
+
+    #[test]
+    fn box_agent_process_finds_shebang_pi_without_argv0() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":41,"name":"node","argv":["/usr/bin/node","/tmp/unrelated.js"]},{"pid":42,"name":"node","argv":["/usr/bin/node","/home/agent/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"]}]}}}"#));
+        let herdr = Herdr::new("herdr", "", &runner);
+        let record = thread::allocate(&fixture.project, |record| {
+            record.pane_id = "w2:p1".into();
+            record.launch.kind = "pi".into();
+        })
+        .unwrap();
+        assert_eq!(box_agent_process(&herdr, &record).unwrap().pid, 42);
     }
 
     #[test]

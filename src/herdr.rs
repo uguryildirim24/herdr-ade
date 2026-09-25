@@ -240,6 +240,8 @@ pub(crate) struct ForegroundProcess {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) argv0: Option<String>,
+    #[serde(default)]
+    pub(crate) argv: Option<Vec<String>>,
 }
 
 impl ProcessInfo {
@@ -903,6 +905,7 @@ mod tests {
                 pid: 9,
                 name: "cursor-agent".into(),
                 argv0: Some("/bin/cursor-agent".into()),
+                argv: None,
             }],
         };
         let id = info.identity("cursor").unwrap();
