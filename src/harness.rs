@@ -549,9 +549,22 @@ impl Running {
     fn capture() -> Result<Running> {
         let current = std::env::current_exe().context("could not find the running executable")?;
         let path = std::fs::canonicalize(&current)
+            .or_else(|error| {
+                // Linux appends this suffix when a concurrent build unlinks the
+                // running image. Its inode remains readable via /proc/self/exe.
+                #[cfg(target_os = "linux")]
+                if let Some(path) = current.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+                    return Ok(PathBuf::from(path));
+                }
+                Err(error)
+            })
             .with_context(|| format!("could not resolve {}", current.display()))?;
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("could not fingerprint {}", path.display()))?;
+        #[cfg(target_os = "linux")]
+        let image = Path::new("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let image = path.as_path();
+        let bytes = std::fs::read(image)
+            .with_context(|| format!("could not fingerprint {}", image.display()))?;
         Ok(Running {
             path,
             hash: crate::thread::sha256_hex(&bytes),
@@ -1541,7 +1554,11 @@ mod tests {
         .unwrap();
         // Hold the lock in a separate Rust process: this test process may
         // fork concurrently, temporarily passing its descriptors to children.
-        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        #[cfg(target_os = "linux")]
+        let executable = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable = std::env::current_exe().unwrap();
+        let mut holder = std::process::Command::new(executable)
             .args([
                 "--exact",
                 "harness::tests::box_ticker_lock_holder",
