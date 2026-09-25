@@ -155,6 +155,18 @@ pub(crate) fn machine_declaration(config_dir: &Path, machine: &str) -> Result<Ma
         })
 }
 
+/// Resolve a recorded Herdr machine id to the config row's label. Saved
+/// machines can have an id unrelated to their `[machines.<label>]` key.
+pub(crate) fn declaration_for_route(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    config_dir: &Path,
+    route: &str,
+) -> Result<MachineDeclaration> {
+    let profile = machine_profile(runner, herdr_bin, config_dir, route)?;
+    machine_declaration(config_dir, &profile.label)
+}
+
 /// The stable profile of one saved machine (SPEC-remote §4.1). `local` is a
 /// real profile with no SSH target.
 pub(crate) fn machine_profile(
@@ -269,6 +281,17 @@ pub(crate) fn box_repo_for(
     Ok(rows
         .into_iter()
         .find(|row| row.path == mac_path && row.box_path.is_some() && row.publish_url.is_some()))
+}
+
+pub(crate) fn box_repo_for_route(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    config_dir: &Path,
+    route: &str,
+    mac_path: &str,
+) -> Result<Option<crate::project::Repo>> {
+    let profile = machine_profile(runner, herdr_bin, config_dir, route)?;
+    box_repo_for(config_dir, &profile.label, mac_path)
 }
 
 /// The URL-matched remote name in `repo`, never by remote name alone. The
