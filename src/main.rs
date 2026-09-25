@@ -53,6 +53,7 @@ mod overview;
 mod paths;
 mod routing;
 // Shared with the `herdr-pi` binary: setup, install and login run only there.
+mod claude_trust;
 #[allow(dead_code)]
 mod pi;
 #[path = "pi/ade.rs"]
