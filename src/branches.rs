@@ -49,6 +49,11 @@ fn parse_refs(output: &str) -> BTreeMap<String, String> {
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let sha = fields.next()?;
+            // ls-remote can advertise a zero OID while another push is deleting
+            // the ref. That is a deletion marker, not a moved branch tip.
+            if sha.bytes().all(|byte| byte == b'0') {
+                return None;
+            }
             let name = fields.next()?.strip_prefix("refs/heads/")?;
             Some((name.to_string(), sha.to_string()))
         })
@@ -135,7 +140,8 @@ fn delete_remote(
     }
     if current.get(branch).map(String::as_str) != Some(expected) {
         return Err(crate::refusal::error(format!(
-            "published branch {branch} moved; not removing it"
+            "published branch {branch} moved from {expected} to {}; not removing it",
+            current[branch]
         )));
     }
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
@@ -147,7 +153,7 @@ fn delete_remote(
     match refs(runner, repo, Some(url))?.get(branch) {
         None => Ok(()),
         Some(actual) if actual != expected => Err(crate::refusal::error(format!(
-            "published branch {branch} moved; not removing it"
+            "published branch {branch} moved from {expected} to {actual}; not removing it"
         ))),
         _ => {
             crate::ledger::unresolved_deferred(&cmd, &out);
@@ -837,6 +843,19 @@ mod tests {
         assert_eq!(*batches.0.borrow(), vec![1, 2]);
     }
 
+    #[test]
+    fn remote_deletion_marker_is_not_a_branch_tip() {
+        let refs = parse_refs(
+            "0000000000000000000000000000000000000000\trefs/heads/hp/demo/deleting\n\
+             abcdef0123456789abcdef0123456789abcdef01\trefs/heads/hp/demo/other\n",
+        );
+        assert!(!refs.contains_key("hp/demo/deleting"));
+        assert_eq!(
+            refs["hp/demo/other"],
+            "abcdef0123456789abcdef0123456789abcdef01"
+        );
+    }
+
     fn configured() -> (crate::round::testkit::Fx, tempfile::TempDir) {
         let fx = crate::round::testkit::fixture();
         let bare = tempfile::tempdir().unwrap();
@@ -1248,7 +1267,8 @@ mod tests {
         let config_dir = base.config_dir;
         std::thread::scope(|scope| {
             let cleanup = || {
-                let runner = crate::runner::RealRunner;
+                let _scope = crate::ledger::Scope::new(&[&fx.project]);
+                let runner = crate::ledger::RecordingRunner(&crate::runner::RealRunner);
                 let ctx = crate::paths::Ctx {
                     env: &env,
                     root: root.clone(),
@@ -1263,6 +1283,7 @@ mod tests {
             a.join().unwrap().unwrap();
             b.join().unwrap().unwrap();
         });
+        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
         assert!(
             !refs(fx.world.ctx().runner, &repo, None)
                 .unwrap()
