@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -529,16 +528,13 @@ impl Runner for RecordingRunner<'_> {
         }
         results
     }
-
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-        self.0.socket_request(socket, line, timeout)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project;
+    use std::time::Duration;
     #[test]
     fn idle_command_recovery_reads_ledger_only_when_it_changes() {
         let (_home, project) = fixture();

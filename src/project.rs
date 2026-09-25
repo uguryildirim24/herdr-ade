@@ -341,22 +341,6 @@ impl Coordinator {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct Safety {
-    pub(crate) start_threads: String,
-    pub(crate) routine_commands: bool,
-}
-
-impl Default for Safety {
-    fn default() -> Self {
-        Safety {
-            start_threads: "auto".into(),
-            routine_commands: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct Project {
     pub(crate) root: PathBuf,
@@ -480,7 +464,6 @@ impl Project {
     }
 
     /// The canonical folder (symlinks resolved): the key of the project's
-    /// `[safety]` table and of its routine approvals.
     pub(crate) fn canonical_dir(&self) -> PathBuf {
         std::fs::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
     }
@@ -540,10 +523,6 @@ impl Project {
         write_json(&self.state_dir().join("coordinator.json"), &record)?;
         Ok(record)
     }
-
-    pub(crate) fn safety(&self, config_dir: &Path) -> Result<Safety> {
-        load_safety(config_dir, &self.canonical_dir())
-    }
 }
 
 /// `ha machine hold <machine>`: new box starts are held until released
@@ -587,25 +566,6 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut text = serde_json::to_string_pretty(value)?;
     text.push('\n');
     write_atomic(path, text.as_bytes())
-}
-
-/// The effective safety settings: `[safety."<canonical project path>"]` in
-/// `<config_dir>/config.toml`, with defaults for an absent table or key.
-fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
-    let document = crate::config::Document::read(config_dir)?;
-    let file = config_dir.join("config.toml");
-    let mut configured: std::collections::BTreeMap<String, Safety> = document.section("safety")?;
-    let safety = configured
-        .remove(&*canonical_project_dir.to_string_lossy())
-        .unwrap_or_default();
-    if !matches!(safety.start_threads.as_str(), "propose" | "auto") {
-        bail!(
-            "{}: start_threads must be \"propose\" or \"auto\", not {:?}",
-            file.display(),
-            safety.start_threads
-        );
-    }
-    Ok(safety)
 }
 
 /// SHA-256 of executable settings and standing rules.
@@ -1063,30 +1023,6 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
     }
 
-    out.push_str("\n## Recent decisions\n\n");
-    let decisions = crate::decide::read(project).records;
-    if decisions.is_empty() {
-        out.push_str("None.\n");
-    }
-    for decision in decisions.iter().rev().take(10) {
-        let text = match &decision.overturned {
-            Some(change) => format!(
-                "{} — overturned by {} at {}: {}",
-                decision.line, change.by, change.at, change.reason
-            ),
-            None => decision.line.clone(),
-        };
-        let date = &decision.at[..decision.at.len().min(10)];
-        let authority = decision
-            .request
-            .as_ref()
-            .map(|request| format!("request:{request}"))
-            .or_else(|| decision.basis.clone());
-        let provenance =
-            authority.map_or_else(|| date.to_string(), |basis| format!("{date}; {basis}"));
-        out.push_str(&markdown_item(&decision.id, &provenance, &text));
-    }
-
     out.push_str("\n## Recently finished or dropped tasks\n\n");
     let mut finished: Vec<_> = views
         .iter()
@@ -1385,12 +1321,10 @@ mod tests {
         .unwrap();
         assert_eq!(project.slug, "demo");
         assert!(project.state_dir().is_dir());
-        for optional in [
-            "tasks", "scratch", "routines", "threads", "inbox", "library",
-        ] {
+        for optional in ["tasks", "scratch", "threads", "inbox", "library"] {
             assert!(!project.dir().join(optional).exists(), "{optional}");
         }
-        for old in ["MEMORY.md", "memory", "TASKS.md", "GLOSSARY.md"] {
+        for old in ["MEMORY.md", "memory", "TASKS.md"] {
             assert!(!project.dir().join(old).exists(), "{old}");
         }
         let (settings, body) = project.read_project_md().unwrap();
@@ -1619,34 +1553,6 @@ mod tests {
         // An `@` inside a path is not a machine.
         assert_eq!(parse_repo_arg("/a@b/c").machine, None);
         assert_eq!(parse_repo_arg("/a@b/c").path, "/a@b/c");
-    }
-
-    #[test]
-    fn safety_defaults_and_overrides_keyed_by_canonical_path() {
-        let config = tempfile::tempdir().unwrap();
-        let here = Path::new("/projects/demo");
-        assert_eq!(load_safety(config.path(), here).unwrap(), Safety::default());
-        assert_eq!(Safety::default().start_threads, "auto");
-
-        std::fs::write(
-            config.path().join("config.toml"),
-            "root = \"/projects\"\n\n[safety.\"/projects/demo\"]\nstart_threads = \"propose\"\n",
-        )
-        .unwrap();
-        let safety = load_safety(config.path(), here).unwrap();
-        assert_eq!(safety.start_threads, "propose");
-        assert!(!safety.routine_commands);
-        assert_eq!(
-            load_safety(config.path(), Path::new("/projects/other")).unwrap(),
-            Safety::default()
-        );
-
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[safety.\"/projects/demo\"]\nstart_threads = \"yolo\"\n",
-        )
-        .unwrap();
-        assert!(load_safety(config.path(), here).is_err());
     }
 
     #[test]

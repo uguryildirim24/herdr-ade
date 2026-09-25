@@ -568,7 +568,6 @@ impl ContextCursor {
                     "## Task notes in force",
                     "## Standing instructions in force",
                     "## Facts in force",
-                    "## Recent decisions",
                 ]
                 .iter()
                 .filter_map(|name| sections.get(*name))
@@ -710,7 +709,7 @@ fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> S
         }
     }
     if previous.standing != current.standing {
-        changes.push("- Standing notes or decisions changed.".into());
+        changes.push("- Standing notes changed.".into());
     }
     if current.relevant_config.iter().any(|(key, value)| {
         previous
@@ -746,16 +745,13 @@ fn filter_page(project: &Project, text: &str, collapse: bool) -> String {
         }
         let standing = matches!(
             section,
-            "## Task notes in force"
-                | "## Standing instructions in force"
-                | "## Facts in force"
-                | "## Recent decisions"
+            "## Task notes in force" | "## Standing instructions in force" | "## Facts in force"
         );
         if standing && collapse {
             if !standing_notice {
                 let _ = writeln!(
                     out,
-                    "## Standing notes and decisions\n\nUnchanged; run `ha context {} --full` to see them.\n",
+                    "## Standing notes\n\nUnchanged; run `ha context {} --full` to see them.\n",
                     project.slug
                 );
                 standing_notice = true;
@@ -1094,7 +1090,7 @@ fn digest_snapshot(
         }
     }
 
-    // Rolf's own words, each under the request id `ha decide --basis` cites.
+    // Rolf's own words, each under its request id.
     let requests = crate::talk::recent_requests(project, REQUEST_ROWS);
     if !requests.is_empty() {
         let _ = writeln!(
@@ -1115,7 +1111,7 @@ fn digest_snapshot(
                 "- {} [{}] {}: {}",
                 item.id, item.kind, item.subject, item.summary
             );
-            if item.kind == "routine" && !item.body.is_empty() {
+            if !item.body.is_empty() {
                 let _ = writeln!(out, "{}", item.body);
             }
         }

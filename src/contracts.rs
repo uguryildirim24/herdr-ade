@@ -772,38 +772,6 @@ pub(crate) struct Plan {
     pub(crate) steps: Vec<PlanStep>,
 }
 
-// ---------------------------------------------------------- decision log
-
-/// The four decision classes (SPEC-talk §6.6). `what-you-get`, `money` and
-/// `undo` need human authority; `routine` does not.
-pub(crate) const DECISION_CLASSES: &[&str] = &["what-you-get", "money", "undo", "routine"];
-
-/// One complete line of `<project>/.state/decisions.jsonl` (SPEC-talk §6.6). Nullable
-/// fields stay present as `null` so an old reader sees the shape.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
-pub(crate) struct Decision {
-    pub(crate) schema: u32,
-    pub(crate) seq: u64,
-    pub(crate) id: String,
-    pub(crate) at: String,
-    pub(crate) line: String,
-    pub(crate) class: String,
-    pub(crate) key: Option<String>,
-    pub(crate) basis: Option<String>,
-    pub(crate) replaces: Option<String>,
-    pub(crate) request: Option<String>,
-    pub(crate) overturned: Option<DecisionOverturn>,
-}
-
-/// An append-only change to a decision; the original line remains in the log.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct DecisionOverturn {
-    pub(crate) by: String,
-    pub(crate) at: String,
-    pub(crate) reason: String,
-}
-
 /// A `--basis` reference: an existing human message (`request:<id>`) or a
 /// current, nonzero answered ask (`ask:<id>@<revision>`) (SPEC-talk §6.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -993,12 +961,12 @@ mod tests {
             revision: 1,
         });
         json_roundtrip(&HumanMessage::Notice {
-            id: "plain_exhausted".into(),
+            id: "journal_tail".into(),
         });
     }
 
     #[test]
-    fn plan_step_decision_and_reference_roundtrip() {
+    fn plan_step_and_reference_roundtrip() {
         let plan = Plan {
             schema: 1,
             revision: 8,
@@ -1034,28 +1002,6 @@ mod tests {
         .unwrap();
         assert_eq!(old.steps[0].state, StepState::Left);
         assert!(old.steps[0].threads.is_empty());
-
-        let decision = Decision {
-            schema: 1,
-            seq: 2,
-            id: "d-0002".into(),
-            at: "2026-09-19T12:18:00Z".into(),
-            line: "I will show more detail beside each choice.".into(),
-            class: "routine".into(),
-            key: Some("change-q-example".into()),
-            basis: None,
-            replaces: Some("d-0001".into()),
-            request: Some("q-example".into()),
-            overturned: None,
-        };
-        json_roundtrip(&decision);
-        let text = serde_json::to_string(&decision).unwrap();
-        assert!(text.contains("\"basis\":null"), "{text}");
-        let old: Decision = serde_json::from_str(
-            "{\"schema\":1,\"seq\":1,\"id\":\"d-0001\",\"at\":\"x\",\"line\":\"A line.\",\"class\":\"routine\"}",
-        )
-        .unwrap();
-        assert!(old.key.is_none() && old.replaces.is_none());
 
         assert_eq!(
             AuthorityRef::parse("request:q-example"),

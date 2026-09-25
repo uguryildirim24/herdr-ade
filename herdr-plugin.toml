@@ -30,18 +30,6 @@ contexts = ["workspace"]
 command = ["target/release/herdr-ade", "action", "overview"]
 
 [[actions]]
-id = "focus"
-title = "Projects: focus sidebar on this project"
-contexts = ["workspace"]
-command = ["target/release/herdr-ade", "action", "focus"]
-
-[[actions]]
-id = "unfocus"
-title = "Projects: clear sidebar focus"
-contexts = ["workspace"]
-command = ["target/release/herdr-ade", "action", "unfocus"]
-
-[[actions]]
 id = "adopt-workspace"
 title = "Projects: continue this workspace as a project"
 contexts = ["workspace"]

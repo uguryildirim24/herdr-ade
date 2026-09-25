@@ -184,32 +184,6 @@ pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, include_history: bool, wait: bo
     Ok(())
 }
 
-/// `focus`: show only this project's panes in the sidebar, by attention.
-pub(crate) fn focus(ctx: &Ctx, slug: &str) -> Result<()> {
-    let project = Project::load(&ctx.root, slug)?;
-    let view = threads::session_view(ctx, &project).ok_or_else(|| {
-        anyhow::anyhow!("the herdr session of `{slug}` is not reachable; run `open {slug}` first")
-    })?;
-    view.herdr
-        .agent_view_set_project(slug)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!(
-        "sidebar focused on `{slug}`; `unfocus` clears it (this replaced any view another tool had set)"
-    );
-    Ok(())
-}
-
-/// `unfocus`: herdr holds a single transient view, so this clears whatever is set.
-pub(crate) fn unfocus(ctx: &Ctx, session: &crate::paths::SessionFlags) -> Result<()> {
-    let session = crate::paths::resolve_session(session, ctx.env, ctx.runner)?;
-    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
-    herdr
-        .agent_view_clear()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("sidebar view cleared");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,30 +274,6 @@ mod tests {
         assert_eq!(project_for_workspace(&ctx, "w7", &b_socket), None);
         assert_eq!(project_for_workspace(&ctx, "w9", &a_socket), None);
         assert_eq!(project_for_workspace(&ctx, "", &a_socket), None);
-    }
-
-    #[test]
-    fn focus_filters_on_the_project_token_and_sorts_by_rank_in_the_projects_socket() {
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        focus(&world.ctx(), "demo").unwrap();
-        let requests = world.runner.socket_requests.borrow();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].0.to_string_lossy(),
-            project.coordinator().unwrap().socket
-        );
-        let request: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
-        assert_eq!(request["method"], "agent.view.set");
-        assert_eq!(request["params"]["source"], "herdr-ade");
-        assert_eq!(
-            request["params"]["filter"],
-            serde_json::json!({"op":"eq","field":{"token":"project"},"value":"demo"})
-        );
-        assert_eq!(
-            request["params"]["sort"],
-            serde_json::json!([{"field":{"token":"rank"},"order":"asc"}])
-        );
     }
 
     #[test]

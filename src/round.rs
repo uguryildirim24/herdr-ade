@@ -40,7 +40,7 @@ pub const REVIEW_TASK_BYTE_CAP: usize = 128 * 1024;
 /// loaded cloud box without mistaking a slow start for a dead one.
 const REVIEWER_LAUNCH_GRACE_SECS: i64 = 600;
 
-/// Git reads for rounds, dialogue and checkpoint. Every lock and ref write
+/// Git reads for rounds and checkpoint. Every lock and ref write
 /// goes through A1's `crate::git`: one repository lock, one D9 commit.
 pub mod repo {
     use std::path::{Path, PathBuf};
@@ -119,21 +119,6 @@ pub mod repo {
                 .skip(1)
                 .map(str::to_string)
                 .collect())
-        }
-
-        /// A file's bytes at a revision, `None` when the path is absent there.
-        pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<String>> {
-            // Query presence first: `show` alone cannot distinguish an absent
-            // path from a bad revision or unreadable object database.
-            let names = self.run(&["ls-tree", "-z", "--name-only", rev, "--", path])?;
-            if !names.split('\0').any(|name| name == path) {
-                return Ok(None);
-            }
-            let out = self.output_in(&self.repo, &["show", &format!("{rev}:{path}")])?;
-            if !out.success() {
-                bail!("`git show {rev}:{path}` failed: {}", out.error_text());
-            }
-            Ok(Some(out.stdout))
         }
 
         /// The worktree that has `branch` checked out, if any.
@@ -223,27 +208,6 @@ pub mod repo {
     /// `<git-common-dir>/herdr-ade.lock` (SPEC-ADE D4).
     pub fn repo_lock(git: &Git) -> Result<crate::git::RepoLock> {
         crate::git::lock(git.runner, &git.repo.to_string_lossy())
-    }
-
-    /// A1's D9 commit (`crate::git::commit_files_locked`). The caller holds
-    /// the repository lock.
-    pub fn commit_files_on_branch(
-        git: &Git,
-        branch: &str,
-        files: &[(&str, &str)],
-        message: &str,
-        expected_old: &str,
-        tmp_dir: &Path,
-    ) -> Result<String> {
-        crate::git::commit_files_locked(
-            git.runner,
-            &git.repo,
-            branch,
-            files,
-            message,
-            expected_old,
-            tmp_dir,
-        )
     }
 }
 
@@ -796,19 +760,9 @@ pub fn thread_attempt(project: &Project, id: &str) -> Result<u32> {
 }
 
 /// The thread's birth sentence (`plain` on A1's record), or empty.
-pub fn thread_plain(project: &Project, id: &str) -> String {
-    thread_record(project, id)
-        .map(|t| t.plain)
-        .unwrap_or_default()
-}
-
-/// A1's typed record. Unreadable fails closed: a round decision never
-/// treats a record it cannot read as absent (D6).
 fn thread_record(project: &Project, id: &str) -> Result<thread::Thread> {
     thread::load(project, id).map_err(|e| anyhow::anyhow!("thread_unreadable: {e:#}"))
 }
-
-// ------------------------------------------------------------------- events
 
 pub fn events_dir(project: &Project) -> PathBuf {
     project.record_dir("events")
@@ -1430,7 +1384,6 @@ pub fn open_with_lanes(
             "plain_missing: `round open` needs --plain \"<one sentence that says what this round does>\""
         );
     };
-    crate::glossary::check_internal_birth(&plain)?;
 
     // Resolve and validate every lane before writing the round record.
     let lanes: Vec<thread::Thread> = threads
@@ -3259,7 +3212,7 @@ fn verdict_summary(round: &str, verdict: &str) -> String {
     }
 }
 
-/// A `say` line that passes the plain check: the round is a born name, so it
+/// A `say` line for a round.
 /// is written in its gloss form and the command stays in the round record.
 fn verdict_say(record: &RoundRecord) -> String {
     format!(
@@ -6085,21 +6038,6 @@ fn tick_rounds(ctx: &Ctx, project: &Project, rounds: &[RoundRecord]) -> Result<(
     Ok(())
 }
 
-/// Round ids and branches for the registry (D17 item 1).
-pub fn registry_names(project: &Project) -> Vec<(String, String, String, String)> {
-    list(project)
-        .into_iter()
-        .map(|r| {
-            (
-                r.round.clone(),
-                r.plain.clone(),
-                format!(".state/rounds/{}.toml", r.round),
-                r.opened.clone(),
-            )
-        })
-        .collect()
-}
-
 /// Fixtures shared by A3's tests: a real git repository behind the fake
 /// runner (git goes to the real runner, herdr to the scripted one).
 #[cfg(test)]
@@ -7199,34 +7137,6 @@ mod tests {
                 .and_then(|checkpoint| checkpoint.artifact.as_deref()),
             None
         );
-    }
-
-    #[test]
-    fn optional_git_answers_do_not_hide_repository_errors() {
-        let fx = fixture();
-        let _scope = crate::ledger::Scope::new(&[&fx.project]);
-        let runner = crate::ledger::RecordingRunner(&crate::runner::RealRunner);
-        let repo = Git::new(&runner, &fx.repo);
-        let (_, lane_sha) = fx.lane(1);
-        for _ in 0..2 {
-            assert!(!repo.is_ancestor(&lane_sha, "main").unwrap());
-            assert!(repo.is_ancestor("main", &lane_sha).unwrap());
-        }
-        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
-        assert!(!fx.project.state_dir().join("ledger.jsonl").exists());
-        assert!(repo.branch_head("box-only").unwrap().is_none());
-        assert!(repo.show_file("HEAD", "missing.md").unwrap().is_none());
-        assert_eq!(
-            repo.show_file("HEAD", "README.md").unwrap().as_deref(),
-            Some("hello\n")
-        );
-        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
-        assert!(repo.show_file("not-a-revision", "README.md").is_err());
-        assert_eq!(crate::ledger::list(&fx.project).unwrap().len(), 1);
-        // Ancestry errors still record; only its precise yes/no statuses
-        // are answers, not a blanket exemption for every normal exit.
-        assert!(repo.is_ancestor("not-a-revision", "HEAD").is_err());
-        assert_eq!(crate::ledger::list(&fx.project).unwrap().len(), 2);
     }
 
     #[test]

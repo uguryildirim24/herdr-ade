@@ -1172,7 +1172,7 @@ fn report(problems: &BTreeMap<String, BTreeSet<String>>, doc: &str, st: &Value) 
 /// session; box lanes are read from the courier's box-local lists (one SSH per
 /// machine, never a second bridge). Gone lanes are printed as start lines, or
 /// restarted through the existing restart path when `--start` runs under a
-/// project whose `start_threads` is `auto`.
+/// active project.
 pub(crate) struct PickupArgs<'a> {
     pub(crate) slug: Option<&'a str>,
     pub(crate) pane: Option<&'a str>,
@@ -1418,12 +1418,7 @@ fn pickup_project(
         out.push_str(&format!("note: {note}\n"));
     }
     if !gone.is_empty() {
-        let safety = project.safety(&ctx.config_dir)?;
-        if args.start
-            && !args.dry_run
-            && project.status() == crate::project::Status::Active
-            && safety.start_threads == "auto"
-        {
+        if args.start && !args.dry_run && project.status() == crate::project::Status::Active {
             out.push_str("started (resumed after the session interruption):\n");
             for t in &gone {
                 match crate::threads::resume_interrupted(ctx, &project.slug, &t.id) {
@@ -2000,101 +1995,5 @@ mod tests {
         .unwrap();
         assert!(out.contains(&format!("--label {id} --no-focus")), "{out}");
         assert!(!out.contains(&format!("re-linked:      {id}")), "{out}");
-    }
-
-    #[test]
-    fn pickup_start_starts_only_under_auto_and_skips_a_relinked_lane() {
-        let fx = fixture();
-        let (linked, _) = fx.lane(1);
-        *fx.world.agents.borrow_mut() = r#"[
-            {"pane_id":"w1:p11","tab_id":"w1:t11","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
-            .into();
-        let gone = thread::allocate(&fx.project, |t| {
-            t.title = "Gone".into();
-            t.kind = thread::Kind::Tab;
-            t.status = thread::Status::Open;
-            t.agent = "claude".into();
-            t.agent_name = thread::agent_name("demo", &t.id);
-            t.workspace_id = "w1".into();
-            t.tab_id = "w1:t3".into();
-            t.pane_id = "w1:p12".into();
-            t.cwd = fx.world.home.path().to_string_lossy().into_owned();
-        })
-        .unwrap()
-        .id;
-        *fx.world.panes.borrow_mut() = format!(
-            "[{},{{\"pane_id\":\"w1:p11\",\"tab_id\":\"w1:t11\",\"workspace_id\":\"w1\",\"cwd\":\"{}\"}}]",
-            fx.world.coordinator_pane(&fx.project),
-            thread::load(&fx.project, &linked).unwrap().cwd
-        );
-        fx.world.runner.on(
-            "tab create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t9","pane_id":"w1:p99","cwd":"/tmp"}}}"#),
-        );
-        let ctx = fx.world.ctx();
-        let config = fx.world.home.path().join("cfg/config.toml");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config,
-            format!(
-                "[safety.\"{}\"]\nstart_threads = \"propose\"\n",
-                fx.project.canonical_dir().display()
-            ),
-        )
-        .unwrap();
-        let propose = PickupArgs {
-            slug: Some("demo"),
-            pane: Some("w1:p1"),
-            dry_run: false,
-            all: false,
-            start: true,
-        };
-        // A project can still opt into proposal-only starts.
-        let out = pickup(&ctx, propose).unwrap();
-        assert!(out.contains("gone (not live;"), "{out}");
-        assert_eq!(fx.world.runner.count("tab create"), 0);
-
-        std::fs::write(
-            &config,
-            format!(
-                "[safety.\"{}\"]\nstart_threads = \"auto\"\n",
-                fx.project.canonical_dir().display()
-            ),
-        )
-        .unwrap();
-        fx.project
-            .set_status(crate::project::Status::Paused)
-            .unwrap();
-        let paused = pickup(
-            &ctx,
-            PickupArgs {
-                slug: Some("demo"),
-                pane: Some("w1:p1"),
-                dry_run: false,
-                all: false,
-                start: true,
-            },
-        )
-        .unwrap();
-        assert!(paused.contains("gone (not live;"), "{paused}");
-        assert_eq!(fx.world.runner.count("tab create"), 0);
-
-        fx.project
-            .set_status(crate::project::Status::Active)
-            .unwrap();
-        let out = pickup(
-            &ctx,
-            PickupArgs {
-                slug: Some("demo"),
-                pane: Some("w1:p1"),
-                dry_run: false,
-                all: false,
-                start: true,
-            },
-        )
-        .unwrap();
-        assert!(out.contains(&format!("{gone} now in pane")), "{out}");
-        assert!(!out.contains(&format!("re-linked:      {linked}")), "{out}");
-        assert_eq!(fx.world.runner.count("tab create"), 1);
     }
 }

@@ -1,5 +1,5 @@
-//! The ticker's per-project steps: delivery, messages, pull requests, routines
-//! and routines. Thread facts update their owning records; only messages
+//! The ticker's per-project steps: delivery, messages and pull requests.
+//! Thread facts update their owning records; only messages
 //! without a thread or round home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +13,7 @@ use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::thread::{self, CopyOutcome, Status, Thread};
 use crate::threads;
-use crate::{events, inbox, pr, routine};
+use crate::{events, inbox, pr};
 
 pub(crate) const TICKER_PROMPT_PREFIX: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing]";
@@ -26,7 +26,6 @@ const DEFAULT_OUTAGE_SECS: i64 = 600;
 #[serde(default)]
 pub(crate) struct State {
     pub(crate) last_pr_check: String,
-    pub(crate) routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
     pub(crate) config_errors: BTreeSet<String>,
     /// Hash of the unseen inbox item ids last announced.
@@ -1287,112 +1286,6 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
 }
 
 /// Step 3, plus `config-error` items for files that do not parse.
-pub(crate) fn routines(
-    ctx: &Ctx,
-    project: &Project,
-    state: &mut State,
-    routine_commands: bool,
-    project_md_error: Option<(String, String)>,
-    now: &jiff::Zoned,
-) -> Vec<anyhow::Error> {
-    let mut errors = Vec::new();
-    let (routines, broken) = routine::load_all(project);
-
-    let mut problems: Vec<(String, String, String)> = broken
-        .into_iter()
-        .map(|b| (b.file, b.hash, b.error))
-        .collect();
-    if let Some((hash, error)) = project_md_error {
-        problems.push(("PROJECT.md".into(), hash, error));
-    }
-    for (file, hash, error) in problems {
-        // One item per distinct file hash, so an unfixed file does not repeat.
-        if state.config_errors.insert(hash) {
-            let stem = file.trim_start_matches("routines/").trim_end_matches(".md");
-            errors.extend(
-                inbox::write(
-                    project,
-                    "config-error",
-                    stem,
-                    &format!("{file} is not usable: {}", pr::sanitize(&error)),
-                    "",
-                )
-                .err(),
-            );
-        }
-    }
-
-    let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_default();
-    for r in routines.iter().filter(|r| r.enabled) {
-        let entry = state.routines.entry(r.name.clone()).or_default();
-        let Ok(last_run) = entry.last_run.parse::<jiff::Timestamp>() else {
-            // First seen counts as the last run: nothing fires the moment a
-            // routine file appears.
-            entry.last_run = now.timestamp().to_string();
-            continue;
-        };
-        if !routine::is_due(&r.schedule, last_run, now) {
-            continue;
-        }
-        entry.last_run = now.timestamp().to_string();
-
-        if r.command.is_empty() {
-            errors.extend(
-                inbox::write(
-                    project,
-                    "routine",
-                    &r.name,
-                    &format!("routine `{}` is due", r.name),
-                    &r.prompt,
-                )
-                .err(),
-            );
-            continue;
-        }
-        if !routine_commands || !routine::is_approved(&ctx.config_dir, project, r) {
-            let hash = r.command_hash();
-            if entry.approval_item_for != hash {
-                entry.approval_item_for = hash;
-                let why = if routine_commands {
-                    "its command is not approved (or was edited since approval)"
-                } else {
-                    "routine commands are not enabled for this project"
-                };
-                let summary = format!(
-                    "routine `{}` did not run: {why}. The user enables them with `routine_commands = true` (see `{prefix} safety show {}`) and approves with `{prefix} routine approve {} {}` in a terminal",
-                    r.name, project.slug, project.slug, r.name
-                );
-                errors
-                    .extend(inbox::write(project, "routine-approval", &r.name, &summary, "").err());
-            }
-            continue;
-        }
-        match routine::run_command(ctx.runner, project, r) {
-            Ok(ran) => {
-                if ran.output_hash != entry.output_hash {
-                    entry.output_hash = ran.output_hash;
-                    let body = format!("{}\n\n{}", r.prompt, ran.block);
-                    errors.extend(
-                        inbox::write(
-                            project,
-                            "routine",
-                            &r.name,
-                            &format!(
-                                "routine `{}` ran ({}) and its output changed",
-                                r.name, ran.exit
-                            ),
-                            body.trim(),
-                        )
-                        .err(),
-                    );
-                }
-            }
-            Err(error) => errors.push(error.context(format!("routine {}", r.name))),
-        }
-    }
-    errors
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

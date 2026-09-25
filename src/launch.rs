@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 
 use crate::contracts::{Launch, Recipe};
 use crate::paths::{Ctx, Env};
-use crate::plain::{self, Glossary};
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 
@@ -132,7 +131,6 @@ pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Resul
             .get(&recipe.kind)
             .with_context(|| format!("adapter_unknown: recipe `{id}` uses `{}`", recipe.kind))?;
         crate::adapters::validate_recipe(adapter, id, recipe)?;
-        check_plain(&format!("recipe {id}"), &recipe.plain)?;
     }
     Ok(())
 }
@@ -254,35 +252,7 @@ pub fn authorize_explicit_recipe(
     {
         bail!("routing_capability_missing: recipe `{recipe_id}` does not declare `{capability}`");
     }
-    let line = format!(
-        "Rolf chose {} for one lane.",
-        recipe.plain.trim_end_matches('.')
-    );
-    let class = if recipe_id == config.routing.default {
-        "routine"
-    } else {
-        // An exact non-default model can cost more than the ordinary route.
-        // Treat the choice as money rather than guessing model prices in core.
-        "money"
-    };
-    let authority = request.basis();
-    let key = format!(
-        "one-off-recipe:{task_id}:{recipe_id}:{}",
-        crate::thread::sha256_hex(quote.as_bytes())
-    );
-    crate::decide::decide(
-        ctx,
-        &project.slug,
-        crate::decide::NewDecision {
-            line: &line,
-            class,
-            key: Some(&key),
-            basis: Some(&authority),
-            replaces: None,
-            request: None,
-        },
-    )?;
-    Ok(authority)
+    Ok(request.basis())
 }
 
 /// Optional task front matter describes the deliverable or a hard runtime
@@ -579,17 +549,8 @@ pub fn ledger(project: &Project, mut row: Value) -> Result<()> {
     Ok(())
 }
 
-/// Dialogue workflow labels may match routing rules. Selection happens only once
+/// Workflow labels may match routing rules. Selection happens only once
 /// each complete side's brief exists; no model pin is printed by this command.
-pub struct DialoguePair;
-impl crate::dialogue::PairFilter for DialoguePair {
-    fn check(&self, drafter: &str, critic: &str) -> std::result::Result<(), String> {
-        crate::dialogue::same_role(drafter, critic)?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorRow {
     pub ok: Option<bool>,
     pub label: String,
@@ -657,23 +618,6 @@ pub fn parse_kinds(help: &str) -> Option<BTreeSet<String>> {
     if kinds.is_empty() { None } else { Some(kinds) }
 }
 
-fn check_plain(context: &str, sentence: &str) -> Result<()> {
-    let result = plain::check(sentence, &Glossary::default());
-    if !result.passed() {
-        let fixes: Vec<String> = result
-            .violations
-            .iter()
-            .map(|violation| violation.fix.clone())
-            .collect();
-        bail!(
-            "recipe_reason_not_plain: {context} fails the plain check (`{sentence}`): {}",
-            fixes.join("; ")
-        );
-    }
-    Ok(())
-}
-
-/// The job noun of each role.
 pub fn job_noun(role: &str) -> &'static str {
     match role {
         "reviewer" => "this review",
@@ -775,101 +719,6 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("herdr-pro start")));
         assert!(lines[2].contains("[disabled]"), "{:?}", lines);
         assert!(!lines[2].contains("reach:"), "{:?}", lines);
-    }
-
-    #[test]
-    fn one_off_recipe_needs_and_records_words_from_the_tasks_request() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        let config_dir = home.path().join("cfg");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("config.toml"),
-            r#"[routing]
-default = "usual"
-
-[recipes.usual]
-kind = "claude"
-args = ["--dangerously-skip-permissions"]
-plain = "the quick helper"
-
-[recipes.named]
-kind = "claude"
-args = ["--dangerously-skip-permissions"]
-plain = "the careful helper"
-"#,
-        )
-        .unwrap();
-        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
-        let source = crate::project::create(&root, "source", "", vec![]).unwrap();
-        let words = "start the careful helper at the same time";
-        let request = crate::talk::record_pane_request(&source, words).unwrap();
-        let task = crate::task::add(
-            &project,
-            "Try both helpers",
-            vec![format!("request:source/{request}")],
-            vec!["The helper starts.".into()],
-            None,
-            None,
-        )
-        .unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let runner = crate::runner::fake::FakeRunner::new();
-        runner.on(
-            "agent start --help",
-            crate::runner::fake::ok("[possible values: pi, claude, cursor, agy]"),
-        );
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir,
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let authority = authorize_explicit_recipe(
-            &ctx,
-            &project,
-            &task.id,
-            "Do the work.",
-            "lane",
-            "named",
-            words,
-        )
-        .unwrap();
-        assert_eq!(authority, format!("request:source/{request}"));
-        let decision = crate::decide::current(&project).pop().unwrap();
-        assert_eq!(decision.class, "money");
-        assert_eq!(decision.basis.as_deref(), Some(authority.as_str()));
-        let launch = resolve_launch(
-            &ctx,
-            &project,
-            &ResolveInput {
-                task: "Do the work.",
-                workflow: "lane",
-                recipe: Some("named"),
-                recipe_basis: Some(words),
-                recipe_request: Some(&authority),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(launch.recipe_id, "named");
-        assert_eq!(launch.ready_timeout_ms, 300_000); // omitted Claude timeout uses adapter default
-        assert_eq!(launch.routing_rule, "explicit");
-        assert_eq!(launch.recipe_basis, words);
-        assert_eq!(launch.recipe_request, authority);
-        let error = authorize_explicit_recipe(
-            &ctx,
-            &project,
-            &task.id,
-            "Do the work.",
-            "lane",
-            "named",
-            "words Rolf did not use",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("recipe_authority"), "{error}");
     }
 
     #[test]

@@ -21,8 +21,6 @@ pub(crate) struct HookAdapter {
     pub(crate) path: String,
     pub(crate) events: Vec<String>,
     pub(crate) prompt_event: String,
-    /// `block`, `followup`, or `none`.
-    pub(crate) block: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,12 +89,6 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
             row.hook.shape
         );
     }
-    if !matches!(row.hook.block.as_str(), "none" | "block" | "followup") {
-        bail!(
-            "adapter_invalid: `{kind}` has unknown block response `{}`",
-            row.hook.block
-        );
-    }
     if !matches!(row.doctor.readiness.as_str(), "command" | "pi") {
         bail!(
             "adapter_invalid: `{kind}` has unknown readiness driver `{}`",
@@ -109,13 +101,12 @@ fn validate(kind: &str, row: &Adapter) -> Result<()> {
     Ok(())
 }
 
-fn hook(shape: &str, path: &str, events: &[&str], prompt: &str, block: &str) -> HookAdapter {
+fn hook(shape: &str, path: &str, events: &[&str], prompt: &str) -> HookAdapter {
     HookAdapter {
         shape: shape.into(),
         path: path.into(),
         events: events.iter().map(|value| (*value).into()).collect(),
         prompt_event: prompt.into(),
-        block: block.into(),
     }
 }
 
@@ -142,7 +133,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ".claude/settings.local.json",
             &["Stop", "UserPromptSubmit"],
             "UserPromptSubmit",
-            "block",
         ),
         &[
             "{args}",
@@ -169,7 +159,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
 
     let mut codex = native(
         "codex",
-        hook("claude", ".codex/hooks.json", &["Stop"], "", "block"),
+        hook("claude", ".codex/hooks.json", &["Stop"], ""),
         &[
             "exec",
             "{args}",
@@ -192,7 +182,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ".cursor/hooks.json",
             &["afterAgentResponse", "stop"],
             "",
-            "followup",
         ),
         &["{args}", "-p", "Reply only OK."],
     );
@@ -207,7 +196,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
             ".agy/hooks.json",
             &["Stop", "UserPromptSubmit"],
             "UserPromptSubmit",
-            "block",
         ),
         &["{args}", "-p", "Reply only OK.", "--print-timeout", "60s"],
     );
@@ -236,7 +224,6 @@ fn builtin() -> BTreeMap<String, Adapter> {
                 ".pi/herdr-ade-hooks.json",
                 &["Stop", "UserPromptSubmit"],
                 "UserPromptSubmit",
-                "block",
             ),
             doctor: DoctorAdapter {
                 readiness: "pi".into(),
@@ -291,14 +278,6 @@ pub(crate) fn settings_path(project_dir: &Path, adapter: &Adapter) -> Option<Pat
         .then(|| project_dir.join(&adapter.hook.path))
 }
 
-pub(crate) fn correction(adapter: &Adapter, reason: &str) -> Option<serde_json::Value> {
-    match adapter.hook.block.as_str() {
-        "block" => Some(serde_json::json!({ "decision": "block", "reason": reason })),
-        "followup" => Some(serde_json::json!({ "followup_message": reason })),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +298,6 @@ hook.shape = "claude"
 hook.path = ".acme/hooks.json"
 hook.events = ["Stop", "UserPromptSubmit"]
 hook.prompt_event = "UserPromptSubmit"
-hook.block = "block"
 "#,
         )
         .unwrap();

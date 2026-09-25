@@ -15,9 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::contracts::{Ask, HumanMessage};
-use crate::glossary::{self, format_check};
 use crate::paths::Ctx;
-use crate::plain;
 use crate::project::{self, Project, write_atomic};
 
 /// The standing extra choice every ask carries (D17 item 4).
@@ -26,10 +24,6 @@ pub(crate) const NOT_UNDERSTOOD: &str = "I did not understand the question";
 /// Fixed notices: the only text a `Notice` can publish. Every text passes the
 /// checker with an empty registry (tested).
 const NOTICES: &[(&str, &str)] = &[
-    (
-        "plain_exhausted",
-        "The coordinator could not say this in plain words. Open its pane to read it.",
-    ),
     (
         "journal_tail",
         "A half written line was found at the end of this record and was left out.",
@@ -120,7 +114,7 @@ fn answer_path(project: &Project, id: &str, revision: u32) -> PathBuf {
 }
 
 fn publications_dir(project: &Project) -> PathBuf {
-    project.state_dir().join("plain").join("publications")
+    project.state_dir().join("publications")
 }
 
 fn publication_path(project: &Project, key: &str) -> PathBuf {
@@ -388,74 +382,12 @@ pub(crate) struct NewAsk {
     pub(crate) reask: Option<String>,
 }
 
-fn check_structured(project: &Project, new: &NewAsk) -> Result<()> {
-    if !(2..=4).contains(&new.choices.len()) {
-        bail!(
-            "ask_choice_count: an ask takes two to four choices, got {}",
-            new.choices.len()
-        );
-    }
-    let g = glossary::registry(project);
-    let mut problems = Vec::new();
-    let r = plain::check(&new.question, &g);
-    if !r.passed() {
-        problems.push(format!("question: {}", format_check(&new.question, &r)));
-    }
-    for (i, choice) in new.choices.iter().enumerate() {
-        let r = plain::check(choice, &g);
-        if !r.passed() {
-            problems.push(format!("choice {}: {}", i + 1, format_check(choice, &r)));
-        }
-    }
-    for (text, violation) in plain::check_question_form(&new.question, &new.choices, &g) {
-        problems.push(format!(
-            "{}: \"{text}\": {}",
-            violation.rule.code(),
-            violation.fix
-        ));
-    }
-    for (field, value) in [("what", &new.what), ("means", &new.means)] {
-        if let Some(value) = value {
-            problems.extend(say_problems(field, value, &g));
-        }
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(crate::refusal::error(format!(
-            "plain_refused:\n{}",
-            problems.join("\n")
-        )))
-    }
-}
-
-/// R7 on an envelope field, then R1 to R5 on its text.
-fn say_problems(field: &str, value: &str, g: &plain::Glossary) -> Vec<String> {
-    if value.trim().is_empty() {
-        return vec![format!(
-            "plain_envelope: required envelope field {field} is missing or empty"
-        )];
-    }
-    let r = plain::check(value, g);
-    if r.passed() {
-        Vec::new()
-    } else {
-        vec![format!("{field}: {}", format_check(value, &r))]
-    }
-}
-
 /// `ha ask`: validate, write the immutable record, only then publish.
 pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let project = Project::load(&ctx.root, slug)?;
-    check_structured(&project, &new)?;
-    // The board line is checked before anything is recorded: a record whose
-    // line can never pass would be retried by the ticker forever.
-    let compact = compact_line(&Ask {
-        question: new.question.trim().to_string(),
-        choices: new.choices.clone(),
-        ..Ask::default()
-    });
-    glossary::gate(&project, &compact).context("the compact board line failed the check")?;
+    if !(2..=4).contains(&new.choices.len()) {
+        bail!("ask_choice_count: an ask takes two to four choices");
+    }
     let binding = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
     let record = {
         let _lock = project.lock()?;
@@ -509,10 +441,7 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
         revision: record.revision,
     };
     match publish(ctx, &project, &message) {
-        Ok(_) => crate::hook::record_receipt(
-            &project,
-            &format!("ask:{}@{}", record.id, record.revision),
-        )?,
+        Ok(_) => {}
         Err(e) => {
             eprintln!("note: the ask is recorded; publication will be retried by the ticker: {e:#}")
         }
@@ -652,7 +581,6 @@ pub(crate) fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Res
             landed_round: None,
         },
     )?;
-    crate::hook::record_receipt(&project, &format!("say:{id}"))?;
     Ok(id)
 }
 
@@ -678,7 +606,6 @@ pub(crate) fn say_landed(
             landed_round: Some(round.to_string()),
         },
     )?;
-    crate::hook::record_receipt(&project, &format!("say:{id}"))?;
     Ok(id)
 }
 
@@ -713,12 +640,7 @@ pub(crate) struct Published {
 
 /// Resolves one stored ask revision for publication: known, latest,
 /// unanswered, not withdrawn, and still passing the check.
-pub(crate) fn open_revision(
-    project: &Project,
-    id: &str,
-    revision: u32,
-    g: &crate::plain::Glossary,
-) -> Result<Ask> {
+pub(crate) fn open_revision(project: &Project, id: &str, revision: u32) -> Result<Ask> {
     let latest = latest_revision(project, id);
     let record = load_revision(project, id, revision)?
         .with_context(|| format!("ask_unknown: `{id}` revision {revision} does not exist"))?;
@@ -730,12 +652,6 @@ pub(crate) fn open_revision(
     }
     if answer_of(project, id, revision).is_some() {
         bail!("ask_closed: `{id}` revision {revision} is answered");
-    }
-    let checked = plain::check_ask(&record.question, &record.choices, g);
-    if !checked.passed() {
-        return Err(crate::refusal::error(
-            "plain_refused: the stored question no longer passes the check",
-        ));
     }
     Ok(record)
 }
@@ -773,31 +689,8 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     if let HumanMessage::Notice { id } = msg {
         return publish_notice_keyed(ctx, project, id, None);
     }
-    let g = glossary::registry(project);
-    let mut problems = Vec::new();
-    match msg {
-        HumanMessage::Say { what, means, .. } => {
-            problems.extend(say_problems("what", what, &g));
-            if let Some(means) = means {
-                problems.extend(say_problems("means", means, &g));
-            }
-        }
-        HumanMessage::Ask { .. } => {
-            for violation in plain::check_message(msg, &g).violations {
-                problems.push(format!("{}: {}", violation.rule.code(), violation.fix));
-            }
-        }
-        HumanMessage::Notice { .. } => unreachable!(),
-    }
-    if !problems.is_empty() {
-        return Err(crate::refusal::error(format!(
-            "plain_refused:\n{}",
-            problems.join("\n")
-        )));
-    }
-
     let ask_record = match msg {
-        HumanMessage::Ask { id, revision } => Some(open_revision(project, id, *revision, &g)?),
+        HumanMessage::Ask { id, revision } => Some(open_revision(project, id, *revision)?),
         HumanMessage::Say { landed_round, .. } => {
             if let Some(round) = landed_round {
                 let merged = crate::round::read_merge(project, round)?
@@ -815,7 +708,6 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
         (HumanMessage::Ask { .. }, Some(record)) => compact_line(record),
         _ => unreachable!(),
     };
-    glossary::gate(project, &board_value).context("the board line failed the check")?;
 
     // Ask closure and all publication retries serialize with one another.
     let _ask_set = matches!(msg, HumanMessage::Ask { .. })
@@ -824,7 +716,7 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     if let HumanMessage::Ask { id, revision } = msg {
         // Recheck after taking the ask-set lock so answer or withdrawal cannot
         // race the board and notification sinks.
-        open_revision(project, id, *revision, &g)?;
+        open_revision(project, id, *revision)?;
     }
     let _publication = publication_lock(project)?;
     let key = publication_key(msg)?;
@@ -931,28 +823,20 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
 }
 
 pub(crate) fn publish_notice_keyed(
-    ctx: &Ctx,
+    _ctx: &Ctx,
     project: &Project,
     id: &str,
     key: Option<&str>,
 ) -> Result<Published> {
-    let text =
-        notice_text(id).with_context(|| format!("notice_unknown: `{id}` is not a fixed notice"))?;
-    glossary::gate(project, text)?;
+    notice_text(id).with_context(|| format!("notice_unknown: `{id}` is not a fixed notice"))?;
     let seq = crate::talk::append(
         project,
         key,
         crate::talk::Entry::Notice { id: id.to_string() },
     )?;
-    let mut board = false;
-    if id == "plain_exhausted" {
-        let line = board_line(text, 80);
-        board = crate::board::publish_value(ctx, project, "ade_last", &line).is_ok();
-        crate::board::remember_last(project, &line);
-    }
     Ok(Published {
         seq,
-        board,
+        board: false,
         notified: false,
     })
 }
@@ -960,9 +844,6 @@ pub(crate) fn publish_notice_keyed(
 /// A plugin notification whose title and body are checked texts.
 fn notify(ctx: &Ctx, project: &Project, title: &str, body: &str) -> bool {
     let body = format!("{body}0. {NOT_UNDERSTOOD}");
-    if glossary::gate(project, title).is_err() || glossary::gate(project, &body).is_err() {
-        return false;
-    }
     let Some(coord) = project.coordinator().filter(|c| !c.socket.is_empty()) else {
         return false;
     };
@@ -1032,89 +913,6 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect()
-    }
-
-    #[test]
-    fn every_fixed_notice_and_the_standing_choice_pass_the_check() {
-        let g = plain::Glossary::default();
-        for (id, text) in NOTICES {
-            let r = plain::check(text, &g);
-            assert!(r.passed(), "{id}: {}", format_check(text, &r));
-        }
-        let r = plain::check(NOT_UNDERSTOOD, &g);
-        assert!(r.passed(), "{}", format_check(NOT_UNDERSTOOD, &r));
-    }
-
-    #[test]
-    fn a_term_as_a_choice_is_refused_and_nothing_is_recorded() {
-        let fx = fixture();
-        let e = ask(
-            &fx.world.ctx(),
-            "demo",
-            NewAsk {
-                question: "F-cap criterion?".into(),
-                choices: vec!["F-cap".into(), "no".into()],
-                ..keep_or_stop()
-            },
-        )
-        .unwrap_err();
-        let e = format!("{e:#}");
-        assert!(
-            e.starts_with("plain_refused") && e.contains("plain_question_form"),
-            "{e}"
-        );
-        assert!(open_asks(&fx.project).is_empty());
-        assert!(!crate::talk::journal_path(&fx.project).exists());
-    }
-
-    #[test]
-    fn ordinary_make_and_leave_choices_pass_and_a_verbless_fragment_fails() {
-        let fx = fixture();
-        let question = "The tool update wants three changes to your project settings. May I make these changes?";
-        let accepted = match ask(
-            &fx.world.ctx(),
-            "demo",
-            NewAsk {
-                question: question.into(),
-                choices: vec![
-                    "I will make the three changes to your project settings.".into(),
-                    "I will leave your project settings exactly as they are.".into(),
-                ],
-                ..keep_or_stop()
-            },
-        ) {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                let error = format!("{error:#}");
-                assert!(
-                    error.contains("plain_question_form: \"I will leave your project settings exactly as they are.\""),
-                    "{error}"
-                );
-                panic!("the ordinary leave choice was refused: {error}");
-            }
-        };
-        assert_eq!(accepted.choices.len(), 2);
-
-        let error = ask(
-            &fx.world.ctx(),
-            "demo",
-            NewAsk {
-                question: question.into(),
-                choices: vec![
-                    "I make changes to your setting.".into(),
-                    "Three changes to your settings.".into(),
-                ],
-                ..keep_or_stop()
-            },
-        )
-        .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains(
-                "plain_question_form: \"Three changes to your settings.\": each choice must be a sentence with a verb"
-            ),
-            "{error}"
-        );
     }
 
     #[test]
@@ -1317,42 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn say_refuses_a_sha_and_a_bare_name_and_appends_nothing() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        let e = format!(
-            "{:#}",
-            say(&ctx, "demo", "The lane landed at 3f9a2c1d.", None).unwrap_err()
-        );
-        assert!(
-            e.contains("plain_identifier") && e.contains("3f9a2c1d"),
-            "{e}"
-        );
-        let (id, _) = fx.lane(1);
-        let error = say(&ctx, "demo", &format!("The lane {id} is done."), None).unwrap_err();
-        assert!(crate::refusal::is(&error));
-        let e = format!("{error:#}");
-        assert!(e.starts_with("plain_refused") && e.contains(&id), "{e}");
-        let e = format!("{:#}", say(&ctx, "demo", "", None).unwrap_err());
-        assert!(e.contains("plain_envelope"), "{e}");
-        assert!(crate::talk::read(&fx.project).lines.is_empty());
-        say(
-            &ctx,
-            "demo",
-            "The first lane is done.",
-            Some("You can read its report now."),
-        )
-        .unwrap();
-        assert_eq!(journal_kinds(&fx.project), ["say"]);
-        assert!(
-            fx.world
-                .runner
-                .count("--token ade_last=The first lane is done.")
-                == 1
-        );
-    }
-
-    #[test]
     fn say_refuses_the_previous_line_with_the_same_what_and_means() {
         let fx = fixture();
         let ctx = fx.world.ctx();
@@ -1423,178 +1185,11 @@ mod tests {
             &fx.world.ctx(),
             &fx.project,
             &HumanMessage::Notice {
-                id: "plain_exhausted".into(),
+                id: "journal_tail".into(),
             },
         )
         .unwrap();
-        assert!(
-            p.board,
-            "the exhausted-budget notice also goes to the board"
-        );
-        assert!(
-            fx.world
-                .runner
-                .count("--token ade_last=The coordinator could not say this in plain words.")
-                == 1
-        );
-    }
-
-    #[test]
-    fn board_refuses_a_failing_value_and_keeps_the_old_one() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        crate::board::publish_value(&ctx, &fx.project, "ade_last", "The first lane is done.")
-            .unwrap();
-        let before = fx.world.runner.count("workspace report-metadata");
-        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", "run cargo_test now")
-            .unwrap_err();
-        assert!(format!("{e:#}").contains("plain_identifier"));
-        let e = crate::board::publish_value(&ctx, &fx.project, "ade_last", &"word ".repeat(20))
-            .unwrap_err();
-        assert!(format!("{e:#}").contains("at most 80"));
-        assert_eq!(
-            fx.world.runner.count("workspace report-metadata"),
-            before,
-            "nothing was sent"
-        );
-        assert_eq!(
-            crate::board::state(&fx.project).values["ade_last"],
-            "The first lane is done."
-        );
-    }
-
-    #[test]
-    fn board_templates_pass_the_check_and_carry_no_registry_name() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some("The first round lands the shared types.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        let (a, sha) = fx.lane(1);
-        let (b, _) = fx.lane(2);
-        crate::round::admit(&ctx, "demo", "r1", &a).unwrap();
-        crate::round::admit(&ctx, "demo", "r1", &b).unwrap();
-        fx.seal_done(&a, 1, 1, &sha, "report\n");
-        fx.seal_waiting(&b, 1, 1, "need a look");
-        crate::round::tick(&ctx, &fx.project).unwrap();
-        ask(&ctx, "demo", keep_or_stop()).unwrap();
-        let values = crate::board::compute(&ctx, &fx.project);
-        let g = glossary::registry(&fx.project);
-        for (k, v) in &values {
-            crate::board::check_value(&fx.project, v).unwrap_or_else(|e| panic!("{k}={v}: {e:#}"));
-            for name in g.names.keys() {
-                assert!(!v.contains(name.as_str()), "{k}={v} carries {name}");
-            }
-        }
-        let get = |k: &str| values.iter().find(|(key, _)| key == k).unwrap().1.clone();
-        assert_eq!(
-            get("ade_stage"),
-            "round 1 has 1 lanes working. The first round lands the shared types."
-        );
-        assert_eq!(
-            get("ade_lanes"),
-            "0 working, 1 done, 1 waiting for you, 0 stuck, 0 unknown"
-        );
-        assert_eq!(
-            get("ade_needs_you"),
-            "keep the experiment running another hour? (2 choices)"
-        );
-        assert!(crate::board::refresh(&ctx, &fx.project).unwrap().is_empty());
-        // Review defect: a gloss-form name passed the check onto the board.
-        crate::thread::update(&fx.project, &a, |t| {
-            t.plain = "The lane that renames the parts.".into()
-        })
-        .unwrap();
-        let glossed = format!("The lane that renames the parts ({a}).");
-        glossary::gate(&fx.project, &glossed).unwrap();
-        let e = format!(
-            "{:#}",
-            crate::board::check_value(&fx.project, &glossed).unwrap_err()
-        );
-        assert!(e.contains("names"), "{e}");
-    }
-
-    #[test]
-    fn names_are_born_with_a_sentence_and_listed_in_the_glossary() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        let e = format!(
-            "{:#}",
-            glossary::add_term(&ctx, "demo", "quotient", None, None, false).unwrap_err()
-        );
-        assert!(e.starts_with("plain_missing"), "{e}");
-        glossary::add_term(
-            &ctx,
-            "demo",
-            "quotient",
-            Some("The smaller model that keeps the same answers."),
-            Some("tasks/spec.md"),
-            false,
-        )
-        .unwrap();
-        let e = format!(
-            "{:#}",
-            glossary::add_term(
-                &ctx,
-                "demo",
-                "quotient",
-                Some("Another sentence for it."),
-                None,
-                false,
-            )
-            .unwrap_err()
-        );
-        assert!(e.starts_with("term_exists"), "{e}");
-        glossary::add_term(&ctx, "demo", "Custombrand", None, None, true).unwrap();
-        assert!(glossary::gate(&fx.project, "Custombrand is here.").is_ok());
-        assert_eq!(
-            glossary::explain(&ctx, "demo", "Custombrand").unwrap(),
-            "Custombrand: familiar name\n(terms.toml)\n"
-        );
-        for name in ["t-0292", "config.toml", "snake_case", "~/projects/demo"] {
-            assert!(glossary::add_term(&ctx, "demo", name, None, None, true).is_err());
-        }
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some("The first round lands the shared types.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        // A branch named "main" must not forbid ordinary words in a birth sentence.
-        glossary::check_birth(&fx.project, "The main folder holds work.").unwrap();
-        assert!(!fx.project.dir().join("GLOSSARY.md").exists());
-        assert_eq!(
-            glossary::explain(&ctx, "demo", "quotient").unwrap(),
-            "quotient: The smaller model that keeps the same answers.\n(tasks/spec.md)\n"
-        );
-        assert_eq!(
-            glossary::explain(&ctx, "demo", "r1").unwrap(),
-            "r1: The first round lands the shared types.\n(.state/rounds/r1.toml)\n"
-        );
-        assert!(
-            format!("{:#}", glossary::explain(&ctx, "demo", "nope").unwrap_err())
-                .starts_with("term_unknown")
-        );
-        // A registered name used bare fails R1; in gloss form it passes.
-        assert!(glossary::gate(&fx.project, "Work on r1 goes on.").is_err());
-        assert!(
-            glossary::gate(&fx.project, "The first round lands the shared types (r1).").is_ok()
-        );
-        // An invented sentence for a term fails R2.
-        assert!(glossary::gate(&fx.project, "The quotient is a thing.").is_err());
+        assert!(!p.board);
     }
 
     fn distinct_ask(n: usize) -> NewAsk {
@@ -1654,7 +1249,7 @@ mod tests {
             .to_string()
             .starts_with("ask_withdrawn")
         );
-        assert!(open_revision(&fx.project, &a.id, 1, &glossary::registry(&fx.project)).is_err());
+        assert!(open_revision(&fx.project, &a.id, 1).is_err());
         assert!(withdraw(&ctx, "demo", &a.id, "Again.", "rolf").is_err());
         // A withdrawn question does not prevent a genuinely new card.
         ask(&ctx, "demo", distinct_ask(1)).unwrap();

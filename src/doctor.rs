@@ -173,13 +173,6 @@ impl Runner for Timings<'_> {
         }
         results
     }
-
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-        let start = Instant::now();
-        let result = self.inner.socket_request(socket, line, timeout);
-        self.command("herdr socket", start.elapsed());
-        result
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
