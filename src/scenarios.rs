@@ -1384,11 +1384,13 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
         t.base = "brief-sha".into();
     });
     std::fs::create_dir_all(&lane.thread_dir).unwrap();
-    let report = "report only ![a](figma/a.png) [notes](notes/b.md) <img src=figma/x.png>\n";
+    let report = "report only ![a](figma/a.png) [notes](notes/b.md) <img src=figma/x.png> <source srcset=\"data:image/png;base64,AAAA 1x, figma/small.webp 2x, figma/large.webp 3x\">\n";
     for (name, bytes) in [
         ("figma/a.png", "png"),
         ("notes/b.md", "notes"),
         ("figma/x.png", "image"),
+        ("figma/small.webp", "small"),
+        ("figma/large.webp", "large"),
     ] {
         let path = Path::new(&lane.thread_dir).join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1477,6 +1479,8 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
         ("figma/a.png", "png"),
         ("notes/b.md", "notes"),
         ("figma/x.png", "image"),
+        ("figma/small.webp", "small"),
+        ("figma/large.webp", "large"),
     ] {
         let hash = thread::sha256_hex(bytes.as_bytes());
         assert!(!rewritten.contains(name));

@@ -3201,6 +3201,54 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut found = Vec::new();
     let mut i = 0;
     while i + 2 < bytes.len() {
+        // srcset is a list of image URLs, each with an optional descriptor.
+        // Treat every URL as a link, not the entire attribute as one path.
+        if bytes[i..].starts_with(b"srcset=") {
+            let mut start = i + b"srcset=".len();
+            let quote = match bytes.get(start) {
+                Some(b'\'' | b'"') => {
+                    let quote = bytes[start];
+                    start += 1;
+                    Some(quote)
+                }
+                _ => None,
+            };
+            let mut end = start;
+            while end < bytes.len()
+                && bytes[end] != b'\n'
+                && bytes[end] != b'\r'
+                && quote.is_none_or(|q| bytes[end] != q)
+                && (quote.is_some() || !matches!(bytes[end], b' ' | b'\t' | b'>'))
+            {
+                end += 1;
+            }
+            let mut pos = start;
+            while pos < end {
+                while pos < end && matches!(bytes[pos], b' ' | b'\t' | b',') {
+                    pos += 1;
+                }
+                let url_start = pos;
+                let data_url = bytes[pos..end].starts_with(b"data:");
+                while pos < end
+                    && !matches!(bytes[pos], b' ' | b'\t')
+                    && (data_url || bytes[pos] != b',')
+                {
+                    pos += 1;
+                }
+                if pos > url_start
+                    && report.is_char_boundary(url_start)
+                    && report.is_char_boundary(pos)
+                {
+                    found.push((url_start..pos, report[url_start..pos].to_string()));
+                }
+                // Ignore the resolution descriptor, then find the next URL.
+                while pos < end && bytes[pos] != b',' {
+                    pos += 1;
+                }
+            }
+            i = end;
+            continue;
+        }
         // Inline links/images and reference definitions: [text](path),
         // ![alt](path), and [label]: path. Preserve titles and fragments.
         let html = [b"src=".as_slice(), b"href=".as_slice()]
