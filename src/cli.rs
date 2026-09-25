@@ -2756,8 +2756,17 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 };
                 crate::output::insert("machine", machine);
                 crate::output::insert("placement_reason", thread.placement_reason.clone());
+                if thread.queued_for_load {
+                    crate::output::set_outcome("queued");
+                    crate::output::insert("queued", true);
+                }
                 let installing = crate::harness::install_in_progress(&ctx.config_dir);
                 let mut result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
+                if thread.queued_for_load {
+                    result["queued"] = true.into();
+                    result["note"] =
+                        format!("the lane is queued on {machine} until its load drops").into();
+                }
                 if installing {
                     let note =
                         "the lane is recorded and launches when the harness install finishes";
