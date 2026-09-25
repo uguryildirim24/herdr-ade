@@ -1096,19 +1096,40 @@ fn thread_pass(
             && ready
             && (!t.is_remote() || !thread::load(project, &t.id)?.checked_slice.is_empty())
         {
-            match herdr.agent_prompt_wait_started(
-                &t.pane_id,
-                &thread::launch_prompt(prefix, slug, t),
-                agent_start_timeout(&t.launch),
-            ) {
-                Ok(()) => {
-                    delivered = true;
-                    thread::update(project, &t.id, |thread| thread.prompt_pending = false)?;
-                }
-                Err(error) => {
-                    pass.error = pass
-                        .error
-                        .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+            // The CLI and ticker can observe the same ready agent. Serialize
+            // the first prompt and recheck its attempt before either sends it.
+            let lock_path = project.state_dir().join(format!("brief-{}.lock", t.id));
+            let lock = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(lock_path)?;
+            lock.lock()?;
+            let current = thread::load(project, &t.id)?;
+            if current.attempt == t.attempt
+                && current.pane_id == t.pane_id
+                && current.status == thread::Status::Open
+                && current.prompt_pending
+            {
+                match herdr.agent_prompt_wait_started(
+                    &t.pane_id,
+                    &thread::launch_prompt(prefix, slug, &current),
+                    agent_start_timeout(&t.launch),
+                ) {
+                    Ok(()) => {
+                        delivered = true;
+                        thread::update_checked(project, &t.id, |record| {
+                            if record.attempt == current.attempt && record.pane_id == current.pane_id {
+                                record.prompt_pending = false;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    Err(error) => {
+                        pass.error = pass
+                            .error
+                            .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+                    }
                 }
             }
         } else if !t.prompt_pending && t.bootstrap == "acknowledged" && ready {
@@ -1369,7 +1390,11 @@ fn box_agent_process(
 /// courier pass. The periodic path still owns unfinished startup and retries.
 pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
     let lane = thread::load(project, id)?;
-    if lane.status != thread::Status::Open || !lane.prompt_pending || lane.queued_for_load {
+    if lane.status != thread::Status::Open
+        || !lane.prompt_pending
+        || lane.queued_for_load
+        || install_in_progress(ctx)
+    {
         return Ok(());
     }
     let socket = project
@@ -1380,7 +1405,11 @@ pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Resul
     let remote = herdr.on_machine(lane.machine_route());
     let agents = remote.agent_list()?;
     let panes = remote.pane_list()?;
-    if !panes.iter().any(|pane| thread::pane_matches(&lane, pane)) {
+    if !panes.iter().any(|pane| {
+        pane.pane_id == lane.pane_id
+            && pane.tab_id == lane.tab_id
+            && pane.workspace_id == lane.workspace_id
+    }) {
         // A newly created tab may not appear in the server's list yet.
         // Leave its pending launch for the next observation.
         return Ok(());
@@ -1637,7 +1666,8 @@ fn launch_pass(
                 record.tab_id = bound.tab_id.clone();
                 record.pane_id = bound.pane_id.clone();
                 record.cwd = bound.cwd.clone();
-                record.startup_wait_started.clear();
+                // Keep the launch claim until the ready pass observes the agent.
+                // Registration can precede exec, especially on a remote box.
                 thread::bind_identity(record, &socket, &bound, process);
             })?;
             if !t.launch.compact_reason.is_empty() {
