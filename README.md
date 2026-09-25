@@ -44,7 +44,7 @@ Say what you want once. The coordinator starts the threads the work needs and te
 
 ### 💬 Know when a thread needs an answer
 
-A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. A background ticker follows pull requests and runs your scheduled routines. The coordinator reads thread, round, and courier event facts directly; its inbox holds messages such as routine runs, not copies of those facts.
+A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. A background ticker follows pull requests. The coordinator reads thread, round, and courier event facts directly; its inbox holds messages, not copies of those facts.
 
 ## Open your first project in three steps
 
@@ -60,7 +60,7 @@ A thread that waits on a permission prompt for more than 30 seconds moves to Wai
 
 <table align="center">
 <tr>
-<td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; A coordinator that delegates and never does the work itself<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Overview by what needs you, in the sidebar and as text<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Pull request follow-up, routines and watched commands<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
+<td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; A coordinator that delegates and never does the work itself<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Overview by what needs you, in the sidebar and as text<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Pull request follow-up<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
 </tr>
 <tr>
 <td align="center"><a href="https://github.com/uguryildirim24/herdr-ade/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></td>
@@ -85,7 +85,7 @@ The command checks the Herdr version, the tools it calls, the ticker, and each p
 
 ### What permissions does the coordinator need?
 
-It runs the `herdr-ade` binary every turn, so you'll want to allow-list it in your agent **by subcommand, never the bare binary**. Allow reading and steering (`skill`, `context`, `inbox done`, `thread list`, `thread prompt` and the like) and leave `thread resolve`, `delete`, `routine approve` and `open` on your agent's normal permission prompt. Allow `thread start` for the default `auto` mode. Leave it off only when you've set `start_threads = "propose"`, so each proposed start gets a real confirmation. [Operations](docs/operations.md#the-allow-list-for-your-coordinator) has the exact patterns.
+It runs the `herdr-ade` binary every turn, so you'll want to allow-list it in your agent **by subcommand, never the bare binary**. Allow reading and steering (`skill`, `context`, `inbox done`, `thread list`, `thread prompt` and the like) and leave `thread resolve`, `delete` and `open` on your agent's normal permission prompt. Allow `thread start` when you want it to start work without a permission prompt. [Operations](docs/operations.md#the-allow-list-for-your-coordinator) has the exact patterns.
 
 ### Does the plugin send my project to a hosted service?
 
@@ -97,19 +97,15 @@ A lane never merges into the integration branch on its own. On a box, `ha done` 
 
 ### What is `--plain`?
 
-An internal birth sentence. `thread start --job` uses the stable task's title as that sentence; pass `--plain` only when this lane is genuinely different. `thread adopt` still requires it. It must be one sentence, but it keeps exact technical detail without vocabulary or length checks. Technical views wrap or collapse long rows. Recipe choice normally comes from the editable `[routing]` table in `config.toml`; `context` lists every recipe and its exact route. `thread start` rejects model and role flags. Only a model Rolf explicitly names may use `--recipe`, together with `--basis` quoting his request on the task. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing).
+An internal birth sentence. `thread start --job` uses the stable task's title as that sentence; pass `--plain` only when this lane is genuinely different. `thread adopt` still requires it. It keeps exact technical detail without vocabulary or length checks. Technical views wrap or collapse long rows. Recipe choice normally comes from the editable `[routing]` table in `config.toml`; `context` lists every recipe and its exact route. `thread start` rejects model and role flags. Only a model Rolf explicitly names may use `--recipe`, together with `--basis` quoting his request on the task. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing).
 
 ### Where does my project live?
 
-In `~/.herdr-ade/<name>/` by default: `PROJECT.md` is the one current page. Its front matter holds hand-editable settings; the binary rebuilds its short body from machine records under `.state/`. Files made for you stay visible under `library/`. The safety settings live outside the project in `~/.config/herdr-ade/config.toml`. [Operations](docs/operations.md#where-things-live) lists the records.
+In `~/.herdr-ade/<name>/` by default: `PROJECT.md` is the one current page. Its front matter holds hand-editable settings; the binary rebuilds its short body from machine records under `.state/`. Files made for you stay visible under `library/`. [Operations](docs/operations.md#where-things-live) lists the records.
 
 ### Do I have to start every thread through the coordinator?
 
 No. Run `herdr-ade thread start` yourself, or take an agent pane you already started and make it a thread with `thread adopt`. The **Projects: continue this workspace as a project** action turns the workspace you're in into a project with its agent as the first thread.
-
-### What if the safety settings aren't enough?
-
-They are soft. By default the coordinator starts needed threads, thread agents keep their normal permission prompts, and routines may not run shell commands until you enable them and approve each command in a terminal. But agents have a shell: one that runs with skip-permission arguments can edit those files, a thread can prompt the coordinator pretending to be you, an approved routine command covers its text and not the scripts it calls, and whatever reaches memory is repeated in every later brief. [Operations](docs/operations.md#what-the-safety-settings-do-and-dont-stop) says plainly what each guard stops and what it doesn't.
 
 ### What does it cost?
 

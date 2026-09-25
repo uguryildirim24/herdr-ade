@@ -399,8 +399,6 @@ pub(crate) fn skill_text(role: &str) -> &'static str {
     match role {
         "coordinator" => include_str!("../skill/COORDINATOR.md"),
         "reviewer" => include_str!("../skill/REVIEWER.md"),
-        "critic" => include_str!("../skill/CRITIC.md"),
-        "drafter" => include_str!("../skill/DRAFTER.md"),
         "pickup" => include_str!("../skill/PICKUP.md"),
         _ => include_str!("../skill/LANE.md"),
     }

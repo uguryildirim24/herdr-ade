@@ -1061,13 +1061,4 @@ mod tests {
         );
         assert_eq!(read(&fx.project).lines.len(), 1);
     }
-
-    #[test]
-    fn an_unchecked_say_is_not_appended() {
-        let fx = fixture();
-        assert!(
-            crate::ask::say(&fx.world.ctx(), "demo", "Run the zorbulate gate now.", None).is_err()
-        );
-        assert!(!journal_path(&fx.project).exists());
-    }
 }

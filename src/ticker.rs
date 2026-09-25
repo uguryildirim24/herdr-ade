@@ -2131,7 +2131,7 @@ fn clean_managed_project_tabs(
 }
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
-/// routines and housekeeping.
+/// housekeeping.
 #[cfg(test)]
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     tick_slow_with_steps(ctx, project, seen, memory, &mut |_| true).0
@@ -2289,26 +2289,6 @@ fn tick_slow_with_steps(
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
     stop_after_state!("pull requests");
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
-    stop_after_state!("routines");
-    let zoned = jiff::Zoned::now();
-    match project.read_project_md() {
-        Ok((_settings, _)) => {
-            let commands = project
-                .safety(&ctx.config_dir)
-                .map(|s| s.routine_commands)
-                .unwrap_or(false);
-            errors.extend(steps::routines(
-                ctx, project, &mut state, commands, None, &zoned,
-            ));
-        }
-        Err(error) => {
-            let text = std::fs::read(project.project_md()).unwrap_or_default();
-            let problem = Some((thread::sha256_hex(&text), format!("{error:#}")));
-            errors.extend(steps::routines(
-                ctx, project, &mut state, false, problem, &zoned,
-            ));
-        }
-    }
     // D5 recovery and delivery (X1 to X5), then rounds, asks and the
     // board (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.
@@ -3415,14 +3395,6 @@ mod tests {
                     }
                 }
                 self.fake.run(cmd)
-            }
-            fn socket_request(
-                &self,
-                socket: &Path,
-                line: &str,
-                timeout: Duration,
-            ) -> Result<String> {
-                self.fake.socket_request(socket, line, timeout)
             }
         }
         let fixture = fixture(false);

@@ -15,52 +15,7 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn decide_reports_its_classes_and_all_missing_class_requirements() {
-    let run = |args: &[&str]| Command::new(BIN).args(args).output().unwrap();
-
-    let help = run(&["decide", "--help"]);
-    assert!(help.status.success());
-    let help = String::from_utf8(help.stdout).unwrap();
-    for (class, meaning) in [
-        ("what-you-get", "taste, direction, or the result"),
-        ("money", "spend money"),
-        ("undo", "cannot be undone"),
-        ("routine", "ordinary choice"),
-    ] {
-        let line = help.lines().find(|line| line.contains(class)).unwrap();
-        assert!(line.contains(meaning), "{line}");
-    }
-    assert!(
-        help.contains("what-you-get, money, undo, routine"),
-        "{help}"
-    );
-
-    let wrong = run(&["decide", "--class", "unknown"]);
-    assert!(!wrong.status.success());
-    let wrong = String::from_utf8(wrong.stderr).unwrap();
-    assert!(
-        wrong.contains("possible values: what-you-get, money, undo, routine"),
-        "{wrong}"
-    );
-
-    let no_class = run(&["decide"]);
-    assert!(!no_class.status.success());
-    let no_class = String::from_utf8(no_class.stderr).unwrap();
-    assert!(no_class.contains("a decision line"), "{no_class}");
-    assert!(
-        no_class.contains("what-you-get, money, undo, or routine"),
-        "{no_class}"
-    );
-
-    let no_basis = run(&["decide", "--class", "what-you-get"]);
-    assert!(!no_basis.status.success());
-    let no_basis = String::from_utf8(no_basis.stderr).unwrap();
-    assert!(no_basis.contains("a decision line"), "{no_basis}");
-    assert!(no_basis.contains("; --basis"), "{no_basis}");
-}
-
-#[test]
-fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
+fn withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
     let run = |args: &[&str]| {
@@ -74,35 +29,6 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
             .unwrap()
     };
     assert!(run(&["new", "demo"]).status.success());
-    assert!(
-        run(&[
-            "decide",
-            "demo",
-            "I kept the words short.",
-            "--class",
-            "routine",
-        ])
-        .status
-        .success()
-    );
-    let overturned = run(&[
-        "decide",
-        "overturn",
-        "demo",
-        "d-0001",
-        "I want more detail.",
-    ]);
-    assert!(
-        overturned.status.success(),
-        "{}",
-        String::from_utf8_lossy(&overturned.stderr)
-    );
-    assert!(String::from_utf8_lossy(&overturned.stdout).contains("overturned by rolf"));
-    assert!(
-        !run(&["decide", "overturn", "demo", "d-9999", "No thanks.",])
-            .status
-            .success()
-    );
     let ask_args = [
         "ask",
         "demo",
@@ -147,7 +73,7 @@ fn overturn_and_withdraw_commands_keep_history_and_ask_output_starts_with_id() {
 }
 
 #[test]
-fn notes_decisions_and_tasks_accept_a_request_from_another_project() {
+fn notes_and_tasks_accept_a_request_from_another_project() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
     let root_arg = root.to_str().unwrap();
@@ -186,15 +112,6 @@ fn notes_decisions_and_tasks_accept_a_request_from_another_project() {
         "source/q-cross",
     ]);
     run(&[
-        "decide",
-        "demo",
-        "I will keep the overnight direction in the project record.",
-        "--class",
-        "what-you-get",
-        "--basis",
-        "request:source/q-cross",
-    ]);
-    run(&[
         "task",
         "add",
         "demo",
@@ -207,13 +124,8 @@ fn notes_decisions_and_tasks_accept_a_request_from_another_project() {
     ]);
 
     let notes = std::fs::read_to_string(root.join("demo/.state/notes.jsonl")).unwrap();
-    let decisions = std::fs::read_to_string(root.join("demo/.state/decisions.jsonl")).unwrap();
     let task = std::fs::read_to_string(root.join("demo/.state/tasks/job-0001.toml")).unwrap();
     assert!(notes.contains("\"request\":\"source/q-cross\""), "{notes}");
-    assert!(
-        decisions.contains("\"basis\":\"request:source/q-cross\""),
-        "{decisions}"
-    );
     assert!(task.contains("request:source/q-cross"), "{task}");
 
     let missing = hp(
@@ -370,10 +282,10 @@ fn peek_records_nothing_and_context_records_seen_items() {
             .status
             .success()
     );
-    let item = "+++\nid = \"20260917T000000Z-routine-r-1\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"x\"\nsummary = \"s\"\n+++\n";
+    let item = "+++\nid = \"20260917T000000Z-note-r-1\"\nkind = \"note\"\nsubject = \"r\"\ncreated = \"x\"\nsummary = \"s\"\n+++\n";
     std::fs::create_dir(root.join("demo/.state/inbox")).unwrap();
     std::fs::write(
-        root.join("demo/.state/inbox/20260917T000000Z-routine-r-1.md"),
+        root.join("demo/.state/inbox/20260917T000000Z-note-r-1.md"),
         item,
     )
     .unwrap();
@@ -393,11 +305,7 @@ fn peek_records_nothing_and_context_records_seen_items() {
             .status
             .success()
     );
-    assert!(
-        std::fs::read_to_string(&seen)
-            .unwrap()
-            .contains("routine-r-1")
-    );
+    assert!(std::fs::read_to_string(&seen).unwrap().contains("note-r-1"));
 }
 
 #[test]
@@ -556,7 +464,6 @@ fn every_named_verb_returns_a_structured_refusal() {
         &["round", "show", "missing", "r1"],
         &["thread", "show", "missing", "t-1"],
         &["ask"],
-        &["decide"],
         &["plan", "show", "missing"],
         &["say", "missing", "--what", "This was checked."],
         &["done", "--report", "report.md", "--sha", "deadbeef"],
