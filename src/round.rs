@@ -508,6 +508,12 @@ pub(crate) fn hold_for_follow_up(
                 if next_barrier.is_none() && existing_barrier.is_some() {
                     continue;
                 }
+                if record.verdict_kind.as_deref() == Some("REJECT") {
+                    record.previous_verdict = record.verdict.take();
+                    record.previous_verdict_kind = record.verdict_kind.take();
+                    record.previous_manifest_hash = record.manifest_hash.clone();
+                    record.previous_review_branch = record.review_branch.clone();
+                }
                 record.verdict = None;
                 record.verdict_kind = None;
                 record.reviewer_awaiting_report_after = next_barrier;
@@ -2113,6 +2119,28 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
                 thread: id.to_string(),
                 phase: current.phase,
             });
+        }
+        if verdict_kind == "REJECT" {
+            let previous = current.verdict.as_ref().or_else(|| {
+                (current.previous_verdict_kind.as_deref() == Some("REJECT"))
+                    .then_some(current.previous_verdict.as_ref())
+                    .flatten()
+            });
+            crate::branches::keep_rejected_fix(
+                ctx.runner,
+                &project,
+                &current.repo,
+                round,
+                &current
+                    .manifest
+                    .members
+                    .iter()
+                    .map(|m| m.thread.clone())
+                    .collect::<Vec<_>>(),
+                &pin.sha,
+                previous.map(|p| p.sha.as_str()),
+            )?;
+            current.rejections = Some(current.rejections.unwrap_or(0) + 1);
         }
         current.reviewer = Some(id.to_string());
         current.verdict = Some(pin);
@@ -3901,7 +3929,15 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         .map(|verdict| verdict.verdict)
         .context("verdict_unreadable: validated verdict disappeared")?;
     let changed = current.verdict.as_ref() != Some(&pin);
-    let previous = current.verdict.as_ref().map(|pin| pin.sha.clone());
+    let previous = current
+        .verdict
+        .as_ref()
+        .or_else(|| {
+            (current.previous_verdict_kind.as_deref() == Some("REJECT"))
+                .then_some(current.previous_verdict.as_ref())
+                .flatten()
+        })
+        .map(|pin| pin.sha.clone());
     current.verdict = Some(pin.clone());
     current.reviewer_awaiting_report_after = None;
     current.verdict_kind = Some(verdict_kind.clone());
@@ -8574,9 +8610,29 @@ mod tests {
         verdict_commit(&fx.project, &load(&fx.project, "r1").unwrap(), &git_repo).unwrap();
         let name = format!("review-fix/demo/r1/{}", lanes[0].0);
         assert_eq!(git(&fx.repo, &["rev-parse", &name]), fix);
+        // A second rejection in this same round must replace the owned fix,
+        // even after the first verdict moved to previous_verdict on follow-up.
+        let events = sealed_events(&fx.project).unwrap();
+        hold_for_follow_up(&ctx, &fx.project, &reviewer, &events).unwrap();
+        assert!(load(&fx.project, "r1").unwrap().verdict.is_none());
+        git(
+            &wt,
+            &["commit", "--allow-empty", "-qm", "second reviewer fix"],
+        );
+        let second = git(&wt, &["rev-parse", "HEAD"]);
+        let pending = load(&fx.project, "r1").unwrap();
+        fx.seal_done(
+            &reviewer,
+            1,
+            2,
+            &second,
+            &front("REJECT", "r1")(&second, &pending),
+        );
+        verdict_commit(&fx.project, &pending, &git_repo).unwrap();
+        assert_eq!(git(&fx.repo, &["rev-parse", &name]), second);
         git(&wt, &["checkout", "-q", "--detach"]);
         git(&fx.repo, &["branch", "-D", "review/r1"]);
-        assert_eq!(git(&fx.repo, &["rev-parse", &name]), fix);
+        assert_eq!(git(&fx.repo, &["rev-parse", &name]), second);
         let mut next = record.clone();
         next.round = "r2".into();
         save(&fx.project, &next).unwrap();
@@ -9159,6 +9215,19 @@ mod tests {
         let record = load(&fx.project, "r1").unwrap();
         assert_eq!(record.reviewer.as_deref(), Some(reviewer.as_str()));
         assert_eq!(record.phase, RoundPhase::VerdictIn);
+
+        // Adoption is another way to accept a rejection. It must publish the
+        // same durable correction ref as the normal verdict path.
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        let reviewer = adoptable_reviewer(&fx, &lanes, front("REJECT", "r1"), None);
+        adopt(&fx.world.ctx(), "demo", "r1", &reviewer).unwrap();
+        let rejected = load(&fx.project, "r1").unwrap();
+        let fix = format!("review-fix/demo/r1/{}", lanes[0].0);
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", &fix]),
+            rejected.verdict.unwrap().sha
+        );
     }
 
     /// A lane stays held through the merge intent and checkpoint, with no override.
