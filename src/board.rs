@@ -217,7 +217,17 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     let events = crate::round::sealed_events(project).unwrap_or_default();
     let mut out = Vec::new();
 
-    out.push(("ade_stage".to_string(), stage(project)));
+    out.push((
+        "ade_stage".to_string(),
+        if project
+            .coordinator()
+            .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
+        {
+            "coordinator closed by Rolf; ha open to reopen".to_string()
+        } else {
+            stage(project)
+        },
+    ));
 
     // ade_lanes: done and waiting from sealed events, working and stuck from
     // runtime state, as separate counts.
