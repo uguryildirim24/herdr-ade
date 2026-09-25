@@ -144,7 +144,7 @@ fn workspace_for(
 
 /// Is exactly `cwd` trusted in the lane Codex home?
 /// `[projects."<path>"] trust_level = "trusted"`. Codex trusts exact project
-/// paths only: a trusted ancestor such as `/Users/rolfie` does not cover a
+/// paths only: a trusted ancestor such as `/Users/agent` does not cover a
 /// subdirectory, so the check never walks up.
 pub(crate) fn trusted(env: &Env, cwd: &Path) -> bool {
     let config = env.lane_codex_home().join("config.toml");

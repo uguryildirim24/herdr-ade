@@ -645,7 +645,7 @@ mod tests {
         let box_bytes = bytes(&event).unwrap();
 
         assert_eq!(
-            import_box_event(&project, "oci", &box_bytes, Some(report)).unwrap(),
+            import_box_event(&project, "buildbox", &box_bytes, Some(report)).unwrap(),
             ImportOutcome::New
         );
         let imported = load(&project, &event.id).unwrap();
@@ -658,16 +658,21 @@ mod tests {
 
         // The exact replay is a no-op; changed bytes under the same id refuse.
         assert_eq!(
-            import_box_event(&project, "oci", &box_bytes, Some(report)).unwrap(),
+            import_box_event(&project, "buildbox", &box_bytes, Some(report)).unwrap(),
             ImportOutcome::Replay
         );
         let mut changed = event.clone();
         changed.created.push('x');
         assert!(
-            import_box_event(&project, "oci", &bytes(&changed).unwrap(), Some(report))
-                .unwrap_err()
-                .to_string()
-                .contains("event_conflict")
+            import_box_event(
+                &project,
+                "buildbox",
+                &bytes(&changed).unwrap(),
+                Some(report)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("event_conflict")
         );
     }
 
@@ -677,7 +682,7 @@ mod tests {
         let event = box_event("deadbeef");
         let box_bytes = bytes(&event).unwrap();
         assert!(
-            import_box_event(&project, "oci", &box_bytes, Some(b"other"))
+            import_box_event(&project, "buildbox", &box_bytes, Some(b"other"))
                 .unwrap_err()
                 .to_string()
                 .contains("artifact_mismatch")

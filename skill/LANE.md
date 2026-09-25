@@ -24,7 +24,7 @@ The command starts (or reuses) a picture lane on Codex's own backend, spends one
 When your approach fails, preserve the git folder and run:
 
 ```text
-hp failed "<what failed, what you tried, and the evidence>"
+ha failed "<what failed, what you tried, and the evidence>"
 ```
 
 This seals a `work_failed` event. The harness follows the matched routing rule's retries and ordered fallbacks while keeping the worktree. Provider and connection failures are classified by the harness and never switch model; a gone process restarts; missing evidence is reported as unknown and waits for the coordinator. Do not keep editing after sealing it. Use `waiting` for missing input, not for a failed approach.
@@ -36,20 +36,20 @@ Pass that same path to `done`: an absolute path or a path relative to the
 git folder is accepted, but the report must be a file inside that folder.
 
 ```text
-hp done --report <report path from the brief> --sha <commit sha>
+ha done --report <report path from the brief> --sha <commit sha>
 ```
 
 If you must stop for input, keep your work and run:
 
 ```text
-hp waiting "<what is missing>"
+ha waiting "<what is missing>"
 ```
 
 Both commands create a durable event. Do not type a separate DONE or WAITING line.
 
 ## On the cloud box
 
-A brief that says you run on the cloud box named `oci` runs on a saved machine, not on this Mac. The box's default-root command is `ha`; run the birth line's skill call first.
+A brief that says you run on a named cloud box runs on a saved machine, not on the home machine. The box's default-root command is `ha`; run the birth line's skill call first.
 
 - The code branch is pinned to an exact Mac commit. The frozen brief arrives separately in `.herdr-project/<project>-<id>/brief.md`; it is never committed to the code repository.
 - Every kind logs in once per machine. If your kind is not signed in on the box, stop and run `ha waiting "<kind> is not signed in on the box"`; never copy a Mac credential across.

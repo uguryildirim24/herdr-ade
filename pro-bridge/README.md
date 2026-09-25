@@ -6,9 +6,6 @@ sees a normal `codex` agent; the plugin feeds it a packet and collects the
 answer from the Codex rollout. It never runs a ChatGPT page, never writes
 `~/.codex`, and never drives a login.
 
-SPEC: `herdr/tasks/pro-bridge/SPEC-pro-bridge.md` v2 (on the fork branch
-`agent-parent-nesting`).
-
 ## Commands
 
 | command | who | what |
@@ -103,7 +100,7 @@ Build with the repo's own gate, then link this directory:
 
 ```bash
 cargo build --release --locked
-herdr plugin link /Users/rolfie/projects/herdr-ade/pro-bridge
+herdr plugin link "$(pwd)/pro-bridge"
 herdr-pro init
 ```
 

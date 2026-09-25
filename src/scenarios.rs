@@ -36,7 +36,7 @@ impl World {
         let root = home.path().join("root");
         let env = Env::for_test(home.path(), &[]);
         std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[machines.box]\ntarget = \"box\"\nsession = \"default\"\nhome = \"/home/ubuntu\"\nroot = \"/home/ubuntu/.herdr-ade\"\nworktrees = \"/home/ubuntu/projects\"\nbuild = \"/home/ubuntu/build/lanes\"\npath = \"/home/ubuntu/.local/bin:/usr/bin:/bin\"\nade_bin = \"/home/ubuntu/.local/bin/herdr-ade\"\npi_bin = \"/home/ubuntu/.local/bin/herdr-pi\"\nkinds = [\"claude\"]\n").unwrap();
+        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[machines.box]\ntarget = \"box\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [\"claude\"]\n").unwrap();
         let world = World {
             env,
             root,
@@ -1045,24 +1045,38 @@ fn resolving_a_clean_lane_from_an_abandoned_round_removes_its_worktree() {
     assert_eq!(world.runner.count("worktree remove"), 1);
 }
 
+fn configure_test_box(world: &World) {
+    let path = world.home.path().join("cfg/config.toml");
+    let existing = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            "{existing}{}\n[[machines.buildbox.repos]]\npath = \"/Users/agent/projects/herdr-ade\"\nbox_path = \"/home/agent/projects/herdr-ade\"\npublish_url = \"https://github.com/uguryildirim24/herdr-ade.git\"\n",
+            crate::remote::TEST_MACHINE
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     let world = World::new();
+    configure_test_box(&world);
     let project = world.project("demo", "a.sock");
     let t = world.thread(
         &project,
-        Path::new("/home/ubuntu/projects/herdr-ade/.worktrees/t-0001"),
+        Path::new("/home/agent/projects/herdr-ade/.worktrees/t-0001"),
         |thread| {
-            thread.repo = "/Users/rolfie/projects/herdr-ade".into();
+            thread.repo = "/Users/agent/projects/herdr-ade".into();
             thread.branch = "hp/demo/t-0001-task".into();
-            thread.machine = "oci".into();
-            thread.machine_id = "oci-id".into();
+            thread.machine = "buildbox".into();
+            thread.machine_id = "buildbox-id".into();
         },
     );
     record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
     world.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"oci-id","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
+        ok(r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#),
     );
     world.runner.on_fn(
         |cmd| cmd.program == "ssh",
@@ -1096,18 +1110,18 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         .expect("box removal ssh call");
     let command = removal.display();
     assert!(
-        command.contains("PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
+        command.contains("PATH=/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
         "{command}"
     );
     assert!(
-        command.contains("cd /home/ubuntu/projects/herdr-ade"),
+        command.contains("cd /home/agent/projects/herdr-ade"),
         "{command}"
     );
-    assert!(!command.contains("cd /Users/rolfie"), "{command}");
+    assert!(!command.contains("cd /Users/agent"), "{command}");
     assert!(!command.contains("rm -rf --"), "{command}");
     assert!(calls.iter().any(|call| {
         call.display()
-            .contains("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001")
+            .contains("rm -rf -- /home/agent/build/lanes/demo-t-0001")
     }));
     let scratch = calls
         .iter()
@@ -1115,7 +1129,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         .expect("scratch-session ssh call")
         .display();
     assert!(
-        scratch.contains("PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
+        scratch.contains("PATH=/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
         "{scratch}"
     );
     assert!(scratch.contains("herdr session list --json"), "{scratch}");
@@ -1130,22 +1144,23 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
 #[test]
 fn cancelling_other_ignored_data_keeps_a_box_worktree_but_removes_its_build() {
     let world = World::new();
+    configure_test_box(&world);
     let project = world.project("demo", "a.sock");
     let t = world.thread(
         &project,
-        Path::new("/home/ubuntu/projects/herdr-ade/.worktrees/t-0001"),
+        Path::new("/home/agent/projects/herdr-ade/.worktrees/t-0001"),
         |thread| {
-            thread.repo = "/Users/rolfie/projects/herdr-ade".into();
+            thread.repo = "/Users/agent/projects/herdr-ade".into();
             thread.branch = "hp/demo/t-0001-task".into();
-            thread.machine = "oci".into();
-            thread.machine_id = "oci-id".into();
+            thread.machine = "buildbox".into();
+            thread.machine_id = "buildbox-id".into();
         },
     );
     record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
     record_stored_report(&project, &t.id);
     world.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"oci-id","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
+        ok(r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#),
     );
     world.runner.on_fn(
         |cmd| cmd.program == "ssh",
@@ -1159,7 +1174,7 @@ fn cancelling_other_ignored_data_keeps_a_box_worktree_but_removes_its_build() {
                 ))
             } else if line.contains("du -sk") {
                 Ok(ok(
-                    "4096\t/home/ubuntu/projects/herdr-ade/.worktrees/t-0001/runs\n",
+                    "4096\t/home/agent/projects/herdr-ade/.worktrees/t-0001/runs\n",
                 ))
             } else {
                 Ok(ok(""))
@@ -1182,7 +1197,7 @@ fn cancelling_other_ignored_data_keeps_a_box_worktree_but_removes_its_build() {
     assert_eq!(
         world
             .runner
-            .count("rm -rf -- /home/ubuntu/build/lanes/demo-t-0001"),
+            .count("rm -rf -- /home/agent/build/lanes/demo-t-0001"),
         1
     );
 }
@@ -2871,7 +2886,7 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
     std::fs::write(
         dir.join("config.toml"),
         format!(
-            "[harness]\nrepos = [\n{}\n]\n[dispatch]\nmachine = \"oci\"\n",
+            "[harness]\nrepos = [\n{}\n]\n[dispatch]\nmachine = \"buildbox\"\n",
             rows.join("\n")
         ),
     )
@@ -2887,8 +2902,8 @@ fn harness_install_builds_and_installs_each_repo_kind() {
     write_harness_config(
         &world,
         &[
-            (&plugin, "/home/ubuntu/projects/herdr-ade"),
-            (&fork, "/home/ubuntu/projects/herdr"),
+            (&plugin, "/home/agent/projects/herdr-ade"),
+            (&fork, "/home/agent/projects/herdr"),
         ],
     );
     world.runner.on("cargo build", ok(""));
@@ -2961,12 +2976,12 @@ fn harness_install_builds_and_installs_each_repo_kind() {
     assert_eq!(
         calls.iter().filter(|c| c.program == "ssh").count(),
         0,
-        "no box step without a saved `oci`"
+        "no box step without a saved `buildbox`"
     );
 }
 
 #[test]
-fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
+fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
     let plugin = |world: &World| {
         (
             harness_repo(world.home.path(), "plugin", "herdr-ade"),
@@ -2979,10 +2994,11 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     write_harness_config(
         &with_box,
         &[
-            (&p, "/home/ubuntu/projects/herdr-ade"),
-            (&f, "/home/ubuntu/projects/herdr"),
+            (&p, "/home/agent/projects/herdr-ade"),
+            (&f, "/home/agent/projects/herdr"),
         ],
     );
+    configure_test_box(&with_box);
     with_box.runner.on("cargo build", ok(""));
     with_box.runner.on("cp ", ok(""));
     with_box.runner.on("mv -f", ok(""));
@@ -3006,7 +3022,7 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     with_box.runner.on("ssh", ok(""));
     with_box.runner.on(
         "machine list --json",
-        ok(r#"[{"id":"oci","label":"oci","target":"oci-pi","session":"default","enabled":true}]"#),
+        ok(r#"[{"id":"buildbox","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#),
     );
     crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
@@ -3032,7 +3048,7 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
                 && s.contains("cargo build --release --locked")
                 && s.contains("source_dirty=\"$(git status --porcelain")
                 && s.contains("cp target/release/")
-                && s.contains("install_to=/home/ubuntu/.local/bin/")
+                && s.contains("install_to=/home/agent/.local/bin/")
                 && s.contains("mv -f \"$install_tmp\" \"$install_to\"")),
         "{scripts:?}"
     );
@@ -3061,8 +3077,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     assert_eq!(settings.stdin.as_deref(), Some("# Lane rules\n"));
     assert!(
         scripts.iter().any(
-            |script| script.contains("HERDR_ADE_ROOT=/home/ubuntu/.herdr-ade")
-                && script.contains("/home/ubuntu/.local/bin/herdr-pi refresh-guard")
+            |script| script.contains("HERDR_ADE_ROOT=/home/agent/.herdr-ade")
+                && script.contains("/home/agent/.local/bin/herdr-pi refresh-guard")
         ),
         "{scripts:?}"
     );
@@ -3073,8 +3089,8 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
     write_harness_config(
         &without_box,
         &[
-            (&p, "/home/ubuntu/projects/herdr-ade"),
-            (&f, "/home/ubuntu/projects/herdr"),
+            (&p, "/home/agent/projects/herdr-ade"),
+            (&f, "/home/agent/projects/herdr"),
         ],
     );
     without_box.runner.on("cargo build", ok(""));
@@ -3093,7 +3109,7 @@ fn harness_install_runs_the_box_steps_only_when_oci_is_saved() {
 fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
     let world = World::new();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
-    write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
+    write_harness_config(&world, &[(&plugin, "/home/agent/projects/herdr-ade")]);
     world.runner.on("cargo build", ok(""));
     world.runner.on("cp ", ok(""));
     world.runner.on("mv -f", ok(""));
@@ -3135,7 +3151,7 @@ fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
 fn harness_install_lock_refuses_a_second_install() {
     let world = World::new();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
-    write_harness_config(&world, &[(&plugin, "/home/ubuntu/projects/herdr-ade")]);
+    write_harness_config(&world, &[(&plugin, "/home/agent/projects/herdr-ade")]);
     let _held = crate::harness::lock(&world.home.path().join("cfg")).unwrap();
     let error = crate::harness::install(&world.ctx())
         .unwrap_err()

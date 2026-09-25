@@ -551,8 +551,6 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
 
 // ---------------------------------------------------------------- briefs
 
-/// The line that opens every thread skill: the skills write `hp`, and this
-/// names the prefix `hp` stands for.
 /// Stores immutable prose alongside the project's machine records. The hash
 /// is both its filename and the receipt carried by the thread record.
 pub(crate) fn store_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
@@ -582,10 +580,10 @@ pub(crate) fn artifact(project: &Project, hash: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn commands_line(prefix: &str) -> String {
-    format!("Commands: `{prefix}`. Every `hp` command below means that prefix.\n\n")
+    format!("Commands: `{prefix}`. Use this prefix instead of `ha` if it differs.\n\n")
 }
 
-/// A brief read without `hp skill` (adopted, remote) carries the lane skill.
+/// A brief read without `ha skill` (adopted, remote) carries the lane skill.
 pub(crate) fn with_lane_skill(prefix: &str, brief: &str) -> String {
     format!(
         "{}{}\n\n{brief}",
@@ -781,7 +779,7 @@ fn compose_brief(input: &BriefInput) -> String {
         }
     }
     brief.push_str(&format!(
-        "\n# Finish\n\nCommit the finished work, then run `hp done --report {} --sha <commit-sha>`.\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for Rolf: `{}`\n",
+        "\n# Finish\n\nCommit the finished work, then run `ha done --report {} --sha <commit-sha>`.\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for Rolf: `{}`\n",
         input.report_path, input.report_path, input.library_path
     ));
     brief
@@ -2009,6 +2007,8 @@ mod tests {
             "{brief}"
         );
         assert!(brief.contains("# Finish"), "{brief}");
+        assert!(brief.contains("`ha done --report"), "{brief}");
+        assert!(!brief.contains("`hp "), "{brief}");
         assert!(memory_use(&project).warning().is_none());
     }
 

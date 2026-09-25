@@ -1718,12 +1718,12 @@ mod tests {
     #[test]
     fn prefix_has_the_fixed_shape_and_quotes_spaces() {
         assert_eq!(
-            command_prefix(Path::new("/bin/hp"), Path::new("/r/oot")),
-            "/bin/hp --root /r/oot"
+            command_prefix(Path::new("/bin/herdr-ade"), Path::new("/r/oot")),
+            "/bin/herdr-ade --root /r/oot"
         );
         assert_eq!(
-            command_prefix(Path::new("/bin/hp"), Path::new("/my root")),
-            "/bin/hp --root '/my root'"
+            command_prefix(Path::new("/bin/herdr-ade"), Path::new("/my root")),
+            "/bin/herdr-ade --root '/my root'"
         );
     }
 
@@ -1743,10 +1743,10 @@ mod tests {
 
     #[test]
     fn priming_prompt_is_one_line_with_the_prefix() {
-        let prompt = priming_prompt("/bin/hp --root /r", "demo");
+        let prompt = priming_prompt("/bin/herdr-ade --root /r", "demo");
         assert!(!prompt.contains('\n'));
-        assert!(prompt.contains("/bin/hp --root /r skill"));
-        assert!(prompt.contains("/bin/hp --root /r context demo"));
+        assert!(prompt.contains("/bin/herdr-ade --root /r skill"));
+        assert!(prompt.contains("/bin/herdr-ade --root /r context demo"));
     }
 
     #[test]

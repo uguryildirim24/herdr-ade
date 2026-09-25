@@ -232,9 +232,9 @@ mod tests {
 
     fn box_machine() -> crate::remote::MachineDeclaration {
         crate::remote::MachineDeclaration {
-            root: "/home/ubuntu/.herdr-ade".into(),
-            path: "/home/ubuntu/.local/bin:/usr/bin:/bin".into(),
-            pi_bin: "/home/ubuntu/.local/bin/herdr-pi".into(),
+            root: "/home/agent/.herdr-ade".into(),
+            path: "/home/agent/.local/bin:/usr/bin:/bin".into(),
+            pi_bin: "/home/agent/.local/bin/herdr-pi".into(),
             ..Default::default()
         }
     }
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(calls[0].cwd.as_deref(), Some(dir.path()));
         assert_eq!(
             calls[0].args.last().unwrap(),
-            "sh -c 'PATH=/home/ubuntu/.local/bin:/usr/bin:/bin; export PATH\nHERDR_ADE_ROOT=/home/ubuntu/.herdr-ade /home/ubuntu/.local/bin/herdr-pi check opencode-go --model deepseek-v4.1-flash'"
+            "sh -c 'PATH=/home/agent/.local/bin:/usr/bin:/bin; export PATH\nHERDR_ADE_ROOT=/home/agent/.herdr-ade /home/agent/.local/bin/herdr-pi check opencode-go --model deepseek-v4.1-flash'"
         );
         drop(calls);
     }

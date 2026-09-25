@@ -639,8 +639,8 @@ mod tests {
     #[test]
     fn recovery_closes_the_failure_without_a_retry_twin() {
         let (_root, p) = fixture();
-        let failure = record(&p, "courier-failed", "oci", "offline").unwrap();
-        recovered(&p, "courier-failed", "oci");
+        let failure = record(&p, "courier-failed", "buildbox", "offline").unwrap();
+        recovered(&p, "courier-failed", "buildbox");
         assert!(list(&p).unwrap().is_empty());
         let closed = show(&p, &failure.id).unwrap();
         assert!(closed.closed);
