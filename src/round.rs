@@ -693,7 +693,8 @@ fn require_merge_turn(
     for slug in project::list_slugs(&ctx.root) {
         let other = Project::load(&ctx.root, &slug)?;
         for record in checked_list(&other)? {
-            if record.branch == branch
+            if !record.phase.closed()
+                && record.branch == branch
                 && record.round != except
                 && record.batch.as_ref().is_some_and(|batch| {
                     batch.rounds.first() == Some(&record.round)
@@ -714,6 +715,7 @@ fn require_merge_turn(
                 }
             }
             if slug == project.slug && record.round == except
+                || record.phase.closed()
                 || record.branch != branch
                 || record
                     .merge
@@ -1584,6 +1586,112 @@ pub struct CancelOutcome {
     pub reason: String,
     pub threads: Vec<crate::threads::ResolveOutcome>,
     pub review_worktrees: Vec<String>,
+    pub dissolved_batch: Vec<String>,
+}
+
+/// Dissolve a selection without cancelling its members. The first round's
+/// integration review superseded its original verdict, so restore the sealed
+/// selection before releasing the merge turn. The project lock makes the
+/// selection and restored record one durable transition.
+fn dissolve_batch(ctx: &Ctx, project: &Project, round: &str) -> Result<Vec<String>> {
+    let owner = checked_list(project)?.into_iter().find(|record| {
+        record.merge.is_none()
+            && !record.phase.closed()
+            && record
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.rounds.iter().any(|id| id == round))
+    });
+    let Some(owner) = owner else {
+        return Ok(Vec::new());
+    };
+    let _owner_operation = (owner.round != round)
+        .then(|| operation_lock(project, &owner.round))
+        .transpose()?;
+    let selected = owner.batch.as_ref().context("batch_missing")?;
+    if owner.review_branch != selected.selection_review_branch
+        && let Some(reviewer) = owner.reviewer.as_deref()
+    {
+        // Stop first: a crash must never release the batch and orphan its
+        // still-running reviewer. A failed cleanup leaves the batch retryable.
+        cancel_superseded_reviewer(
+            ctx,
+            project,
+            reviewer,
+            &format!("batch {} dissolved", selected.rounds.join(", ")),
+        )?;
+    }
+    let batch = {
+        let _lock = project.lock()?;
+        let mut owner = load(project, &owner.round)?;
+        let batch = owner.batch.clone().context("batch_missing")?;
+        if owner.review_branch != batch.selection_review_branch {
+            owner.verdict = batch
+                .selection_verdict
+                .clone()
+                .or_else(|| owner.previous_verdict.take());
+            owner.verdict_kind = Some("MERGE".into());
+            owner.review_branch = batch
+                .selected_review_branch
+                .clone()
+                .or_else(|| batch.selection_review_branch.clone());
+            owner.reviewer = batch.selection_reviewer.clone().or_else(|| {
+                // Selection records written before the reviewer pin was added
+                // can recover it from the original sealed verdict.
+                let pin = owner.verdict.as_ref()?;
+                let events = sealed_events(project).ok()?;
+                thread::list(project)
+                    .into_iter()
+                    .find(|thread| {
+                        thread.role == "reviewer" && thread.review_round == owner.round && {
+                            let mut candidate = owner.clone();
+                            candidate.reviewer = Some(thread.id.clone());
+                            reviewer_completion(project, &candidate, &events)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                == Some(pin)
+                        }
+                    })
+                    .map(|thread| thread.id)
+            });
+            owner.review_intent = None;
+            owner.reviewer_awaiting_report_after = None;
+            owner.phase = RoundPhase::VerdictIn;
+            owner.announced = None;
+            owner.attention.clear();
+        } else if let Some(pin) = &batch.selection_verdict {
+            // A previously rejected integration owner can be selected with
+            // its earlier MERGE pin, even before the new review starts.
+            if owner.verdict.as_ref() != Some(pin) {
+                owner.verdict = Some(pin.clone());
+                owner.verdict_kind = Some("MERGE".into());
+                owner.reviewer = batch.selection_reviewer.clone();
+                owner.review_branch = batch
+                    .selected_review_branch
+                    .clone()
+                    .or_else(|| batch.selection_review_branch.clone());
+                owner.phase = RoundPhase::VerdictIn;
+            }
+        }
+        owner.batch = None;
+        save(project, &owner)?;
+        batch
+    };
+    Ok(batch.rounds)
+}
+
+/// Dissolve an unmerged batch, leaving each member's own review intact.
+pub fn dissolve(ctx: &Ctx, slug: &str, round: &str) -> Result<Vec<String>> {
+    let project = Project::load(&ctx.root, slug)?;
+    let _advance = advance_lock(&project)?;
+    let _operation = operation_lock(&project, round)?;
+    let rounds = dissolve_batch(ctx, &project, round)?;
+    if rounds.is_empty() {
+        bail!("batch_missing: `{round}` is not in an unmerged batch");
+    }
+    let _ = crate::board::refresh(ctx, &project);
+    Ok(rounds)
 }
 
 /// Stop every process owned by an open round. The round is closed before
@@ -1599,6 +1707,14 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
     let project = Project::load(&ctx.root, slug)?;
     let _advance = advance_lock(&project)?;
     let _operation = operation_lock(&project, round)?;
+    // Refuse a transaction before touching any batch member.
+    let original = load(&project, round)?;
+    if original.merge.is_some() {
+        return Err(crate::refusal::error(format!(
+            "round_cancel_refused: `{round}` has begun its merge transaction; finish or repair that transaction"
+        )));
+    }
+    let dissolved_batch = dissolve_batch(ctx, &project, round)?;
     let record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
@@ -1666,6 +1782,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
             .unwrap_or_else(|| reason.to_string()),
         threads: outcomes,
         review_worktrees,
+        dissolved_batch,
     })
 }
 
@@ -1943,13 +2060,51 @@ pub struct RecoveryOutcome {
 /// If no reviewer was ever bound, this atomically starts and binds one through
 /// the same locked path used by `advance`.
 pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<RecoveryOutcome> {
+    retry_on_machine(ctx, slug, round, reason, None)
+}
+
+pub fn retry_on_machine(
+    ctx: &Ctx,
+    slug: &str,
+    round: &str,
+    reason: &str,
+    machine: Option<&str>,
+) -> Result<RecoveryOutcome> {
     if reason.trim().is_empty() {
         bail!("retry_reason_missing: say why `{round}` is being retried");
     }
     let project = Project::load(&ctx.root, slug)?;
     let _advance = advance_lock(&project)?;
-    let record = load(&project, round)?;
+    let mut record = load(&project, round)?;
     require_mutable(&record)?;
+    if machine.is_some()
+        && record
+            .batch
+            .as_ref()
+            .is_none_or(|batch| batch.review_branch.is_none())
+    {
+        bail!(
+            "batch_review_missing: choose a machine only after the batch integration review exists"
+        );
+    }
+    if let Some(reviewer) = record.reviewer.as_deref()
+        && machine.is_some()
+    {
+        if record.verdict.is_some()
+            || reviewer_completion(&project, &record, &sealed_events(&project)?)?.is_some()
+        {
+            bail!("batch_review_complete: `{round}` already has a sealed integration verdict");
+        }
+        cancel_superseded_reviewer(ctx, &project, reviewer, reason)?;
+        let _lock = project.lock()?;
+        let mut current = load(&project, round)?;
+        if current.reviewer.as_deref() != Some(reviewer) {
+            bail!("reviewer_stale: the batch reviewer changed while retrying");
+        }
+        current.reviewer = None;
+        save(&project, &current)?;
+        record = current;
+    }
     if let Some(reviewer) = record.reviewer.as_deref() {
         let retried = crate::threads::retry_during_advance(ctx, slug, reviewer, reason)?;
         return Ok(RecoveryOutcome {
@@ -1983,7 +2138,7 @@ pub fn retry(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Recover
         format!("round_not_complete: the review inputs for `{round}` changed while retrying")
     })?;
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "ha".into());
-    let reviewer = start_and_bind_reviewer(ctx, &project, slug, round, &branch, &prefix)?.context(
+    let reviewer = start_and_bind_reviewer_on_machine(ctx, &project, slug, round, &branch, &prefix, machine)?.context(
         "reviewer_start_pending: the review inputs changed or the bounded start failure remains recorded",
     )?;
     Ok(RecoveryOutcome {
@@ -2637,6 +2792,7 @@ fn start_reviewer(
     round: &str,
     review_branch: &str,
     prefix: &str,
+    machine: Option<&str>,
 ) -> Result<thread::Thread> {
     let record = load(project, round)?;
     let git = Git::new(ctx.runner, &record.repo);
@@ -2707,7 +2863,7 @@ fn start_reviewer(
     let args = crate::threads::StartArgs {
         title: format!("Review {round}: {}", record.plain),
         repo: (!record.repo.is_empty()).then(|| record.repo.clone()),
-        machine: None,
+        machine: machine.map(str::to_string),
         base: Some(review_branch.to_string()),
         task,
         plain: record.plain.clone(),
@@ -2743,6 +2899,18 @@ fn start_and_bind_reviewer(
     round: &str,
     review_branch: &str,
     prefix: &str,
+) -> Result<Option<String>> {
+    start_and_bind_reviewer_on_machine(ctx, project, slug, round, review_branch, prefix, None)
+}
+
+fn start_and_bind_reviewer_on_machine(
+    ctx: &Ctx,
+    project: &Project,
+    slug: &str,
+    round: &str,
+    review_branch: &str,
+    prefix: &str,
+    machine: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(launch) = review_launch_snapshot(project, round, review_branch)? else {
         return Ok(None);
@@ -2789,7 +2957,7 @@ fn start_and_bind_reviewer(
             }
         };
     }
-    match start_reviewer(ctx, project, round, review_branch, prefix) {
+    match start_reviewer(ctx, project, round, review_branch, prefix, machine) {
         Ok(thread) => match bind_reviewer(ctx, slug, round, &thread.id) {
             Ok(_) => {
                 crate::ledger::recovered(project, "reviewer-start-failed", round);
@@ -4313,12 +4481,49 @@ fn merge_batch_run_with(
         {
             bail!("batch_stale: `{first}` changed while selecting the batch");
         }
+        let earlier = current
+            .verdict
+            .as_ref()
+            .is_none_or(|pin| pin.sha != candidates[0]);
+        let selected = if earlier {
+            current.previous_verdict.clone()
+        } else {
+            current.verdict.clone()
+        };
+        let selection_review_branch = if earlier {
+            current.previous_review_branch.clone()
+        } else {
+            current.review_branch.clone()
+        };
+        let selection_reviewer = if earlier {
+            let events = sealed_events(&project)?;
+            thread::list(&project)
+                .into_iter()
+                .find(|thread| {
+                    if thread.role != "reviewer" || thread.review_round != current.round {
+                        return false;
+                    }
+                    let mut evidence = current.clone();
+                    evidence.reviewer = Some(thread.id.clone());
+                    evidence.review_branch = selection_review_branch.clone();
+                    reviewer_completion(&project, &evidence, &events)
+                        .ok()
+                        .flatten()
+                        == selected
+                })
+                .map(|thread| thread.id)
+        } else {
+            current.reviewer.clone()
+        };
         current.batch = Some(BatchMerge {
             rounds: rounds.to_vec(),
             verdicts: candidates,
             base: head,
             candidate: combined,
             selection_review_branch: current.review_branch.clone(),
+            selection_reviewer,
+            selection_verdict: selected,
+            selected_review_branch: selection_review_branch,
             review_branch: None,
         });
         save(&project, &current)?;
@@ -6142,6 +6347,135 @@ mod tests {
             reviewer
         });
         fx.seal_done(&reviewer, 1, 1, &candidate, &report);
+    }
+
+    #[test]
+    fn cancelling_batch_leader_releases_branch_for_another_round() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 3);
+        merge_batch_run(&ctx, "demo", &rounds[..2], None).unwrap();
+        let result = cancel(&ctx, "demo", "r1", "not proceeding with this batch").unwrap();
+        assert_eq!(result.dissolved_batch, rounds[..2]);
+        assert!(load(&fx.project, "r1").unwrap().batch.is_none());
+        assert!(load(&fx.project, "r2").unwrap().batch.is_none());
+        let merged = merge_run(&ctx, "demo", "r3", None).unwrap();
+        assert!(matches!(
+            merged.merge,
+            MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. }
+        ));
+    }
+
+    #[test]
+    fn abandoned_historical_batch_never_owns_merge_turn() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 3);
+        merge_batch_run(&ctx, "demo", &rounds[..2], None).unwrap();
+        let mut leader = load(&fx.project, "r1").unwrap();
+        leader.phase = RoundPhase::Abandoned;
+        save(&fx.project, &leader).unwrap();
+        let merged = merge_run(&ctx, "demo", "r3", None).unwrap();
+        assert!(matches!(
+            merged.merge,
+            MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. }
+        ));
+    }
+
+    #[test]
+    fn cancelling_batch_member_restores_leader_verdict() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        let original = load(&fx.project, "r1").unwrap().previous_verdict.unwrap();
+        let result = cancel(&ctx, "demo", "r2", "not proceeding with this member").unwrap();
+        assert_eq!(result.dissolved_batch, rounds);
+        let leader = load(&fx.project, "r1").unwrap();
+        assert_eq!(leader.verdict, Some(original));
+        assert!(leader.batch.is_none());
+        let merged = merge_run(&ctx, "demo", "r1", None).unwrap();
+        assert!(matches!(
+            merged.merge,
+            MergeOutcome::Checkpointed { .. } | MergeOutcome::NoOp { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_batch_reviewer_can_retry_with_explicit_machine() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        let old = thread::list(&fx.project)
+            .into_iter()
+            .find(|thread| {
+                thread.role == "reviewer"
+                    && thread.review_round == "r1"
+                    && thread.status != thread::Status::Resolved
+            })
+            .map(|thread| thread.id);
+        reviewer_ready(&fx);
+        let retry = retry_on_machine(
+            &ctx,
+            "demo",
+            "r1",
+            "first placement did not start",
+            Some("local"),
+        )
+        .unwrap();
+        if let Some(old) = old {
+            assert_ne!(retry.thread, old);
+        }
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(retry.thread.as_str())
+        );
+        assert_eq!(
+            thread::load(&fx.project, &retry.thread).unwrap().machine,
+            ""
+        );
+    }
+
+    #[test]
+    fn bound_batch_reviewer_moves_on_explicit_retry() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        reviewer_ready(&fx);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        let old = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let retry = retry_on_machine(
+            &ctx,
+            "demo",
+            "r1",
+            "first attempt cannot proceed",
+            Some("local"),
+        )
+        .unwrap();
+        assert_ne!(retry.thread, old);
+        assert_eq!(
+            thread::load(&fx.project, &old).unwrap().status,
+            thread::Status::Resolved
+        );
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(retry.thread.as_str())
+        );
+    }
+
+    #[test]
+    fn dissolving_batch_keeps_all_members_open() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        assert_eq!(dissolve(&ctx, "demo", "r2").unwrap(), rounds);
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().phase,
+            RoundPhase::VerdictIn
+        );
+        assert!(!load(&fx.project, "r2").unwrap().phase.closed());
     }
 
     #[test]
@@ -9140,17 +9474,21 @@ mod tests {
         assert!(task.contains("skill reviewer"), "{task}");
         assert!(task.contains(".state/artifacts/"), "{task}");
 
+        thread::update(&fx.project, &started.id, |t| {
+            t.status = thread::Status::Starting
+        })
+        .unwrap();
         let unknown = err(retry(
             &ctx,
             "demo",
             "r1",
             "there is no evidence about what failed",
         ));
-        assert!(unknown.starts_with("recovery_unknown:"), "{unknown}");
+        assert!(unknown.starts_with("retry_refused:"), "{unknown}");
         assert_eq!(
             thread::load(&fx.project, &started.id).unwrap().attempt,
             1,
-            "unknown evidence must not spend an attempt"
+            "a still-starting reviewer must not spend an attempt"
         );
 
         // Simulate a crash after placement moved `base` from the review branch
@@ -9169,6 +9507,40 @@ mod tests {
         assert_eq!(
             load(&fx.project, "r1").unwrap().reviewer.as_deref(),
             Some(started.id.as_str())
+        );
+    }
+
+    #[test]
+    fn round_retry_replaces_failed_start_with_unknown_failure_class() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        let first = retry(&ctx, "demo", "r1", "start reviewer").unwrap();
+        fx.world
+            .runner
+            .on("pane read", crate::runner::fake::ok("Trust this folder?\n"));
+        thread::update(&fx.project, &first.thread, |thread| {
+            thread.status = thread::Status::Failed;
+            thread.failure_class = crate::contracts::FailureClass::Unknown;
+            thread.error = "agent_not_ready: screen: Trust this folder?; herdr: blocked".into();
+            thread.startup_wait_started.clear();
+            thread.prompt_pending = false;
+        })
+        .unwrap();
+
+        *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+        let recovered = retry(&ctx, "demo", "r1", "reviewer start failed").unwrap();
+        assert_eq!(recovered.thread, first.thread);
+        let reviewer = thread::load(&fx.project, &first.thread).unwrap();
+        assert_eq!(reviewer.attempt, 2);
+        assert_eq!(reviewer.launch.same_recipe_retries, 1);
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(first.thread.as_str())
         );
     }
 
