@@ -154,14 +154,8 @@ pub(crate) struct Thread {
     pub(crate) last_report_change: String,
     /// Incomplete report/library copy, kept with the report it describes.
     pub(crate) copy_notes: Vec<String>,
-    /// Current pull request validation problem (not a second inbox record).
-    pub(crate) pr_note: String,
     pub(crate) lineage_mismatch: bool,
     pub(crate) acked_report_hash: String,
-    pub(crate) pr: String,
-    pub(crate) pr_state: String,
-    pub(crate) pr_review: String,
-    pub(crate) pr_summary: Option<crate::pr::Summary>,
     pub(crate) resolved_reason: String,
     /// Why recovery deliberately stopped this thread. Empty on historical and
     /// normally resolved records.
@@ -892,7 +886,6 @@ pub(crate) enum Group {
     WaitingOnYou,
     Unknown,
     Working,
-    Landing,
     Idle,
     Resolved,
 }
@@ -907,9 +900,8 @@ impl Group {
             Group::WaitingOnYou => 3,
             Group::Unknown => 4,
             Group::Working => 5,
-            Group::Landing => 6,
-            Group::Idle => 7,
-            Group::Resolved => 8,
+            Group::Idle => 6,
+            Group::Resolved => 7,
         }
     }
 
@@ -920,7 +912,6 @@ impl Group {
             Group::WaitingOnYou => "Waiting on you",
             Group::Unknown => "Unknown",
             Group::Working => "Working",
-            Group::Landing => "Landing",
             Group::Idle => "Idle",
             Group::Resolved => "Resolved",
         }
@@ -934,7 +925,6 @@ impl Group {
             Group::WaitingOnYou => "waiting-on-you",
             Group::Unknown => "unknown",
             Group::Working => "working",
-            Group::Landing => "landing",
             Group::Idle => "idle",
             Group::Resolved => "resolved",
         }
@@ -947,7 +937,6 @@ impl Group {
             Group::WaitingOnYou,
             Group::Unknown,
             Group::Working,
-            Group::Landing,
             Group::Idle,
             Group::Resolved,
         ]
@@ -955,13 +944,12 @@ impl Group {
         .find(|g| g.token() == token)
     }
 
-    pub(crate) const DISPLAY_ORDER: [Group; 8] = [
+    pub(crate) const DISPLAY_ORDER: [Group; 7] = [
         Group::ReadyForReview,
         Group::Parked,
         Group::WaitingOnYou,
         Group::Unknown,
         Group::Working,
-        Group::Landing,
         Group::Idle,
         Group::Resolved,
     ];
@@ -1058,15 +1046,10 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
         return Group::Working;
     }
     // 5
-    let pr_open = thread.pr_state.eq_ignore_ascii_case("open");
-    if pr_open && thread.pr_review.eq_ignore_ascii_case("approved") {
-        return Group::Landing;
-    }
-    // 6
-    if has_report && (pr_open || thread.report_hash != thread.acked_report_hash) {
+    if has_report && thread.report_hash != thread.acked_report_hash {
         return Group::ReadyForReview;
     }
-    // 7
+    // 6
     Group::Idle
 }
 
@@ -1565,26 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn row5_landing_needs_open_and_approved() {
-        let t = Thread {
-            report_hash: "h".into(),
-            pr_state: "OPEN".into(),
-            pr_review: "APPROVED".into(),
-            ..open_thread()
-        };
-        assert_eq!(group(&t, &live(Some("idle"), 0), now()), Group::Landing);
-        let t = Thread {
-            pr_review: "CHANGES_REQUESTED".into(),
-            ..t
-        };
-        assert_eq!(
-            group(&t, &live(Some("idle"), 0), now()),
-            Group::ReadyForReview
-        );
-    }
-
-    #[test]
-    fn row6_ready_for_review_until_ack_or_while_pr_open() {
+    fn row6_ready_for_review_until_ack() {
         let t = Thread {
             report_hash: "h".into(),
             ..open_thread()
@@ -1598,14 +1562,6 @@ mod tests {
             ..t.clone()
         };
         assert_eq!(group(&acked, &live(Some("done"), 0), now()), Group::Idle);
-        let with_pr = Thread {
-            pr_state: "OPEN".into(),
-            ..acked
-        };
-        assert_eq!(
-            group(&with_pr, &live(Some("done"), 0), now()),
-            Group::ReadyForReview
-        );
     }
 
     #[test]
@@ -1620,12 +1576,7 @@ mod tests {
             ..open_thread()
         };
         assert_eq!(group(&t, &live(Some("working"), 0), now()), Group::Working);
-        // Blocked for long (row 3) beats an approved pull request (row 5).
-        let t = Thread {
-            pr_state: "OPEN".into(),
-            pr_review: "APPROVED".into(),
-            ..t
-        };
+        // Blocked for long (row 3) beats a pending report (row 6).
         assert_eq!(
             group(&t, &live(Some("blocked"), 31), now()),
             Group::WaitingOnYou
@@ -1654,10 +1605,9 @@ mod tests {
     #[test]
     fn display_order_and_rank_digits() {
         let ranks: Vec<u8> = Group::DISPLAY_ORDER.iter().map(|g| g.rank()).collect();
-        assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(Group::ReadyForReview.token(), "ready-for-review");
         assert_eq!(Group::WaitingOnYou.token(), "waiting-on-you");
-        assert_eq!(Group::from_token("landing"), Some(Group::Landing));
     }
 
     fn agent(name: &str, cwd: &str) -> Agent {
@@ -2057,7 +2007,9 @@ mod tests {
     #[test]
     fn the_lane_skill_says_done_publishes_on_the_box() {
         let lane = include_str!("../skill/LANE.md");
-        let rules_end = lane.find("## Pictures").expect("the pictures heading");
+        let rules_end = lane
+            .find("## If this attempt fails")
+            .expect("the failure heading");
         let standing = &lane[..rules_end];
         assert!(
             standing.contains("`round merge` publishes the integration branch"),

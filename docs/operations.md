@@ -7,9 +7,9 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
 - **The coordinator is an ordinary agent** in a Herdr pane that follows a skill (`herdr-ade skill` prints it). Plugin code does not route messages, plan work or decide anything.
 - **The binary does mechanics.** Starting or restarting a thread, copying reports, marking inbox items handled: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The coordinator prompt hook also records Rolf's own messages.
 - **Files are the record, prompts are wake-ups.** Thread and round records own their state; `context` renders it directly at the start of every turn. The inbox holds only messages such as courier deliveries and machine notices. A missed prompt loses nothing.
-- **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pending cleanup and pull requests (every two minutes). Remote machines are polled once a minute.
+- **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pending cleanup. Remote machines are polled once a minute.
 - **Tools are found even under a bare `PATH`.** A Herdr server started outside a login shell gives its plugins a minimal `PATH`; the binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own, so the ticker finds `gh`, `rsync` and friends. `ticker status` and `doctor` show what resolved.
-- **Destructive work is explicit.** The binary prunes finished lane and closed review branches after worktree cleanup, with a lease for published refs. It removes worktrees or merges only in response to the matching command; `doctor` requires an exact preview token to prune older landed branches. Text from reports, pull requests and command output is never placed in a prompt.
+- **Destructive work is explicit.** The binary prunes finished lane and closed review branches after worktree cleanup, with a lease for published refs. It removes worktrees or merges only in response to the matching command; `doctor` requires an exact preview token to prune older landed branches. Text from reports and command output is never placed in a prompt.
 
 ## Where things live
 
@@ -86,7 +86,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--preview] [--github]` | Project lifecycle. `delete` stops project-owned processes and sends owned local files to the macOS Trash; shared resources stay. GitHub deletion is explicit. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 
-An early `agent_not_ready` startup block keeps the brief pending and shows as starting while the recipe's ready window remains open. Only a still-blocked agent at the end of that window fails with a visible-screen excerpt. Claude's default window is five minutes; recipes can set `ready_timeout_ms` explicitly. `thread retry` refuses a still-starting or working agent and shows its pane text. Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a process gone with no report, or blocked for 30 seconds); **Unknown** for a box lane that has not been polled; **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. A report-only lane whose sealed commit equals its base closes after its final copy. A changed lane stays visible until a round carries it.
+An early `agent_not_ready` startup block keeps the brief pending and shows as starting while the recipe's ready window remains open. Only a still-blocked agent at the end of that window fails with a visible-screen excerpt. Claude's default window is five minutes; recipes can set `ready_timeout_ms` explicitly. `thread retry` refuses a still-starting or working agent and shows its pane text. Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a process gone with no report, or blocked for 30 seconds); **Unknown** for a box lane that has not been polled; **Working**; **Ready for review** (a report exists and you haven't acknowledged it); Idle. A report-only lane whose sealed commit equals its base closes after its final copy. A changed lane stays visible until a round carries it.
 
 ## Plans and questions
 
@@ -120,7 +120,7 @@ No remote machine is declared by default. Copy the neutral example in [`assets/d
 
 Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table and flags an enabled recipe with neither a route nor a command. `context` prints one line per recipe with its plain use, capabilities and the rule or choice that reaches it; command syntax stays in the coordinator skill. Disabled recipes have no route.
 
-The coordinator uses routing by default. When Rolf names the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When Rolf names one for a single lane, the task must cite his request and the start uses `--recipe <id> --basis "<Rolf's exact words>"`. The lane launch record and context keep the recipe, quote and request. Pro is command-only and Mac-only: run `herdr-pro start --name <n> --cwd <dir> &`, then `herdr-pro turn <n> --brief <f> --out <f> --notify <coordinator-agent> [--attach <f>]`; never type into its pane.
+The coordinator uses routing by default. When Rolf names the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When Rolf names one for a single lane, the task must cite his request and the start uses `--recipe <id> --basis "<Rolf's exact words>"`. The lane launch record and context keep the recipe, quote and request.
 
 The starting table is:
 
@@ -128,7 +128,6 @@ The starting table is:
 [routing]
 default = "pi_codex_sol_high"
 retries = 1
-fallback = []
 
 [[routing.rules]]
 workflow = "coordinator"
@@ -150,7 +149,7 @@ recipe = "claude_fable_xhigh"
 # "SHA256-of-exact-task-file-bytes" = "recipe-id"
 ```
 
-A rule may override the global recovery policy with `retries = N` and `fallback = ["recipe-a", "recipe-b"]`. `ha failed "<failure and evidence>"` reports failed work by default: it retries up to that bound, then tries each fallback once in order. `--class provider --provider-kind <kind>` and `--class lost_connection` use only bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. When recovery is exhausted, no other recipe is guessed.
+A rule may override the global recovery policy with `retries = N`. `ha failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
 
 Each launch record and dispatch-ledger row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. An explicit row also carries `recipe_basis` and `recipe_request`. Historical launch, dispatch and round records without those fields still load.
 

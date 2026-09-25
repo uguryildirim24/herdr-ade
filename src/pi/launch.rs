@@ -14,8 +14,8 @@ use anyhow::{Result, bail};
 /// The provider and model names an executable recipe may start. Routing
 /// recipes use exactly these strings (SPEC-pi v2 §3.4, §3.5).
 /// `opencode-go` is the OpenCode Go plan (the DeepSeek and Muse rows, SPEC-ADE
-/// §6 items 65, 80). `pro` is the local relay from `herdr-pro serve`.
-pub(crate) const PROVIDERS: [&str; 4] = ["openai-codex", "opencode-go", "kimi-coding", "pro"];
+/// §6 items 65, 80).
+pub(crate) const PROVIDERS: [&str; 3] = ["openai-codex", "opencode-go", "kimi-coding"];
 
 /// Flags a `kind = "pi"` recipe may never carry (SPEC-pi v2 §3.5):
 /// `pi_args_forbidden`. `-na` is `--no-approve`'s short form (§1) and

@@ -224,14 +224,12 @@ mod tests {
             row("t-0003", Group::Working, "working"),
             row("t-0004", Group::WaitingOnYou, "blocked"),
             row("t-0005", Group::ReadyForReview, "done"),
-            row("t-0006", Group::Landing, "idle"),
         ];
         let text = render(&project, &rows);
         let order: Vec<usize> = [
             "Ready for review",
             "Waiting on you",
             "Working",
-            "Landing",
             "Idle",
             "Resolved",
         ]

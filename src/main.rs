@@ -57,7 +57,6 @@ mod pi;
 #[path = "pi/ade.rs"]
 mod pi_ade;
 mod plan;
-mod pr;
 mod project;
 mod refusal;
 mod remote;

@@ -1147,10 +1147,8 @@ fn digest_snapshot(
                     crate::thread::Group::ReadyForReview
                         | crate::thread::Group::WaitingOnYou
                         | crate::thread::Group::Unknown
-                        | crate::thread::Group::Landing
                 ) || row.thread.lineage_mismatch
                     || !row.thread.copy_notes.is_empty()
-                    || !row.thread.pr_note.is_empty()
                     || crate::round::latest_event(
                         &events,
                         &row.thread.id,
@@ -1274,17 +1272,6 @@ fn digest_snapshot(
             let _ = writeln!(
                 out,
                 "  lineage-mismatch: live process identity differs; parent not repaired"
-            );
-        }
-        if !t.pr_note.is_empty() {
-            let _ = writeln!(out, "  PR: {}", t.pr_note);
-        }
-        if let Some(summary) = &t.pr_summary {
-            let _ = writeln!(
-                out,
-                "  PR {}: {}",
-                t.pr,
-                crate::pr::describe_change(None, summary)
             );
         }
     }
