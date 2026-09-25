@@ -339,24 +339,34 @@ fn row(step: &Step, width: usize) -> String {
     let text = cut(&step.text, width.saturating_sub(5));
     match step.mark {
         Mark::Done => format!(
-            "{}{}{BOLD} ✦ {RESET}  {}{text}{RESET}",
-            GREEN.bg(),
-            INK.fg(),
+            "{}  {}{text}{RESET}",
+            tile(GREEN, INK, true, '✦'),
             QUIET.fg()
         ),
         Mark::Now => format!(
-            "{}{}{BOLD} ◐ {RESET}  {BOLD}{}{text}{RESET}",
-            AMBER.bg(),
-            INK.fg(),
+            "{}  {BOLD}{}{text}{RESET}",
+            tile(AMBER, INK, true, '◐'),
             AMBER.fg()
         ),
         Mark::Later => format!(
-            "{}{} ◌ {RESET}  {}{text}{RESET}",
-            TRACK.bg(),
-            QUIET.fg(),
+            "{}  {}{text}{RESET}",
+            tile(TRACK, QUIET, false, '◌'),
             TEXT.fg()
         ),
     }
+}
+
+/// A square box with `mark` in its middle. A cell is about twice as tall as
+/// it is wide, so the box is the mark's cell plus half a cell each side:
+/// `▐` and `▌` drawn in the box colour. Two cells wide, one row tall.
+fn tile(color: Rgb, ink: Rgb, bold: bool, mark: char) -> String {
+    let weight = if bold { BOLD } else { "" };
+    format!(
+        "{edge}▐{RESET}{}{}{weight}{mark}{RESET}{edge}▌{RESET}",
+        color.bg(),
+        ink.fg(),
+        edge = color.fg()
+    )
 }
 
 /// A chunky bar that warms from teal to green as it fills, and the count.
@@ -480,9 +490,9 @@ mod tests {
             text.contains("Rolf's job pipeline: bring in the right postings"),
             "{text}"
         );
-        assert!(text.contains(" ✦   Tidy the dashboard screens "), "{text}");
-        assert!(text.contains(" ◐   Fix how jobs come in"), "{text}");
-        assert!(text.contains(" ◌   Switch the sorting on"), "{text}");
+        assert!(text.contains("▐✦▌  Tidy the dashboard screens "), "{text}");
+        assert!(text.contains("▐◐▌  Fix how jobs come in"), "{text}");
+        assert!(text.contains("▐◌▌  Switch the sorting on"), "{text}");
         assert!(text.contains("█   1 of 3"), "{text}");
         for word in [
             "2026",
