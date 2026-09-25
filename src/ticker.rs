@@ -343,15 +343,36 @@ fn request_stop_with_progress(
     wait: Duration,
     track_progress: bool,
 ) -> Result<StopOutcome> {
-    if lock_state(root) == LockState::Free {
+    let start = Instant::now();
+    request_stop_with_progress_on(
+        root,
+        wait,
+        track_progress,
+        || start.elapsed(),
+        std::thread::sleep,
+        lock_state,
+    )
+}
+
+// The clock and poll boundary are supplied so progress/deadline interactions
+// can be exercised without racing the scheduler or sleeping in tests.
+fn request_stop_with_progress_on(
+    root: &Path,
+    wait: Duration,
+    track_progress: bool,
+    now: impl Fn() -> Duration,
+    mut pause: impl FnMut(Duration),
+    mut state: impl FnMut(&Path) -> LockState,
+) -> Result<StopOutcome> {
+    if state(root) == LockState::Free {
         let _ = std::fs::remove_file(stop_path(root));
         return Ok(StopOutcome::Stopped);
     }
     std::fs::write(stop_path(root), b"")?;
-    let mut deadline = Instant::now() + wait;
+    let mut deadline = now() + wait;
     let mut observed: Option<Progress> = None;
     loop {
-        match lock_state(root) {
+        match state(root) {
             LockState::Free => {
                 let _ = std::fs::remove_file(stop_path(root));
                 return Ok(StopOutcome::Stopped);
@@ -363,17 +384,17 @@ fn request_stop_with_progress(
                             && old.started == progress.started
                             && old.sequence < progress.sequence
                     }) {
-                        deadline = Instant::now() + wait;
+                        deadline = now() + wait;
                     }
                     observed = Some(progress);
                 }
             }
             LockState::Held(_) => {}
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        pause(Duration::from_millis(25));
     }
     Ok(StopOutcome::Pending)
 }
@@ -2646,52 +2667,55 @@ mod tests {
     #[test]
     fn install_wait_resets_only_when_the_holder_reaches_another_step() {
         let root = tempfile::tempdir().unwrap();
-        let mut holder = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path(root.path()))
-            .unwrap();
-        holder.lock().unwrap();
         let info = Info {
             version: "old".into(),
             pid: 123,
             started: "this-run".into(),
             ..Info::default()
         };
-        holder
-            .write_all(serde_json::to_string(&info).unwrap().as_bytes())
-            .unwrap();
         let progress = Progress {
             pid: info.pid,
-            started: info.started,
+            started: info.started.clone(),
             sequence: 1,
             step: "cheap project demo".into(),
         };
         project::write_json(&progress_path(root.path()), &progress).unwrap();
         let path = progress_path(root.path());
-        let worker = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(65));
-            project::write_json(
-                &path,
-                &Progress {
-                    sequence: 2,
-                    step: "machine oci".into(),
-                    ..progress
-                },
-            )
-            .unwrap();
-            std::thread::sleep(Duration::from_millis(65));
-            drop(holder);
-        });
-        let start = Instant::now();
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut updated = false;
         assert_eq!(
-            request_stop_with_progress(root.path(), Duration::from_millis(100), true).unwrap(),
+            request_stop_with_progress_on(
+                root.path(),
+                Duration::from_millis(100),
+                true,
+                || clock.get(),
+                |interval| {
+                    clock.set(clock.get() + interval);
+                    if clock.get() >= Duration::from_millis(75) && !updated {
+                        project::write_json(
+                            &path,
+                            &Progress {
+                                sequence: 2,
+                                step: "machine oci".into(),
+                                ..progress.clone()
+                            },
+                        )
+                        .unwrap();
+                        updated = true;
+                    }
+                },
+                |_| {
+                    if clock.get() >= Duration::from_millis(125) {
+                        LockState::Free
+                    } else {
+                        LockState::Held(info.clone())
+                    }
+                }
+            )
+            .unwrap(),
             StopOutcome::Stopped
         );
-        assert!(start.elapsed() >= Duration::from_millis(115));
-        worker.join().unwrap();
+        assert!(clock.get() >= Duration::from_millis(125));
     }
 
     #[test]

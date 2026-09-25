@@ -549,9 +549,22 @@ impl Running {
     fn capture() -> Result<Running> {
         let current = std::env::current_exe().context("could not find the running executable")?;
         let path = std::fs::canonicalize(&current)
+            .or_else(|error| {
+                // Linux appends this suffix when a concurrent build unlinks the
+                // running image. Its inode remains readable via /proc/self/exe.
+                #[cfg(target_os = "linux")]
+                if let Some(path) = current.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+                    return Ok(PathBuf::from(path));
+                }
+                Err(error)
+            })
             .with_context(|| format!("could not resolve {}", current.display()))?;
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("could not fingerprint {}", path.display()))?;
+        #[cfg(target_os = "linux")]
+        let image = Path::new("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let image = path.as_path();
+        let bytes = std::fs::read(image)
+            .with_context(|| format!("could not fingerprint {}", image.display()))?;
         Ok(Running {
             path,
             hash: crate::thread::sha256_hex(&bytes),
@@ -1500,6 +1513,23 @@ mod tests {
     }
 
     #[test]
+    fn box_ticker_lock_holder() {
+        let Ok(path) = std::env::var("HERDR_ADE_TEST_TICKER_LOCK") else {
+            return;
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.lock().unwrap();
+        use std::io::{Read as _, Write as _};
+        std::io::stdout().write_all(b"locked\n").unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+    }
+
+    #[test]
     fn a_box_ticker_from_the_same_commit_passes_with_its_exact_build() {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
@@ -1522,25 +1552,36 @@ mod tests {
             format!("{{\n  \"version\": \"{box_build}\",\n  \"pid\": 42\n}}"),
         )
         .unwrap();
-        // Hold the lock in a separate process: a lock owned by this test
-        // process leaks to its concurrently forked children until exec.
-        let mut holder = std::process::Command::new("sh")
+        // Hold the lock in a separate Rust process: this test process may
+        // fork concurrently, temporarily passing its descriptors to children.
+        #[cfg(target_os = "linux")]
+        let executable = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable = std::env::current_exe().unwrap();
+        let mut holder = std::process::Command::new(executable)
             .args([
-                "-c",
-                "exec 9<> \"$1\"; flock 9; echo locked; cat >/dev/null",
-                "sh",
+                "--exact",
+                "harness::tests::box_ticker_lock_holder",
+                "--nocapture",
             ])
-            .arg(box_root.join(".ticker.lock"))
+            .env("HERDR_ADE_TEST_TICKER_LOCK", box_root.join(".ticker.lock"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         use std::io::BufRead as _;
         let mut ready = String::new();
-        std::io::BufReader::new(holder.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        assert_eq!(ready, "locked\n");
+        let mut output = std::io::BufReader::new(holder.stdout.take().unwrap());
+        loop {
+            let read = output.read_line(&mut ready).unwrap();
+            assert!(
+                read > 0,
+                "lock holder exited before acquiring the lock: {ready}"
+            );
+            if ready.contains("locked\n") {
+                break;
+            }
+        }
         let runner = FakeRunner::new();
         runner.on_fn(
             |cmd| cmd.program == "ssh",
