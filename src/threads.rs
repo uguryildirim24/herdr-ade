@@ -5326,7 +5326,7 @@ mod tests {
         std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
-            "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+            "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
         )
         .unwrap();
 
@@ -5531,7 +5531,7 @@ mod tests {
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
             format!(
-                "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
+                "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[harness]\nrepos = [{{ path = \"{harness_s}\" }}]\n"
             ),
         )
         .unwrap();
@@ -5783,7 +5783,7 @@ mod tests {
         );
     }
 
-    const ROUTED_BOX_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"buildbox\"\n";
+    const ROUTED_BOX_CONFIG: &str = "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[[routing.rules]]\nproduct = \"web-research\"\nrecipe = \"agy_gemini_flash\"\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[dispatch]\nmachine = \"buildbox\"\n";
 
     const NATIVE_BOX: &str = "\n[machines.buildbox]\nlabel = \"buildbox\"\ntarget = \"buildbox-pi\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [\"pi\", \"claude\", \"agy\"]\n";
 
@@ -6671,7 +6671,7 @@ mod tests {
         write_config(
             &fx,
             &format!(
-                "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"buildbox\"\n{NATIVE_BOX}"
+                "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"buildbox\"\n{NATIVE_BOX}"
             ),
         );
         stub_box(&fx);

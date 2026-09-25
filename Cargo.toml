@@ -22,12 +22,6 @@ toml = "0.9"
 name = "herdr-pi"
 path = "src/bin/herdr-pi.rs"
 
-# The Pro bridge plugin (SPEC-pro-bridge v2): Pro as an ordinary Codex lane on
-# the installed codex-chatgpt-web bridge. Compiles `src/pro/` the same way.
-[[bin]]
-name = "herdr-pro"
-path = "src/bin/herdr-pro.rs"
-
 # The Rundown tab (W132): one project's plan card as a plain to-do list, opened
 # by `ha open` as the `rundown` plugin pane. Compiles `src/rundown/view.rs`.
 [[bin]]

@@ -6563,7 +6563,7 @@ mod tests {
         std::fs::create_dir_all(fx.world.home.path().join("cfg")).unwrap();
         std::fs::write(
             fx.world.home.path().join("cfg/config.toml"),
-            "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
+            "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n",
         )
         .unwrap();
         fx.world.runner.on(

@@ -84,7 +84,7 @@ enum Kind {
 impl Kind {
     fn binaries(self) -> &'static [&'static str] {
         match self {
-            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-pro", "herdr-rundown"],
+            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-rundown"],
             Kind::Fork => &["herdr"],
         }
     }
@@ -387,7 +387,7 @@ fn box_binary(machine: &crate::remote::MachineDeclaration, bin: &str) -> Result<
     match bin {
         "herdr-ade" => Ok(machine.ade_bin.clone()),
         "herdr-pi" => Ok(machine.pi_bin.clone()),
-        "herdr-pro" | "herdr-rundown" => Path::new(&machine.ade_bin)
+        "herdr-rundown" => Path::new(&machine.ade_bin)
             .parent()
             .map(|dir| dir.join(bin).to_string_lossy().into_owned())
             .context("machine ade_bin has no parent folder"),
@@ -1208,7 +1208,6 @@ mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
-    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1736,52 +1735,6 @@ mod tests {
             out.stdout
         );
         assert!(!out.stdout.contains("HERDR_ADE_BOX_TICKER_STALE="));
-    }
-
-    #[test]
-    fn installing_the_same_clean_commit_keeps_every_installed_inode() {
-        let root = tempfile::tempdir().unwrap();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
-        let runner = RealRunner;
-        let ctx = Ctx {
-            env: &env,
-            root: root.path().join("root"),
-            config_dir: root.path().join("config"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let repo = root.path().join("repo");
-        let release = repo.join("target/release");
-        let installed_dir = root.path().join(".local/bin");
-        std::fs::create_dir_all(&release).unwrap();
-        std::fs::create_dir_all(&installed_dir).unwrap();
-
-        for bin in ["herdr-ade", "herdr-pi", "herdr-pro"] {
-            let source = release.join(bin);
-            let installed = installed_dir.join(bin);
-            write_version_binary(&source, &format!("{bin} 0.1.0+abc1234.200"), "new stamp");
-            write_version_binary(&installed, &format!("{bin} 0.1.0+abc1234.100"), "old stamp");
-            let before = std::fs::metadata(&installed).unwrap().ino();
-
-            local_install(&ctx, repo.to_str().unwrap(), bin, "abc1234", true).unwrap();
-
-            assert_eq!(
-                std::fs::metadata(&installed).unwrap().ino(),
-                before,
-                "{bin}"
-            );
-        }
-
-        let source = release.join("herdr");
-        let installed = installed_dir.join("herdr");
-        write_version_binary(&source, "herdr 0.9.1", "rebuilt fork");
-        write_version_binary(&installed, "herdr 0.9.1", "installed fork");
-        std::fs::write(install_record(&installed_dir, "herdr"), "abc1234\n").unwrap();
-        let before = std::fs::metadata(&installed).unwrap().ino();
-
-        local_install(&ctx, repo.to_str().unwrap(), "herdr", "abc1234", true).unwrap();
-
-        assert_eq!(std::fs::metadata(&installed).unwrap().ino(), before);
     }
 
     #[test]

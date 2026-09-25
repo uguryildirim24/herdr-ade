@@ -10,11 +10,6 @@ use anyhow::{Context, Result, bail};
 
 use super::{Layout, PI_PACKAGE, PI_VERSION, sh};
 
-/// The `pro` provider writer, shared with `herdr-pro` by path (the file is
-/// self-contained, so both binaries can compile it).
-#[path = "../pro/provider.rs"]
-mod provider;
-
 /// The DeepSeek `contextWindow` merge (a second writer of the same
 /// `models.json`; it derives its models from the recipe rows).
 use super::provider as deepseek;
@@ -124,40 +119,8 @@ pub(crate) struct SetupReport {
     pub(crate) link_line: String,
 }
 
-/// Write the `pro` provider into `models.json` when the relay has written its
-/// `serve.json`. Returns the relay base URL that was written.
-fn write_provider(layout: &Layout) -> Result<Option<String>> {
-    let Some(ade_root) = layout.root.parent() else {
-        return Ok(None);
-    };
-    let state = ade_root.join("pro-bridge/serve.json");
-    let text = match std::fs::read_to_string(&state) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", state.display()));
-        }
-    };
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("{} does not parse", state.display()))?;
-    let port = value
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())
-        .with_context(|| format!("{} has no valid port", state.display()))?;
-    let token = value
-        .get("token")
-        .and_then(serde_json::Value::as_str)
-        .filter(|token| !token.is_empty())
-        .with_context(|| format!("{} has no token", state.display()))?;
-    let base = provider::base_url(port);
-    provider::write_merged(&layout.models(), &base, token)?;
-    Ok(Some(base))
-}
-
 /// Write the DeepSeek `contextWindow` overrides into `models.json`. Runs on
-/// every setup, with or without the relay's `serve.json`; the merge keeps the
-/// `pro` provider and every other key.
+/// every setup; the merge keeps every other key.
 fn write_deepseek(env: &super::Env, layout: &Layout) -> Result<()> {
     let models = super::doctor::configured_deepseek_models(&env.config_dir())?;
     deepseek::write_overrides(&layout.models(), &models)
@@ -174,7 +137,6 @@ pub(crate) fn setup(
     let folder = super::folder::ensure(layout)?;
     let wrapper = super::launch::write_wrapper(layout)?;
     let guard = write_guard(layout)?;
-    let provider = write_provider(layout)?;
     write_deepseek(env, layout)?;
 
     let integration = runner.run(
@@ -190,7 +152,7 @@ pub(crate) fn setup(
         );
     }
 
-    let mut steps = vec![
+    let steps = vec![
         format!(
             "installed {PI_PACKAGE}@{PI_VERSION} into {} (`{}`)",
             layout.npm().display(),
@@ -212,22 +174,6 @@ pub(crate) fn setup(
             layout.models().display()
         ),
     ];
-    if let Some(base) = &provider {
-        steps.push(format!(
-            "wrote the `pro` provider ({base}) into {}",
-            layout.models().display()
-        ));
-    } else {
-        steps.push(format!(
-            "no `pro` provider yet: {} is missing; run `herdr-pro serve`, then `herdr-pi setup` again",
-            layout
-                .root
-                .parent()
-                .unwrap_or(&layout.root)
-                .join("pro-bridge/serve.json")
-                .display()
-        ));
-    }
     let _ = folder;
     Ok(SetupReport {
         steps,
@@ -289,29 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_writes_the_provider_when_the_relay_has_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        std::fs::create_dir_all(layout.agent()).unwrap();
-        let pro = dir.path().join("pro-bridge");
-        std::fs::create_dir_all(&pro).unwrap();
-        std::fs::write(
-            pro.join("serve.json"),
-            r#"{"port":1234,"pid":1,"started":"now","token":"tok"}"#,
-        )
-        .unwrap();
-        let base = write_provider(&layout).unwrap().unwrap();
-        assert_eq!(base, "http://127.0.0.1:1234/v1");
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
-        assert_eq!(value["providers"]["pro"]["apiKey"], "tok");
-        assert_eq!(
-            value["providers"]["pro"]["baseUrl"],
-            "http://127.0.0.1:1234/v1"
-        );
-    }
-
-    #[test]
     fn a_guard_with_the_current_marker_but_old_untyped_behavior_is_stale() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pi"));
@@ -354,21 +277,12 @@ mod tests {
         );
         runner.on("/h/herdr integration install pi", ok("installed pi\n"));
         let report = setup(&runner, &env, &layout).unwrap();
-        assert_eq!(report.steps.len(), 7);
-        assert!(
-            report
-                .steps
-                .last()
-                .unwrap()
-                .contains("no `pro` provider yet"),
-            "{:?}",
-            report.steps
-        );
+        assert_eq!(report.steps.len(), 6);
         assert!(report.link_line.starts_with("ln -s "));
         assert!(layout.settings().exists());
         assert!(layout.guard().exists());
         assert!(layout.wrapper().exists());
-        // The relay never ran, so the DeepSeek override is the only provider
+        // The DeepSeek override is the only provider
         // row, and setup wrote it itself.
         let models: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
@@ -378,7 +292,7 @@ mod tests {
         );
         let first = std::fs::read_to_string(layout.models()).unwrap();
         let second = setup(&runner, &env, &layout).unwrap();
-        assert_eq!(second.steps.len(), 7);
+        assert_eq!(second.steps.len(), 6);
         assert_eq!(std::fs::read_to_string(layout.models()).unwrap(), first);
         let integration = runner
             .calls

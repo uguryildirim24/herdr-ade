@@ -225,7 +225,6 @@ fn context_uses_ha_for_the_default_root_and_keeps_recipe_commands_in_the_skill()
         .unwrap();
     assert!(!recipes.contains("--root"), "{recipes}");
     assert!(!recipes.contains("thread start"), "{recipes}");
-    assert!(!recipes.contains("herdr-pro start"), "{recipes}");
     assert!(recipes.contains("Rolf's one-off choice"), "{recipes}");
 }
 

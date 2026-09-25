@@ -178,11 +178,7 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
                 }
                 reach.push(format!("rule[{index}] {}", trigger.join("; ")));
             }
-            if recipe.provider == "pro" {
-                reach.push("Pro command on the Mac".into());
-            } else {
-                reach.push("Rolf's one-off choice".into());
-            }
+            reach.push("Rolf's one-off choice".into());
             format!(
                 "- {id} [enabled] {} — capabilities={capabilities}; reach: {}",
                 recipe.plain,
@@ -240,11 +236,6 @@ pub fn authorize_explicit_recipe(
         .with_context(|| format!("routing_recipe_unknown: {recipe_id}"))?;
     if !recipe.enabled {
         bail!("routing_recipe_disabled: {recipe_id}");
-    }
-    if recipe.provider == "pro" {
-        return Err(crate::refusal::error(
-            "recipe_command_only: Pro lanes use `herdr-pro start` and `herdr-pro turn` on the Mac",
-        ));
     }
     let work = work_contract(task_text, workflow)?;
     if let Some(capability) = &work.capability
@@ -324,7 +315,7 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
 
 /// Apply the recovery policy without turning infrastructure evidence into
 /// failed work. Provider and connection failures get bounded same-recipe
-/// retries; a gone process restarts; only failed work may select a fallback.
+/// retries; a gone process restarts. Failed work retries its original recipe.
 pub fn resolve_failure(
     ctx: &Ctx,
     project: &Project,
@@ -366,7 +357,7 @@ pub fn resolve_failure(
 
 /// The coordinator may replace an unknown failed attempt after recording why.
 /// This is a bounded same-recipe retry; unknown evidence never selects a
-/// fallback recipe and automatic escalation still waits for this decision.
+/// different recipe and automatic recovery still waits for this decision.
 pub fn resolve_coordinator_retry(
     ctx: &Ctx,
     project: &Project,
@@ -464,18 +455,24 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
                 pinned: true,
             }
         }
-        (None, None) => config.routing.select(&hash, &work, recovery)?,
+        (None, None) => {
+            let selected = config.routing.select(&hash, &work, recovery)?;
+            if let Some(previous) = input.previous {
+                crate::routing::Selection {
+                    recipe: previous.recipe_id.clone(),
+                    rule: previous.routing_rule.clone(),
+                    pinned: selected.pinned,
+                }
+            } else {
+                selected
+            }
+        }
         (Some(_), Some(_)) => bail!("recipe_choice_ambiguous"),
     };
     let recipe = config
         .recipes
         .get(&selected.recipe)
         .context("routing_recipe_unknown")?;
-    if recipe.provider == "pro" {
-        bail!(
-            "recipe_command_only: Pro lanes use `herdr-pro start` and `herdr-pro turn` on the Mac"
-        );
-    }
     if let Some(capability) = &work.capability
         && !recipe.capabilities.contains(capability)
     {
@@ -580,13 +577,8 @@ fn validate_recipe_reachability(config: &LaunchConfig) -> Result<()> {
         let routed = config.routing.default == *id
             || config.routing.rules.iter().any(|rule| rule.recipe == *id);
         // Every declared adapter can be reached by Rolf's guarded one-off
-        // `thread start --recipe` command. Pro is the one command-only recipe:
-        // its provider declaration is the structural link doctor can verify.
-        let commanded = if recipe.provider == "pro" {
-            true
-        } else {
-            config.adapters.contains_key(&recipe.kind)
-        };
+        // `thread start --recipe` command.
+        let commanded = config.adapters.contains_key(&recipe.kind);
         if !routed && !commanded {
             bail!(
                 "recipe_unreachable: enabled recipe `{id}` has no default or rule and no command can reach it"
@@ -675,17 +667,8 @@ mod tests {
             plain: "the sleeping helper".into(),
             ..ordinary.clone()
         };
-        let pro = Recipe {
-            provider: "pro".into(),
-            plain: "the paid helper".into(),
-            ..ordinary.clone()
-        };
         let config = LaunchConfig {
-            recipes: BTreeMap::from([
-                ("ordinary".into(), ordinary),
-                ("paid".into(), pro),
-                ("sleeping".into(), disabled),
-            ]),
+            recipes: BTreeMap::from([("ordinary".into(), ordinary), ("sleeping".into(), disabled)]),
             adapters: BTreeMap::new(),
             dispatch: DispatchConfig::default(),
             routing: crate::routing::Routing {
@@ -703,7 +686,7 @@ mod tests {
         };
         validate_recipe_reachability(&config).unwrap();
         let lines = context_recipe_lines(&config);
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("capabilities=pictures"), "{:?}", lines);
         assert!(lines[0].contains("reach: default"), "{:?}", lines);
         assert!(
@@ -714,11 +697,9 @@ mod tests {
             lines
         );
         assert!(lines[0].contains("Rolf's one-off choice"), "{:?}", lines);
-        assert!(lines[1].contains("Pro command on the Mac"), "{:?}", lines);
         assert!(!lines.iter().any(|line| line.contains("thread start")));
-        assert!(!lines.iter().any(|line| line.contains("herdr-pro start")));
-        assert!(lines[2].contains("[disabled]"), "{:?}", lines);
-        assert!(!lines[2].contains("reach:"), "{:?}", lines);
+        assert!(lines[1].contains("[disabled]"), "{:?}", lines);
+        assert!(!lines[1].contains("reach:"), "{:?}", lines);
     }
 
     #[test]

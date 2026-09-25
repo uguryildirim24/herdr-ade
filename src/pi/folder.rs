@@ -31,9 +31,7 @@ pub(crate) const SETTINGS_JSON: &str = r#"{
 }
 "#;
 
-/// The empty provider table setup starts from. `herdr-pro serve` and
-/// `herdr-pi setup` merge the `pro` relay provider into it; nothing else adds
-/// a provider this round (Cursor stays outside pi, decisions 18:05, 18:30).
+/// The empty provider table setup starts from.
 const MODELS_JSON: &str = "{\n  \"providers\": {}\n}\n";
 
 /// What setup created; printed by `herdr-pi setup`.
