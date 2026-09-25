@@ -487,6 +487,13 @@ impl PinnedGate {
     }
 }
 
+/// Which pinned gate ran and which changed paths selected it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GateSelection {
+    pub(crate) index: usize,
+    pub(crate) files: Vec<String>,
+}
+
 /// `.state/rounds/r<n>.toml` owns the entire round transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct RoundRecord {
@@ -518,6 +525,11 @@ pub(crate) struct RoundRecord {
     /// vector is an explicit gate-free policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gates: Option<Vec<PinnedGate>>,
+    /// `None` on historical records means every pinned gate ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_gates: Option<Vec<GateSelection>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skipped_gates: Vec<usize>,
     pub(crate) policy_hash: String,
     pub(crate) manifest: AdmissionManifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
