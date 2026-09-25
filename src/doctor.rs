@@ -59,7 +59,7 @@ impl<'a> Timings<'a> {
     fn remote_phases(&self, label: &str, snapshot: &str) {
         let facts = parse_facts(snapshot);
         for (phase, commands) in [
-            ("facts", "hostname, systemctl, gh auth, df"),
+            ("facts", "host, load, slices, disk, gh auth"),
             ("readiness", "provider probes, command -v"),
             ("worktrees", "git status, find, du"),
             ("builds", "find"),
@@ -81,7 +81,7 @@ impl<'a> Timings<'a> {
         let state = self.state.lock().unwrap();
         let _ = writeln!(
             text,
-            "\nTimings (wall time since previous check; batch work is charged to its first row):"
+            "\nTimings (wall time since previous row; batched checks have a setup row):"
         );
         for row in &state.rows {
             let _ = writeln!(text, "{row}");
@@ -478,7 +478,11 @@ fn run_with_trace(
     // unused built-in provider knowledge never causes a doctor failure.
     let pi_models =
         crate::pi::doctor::configured_routed_models(&ctx.config_dir).unwrap_or_default();
-    match crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, &pi_models) {
+    let pi_result = crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, &pi_models);
+    if let Some(timings) = timings {
+        timings.row("pi readiness batch");
+    }
+    match pi_result {
         Ok((rows, pi_healthy)) => {
             healthy &= pi_healthy;
             for row in rows {
@@ -1001,18 +1005,20 @@ fn report_with_checks(
                                 format!("ssh target {}", profile.target),
                             );
                             let mut box_snapshot = String::new();
-                            for (ok, label, detail) in box_rows_with_snapshot(
+                            let box_rows = box_rows_with_snapshot(
                                 runner,
                                 config_dir,
                                 &profile,
                                 &config.recipes,
                                 config.doctor.min_free_disk_gb,
                                 Some((&ctx, &mut box_snapshot)),
-                            ) {
-                                check(&mut out, ok, &label, detail);
-                            }
+                            );
                             if let Some(timings) = timings {
                                 timings.remote_phases(&profile.label, &box_snapshot);
+                                timings.row(&format!("box {} snapshot", profile.label));
+                            }
+                            for (ok, label, detail) in box_rows {
+                                check(&mut out, ok, &label, detail);
                             }
                             let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
                             check_workspace_leaks_with_snapshot(
@@ -2938,11 +2944,12 @@ recipe = "claude_fable_xhigh"
         assert!(result.message.contains("  branches:"));
         let timing = Timings::new(&runner);
         timing.remote_phases("buildbox", "doctor_phase_builds\t250\n");
-        timing.row("box buildbox boot");
+        timing.row("box buildbox snapshot");
         let mut detail = String::new();
         timing.print(&mut detail);
+        assert!(detail.contains("  box buildbox snapshot:"), "{detail}");
         assert!(
-            detail.contains("box buildbox builds (find, grouped): 0.250s"),
+            detail.contains("    box buildbox builds (find, grouped): 0.250s"),
             "{detail}"
         );
     }
