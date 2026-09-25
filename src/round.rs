@@ -1598,7 +1598,9 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
     }
     let _ = crate::board::refresh(ctx, &project);
     let review_worktrees = cleanup_review_worktrees(ctx, &project, &record);
-    if let Err(error) = finish_cleanup_marker(&project, round) {
+    if let Err(error) = crate::branches::closed_round(ctx, &project, &record) {
+        eprintln!("branch cleanup pending for {round}: {error:#}");
+    } else if let Err(error) = finish_cleanup_marker(&project, round) {
         eprintln!("cleanup marker pending for {round}: {error:#}");
     }
     Ok(CancelOutcome {
@@ -1612,11 +1614,14 @@ pub fn cancel(ctx: &Ctx, slug: &str, round: &str, reason: &str) -> Result<Cancel
     })
 }
 
-/// Remove every review checkout for a closed round while retaining its review
-/// branches. Repairs use `review-rN-2`, `review-rN-3`, and so on, so cleanup
-/// discovers the actual registered worktrees rather than trusting only the
-/// latest branch on the round record.
-fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) -> Vec<String> {
+/// Remove every review checkout for a closed round before pruning its refs.
+/// Repairs use `review-rN-2`, `review-rN-3`, and so on, so cleanup discovers
+/// registered worktrees rather than trusting only the latest branch.
+pub(crate) fn cleanup_review_worktrees(
+    ctx: &Ctx,
+    project: &Project,
+    record: &RoundRecord,
+) -> Vec<String> {
     if !record.phase.closed() || record.repo.is_empty() {
         return Vec::new();
     }
@@ -1661,7 +1666,7 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
             Ok(false) => {
                 match crate::git::worktree_prune(ctx.runner, &record.repo) {
                     Ok(()) => lines.push(format!(
-                        "review worktree {} removed; its branch was kept",
+                        "review worktree {} removed; branch cleanup follows",
                         path.display()
                     )),
                     Err(error) => lines.push(format!(
@@ -1699,13 +1704,13 @@ fn cleanup_review_worktrees(ctx: &Ctx, project: &Project, record: &RoundRecord) 
             )),
             Ok(_) => match crate::git::worktree_remove(ctx.runner, &record.repo, &path_text) {
                 Ok(()) => lines.push(format!(
-                    "review worktree {} removed; its branch was kept",
+                    "review worktree {} removed; branch cleanup follows",
                     path.display()
                 )),
                 Err(remove_error) => match path.try_exists() {
                     Ok(false) => match crate::git::worktree_prune(ctx.runner, &record.repo) {
                         Ok(()) => lines.push(format!(
-                            "review worktree {} removed; its branch was kept",
+                            "review worktree {} removed; branch cleanup follows",
                             path.display()
                         )),
                         Err(error) => lines.push(format!(
@@ -4500,6 +4505,10 @@ fn finalize_round(ctx: &Ctx, project: &Project, slug: &str, round: &str) {
             eprintln!("{}", cleanup_retry_message(&id));
         }
     }
+    if let Err(error) = crate::branches::closed_round(ctx, project, &record) {
+        eprintln!("branch cleanup pending for {round}: {error:#}");
+        return;
+    }
     if let Err(error) = finish_cleanup_marker(project, round) {
         eprintln!("cleanup marker pending for {round}: {error:#}");
     }
@@ -6889,7 +6898,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![format!(
-                "review worktree {} removed; its branch was kept",
+                "review worktree {} removed; branch cleanup follows",
                 review_worktree.display()
             )]
         );
