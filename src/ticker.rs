@@ -1648,6 +1648,8 @@ pub(crate) fn idle_nudge_status(
         Some(reason)
     } else if input_clear == Some(false) {
         Some("input held".into())
+    } else if input_clear.is_none() {
+        Some("input unavailable".into())
     } else {
         None
     };
@@ -1671,8 +1673,10 @@ pub(crate) fn idle_nudge_line(
     let (settings, _) = project.read_project_md()?;
     let minutes = crate::project::coordinator_settings(config_dir)?.idle_nudge_minutes;
     let record = project.coordinator();
-    let agents = herdr.agent_list().unwrap_or_default();
-    let panes = herdr.pane_list().unwrap_or_default();
+    // Without a live view the ticker cannot send; an empty invented view
+    // would misreport a transport failure as an agent or lane still working.
+    let agents = herdr.agent_list()?;
+    let panes = herdr.pane_list()?;
     let agent = record.as_ref().and_then(|record| {
         agents
             .iter()
@@ -4033,6 +4037,7 @@ mod tests {
             ..state
         };
         assert!(line(&state, Some(false)).ends_with("input held"));
+        assert!(line(&state, None).ends_with("input unavailable"));
         assert!(line(&state, Some(true)).ends_with("due"));
     }
 

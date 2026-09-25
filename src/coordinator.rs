@@ -1051,14 +1051,19 @@ fn digest_snapshot(
     }
     if let Some(record) = project.coordinator() {
         let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-        if let Ok(line) = crate::ticker::idle_nudge_line(project, &ctx.config_dir, &herdr) {
-            let _ = writeln!(out, "\n{line}");
+        match crate::ticker::idle_nudge_line(project, &ctx.config_dir, &herdr) {
+            Ok(line) => {
+                let _ = writeln!(out, "\n{line}");
+            }
+            Err(error) => {
+                let _ = writeln!(out, "\nidle nudge status unavailable: {error:#}");
+            }
         }
     } else {
         let state = crate::steps::load_state(project);
         let _ = writeln!(
             out,
-            "\nlast idle nudge: {}; agent working",
+            "\nlast idle nudge: {}; no coordinator",
             if state.idle_nudge_last.is_empty() {
                 "never"
             } else {
