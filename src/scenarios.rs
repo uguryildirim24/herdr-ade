@@ -1128,7 +1128,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
         call.program == "ssh"
             && call
                 .display()
-                .contains("git branch -D -- hp/demo/t-0001-task")
+                .contains("git update-ref -d refs/heads/hp/demo/t-0001-task")
             && call.display().contains("cd /home/agent/projects/herdr-ade")
     }));
     assert!(calls.iter().any(|call| {
