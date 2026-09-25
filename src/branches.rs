@@ -545,14 +545,16 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
     // Fetch each distinct remote once, in parallel; sequential ls-remote calls
     // previously serialized network latency across projects.
     let mut urls = BTreeSet::new();
+    let mut repos = BTreeSet::new();
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
         let (settings, _) = project.read_project_md()?;
         for row in settings.repos {
-            if Path::new(&row.path).is_dir()
-                && let Some(url) = row.publish_url.or(row.push_remote)
-            {
-                urls.insert((row.path, url));
+            if Path::new(&row.path).is_dir() {
+                repos.insert(row.path.clone());
+                if let Some(url) = row.publish_url.or(row.push_remote) {
+                    urls.insert((row.path, url));
+                }
             }
         }
     }
@@ -568,6 +570,46 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
         }
         remotes.insert((repo, url), parse_refs(&output.stdout));
     }
+    // Local ref inventories and checked-out branch lists are independent.
+    // Query each repo once, in one parallel batch, even when multiple projects
+    // name that same checkout.
+    let commands: Vec<_> = repos
+        .iter()
+        .flat_map(|repo| {
+            [
+                Cmd::new("git", TIMEOUT).args([
+                    "-C",
+                    repo,
+                    "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads",
+                ]),
+                Cmd::new("git", TIMEOUT).args(["-C", repo, "worktree", "list", "--porcelain"]),
+            ]
+        })
+        .collect();
+    let mut local_by_repo = BTreeMap::new();
+    let mut in_use_by_repo = BTreeMap::new();
+    let mut answers = ctx.runner.run_parallel(&commands).into_iter();
+    for repo in &repos {
+        let refs = answers.next().expect("one refs answer per repo")?;
+        if !refs.success() {
+            bail!("git for-each-ref in {repo}: {}", refs.error_text());
+        }
+        let worktrees = answers.next().expect("one worktree answer per repo")?;
+        if !worktrees.success() {
+            bail!("git worktree list in {repo}: {}", worktrees.error_text());
+        }
+        local_by_repo.insert(repo.clone(), parse_refs(&refs.stdout));
+        in_use_by_repo.insert(
+            repo.clone(),
+            worktrees
+                .stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix("branch refs/heads/").map(str::to_owned))
+                .collect::<BTreeSet<_>>(),
+        );
+    }
     let mut result = Vec::new();
     let mut merged_by_repo = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -579,8 +621,8 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
             if !Path::new(&row.path).is_dir() {
                 continue;
             }
-            let local = refs(ctx.runner, &row.path, None)?;
-            let in_use = checked_out(ctx.runner, &row.path)?;
+            let local = &local_by_repo[&row.path];
+            let in_use = &in_use_by_repo[&row.path];
             let remote_url = row.publish_url.as_ref().or(row.push_remote.as_ref());
             let remote = remote_url
                 .and_then(|url| remotes.get(&(row.path.clone(), url.clone())))
@@ -730,6 +772,37 @@ mod tests {
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
+    #[test]
+    fn local_refs_and_checked_out_branches_share_a_parallel_batch() {
+        struct Batches(std::cell::RefCell<Vec<usize>>);
+        impl Runner for Batches {
+            fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+                crate::runner::RealRunner.run(cmd)
+            }
+            fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<crate::runner::Output>> {
+                self.0.borrow_mut().push(commands.len());
+                commands.iter().map(|cmd| self.run(cmd)).collect()
+            }
+            fn socket_request(
+                &self,
+                socket: &Path,
+                line: &str,
+                timeout: Duration,
+            ) -> Result<String> {
+                crate::runner::RealRunner.socket_request(socket, line, timeout)
+            }
+        }
+        let (fx, _bare) = configured();
+        let batches = Batches(std::cell::RefCell::new(Vec::new()));
+        let ctx = fx.world.ctx();
+        let ctx = Ctx {
+            runner: &batches,
+            ..ctx
+        };
+        doctor(&ctx, None).unwrap();
+        assert_eq!(*batches.0.borrow(), vec![1, 2]);
+    }
+
     fn configured() -> (crate::round::testkit::Fx, tempfile::TempDir) {
         let fx = crate::round::testkit::fixture();
         let bare = tempfile::tempdir().unwrap();
