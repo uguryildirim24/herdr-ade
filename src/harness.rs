@@ -1501,6 +1501,16 @@ mod tests {
 
     #[test]
     fn a_box_ticker_from_the_same_commit_passes_with_its_exact_build() {
+        // The simulated box needs Linux's flock CLI to hold and probe its
+        // lock; macOS does not ship it, so it cannot simulate this case.
+        if !std::process::Command::new("sh")
+            .args(["-c", "PATH=/usr/bin:/bin; command -v flock >/dev/null"])
+            .status()
+            .unwrap()
+            .success()
+        {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let commit = crate::build::commit_version(crate::VERSION).unwrap();
