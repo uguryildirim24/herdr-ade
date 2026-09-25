@@ -28,6 +28,7 @@ struct Timings<'a> {
 struct TimingState {
     last: Instant,
     commands: Vec<String>,
+    command_time: Duration,
     rows: Vec<String>,
 }
 
@@ -38,6 +39,7 @@ impl<'a> Timings<'a> {
             state: Mutex::new(TimingState {
                 last: Instant::now(),
                 commands: Vec::new(),
+                command_time: Duration::ZERO,
                 rows: Vec::new(),
             }),
         }
@@ -61,9 +63,9 @@ impl<'a> Timings<'a> {
         for (phase, commands) in [
             ("facts", "host, load, slices, disk, gh auth"),
             ("readiness", "provider probes, command -v"),
-            ("worktrees", "git status, find, du"),
-            ("builds", "find"),
             ("herdr", "workspace list, agent list, tab list"),
+            ("builds", "find"),
+            ("worktrees", "parallel git status, find, du"),
         ] {
             if let Some(ms) = facts
                 .get(&format!("doctor_phase_{phase}"))
@@ -89,11 +91,15 @@ impl<'a> Timings<'a> {
     }
 
     fn command(&self, program: &str, elapsed: Duration) {
-        self.state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        state.command_time += elapsed;
+        state
             .commands
             .push(format!("{program}: {:.3}s", elapsed.as_secs_f64()));
+    }
+
+    fn command_time(&self) -> Duration {
+        self.state.lock().unwrap().command_time
     }
 }
 
@@ -476,9 +482,25 @@ fn run_with_trace(
     );
     // The pi rows read only providers named by enabled configured recipes;
     // unused built-in provider knowledge never causes a doctor failure.
+    let setup_start = Instant::now();
     let pi_models =
         crate::pi::doctor::configured_routed_models(&ctx.config_dir).unwrap_or_default();
+    if let Some(timings) = timings {
+        timings.command(
+            "pi routed model inventory (file walk)",
+            setup_start.elapsed(),
+        );
+    }
+    let pi_start = Instant::now();
+    let command_start = timings.map(Timings::command_time).unwrap_or_default();
     let pi_result = crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, &pi_models);
+    if let Some(timings) = timings {
+        let commands = timings.command_time().saturating_sub(command_start);
+        timings.command(
+            "pi readiness setup and cache (in-process)",
+            pi_start.elapsed().saturating_sub(commands),
+        );
+    }
     if let Some(timings) = timings {
         timings.row("pi readiness batch");
     }
@@ -773,7 +795,14 @@ fn report_with_checks(
             runner,
             detached_ticker: false,
         };
-        let (leftovers, data_kept, errors) = finished_worktrees(&ctx);
+        let started = Instant::now();
+        let (leftovers, data_kept, errors) = finished_worktrees_impl(&ctx, None, None, timings);
+        if let Some(timings) = timings {
+            timings.command(
+                "local worktree inventory and inspection (includes git)",
+                started.elapsed(),
+            );
+        }
         check(
             &mut out,
             worktree_check_status(&leftovers, &errors),
@@ -1281,6 +1310,7 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
 export -f inspect
 "#,
     );
+    bash.push_str("doctor_tmp=$(mktemp -d /tmp/herdr-doctor-batch.XXXXXXXX) || exit 1\ntrap 'rm -rf -- \"$doctor_tmp\"' EXIT\ndoctor_jobs=\ndoctor_index=0\n");
     for (project, thread) in candidates {
         let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
         let path = crate::remote::quote(&thread.worktree_path);
@@ -1295,10 +1325,17 @@ export -f inspect
             .collect::<Vec<_>>()
             .join(" ");
         bash.push_str(&format!(
-            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; printf 'doctor_active\\tworktree {key}\\n'; timeout 2s du -sk -- {path} | while read -r kib rest; do printf 'size_{key}\\t%s\\n' \"$kib\"; done; timeout 6s bash -c 'inspect \"$@\"' _ {path} {key} {skips} || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
+            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; ( timeout 2s du -sk -- {path} | while read -r kib rest; do printf 'size_{key}\\t%s\\n' \"$kib\"; done; timeout 6s bash -c 'inspect \"$@\"' _ {path} {key} {skips} || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0' ) > \"$doctor_tmp/$doctor_index\" & doctor_jobs=\"$doctor_jobs $!\"; doctor_index=$((doctor_index+1)); else printf 'worktree_{key}\\t0\\n'; fi\n",
         ));
     }
-    format!("bash -c {}\n", crate::remote::quote(&bash))
+    // Capture each worker separately: status uses NUL framing and concurrent
+    // writes to stdout would corrupt its records. All workers share one wall
+    // bound; a slow tree cannot consume a separate six seconds per checkout.
+    bash.push_str("for doctor_job in $doctor_jobs; do wait \"$doctor_job\" || :; done\nfor ((doctor_i=0; doctor_i<doctor_index; doctor_i++)); do cat \"$doctor_tmp/$doctor_i\"; printf '\\n'; done\n");
+    format!(
+        "timeout -k 1s 12s bash -c {}; doctor_status=$?; case $doctor_status in 0) ;; 124|137) printf 'doctor_worktrees_timeout\\t1\\n' ;; *) printf 'doctor_worktrees_failed\\t%s\\n' \"$doctor_status\" ;; esac\n",
+        crate::remote::quote(&bash)
+    )
 }
 
 fn finished_worktrees_with_snapshot(
@@ -1306,11 +1343,12 @@ fn finished_worktrees_with_snapshot(
     profile: &crate::contracts::MachineProfile,
     snapshot: &str,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
-    finished_worktrees_impl(ctx, Some(profile), Some(snapshot))
+    finished_worktrees_impl(ctx, Some(profile), Some(snapshot), None)
 }
 
+#[cfg(test)]
 fn finished_worktrees(ctx: &Ctx) -> (Vec<String>, Vec<String>, Vec<String>) {
-    finished_worktrees_impl(ctx, None, None)
+    finished_worktrees_impl(ctx, None, None, None)
 }
 
 /// Two Git batches per repository replace repeated branch-head, integration
@@ -1379,6 +1417,7 @@ fn finished_worktrees_impl(
     ctx: &Ctx,
     remote: Option<&crate::contracts::MachineProfile>,
     snapshot: Option<&str>,
+    timings: Option<&Timings<'_>>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let (candidates, mut errors) = finished_worktree_candidates(ctx, remote);
     // Check existence on the box before any completion probe. A merged
@@ -1387,6 +1426,23 @@ fn finished_worktrees_impl(
     // healthy "gone" result cannot enter the command-failure ledger and a
     // transport failure remains distinguishable from a negative answer.
     let remote_exists = remote.map(|profile| {
+        if let Some(snapshot) = snapshot {
+            if snapshot.contains("doctor_worktrees_timeout\t1") {
+                errors.push(format!(
+                    "{}: box worktree inspection exceeded 12s",
+                    profile.label
+                ));
+            }
+            if let Some(status) = snapshot
+                .lines()
+                .find_map(|line| line.strip_prefix("doctor_worktrees_failed\t"))
+            {
+                errors.push(format!(
+                    "{}: box worktree inspection failed (exit {status})",
+                    profile.label
+                ));
+            }
+        }
         let Some(snapshot) = snapshot else {
             errors.push(format!("{}: box snapshot missing", profile.label));
             return vec![false; candidates.len()];
@@ -1465,9 +1521,14 @@ fn finished_worktrees_impl(
                     .map(|kib| kib * 1024)
             })
         } else {
-            std::process::Command::new("du")
+            let started = Instant::now();
+            let output = std::process::Command::new("du")
                 .args(["-sk", "--", path])
-                .output()
+                .output();
+            if let Some(timings) = timings {
+                timings.command("du (worktree size)", started.elapsed());
+            }
+            output
                 .ok()
                 .filter(|out| out.status.success())
                 .and_then(|out| String::from_utf8(out.stdout).ok())
@@ -2111,12 +2172,7 @@ done
     script.push_str("for doctor_job in $doctor_jobs; do wait \"$doctor_job\"; done\n");
     if let Some((ctx, _)) = &snapshot {
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_readiness\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
-        script.push_str("printf 'doctor_active\\tworktrees\\n'\n");
-        script.push_str(&remote_worktree_script(ctx, profile));
-        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_worktrees\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
-        script.push_str("printf 'doctor_active\\tbuilds\\n'\n");
-        script.push_str(&build_folder_script(&machine_paths.build));
-        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_builds\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
+
         for (key, command) in [
             ("workspaces", "workspace list"),
             ("agents", "agent list"),
@@ -2127,7 +2183,13 @@ done
                 session = crate::remote::quote(&profile.session),
             ));
         }
-        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_herdr\\t%s\\n' \"$((doctor_now-doctor_start))\"\n");
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_herdr\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
+        script.push_str("printf 'doctor_active\\tbuilds\\n'\n");
+        script.push_str(&build_folder_script(&machine_paths.build));
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_builds\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
+        script.push_str("printf 'doctor_active\\tworktrees\\n'\n");
+        script.push_str(&remote_worktree_script(ctx, profile));
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_worktrees\\t%s\\n' \"$((doctor_now-doctor_start))\"\n");
     }
     let facts = match crate::remote::ssh(
         runner,
@@ -3715,6 +3777,10 @@ recipe = "claude_fable_xhigh"
             .display();
         assert!(ssh.contains("git status --porcelain --ignored"));
         assert!(ssh.contains("du -sk"));
+        assert!(
+            ssh.find("herdr_workspaces").unwrap() < ssh.find("doctor_active\\tworktrees").unwrap(),
+            "worktree delays must not hide herdr answers"
+        );
     }
 
     #[test]
