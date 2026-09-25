@@ -1078,10 +1078,6 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
     for (project, thread) in candidates {
         let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
         let path = crate::remote::quote(&thread.worktree_path);
-        let inspect = matches!(
-            crate::threads::finished_worktree_reason(ctx, &project, &thread),
-            Ok(None)
-        );
         let skips = crate::worktrees::disposable(&ctx.config_dir, &project, &thread.repo)
             .unwrap_or_default()
             .into_iter()
@@ -1089,13 +1085,11 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
             .map(|entry| crate::remote::quote(&entry))
             .collect::<Vec<_>>()
             .join(" ");
+        // Do not probe completion before the box has answered existence.
+        // Most resolved checkouts are gone; the completion probe can run
+        // several local git processes for each of those old records.
         bash.push_str(&format!(
-            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; {inspect}; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
-            inspect = if inspect {
-                format!("(inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'")
-            } else {
-                ":".into()
-            },
+            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; (inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
         ));
     }
     format!("bash -c {}\n", crate::remote::quote(&bash))
@@ -2684,6 +2678,10 @@ recipe = "claude_fable_xhigh"
             target: "me@box".into(),
             session: "default".into(),
         };
+        // Building the batch must not run completion git probes for the
+        // numerous resolved checkouts that no longer exist on the box.
+        remote_worktree_script(&ctx, &profile);
+        assert!(fake.calls.borrow().iter().all(|call| call.program != "git"));
         let (leftovers, data, errors) = finished_worktrees_with_snapshot(&ctx, &profile, &snapshot);
 
         assert!(leftovers.is_empty());
