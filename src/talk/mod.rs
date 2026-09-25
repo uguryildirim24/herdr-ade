@@ -384,12 +384,229 @@ fn pending_prompt_path(project: &Project, pane: &str, text: &str) -> PathBuf {
         .join(format!("{:x}.json", hash.finalize()))
 }
 
-/// Marks a harness prompt for the prompt-submit hook so it is not recorded
-/// as Rolf's request. Kinds without hooks leave no marker.
-pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
-    if !crate::hook::captures(project, pane)? {
-        return Ok(());
+/// Visible characters and their ANSI intensity/inverse-video attributes.
+/// An unrecognised control sequence means the input cannot be read safely.
+struct StyledLine {
+    text: String,
+    faint: Vec<bool>,
+    inverse: Vec<bool>,
+}
+
+fn styled_lines(screen: &str) -> Option<Vec<StyledLine>> {
+    let mut lines = vec![StyledLine {
+        text: String::new(),
+        faint: Vec::new(),
+        inverse: Vec::new(),
+    }];
+    let mut chars = screen.chars().peekable();
+    let (mut faint, mut inverse) = (false, false);
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.next()? != '[' {
+                return None;
+            }
+            let mut codes = String::new();
+            loop {
+                let next = chars.next()?;
+                if next == 'm' {
+                    break;
+                }
+                if !next.is_ascii_digit() && next != ';' {
+                    return None;
+                }
+                codes.push(next);
+            }
+            let params: Vec<u16> = codes
+                .split(';')
+                .map(|code| {
+                    if code.is_empty() {
+                        Some(0)
+                    } else {
+                        code.parse().ok()
+                    }
+                })
+                .collect::<Option<_>>()?;
+            let mut i = 0;
+            while i < params.len() {
+                match params[i] {
+                    0 => {
+                        faint = false;
+                        inverse = false;
+                    }
+                    2 => faint = true,
+                    22 => faint = false,
+                    7 => inverse = true,
+                    27 => inverse = false,
+                    38 | 48 | 58 => {
+                        i += match params.get(i + 1)? {
+                            2 if i + 4 < params.len() => 5,
+                            5 if i + 2 < params.len() => 3,
+                            _ => return None,
+                        };
+                        continue;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else if ch == '\n' {
+            lines.push(StyledLine {
+                text: String::new(),
+                faint: Vec::new(),
+                inverse: Vec::new(),
+            });
+        } else {
+            if ch.is_control() && ch != '\r' {
+                return None;
+            }
+            let line = lines.last_mut()?;
+            line.text.push(ch);
+            line.faint.push(faint);
+            line.inverse.push(inverse);
+        }
     }
+    Some(lines)
+}
+
+fn separator(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && line.chars().all(|ch| ch == '─')
+}
+
+/// Inspect the live editor, not scrollback. Claude's faint (SGR 2) suggestion
+/// is not Rolf's text; a normal-intensity character is. Pi's cursor is a
+/// single inverse-video space between two coloured separator rows.
+pub(crate) fn coordinator_input_clear(screen: &str) -> bool {
+    let Some(lines) = styled_lines(screen) else {
+        return false;
+    };
+    if lines.iter().all(|line| line.text.trim().is_empty()) {
+        return false;
+    }
+    // Pi: demand both borders and the cursor, and refuse any printable draft
+    // in the middle. A border elsewhere in the transcript is not an editor.
+    if lines.windows(3).enumerate().any(|(i, rows)| {
+        lines.len().saturating_sub(i) <= 10
+            && separator(&rows[0].text)
+            && separator(&rows[2].text)
+            && rows[1].text.trim().is_empty()
+            && rows[1].inverse.iter().any(|inverse| *inverse)
+            && lines[i + 3..]
+                .iter()
+                .all(|line| line.text.trim().is_empty())
+    }) {
+        return true;
+    }
+    let Some((index, line)) = lines.iter().enumerate().rev().find(|(_, line)| {
+        ["❯", "›", ">", "⟩"]
+            .iter()
+            .any(|mark| line.text.trim_start().starts_with(mark))
+    }) else {
+        return false;
+    };
+    if lines.len().saturating_sub(index) > 8 {
+        return false;
+    }
+    let Some(marker) = line.text.chars().position(|ch| !ch.is_whitespace()) else {
+        return false;
+    };
+    let draft = line
+        .text
+        .trim_start()
+        .trim_start_matches(['❯', '›', '>', '⟩'])
+        .trim();
+    let faint_suggestion = !draft.is_empty()
+        && line
+            .text
+            .chars()
+            .zip(&line.faint)
+            .skip(marker + 1)
+            .filter(|(ch, _)| !ch.is_whitespace())
+            .all(|(_, faint)| *faint);
+    let codex_hint = line.text.chars().nth(marker) == Some('›')
+        && matches!(
+            draft,
+            "Ask Codex to do anything"
+                | "Try \"debug this error\""
+                | "Use /skills to list available skills"
+        );
+    let placeholder = draft.is_empty() || faint_suggestion || codex_hint;
+    placeholder
+        && lines[index + 1..].iter().all(|line| {
+            let line = line.text.trim();
+            line.is_empty() || separator(line) || line.contains(" · ")
+        })
+}
+
+/// A previous automated line left in the editor is not Rolf's draft. Only
+/// exact live markers for this pane count; never infer ownership from a prefix.
+pub(crate) fn coordinator_prompt_clear(
+    project: &Project,
+    herdr: &crate::herdr::Herdr<'_>,
+    pane: &str,
+) -> Result<bool> {
+    let screen = herdr.pane_read_ansi(pane, "visible")?;
+    if coordinator_input_clear(&screen) {
+        clear_input_hold(project);
+        return Ok(true);
+    }
+    let dir = talk_dir(project).join("prompts");
+    let entries = std::fs::read_dir(dir).ok();
+    let now = jiff::Timestamp::now().as_second();
+    let tail = styled_lines(&screen)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(8)
+        .map(|line| line.text)
+        .collect::<Vec<_>>();
+    for entry in entries.into_iter().flatten().flatten() {
+        let Some(record) = project::read_json::<PendingPromptRecord>(&entry.path()) else {
+            continue;
+        };
+        if record.pane == pane
+            && now - record.at <= PENDING_PROMPT_SECS
+            && !record.text.is_empty()
+            && tail.iter().any(|line| {
+                let input = line.trim().trim_start_matches(['❯', '›', '>', '⟩']).trim();
+                input == record.text
+            })
+        {
+            clear_input_hold(project);
+            return Ok(true);
+        }
+    }
+    hold_input(project)?;
+    Ok(false)
+}
+
+fn input_hold_path(project: &Project) -> PathBuf {
+    project.state_dir().join("coordinator-input-hold.json")
+}
+
+fn clear_input_hold(project: &Project) {
+    let _ = std::fs::remove_file(input_hold_path(project));
+}
+
+fn hold_input(project: &Project) -> Result<()> {
+    let path = input_hold_path(project);
+    if !path.exists() {
+        project::write_json(&path, &jiff::Timestamp::now().as_second())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn long_input_hold(project: &Project) -> bool {
+    project::read_json::<i64>(&input_hold_path(project))
+        .is_some_and(|since| jiff::Timestamp::now().as_second() - since >= 30 * 60)
+}
+
+/// Marks a harness prompt so an exact leftover in the editor is recognised
+/// and the prompt-submit hook does not record it as Rolf's request.
+pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
+    // Check the hook binding as before, but keep the marker even for kinds
+    // without a submit hook: their unfinished automated drafts need ownership.
+    let _ = crate::hook::captures(project, pane)?;
     project.record_dir_for_write("talk")?;
     let path = pending_prompt_path(project, pane, text);
     if let Some(parent) = path.parent() {
@@ -612,6 +829,76 @@ fn fresh_request() -> String {
 mod tests {
     use super::*;
     use crate::round::testkit::fixture;
+
+    #[test]
+    fn live_claude_suggestions_and_pi_cursor_are_empty_editors() {
+        // Visible ANSI bytes captured from idle Mac coordinator panes.
+        assert!(coordinator_input_clear(
+            "❯ \x1b[0m\x1b[2mshow me the twelve\x1b[0m\n"
+        ));
+        assert!(coordinator_input_clear(
+            "❯ \x1b[0m\x1b[2many news?\x1b[0m\n"
+        ));
+        let border = "\x1b[38;2;178;148;187m────────────────\x1b[0m";
+        let pi = format!("{border}\n\x1b[0m\x1b[7m \x1b[0m   \n{border}\n");
+        assert!(coordinator_input_clear(&pi));
+        assert!(!coordinator_input_clear(
+            &pi.replace("\x1b[7m \x1b[0m", "hello")
+        ));
+        assert!(!coordinator_input_clear("❯ \x1b[0mshow me the twelve\n"));
+        assert!(!coordinator_input_clear("❯ Type a message\n"));
+        assert!(!coordinator_input_clear(
+            "❯ \x1b[0m\x1b[2many news?\x1b[22m and my words\n"
+        ));
+        assert!(!coordinator_input_clear("unfamiliar editor\n"));
+    }
+
+    #[test]
+    fn a_harness_owned_leftover_is_not_a_rolf_draft() {
+        use crate::runner::fake::ok;
+        let fx = fixture();
+        let prompt =
+            "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items.";
+        let path = pending_prompt_path(&fx.project, "w1:p1", prompt);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        project::write_json(
+            &path,
+            &PendingPromptRecord {
+                at: jiff::Timestamp::now().as_second(),
+                pane: "w1:p1".into(),
+                text: prompt.into(),
+            },
+        )
+        .unwrap();
+        fx.world
+            .runner
+            .on("pane read", ok(&format!("❯ {prompt}\n")));
+        let herdr = crate::herdr::Herdr::new("herdr", "/missing.sock", &fx.world.runner);
+        assert!(coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
+        assert!(fx.world.runner.calls.borrow().iter().any(|call| {
+            call.display()
+                .contains("pane read w1:p1 --source visible --format ansi")
+        }));
+        assert!(!coordinator_input_clear("❯ Rolf's unfinished sentence\n"));
+        assert!(coordinator_input_clear("❯ \n"));
+        project::write_json(
+            &input_hold_path(&fx.project),
+            &(jiff::Timestamp::now().as_second() - 31 * 60),
+        )
+        .unwrap();
+        assert!(long_input_hold(&fx.project));
+        let ctx = fx.world.ctx();
+        let board = crate::board::compute(&ctx, &fx.project);
+        assert!(
+            board
+                .iter()
+                .any(|(key, value)| key == "ade_needs_you" && value.contains("30 minutes"))
+        );
+        let context = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(context.contains("over 30 minutes"));
+    }
 
     #[test]
     fn a_cut_tail_is_skipped_terminated_and_reported_once() {

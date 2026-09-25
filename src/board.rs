@@ -264,9 +264,13 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     // waiting event and never inferred from idle.
     out.push((
         "ade_needs_you".to_string(),
-        crate::ask::newest_open(project)
-            .map(|a| crate::ask::compact_line(&a))
-            .unwrap_or_else(|| "nothing waits for you".to_string()),
+        if crate::talk::long_input_hold(project) {
+            "your unfinished input has held automated prompts for over 30 minutes".to_string()
+        } else {
+            crate::ask::newest_open(project)
+                .map(|a| crate::ask::compact_line(&a))
+                .unwrap_or_else(|| "nothing waits for you".to_string())
+        },
     ));
 
     // ade_last: the last say line or a templated last event with its age.
