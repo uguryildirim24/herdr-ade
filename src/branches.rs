@@ -255,6 +255,7 @@ struct Candidate {
 
 fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
     let mut result = Vec::new();
+    let mut merged_by_repo = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
         let (settings, _) = project.read_project_md()?;
@@ -272,6 +273,24 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
                 None => BTreeMap::new(),
             };
             let base = row.branch.as_deref().unwrap_or("main");
+            // Enumerate merged tips in one traversal, instead of spawning git
+            // once for every local and published ref. A published SHA that is
+            // absent locally cannot be proven merged without fetching it.
+            let merged = if let Some(merged) = merged_by_repo.get(&(row.path.clone(), base.into()))
+            {
+                merged.clone()
+            } else {
+                let merged: BTreeSet<String> = git(
+                    ctx.runner,
+                    &row.path,
+                    &["for-each-ref", "--merged", base, "--format=%(objectname)"],
+                )?
+                .lines()
+                .map(str::to_owned)
+                .collect();
+                merged_by_repo.insert((row.path.clone(), base.into()), merged.clone());
+                merged
+            };
             let mut names: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
             names.retain(|name| harness_ref(name) && !in_use.contains(name));
             for name in names {
@@ -295,9 +314,7 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
                     .get(&name)
                     .into_iter()
                     .chain(remote.get(&name))
-                    .all(|sha| {
-                        crate::git::is_ancestor(ctx.runner, &row.path, sha, base).unwrap_or(false)
-                    });
+                    .all(|sha| merged.contains(sha));
                 // An open thread still owns its ref, even when it has not
                 // diverged from the base yet.
                 let active = threads.iter().any(|t| {
@@ -373,7 +390,21 @@ pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::process::Command;
+
+    struct CountingRunner(Cell<usize>);
+    impl Runner for CountingRunner {
+        fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+            if cmd.program == "git" && cmd.args.iter().any(|arg| arg == "--merged") {
+                self.0.set(self.0.get() + 1);
+            }
+            crate::runner::RealRunner.run(cmd)
+        }
+        fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
+            crate::runner::RealRunner.socket_request(socket, line, timeout)
+        }
+    }
     fn run(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
@@ -517,6 +548,23 @@ mod tests {
                 .unwrap()
                 .contains_key("hp/demo/t-2")
         );
+    }
+
+    #[test]
+    fn inventory_checks_merged_refs_once_for_many_branches() {
+        let (fx, _bare) = configured();
+        for index in 0..30 {
+            run(&fx.repo, &["branch", &format!("hp/demo/t-{index}"), "main"]);
+        }
+        let runner = CountingRunner(Cell::new(0));
+        let original = fx.world.ctx();
+        let ctx = Ctx {
+            runner: &runner,
+            ..original
+        };
+        let plan = doctor(&ctx, None).unwrap();
+        assert!(plan.contains("hp/demo/t-29"));
+        assert_eq!(runner.0.get(), 1);
     }
 
     #[test]
