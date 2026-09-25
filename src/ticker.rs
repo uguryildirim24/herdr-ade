@@ -1561,7 +1561,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     }
 
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
-        first_error = first_error.or(Some(error.context("pending thread cleanup")));
+        eprintln!("note: pending cleanup will retry: {error:#}");
     }
     crate::threads::resolve_report_only(ctx, project);
 

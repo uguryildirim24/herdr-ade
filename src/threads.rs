@@ -1699,6 +1699,17 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         t.cleanup_pending = true;
         t.cleanup_reason = "cancelled".into();
     })?;
+    let fix_cleanup_failed = if !record.repo.is_empty() && record.role != "reviewer" {
+        match crate::branches::release_review_fixes(ctx, &project, &record.repo, id, None) {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!("note: reviewer fix cleanup pending for {id}: {error:#}");
+                true
+            }
+        }
+    } else {
+        false
+    };
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &record);
     }
@@ -1754,15 +1765,17 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         }
         remove_finished_build_folder(ctx, &project, &record)?;
         remove_scratch_session(ctx, &record)?;
-        thread::update(&project, id, |t| {
-            t.cleanup_pending = false;
-            t.cleanup_reason.clear();
-        })?;
+        if !fix_cleanup_failed {
+            thread::update(&project, id, |t| {
+                t.cleanup_pending = false;
+                t.cleanup_reason.clear();
+            })?;
+        }
     }
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
         thread: id.to_string(),
-        state: if pane == "cleanup_pending" {
+        state: if pane == "cleanup_pending" || fix_cleanup_failed {
             "cleanup_pending"
         } else {
             "cancelled"
@@ -1815,12 +1828,16 @@ pub(crate) fn resolve_automatically(
     }
     let attempted = resolve(ctx, &project.slug, id, &ResolveArgs::default());
     match attempted {
-        Ok(outcome) => {
-            let _ = thread::update(project, id, |t| {
-                t.resolved_reason = reason.to_string();
-                t.cleanup_pending = false;
-                t.cleanup_reason.clear();
-            });
+        Ok(mut outcome) => {
+            let pending = thread::load(project, id).is_ok_and(|t| t.cleanup_pending);
+            if !pending {
+                let _ = thread::update(project, id, |t| {
+                    t.resolved_reason = reason.to_string();
+                    t.cleanup_reason.clear();
+                });
+            } else {
+                outcome.state = "cleanup_pending".into();
+            }
             outcome
         }
         Err(error) => {
@@ -1856,7 +1873,10 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         .filter(|record| record.cleanup_pending)
     {
         if !record.cancellation_reason.is_empty() {
-            cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)?;
+            if let Err(error) = cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)
+            {
+                eprintln!("note: cleanup pending for {}: {error:#}", record.id);
+            }
         } else {
             let reason = if record.cleanup_reason.is_empty() {
                 "automatic"
@@ -1867,10 +1887,27 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         }
     }
 
-    for round in crate::round::checked_list(project)?
-        .into_iter()
-        .filter(|round| round.cleanup_pending)
-    {
+    let rounds = crate::round::checked_list(project)?;
+    // An admission can succeed while its older fix ref's remote is down.
+    // Round membership is the durable retry marker; keep reconciling until
+    // the older ref disappears, without failing another command.
+    for round in &rounds {
+        for member in &round.manifest.members {
+            if let Err(error) = crate::branches::release_review_fixes(
+                ctx,
+                project,
+                &round.repo,
+                &member.thread,
+                Some(&round.round),
+            ) {
+                eprintln!(
+                    "note: reviewer fix cleanup pending for {}: {error:#}",
+                    member.thread
+                );
+            }
+        }
+    }
+    for round in rounds.into_iter().filter(|round| round.cleanup_pending) {
         let reason = if round.phase == crate::contracts::RoundPhase::Merged {
             "merged"
         } else {
@@ -1899,7 +1936,12 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             eprintln!("branch cleanup pending for {}: {error:#}", round.round);
             continue;
         }
-        crate::round::finish_cleanup_marker(project, &round.round)?;
+        if let Err(error) = crate::round::finish_cleanup_marker(project, &round.round) {
+            eprintln!(
+                "note: cleanup marker pending for {}: {error:#}",
+                round.round
+            );
+        }
     }
     Ok(())
 }
@@ -2527,6 +2569,25 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         t.status = Status::Resolved;
         t.resolved_reason = "manual".into();
         t.prompt_pending = false;
+    })?;
+    let fix_cleanup_failed = if !resolved.repo.is_empty() && resolved.role != "reviewer" {
+        match crate::branches::release_review_fixes(ctx, &project, &resolved.repo, id, None) {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!("note: reviewer fix cleanup pending for {id}: {error:#}");
+                true
+            }
+        }
+    } else {
+        false
+    };
+    thread::update(&project, id, |t| {
+        t.cleanup_pending = fix_cleanup_failed;
+        t.cleanup_reason = if fix_cleanup_failed {
+            "reviewer fix".into()
+        } else {
+            String::new()
+        };
     })?;
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &resolved);

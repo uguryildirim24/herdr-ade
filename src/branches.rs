@@ -1,6 +1,7 @@
 //! Prune harness refs only after their lane is resolved or their commit landed.
 //! Remote deletion uses a lease, so a new push cannot be erased by a stale plan.
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
@@ -77,14 +78,28 @@ fn harness_ref(name: &str) -> bool {
 }
 
 fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -> Result<()> {
-    if !refs(runner, repo, None)?.contains_key(branch) {
-        return Ok(());
+    let name = format!("refs/heads/{branch}");
+    // update-ref compares the old value atomically. Unlike branch -D it cannot
+    // lose a check/delete race to another cleanup process.
+    if let Err(error) = git(runner, repo, &["update-ref", "-d", &name, expected]) {
+        match refs(runner, repo, None)?.get(branch) {
+            None => return Ok(()),
+            Some(actual) if actual != expected => bail!("branch {branch} moved; not removing it"),
+            _ => return Err(error),
+        }
     }
-    if refs(runner, repo, None)?.get(branch).map(String::as_str) != Some(expected) {
-        bail!("branch {branch} moved; not removing it");
-    }
-    git(runner, repo, &["branch", "-D", "--", branch])?;
     Ok(())
+}
+
+fn cleanup_lock(project: &Project) -> Result<File> {
+    let path = project.state_dir().join("branch-cleanup.lock");
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn delete_remote(
@@ -103,7 +118,120 @@ fn delete_remote(
     }
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
     let deletion = format!(":refs/heads/{branch}");
-    git(runner, repo, &["push", &lease, url, &deletion])?;
+    if let Err(error) = git(runner, repo, &["push", &lease, url, &deletion]) {
+        match refs(runner, repo, Some(url))?.get(branch) {
+            None => return Ok(()),
+            Some(actual) if actual != expected => {
+                bail!("published branch {branch} moved; not removing it")
+            }
+            _ => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Keep a rejected reviewer's commit outside the disposable reviewer branch.
+/// Each admitted lane can merge this ref even after reviewer cleanup.
+pub(crate) fn keep_rejected_fix(
+    runner: &dyn Runner,
+    project: &Project,
+    repo: &str,
+    slug: &str,
+    round: &str,
+    lanes: &[String],
+    sha: &str,
+) -> Result<Vec<String>> {
+    let (settings, _) = project.read_project_md()?;
+    let url = settings
+        .repos
+        .iter()
+        .find(|row| row.path == repo)
+        .and_then(|row| row.publish_url.as_ref().or(row.push_remote.as_ref()));
+    let mut names = Vec::new();
+    for lane in lanes {
+        let name = format!("review-fix/{slug}/{round}/{lane}");
+        git(
+            runner,
+            repo,
+            &["update-ref", &format!("refs/heads/{name}"), sha],
+        )?;
+        if let Some(url) = url {
+            let previous = refs(runner, repo, Some(url))?
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            let lease = format!("--force-with-lease=refs/heads/{name}:{previous}");
+            git(
+                runner,
+                repo,
+                &["push", &lease, url, &format!("{sha}:refs/heads/{name}")],
+            )?;
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Release only fixes from older rounds after this lane enters a new round,
+/// or all its fixes when it is resolved.
+pub(crate) fn release_review_fixes(
+    ctx: &Ctx,
+    project: &Project,
+    repo: &str,
+    lane: &str,
+    except_round: Option<&str>,
+) -> Result<()> {
+    // Only a lane with a rejected review can own one of these refs. Avoid
+    // touching git/remote for every unrelated thread lifecycle command.
+    if !crate::round::list(project).iter().any(|round| {
+        round.repo == repo
+            && (round.rejections.unwrap_or(0) > 0
+                || round.verdict_kind.as_deref() == Some("REJECT"))
+            && round
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.thread == lane)
+    }) {
+        return Ok(());
+    }
+    // These refs are disjoint from thread/round cleanup; atomic ref deletion
+    // needs no project-wide lock and cannot wait for another lane's box.
+    let local = refs(ctx.runner, repo, None)?;
+    let prefix = format!("review-fix/{}/", project.slug);
+    let suffix = format!("/{lane}");
+    let eligible = |name: &str| {
+        name.starts_with(&prefix)
+            && name.ends_with(&suffix)
+            && name.split('/').count() == 4
+            && except_round
+                .is_none_or(|round| name != format!("review-fix/{}/{round}/{lane}", project.slug))
+    };
+    if !local.keys().any(|name| eligible(name)) {
+        return Ok(());
+    }
+    let (settings, _) = project.read_project_md()?;
+    let url = settings
+        .repos
+        .iter()
+        .find(|row| row.path == repo)
+        .and_then(|row| row.publish_url.as_ref().or(row.push_remote.as_ref()));
+    let remote = match url {
+        Some(url) => refs(ctx.runner, repo, Some(url))?,
+        None => BTreeMap::new(),
+    };
+    for name in local.keys().chain(remote.keys()).collect::<BTreeSet<_>>() {
+        if eligible(name) {
+            if let Some(url) = url
+                && let Some(sha) = remote.get(name)
+            {
+                delete_remote(ctx.runner, repo, url, name, sha)?;
+            }
+            if let Some(sha) = local.get(name) {
+                delete_local(ctx.runner, repo, name, sha)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -113,6 +241,8 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     if record.repo.is_empty() || !harness_ref(&record.branch) {
         return Ok(());
     }
+    release_review_fixes(ctx, project, &record.repo, &record.id, None)?;
+    let _cleanup = cleanup_lock(project)?;
     if checked_threads(project)?.iter().any(|t| {
         t.id != record.id
             && t.repo == record.repo
@@ -143,10 +273,9 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
         let script = crate::remote::with_path(
             &machine.path,
             &format!(
-                "cd {} && if git show-ref --verify --quiet {}; then git branch -D -- {}; fi",
+                "cd {} && git update-ref -d {}",
                 crate::remote::quote(&box_repo),
-                crate::remote::quote(&format!("refs/heads/{}", record.branch)),
-                crate::remote::quote(&record.branch)
+                crate::remote::quote(&format!("refs/heads/{}", record.branch))
             ),
         );
         let out = crate::remote::ssh(ctx.runner, &profile.target, &script, None, TIMEOUT)?;
@@ -179,6 +308,7 @@ pub(crate) fn closed_round(
     if !record.phase.closed() || record.repo.is_empty() {
         return Ok(());
     }
+    let _cleanup = cleanup_lock(project)?;
     let (settings, _) = project.read_project_md()?;
     let url = settings
         .repos
@@ -345,6 +475,14 @@ pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
             bail!("branch plan changed; run `ha doctor` again");
         }
         for item in &plan {
+            let project = project::list_slugs(&ctx.root)
+                .into_iter()
+                .filter_map(|slug| Project::load(&ctx.root, &slug).ok())
+                .find(|p| {
+                    p.read_project_md()
+                        .is_ok_and(|(s, _)| s.repos.iter().any(|r| r.path == item.repo))
+                });
+            let _cleanup = project.as_ref().map(cleanup_lock).transpose()?;
             if let Some(sha) = &item.local {
                 delete_local(ctx.runner, &item.repo, &item.branch, sha)?;
             }
@@ -516,6 +654,104 @@ mod tests {
             !refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
                 .unwrap()
                 .contains_key("hp/demo/t-2")
+        );
+    }
+
+    #[test]
+    fn rejected_fix_is_published_for_box_lanes_and_released_remotely() {
+        let (fx, bare) = configured();
+        let runner = crate::runner::RealRunner;
+        let repo = fx.repo.to_string_lossy();
+        let sha = run(&fx.repo, &["rev-parse", "main"]);
+        let round = crate::contracts::RoundRecord {
+            round: "r1".into(),
+            repo: repo.to_string(),
+            rejections: Some(1),
+            manifest: crate::contracts::AdmissionManifest {
+                members: vec![crate::contracts::ManifestMember {
+                    thread: "t-1".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        std::fs::create_dir_all(crate::round::rounds_dir(&fx.project)).unwrap();
+        std::fs::write(
+            crate::round::round_path(&fx.project, "r1"),
+            toml::to_string(&round).unwrap(),
+        )
+        .unwrap();
+        let names = keep_rejected_fix(
+            &runner,
+            &fx.project,
+            &repo,
+            "demo",
+            "r1",
+            &["t-1".into()],
+            &sha,
+        )
+        .unwrap();
+        let url = bare.path().to_str().unwrap();
+        assert_eq!(refs(&runner, &repo, Some(url)).unwrap()[&names[0]], sha);
+        release_review_fixes(&fx.world.ctx(), &fx.project, &repo, "t-1", Some("r2")).unwrap();
+        assert!(
+            !refs(&runner, &repo, Some(url))
+                .unwrap()
+                .contains_key(&names[0])
+        );
+    }
+
+    #[test]
+    fn concurrent_cleanup_of_same_thread_is_idempotent() {
+        let (fx, bare) = configured();
+        let name = "hp/demo/t-concurrent";
+        run(&fx.repo, &["branch", name, "main"]);
+        run(
+            &fx.repo,
+            &["push", "-q", bare.path().to_str().unwrap(), name],
+        );
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let record = thread::allocate(&fx.project, |t| {
+            t.repo = repo.clone();
+            t.branch = name.into();
+            t.status = Status::Resolved;
+        })
+        .unwrap();
+        let env = crate::paths::Env::for_test(fx.world.home.path(), &[]);
+        let base = fx.world.ctx();
+        let root = base.root;
+        let config_dir = base.config_dir;
+        std::thread::scope(|scope| {
+            let cleanup = || {
+                let runner = crate::runner::RealRunner;
+                let ctx = crate::paths::Ctx {
+                    env: &env,
+                    root: root.clone(),
+                    config_dir: config_dir.clone(),
+                    runner: &runner,
+                    detached_ticker: false,
+                };
+                resolved_thread(&ctx, &fx.project, &record)
+            };
+            let a = scope.spawn(cleanup);
+            let b = scope.spawn(cleanup);
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+        });
+        assert!(
+            !refs(fx.world.ctx().runner, &repo, None)
+                .unwrap()
+                .contains_key(name)
+        );
+        assert!(
+            !refs(
+                fx.world.ctx().runner,
+                &repo,
+                Some(bare.path().to_str().unwrap())
+            )
+            .unwrap()
+            .contains_key(name)
         );
     }
 
