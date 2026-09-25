@@ -553,6 +553,14 @@ pub(crate) fn hold_for_follow_up(
                 record.manifest.members[index].awaiting_report_after = next_barrier;
                 record.manifest.revision += 1;
                 let reviewer = record.reviewer.clone();
+                if record.verdict_kind.as_deref() == Some("REJECT") {
+                    // Preserve the sealed rejection across cleanup and retry.
+                    // The held pin cannot fall back to that rejected candidate.
+                    record.previous_verdict = record.verdict.take();
+                    record.previous_verdict_kind = record.verdict_kind.take();
+                    record.previous_manifest_hash = record.manifest_hash.clone();
+                    record.previous_review_branch = record.review_branch.clone();
+                }
                 return_to_admitting(&mut record);
                 save(project, &record)?;
                 changed = true;
@@ -588,9 +596,22 @@ fn cancel_superseded_reviewer(
     {
         return Ok(());
     }
-    let outcome = crate::threads::cancel(ctx, &project.slug, reviewer, reason)?;
-    if outcome.state == "cleanup_pending" {
-        eprintln!("reviewer cleanup pending for {reviewer}; it will retry automatically");
+    match crate::threads::cancel(ctx, &project.slug, reviewer, reason) {
+        Ok(outcome) if outcome.state == "cleanup_pending" => {
+            eprintln!("reviewer cleanup pending for {reviewer}; it will retry automatically");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // The cancellation marker is written before external cleanup. An
+            // error after that marker must not abort delivery to the worker;
+            // the ticker owns the retry. An error before it remains fatal.
+            if !thread::load(project, reviewer)
+                .is_ok_and(|t| t.status == crate::thread::Status::Resolved && t.cleanup_pending)
+            {
+                return Err(error);
+            }
+            eprintln!("reviewer cleanup pending for {reviewer}: {error:#}");
+        }
     }
     Ok(())
 }
@@ -918,6 +939,8 @@ pub fn refresh_pins(project: &Project, record: &mut RoundRecord, events: &[Event
         // An older completion may stand after a follow-up only if delivery
         // did not overtake that seal. Otherwise the next seal must replace it.
         if pin.is_none()
+            && !(record.previous_verdict_kind.as_deref() == Some("REJECT")
+                && record.previous_manifest_hash == record.manifest_hash)
             && let Some(barrier) = barrier.as_deref()
             && let attempt = thread_attempt(project, &member.thread)?
             && events.iter().any(|event| {
@@ -8001,6 +8024,200 @@ mod tests {
             load(&fx.project, "r1").unwrap().review_branch.as_deref(),
             Some("review/r1-2")
         );
+    }
+
+    #[test]
+    fn remote_reviewer_missing_owned_ref_does_not_lose_rejected_follow_up() {
+        use crate::runner::fake::ok;
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        reviewer_ready(&fx);
+        open_r1(&fx);
+        let (lane, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &lane).unwrap();
+        let first = fx.seal_done(&lane, 1, 1, &sha, "# rejected candidate\n");
+        advance(&ctx, "demo").unwrap();
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let old = thread::load(&fx.project, &reviewer).unwrap();
+        git(
+            std::path::Path::new(&old.worktree_path),
+            &["merge", "-q", "--no-edit", &sha],
+        );
+        let candidate = git(
+            std::path::Path::new(&old.worktree_path),
+            &["rev-parse", "HEAD"],
+        );
+        let report = front("REJECT", "r1")(&candidate, &load(&fx.project, "r1").unwrap());
+        fx.seal_done(&reviewer, 1, 1, &candidate, &report);
+        advance(&ctx, "demo").unwrap();
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().verdict_kind.as_deref(),
+            Some("REJECT")
+        );
+        // The review ran on the box: its owned branch and worktree are not
+        // present in the Mac clone when the rejected lane gets a follow-up.
+        git(&fx.repo, &["worktree", "remove", &old.worktree_path]);
+        git(&fx.repo, &["branch", "-D", &old.branch]);
+        git(&fx.repo, &["branch", "hp/unrelated", "main"]);
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].box_path = Some("/box/repo".into());
+        settings.repos[0].publish_url = Some(fx.repo.to_string_lossy().into_owned());
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        let cfg = fx.world.home.path().join("cfg/config.toml");
+        let current = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(&cfg, format!("{current}{}", crate::remote::TEST_MACHINE)).unwrap();
+        fx.world.runner.on("machine list --json", ok(r#"[{"id":"box-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#));
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh" && cmd.display().contains("__HERDR_WORKTREE_REMOVED__"),
+            |_| Ok(ok("__HERDR_WORKTREE_REMOVED__\n")),
+        );
+        let first_cleanup = std::rc::Rc::new(std::cell::Cell::new(true));
+        let fail_once = first_cleanup.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh" && cmd.display().contains("git branch -D"),
+            move |_| {
+                if fail_once.replace(false) {
+                    Ok(crate::runner::fake::fail(
+                        1,
+                        "box branch cleanup unavailable",
+                    ))
+                } else {
+                    Ok(ok(""))
+                }
+            },
+        );
+        fx.world
+            .runner
+            .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+        thread::update(&fx.project, &reviewer, |t| {
+            t.machine = "buildbox".into();
+            t.machine_id = "box-id".into();
+            t.worktree_path = "/box/repo/.worktrees/reviewer".into();
+        })
+        .unwrap();
+        thread::update(&fx.project, &lane, |t| t.prompt_pending = true).unwrap();
+        // Model the interruption between holding the round and recording the
+        // follow-up: cleanup failed, and the old command returned no delivery.
+        let events = sealed_events(&fx.project).unwrap();
+        hold_for_follow_up(&ctx, &fx.project, &lane, &events).unwrap();
+        let interrupted = load(&fx.project, "r1").unwrap();
+        assert_eq!(interrupted.previous_verdict_kind.as_deref(), Some("REJECT"));
+        let prior = earlier_review(&fx.project, &interrupted).unwrap().unwrap();
+        assert_eq!(prior.candidate, candidate);
+        assert_eq!(prior.verdict_kind, "REJECT");
+        assert!(std::path::Path::new(&prior.verdict_artifact).exists());
+        assert!(
+            thread::load(&fx.project, &lane)
+                .unwrap()
+                .follow_ups
+                .is_empty()
+        );
+        // The old failure returned with neither a pending prompt nor text.
+        thread::update(&fx.project, &lane, |t| {
+            t.prompt_pending = false;
+            t.last_group = crate::thread::Group::ReadyForReview.token().into();
+        })
+        .unwrap();
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+        assert!(
+            load(&fx.project, "r1").unwrap().manifest.members[0]
+                .pin
+                .is_none()
+        );
+        thread::update(&fx.project, &lane, |t| t.prompt_pending = true).unwrap();
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane, "Correct the rejected work.").unwrap(),
+            crate::threads::PromptOutcome::Queued { .. }
+        ));
+        let held = load(&fx.project, "r1").unwrap();
+        assert_eq!(held.phase, RoundPhase::Admitting);
+        assert_eq!(held.manifest.revision, 2);
+        assert_eq!(
+            held.manifest.members[0].awaiting_report_after.as_deref(),
+            Some(first.as_str())
+        );
+        let worker = thread::load(&fx.project, &lane).unwrap();
+        assert_eq!(worker.follow_ups.len(), 1);
+        assert!(worker.prompt_pending);
+        let retired = thread::load(&fx.project, &reviewer).unwrap();
+        assert_eq!(retired.status, thread::Status::Resolved);
+        assert!(
+            retired.cleanup_pending,
+            "failed cleanup must remain retryable"
+        );
+        assert!(retired.worktree_path.is_empty());
+        assert!(git(&fx.repo, &["branch", "--list", "hp/unrelated"]).contains("hp/unrelated"));
+        crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
+        assert!(
+            !thread::load(&fx.project, &reviewer)
+                .unwrap()
+                .cleanup_pending
+        );
+        assert_eq!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| {
+                    call.program == "ssh"
+                        && call.display().contains("/box/repo")
+                        && call.display().contains("git branch -D")
+                })
+                .count(),
+            2,
+            "branch retirement must actually run again before clearing cleanup_pending"
+        );
+        // A retry after the round was already held queues another message
+        // without incrementing its revision or reviving the old verdict.
+        crate::threads::prompt(&ctx, "demo", &lane, "One more correction.").unwrap();
+        assert_eq!(load(&fx.project, "r1").unwrap().manifest.revision, 2);
+        assert_eq!(
+            thread::load(&fx.project, &lane).unwrap().follow_ups.len(),
+            2
+        );
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+        // Delivery alone cannot replace the rejected seal. Only a later
+        // completion, after the correction, can authorize the next reviewer.
+        thread::update(&fx.project, &lane, |t| {
+            t.prompt_pending = false;
+            t.last_group = crate::thread::Group::ReadyForReview.token().into();
+            for follow_up in &mut t.follow_ups {
+                follow_up.state = crate::thread::FollowUpState::Delivered;
+                follow_up.after_seal = first.clone();
+            }
+        })
+        .unwrap();
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+        let repaired = commit_file(
+            &fx.repo.join(".worktrees/lane-1"),
+            "src/lane1.rs",
+            "// corrected after rejection\n",
+            "correct lane 1",
+        );
+        let second = fx.seal_done(&lane, 1, 2, &repaired, "# corrected candidate\n");
+        let next = advance(&ctx, "demo").unwrap();
+        assert_eq!(next.started.len(), 1);
+        let current = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            current.manifest.members[0].pin.as_ref().unwrap().event,
+            second
+        );
+        assert_eq!(
+            current.manifest.members[0].pin.as_ref().unwrap().sha,
+            repaired
+        );
+        let task =
+            std::fs::read_to_string(thread::task_path(&fx.project, &next.started[0].reviewer))
+                .unwrap();
+        assert!(task.contains("earlier verdict was REJECT"), "{task}");
+        assert!(task.contains(&prior.verdict_artifact), "{task}");
+        assert!(task.contains(&candidate), "{task}");
+        assert!(git(&fx.repo, &["branch", "--list", "hp/unrelated"]).contains("hp/unrelated"));
     }
 
     /// `advance` may already have prepared a review branch when a concurrent

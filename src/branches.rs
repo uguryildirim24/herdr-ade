@@ -83,7 +83,18 @@ fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -
     if refs(runner, repo, None)?.get(branch).map(String::as_str) != Some(expected) {
         bail!("branch {branch} moved; not removing it");
     }
-    git(runner, repo, &["branch", "-D", "--", branch])?;
+    // Another cleanup may have removed this owned ref since the snapshot.
+    // Only absence is success; a moved ref or any other Git failure remains a refusal.
+    if let Err(error) = git(runner, repo, &["branch", "-D", "--", branch]) {
+        if error
+            .to_string()
+            .ends_with(&format!("error: branch '{branch}' not found"))
+            && !refs(runner, repo, None)?.contains_key(branch)
+        {
+            return Ok(());
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -140,13 +151,14 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
         let (box_repo, url) =
             crate::threads::box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
         let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        let refname = crate::remote::quote(&format!("refs/heads/{}", record.branch));
+        let branch = crate::remote::quote(&record.branch);
+        let missing = crate::remote::quote(&format!("error: branch '{}' not found", record.branch));
         let script = crate::remote::with_path(
             &machine.path,
             &format!(
-                "cd {} && if git show-ref --verify --quiet {}; then git branch -D -- {}; fi",
+                "cd {} || exit $?; git show-ref --verify --quiet {refname}; status=$?; if [ \"$status\" -eq 0 ]; then error=$(git branch -D -- {branch} 2>&1) || {{ git show-ref --verify --quiet {refname}; status=$?; if [ \"$error\" = {missing} ] && [ \"$status\" -eq 1 ]; then :; else printf '%s\\n' \"$error\" >&2; exit 1; fi; }}; elif [ \"$status\" -ne 1 ]; then exit \"$status\"; fi",
                 crate::remote::quote(&box_repo),
-                crate::remote::quote(&format!("refs/heads/{}", record.branch)),
-                crate::remote::quote(&record.branch)
             ),
         );
         let out = crate::remote::ssh(ctx.runner, &profile.target, &script, None, TIMEOUT)?;
@@ -528,6 +540,23 @@ mod tests {
                 .unwrap()
                 .contains_key("hp/demo/t-2")
         );
+    }
+
+    #[test]
+    fn local_branch_deletion_refuses_a_non_missing_git_error() {
+        let fx = crate::round::testkit::fixture();
+        let branch = "hp/demo/reviewer";
+        run(&fx.repo, &["branch", branch, "main"]);
+        run(&fx.repo, &["checkout", "-q", branch]);
+        let sha = run(&fx.repo, &["rev-parse", branch]);
+        let repo = fx.repo.to_str().unwrap();
+        let runner = crate::runner::RealRunner;
+        let error = delete_local(&runner, repo, branch, &sha).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot delete branch"),
+            "{error:#}"
+        );
+        assert_eq!(refs(&runner, repo, None).unwrap().get(branch), Some(&sha));
     }
 
     #[test]
