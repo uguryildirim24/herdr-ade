@@ -350,25 +350,21 @@ pub fn resolve_failure(
         }
         FailureClass::WorkFailed => resolve_launch(ctx, project, input),
         FailureClass::Provider | FailureClass::LostConnection | FailureClass::ProcessGone => {
-            same_recipe_retry(ctx, project, input, class, "recovery")
+            same_recipe_retry(ctx, project, input, class, "recovery", true)
         }
     }
 }
 
-/// The coordinator may replace an unknown failed attempt after recording why.
-/// This is a bounded same-recipe retry; unknown evidence never selects a
-/// different recipe and automatic recovery still waits for this decision.
+/// A coordinator's explicit retry keeps the recipe and records the reason,
+/// even after automatic retries are exhausted. Unknown evidence never chooses
+/// another recipe; automatic recovery still stops at its configured limit.
 pub fn resolve_coordinator_retry(
     ctx: &Ctx,
     project: &Project,
     input: &ResolveInput<'_>,
     class: crate::contracts::FailureClass,
 ) -> Result<Launch> {
-    if class == crate::contracts::FailureClass::Unknown {
-        same_recipe_retry(ctx, project, input, class, "coordinator-retry")
-    } else {
-        resolve_failure(ctx, project, input, class)
-    }
+    same_recipe_retry(ctx, project, input, class, "coordinator-retry", false)
 }
 
 fn same_recipe_retry(
@@ -377,6 +373,7 @@ fn same_recipe_retry(
     input: &ResolveInput<'_>,
     class: crate::contracts::FailureClass,
     ledger_kind: &str,
+    automatic: bool,
 ) -> Result<Launch> {
     let previous = input.previous.context("recovery_previous_missing")?;
     let config = parse_launch_config(&ctx.config_dir)?;
@@ -384,7 +381,7 @@ fn same_recipe_retry(
     let work = work_contract(input.task, input.workflow)?;
     let recovery = previous.same_recipe_retries.saturating_add(1);
     let retries = config.routing.retry_limit(&work);
-    if recovery > retries {
+    if automatic && recovery > retries {
         return Err(crate::refusal::error(format!(
             "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
             class.plain()
