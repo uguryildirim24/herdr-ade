@@ -1935,6 +1935,22 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     let slug = &project.slug;
     let prefix = coordinator::current_prefix(&ctx.root)?;
     let mut first_error = None;
+    // A replacement binding must carry its existing lanes with it. Pickup
+    // checks agent identity on each machine before touching parent metadata.
+    let state = steps::load_state(project);
+    if !state.lanes_parented_to.is_empty() && state.lanes_parented_to != record.pane_id {
+        match crate::checkpoint::relink_binding(ctx, project, &record.pane_id) {
+            Ok(()) => {
+                let mut state = steps::load_state(project);
+                state.lanes_parented_to = record.pane_id.clone();
+                steps::save_state(project, &state)?;
+            }
+            Err(error) => eprintln!(
+                "{}: re-link coordinator lanes will retry: {error:#}",
+                project.slug
+            ),
+        }
+    }
 
     // The recorded name can be gone while the agent keeps running in the
     // bound pane: `agent start` drops it when interactive readiness times out,
@@ -3749,6 +3765,48 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn replacement_binding_reparents_live_local_lane_on_next_pass() {
+        let f = fixture(false);
+        let lane = thread::allocate(&f.project, |t| {
+            t.status = thread::Status::Open;
+            t.pane_id = "w1:p2".into();
+            t.tab_id = "w1:t2".into();
+            t.workspace_id = "w1".into();
+            t.agent = "claude".into();
+            t.cwd = f.project.dir().to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let mut state = steps::load_state(&f.project);
+        state.lanes_parented_to = "w1:p1".into();
+        steps::save_state(&f.project, &state).unwrap();
+        f.project
+            .update_coordinator(|c| {
+                c.pane_id = "w1:p9".into();
+                c.tab_id = "w1:t9".into();
+            })
+            .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(r#"{"result":{"agents":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle"}]}}"#));
+        runner.on("pane list", ok(&with_cwd(r#"{"result":{"panes":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","cwd":"CWD"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"CWD"}]}}"#, &f)));
+        runner.on("pane report-metadata", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let _ = tick_cheap(&ctx, &f.project, false);
+        assert_eq!(
+            runner.count("pane report-metadata w1:p2 --source herdr-ade --token parent=w1:p9"),
+            1,
+            "{}",
+            lane.id
+        );
+        assert_eq!(steps::load_state(&f.project).lanes_parented_to, "w1:p9");
     }
 
     #[test]

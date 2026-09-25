@@ -48,6 +48,8 @@ pub(crate) struct State {
     pub(crate) coordinator_worked_at: String,
     /// Last automatic coordinator relaunch attempt, including failed starts.
     pub(crate) coordinator_relaunch_last: String,
+    /// Coordinator pane whose live lanes were last reconciled by pickup.
+    pub(crate) lanes_parented_to: String,
 }
 
 pub(crate) fn load_state(project: &Project) -> State {
@@ -111,31 +113,9 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
                 continue;
             }
         };
-        // Reconcile already-submitted seals too: an older delivery may have
-        // reached the coordinator before its report was recorded locally.
+        // Context reads sealed work directly, including seals submitted to a
+        // previous coordinator. Never replay a line already typed once.
         if states.contains(&crate::contracts::DeliveryState::Submitted) {
-            // Typed to a coordinator that has since been replaced and never
-            // acknowledged: the current one gets a recipient-changed item.
-            let settled = states.iter().any(|s| {
-                matches!(
-                    s,
-                    crate::contracts::DeliveryState::Acknowledged
-                        | crate::contracts::DeliveryState::Handled
-                )
-            });
-            if !settled
-                && let Some(current) = project.coordinator()
-                && (current.pane_id != event.recipient.pane
-                    || current.attempt() != event.recipient.coordinator_attempt)
-                && let Err(error) = inbox::write_event(
-                    project,
-                    &event,
-                    "recipient-changed",
-                    "a lane event was typed to an earlier coordinator binding",
-                )
-            {
-                first.get_or_insert(error);
-            }
             continue;
         }
         // No `submitted` yet: fresh, or read before its wake-up line was
@@ -175,12 +155,8 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     if coordinator.pane_id != event.recipient.pane
         || coordinator.attempt() != event.recipient.coordinator_attempt
     {
-        inbox::write_event(
-            project,
-            event,
-            "recipient-changed",
-            "a sealed lane event belongs to an earlier coordinator binding",
-        )?;
+        // The new binding sees this seal in context; it must not receive a
+        // second inbox projection or a line addressed to the old binding.
         return Ok(());
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);

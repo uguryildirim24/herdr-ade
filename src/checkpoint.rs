@@ -1202,6 +1202,33 @@ pub(crate) fn pickup(ctx: &Ctx, args: PickupArgs<'_>) -> Result<String> {
     Ok(out)
 }
 
+/// The ticker uses pickup's exact re-link path when a binding changes. A
+/// failed box observation must retry next pass rather than certify the pane.
+pub(crate) fn relink_binding(ctx: &Ctx, project: &Project, pane: &str) -> Result<()> {
+    let views = machine_views(ctx, std::slice::from_ref(project));
+    for (machine, view) in &views {
+        let result = view
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{machine}: {e}"))?;
+        if result.agents.is_none() || result.panes.is_none() {
+            bail!("machine `{machine}` did not answer the re-link observation");
+        }
+    }
+    pickup_project(
+        ctx,
+        project,
+        &views,
+        &PickupArgs {
+            slug: Some(&project.slug),
+            pane: Some(pane),
+            dry_run: false,
+            all: false,
+            start: false,
+        },
+    )?;
+    Ok(())
+}
+
 /// Every active project under the root. Paused projects stay stopped even
 /// when `pickup --all --start` is used.
 fn active_slugs(ctx: &Ctx) -> Vec<String> {
@@ -1224,7 +1251,11 @@ fn machine_views(
     let mut by_machine: BTreeMap<String, Vec<&Project>> = BTreeMap::new();
     for project in projects {
         for t in thread::list(project) {
-            if t.status == thread::Status::Resolved || !t.is_remote() || t.pane_id.is_empty() {
+            if t.status == thread::Status::Resolved
+                || t.parked
+                || !t.is_remote()
+                || t.pane_id.is_empty()
+            {
                 continue;
             }
             let entry = by_machine.entry(t.machine_route().to_string()).or_default();
@@ -1265,10 +1296,15 @@ fn pickup_project(
     let by_pane = by_key(&agents, "pane_id");
     let now = jiff::Timestamp::now();
     let (mut relinked, mut already) = (Vec::new(), Vec::new());
+    let mut parked = Vec::new();
     let mut gone: Vec<thread::Thread> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for t in thread::list(project) {
         if t.status == thread::Status::Resolved || t.pane_id.is_empty() {
+            continue;
+        }
+        if t.parked {
+            parked.push(t.id);
             continue;
         }
         if t.is_remote() {
@@ -1363,6 +1399,9 @@ fn pickup_project(
             relinked.join(", ")
         }
     ));
+    if !parked.is_empty() {
+        out.push_str(&format!("parked:         {}\n", parked.join(", ")));
+    }
     for note in &notes {
         out.push_str(&format!("note: {note}\n"));
     }
@@ -1714,6 +1753,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pickup_lists_parked_lanes_without_restart_lines() {
+        let fx = fixture();
+        let (id, _) = fx.lane(1);
+        thread::update(&fx.project, &id, |t| t.parked = true).unwrap();
+        let out = pickup(
+            &fx.world.ctx(),
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p1"),
+                dry_run: false,
+                all: false,
+                start: true,
+            },
+        )
+        .unwrap();
+        assert!(out.contains(&format!("parked:         {id}")), "{out}");
+        assert!(!out.contains("gone ("), "{out}");
+        assert!(!out.contains("--label"), "{out}");
+        assert_eq!(fx.world.runner.count("pane report-metadata"), 0);
+    }
+
     /// One box lane on saved machine `box` (id `1`), live at `pane`.
     fn box_lane(fx: &Fx, pane: &str, cwd: &str) -> String {
         thread::allocate(&fx.project, |t| {
@@ -1781,6 +1842,25 @@ mod tests {
                 .iter()
                 .any(|c| c.display().contains("--machine box pane report-metadata")),
             "the re-parent must go through the box bridge"
+        );
+    }
+
+    #[test]
+    fn binding_relink_uses_pickup_for_box_and_retries_failed_observation() {
+        let fx = fixture();
+        let id = box_lane(&fx, "w2:p1", "/box/wt");
+        box_courier(
+            &fx.world,
+            r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"hp-demo-t-0001","agent":"claude","agent_status":"idle","cwd":"/box/wt"}]"#,
+            r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/box/wt"}]"#,
+        );
+        relink_binding(&fx.world.ctx(), &fx.project, "w1:p9").unwrap();
+        assert_eq!(
+            fx.world
+                .runner
+                .count("pane report-metadata w2:p1 --source herdr-ade --token parent=Local:w1:p9"),
+            1,
+            "{id}"
         );
     }
 
