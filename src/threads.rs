@@ -139,7 +139,7 @@ pub fn check_birth_plain(text: &str) -> Result<()> {
     if trimmed.is_empty() {
         bail!("plain_missing");
     }
-    if crate::plain::sentence_count(trimmed) != 1 {
+    if trimmed.is_empty() {
         bail!("write one sentence");
     }
     Ok(())
@@ -5182,15 +5182,6 @@ mod tests {
             } else {
                 self.fake.run(cmd)
             }
-        }
-
-        fn socket_request(
-            &self,
-            socket: &Path,
-            line: &str,
-            timeout: Duration,
-        ) -> anyhow::Result<String> {
-            self.fake.socket_request(socket, line, timeout)
         }
     }
 

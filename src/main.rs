@@ -32,13 +32,10 @@ mod cli;
 mod config;
 mod contracts;
 mod coordinator;
-mod decide;
-mod dialogue;
 mod doctor;
 mod escalation;
 mod events;
 mod git;
-mod glossary;
 mod harness;
 mod herdr;
 mod hook;
@@ -59,14 +56,12 @@ mod gate_paths;
 mod pi;
 #[path = "pi/ade.rs"]
 mod pi_ade;
-mod plain;
 mod plan;
 mod pr;
 mod project;
 mod refusal;
 mod remote;
 mod round;
-mod routine;
 mod runner;
 #[cfg(test)]
 mod scenarios;

@@ -125,7 +125,7 @@ fn action_rows_are_bounded_without_raw_storage_pointers() {
         );
         p.write(
             format!(".state/inbox/i-{n:04}.md"),
-            format!("+++\nid = \"i-{n:04}\"\nkind = \"routine\"\nsubject = \"job\"\ncreated = \"x\"\nsummary = \"message-{n:04}\"\n+++\n"),
+            format!("+++\nid = \"i-{n:04}\"\nkind = \"note\"\nsubject = \"job\"\ncreated = \"x\"\nsummary = \"message-{n:04}\"\n+++\n"),
         );
     }
     let text = p.context(true);

@@ -821,9 +821,6 @@ mod tests {
             }
             crate::runner::RealRunner.run(cmd)
         }
-        fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-            crate::runner::RealRunner.socket_request(socket, line, timeout)
-        }
     }
     fn run(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -849,14 +846,6 @@ mod tests {
             fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<crate::runner::Output>> {
                 self.0.borrow_mut().push(commands.len());
                 commands.iter().map(|cmd| self.run(cmd)).collect()
-            }
-            fn socket_request(
-                &self,
-                socket: &Path,
-                line: &str,
-                timeout: Duration,
-            ) -> Result<String> {
-                crate::runner::RealRunner.socket_request(socket, line, timeout)
             }
         }
         let (fx, _bare) = configured();
@@ -884,14 +873,6 @@ mod tests {
                     );
                 }
                 crate::runner::RealRunner.run(cmd)
-            }
-            fn socket_request(
-                &self,
-                socket: &Path,
-                line: &str,
-                timeout: Duration,
-            ) -> Result<String> {
-                crate::runner::RealRunner.socket_request(socket, line, timeout)
             }
         }
         let (fx, _bare) = configured();

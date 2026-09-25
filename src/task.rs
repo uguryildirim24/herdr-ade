@@ -82,7 +82,7 @@ pub(crate) struct Task {
     /// `request:<id>` or `ask:<id>@<revision>`, all validated at creation.
     pub(crate) authority: Vec<String>,
     pub(crate) acceptance: Vec<String>,
-    /// An explicit older note, instruction, decision or task this task supersedes.
+    /// An explicit older note, instruction or task this task supersedes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) replaces: Option<String>,
     pub(crate) notes: Vec<DatedNote>,
@@ -269,7 +269,7 @@ fn validate_record(task: &Task) -> Result<()> {
         bail!("task_authority: at least one request or answered ask is required");
     }
     if task.acceptance.is_empty() || task.acceptance.iter().any(|line| line.trim().is_empty()) {
-        bail!("task_acceptance: at least one plain acceptance condition is required");
+        bail!("task_acceptance: at least one acceptance condition is required");
     }
     let mut withdrawn = BTreeSet::new();
     for evidence in &task.withdrawn {
@@ -472,7 +472,7 @@ pub(crate) fn add(
             "task_acceptance: pass at least one non-empty --acceptance condition",
         ));
     }
-    let title = crate::glossary::check_internal_sentence("task title", title)?;
+    let title = title.trim().to_string();
     let checked_acceptance = acceptance
         .iter()
         .map(|condition| condition.trim().to_string())
@@ -480,7 +480,7 @@ pub(crate) fn add(
     let authority = authority
         .iter()
         .map(|reference| {
-            crate::decide::validate_basis(project, reference)
+            crate::note::validate_basis(project, reference)
                 .map_err(|error| crate::refusal::error(error.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -491,7 +491,7 @@ pub(crate) fn add(
     if let Some(old) = replaces.as_deref() {
         if !crate::note::target_exists(project, old) {
             return Err(crate::refusal::error(format!(
-                "task_replacement: no note, decision or task `{old}` exists"
+                "task_replacement: no note or task `{old}` exists"
             )));
         }
         let rows = crate::note::rows(project);

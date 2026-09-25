@@ -72,7 +72,7 @@ pub(crate) struct ReplacementLock {
     _file: File,
 }
 
-/// Serializes the check-and-append boundary shared by notes, decisions and
+/// Serializes the check-and-append boundary shared by notes and
 /// tasks. Their own storage locks cannot prevent two different record kinds
 /// from replacing the same current row at once.
 pub(crate) fn replacement_lock(project: &Project) -> Result<ReplacementLock> {
@@ -115,24 +115,6 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
             request: Some(retirement.request),
             text: retirement.reason,
             replaces: Some(retirement.id),
-            tasks: Vec::new(),
-        });
-    }
-    for decision in crate::decide::read(project).records {
-        let request = decision.request.clone().or_else(|| {
-            decision
-                .basis
-                .as_deref()
-                .and_then(|basis| basis.strip_prefix("request:"))
-                .map(str::to_string)
-        });
-        rows.push(Row {
-            id: decision.id,
-            kind: "decision".into(),
-            at: Some(decision.at),
-            request,
-            text: decision.line,
-            replaces: decision.replaces,
             tasks: Vec::new(),
         });
     }
@@ -186,6 +168,26 @@ fn retirements(project: &Project) -> Vec<Retirement> {
         .collect()
 }
 
+pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
+    use crate::contracts::AuthorityRef;
+    use anyhow::Context;
+    let reference = AuthorityRef::parse(text).context("invalid authority reference")?;
+    match &reference {
+        AuthorityRef::Request(_) => return Ok(crate::talk::resolve_request(project, text)?.basis()),
+        AuthorityRef::Ask { id, revision } => {
+            if crate::ask::latest_revision(project, id) != *revision {
+                bail!("ask revision is not current");
+            }
+            let answer =
+                crate::ask::answer_of(project, id, *revision).context("ask is not answered")?;
+            if answer.not_understood || answer.choice == 0 {
+                bail!("a no answer authorizes nothing");
+            }
+        }
+    }
+    Ok(reference.as_str())
+}
+
 /// Retire a current memory or instruction without inventing a replacement fact.
 pub(crate) fn retire(
     project: &Project,
@@ -201,7 +203,7 @@ pub(crate) fn retire(
     } else {
         format!("request:{request}")
     };
-    let request = crate::decide::validate_basis(project, &reference)?;
+    let request = validate_basis(project, &reference)?;
     let _replacement_lock = replacement_lock(project)?;
     let _lock = project.lock()?;
     if !read(project).iter().any(|note| note.id == id) {
@@ -257,7 +259,7 @@ pub(crate) fn add(
     } else {
         format!("request:{request}")
     };
-    let request = crate::decide::validate_basis(project, &reference)?;
+    let request = validate_basis(project, &reference)?;
     let request = request
         .strip_prefix("request:")
         .expect("validated request basis");
@@ -345,59 +347,6 @@ pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::round::testkit::fixture;
-
-    #[test]
-    fn a_note_replacement_removes_a_stale_decision_from_current_views() {
-        let fx = fixture();
-        crate::talk::append(
-            &fx.project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "Use the newer instruction.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
-        let decision = crate::decide::decide(
-            &fx.world.ctx(),
-            "demo",
-            crate::decide::NewDecision {
-                line: "I kept the old instruction.",
-                class: "routine",
-                key: None,
-                basis: None,
-                replaces: None,
-                request: None,
-            },
-        )
-        .unwrap();
-        add(
-            &fx.project,
-            Kind::Instruction,
-            "Use the newer instruction.",
-            "q-1",
-            Some(&decision.id),
-            vec![],
-        )
-        .unwrap();
-
-        assert!(crate::decide::current(&fx.project).is_empty());
-        let error = crate::decide::decide(
-            &fx.world.ctx(),
-            "demo",
-            crate::decide::NewDecision {
-                line: "I chose another replacement.",
-                class: "routine",
-                key: None,
-                basis: None,
-                replaces: Some(&decision.id),
-                request: Some("q-1"),
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().starts_with("decision_replaced"));
-    }
 
     #[test]
     fn retirement_keeps_history_but_removes_current_fact_and_instruction() {

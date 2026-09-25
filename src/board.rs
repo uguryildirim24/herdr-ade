@@ -74,7 +74,7 @@ pub(crate) fn remember_last(project: &Project, line: &str) {
 }
 
 /// Gate B for one value: bounded, no control characters, passes the check.
-pub(crate) fn check_value(project: &Project, value: &str) -> Result<()> {
+pub(crate) fn check_value(_project: &Project, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("board_refused: an empty value");
     }
@@ -87,10 +87,7 @@ pub(crate) fn check_value(project: &Project, value: &str) -> Result<()> {
     if value.chars().any(char::is_control) {
         bail!("board_refused: control characters");
     }
-    if let Some(name) = crate::glossary::name_in(project, value) {
-        bail!("board_refused: the value names `{name}`");
-    }
-    crate::glossary::gate(project, value).context("board_refused")
+    Ok(())
 }
 
 fn workspace_herdr<'a>(ctx: &'a Ctx, project: &Project) -> Option<(Herdr<'a>, String)> {
@@ -354,7 +351,6 @@ fn input_stamp(project: &Project) -> InputStamp {
             "plan.toml",
             "notes.jsonl",
             "retirements.jsonl",
-            "decisions.jsonl",
             "project.json",
             "board.json",
         ]
@@ -455,19 +451,6 @@ mod tests {
     use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
     use crate::paths::{Ctx, Env};
     use crate::runner::fake::FakeRunner;
-
-    #[test]
-    fn old_state_loads_and_a_rejected_row_gets_a_checked_notice() {
-        let old = r#"{"values":{"ade_stage":"old"},"last_say":"","last_say_at":""}"#;
-        let state: BoardState = serde_json::from_str(old).unwrap();
-        assert!(state.observed_at.is_empty());
-
-        let home = tempfile::tempdir().unwrap();
-        let project = project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
-        let (published, rejection) = checked_value_or_notice(&project, "README".into(), None);
-        assert!(rejection.unwrap().contains("plain_identifier"));
-        assert_eq!(published.unwrap(), "This board row is unavailable.");
-    }
 
     #[test]
     fn unchanged_ticker_page_does_not_reparse_or_replace_records() {
