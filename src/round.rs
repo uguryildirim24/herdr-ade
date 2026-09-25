@@ -48,7 +48,7 @@ pub mod repo {
 
     use anyhow::{Context, Result, bail};
 
-    use crate::runner::{Cmd, Output, Runner};
+    use crate::runner::{Cmd, ExitMeaning, Output, Runner};
 
     const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -166,13 +166,25 @@ pub mod repo {
         }
 
         /// The tree of merging `other` into `into`, written nowhere. Uses
-        /// `git merge-tree --write-tree` (git 2.38+): a non-zero exit is a
-        /// conflict and no tree is returned. The first output line is the
-        /// tree object id.
+        /// `git merge-tree --write-tree` (git 2.38+): exit 1 with conflict
+        /// diagnostics is a conflict; other failures are not. The first
+        /// output line on success is the tree object id.
         pub fn merge_tree(&self, into: &str, other: &str) -> Result<String> {
-            let out = self.output_in(&self.repo, &["merge-tree", "--write-tree", into, other])?;
+            let out = self.runner.run(
+                &self
+                    .cmd_in(&self.repo, &["merge-tree", "--write-tree", into, other])
+                    .exit_meaning(ExitMeaning::MergeTree),
+            )?;
+            if out.merge_tree_conflict() {
+                return Err(crate::refusal::error(format!(
+                    "merge_conflict: {other} does not merge cleanly into {into}"
+                )));
+            }
             if !out.success() {
-                bail!("merge_conflict: {other} does not merge cleanly into {into}");
+                bail!(
+                    "`git merge-tree --write-tree {into} {other}` failed: {}",
+                    out.error_text()
+                );
             }
             out.stdout
                 .lines()
@@ -4265,14 +4277,20 @@ fn merge_batch_run_with(
                 continue;
             }
             let tree = git.merge_tree(&combined, candidate).map_err(|error| {
+                if !crate::refusal::is(&error) {
+                    return error;
+                }
                 let earlier = (0..index)
-                    .find(|&i| git.merge_tree(&candidates[i], candidate).is_err())
+                    .find(|&i| {
+                        git.merge_tree(&candidates[i], candidate)
+                            .is_err_and(|error| crate::refusal::is(&error))
+                    })
                     .map(|i| rounds[i].as_str())
                     .unwrap_or(owner.branch.as_str());
-                anyhow::anyhow!(
+                crate::refusal::error(format!(
                     "batch_conflict: `{}` conflicts with `{earlier}`: {error:#}",
                     rounds[index]
-                )
+                ))
             })?;
             combined = git.commit_tree(
                 &tree,
@@ -6202,7 +6220,16 @@ mod tests {
             let reviewer = record.reviewer.as_ref().unwrap();
             fx.seal_done(reviewer, 1, 2, &sha, &front("MERGE", round)(&sha, &record));
         }
-        let error = err(merge_batch_run(&ctx, "demo", &rounds, None));
+        let _scope = crate::ledger::Scope::new(&[&fx.project]);
+        let recording = crate::ledger::RecordingRunner(ctx.runner);
+        let ctx = crate::paths::Ctx {
+            runner: &recording,
+            ..ctx
+        };
+        let failure = merge_batch_run(&ctx, "demo", &rounds, None).unwrap_err();
+        assert!(crate::refusal::is(&failure));
+        let error = format!("{failure:#}");
+        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
         assert!(
             error.contains("batch_conflict") && error.contains("r1") && error.contains("r2"),
             "{error}"
