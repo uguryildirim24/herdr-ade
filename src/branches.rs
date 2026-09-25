@@ -581,7 +581,7 @@ struct Candidate {
     remote: Option<(String, String)>,
 }
 
-fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
+fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, Vec<String>)> {
     // Fetch each distinct remote once, in parallel; sequential ls-remote calls
     // previously serialized network latency across projects.
     let mut urls = BTreeSet::new();
@@ -600,15 +600,31 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
     }
     let commands: Vec<_> = urls
         .iter()
-        .map(|(repo, url)| Cmd::new("git", TIMEOUT).args(["-C", repo, "ls-remote", "--heads", url]))
+        .map(|(repo, url)| {
+            Cmd::new("git", Duration::from_secs(10))
+                .args(["-C", repo, "ls-remote", "--heads", url])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .own_group()
+        })
         .collect();
     let mut remotes = BTreeMap::new();
+    let mut unreachable = Vec::new();
     for ((repo, url), output) in urls.into_iter().zip(ctx.runner.run_parallel(&commands)) {
-        let output = output?;
-        if !output.success() {
-            bail!("git ls-remote --heads in {repo}: {}", output.error_text());
+        match output {
+            Ok(output) if output.success() => {
+                remotes.insert((repo, url), parse_refs(&output.stdout));
+            }
+            answer => {
+                let detail = match answer {
+                    Ok(output) => output.error_text(),
+                    Err(error) => format!("{error:#}"),
+                };
+                if !tolerate_unreachable {
+                    bail!("git ls-remote --heads in {repo}: {detail}");
+                }
+                unreachable.push(format!("{repo}: remote unreachable ({detail})"));
+            }
         }
-        remotes.insert((repo, url), parse_refs(&output.stdout));
     }
     // Local ref inventories and checked-out branch lists are independent.
     // Query each repo once, in one parallel batch, even when multiple projects
@@ -737,7 +753,7 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
     }
     result.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
     result.dedup_by(|a, b| a.repo == b.repo && a.branch == b.branch);
-    Ok(result)
+    Ok((result, unreachable))
 }
 
 fn fingerprint(plan: &[Candidate]) -> String {
@@ -748,7 +764,7 @@ fn fingerprint(plan: &[Candidate]) -> String {
 /// Doctor only offers an exact, short-lived plan. Re-run doctor if any ref or
 /// project status changed since the printed command was built.
 pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
-    let plan = candidates(ctx)?;
+    let (plan, unreachable) = candidates(ctx, prune.is_none())?;
     let id = fingerprint(&plan);
     if let Some(requested) = prune {
         if requested != id || plan.is_empty() {
@@ -767,16 +783,27 @@ pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
             plan.len()
         ));
     }
-    if plan.is_empty() {
-        return Ok("leftover harness branches: none\n".into());
+    let mut text = String::new();
+    for warning in &unreachable {
+        text.push_str(&format!("[warn] branch inventory: {warning}\n"));
     }
-    let mut text = format!("leftover harness branches ({}):\n", plan.len());
+    if plan.is_empty() {
+        text.push_str(if unreachable.is_empty() {
+            "leftover harness branches: none\n"
+        } else {
+            "leftover harness branches: remote inventory incomplete\n"
+        });
+        return Ok(text);
+    }
+    text.push_str(&format!("leftover harness branches ({}):\n", plan.len()));
     for item in &plan {
         text.push_str(&format!("  {}: {}\n", item.repo, item.branch));
     }
-    text.push_str(&format!(
-        "Remove exactly these: ha doctor --prune-branches {id}\n"
-    ));
+    if unreachable.is_empty() {
+        text.push_str(&format!(
+            "Remove exactly these: ha doctor --prune-branches {id}\n"
+        ));
+    }
     Ok(text)
 }
 
@@ -841,6 +868,47 @@ mod tests {
         };
         doctor(&ctx, None).unwrap();
         assert_eq!(*batches.0.borrow(), vec![1, 2]);
+    }
+
+    #[test]
+    fn doctor_bounds_hung_remote_and_keeps_local_inventory() {
+        struct HungRemote;
+        impl Runner for HungRemote {
+            fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+                if cmd.args.iter().any(|arg| arg == "ls-remote") {
+                    assert!(cmd.own_group);
+                    return crate::runner::RealRunner.run(
+                        &Cmd::new("sh", Duration::from_millis(250))
+                            .args(["-c", "sleep 30 & exit 0"])
+                            .own_group(),
+                    );
+                }
+                crate::runner::RealRunner.run(cmd)
+            }
+            fn socket_request(
+                &self,
+                socket: &Path,
+                line: &str,
+                timeout: Duration,
+            ) -> Result<String> {
+                crate::runner::RealRunner.socket_request(socket, line, timeout)
+            }
+        }
+        let (fx, _bare) = configured();
+        let ctx = fx.world.ctx();
+        let ctx = Ctx {
+            runner: &HungRemote,
+            ..ctx
+        };
+        let start = std::time::Instant::now();
+        let result = doctor(&ctx, None).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            result.contains("remote unreachable (timed out)"),
+            "{result}"
+        );
+        assert!(result.contains("remote inventory incomplete"), "{result}");
+        assert!(!result.contains("--prune-branches"));
     }
 
     #[test]

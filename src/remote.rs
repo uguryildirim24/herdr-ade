@@ -379,11 +379,10 @@ fn ssh_command(
     timeout: Duration,
 ) -> Result<Output> {
     check_target(target)?;
-    let mut cmd = Cmd::new("ssh", timeout).args(SSH_OPTIONS).args([
-        "--",
-        target,
-        &format!("sh -c {}", quote(script)),
-    ]);
+    let mut cmd = Cmd::new("ssh", timeout)
+        .own_group()
+        .args(SSH_OPTIONS)
+        .args(["--", target, &format!("sh -c {}", quote(script))]);
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
     }
