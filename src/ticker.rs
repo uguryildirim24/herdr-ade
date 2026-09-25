@@ -350,6 +350,7 @@ fn request_stop_with_progress(
         track_progress,
         || start.elapsed(),
         std::thread::sleep,
+        lock_state,
     )
 }
 
@@ -361,8 +362,9 @@ fn request_stop_with_progress_on(
     track_progress: bool,
     now: impl Fn() -> Duration,
     mut pause: impl FnMut(Duration),
+    mut state: impl FnMut(&Path) -> LockState,
 ) -> Result<StopOutcome> {
-    if lock_state(root) == LockState::Free {
+    if state(root) == LockState::Free {
         let _ = std::fs::remove_file(stop_path(root));
         return Ok(StopOutcome::Stopped);
     }
@@ -370,7 +372,7 @@ fn request_stop_with_progress_on(
     let mut deadline = now() + wait;
     let mut observed: Option<Progress> = None;
     loop {
-        match lock_state(root) {
+        match state(root) {
             LockState::Free => {
                 let _ = std::fs::remove_file(stop_path(root));
                 return Ok(StopOutcome::Stopped);
@@ -2658,33 +2660,21 @@ mod tests {
     #[test]
     fn install_wait_resets_only_when_the_holder_reaches_another_step() {
         let root = tempfile::tempdir().unwrap();
-        let mut holder = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path(root.path()))
-            .unwrap();
-        holder.lock().unwrap();
         let info = Info {
             version: "old".into(),
             pid: 123,
             started: "this-run".into(),
             ..Info::default()
         };
-        holder
-            .write_all(serde_json::to_string(&info).unwrap().as_bytes())
-            .unwrap();
         let progress = Progress {
             pid: info.pid,
-            started: info.started,
+            started: info.started.clone(),
             sequence: 1,
             step: "cheap project demo".into(),
         };
         project::write_json(&progress_path(root.path()), &progress).unwrap();
         let path = progress_path(root.path());
         let clock = std::cell::Cell::new(Duration::ZERO);
-        let mut holder = Some(holder);
         let mut updated = false;
         assert_eq!(
             request_stop_with_progress_on(
@@ -2706,8 +2696,12 @@ mod tests {
                         .unwrap();
                         updated = true;
                     }
+                },
+                |_| {
                     if clock.get() >= Duration::from_millis(125) {
-                        drop(holder.take());
+                        LockState::Free
+                    } else {
+                        LockState::Held(info.clone())
                     }
                 }
             )
