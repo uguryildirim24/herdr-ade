@@ -1535,6 +1535,30 @@ mod tests {
         std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
     }
 
+    /// The box has util-linux `flock`; macOS does not. Give the local
+    /// shell-driven box tests a real nonblocking lock command on macOS so a
+    /// missing executable cannot masquerade as a held ticker lock.
+    fn test_box_path(root: &Path) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            let flock = root.join("flock");
+            std::fs::write(
+                &flock,
+                "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = 9 ] || exit 2\nexec /usr/bin/perl -e 'open my $fd, \"+<&=9\" or exit 2; flock($fd, 2 | 4) or exit 1'\n",
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&flock).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&flock, permissions).unwrap();
+            format!("{}:/usr/bin:/bin", root.display())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = root;
+            "/usr/bin:/bin".into()
+        }
+    }
+
     #[test]
     fn a_box_ticker_from_the_same_commit_passes_with_its_exact_build() {
         let root = tempfile::tempdir().unwrap();
@@ -1610,7 +1634,7 @@ mod tests {
             id: "buildbox".into(),
             target: "box".into(),
             root: box_root.to_string_lossy().into_owned(),
-            path: "/usr/bin:/bin".into(),
+            path: test_box_path(root.path()),
             ade_bin: bin.to_string_lossy().into_owned(),
             ..Default::default()
         };
@@ -1682,7 +1706,7 @@ mod tests {
         .unwrap();
         let machine = crate::remote::MachineDeclaration {
             root: box_root.to_string_lossy().into_owned(),
-            path: "/usr/bin:/bin".into(),
+            path: test_box_path(root.path()),
             ade_bin: bin.to_string_lossy().into_owned(),
             ..Default::default()
         };
