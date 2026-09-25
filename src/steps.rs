@@ -70,7 +70,33 @@ pub(crate) fn save_state(project: &Project, state: &State) -> Result<()> {
 /// undelivered.
 pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
-    for event in crate::events::list(project) {
+    let sealed = crate::events::list(project);
+    // Prompt order is serialized, but adoption is not: a held notice must
+    // never delay reports from later seals in the same pass.
+    let mut latest = std::collections::BTreeMap::new();
+    for event in &sealed {
+        if event.payload.done.is_some() {
+            let key = (&event.thread, event.attempt);
+            let sequence = event
+                .id
+                .rsplit('-')
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if latest
+                .get(&key)
+                .is_none_or(|(number, _)| sequence >= *number)
+            {
+                latest.insert(key, (sequence, event));
+            }
+        }
+    }
+    for (_, event) in latest.values() {
+        if let Err(error) = adopt_report(project, event) {
+            first.get_or_insert(error.context(format!("adopt event {}", event.id)));
+        }
+    }
+    for event in sealed {
         if event.payload.failed.is_some() {
             continue;
         }
@@ -85,6 +111,8 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
                 continue;
             }
         };
+        // Reconcile already-submitted seals too: an older delivery may have
+        // reached the coordinator before its report was recorded locally.
         if states.contains(&crate::contracts::DeliveryState::Submitted) {
             // Typed to a coordinator that has since been replaced and never
             // acknowledged: the current one gets a recipient-changed item.
@@ -117,7 +145,7 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         {
             continue;
         }
-        if let Err(error) = deliver_event(ctx, project, &event) {
+        if let Err(error) = deliver_notice(ctx, project, &event) {
             first.get_or_insert(error.context(format!("event {}", event.id)));
             break;
         }
@@ -136,6 +164,11 @@ pub(crate) fn deliver_event(
     project: &Project,
     event: &crate::contracts::Event,
 ) -> Result<()> {
+    adopt_report(project, event)?;
+    deliver_notice(ctx, project, event)
+}
+
+fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event) -> Result<()> {
     let coordinator = project
         .coordinator()
         .ok_or_else(|| anyhow::anyhow!("recipient_unavailable: project has no coordinator"))?;
@@ -250,6 +283,30 @@ pub(crate) fn deliver_event(
         &event.id,
         crate::contracts::DeliveryState::Submitted,
     )
+}
+
+fn adopt_report(project: &Project, event: &crate::contracts::Event) -> Result<()> {
+    let Some(done) = &event.payload.done else {
+        return Ok(());
+    };
+    let lane = thread::load(project, &event.thread)?;
+    if lane.status != Status::Open
+        || lane.attempt.max(1) != event.attempt
+        || !lane.is_remote()
+        || lane.report_hash == done.artifact
+    {
+        return Ok(());
+    }
+    // The imported artifact was checked against this hash before the event
+    // was written. Do not claim a report if the artifact is not here yet.
+    if !crate::events::artifact_path(project, &done.artifact).is_file() {
+        return Ok(());
+    }
+    thread::update(project, &event.thread, |t| {
+        t.report_hash = done.artifact.clone();
+        t.last_report_change = project::now();
+    })?;
+    Ok(())
 }
 
 /// The configured publish URL for a repository (SPEC-remote §4.1): the
@@ -1627,6 +1684,83 @@ mod tests {
         assert!(lines[1].contains(&second.id));
         nudge(&project, &mut state, &settings, &herdr, Some("w1:p1")).unwrap();
         assert_eq!(typed_lines(&world).len(), 3);
+    }
+
+    #[test]
+    fn held_remote_seal_still_records_its_report_and_retries_notice() {
+        let (world, project) = delivery_world();
+        let (mut settings, body) = project.read_project_md().unwrap();
+        settings.repos.push(crate::project::Repo {
+            path: "/repo".into(),
+            publish_url: Some("https://example.test/repo.git".into()),
+            ..Default::default()
+        });
+        std::fs::write(
+            project.project_md(),
+            format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        world.runner.on(
+            "git -C /repo remote get-url fork",
+            crate::runner::fake::ok("https://example.test/repo.git\n"),
+        );
+        world
+            .runner
+            .on("git -C /repo remote", crate::runner::fake::ok("fork\n"));
+        world
+            .runner
+            .on("git -C /repo fetch", crate::runner::fake::ok(""));
+        world.runner.on(
+            "git -C /repo merge-base --is-ancestor",
+            crate::runner::fake::ok(""),
+        );
+        let screen = std::rc::Rc::new(std::cell::RefCell::new(
+            "❯ Rolf's unfinished draft\n".to_string(),
+        ));
+        let read = screen.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("pane read"),
+            move |_| Ok(crate::runner::fake::ok(&read.borrow())),
+        );
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.machine = "box".into();
+            t.machine_id = "box".into();
+            t.repo = "/repo".into();
+            t.branch = "hp/demo/t-0001".into();
+        })
+        .unwrap();
+        let event = sealed_done(&project, &lane.id);
+        let next = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.machine = "box".into();
+            t.machine_id = "box".into();
+            t.repo = "/repo".into();
+            t.branch = "hp/demo/t-0002".into();
+        })
+        .unwrap();
+        let later = sealed_done(&project, &next.id);
+        let artifact = crate::events::artifact_path(&project, "def");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(artifact, b"report").unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(thread::load(&project, &lane.id).unwrap().report_hash, "def");
+        assert_eq!(thread::load(&project, &next.id).unwrap().report_hash, "def");
+        assert!(events::states(&project, &event.id).unwrap().is_empty());
+        assert!(events::states(&project, &later.id).unwrap().is_empty());
+        assert!(typed_lines(&world).is_empty());
+        let digest = crate::coordinator::digest(&world.ctx(), &project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains("done: abc"), "{digest}");
+        *screen.borrow_mut() = "────────────────────\n❯ \n────────────────────\n  /home/agent/.herdr-ade/adeherdr > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n  ● main\n  ◯ general-purpose  Verifying excluded files · 20m\n".into();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 2);
+        assert!(
+            events::states(&project, &event.id)
+                .unwrap()
+                .contains(&crate::contracts::DeliveryState::Submitted)
+        );
     }
 
     #[test]
