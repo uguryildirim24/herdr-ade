@@ -295,6 +295,9 @@ enum Command {
         /// Show wall time per check and duration of outside commands
         #[arg(long)]
         timings: bool,
+        /// Remove exactly one resolved retained worktree and its branch
+        #[arg(long, value_name = "PROJECT/THREAD")]
+        remove_kept_worktree: Option<String>,
     },
     /// Rounds: open, review and merge related lanes
     #[command(
@@ -3062,7 +3065,15 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             session,
             prune_branches,
             timings,
+            remove_kept_worktree,
         } => {
+            if let Some(target) = remove_kept_worktree {
+                let (slug, id) = target
+                    .split_once('/')
+                    .ok_or_else(|| anyhow::anyhow!("expected PROJECT/THREAD"))?;
+                println!("{}", crate::threads::remove_kept_worktree(&ctx, slug, id)?);
+                return Ok(());
+            }
             if let Some(plan) = prune_branches {
                 println!("{}", crate::branches::doctor(&ctx, Some(&plan))?);
                 return Ok(());
@@ -3507,6 +3518,7 @@ mod tests {
                 session: SessionArgs::default(),
                 prune_branches: None,
                 timings: false,
+                remove_kept_worktree: None,
             },
         );
         let error = result.as_ref().unwrap_err();
