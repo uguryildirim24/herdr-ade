@@ -2807,33 +2807,23 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                     crate::output::set_outcome("queued");
                     crate::output::insert("queued", true);
                 }
-                let installing = crate::harness::install_in_progress(&ctx.config_dir);
                 let mut result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
                 if thread.queued_for_load {
                     result["queued"] = true.into();
                     result["note"] =
                         format!("the lane is queued on {machine} until its load drops").into();
                 }
-                if installing {
-                    let note =
-                        "the lane is recorded and launches when the harness install finishes";
-                    result["note"] = note.into();
-                    crate::output::insert("note", note);
-                }
                 println!("{result}");
                 Ok(())
             }
             ThreadCommand::Retry { slug, id, reason } => {
                 let result = threads::retry(&ctx, &slug, &id, &reason)?;
-                let installing = crate::harness::install_in_progress(&ctx.config_dir);
-                let launch = if installing {
-                    "the lane is recorded and launches when the harness install finishes"
+                let current = crate::thread::load(&Project::load(&ctx.root, &slug)?, &id)?;
+                let launch = if current.prompt_pending {
+                    "startup is still pending; the ticker resumes it"
                 } else {
-                    "the ticker launches its agent"
+                    "its brief was delivered"
                 };
-                if installing {
-                    crate::output::insert("note", launch);
-                }
                 crate::output::success(
                     Some("retried"),
                     &result,

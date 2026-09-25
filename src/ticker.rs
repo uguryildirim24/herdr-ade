@@ -1029,20 +1029,23 @@ fn thread_pass(
         // It must pass the same process check before receiving its brief.
         if t.is_remote() && t.prompt_pending && ready && t.checked_slice.is_empty() {
             let check = (|| {
-                let process = box_agent_process(herdr, t)
-                    .ok_or_else(|| anyhow::anyhow!("agent process missing"))?;
+                let Some(process) = box_agent_process(herdr, t) else {
+                    // Registration may precede exec; keep the brief pending.
+                    return Ok(None);
+                };
                 let machine = crate::remote::declaration_for_route(
                     ctx.runner,
                     &ctx.env.herdr_bin(),
                     &ctx.config_dir,
                     t.machine_route(),
                 )?;
-                crate::remote::check_agent_slice(ctx.runner, &machine, slug, process.pid)
+                crate::remote::check_agent_slice(ctx.runner, &machine, slug, process.pid).map(Some)
             })();
             match check {
-                Ok(slice) => {
+                Ok(Some(slice)) => {
                     thread::update(project, &t.id, |record| record.checked_slice = slice)?;
                 }
+                Ok(None) => continue,
                 Err(error) => {
                     if let Err(cleanup) = threads::fail_start(
                         ctx,
@@ -1089,7 +1092,10 @@ fn thread_pass(
             }
         }
         let mut delivered = false;
-        if t.prompt_pending && ready {
+        if t.prompt_pending
+            && ready
+            && (!t.is_remote() || !thread::load(project, &t.id)?.checked_slice.is_empty())
+        {
             match herdr.agent_prompt_wait_started(
                 &t.pane_id,
                 &thread::launch_prompt(prefix, slug, t),
@@ -1359,6 +1365,83 @@ fn box_agent_process(
     })
 }
 
+/// Start a just-placed attempt in the caller, without a later ticker or
+/// courier pass. The periodic path still owns unfinished startup and retries.
+pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    let lane = thread::load(project, id)?;
+    if lane.status != thread::Status::Open || !lane.prompt_pending || lane.queued_for_load {
+        return Ok(());
+    }
+    let socket = project
+        .coordinator()
+        .context("project has no coordinator")?
+        .socket;
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let remote = herdr.on_machine(lane.machine_route());
+    let agents = remote.agent_list()?;
+    let panes = remote.pane_list()?;
+    if !panes.iter().any(|pane| thread::pane_matches(&lane, pane)) {
+        // A newly created tab may not appear in the server's list yet.
+        // Leave its pending launch for the next observation.
+        return Ok(());
+    }
+    let threads = [lane];
+    let mut errors = Vec::new();
+    launch_pass(
+        &LaunchPass {
+            ctx,
+            project,
+            herdr: &herdr,
+            threads: &threads,
+            agents: &agents,
+            panes: &panes,
+        },
+        &mut true,
+        false,
+        &mut errors,
+    );
+    // A successful start normally returns a ready agent. Read fresh state and
+    // deliver its brief before returning to the coordinator.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let prefix = coordinator::current_prefix(&ctx.root)?;
+    loop {
+        let current = thread::load(project, id)?;
+        if current.status != thread::Status::Open
+            || !current.prompt_pending
+            || current.launch_attempts == 0
+        {
+            break;
+        }
+        let agents = remote.agent_list()?;
+        let panes = remote.pane_list()?;
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx,
+                project,
+                herdr: &remote,
+                threads: &[current],
+                agents: &agents,
+                panes: &panes,
+            },
+            &prefix,
+            None,
+            false,
+        )?;
+        if let Some(error) = pass.error {
+            errors.push(error);
+            break;
+        }
+        if !thread::load(project, id)?.prompt_pending || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    match errors.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Launches pending threads whose pane is at a shell prompt. Local starts stay
 /// one per pass; independent box starts are submitted as one parallel batch.
 /// Prompts still go only to agents listed before this launch pass.
@@ -1384,7 +1467,7 @@ fn launch_pass(
             continue;
         }
         let live = thread::live_state(t, pass.agents, pass.panes, now);
-        if live.agent_state.is_some() || !live.pane_exists {
+        if live.agent_state.is_some() || !live.pane_exists || !t.startup_wait_started.is_empty() {
             continue;
         }
         if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
@@ -1437,18 +1520,32 @@ fn launch_pass(
                 }
             }
         }
-        match thread::update(pass.project, &t.id, |t| {
-            t.launch_attempts += 1;
-            t.trust_answered = false;
-            t.startup_wait_started = project::now();
+        // The CLI and the ticker can race on the same newly placed pane.
+        // Claim the launch under the record lock before issuing `agent start`.
+        let mut claimed = false;
+        match thread::update_checked(pass.project, &t.id, |current| {
+            if current.attempt != t.attempt
+                || current.pane_id != t.pane_id
+                || current.status != thread::Status::Open
+                || !current.prompt_pending
+                || !current.startup_wait_started.is_empty()
+            {
+                return Ok(());
+            }
+            current.launch_attempts += 1;
+            current.trust_answered = false;
+            current.startup_wait_started = project::now();
+            claimed = true;
+            Ok(())
         }) {
-            Ok(_) => {
+            Ok(_) if claimed => {
                 pending.push(t);
                 if one_at_a_time {
                     *may_start = false;
                     break;
                 }
             }
+            Ok(_) => {}
             Err(error) => errors.push(error.context(format!("{}: launch record", t.id))),
         }
     }
@@ -1505,23 +1602,19 @@ fn launch_pass(
                 }
                 std::thread::sleep(Duration::from_millis(100));
             };
-            let checked_slice = if let Some(machine) = &machine {
-                let pid = process
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "box_slice_check: agent process missing; cannot check /proc/<pid>/cgroup"
-                        )
-                    })?
-                    .pid;
-                Some(crate::remote::check_agent_slice(
-                    pass.ctx.runner,
-                    machine,
-                    &pass.project.slug,
-                    pid,
-                ).map_err(|error| anyhow::anyhow!("box_slice_check: {error:#}"))?)
-            } else {
-                None
+            // A shell can be acknowledged before exec. No PID yet is not a
+            // slice violation; the ready-state pass checks before prompting.
+            let checked_slice = match (&machine, &process) {
+                (Some(machine), Some(process)) => Some(
+                    crate::remote::check_agent_slice(
+                        pass.ctx.runner,
+                        machine,
+                        &pass.project.slug,
+                        process.pid,
+                    )
+                    .map_err(|error| anyhow::anyhow!("box_slice_check: {error:#}"))?,
+                ),
+                _ => None,
             };
             thread::update(pass.project, &t.id, |record| {
                 if let Some(slice) = &checked_slice {
@@ -2464,6 +2557,41 @@ mod tests {
     use super::*;
     use crate::paths::Env;
     use crate::runner::fake::{FakeRunner, fail, ok, timeout};
+
+    #[test]
+    fn explicit_launch_delivers_brief_without_a_ticker_pass() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |record| {
+            record.prompt_pending = true;
+            record.launch.kind = "claude".into();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        );
+        let agents = world.agents.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("agent start hp-demo-t-0001"),
+            move |_| {
+                *agents.borrow_mut() = r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":""#
+                    .to_owned()
+                    + &cwd.to_string_lossy()
+                    + r#"","name":"hp-demo-t-0001","agent_status":"idle"}]"#;
+                Ok(ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"hp-demo-t-0001"}}}"#))
+            },
+        );
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        launch_thread_now(&world.ctx(), &project, &lane.id).unwrap();
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.launch_attempts, 1);
+        assert!(!saved.prompt_pending);
+        assert_eq!(world.runner.count("agent start hp-demo-t-0001"), 1);
+        assert_eq!(world.runner.count("agent prompt"), 1);
+    }
 
     fn held(version: &str) -> LockState {
         LockState::Held(Info {
