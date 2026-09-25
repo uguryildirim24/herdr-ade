@@ -8096,6 +8096,44 @@ mod tests {
             thread::load(&fx.project, &lane).unwrap().follow_ups.len(),
             2
         );
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+        // Delivery alone cannot replace the rejected seal. Only a later
+        // completion, after the correction, can authorize the next reviewer.
+        thread::update(&fx.project, &lane, |t| {
+            t.prompt_pending = false;
+            t.last_group = crate::thread::Group::ReadyForReview.token().into();
+            for follow_up in &mut t.follow_ups {
+                follow_up.state = crate::thread::FollowUpState::Delivered;
+                follow_up.after_seal = first.clone();
+            }
+        })
+        .unwrap();
+        assert!(advance(&ctx, "demo").unwrap().started.is_empty());
+        let repaired = commit_file(
+            &fx.repo.join(".worktrees/lane-1"),
+            "src/lane1.rs",
+            "// corrected after rejection\n",
+            "correct lane 1",
+        );
+        let second = fx.seal_done(&lane, 1, 2, &repaired, "# corrected candidate\n");
+        let next = advance(&ctx, "demo").unwrap();
+        assert_eq!(next.started.len(), 1);
+        let current = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            current.manifest.members[0].pin.as_ref().unwrap().event,
+            second
+        );
+        assert_eq!(
+            current.manifest.members[0].pin.as_ref().unwrap().sha,
+            repaired
+        );
+        let task =
+            std::fs::read_to_string(thread::task_path(&fx.project, &next.started[0].reviewer))
+                .unwrap();
+        assert!(task.contains("earlier verdict was REJECT"), "{task}");
+        assert!(task.contains(&prior.verdict_artifact), "{task}");
+        assert!(task.contains(&candidate), "{task}");
+        assert!(git(&fx.repo, &["branch", "--list", "hp/unrelated"]).contains("hp/unrelated"));
     }
 
     /// `advance` may already have prepared a review branch when a concurrent
