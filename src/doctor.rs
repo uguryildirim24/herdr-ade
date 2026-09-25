@@ -940,28 +940,6 @@ fn report_with_checks(
             continue;
         };
         let label = format!("project {slug}");
-        if let Some(record) = project.coordinator() {
-            let herdr = Herdr::new(&bin, &record.socket, runner);
-            match crate::ticker::idle_nudge_line(&project, config_dir, &herdr) {
-                Ok(line) => {
-                    let _ = writeln!(out, "[{label}] {line}");
-                }
-                Err(error) => {
-                    let _ = writeln!(out, "[{label}] idle nudge status unavailable: {error:#}");
-                }
-            }
-        } else {
-            let state = crate::steps::load_state(&project);
-            let _ = writeln!(
-                out,
-                "[{label}] last idle nudge: {}; no coordinator",
-                if state.idle_nudge_last.is_empty() {
-                    "never"
-                } else {
-                    &state.idle_nudge_last
-                }
-            );
-        }
         if let Ok((settings, _)) = project.read_project_md() {
             for repo in &settings.repos {
                 if let Some(gates) = &repo.gates {
@@ -1083,7 +1061,6 @@ fn report_with_checks(
                     ),
                     Err(_) => None,
                 };
-                let unread = crate::steps::announced_unread(&project);
                 let mut detail = format!(
                     "{}; socket {}; workspace {} {}; coordinator pane {} {}",
                     project.status(),
@@ -1113,18 +1090,7 @@ fn report_with_checks(
                 if record.name_restored > 0 {
                     detail.push_str(&format!("; name restored {}x", record.name_restored));
                 }
-                if let Some(passes) = unread {
-                    detail.push_str(&format!(
-                        "; announced inbox items unread for {passes} ticker passes"
-                    ));
-                }
-                let ok = if unread.is_some() {
-                    Some(false)
-                } else if !pane {
-                    None
-                } else {
-                    named
-                };
+                let ok = if !pane { None } else { named };
                 check(&mut out, ok, &label, detail);
             }
         }
@@ -3818,55 +3784,6 @@ recipe = "claude_fable_xhigh"
         );
         assert!(!healthy, "{text}");
         assert!(text.contains("does not resolve"), "{text}");
-        assert!(
-            text.contains("last idle nudge: never; agent working"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn announced_items_unread_across_passes_fail_the_project_row() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        write_routing_config(&home.path().join("cfg"));
-        let root = home.path().join("root");
-        let project = opened_project(home.path(), &root, "w1:p1", "hp-demo-coordinator");
-        let cwd = project.canonical_dir().to_string_lossy().into_owned();
-        let panes = format!(
-            r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}"}}]}}}}"#
-        );
-        let agents = format!(
-            r#"{{"result":{{"agents":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"}}]}}}}"#
-        );
-        let runner = runner_with_project("herdr 0.9.1\n", &panes, &agents);
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
-        );
-        runner.on("notification show", ok(r#"{"result":{"shown":true}}"#));
-        // Announce an item and let the ticker count the passes where it stays
-        // unread. `nudge = false` keeps the announcement out of the runner's
-        // prompt path; the pass count is the same either way.
-        crate::inbox::write(&project, "routine", "r", "due", "Prompt").unwrap();
-        let herdr = Herdr::new("herdr", "", &runner);
-        let settings = project::Settings {
-            nudge: false,
-            ..project::Settings::default()
-        };
-        let mut state = crate::steps::load_state(&project);
-        for _ in 0..(crate::steps::UNREAD_NUDGE_PASSES + 1) {
-            crate::steps::nudge(&project, &mut state, &settings, &herdr, None).unwrap();
-        }
-        crate::steps::save_state(&project, &state).unwrap();
-        let (text, healthy) = report(
-            &env,
-            &root,
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(!healthy, "{text}");
-        assert!(text.contains("unread"), "{text}");
     }
 
     #[test]

@@ -174,11 +174,6 @@ enum Command {
         #[command(subcommand)]
         command: RoutineCommand,
     },
-    /// Mark the project's goal reached; a new message from Rolf reopens it
-    Finish {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-    },
     /// Pause a project: the ticker skips it and `thread start` is refused
     Pause {
         #[arg(value_name = "PROJECT")]
@@ -2217,16 +2212,6 @@ pub fn run() -> Result<()> {
         .and_then(|s| Project::load(&ctx.root, s).ok());
     let _scope = (!read_only)
         .then(|| crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>()));
-    // Only commands issued in the bound coordinator pane count as a response
-    // to an idle nudge. A background ticker or a lane must not open the gate.
-    if let Some(project) = &observed_project
-        && project
-            .coordinator()
-            .is_some_and(|record| ctx.env.var("HERDR_PANE_ID") == Some(record.pane_id.as_str()))
-        && !command_name.starts_with("plain hook")
-    {
-        crate::ledger::coordinator_command(project)?;
-    }
     let subject = format!("ha {command_name}");
     let result = dispatch(ctx, cli.command);
     if read_only {
@@ -2995,12 +2980,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 Ok(())
             }
         },
-        Command::Finish { slug } => {
-            let project = Project::load(&ctx.root, &slug)?;
-            project.set_finished(true)?;
-            println!("`{slug}` is finished; idle nudges stop until Rolf writes again.");
-            Ok(())
-        }
         Command::Pause { slug } => lifecycle::set_status(&ctx, &slug, Status::Paused),
         Command::Resume { slug } => {
             if Project::load(&ctx.root, &slug)?.status() == Status::Archived {
@@ -3250,17 +3229,6 @@ mod tests {
         assert!(dispatch(fx.world.ctx(), cli.command).is_ok());
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(!crate::plain::check(&text, &crate::plain::Glossary::default()).passed());
-    }
-
-    #[test]
-    fn finish_command_marks_goal_reached_until_rolf_writes() {
-        let fx = crate::round::testkit::fixture();
-        let project = &fx.project;
-        let cli = Cli::try_parse_from(["ha", "finish", "demo"]).unwrap();
-        dispatch(fx.world.ctx(), cli.command).unwrap();
-        assert!(project.finished());
-        crate::talk::record_pane_request(project, "Another goal.").unwrap();
-        assert!(!project.finished());
     }
 
     #[test]

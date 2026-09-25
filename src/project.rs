@@ -175,7 +175,6 @@ pub(crate) struct Repo {
 pub(crate) struct Settings {
     pub(crate) name: String,
     pub(crate) goal: String,
-    pub(crate) nudge: bool,
     /// Ordered task milestones used when a repository has no override.
     #[serde(default = "default_task_states")]
     pub(crate) task_states: Vec<String>,
@@ -194,9 +193,6 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             goal: String::new(),
-            // On by default: idle and inbox nudges wait for the coordinator's
-            // input line to clear. Projects may opt out with `nudge = false`.
-            nudge: true,
             task_states: default_task_states(),
             repos: Vec::new(),
         }
@@ -291,7 +287,6 @@ impl std::fmt::Display for Status {
 #[serde(default)]
 struct ProjectState {
     status: Status,
-    finished: bool,
 }
 
 /// The coordinator's pane and the session the project belongs to.
@@ -520,20 +515,6 @@ impl Project {
             .status
     }
 
-    pub(crate) fn finished(&self) -> bool {
-        read_json::<ProjectState>(&self.state_dir().join("project.json"))
-            .unwrap_or_default()
-            .finished
-    }
-
-    pub(crate) fn set_finished(&self, finished: bool) -> Result<()> {
-        let _lock = self.lock()?;
-        let path = self.state_dir().join("project.json");
-        let mut state = read_json::<ProjectState>(&path).unwrap_or_default();
-        state.finished = finished;
-        write_json(&path, &state)
-    }
-
     pub(crate) fn set_status(&self, status: Status) -> Result<()> {
         let _lock = self.lock()?;
         let path = self.state_dir().join("project.json");
@@ -625,34 +606,6 @@ fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety
         );
     }
     Ok(safety)
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub(crate) struct CoordinatorSettings {
-    pub(crate) idle_nudge_minutes: u64,
-}
-
-impl Default for CoordinatorSettings {
-    fn default() -> Self {
-        Self {
-            idle_nudge_minutes: 20,
-        }
-    }
-}
-
-/// Global coordinator behaviour from `[coordinator]` in `config.toml`.
-pub(crate) fn coordinator_settings(config_dir: &Path) -> Result<CoordinatorSettings> {
-    let document = crate::config::Document::read(config_dir)?;
-    let file = config_dir.join("config.toml");
-    let settings: CoordinatorSettings = document.section("coordinator")?;
-    if settings.idle_nudge_minutes == 0 {
-        bail!(
-            "{}: coordinator.idle_nudge_minutes must be at least 1",
-            file.display()
-        );
-    }
-    Ok(settings)
 }
 
 /// SHA-256 of executable settings and standing rules.
@@ -1443,7 +1396,6 @@ mod tests {
         let (settings, body) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
-        assert!(settings.nudge);
         assert_eq!(
             settings.repos,
             vec![
@@ -1649,15 +1601,8 @@ mod tests {
     #[test]
     fn front_matter_parsing() {
         let (settings, body) =
-            parse_project_md("+++\nname = \"X\"\nnudge = true\n+++\n\nBody\n+++\nmore\n").unwrap();
+            parse_project_md("+++\nname = \"X\"\n+++\n\nBody\n+++\nmore\n").unwrap();
         assert_eq!(settings.name, "X");
-        assert!(settings.nudge);
-        // Prompting is the default: a PROJECT.md without the key wakes the
-        // coordinator. Only an explicit `nudge = false` turns it off.
-        let (settings, _) = parse_project_md("+++\nname = \"X\"\n+++\n").unwrap();
-        assert!(settings.nudge);
-        let (settings, _) = parse_project_md("+++\nname = \"X\"\nnudge = false\n+++\n").unwrap();
-        assert!(!settings.nudge);
         assert_eq!(body, "Body\n+++\nmore\n");
         assert!(parse_project_md("no front matter").is_err());
         assert!(parse_project_md("+++\nname = \n+++\n").is_err());
@@ -1702,35 +1647,6 @@ mod tests {
         )
         .unwrap();
         assert!(load_safety(config.path(), here).is_err());
-    }
-
-    #[test]
-    fn coordinator_idle_nudge_defaults_and_validates() {
-        let config = tempfile::tempdir().unwrap();
-        assert_eq!(
-            coordinator_settings(config.path()).unwrap(),
-            CoordinatorSettings::default()
-        );
-        assert_eq!(CoordinatorSettings::default().idle_nudge_minutes, 20);
-
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[coordinator]\nidle_nudge_minutes = 7\n",
-        )
-        .unwrap();
-        assert_eq!(
-            coordinator_settings(config.path())
-                .unwrap()
-                .idle_nudge_minutes,
-            7
-        );
-
-        std::fs::write(
-            config.path().join("config.toml"),
-            "[coordinator]\nidle_nudge_minutes = 0\n",
-        )
-        .unwrap();
-        assert!(coordinator_settings(config.path()).is_err());
     }
 
     #[test]
