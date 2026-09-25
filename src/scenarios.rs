@@ -303,15 +303,15 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
         let _ = ticker::tick_project(&ctx, &project);
         assert_eq!(
             world.runner.count("agent start"),
-            tick,
-            "one start per tick"
+            tick + 1,
+            "one lane start per tick plus the missing coordinator relaunch"
         );
     }
-    // Six starts: three each. The listed panes remain intact after the bound;
-    // absent agent state is unknown, not evidence that either process is gone.
+    // Six lane starts: three each, plus one missing coordinator relaunch.
+    // Absent agent state in the listed lane panes is still unknown.
     let _ = ticker::tick_project(&ctx, &project);
     let _ = ticker::tick_project(&ctx, &project);
-    assert_eq!(world.runner.count("agent start"), 6);
+    assert_eq!(world.runner.count("agent start"), 7);
     assert_eq!(world.runner.count("tab close"), 0);
     for id in ["t-0001", &second.id] {
         let t = thread::load(&project, id).unwrap();
@@ -2694,6 +2694,50 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
             .all(|start| start.contains("--kind agy") && start.contains("--model chosen")),
         "{starts:?}"
     );
+}
+
+#[test]
+fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    project
+        .update_coordinator(|c| {
+            c.launch.kind = "claude".into();
+            c.launch.recipe_id = "chosen".into();
+            c.launch.args = vec!["--model".into(), "recorded".into()];
+        })
+        .unwrap();
+    world.runner.on(
+        "workspace create",
+        ok(r#"{"result":{"root_pane":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
+    );
+    world.runner.on(
+        "agent start hp-demo-coordinator",
+        fail(
+            1,
+            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
+        ),
+    );
+    ticker::tick_project(&world.ctx(), &project).unwrap();
+    assert_eq!(project.coordinator().unwrap().launch.recipe_id, "chosen");
+    assert_eq!(
+        project.coordinator().unwrap().launch.args,
+        ["--model", "recorded"]
+    );
+    let starts = world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.display().contains("agent start hp-demo-coordinator"))
+        .map(Cmd::display)
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert!(starts[0].contains("--model recorded"), "{starts:?}");
+    let ledger = std::fs::read_to_string(project.record_file("ledger.jsonl")).unwrap();
+    assert_eq!(ledger.matches("coordinator_relaunch").count(), 1);
+    ticker::tick_project(&world.ctx(), &project).unwrap();
+    assert_eq!(world.runner.count("agent start hp-demo-coordinator"), 1);
 }
 
 #[test]

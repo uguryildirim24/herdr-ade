@@ -224,7 +224,7 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 `nudge` in `PROJECT.md` controls new-inbox announcements. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items"); with it on, the ticker prompts an idle coordinator. The message always begins `[herdr-ade ticker: automated, not the user, approves nothing]` and never carries outside text.
 
-The ticker also prompts an idle coordinator to continue when tasks have an available next step. It does not do that while Rolf's message is waiting, a lane is working, or every task waits on Rolf. `[coordinator].idle_nudge_minutes` in `config.toml` is the minimum interval (20 by default), and a coordinator turn must occur before another continue prompt.
+With `nudge = true`, the ticker also prompts an idle coordinator to find the next useful step when work stalls, even if every task is waiting or there are no open tasks. It waits while a lane is working, and stops after `ha finish <project>` until Rolf sends a new message. `[coordinator].idle_nudge_minutes` in `config.toml` is the minimum interval (20 by default); a coordinator context read must occur before a repeat. If the coordinator pane is missing but its session responds, the ticker attempts to relaunch it with its saved recipe at most once per hour.
 
 ## Lane completion deliveries
 

@@ -174,6 +174,11 @@ enum Command {
         #[command(subcommand)]
         command: RoutineCommand,
     },
+    /// Mark the project's goal reached; a new message from Rolf reopens it
+    Finish {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+    },
     /// Pause a project: the ticker skips it and `thread start` is refused
     Pause {
         #[arg(value_name = "PROJECT")]
@@ -2579,9 +2584,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let record = crate::task::set_wait(&project, &id, &on, &target)?;
-                let mut state = crate::steps::load_state(&project);
-                state.idle_nudge_next.remove(&id);
-                crate::steps::save_state(&project, &state)?;
                 crate::output::success(
                     Some("waiting"),
                     &serde_json::json!({ "task": record }),
@@ -2592,9 +2594,6 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             TaskCommand::Unwait { slug, id } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 let record = crate::task::clear_wait(&project, &id)?;
-                let mut state = crate::steps::load_state(&project);
-                state.idle_nudge_next.remove(&id);
-                crate::steps::save_state(&project, &state)?;
                 crate::output::success(
                     Some("open"),
                     &serde_json::json!({ "task": record }),
@@ -2940,6 +2939,12 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 Ok(())
             }
         },
+        Command::Finish { slug } => {
+            let project = Project::load(&ctx.root, &slug)?;
+            project.set_finished(true)?;
+            println!("`{slug}` is finished; idle nudges stop until Rolf writes again.");
+            Ok(())
+        }
         Command::Pause { slug } => lifecycle::set_status(&ctx, &slug, Status::Paused),
         Command::Resume { slug } => {
             if Project::load(&ctx.root, &slug)?.status() == Status::Archived {
@@ -3180,6 +3185,17 @@ mod tests {
         assert!(dispatch(fx.world.ctx(), cli.command).is_ok());
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(!crate::plain::check(&text, &crate::plain::Glossary::default()).passed());
+    }
+
+    #[test]
+    fn finish_command_marks_goal_reached_until_rolf_writes() {
+        let fx = crate::round::testkit::fixture();
+        let project = &fx.project;
+        let cli = Cli::try_parse_from(["ha", "finish", "demo"]).unwrap();
+        dispatch(fx.world.ctx(), cli.command).unwrap();
+        assert!(project.finished());
+        crate::talk::record_pane_request(project, "Another goal.").unwrap();
+        assert!(!project.finished());
     }
 
     #[test]
