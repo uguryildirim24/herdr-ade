@@ -9442,17 +9442,21 @@ mod tests {
         assert!(task.contains("skill reviewer"), "{task}");
         assert!(task.contains(".state/artifacts/"), "{task}");
 
+        thread::update(&fx.project, &started.id, |t| {
+            t.status = thread::Status::Starting
+        })
+        .unwrap();
         let unknown = err(retry(
             &ctx,
             "demo",
             "r1",
             "there is no evidence about what failed",
         ));
-        assert!(unknown.starts_with("recovery_unknown:"), "{unknown}");
+        assert!(unknown.starts_with("retry_refused:"), "{unknown}");
         assert_eq!(
             thread::load(&fx.project, &started.id).unwrap().attempt,
             1,
-            "unknown evidence must not spend an attempt"
+            "a still-starting reviewer must not spend an attempt"
         );
 
         // Simulate a crash after placement moved `base` from the review branch
@@ -9471,6 +9475,40 @@ mod tests {
         assert_eq!(
             load(&fx.project, "r1").unwrap().reviewer.as_deref(),
             Some(started.id.as_str())
+        );
+    }
+
+    #[test]
+    fn round_retry_replaces_failed_start_with_unknown_failure_class() {
+        let fx = fixture();
+        reviewer_ready(&fx);
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let (id, sha) = fx.lane(1);
+        admit(&ctx, "demo", "r1", &id).unwrap();
+        fx.seal_done(&id, 1, 1, &sha, "# report\n");
+        let first = retry(&ctx, "demo", "r1", "start reviewer").unwrap();
+        fx.world
+            .runner
+            .on("pane read", crate::runner::fake::ok("Trust this folder?\n"));
+        thread::update(&fx.project, &first.thread, |thread| {
+            thread.status = thread::Status::Failed;
+            thread.failure_class = crate::contracts::FailureClass::Unknown;
+            thread.error = "agent_not_ready: screen: Trust this folder?; herdr: blocked".into();
+            thread.startup_wait_started.clear();
+            thread.prompt_pending = false;
+        })
+        .unwrap();
+
+        *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+        let recovered = retry(&ctx, "demo", "r1", "reviewer start failed").unwrap();
+        assert_eq!(recovered.thread, first.thread);
+        let reviewer = thread::load(&fx.project, &first.thread).unwrap();
+        assert_eq!(reviewer.attempt, 2);
+        assert_eq!(reviewer.launch.same_recipe_retries, 1);
+        assert_eq!(
+            load(&fx.project, "r1").unwrap().reviewer.as_deref(),
+            Some(first.thread.as_str())
         );
     }
 
