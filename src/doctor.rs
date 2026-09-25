@@ -579,7 +579,7 @@ fn report_with_checks(
             runner,
             detached_ticker: false,
         };
-        let (leftovers, data_kept, errors) = finished_worktrees(&ctx, None);
+        let (leftovers, data_kept, errors) = finished_worktrees(&ctx);
         check(
             &mut out,
             worktree_check_status(&leftovers, &errors),
@@ -810,24 +810,26 @@ fn report_with_checks(
                                 &format!("machine {machine}"),
                                 format!("ssh target {}", profile.target),
                             );
-                            for (ok, label, detail) in box_rows(
+                            let mut box_snapshot = String::new();
+                            for (ok, label, detail) in box_rows_with_snapshot(
                                 runner,
-                                &bin,
                                 config_dir,
                                 &profile,
                                 &config.recipes,
                                 config.doctor.min_free_disk_gb,
+                                Some((&ctx, &mut box_snapshot)),
                             ) {
                                 check(&mut out, ok, &label, detail);
                             }
                             let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
-                            check_workspace_leaks(
+                            check_workspace_leaks_with_snapshot(
                                 &mut out,
                                 &mut check,
                                 root,
                                 &profile.id,
                                 &format!("machine {}", profile.label),
                                 &herdr,
+                                Some(&box_snapshot),
                             );
                             let ctx = Ctx {
                                 env,
@@ -837,8 +839,9 @@ fn report_with_checks(
                                 detached_ticker: false,
                             };
                             let (mut leftovers, data_kept, mut errors) =
-                                finished_worktrees(&ctx, Some(&profile));
-                            let (builds, build_errors) = finished_build_folders(&ctx, &profile);
+                                finished_worktrees_with_snapshot(&ctx, &profile, &box_snapshot);
+                            let (builds, build_errors) =
+                                finished_build_folders_with_snapshot(&ctx, &profile, &box_snapshot);
                             leftovers.extend(builds);
                             errors.extend(build_errors);
                             check(
@@ -976,10 +979,10 @@ fn thread_is_on_machine(
         }
 }
 
-fn finished_worktrees(
+fn finished_worktree_candidates(
     ctx: &Ctx,
     remote: Option<&crate::contracts::MachineProfile>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+) -> (Vec<(project::Project, crate::thread::Thread)>, Vec<String>) {
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -1027,67 +1030,134 @@ fn finished_worktrees(
             candidates.push((project.clone(), thread));
         }
     }
+    (candidates, errors)
+}
+
+fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile) -> String {
+    let (candidates, _) = finished_worktree_candidates(ctx, Some(profile));
+    if candidates.is_empty() {
+        return String::new();
+    }
+    // NUL framing is shared with worktrees::inspect_batched. All inspections
+    // run inside this one box script; no follow-up SSH is needed for ignored
+    // sizes, even when a resolved checkout remains on disk.
+    let mut bash = String::from(
+        r#"inspect() {
+  local path=$1 key=$2 record rel root line kib
+  local -A roots=()
+  cd "$path" || return 1
+  printf '\0__HERDR_INSPECT_%s__\0' "$key"
+  git status --porcelain --ignored --untracked-files=all -z || return 1
+  printf '\0__HERDR_NESTED__\0'
+  find . -mindepth 2 -name .git -print0 || return 1
+  printf '\0__HERDR_SIZES__\0'
+  while IFS= read -r -d '' record; do
+    if [[ $record == '!! '* ]]; then
+      rel=${record:3}
+      root=${rel%%/*}
+      [[ -z $root ]] || roots["$root"]=1
+    fi
+  done < <(git status --porcelain --ignored --untracked-files=all -z)
+  while IFS= read -r -d '' record; do
+    rel=${record#./}
+    rel=${rel%/.git}
+    [[ -z $rel ]] || roots["$rel"]=1
+  done < <(find . -mindepth 2 -name .git -print0)
+  for rel in "${!roots[@]}"; do
+    for skip in "${@:3}"; do
+      [[ $rel == "$skip" ]] && continue 2
+    done
+    line=$(du -sk -- "$rel") || return 1
+    kib=${line%%[[:space:]]*}
+    printf '%s\0%s\0' "$rel" "$kib"
+  done
+  printf '\0__HERDR_INSPECT_DONE_%s__\0' "$key"
+}
+"#,
+    );
+    for (project, thread) in candidates {
+        let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
+        let path = crate::remote::quote(&thread.worktree_path);
+        let inspect = matches!(
+            crate::threads::finished_worktree_reason(ctx, &project, &thread),
+            Ok(None)
+        );
+        let skips = crate::worktrees::disposable(&ctx.config_dir, &project, &thread.repo)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.contains('/') && !entry.contains('*'))
+            .map(|entry| crate::remote::quote(&entry))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bash.push_str(&format!(
+            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; {inspect}; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
+            inspect = if inspect {
+                format!("(inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'")
+            } else {
+                ":".into()
+            },
+        ));
+    }
+    format!("bash -c {}\n", crate::remote::quote(&bash))
+}
+
+fn finished_worktrees_with_snapshot(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    snapshot: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    finished_worktrees_impl(ctx, Some(profile), Some(snapshot))
+}
+
+fn finished_worktrees(ctx: &Ctx) -> (Vec<String>, Vec<String>, Vec<String>) {
+    finished_worktrees_impl(ctx, None, None)
+}
+
+fn finished_worktrees_impl(
+    ctx: &Ctx,
+    remote: Option<&crate::contracts::MachineProfile>,
+    snapshot: Option<&str>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (candidates, mut errors) = finished_worktree_candidates(ctx, remote);
     // Check existence on the box before any completion probe. A merged
     // round can retain a resolved member long after its checkout is removed.
     // The shell always exits zero after printing each yes/no answer, so a
     // healthy "gone" result cannot enter the command-failure ledger and a
     // transport failure remains distinguishable from a negative answer.
     let remote_exists = remote.map(|profile| {
-        let script = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, (_, thread))| {
-                format!(
-                    "if [ -d {} ]; then printf '{}\\t1\\n'; else printf '{}\\t0\\n'; fi",
-                    crate::remote::quote(&thread.worktree_path),
-                    index,
-                    index
-                )
+        let Some(snapshot) = snapshot else {
+            errors.push(format!("{}: box snapshot missing", profile.label));
+            return vec![false; candidates.len()];
+        };
+        let facts: BTreeMap<String, bool> = snapshot
+            .lines()
+            .filter_map(|line| {
+                let (key, exists) = line.split_once('\t')?;
+                let key = key.strip_prefix("worktree_")?;
+                let exists = match exists {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                Some((key.to_owned(), exists))
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-        match crate::remote::ssh(ctx.runner, &profile.target, &script, None, TOOL_TIMEOUT) {
-            Ok(output) if output.success() => {
-                let facts: BTreeMap<usize, bool> = output
-                    .stdout
-                    .lines()
-                    .filter_map(|line| {
-                        let (index, exists) = line.split_once('\t')?;
-                        let exists = match exists {
-                            "0" => false,
-                            "1" => true,
-                            _ => return None,
-                        };
-                        Some((index.parse().ok()?, exists))
-                    })
-                    .collect();
-                let mut answers = Vec::with_capacity(candidates.len());
-                for (index, (_, thread)) in candidates.iter().enumerate() {
-                    match facts.get(&index) {
-                        Some(exists) => answers.push(*exists),
-                        None => {
-                            errors.push(format!(
-                                "{}: box worktree existence answer was missing",
-                                thread.worktree_path
-                            ));
-                            answers.push(false);
-                        }
+            .collect();
+        candidates
+            .iter()
+            .map(|(_, thread)| {
+                let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
+                match facts.get(&key) {
+                    Some(exists) => *exists,
+                    None => {
+                        errors.push(format!(
+                            "{}: box worktree existence answer was missing",
+                            thread.worktree_path
+                        ));
+                        false
                     }
                 }
-                answers
-            }
-            Ok(output) => {
-                errors.push(format!("box worktree check: {}", output.error_text()));
-                vec![false; candidates.len()]
-            }
-            Err(error) => {
-                errors.push(format!("box worktree check: {error:#}"));
-                vec![false; candidates.len()]
-            }
-        }
+            })
+            .collect()
     });
 
     let mut leftovers = Vec::new();
@@ -1108,7 +1178,14 @@ fn finished_worktrees(
                 continue;
             }
         }
-        match crate::threads::inspect_worktree_for_removal(ctx, &project, &thread) {
+        let inspection = if let Some(snapshot) = snapshot
+            && thread.is_remote()
+        {
+            crate::threads::inspect_worktree_from_snapshot(ctx, &project, &thread, snapshot)
+        } else {
+            crate::threads::inspect_worktree_for_removal(ctx, &project, &thread)
+        };
+        match inspection {
             Ok(inspection) if !inspection.dirty.is_empty() => leftovers.push(path.clone()),
             Ok(inspection) if !inspection.ignored_data.is_empty() => data_kept.push(format!(
                 "{} ({})",
@@ -1124,9 +1201,33 @@ fn finished_worktrees(
 
 /// Rebuildable box output whose owning thread is no longer open. The folder
 /// names come from the same helper that sets `CARGO_TARGET_DIR` at launch.
+fn build_folder_script(root: &str) -> String {
+    format!(
+        "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -exec du -sk -- {{}} +; fi; printf '__HERDR_BUILDS_DONE__\\n'",
+        root = crate::remote::quote(root),
+    )
+}
+
+fn finished_build_folders_with_snapshot(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    snapshot: &str,
+) -> (Vec<String>, Vec<String>) {
+    finished_build_folders_impl(ctx, profile, Some(snapshot))
+}
+
+#[cfg(test)]
 fn finished_build_folders(
     ctx: &Ctx,
     profile: &crate::contracts::MachineProfile,
+) -> (Vec<String>, Vec<String>) {
+    finished_build_folders_impl(ctx, profile, None)
+}
+
+fn finished_build_folders_impl(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    snapshot: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut active = BTreeSet::new();
     let mut uncertain_projects = BTreeSet::new();
@@ -1166,20 +1267,24 @@ fn finished_build_folders(
     }
 
     let root = machine_paths.build;
-    let script = format!(
-        "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -exec du -sk -- {{}} +; fi; printf '__HERDR_BUILDS_DONE__\\n'",
-        root = crate::remote::quote(&root),
-    );
-    let output = match crate::remote::ssh(ctx.runner, &profile.target, &script, None, TOOL_TIMEOUT)
-    {
-        Ok(output) if output.success() => output,
-        Ok(output) => {
-            errors.push(output.error_text());
-            return (Vec::new(), errors);
+    let script = build_folder_script(&root);
+    let output = if let Some(snapshot) = snapshot {
+        crate::runner::Output {
+            code: Some(0),
+            stdout: snapshot.to_owned(),
+            ..Default::default()
         }
-        Err(error) => {
-            errors.push(format!("{error:#}"));
-            return (Vec::new(), errors);
+    } else {
+        match crate::remote::ssh(ctx.runner, &profile.target, &script, None, TOOL_TIMEOUT) {
+            Ok(output) if output.success() => output,
+            Ok(output) => {
+                errors.push(output.error_text());
+                return (Vec::new(), errors);
+            }
+            Err(error) => {
+                errors.push(format!("{error:#}"));
+                return (Vec::new(), errors);
+            }
         }
     };
 
@@ -1231,6 +1336,22 @@ fn finished_build_folders(
     (leftovers, errors)
 }
 
+fn snapshot_list<T: serde::de::DeserializeOwned>(
+    snapshot: &str,
+    key: &str,
+    field: &str,
+) -> Result<Vec<T>> {
+    let facts = parse_facts(snapshot);
+    let raw = facts.get(key).context("box snapshot has no herdr answer")?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).with_context(|| format!("box herdr {key} reply was invalid"))?;
+    if let Some(error) = value.get("error") {
+        anyhow::bail!("box herdr {key}: {error}");
+    }
+    serde_json::from_value(value["result"][field].clone())
+        .with_context(|| format!("box herdr {key} reply changed"))
+}
+
 fn check_workspace_leaks(
     out: &mut String,
     check: &mut impl FnMut(&mut String, Option<bool>, &str, String),
@@ -1239,7 +1360,26 @@ fn check_workspace_leaks(
     display: &str,
     herdr: &Herdr<'_>,
 ) {
-    let workspaces = match herdr.workspace_list() {
+    check_workspace_leaks_with_snapshot(out, check, root, machine, display, herdr, None)
+}
+
+fn check_workspace_leaks_with_snapshot(
+    out: &mut String,
+    check: &mut impl FnMut(&mut String, Option<bool>, &str, String),
+    root: &Path,
+    machine: &str,
+    display: &str,
+    herdr: &Herdr<'_>,
+    snapshot: Option<&str>,
+) {
+    let workspaces = match snapshot.map_or_else(
+        || {
+            herdr
+                .workspace_list()
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        },
+        |text| snapshot_list(text, "herdr_workspaces", "workspaces"),
+    ) {
         Ok(workspaces) => workspaces,
         Err(error) => {
             check(
@@ -1251,7 +1391,14 @@ fn check_workspace_leaks(
             return;
         }
     };
-    let agents = match herdr.agent_list() {
+    let agents = match snapshot.map_or_else(
+        || {
+            herdr
+                .agent_list()
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        },
+        |text| snapshot_list(text, "herdr_agents", "agents"),
+    ) {
         Ok(agents) => agents,
         Err(error) => {
             check(
@@ -1353,7 +1500,10 @@ fn check_workspace_leaks(
     if machine == "local" {
         return;
     }
-    let tabs = match herdr.tab_list() {
+    let tabs = match snapshot.map_or_else(
+        || herdr.tab_list().map_err(|error| anyhow::anyhow!("{error}")),
+        |text| snapshot_list(text, "herdr_tabs", "tabs"),
+    ) {
         Ok(tabs) => tabs,
         Err(error) => {
             check(
@@ -1486,13 +1636,25 @@ fn machines_to_check(
 /// server, host, listeners, repository mapping, Git identity and GitHub
 /// reach, enabled recipes' readiness, and live CPU/RAM/disk capacity with the
 /// configured free-space gate. One read-only SSH call.
+#[cfg(test)]
 fn box_rows(
     runner: &dyn Runner,
-    herdr_bin: &str,
+    _herdr_bin: &str,
     config_dir: &Path,
     profile: &crate::contracts::MachineProfile,
     recipes: &BTreeMap<String, crate::contracts::Recipe>,
     min_free_disk_gb: f64,
+) -> Vec<(Option<bool>, String, String)> {
+    box_rows_with_snapshot(runner, config_dir, profile, recipes, min_free_disk_gb, None)
+}
+
+fn box_rows_with_snapshot(
+    runner: &dyn Runner,
+    config_dir: &Path,
+    profile: &crate::contracts::MachineProfile,
+    recipes: &BTreeMap<String, crate::contracts::Recipe>,
+    min_free_disk_gb: f64,
+    snapshot: Option<(&Ctx<'_>, &mut String)>,
 ) -> Vec<(Option<bool>, String, String)> {
     let label = &profile.label;
     if profile.target.is_empty() {
@@ -1596,6 +1758,18 @@ fn box_rows(
     for probe in natives.values() {
         script.push_str(&box_native_probe_script(probe, true, &machine_paths));
     }
+    // The lane shell receives this exact PATH. Check the first pi hit and
+    // required executables in the same box invocation as the other facts.
+    script.push_str("printf 'pane_pi\\t%s\\n' \"$(command -v pi 2>/dev/null || true)\"\n");
+    for tool in ["cargo", "just", "node"]
+        .into_iter()
+        .chain(natives.values().map(|probe| probe.program.as_str()))
+    {
+        script.push_str(&format!(
+            "printf 'pane_tool_{tool}\\t%s\\n' \"$(command -v {tool} 2>/dev/null || true)\"\n",
+            tool = crate::remote::quote(tool),
+        ));
+    }
     // Pi readiness is read on the box through its own wrapper and login store
     // (SPEC-remote §3.3, SPEC-pi §3.4, item 101): never Mac auth.
     for (provider, model) in &providers {
@@ -1616,6 +1790,20 @@ fn box_rows(
             "if [ -d {path}/.git ]; then printf 'repo %s\\tok\\n' {path}; else printf 'repo %s\\tmissing\\n' {path}; fi\n"
         ));
     }
+    if let Some((ctx, _)) = &snapshot {
+        script.push_str(&remote_worktree_script(ctx, profile));
+        script.push_str(&build_folder_script(&machine_paths.build));
+        for (key, command) in [
+            ("workspaces", "workspace list"),
+            ("agents", "agent list"),
+            ("tabs", "tab list"),
+        ] {
+            script.push_str(&format!(
+                "printf 'herdr_{key}\\t%s\\n' \"$(HERDR_SESSION={session} \"$herdr_bin\" {command} 2>/dev/null | tr '\\n\\t' '  ')\"\n",
+                session = crate::remote::quote(&profile.session),
+            ));
+        }
+    }
     let facts = match crate::remote::ssh(
         runner,
         &profile.target,
@@ -1623,7 +1811,12 @@ fn box_rows(
         None,
         crate::remote::SSH_START_TIMEOUT,
     ) {
-        Ok(out) if out.success() => parse_facts(&out.stdout),
+        Ok(out) if out.success() => {
+            if let Some((_, snapshot)) = snapshot {
+                *snapshot = out.stdout.clone();
+            }
+            parse_facts(&out.stdout)
+        }
         Ok(out) => {
             return vec![(
                 Some(false),
@@ -1714,68 +1907,42 @@ fn box_rows(
             },
         ));
     }
-    // The box pane probe (SPEC-remote §3.3): a fresh pane with the lane PATH
-    // answers `type -a -P pi` and `command -v` in its own shell.
+    let pi = fact("pane_pi");
+    let wrapper = Path::new(&machine_paths.pi_bin)
+        .parent()
+        .map(|dir| dir.join("pi").to_string_lossy().into_owned())
+        .unwrap_or_default();
+    rows.push((
+        Some(pi == wrapper),
+        format!("box {label} wrapper"),
+        if pi.is_empty() {
+            "the lane PATH did not resolve `pi`".into()
+        } else {
+            format!("`command -v pi` first hit: {pi}")
+        },
+    ));
     let required_tools: Vec<&str> = ["cargo", "just", "node"]
         .into_iter()
         .chain(natives.values().map(|probe| probe.program.as_str()))
         .collect();
-    match box_pane_probe(
-        runner,
-        herdr_bin,
-        profile,
-        Some(&machine_paths),
-        &required_tools,
-    ) {
-        Ok(answer) => {
-            let (pi, tools) = parse_box_probe(&answer);
-            let wrapper = Path::new(&machine_paths.pi_bin)
-                .parent()
-                .map(|dir| dir.join("pi").to_string_lossy().into_owned())
-                .unwrap_or_default();
-            rows.push((
-                if pi == wrapper {
-                    Some(true)
-                } else {
-                    Some(false)
-                },
-                format!("box {label} wrapper"),
-                if pi.is_empty() {
-                    "the box pane did not answer `type -a -P pi`".into()
-                } else {
-                    format!("`type -a -P pi` first hit: {pi}")
-                },
-            ));
-            // Only native recipes require their standalone executables.
-            let missing: Vec<&str> = required_tools
+    let missing: Vec<_> = required_tools
+        .iter()
+        .filter(|tool| fact(&format!("pane_tool_{tool}")).is_empty())
+        .copied()
+        .collect();
+    rows.push((
+        Some(missing.is_empty()),
+        format!("box {label} tools"),
+        if missing.is_empty() {
+            required_tools
                 .iter()
-                .copied()
-                .filter(|tool| {
-                    !tools
-                        .iter()
-                        .any(|found| found.ends_with(&format!("/{tool}")))
-                })
-                .collect();
-            rows.push((
-                if missing.is_empty() {
-                    Some(true)
-                } else {
-                    Some(false)
-                },
-                format!("box {label} tools"),
-                if missing.is_empty() {
-                    tools.join(" ")
-                } else {
-                    format!("the pane cannot find: {}", missing.join(" "))
-                },
-            ));
-        }
-        Err(error) => rows.push((
-            Some(false),
-            format!("box {label} wrapper"),
-            format!("the box pane probe failed: {error:#}"),
-        )),
-    }
+                .map(|tool| fact(&format!("pane_tool_{tool}")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            format!("the lane PATH cannot find: {}", missing.join(" "))
+        },
+    ));
     for (provider, model) in providers {
         let value = fact(&format!("pi_{provider}/{model}"));
         rows.push((
@@ -1833,72 +2000,6 @@ fn parse_facts(text: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// Creates a fresh box pane with the lane PATH, runs the tool probe in that
-/// pane's own shell, reads the answer and closes the workspace. This is the
-/// §3.3 probe: never a bare `ssh` command string, never `bash -lic`.
-fn box_pane_probe(
-    runner: &dyn Runner,
-    herdr_bin: &str,
-    profile: &crate::contracts::MachineProfile,
-    machine: Option<&crate::remote::MachineDeclaration>,
-    tools: &[&str],
-) -> Result<String> {
-    let tools = tools
-        .iter()
-        .map(|tool| crate::remote::quote(tool))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let probe = format!(
-        "printf '@@pi '; type -a -P pi 2>/dev/null | head -n1; \
-         printf '@@cmd\\n'; command -v {tools} 2>/dev/null; \
-         printf '@@done\\n'"
-    );
-    let herdr = Herdr::new(herdr_bin, "", runner).on_machine(&profile.id);
-    let machine = machine.context("machine path declaration is missing")?;
-    let env = vec![format!("PATH={}", machine.path)];
-    let created = herdr
-        .workspace_create_env(Path::new(&machine.home), "ha-doctor-probe", false, &env)
-        .map_err(|error| anyhow::anyhow!("box probe pane: {error}"))?;
-    let pane = created.pane_id.clone();
-    let answer = (|| -> Result<String> {
-        herdr
-            .pane_run(&pane, &probe)
-            .map_err(|error| anyhow::anyhow!("box probe run: {error}"))?;
-        for _ in 0..50 {
-            let text = herdr
-                .pane_read_text(&pane, "recent")
-                .map_err(|error| anyhow::anyhow!("box probe read: {error}"))?;
-            if text.contains("@@done") {
-                return Ok(text);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        anyhow::bail!("the box pane did not answer the probe in time")
-    })();
-    let _ = herdr.workspace_close(&created.workspace_id);
-    answer
-}
-
-/// The `@@pi` first hit and the `command -v` paths from a probe answer.
-fn parse_box_probe(text: &str) -> (String, Vec<String>) {
-    let mut pi = String::new();
-    let mut tools = Vec::new();
-    let mut in_tools = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("@@pi ") {
-            pi = rest.trim().to_string();
-        } else if line == "@@cmd" {
-            in_tools = true;
-        } else if line == "@@done" {
-            in_tools = false;
-        } else if in_tools && !line.is_empty() {
-            tools.push(line.to_string());
-        }
-    }
-    (pi, tools)
-}
-
 fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
     if ok.contains(&value) {
         Some(true)
@@ -1911,6 +2012,7 @@ fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
+    use std::io::Write as _;
 
     const ROUTING_CONFIG: &str = r#"[routing]
 default = "pi_codex_sol_high"
@@ -1977,9 +2079,16 @@ recipe = "claude_fable_xhigh"
             |_| Ok(fail(1, "not logged in")),
         );
         runner.on("machine list --json", ok(machines));
-        runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
-        runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
-        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        for (command, reply) in [
+            ("workspace list", r#"{"result":{"workspaces":[]}}"#),
+            ("tab list", r#"{"result":{"tabs":[]}}"#),
+            ("agent list", r#"{"result":{"agents":[]}}"#),
+        ] {
+            runner.on_fn(
+                move |cmd| cmd.program == "herdr" && cmd.display().contains(command),
+                move |_| Ok(ok(reply)),
+            );
+        }
         runner
     }
 
@@ -2553,7 +2662,12 @@ recipe = "claude_fable_xhigh"
         // Without round completion evidence the old code probed git in each
         // absent worktree before asking the box whether the path existed.
         let fake = FakeRunner::new();
-        fake.on("ssh", ok("0\t0\n1\t0\n"));
+        let snapshot = (1..=2)
+            .map(|number| {
+                let key = crate::thread::sha256_hex(format!("/box/worktree-{number}").as_bytes());
+                format!("worktree_{key}\t0\n")
+            })
+            .collect::<String>();
         let recording = crate::ledger::RecordingRunner(&fake);
         let ctx = Ctx {
             env: &env,
@@ -2570,12 +2684,12 @@ recipe = "claude_fable_xhigh"
             target: "me@box".into(),
             session: "default".into(),
         };
-        let (leftovers, data, errors) = finished_worktrees(&ctx, Some(&profile));
+        let (leftovers, data, errors) = finished_worktrees_with_snapshot(&ctx, &profile, &snapshot);
 
         assert!(leftovers.is_empty());
         assert!(data.is_empty());
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(fake.count("ssh"), 1);
+        assert_eq!(fake.count("ssh"), 0);
         assert!(fake.calls.borrow().iter().all(|call| call.program != "git"));
         assert!(crate::ledger::list(&project).unwrap().is_empty());
         assert!(!project.state_dir().join("ledger.jsonl").exists());
@@ -2646,7 +2760,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, data, errors) = finished_worktrees(&ctx, None);
+        let (leftovers, data, errors) = finished_worktrees(&ctx);
 
         assert!(leftovers.is_empty());
         assert!(data.is_empty());
@@ -2951,6 +3065,275 @@ recipe = "claude_fable_xhigh"
             "{text}"
         );
         assert!(text.contains("[ok  ] box buildbox capacity"), "{text}");
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.program == "ssh" && call.args != ["-V"])
+                .count(),
+            1,
+            "box facts, worktree presence and build folders share one SSH call"
+        );
+        assert_eq!(
+            runner.count("workspace create"),
+            0,
+            "doctor must not spawn a disposable probe pane"
+        );
+    }
+
+    #[test]
+    fn box_snapshot_reuses_the_presence_answer_without_a_second_ssh() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.machine = "buildbox".into();
+            thread.machine_id = "abc".into();
+            thread.worktree_path = "/home/agent/projects/demo/.worktrees/t-1".into();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let key = crate::thread::sha256_hex(b"/home/agent/projects/demo/.worktrees/t-1");
+        let (leftovers, data, errors) =
+            finished_worktrees_with_snapshot(&ctx, &box_profile(), &format!("worktree_{key}\t0\n"));
+        assert!(
+            leftovers.is_empty() && data.is_empty() && errors.is_empty(),
+            "{leftovers:?} {data:?} {errors:?}"
+        );
+        assert_eq!(runner.count("ssh"), 0);
+    }
+
+    #[test]
+    fn one_ssh_inspects_present_box_worktrees_and_keeps_dirty_and_ignored_data() {
+        let home = tempfile::tempdir().unwrap();
+        let config = machine_config(&["pi"]);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(config.path().join("config.toml"))
+            .unwrap()
+            .write_all(b"\n[worktrees]\ndisposable = [\"target\"]\n")
+            .unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.test"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["commit", "--allow-empty", "-qm", "initial"]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let paths = ["/box/t-a", "/box/t-b"];
+        for path in paths {
+            crate::thread::allocate(&project, |thread| {
+                thread.status = crate::thread::Status::Resolved;
+                thread.kind = crate::thread::Kind::Worktree;
+                thread.machine = "buildbox".into();
+                thread.machine_id = "abc".into();
+                thread.repo = repo.to_string_lossy().into_owned();
+                thread.branch = "main".into();
+                thread.worktree_path = path.into();
+            })
+            .unwrap();
+        }
+        let key_a = crate::thread::sha256_hex(paths[0].as_bytes());
+        let key_b = crate::thread::sha256_hex(paths[1].as_bytes());
+        let snapshot = format!(
+            "{}worktree_{key_a}\t1\n\0__HERDR_INSPECT_{key_a}__\0 M file\0\0__HERDR_NESTED__\0\0__HERDR_SIZES__\0\0__HERDR_INSPECT_DONE_{key_a}__\0\nworktree_{key_b}\t1\n\0__HERDR_INSPECT_{key_b}__\0!! target/file\0!! safe/file\0\0__HERDR_NESTED__\0./target/nested/.git\0\0__HERDR_SIZES__\0safe\03\0target/nested\04\0\0__HERDR_INSPECT_DONE_{key_b}__\0\n",
+            box_facts(),
+        );
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&snapshot));
+        runner.on_fn(
+            |cmd| cmd.program == "git",
+            |cmd| crate::runner::RealRunner.run(cmd),
+        );
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: config.path().into(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let mut captured = String::new();
+        box_rows_with_snapshot(
+            &runner,
+            config.path(),
+            &box_profile(),
+            &BTreeMap::new(),
+            12.0,
+            Some((&ctx, &mut captured)),
+        );
+        let (leftovers, data, errors) =
+            finished_worktrees_with_snapshot(&ctx, &box_profile(), &captured);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(leftovers, [paths[0]]);
+        assert_eq!(
+            data,
+            [format!(
+                "{} (safe: 3.0 KiB, target/nested: 4.0 KiB)",
+                paths[1]
+            )]
+        );
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "ssh")
+                .count(),
+            1
+        );
+        let ssh = runner
+            .calls
+            .borrow()
+            .iter()
+            .find(|cmd| cmd.program == "ssh")
+            .unwrap()
+            .display();
+        assert!(ssh.contains("git status --porcelain --ignored"));
+        assert!(ssh.contains("du -sk"));
+    }
+
+    #[test]
+    fn batched_shell_preserves_nul_status_nested_and_sizes() {
+        let home = tempfile::tempdir().unwrap();
+        let config = machine_config(&["pi"]);
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.test"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join(".gitignore"), "target/\nsafe/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "initial"]);
+        std::fs::write(repo.join(".gitignore"), "target/\nsafe/\n# changed\n").unwrap();
+        std::fs::create_dir_all(repo.join("target/nested")).unwrap();
+        std::fs::create_dir_all(repo.join("safe")).unwrap();
+        std::fs::write(repo.join("target/nested/.git"), "gitdir: /nowhere\n").unwrap();
+        std::fs::write(repo.join("safe/keep"), "keep").unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.machine = "buildbox".into();
+            thread.machine_id = "abc".into();
+            thread.repo = repo.to_string_lossy().into_owned();
+            thread.branch = "main".into();
+            thread.worktree_path = repo.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let missing = home.path().join("gone");
+        crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.machine = "buildbox".into();
+            thread.machine_id = "abc".into();
+            thread.repo = repo.to_string_lossy().into_owned();
+            thread.branch = "main".into();
+            thread.worktree_path = missing.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = crate::runner::RealRunner;
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: config.path().into(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let script = format!(
+            "{}printf '__HERDR_BUILDS__\\n'\n",
+            remote_worktree_script(&ctx, &box_profile())
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).unwrap();
+        let key = crate::thread::sha256_hex(repo.to_string_lossy().as_bytes());
+        assert!(
+            text.lines()
+                .any(|line| line == format!("worktree_{key}\t1"))
+        );
+        let absent = crate::thread::sha256_hex(missing.to_string_lossy().as_bytes());
+        assert!(
+            text.lines()
+                .any(|line| line == format!("worktree_{absent}\t0"))
+        );
+        assert!(text.lines().any(|line| line == "__HERDR_BUILDS__"));
+        let inspection = crate::worktrees::inspect_batched(&text, &key, &[], false).unwrap();
+        assert!(inspection.dirty.iter().any(|path| path == ".gitignore"));
+        assert!(
+            inspection
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "safe" && data.bytes > 0)
+        );
+        assert!(
+            inspection
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "target/nested" && data.bytes > 0)
+        );
+        let filtered =
+            crate::worktrees::inspect_batched(&text, &key, &["target".into()], false).unwrap();
+        assert!(
+            !filtered
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "target")
+        );
+        assert!(
+            filtered
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "target/nested" && data.bytes > 0)
+        );
     }
 
     #[test]
@@ -3352,10 +3735,15 @@ recipe = "claude_fable_xhigh"
             let runner = FakeRunner::new();
             runner.on(
                 "ssh",
-                ok(&box_facts().replace(
-                    &format!("login_{kind}\tok"),
-                    &format!("login_{kind}\tmissing"),
-                )),
+                ok(&box_facts()
+                    .replace(
+                        &format!("login_{kind}\tok"),
+                        &format!("login_{kind}\tmissing"),
+                    )
+                    .replace(
+                        &format!("pane_tool_{kind}\t/home/agent/.local/bin/{kind}"),
+                        &format!("pane_tool_{kind}\t"),
+                    )),
             );
             runner.on("pane read", ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
             probe_fakes(&runner);
@@ -3494,6 +3882,16 @@ recipe = "claude_fable_xhigh"
             "git_email\trolf@example.com",
             "gh\tok",
             "rules\tabc",
+            "pane_pi\t/home/agent/.local/bin/pi",
+            "pane_tool_cargo\t/home/agent/.cargo/bin/cargo",
+            "pane_tool_just\t/home/agent/.cargo/bin/just",
+            "pane_tool_node\t/usr/local/bin/node",
+            "pane_tool_claude\t/home/agent/.local/bin/claude",
+            "pane_tool_codex\t/home/agent/.local/bin/codex",
+            "pane_tool_agy\t/home/agent/.local/bin/agy",
+            "herdr_workspaces\t{\"result\":{\"workspaces\":[]}}",
+            "herdr_agents\t{\"result\":{\"agents\":[]}}",
+            "herdr_tabs\t{\"result\":{\"tabs\":[]}}",
             "login_claude\tok",
             "login_codex\tok",
             "login_agy\tok",
@@ -3654,6 +4052,14 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         let facts = box_facts()
             .replace("login_agy\tok", "login_agy\tmissing")
+            .replace(
+                "pane_tool_agy\t/home/agent/.local/bin/agy",
+                "pane_tool_agy\t",
+            )
+            .replace(
+                "pane_tool_claude\t/home/agent/.local/bin/claude",
+                "pane_tool_claude\t",
+            )
             .replace("pi_pro/pro\tok", "pi_pro/pro\tfail");
         runner.on("ssh", ok(&facts));
         runner.on(
@@ -3687,16 +4093,15 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn box_wrapper_probe_fails_closed_when_the_pane_answers_another_path() {
+    fn box_wrapper_probe_fails_closed_when_the_path_resolves_another_binary() {
         let runner = FakeRunner::new();
-        runner.on("ssh", ok(&box_facts()));
         runner.on(
-            "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/agent"}}}"#),
+            "ssh",
+            ok(&box_facts().replace(
+                "pane_pi\t/home/agent/.local/bin/pi",
+                "pane_pi\t/usr/local/bin/pi",
+            )),
         );
-        runner.on("pane run", ok(r#"{"result":{}}"#));
-        runner.on("pane read", ok("@@pi /usr/local/bin/pi\n@@cmd\n@@done\n"));
-        runner.on("workspace close", ok(r#"{"result":{}}"#));
         let row = find_row(&runner, "box buildbox wrapper");
         assert_eq!(row.0, Some(false));
         assert!(row.2.contains("/usr/local/bin/pi"), "{}", row.2);
