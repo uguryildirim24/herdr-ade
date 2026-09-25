@@ -2672,6 +2672,7 @@ fn provider_readiness_and_a_gone_process_schedule_same_recipe_restarts() {
     let lane = world.thread(&project, world.home.path(), |thread| {
         thread.attempt = 1;
         thread.launch = launch;
+        thread.launch_attempts = 1;
     });
     std::fs::write(thread::task_path(&project, &lane.id), "Do the work.").unwrap();
     threads::fail_start(
@@ -2707,6 +2708,7 @@ fn provider_readiness_and_a_gone_process_schedule_same_recipe_restarts() {
     let provider_lane = world.thread(&project, world.home.path(), |thread| {
         thread.attempt = 1;
         thread.launch = provider_launch;
+        thread.launch_attempts = 1;
     });
     std::fs::write(
         thread::task_path(&project, &provider_lane.id),
