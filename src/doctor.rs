@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -11,9 +12,148 @@ use serde::Serialize;
 use crate::herdr::{self, Herdr};
 use crate::paths::{self, Ctx, Env, SessionFlags};
 use crate::project;
-use crate::runner::{Cmd, Runner};
+use crate::runner::{Cmd, Output, Runner};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Instrument the same Runner used by all doctor dependencies, including the
+/// single box SSH snapshot. Never print arguments: they can contain credentials
+/// or the entire remote script. The program, duration and check are sufficient
+/// to locate an expensive call; SSH script phases have their own facts below.
+struct Timings<'a> {
+    inner: &'a dyn Runner,
+    state: Mutex<TimingState>,
+}
+
+struct TimingState {
+    last: Instant,
+    commands: Vec<String>,
+    rows: Vec<String>,
+}
+
+impl<'a> Timings<'a> {
+    fn new(inner: &'a dyn Runner) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(TimingState {
+                last: Instant::now(),
+                commands: Vec::new(),
+                rows: Vec::new(),
+            }),
+        }
+    }
+
+    fn row(&self, label: &str) {
+        let mut state = self.state.lock().unwrap();
+        let elapsed = state.last.elapsed();
+        let commands = std::mem::take(&mut state.commands);
+        state
+            .rows
+            .push(format!("  {label}: {:.3}s", elapsed.as_secs_f64()));
+        for command in commands {
+            state.rows.push(format!("    {command}"));
+        }
+        state.last = Instant::now();
+    }
+
+    fn remote_phases(&self, label: &str, snapshot: &str) {
+        let facts = parse_facts(snapshot);
+        for (phase, commands) in [
+            ("facts", "hostname, systemctl, gh auth, df"),
+            ("readiness", "provider probes, command -v"),
+            ("worktrees", "git status, find, du"),
+            ("builds", "find"),
+            ("herdr", "workspace list, agent list, tab list"),
+        ] {
+            if let Some(ms) = facts
+                .get(&format!("doctor_phase_{phase}"))
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                self.command(
+                    &format!("box {label} {phase} ({commands}, grouped)"),
+                    Duration::from_millis(ms),
+                );
+            }
+        }
+    }
+
+    fn print(&self, text: &mut String) {
+        let state = self.state.lock().unwrap();
+        let _ = writeln!(
+            text,
+            "\nTimings (wall time since previous check; batch work is charged to its first row):"
+        );
+        for row in &state.rows {
+            let _ = writeln!(text, "{row}");
+        }
+    }
+
+    fn command(&self, program: &str, elapsed: Duration) {
+        self.state
+            .lock()
+            .unwrap()
+            .commands
+            .push(format!("{program}: {:.3}s", elapsed.as_secs_f64()));
+    }
+}
+
+/// Include only known command verbs. Paths, scripts, tokens and model arguments
+/// can be private; printing an arbitrary argv from a doctor is not safe.
+fn command_name(cmd: &Cmd) -> String {
+    let program = Path::new(&cmd.program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&cmd.program);
+    let args = if program == "git" && cmd.args.first().is_some_and(|arg| arg == "-C") {
+        cmd.args.get(2..).unwrap_or_default()
+    } else {
+        &cmd.args
+    };
+    let verb = args.first().map(String::as_str).unwrap_or("");
+    match (program, verb) {
+        ("git", "status" | "ls-remote" | "for-each-ref" | "worktree" | "rev-list") => {
+            format!("git {verb}")
+        }
+        ("gh", "auth") => "gh auth status".into(),
+        ("herdr", "agent" | "pane" | "tab" | "workspace" | "machine" | "session") => {
+            format!(
+                "herdr {verb} {}",
+                args.get(1).map(String::as_str).unwrap_or("")
+            )
+        }
+        ("ssh", _) => "ssh (remote script)".into(),
+        _ => program.into(),
+    }
+}
+
+impl Runner for Timings<'_> {
+    fn run(&self, cmd: &Cmd) -> Result<Output> {
+        let start = Instant::now();
+        let result = self.inner.run(cmd);
+        self.command(&command_name(cmd), start.elapsed());
+        result
+    }
+
+    fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
+        // Keep the underlying runner's concurrency and scripted-test semantics.
+        let start = Instant::now();
+        let results = self.inner.run_parallel(commands);
+        for command in commands {
+            self.command(
+                &format!("{} (parallel batch)", command_name(command)),
+                start.elapsed(),
+            );
+        }
+        results
+    }
+
+    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
+        let start = Instant::now();
+        let result = self.inner.socket_request(socket, line, timeout);
+        self.command("herdr socket", start.elapsed());
+        result
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct CheckResult {
@@ -303,8 +443,37 @@ pub(crate) fn recipe_ready_on_box(
 
 /// Builds the human report and its typed check results from the same facts.
 pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
-    let (mut text, mut healthy, mut checks) =
-        report_with_checks(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner);
+    run_with_trace(ctx, session, None)
+}
+
+pub(crate) fn run_timed(ctx: &Ctx, session: &SessionFlags, enabled: bool) -> Result<DoctorOutcome> {
+    if !enabled {
+        return run(ctx, session);
+    }
+    let timings = Timings::new(ctx.runner);
+    let traced = Ctx {
+        env: ctx.env,
+        root: ctx.root.clone(),
+        config_dir: ctx.config_dir.clone(),
+        runner: &timings,
+        detached_ticker: ctx.detached_ticker,
+    };
+    run_with_trace(&traced, session, Some(&timings))
+}
+
+fn run_with_trace(
+    ctx: &Ctx,
+    session: &SessionFlags,
+    timings: Option<&Timings<'_>>,
+) -> Result<DoctorOutcome> {
+    let (mut text, mut healthy, mut checks) = report_with_checks(
+        ctx.env,
+        &ctx.root,
+        &ctx.config_dir,
+        session,
+        ctx.runner,
+        timings,
+    );
     // The pi rows read only providers named by enabled configured recipes;
     // unused built-in provider knowledge never causes a doctor failure.
     let pi_models =
@@ -318,6 +487,9 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
                     crate::pi::doctor::Level::Warn => "warning",
                     crate::pi::doctor::Level::Fail => "failed",
                 };
+                if let Some(timings) = timings {
+                    timings.row(&row.label);
+                }
                 checks.push(CheckResult {
                     status: status.into(),
                     label: row.label.clone(),
@@ -329,6 +501,9 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
         Err(error) => {
             healthy = false;
             let detail = format!("{error:#}");
+            if let Some(timings) = timings {
+                timings.row("pi");
+            }
             checks.push(CheckResult {
                 status: "failed".into(),
                 label: "pi".into(),
@@ -338,8 +513,16 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
         }
     }
     match crate::branches::doctor(ctx, None) {
-        Ok(branches) => text.push_str(&branches),
+        Ok(branches) => {
+            if let Some(timings) = timings {
+                timings.row("branches");
+            }
+            text.push_str(&branches);
+        }
         Err(error) => {
+            if let Some(timings) = timings {
+                timings.row("branches");
+            }
             healthy = false;
             let detail = format!("branch inventory: {error:#}");
             checks.push(CheckResult {
@@ -349,6 +532,9 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
             });
             let _ = writeln!(text, "[FAIL] {detail}");
         }
+    }
+    if let Some(timings) = timings {
+        timings.print(&mut text);
     }
     Ok(DoctorOutcome {
         healthy,
@@ -365,7 +551,7 @@ fn report(
     session: &SessionFlags,
     runner: &dyn Runner,
 ) -> (String, bool) {
-    let (text, healthy, _) = report_with_checks(env, root, config_dir, session, runner);
+    let (text, healthy, _) = report_with_checks(env, root, config_dir, session, runner, None);
     (text, healthy)
 }
 
@@ -375,6 +561,7 @@ fn report_with_checks(
     config_dir: &Path,
     session: &SessionFlags,
     runner: &dyn Runner,
+    timings: Option<&Timings<'_>>,
 ) -> (String, bool, Vec<CheckResult>) {
     let stable_runner = crate::runner::CwdRunner::new(runner, root);
     let runner: &dyn Runner = &stable_runner;
@@ -390,6 +577,9 @@ fn report_with_checks(
             }
             None => ("warn", "warning"),
         };
+        if let Some(timings) = timings {
+            timings.row(label);
+        }
         checks.push(CheckResult {
             status: status.into(),
             label: label.into(),
@@ -821,6 +1011,9 @@ fn report_with_checks(
                             ) {
                                 check(&mut out, ok, &label, detail);
                             }
+                            if let Some(timings) = timings {
+                                timings.remote_phases(&profile.label, &box_snapshot);
+                            }
                             let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
                             check_workspace_leaks_with_snapshot(
                                 &mut out,
@@ -1197,7 +1390,7 @@ fn finished_worktrees_impl(
 /// names come from the same helper that sets `CARGO_TARGET_DIR` at launch.
 fn build_folder_script(root: &str) -> String {
     format!(
-        "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -exec du -sk -- {{}} +; fi; printf '__HERDR_BUILDS_DONE__\\n'",
+        "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -print; fi; printf '__HERDR_BUILDS_DONE__\\n'",
         root = crate::remote::quote(root),
     )
 }
@@ -1298,17 +1491,9 @@ fn finished_build_folders_impl(
             _ if !in_list => continue,
             _ => {}
         }
-        let Some((kb, path)) = line.split_once(char::is_whitespace) else {
-            errors.push(format!("build folder size unreadable: {line}"));
-            continue;
-        };
-        let path = path.trim();
+        let path = line.trim();
         let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
             errors.push(format!("build folder path unreadable: {path}"));
-            continue;
-        };
-        let Ok(kb) = kb.parse::<u64>() else {
-            errors.push(format!("build folder size unreadable: {line}"));
             continue;
         };
         let ownership_unknown = uncertain_projects.iter().any(|slug| {
@@ -1317,11 +1502,7 @@ fn finished_build_folders_impl(
                 .is_some_and(|id| crate::thread::validate_id(id).is_ok())
         });
         if !active.contains(name) && !ownership_unknown {
-            leftovers.push(format!(
-                "{} ({})",
-                path,
-                crate::worktrees::human_size(kb.saturating_mul(1024))
-            ));
+            leftovers.push(path.to_string());
         }
     }
     if !complete {
@@ -1732,6 +1913,7 @@ fn box_rows_with_snapshot(
     let mut script = format!(
         "set -u\n\
          PATH={path}; export PATH\n\
+         doctor_start=$(date +%s%3N)\n\
          printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
          printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
          herdr_bin=$(command -v herdr 2>/dev/null || true)\n\
@@ -1749,6 +1931,7 @@ fn box_rows_with_snapshot(
         path = crate::remote::quote(&machine_paths.path),
         home = crate::remote::quote(&machine_paths.home),
     );
+    script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_facts\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
     for probe in natives.values() {
         script.push_str(&box_native_probe_script(probe, true, &machine_paths));
     }
@@ -1785,8 +1968,11 @@ fn box_rows_with_snapshot(
         ));
     }
     if let Some((ctx, _)) = &snapshot {
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_readiness\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
         script.push_str(&remote_worktree_script(ctx, profile));
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_worktrees\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
         script.push_str(&build_folder_script(&machine_paths.build));
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_builds\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
         for (key, command) in [
             ("workspaces", "workspace list"),
             ("agents", "agent list"),
@@ -1797,6 +1983,7 @@ fn box_rows_with_snapshot(
                 session = crate::remote::quote(&profile.session),
             ));
         }
+        script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_herdr\\t%s\\n' \"$((doctor_now-doctor_start))\"\n");
     }
     let facts = match crate::remote::ssh(
         runner,
@@ -2690,6 +2877,37 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
+    fn timings_name_checks_and_commands_without_leaking_arguments() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let config = home.path().join("cfg");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(crate::harness::BOX_WORKER_MARKER), "worker\n").unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir: config,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let result = run_timed(&ctx, &SessionFlags::default(), true).unwrap();
+        assert!(result.message.contains("Timings (wall time"));
+        assert!(result.message.contains("  herdr:"));
+        assert!(result.message.contains("    herdr:"));
+        assert!(result.message.contains("  branches:"));
+        let timing = Timings::new(&runner);
+        timing.remote_phases("buildbox", "doctor_phase_builds\t250\n");
+        timing.row("box buildbox boot");
+        let mut detail = String::new();
+        timing.print(&mut detail);
+        assert!(
+            detail.contains("box buildbox builds (find, grouped): 0.250s"),
+            "{detail}"
+        );
+    }
+
+    #[test]
     fn an_open_working_thread_is_not_a_finished_worktree() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
@@ -2715,8 +2933,14 @@ recipe = "claude_fable_xhigh"
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
 
-        let (text, healthy, checks) =
-            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+        let (text, healthy, checks) = report_with_checks(
+            &env,
+            &root,
+            &config,
+            &SessionFlags::default(),
+            &runner,
+            None,
+        );
 
         assert!(healthy, "{text}");
         assert!(
@@ -2786,8 +3010,14 @@ recipe = "claude_fable_xhigh"
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
 
-        let (text, healthy, checks) =
-            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+        let (text, healthy, checks) = report_with_checks(
+            &env,
+            &root,
+            &config,
+            &SessionFlags::default(),
+            &runner,
+            None,
+        );
 
         assert!(healthy, "{text}");
         assert!(text.contains("thread state unknown"), "{text}");
@@ -2845,8 +3075,14 @@ recipe = "claude_fable_xhigh"
         let runner = runner_with_herdr("herdr 0.9.1\n");
         runner.on("status --porcelain --ignored --untracked-files=all", ok(""));
 
-        let (text, healthy, checks) =
-            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+        let (text, healthy, checks) = report_with_checks(
+            &env,
+            &root,
+            &config,
+            &SessionFlags::default(),
+            &runner,
+            None,
+        );
 
         assert!(!healthy, "{text}");
         assert!(text.contains("[FAIL] finished worktrees local"), "{text}");
@@ -2909,8 +3145,14 @@ recipe = "claude_fable_xhigh"
             ok("!! camber-runs/raw.bin\n"),
         );
 
-        let (text, healthy, checks) =
-            report_with_checks(&env, &root, &config, &SessionFlags::default(), &runner);
+        let (text, healthy, checks) = report_with_checks(
+            &env,
+            &root,
+            &config,
+            &SessionFlags::default(),
+            &runner,
+            None,
+        );
 
         assert!(healthy, "{text}");
         assert!(text.contains("[warn] worktree data kept local"), "{text}");
@@ -3347,7 +3589,7 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn doctor_lists_an_orphan_box_build_folder_with_its_size() {
+    fn doctor_lists_an_orphan_box_build_folder() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         write_routing_config(&home.path().join("cfg"));
@@ -3362,7 +3604,7 @@ recipe = "claude_fable_xhigh"
         );
         let facts = box_facts().replace(
             "__HERDR_BUILDS_DONE__",
-            "2662400\t/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__",
+            "/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__",
         );
         runner.on("ssh", ok(&facts));
         probe_fakes(&runner);
@@ -3373,6 +3615,7 @@ recipe = "claude_fable_xhigh"
             &home.path().join("cfg"),
             &SessionFlags::default(),
             &runner,
+            None,
         );
 
         assert!(!healthy, "{text}");
@@ -3380,11 +3623,11 @@ recipe = "claude_fable_xhigh"
             text.contains("[FAIL] finished worktrees buildbox"),
             "{text}"
         );
-        assert!(text.contains("demo-t-0099 (2.5 GiB)"), "{text}");
+        assert!(text.contains("demo-t-0099"), "{text}");
         assert!(checks.iter().any(|check| {
             check.status == "failed"
                 && check.label == "finished worktrees buildbox"
-                && check.detail.contains("demo-t-0099 (2.5 GiB)")
+                && check.detail.contains("demo-t-0099")
         }));
     }
 
@@ -3406,7 +3649,7 @@ recipe = "claude_fable_xhigh"
         runner.on(
             "ssh",
             ok(&format!(
-                "__HERDR_BUILDS__\n1\t/home/agent/build/lanes/demo-{}\n__HERDR_BUILDS_DONE__\n",
+                "__HERDR_BUILDS__\n/home/agent/build/lanes/demo-{}\n__HERDR_BUILDS_DONE__\n",
                 thread.id
             )),
         );
@@ -3446,7 +3689,7 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
-            ok("__HERDR_BUILDS__\n1\t/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__\n"),
+            ok("__HERDR_BUILDS__\n/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__\n"),
         );
         let ctx = Ctx {
             env: &env,
@@ -3501,6 +3744,7 @@ recipe = "claude_fable_xhigh"
             &config,
             &SessionFlags::default(),
             &runner,
+            None,
         );
 
         assert!(healthy, "{text}");
