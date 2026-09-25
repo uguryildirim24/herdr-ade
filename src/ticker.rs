@@ -1465,7 +1465,7 @@ fn nudge_idle_coordinator(
     coordinator: &crate::project::Coordinator,
     agent: Option<&Agent>,
 ) -> Result<()> {
-    if coordinator.prime_pending || agent.is_none_or(|agent| agent.agent_status != "idle") {
+    if coordinator.prime_pending || agent.is_none_or(|agent| !agent.ready()) {
         return Ok(());
     }
     if project.finished() || project.status() != project::Status::Active {
@@ -3256,7 +3256,7 @@ mod tests {
     }
 
     #[test]
-    fn work_nudge_requires_an_idle_coordinator() {
+    fn work_nudge_requires_a_ready_coordinator() {
         let f = fixture(false);
         write_task(&f.project, Vec::new());
         let runner = FakeRunner::new();
@@ -3308,11 +3308,15 @@ mod tests {
     }
 
     #[test]
-    fn idle_coordinator_is_nudged_once_for_open_work() {
+    fn done_coordinator_is_nudged_once_per_interval_for_open_work() {
         let f = fixture(false);
         write_task(&f.project, Vec::new());
         let runner = FakeRunner::new();
-        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
+        runner.on(
+            "agent list",
+            ok(&with_cwd(AGENT_READY, &f)
+                .replace(r#""agent_status":"idle""#, r#""agent_status":"done""#)),
+        );
         runner.on("pane list", ok(&with_cwd(PANE, &f)));
         runner.on("agent prompt", ok(r#"{"result":{}}"#));
         runner.on("report-metadata", ok("{}"));
