@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -344,8 +345,8 @@ impl Runner for RealRunner {
         {
             let _ = thread.join();
         }
-        let stdout = stdout_thread.map(join_finished_text).unwrap_or_default();
-        let stderr = stderr_thread.map(join_finished_text).unwrap_or_default();
+        let stdout = stdout_thread.map(PipeReader::text).unwrap_or_default();
+        let stderr = stderr_thread.map(PipeReader::text).unwrap_or_default();
 
         Ok(Output {
             code: if timed_out {
@@ -395,20 +396,39 @@ fn socket_round_trip(socket: &Path, line: &str, timeout: Duration) -> Result<Str
     Ok(reply)
 }
 
-fn read_all<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    })
+struct PipeReader {
+    content: Arc<Mutex<Vec<u8>>>,
+    thread: std::thread::JoinHandle<()>,
 }
 
-fn join_finished_text(thread: std::thread::JoinHandle<Vec<u8>>) -> String {
-    if thread.is_finished() {
-        String::from_utf8_lossy(&thread.join().unwrap_or_default()).into_owned()
-    } else {
-        String::new()
+impl PipeReader {
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
     }
+
+    fn text(self) -> String {
+        if self.thread.is_finished() {
+            let _ = self.thread.join();
+        }
+        // Even if a descendant kept the pipe open past the deadline, retain
+        // bytes already drained instead of discarding the entire answer.
+        String::from_utf8_lossy(&self.content.lock().unwrap()).into_owned()
+    }
+}
+
+fn read_all<R: Read + Send + 'static>(mut pipe: R) -> PipeReader {
+    let content = Arc::new(Mutex::new(Vec::new()));
+    let saved = Arc::clone(&content);
+    let thread = std::thread::spawn(move || {
+        let mut chunk = [0; 8192];
+        while let Ok(len) = pipe.read(&mut chunk) {
+            if len == 0 {
+                break;
+            }
+            saved.lock().unwrap().extend_from_slice(&chunk[..len]);
+        }
+    });
+    PipeReader { content, thread }
 }
 
 fn kill(child: &mut std::process::Child, own_group: bool) {
