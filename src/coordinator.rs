@@ -301,6 +301,9 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         launch.attempt = previous_launch.attempt + 1;
         launch.brief_hash = brief_hash;
     }
+    // Coordinator panes are created on this machine's herdr server, not on
+    // the dispatch machine selected for work lanes by the launch recipe.
+    launch.machine = "local".into();
     launch.skill_hash =
         crate::thread::sha256_hex(crate::lane::skill_text("coordinator").as_bytes());
     let spec = crate::contracts::RoleSpec {
@@ -386,6 +389,29 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             name_restored: previous.as_ref().map_or(0, |r| r.name_restored),
         }
     })?;
+
+    // Preserve the old pane as the ticker's re-link trigger. A fresh project
+    // has no existing lanes to carry; reopening a closed binding may have
+    // lanes even though the old coordinator record was cleared.
+    let mut ticker_state = crate::steps::load_state(&project);
+    if ticker_state.lanes_parented_to.is_empty() {
+        ticker_state.lanes_parented_to = previous
+            .as_ref()
+            .map(|old| old.pane_id.clone())
+            .filter(|pane| !pane.is_empty())
+            .unwrap_or_else(|| {
+                if crate::thread::list(&project).iter().any(|lane| {
+                    lane.status != crate::thread::Status::Resolved
+                        && !lane.parked
+                        && !lane.pane_id.is_empty()
+                }) {
+                    "pending".into()
+                } else {
+                    record.pane_id.clone()
+                }
+            });
+        crate::steps::save_state(&project, &ticker_state)?;
+    }
 
     // Hook installation and verification precede the coordinator launch. An
     // unsupported kind remains honestly unqualified and installs nothing.

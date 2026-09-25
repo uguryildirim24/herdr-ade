@@ -2899,6 +2899,7 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
         .update_coordinator(|c| {
             c.launch.kind = "claude".into();
             c.launch.recipe_id = "chosen".into();
+            c.launch.machine = "oci".into();
             c.launch.args = vec!["--model".into(), "recorded".into()];
         })
         .unwrap();
@@ -2918,6 +2919,7 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
     );
     ticker::tick_project(&world.ctx(), &project).unwrap();
     assert_eq!(project.coordinator().unwrap().launch.recipe_id, "chosen");
+    assert_eq!(project.coordinator().unwrap().launch.machine, "local");
     assert_eq!(
         project.coordinator().unwrap().launch.args,
         ["--model", "recorded"]
