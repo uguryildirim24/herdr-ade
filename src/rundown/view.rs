@@ -217,7 +217,11 @@ const PAD: usize = 3;
 /// to-do list joined by a thin line. `note` is a quiet line under the panel
 /// (for example when the last refresh failed).
 pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Vec<String> {
-    let panel = width.saturating_sub(4).clamp(28, MAX_PANEL);
+    let mut panel = width.saturating_sub(4).clamp(28, MAX_PANEL);
+    // Equal margins left and right.
+    if panel > 28 && (width.saturating_sub(panel)) % 2 == 1 {
+        panel -= 1;
+    }
     let inner = panel - 2 - PAD * 2;
     let indent = " ".repeat(width.saturating_sub(panel) / 2);
 
@@ -249,7 +253,7 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
         body.push(String::new());
         // A blank line (carrying the joining line) between steps while the
         // pane has the height; a short pane packs them.
-        let fixed = header.len() + body.len() + 4 + usize::from(!note.is_empty());
+        let fixed = header.len() + body.len() + 3 + usize::from(!note.is_empty());
         let spaced = height == 0 || fixed + card.steps.len() * 2 - 1 <= height;
         for (i, step) in card.steps.iter().enumerate() {
             if spaced && i > 0 {
@@ -267,7 +271,7 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
 
     let rule = "─".repeat(panel - 2);
     let frame = FRAME.fg();
-    let mut lines = vec![String::new(), format!("{indent}{frame}╭{rule}╮{RESET}")];
+    let mut lines = vec![format!("{indent}{frame}╭{rule}╮{RESET}")];
     let pad = " ".repeat(PAD);
     let band = SURFACE.bg();
     for content in header {
@@ -283,6 +287,7 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
         ));
     }
     lines.push(format!("{indent}{frame}╰{rule}╯{RESET}"));
+    let frame_lines = lines.len();
     if !note.is_empty() {
         lines.push(format!(
             "{indent}   {}{}{RESET}",
@@ -290,10 +295,11 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
             cut(note, panel - 3)
         ));
     }
-    // A tall pane shows the panel a little above the middle.
-    if height > lines.len() + 2 {
-        let top = (height - lines.len()) / 3;
-        lines.splice(0..1, std::iter::repeat_n(String::new(), top.max(1)));
+    // The frame sits in the middle of the pane; the note hangs below it, so
+    // the frame never moves when the note comes and goes.
+    if height > frame_lines {
+        let top = (height - frame_lines) / 2;
+        lines.splice(0..0, std::iter::repeat_n(String::new(), top));
     }
     if height > 0 && lines.len() > height {
         lines.truncate(height.saturating_sub(1));
@@ -314,23 +320,30 @@ fn shine(title: &str) -> String {
     out
 }
 
-/// One step: a coloured box with its mark, then a few words.
+/// One step: a coloured box with its mark, then a few words. A finished
+/// step gets a sparkle, the one under way a half-filled circle, and one
+/// still to do an empty dotted circle.
 fn row(step: &Step, width: usize) -> String {
     let text = cut(&step.text, width.saturating_sub(5));
     match step.mark {
         Mark::Done => format!(
-            "{}{}{BOLD} ✓ {RESET}  {}{text}{RESET}",
+            "{}{}{BOLD} ✦ {RESET}  {}{text}{RESET}",
             GREEN.bg(),
             INK.fg(),
             QUIET.fg()
         ),
         Mark::Now => format!(
-            "{}{}{BOLD} ▸ {RESET}  {BOLD}{}{text}{RESET}",
+            "{}{}{BOLD} ◐ {RESET}  {BOLD}{}{text}{RESET}",
             AMBER.bg(),
             INK.fg(),
             AMBER.fg()
         ),
-        Mark::Later => format!("{}   {RESET}  {}{text}{RESET}", TRACK.bg(), TEXT.fg()),
+        Mark::Later => format!(
+            "{}{} ◌ {RESET}  {}{text}{RESET}",
+            TRACK.bg(),
+            QUIET.fg(),
+            TEXT.fg()
+        ),
     }
 }
 
@@ -452,9 +465,9 @@ mod tests {
             text.contains("Rolf's job pipeline: bring in the right postings"),
             "{text}"
         );
-        assert!(text.contains(" ✓   Tidy the dashboard screens "), "{text}");
-        assert!(text.contains(" ▸   Fix how jobs come in"), "{text}");
-        assert!(text.contains("     Switch the sorting on"), "{text}");
+        assert!(text.contains(" ✦   Tidy the dashboard screens "), "{text}");
+        assert!(text.contains(" ◐   Fix how jobs come in"), "{text}");
+        assert!(text.contains(" ◌   Switch the sorting on"), "{text}");
         assert!(text.contains("█   1 of 3"), "{text}");
         for word in [
             "2026",
@@ -572,7 +585,7 @@ mod tests {
                 ],
             ),
         );
-        // 12 rows around the list: 6 packed steps fit in 20, spaced do not.
+        // 11 rows around the list: 6 packed steps fit in 20, spaced do not.
         let packed: Vec<String> = render(&six, 80, 20, "")
             .iter()
             .map(|l| visible(l))
@@ -594,11 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn a_tall_pane_sets_the_panel_a_little_above_the_middle() {
+    fn the_panel_sits_in_the_middle_of_the_pane() {
         let card = Card::from_plan("Demo", &reply("A demo.", "", &[("left", "One")]));
-        let lines = render(&card, 80, 60, "");
-        let top = lines.iter().position(|l| visible(l).contains('╭')).unwrap();
-        assert!(top > 5 && top < 30, "{top}");
+        for (width, height) in [(80, 60), (90, 41), (161, 30)] {
+            for note in ["", "Trying again."] {
+                let lines: Vec<String> = render(&card, width, height, note)
+                    .iter()
+                    .map(|l| visible(l))
+                    .collect();
+                let top = lines.iter().position(|l| l.contains('╭')).unwrap();
+                let bottom = lines.iter().position(|l| l.contains('╰')).unwrap();
+                let below = height - 1 - bottom;
+                assert!(below == top || below == top + 1, "{top} {below}");
+                let left = lines[top].chars().take_while(|c| *c == ' ').count();
+                let right = width - left - lines[top].trim().chars().count();
+                assert_eq!(left, right, "{width}");
+            }
+        }
     }
 
     #[test]
