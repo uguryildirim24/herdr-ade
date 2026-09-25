@@ -173,6 +173,9 @@ pub(crate) struct Thread {
     pub(crate) bootstrap: String,
     pub(crate) plain: String,
     pub(crate) identity: crate::contracts::IdentityBinding,
+    /// Slice verified from the agent process's cgroup after a box launch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) checked_slice: String,
     #[serde(default)]
     pub(crate) passive: bool,
 }
