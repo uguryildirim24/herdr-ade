@@ -611,6 +611,15 @@ pub(crate) struct BatchMerge {
     /// batch from a review created just before a crash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) selection_review_branch: Option<String>,
+    /// Reviewer whose sealed verdict selected the batch. Historical records
+    /// omit this and can recover it from the sealed completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_reviewer: Option<String>,
+    /// The selected sealed verdict may predate a rejected integration review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_verdict: Option<CompletionPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_review_branch: Option<String>,
     /// Set once the integration review revision exists; a prior REJECT on the
     /// owning round is not a verdict on this selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
