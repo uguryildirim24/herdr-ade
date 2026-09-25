@@ -954,6 +954,13 @@ pub(crate) fn remote_attention(
         // evidence of a gone process and must not spend recovery retries.
         // Also discard a prior attempt's gone marker so this attempt can be
         // observed independently once its launch begins.
+        if lane.parked || crate::threads::parkable(project, lane) {
+            state.blocked.remove(&lane.id);
+            state.missing.remove(&lane.id);
+            state.gone.remove(&lane.id);
+            state.pending_gone.remove(&lane.id);
+            continue;
+        }
         if lane.launch_attempts == 0 && lane.startup_wait_started.is_empty() {
             state.missing.remove(&lane.id);
             state.gone.remove(&lane.id);
