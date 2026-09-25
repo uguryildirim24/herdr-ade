@@ -389,6 +389,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         kind: &launch.kind,
         pane: &record.pane_id,
         agent_args: &launch.args,
+        launch_bin: None,
         parent: None,
         ready_timeout_ms: launch.ready_timeout_ms,
     }) {

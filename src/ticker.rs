@@ -1299,6 +1299,20 @@ fn launch_pass(
         .coordinator()
         .filter(|_| !first.is_remote())
         .map(|coordinator| coordinator.pane_id);
+    let machine = if first.is_remote() {
+        match crate::remote::machine_declaration(&pass.ctx.config_dir, first.machine_route()) {
+            Ok(machine) => Some(machine),
+            Err(error) => {
+                errors.push(error.context(format!("{}: box launch declaration", first.id)));
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let exclusive_bin = machine
+        .as_ref()
+        .map(|machine| format!("{}/.state/slices/{}/bin", machine.root, pass.project.slug));
     let starts: Vec<_> = pending
         .iter()
         .map(|t| crate::herdr::AgentStart {
@@ -1306,6 +1320,7 @@ fn launch_pass(
             kind: &t.launch.kind,
             pane: &t.pane_id,
             agent_args: &t.launch.args,
+            launch_bin: exclusive_bin.as_deref(),
             parent: parent.as_deref(),
             // `agent start` need not hold the ticker for the whole observation
             // window: subsequent passes watch the pane for the remaining time.
@@ -1322,11 +1337,49 @@ fn launch_pass(
         .unwrap_or_default();
     for (t, outcome) in pending.into_iter().zip(outcomes) {
         let launched = outcome.map_err(anyhow::Error::from).and_then(|agent| {
-            let process = herdr
-                .pane_process_info(&t.pane_id)
-                .ok()
-                .and_then(|info| info.identity(&t.launch.kind));
+            // Herdr acknowledges a start before the interactive shell has
+            // necessarily exec'd the command. Wait briefly for the real
+            // agent process, not the preceding shell/systemd-run process.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let process = loop {
+                let found = herdr
+                    .pane_process_info(&t.pane_id)
+                    .ok()
+                    .and_then(|info| {
+                        let process = info.identity(&t.launch.kind)?;
+                        (!t.is_remote()
+                            || process.argv0.rsplit('/').next().is_some_and(|name| {
+                                name.contains(if t.launch.kind == "dsh" { "dst" } else { &t.launch.kind })
+                            }))
+                        .then_some(process)
+                    });
+                if found.is_some() || !t.is_remote() || Instant::now() >= deadline {
+                    break found;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let checked_slice = if let Some(machine) = &machine {
+                let pid = process
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "box_slice_check: agent process missing; cannot check /proc/<pid>/cgroup"
+                        )
+                    })?
+                    .pid;
+                Some(crate::remote::check_agent_slice(
+                    pass.ctx.runner,
+                    machine,
+                    &pass.project.slug,
+                    pid,
+                ).map_err(|error| anyhow::anyhow!("box_slice_check: {error:#}"))?)
+            } else {
+                None
+            };
             thread::update(pass.project, &t.id, |record| {
+                if let Some(slice) = &checked_slice {
+                    record.checked_slice = slice.clone();
+                }
                 let mut bound = agent.clone();
                 if bound.workspace_id.is_empty() {
                     bound.workspace_id = record.workspace_id.clone();
@@ -1373,6 +1426,20 @@ fn launch_pass(
                     .err()
                     .map(|e| e.context(format!("{}: launch record", t.id))),
             );
+            if t.is_remote() && error.to_string().contains("box_slice_check:") {
+                let message = format!("{error:#}");
+                errors.extend(
+                    threads::fail_start(
+                        pass.ctx,
+                        pass.project,
+                        &t.id,
+                        &message,
+                        crate::contracts::FailureClass::Unknown,
+                        false,
+                    )
+                    .err(),
+                );
+            }
             errors.push(error.context(format!("{}: launch", t.id)));
         }
     }
@@ -1810,6 +1877,7 @@ fn tick_slow_with_steps(
                     kind: &launch.kind,
                     pane: &record.pane_id,
                     agent_args: &launch.args,
+                    launch_bin: None,
                     parent: None,
                     ready_timeout_ms: launch.ready_timeout_ms,
                 })?;
@@ -1998,7 +2066,18 @@ mod tests {
     #[test]
     fn one_remote_pass_submits_every_independent_lane_start() {
         let fixture = fixture(false);
+        std::fs::create_dir_all(fixture.root.join("cfg")).unwrap();
+        std::fs::write(
+            fixture.root.join("cfg/config.toml"),
+            crate::remote::TEST_MACHINE,
+        )
+        .unwrap();
         let runner = FakeRunner::new();
+        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
+        runner.on(
+            "cat /proc/42/cgroup",
+            ok("0::/user.slice/herdr-ade-demo.slice/run.scope\n"),
+        );
         runner.on(
             "agent start",
             ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
@@ -2015,7 +2094,7 @@ mod tests {
                 record.status = thread::Status::Open;
                 record.prompt_pending = true;
                 record.machine = "buildbox".into();
-                record.machine_id = "machine-1".into();
+                record.machine_id = "buildbox".into();
                 record.workspace_id = "w2".into();
                 record.tab_id = tab_id.clone();
                 record.pane_id = pane_id.clone();
@@ -2060,6 +2139,11 @@ mod tests {
 
         assert!(errors.is_empty(), "{errors:#?}");
         assert_eq!(runner.count("agent start"), 3);
+        assert_eq!(runner.count("cat /proc/42/cgroup"), 3);
+        assert!(runner.calls.borrow().iter().any(|call| {
+            call.display()
+                .contains("--env PATH=/home/agent/.herdr-ade/.state/slices/demo/bin")
+        }));
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
@@ -2070,7 +2154,74 @@ mod tests {
         );
         assert_eq!(rebound.identity.pane_id, rebound.pane_id);
         assert_eq!(rebound.identity.cwd, rebound.cwd);
+        assert_eq!(rebound.checked_slice, "herdr-ade-demo.slice");
         assert!(!rebound.identity.pane_id.is_empty());
+    }
+
+    #[test]
+    fn box_agent_outside_slice_fails_start_with_observed_cgroup() {
+        let fixture = fixture(false);
+        std::fs::create_dir_all(fixture.root.join("cfg")).unwrap();
+        std::fs::write(
+            fixture.root.join("cfg/config.toml"),
+            crate::remote::TEST_MACHINE,
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
+        );
+        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
+        runner.on("cat /proc/42/cgroup", ok("0::/app.slice/herdr.service\n"));
+        let record = thread::allocate(&fixture.project, |record| {
+            record.status = thread::Status::Open;
+            record.prompt_pending = true;
+            record.machine = "buildbox".into();
+            record.machine_id = "buildbox".into();
+            record.workspace_id = "w2".into();
+            record.tab_id = "w2:t1".into();
+            record.pane_id = "w2:p1".into();
+            record.cwd = "/box/lane".into();
+            record.agent_name = "hp-demo-t-0001".into();
+            record.launch.kind = "claude".into();
+        })
+        .unwrap();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: &[record],
+                agents: &[],
+                panes: &[Pane {
+                    pane_id: "w2:p1".into(),
+                    tab_id: "w2:t1".into(),
+                    workspace_id: "w2".into(),
+                    cwd: "/box/lane".into(),
+                }],
+            },
+            &mut true,
+            false,
+            &mut errors,
+        );
+        let failed = thread::load(&fixture.project, "t-0001").unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert!(
+            failed.error.contains("app.slice/herdr.service"),
+            "{}; errors={errors:#?}",
+            failed.error
+        );
+        assert!(failed.checked_slice.is_empty());
     }
 
     #[test]
