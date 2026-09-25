@@ -1748,21 +1748,35 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             }
         }
     }
+    let mut cleanup_failed = false;
     if pane != "cleanup_pending" {
-        if worktree == "removed" {
-            crate::branches::resolved_thread(ctx, &project, &record)?;
+        // The round may already be held when a superseded reviewer reaches
+        // here. Keep cleanup retryable instead of failing its worker's prompt.
+        let cleanup = (|| -> Result<()> {
+            if worktree == "removed" {
+                crate::branches::resolved_thread(ctx, &project, &record)?;
+            }
+            remove_finished_build_folder(ctx, &project, &record)?;
+            remove_scratch_session(ctx, &record)?;
+            Ok(())
+        })();
+        match cleanup {
+            Ok(()) => {
+                thread::update(&project, id, |t| {
+                    t.cleanup_pending = false;
+                    t.cleanup_reason.clear();
+                })?;
+            }
+            Err(error) => {
+                cleanup_failed = true;
+                worktree_reason = Some(format!("cleanup pending: {error:#}"));
+            }
         }
-        remove_finished_build_folder(ctx, &project, &record)?;
-        remove_scratch_session(ctx, &record)?;
-        thread::update(&project, id, |t| {
-            t.cleanup_pending = false;
-            t.cleanup_reason.clear();
-        })?;
     }
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
         thread: id.to_string(),
-        state: if pane == "cleanup_pending" {
+        state: if pane == "cleanup_pending" || cleanup_failed {
             "cleanup_pending"
         } else {
             "cancelled"
