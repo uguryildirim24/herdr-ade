@@ -1313,6 +1313,68 @@ fn finished_worktrees(ctx: &Ctx) -> (Vec<String>, Vec<String>, Vec<String>) {
     finished_worktrees_impl(ctx, None, None)
 }
 
+/// Two Git batches per repository replace repeated branch-head, integration
+/// head and ancestry subprocesses for each resolved local checkout. Only the
+/// doctor uses this inventory; explicit cleanup rechecks individual commits.
+fn local_merged_branches(
+    ctx: &Ctx,
+    candidates: &[(project::Project, crate::thread::Thread)],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let repos: BTreeSet<String> = candidates
+        .iter()
+        .filter(|(project, thread)| {
+            !crate::threads::managed_git_folder(project, thread) && !thread.branch.is_empty()
+        })
+        .map(|(_, thread)| thread.repo.clone())
+        .collect();
+    let commands: Vec<_> = repos
+        .iter()
+        .map(|repo| {
+            Cmd::new("git", TOOL_TIMEOUT).args(["-C", repo, "symbolic-ref", "--short", "HEAD"])
+        })
+        .collect();
+    let mut heads = Vec::new();
+    for (repo, answer) in repos.iter().zip(ctx.runner.run_parallel(&commands)) {
+        if let Ok(output) = answer
+            && output.success()
+            && !output.stdout.trim().is_empty()
+        {
+            heads.push((repo.clone(), output.stdout.trim().to_string()));
+        }
+    }
+    let commands: Vec<_> = heads
+        .iter()
+        .map(|(repo, head)| {
+            Cmd::new("git", TOOL_TIMEOUT).args([
+                "-C",
+                repo,
+                "for-each-ref",
+                "--format=%(refname)",
+                "--merged",
+                head,
+                "refs/heads",
+            ])
+        })
+        .collect();
+    let mut merged = BTreeMap::new();
+    for ((repo, _), answer) in heads.into_iter().zip(ctx.runner.run_parallel(&commands)) {
+        if let Ok(output) = answer
+            && output.success()
+        {
+            merged.insert(
+                repo,
+                output
+                    .stdout
+                    .lines()
+                    .filter_map(|name| name.strip_prefix("refs/heads/"))
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+    }
+    merged
+}
+
 fn finished_worktrees_impl(
     ctx: &Ctx,
     remote: Option<&crate::contracts::MachineProfile>,
@@ -1360,6 +1422,11 @@ fn finished_worktrees_impl(
             .collect()
     });
 
+    let merged = if remote.is_none() {
+        local_merged_branches(ctx, &candidates)
+    } else {
+        BTreeMap::new()
+    };
     let mut leftovers = Vec::new();
     let mut data_kept = Vec::new();
     for (index, (project, thread)) in candidates.into_iter().enumerate() {
@@ -1370,7 +1437,12 @@ fn finished_worktrees_impl(
         if !exists {
             continue;
         }
-        match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
+        match crate::threads::finished_worktree_reason_with_merged(
+            ctx,
+            &project,
+            &thread,
+            merged.get(&thread.repo),
+        ) {
             Ok(None) => {}
             Ok(Some(_)) => continue,
             Err(error) => {
@@ -3019,6 +3091,69 @@ recipe = "claude_fable_xhigh"
                 && check.label == "finished worktrees local"
                 && check.detail == "none whose work is done"
         }));
+    }
+
+    #[test]
+    fn local_worktrees_share_one_branch_inventory_per_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let mut candidates = Vec::new();
+        for branch in ["merged", "diverged"] {
+            let thread = crate::thread::allocate(&project, |thread| {
+                thread.kind = crate::thread::Kind::Worktree;
+                thread.status = crate::thread::Status::Resolved;
+                thread.repo = "/shared/repo".into();
+                thread.branch = branch.into();
+                thread.worktree_path = format!("/shared/repo/.worktrees/{branch}");
+            })
+            .unwrap();
+            candidates.push((project.clone(), thread));
+        }
+        let runner = FakeRunner::new();
+        runner.on("symbolic-ref", ok("main\n"));
+        runner.on("for-each-ref", ok("refs/heads/merged\nrefs/heads/main\n"));
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let merged = local_merged_branches(&ctx, &candidates);
+        let inventory = merged.get("/shared/repo").unwrap();
+        assert!(inventory.contains("merged"));
+        assert!(!inventory.contains("diverged"));
+        assert!(
+            crate::threads::finished_worktree_reason_with_merged(
+                &ctx,
+                &project,
+                &candidates[0].1,
+                Some(inventory)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            crate::threads::finished_worktree_reason_with_merged(
+                &ctx,
+                &project,
+                &candidates[1].1,
+                Some(inventory)
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.program == "git")
+                .count(),
+            2
+        );
     }
 
     #[test]
