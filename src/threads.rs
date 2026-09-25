@@ -1600,7 +1600,7 @@ fn retry_with_ticker(
     // same selected attempt. It must not spend another routing recovery.
     if record.escalation_pending {
         ensure_ticker(ctx)?;
-        place_escalation(ctx, &project, &record)?;
+        place_prelaunch_escalation(ctx, &project, &record)?;
         let placed = thread::load(&project, id)?;
         return Ok(RetryOutcome {
             thread: placed.id,
@@ -1646,8 +1646,13 @@ fn retry_with_ticker(
         source_truncation: record.launch.source_truncation.as_ref(),
         ..Default::default()
     };
-    let mut launch =
-        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?;
+    // No agent was submitted: retry the same selection without spending a
+    // process/provider recovery allowance.
+    let mut launch = if record.launch_attempts == 0 {
+        record.launch.clone()
+    } else {
+        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?
+    };
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
@@ -1720,7 +1725,7 @@ fn retry_with_ticker(
     })?;
 
     ensure_ticker(ctx)?;
-    place_escalation(ctx, &project, &thread::load(&project, id)?)?;
+    place_prelaunch_escalation(ctx, &project, &thread::load(&project, id)?)?;
     let placed = thread::load(&project, id)?;
     Ok(RetryOutcome {
         thread: placed.id,
@@ -1729,6 +1734,16 @@ fn retry_with_ticker(
         recipe: selected_recipe,
         screen,
     })
+}
+
+// Placement counts its own tries; if it failed before submitting an agent,
+// keep the launch counter at zero so round recovery never calls it process gone.
+fn place_prelaunch_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    let result = place_escalation(ctx, project, record);
+    if result.is_err() && record.launch_attempts == 0 {
+        thread::update(project, &record.id, |t| t.launch_attempts = 0)?;
+    }
+    result
 }
 
 /// Resume after a server/session interruption. This is not failed-work
@@ -3028,7 +3043,8 @@ pub(crate) fn fail_start(
     recover: bool,
 ) -> Result<Thread> {
     let provider_kind = None;
-    let (recovery, recovery_error) = if !recover {
+    let (recovery, recovery_error) = if !recover || thread::load(project, id)?.launch_attempts == 0
+    {
         (None, None)
     } else {
         let record = thread::load(project, id)?;
