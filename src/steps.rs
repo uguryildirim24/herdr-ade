@@ -10,23 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
-use crate::project::{self, Project, Settings};
+use crate::project::{self, Project};
 use crate::thread::{self, CopyOutcome, Status, Thread};
 use crate::threads;
 use crate::{events, inbox, pr, routine};
 
 pub(crate) const TICKER_PROMPT_PREFIX: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing]";
-pub(crate) const NUDGE_TEXT: &str =
-    "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
 const PR_INTERVAL_SECS: i64 = 120;
 pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
-
-/// Ticker passes an announced inbox set may stay unread before `doctor` fails
-/// the project row. The ticker beats every 15 seconds, so this is about a
-/// minute of a coordinator that does not read what was announced.
-pub(crate) const UNREAD_NUDGE_PASSES: u32 = 3;
 
 /// `.state/ticker.json`: what the ticker compared against last time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -36,16 +29,9 @@ pub(crate) struct State {
     pub(crate) routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
     pub(crate) config_errors: BTreeSet<String>,
-    /// Hash of the set of unseen item ids that was last nudged.
-    pub(crate) nudged: String,
-    /// Ticker passes where the set in `nudged` was announced and stayed
-    /// unread. Reset when the set is read or a different set is announced.
-    pub(crate) unread_passes: u32,
+    /// Hash of the unseen inbox item ids last announced.
+    pub(crate) announced: String,
     pub(crate) session_item_written: bool,
-    /// Last successful automated prompt to continue the project.
-    pub(crate) idle_nudge_last: String,
-    /// A working observation after a nudge, retained even when the agent is done.
-    pub(crate) coordinator_worked_at: String,
     /// Last automatic coordinator relaunch attempt, including failed starts.
     pub(crate) coordinator_relaunch_last: String,
     /// Coordinator pane whose live lanes were last reconciled by pickup.
@@ -1131,36 +1117,9 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
     )
 }
 
-/// The announced set is still unseen and has gone unread for at least
-/// `UNREAD_NUDGE_PASSES` ticker passes. Returns that pass count, or `None`
-/// when the coordinator has read it, nothing is announced, or too few passes
-/// were counted. Recomputed against the live inbox, so a stale counter never
-/// fails a project whose items are now read.
-pub(crate) fn announced_unread(project: &Project) -> Option<u32> {
-    let state = load_state(project);
-    if state.nudged.is_empty() || state.unread_passes < UNREAD_NUDGE_PASSES {
-        return None;
-    }
-    let seen = inbox::seen(project);
-    let unseen: BTreeSet<String> = inbox::unhandled(project)
-        .into_iter()
-        .map(|i| i.id)
-        .filter(|id| !seen.contains(id))
-        .collect();
-    (!unseen.is_empty() && hash_ids(&unseen) == state.nudged).then_some(state.unread_passes)
-}
-
-/// Step 6. A given set of unseen items is announced once; there is no timed
-/// re-nudge. With `nudge = true`, the default, the coordinator is prompted;
-/// `nudge = false` gives the user a herdr notification instead. Either way,
-/// passes where the same set stays unread are counted for `doctor`.
-pub(crate) fn nudge(
-    project: &Project,
-    state: &mut State,
-    settings: &Settings,
-    herdr: &Herdr,
-    coordinator_ready: Option<&str>,
-) -> Result<()> {
+/// Step 6. Announce each unseen inbox set once as a Herdr notification.
+/// Its contents remain available to the coordinator's next context read.
+pub(crate) fn announce_inbox(project: &Project, state: &mut State, herdr: &Herdr) -> Result<()> {
     let seen = inbox::seen(project);
     let unseen: BTreeSet<String> = inbox::unhandled(project)
         .into_iter()
@@ -1168,40 +1127,22 @@ pub(crate) fn nudge(
         .filter(|id| !seen.contains(id))
         .collect();
     if unseen.is_empty() {
-        // Nothing is waiting: the announced set was read, or none was ever
-        // announced. Clear both so an old announcement cannot keep counting.
-        state.nudged.clear();
-        state.unread_passes = 0;
+        state.announced.clear();
         return Ok(());
     }
     let hash = hash_ids(&unseen);
-    if hash == state.nudged {
-        // The announced set is still unread on this pass. `doctor` reads this
-        // count to fail a coordinator that never woke.
-        state.unread_passes = state.unread_passes.saturating_add(1);
+    if hash == state.announced {
         return Ok(());
     }
-    if settings.nudge {
-        let Some(pane) = coordinator_ready else {
-            return Ok(()); // not idle or done: try again on a later tick
-        };
-        // `agent_blocked` and other errors are returned, logged by the caller,
-        // and the nudge is retried on a later tick.
-        let _writer = crate::talk::writer_lock(project)?;
-        if !crate::talk::coordinator_prompt_clear(project, herdr, pane)? {
-            return Ok(());
-        }
-        crate::talk::mark_automated_prompt(project, pane, NUDGE_TEXT)?;
-        herdr.agent_prompt(pane, NUDGE_TEXT)?;
-    } else {
-        let body = format!(
-            "{} new inbox item(s). The coordinator reads them at its next turn.",
-            unseen.len()
-        );
-        let _ = herdr.notification_show(&format!("herdr-ade: {}", project.slug), &body);
+    let body = format!(
+        "{} new inbox item(s). The coordinator reads them at its next turn.",
+        unseen.len()
+    );
+    if let Err(error) = herdr.notification_show(&format!("herdr-ade: {}", project.slug), &body) {
+        eprintln!("note: inbox notification will retry: {error:#}");
+        return Ok(());
     }
-    state.nudged = hash;
-    state.unread_passes = 0;
+    state.announced = hash;
     Ok(())
 }
 
@@ -1632,8 +1573,11 @@ mod tests {
     }
 
     #[test]
-    fn typed_draft_holds_inbox_nudge_and_ordered_lane_notices() {
+    fn typed_draft_holds_ordered_lane_notices_while_inbox_uses_notification() {
         let (world, project) = delivery_world();
+        world
+            .runner
+            .on("notification show", crate::runner::fake::ok("{}"));
         let screen = std::rc::Rc::new(std::cell::RefCell::new("❯ Rolf is typing\n".to_string()));
         let read = screen.clone();
         world.runner.on_fn(
@@ -1652,11 +1596,11 @@ mod tests {
             ctx.runner,
         );
         let mut state = State::default();
-        let settings = Settings::default();
-        nudge(&project, &mut state, &settings, &herdr, Some("w1:p1")).unwrap();
+        announce_inbox(&project, &mut state, &herdr).unwrap();
         deliver_events(&ctx, &project).unwrap();
         assert!(typed_lines(&world).is_empty());
-        assert!(state.nudged.is_empty());
+        assert!(!state.announced.is_empty());
+        assert_eq!(world.runner.count("notification show"), 1);
         assert!(events::states(&project, &a.id).unwrap().is_empty());
         assert!(events::states(&project, &b.id).unwrap().is_empty());
         *screen.borrow_mut() = "❯ \n".into();
@@ -1665,8 +1609,9 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains(&first.id));
         assert!(lines[1].contains(&second.id));
-        nudge(&project, &mut state, &settings, &herdr, Some("w1:p1")).unwrap();
-        assert_eq!(typed_lines(&world).len(), 3);
+        announce_inbox(&project, &mut state, &herdr).unwrap();
+        assert_eq!(typed_lines(&world).len(), 2);
+        assert_eq!(world.runner.count("notification show"), 1);
     }
 
     #[test]

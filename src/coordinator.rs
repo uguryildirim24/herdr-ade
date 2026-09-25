@@ -950,7 +950,7 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     });
     if !peek && owns_read {
         // An external read is a peek: it cannot consume the coordinator's
-        // delta, failure reminder or inbox nudge.
+        // delta or failure reminder.
         crate::project::write_json(&path, &current)?;
         crate::ledger::context_read(&project, &read_at)?;
         inbox::mark_seen(&project, &shown)?;
@@ -1076,9 +1076,6 @@ fn digest_snapshot(
         }
     }
 
-    if project.finished() {
-        out.push_str("\nProject finished. Idle nudges are off until Rolf writes again.\n");
-    }
     if project
         .coordinator()
         .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
@@ -1088,29 +1085,6 @@ fn digest_snapshot(
     if crate::talk::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending; finish or clear the draft when ready.\n");
     }
-    if let Some(record) = project.coordinator() {
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-        match crate::ticker::idle_nudge_line(project, &ctx.config_dir, &herdr) {
-            Ok(line) => {
-                let _ = writeln!(out, "\n{line}");
-            }
-            Err(error) => {
-                let _ = writeln!(out, "\nidle nudge status unavailable: {error:#}");
-            }
-        }
-    } else {
-        let state = crate::steps::load_state(project);
-        let _ = writeln!(
-            out,
-            "\nlast idle nudge: {}; no coordinator",
-            if state.idle_nudge_last.is_empty() {
-                "never"
-            } else {
-                &state.idle_nudge_last
-            }
-        );
-    }
-
     if let Ok((settings, _)) = project.read_project_md()
         && !settings.repos.is_empty()
     {
@@ -1748,7 +1722,6 @@ mod tests {
             crate::runner::fake::ok("## main...origin/main [ahead 6, behind 2]\n M file\n"),
         );
         let (text, _) = digest(&world.ctx(), &project, "ha").unwrap();
-        assert!(text.contains("last idle nudge: never"), "{text}");
         assert!(
             text.contains(&format!(
                 "{}: main, dirty, ahead 6, behind 2 origin/main; documents: STATE.md, HANDOFF.md",
