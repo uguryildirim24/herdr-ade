@@ -24,10 +24,10 @@ const TICK: Duration = crate::pi::doctor::READINESS_CACHE_TTL;
 const STOP_WAIT: Duration = Duration::from_secs(60);
 // A replacement never leaves a second ticker waiting behind a blocked pass.
 const REPLACE_WAIT: Duration = Duration::from_millis(500);
-// An install waits for an in-flight pass (including a remote courier trip),
-// not just the idle sleep. Explicit stops with a 60 s bound have succeeded
-// during these passes; allow twice that while still bounding a blocked pass.
-const INSTALL_REPLACE_WAIT: Duration = Duration::from_secs(120);
+// Bound each in-flight step, not the whole pass. The pre-progress ticker
+// took 123 seconds to finish the pass in the observed failed install; leave
+// enough room for that first replacement too.
+const INSTALL_REPLACE_WAIT: Duration = Duration::from_secs(180);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
@@ -45,6 +45,23 @@ fn log_path(root: &Path) -> PathBuf {
 
 fn wake_path(root: &Path) -> PathBuf {
     root.join(".ticker.wake")
+}
+
+fn progress_path(root: &Path) -> PathBuf {
+    root.join(".ticker.progress")
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+struct Progress {
+    pid: u32,
+    started: String,
+    sequence: u64,
+    step: String,
+}
+
+fn current_progress(root: &Path, info: &Info) -> Option<Progress> {
+    let progress: Progress = project::read_json(&progress_path(root))?;
+    (progress.pid == info.pid && progress.started == info.started).then_some(progress)
 }
 
 fn poll_request_path(project: &Project) -> PathBuf {
@@ -181,16 +198,22 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
 }
 
 /// The installer owns the install lock, so it is the only caller allowed to
-/// replace a ticker while installing. A pass that exceeds the bound leaves
-/// its stop request active, so the next start can launch the installed build.
+/// replace a ticker while installing. A stalled step leaves its stop request
+/// active, so the next start can launch the installed build.
 pub(crate) fn start_for_install(ctx: &Ctx) -> Result<()> {
     start_for_install_with_wait(ctx, INSTALL_REPLACE_WAIT)
 }
 
 fn start_for_install_with_wait(ctx: &Ctx, wait: Duration) -> Result<()> {
     if start_inner_with_wait(ctx, wait, true)? {
+        let step = match lock_state(&ctx.root) {
+            LockState::Held(info) => current_progress(&ctx.root, &info)
+                .map(|progress| progress.step)
+                .unwrap_or_else(|| "unknown (ticker has no progress record)".into()),
+            LockState::Free => "unknown (lock released)".into(),
+        };
         bail!(
-            "ticker replacement timed out after {} seconds; stop request remains active; lock state: {:?}",
+            "ticker replacement timed out: stalled after {} seconds without progress in step {step}; stop request remains active; lock state: {:?}",
             wait.as_secs(),
             lock_state(&ctx.root)
         );
@@ -284,10 +307,10 @@ fn spawn(root: &Path) -> Result<()> {
 }
 
 /// Ask the old ticker to leave, but never start a contender behind it. If an
-/// install times out, keep the request so the old ticker exits after its pass;
-/// a later start can then launch the installed build.
+/// install times out, keep the request so the old ticker exits at its next
+/// boundary; a later start can then launch the installed build.
 fn replace(root: &Path, wait: Duration, install: bool) -> Result<bool> {
-    match request_stop(root, wait)? {
+    match request_stop_with_progress(root, wait, install)? {
         StopOutcome::Stopped => {
             spawn(root)?;
             Ok(false)
@@ -312,16 +335,43 @@ fn replace(root: &Path, wait: Duration, install: bool) -> Result<bool> {
 
 /// Leaves a durable stop request and waits up to `wait` for its holder.
 fn request_stop(root: &Path, wait: Duration) -> Result<StopOutcome> {
+    request_stop_with_progress(root, wait, false)
+}
+
+fn request_stop_with_progress(
+    root: &Path,
+    wait: Duration,
+    track_progress: bool,
+) -> Result<StopOutcome> {
     if lock_state(root) == LockState::Free {
         let _ = std::fs::remove_file(stop_path(root));
         return Ok(StopOutcome::Stopped);
     }
     std::fs::write(stop_path(root), b"")?;
-    let deadline = Instant::now() + wait;
-    while Instant::now() < deadline {
-        if lock_state(root) == LockState::Free {
-            let _ = std::fs::remove_file(stop_path(root));
-            return Ok(StopOutcome::Stopped);
+    let mut deadline = Instant::now() + wait;
+    let mut observed: Option<Progress> = None;
+    loop {
+        match lock_state(root) {
+            LockState::Free => {
+                let _ = std::fs::remove_file(stop_path(root));
+                return Ok(StopOutcome::Stopped);
+            }
+            LockState::Held(info) if track_progress => {
+                if let Some(progress) = current_progress(root, &info) {
+                    if observed.as_ref().is_some_and(|old| {
+                        old.pid == progress.pid
+                            && old.started == progress.started
+                            && old.sequence < progress.sequence
+                    }) {
+                        deadline = Instant::now() + wait;
+                    }
+                    observed = Some(progress);
+                }
+            }
+            LockState::Held(_) => {}
+        }
+        if Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -333,7 +383,7 @@ pub(crate) fn stop(root: &Path) -> Result<()> {
     match request_stop(root, STOP_WAIT)? {
         StopOutcome::Stopped => Ok(()),
         StopOutcome::Pending => bail!(
-            "ticker stop pending: the current pass exceeded {} seconds; the stop request remains active",
+            "ticker stop pending: the current step exceeded {} seconds; the stop request remains active",
             STOP_WAIT.as_secs()
         ),
     }
@@ -468,8 +518,26 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         "ticker {} started (pid {})",
         info.version, info.pid
     ));
-    if tick(ctx, &log, &mut memory) {
-        last_reachable = Instant::now();
+    let mut progress = Progress {
+        pid: info.pid,
+        started: info.started.clone(),
+        ..Progress::default()
+    };
+    let mut step = |name: &str| {
+        progress.sequence += 1;
+        progress.step = name.to_string();
+        if let Err(error) = project::write_json(&progress_path(root), &progress) {
+            log.line(&format!("could not publish ticker progress: {error:#}"));
+        }
+        !stop_path(root).exists()
+    };
+    match tick_with_steps(ctx, &log, &mut memory, &mut step) {
+        None => {
+            log.line("stop file found; exiting");
+            return Ok(());
+        }
+        Some(true) => last_reachable = Instant::now(),
+        Some(false) => {}
     }
 
     loop {
@@ -486,11 +554,17 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        if tick(ctx, &log, &mut memory) {
-            last_reachable = Instant::now();
-        } else if last_reachable.elapsed() > IDLE_EXIT {
-            log.line("no project has had a reachable session for five minutes; exiting");
-            return Ok(());
+        match tick_with_steps(ctx, &log, &mut memory, &mut step) {
+            None => {
+                log.line("stop file found; exiting");
+                return Ok(());
+            }
+            Some(true) => last_reachable = Instant::now(),
+            Some(false) if last_reachable.elapsed() > IDLE_EXIT => {
+                log.line("no project has had a reachable session for five minutes; exiting");
+                return Ok(());
+            }
+            Some(false) => {}
         }
     }
 }
@@ -500,11 +574,25 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
 /// slow project does not delay the others' sidebar. Returns whether any
 /// project's session was reachable. A failure in one project never stops the
 /// others.
+#[cfg(test)]
 pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
+    tick_with_steps(ctx, log, memory, &mut |_| true).unwrap_or(false)
+}
+
+// None means a stop was requested before the next step began.
+fn tick_with_steps(
+    ctx: &Ctx,
+    log: &Log,
+    memory: &mut Memory,
+    step: &mut impl FnMut(&str) -> bool,
+) -> Option<bool> {
     memory.tick += 1;
     memory.machine_views.clear();
     let mut reachable = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
+        if !step(&format!("cheap project {slug}")) {
+            return None;
+        }
         let Ok(project) = Project::load(&ctx.root, &slug) else {
             continue;
         };
@@ -525,15 +613,28 @@ pub(crate) fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     // it (SPEC-remote §4.3). This runs before the per-project slow pass so the
     // first project cannot starve the cadence of the others.
     let project_refs: Vec<&Project> = reachable.iter().map(|(project, _)| project).collect();
-    for error in machine_passes(ctx, &project_refs, memory, log) {
+    if !step("machine phase") {
+        return None;
+    }
+    for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
         log.line(&format!("{error:#}"));
     }
+    if !step("slow phase") {
+        return None;
+    }
     for (project, seen) in &reachable {
-        for error in tick_slow(ctx, project, seen, memory) {
+        if !step(&format!("slow project {}", project.slug)) {
+            return None;
+        }
+        let (errors, completed) = tick_slow_with_steps(ctx, project, seen, memory, step);
+        for error in errors {
             log.line(&format!("{}: {error:#}", project.slug));
         }
+        if !completed {
+            return None;
+        }
     }
-    !reachable.is_empty()
+    Some(!reachable.is_empty())
 }
 
 fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail: &str, log: &Log) {
@@ -570,12 +671,23 @@ fn clear_lost_connections(entries: &[(Project, Vec<thread::Thread>)], log: &Log)
 /// One courier pass per saved machine that has lanes, once per fourth tick.
 /// The cadence lives per machine in `Memory`, not per project, and every
 /// project with lanes on that machine shares the one SSH trip.
+#[cfg(test)]
 fn machine_passes(
     ctx: &Ctx,
     projects: &[&Project],
     memory: &mut Memory,
     log: &Log,
 ) -> Vec<anyhow::Error> {
+    machine_passes_with_steps(ctx, projects, memory, log, &mut |_| true).unwrap_or_default()
+}
+
+fn machine_passes_with_steps(
+    ctx: &Ctx,
+    projects: &[&Project],
+    memory: &mut Memory,
+    log: &Log,
+    step: &mut impl FnMut(&str) -> bool,
+) -> Option<Vec<anyhow::Error>> {
     let now = jiff::Timestamp::now();
     let mut by_machine: BTreeMap<String, Vec<(Project, Vec<thread::Thread>)>> = BTreeMap::new();
     for project in projects {
@@ -603,6 +715,9 @@ fn machine_passes(
     }
     let mut errors = Vec::new();
     for (machine, entries) in by_machine {
+        if !step(&format!("machine {machine}")) {
+            return None;
+        }
         let forced = entries
             .iter()
             .any(|(project, _)| poll_requests(project).contains(&machine));
@@ -678,7 +793,7 @@ fn machine_passes(
             .machine_views
             .insert(machine, outcome.map_err(|e| format!("{e:#}")));
     }
-    errors
+    Some(errors)
 }
 
 #[cfg(test)]
@@ -1639,14 +1754,33 @@ fn clean_managed_project_tabs(
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
 /// routines and housekeeping.
+#[cfg(test)]
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
+    tick_slow_with_steps(ctx, project, seen, memory, &mut |_| true).0
+}
+
+// Each boundary prevents a stop received during a slow operation from
+// starting the next independent operation in the same project's pass.
+fn tick_slow_with_steps(
+    ctx: &Ctx,
+    project: &Project,
+    seen: &Seen,
+    memory: &mut Memory,
+    step: &mut impl FnMut(&str) -> bool,
+) -> (Vec<anyhow::Error>, bool) {
     let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
+    if !step("escalation") {
+        return (errors, false);
+    }
     errors.extend(crate::escalation::tick(ctx, project).err());
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
     let mut may_start = true;
 
+    if !step("coordinator launch") {
+        return (errors, false);
+    }
     if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
         let pane_alive = seen
             .panes
@@ -1681,6 +1815,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
     for t in local.iter().filter(|t| t.status == thread::Status::Open) {
+        if !step(&format!("local report {}", t.id)) {
+            return (errors, false);
+        }
         if let Some(hash) = thread::local_report_hash(t)
             && hash != t.report_hash
         {
@@ -1704,6 +1841,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             }
         }
     }
+    if !step("local launches") {
+        return (errors, false);
+    }
     launch_pass(
         &LaunchPass {
             ctx,
@@ -1722,6 +1862,18 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // A machine with no view was not due this tick (SPEC-remote §4.3).
     let mut state = steps::load_state(project);
     let before = state.clone();
+    // A stop after a stateful slow stage must still persist that stage's
+    // completed work; otherwise the next ticker replays it.
+    macro_rules! stop_after_state {
+        ($name:expr) => {
+            if !step($name) {
+                if state != before {
+                    errors.extend(steps::save_state(project, &state).err());
+                }
+                return (errors, false);
+            }
+        };
+    }
     let remote_threads = open_threads(project, true);
     let mut machines: Vec<String> = remote_threads
         .iter()
@@ -1730,6 +1882,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     machines.sort();
     machines.dedup();
     for machine in machines {
+        if !step(&format!("remote state {machine}")) {
+            return (errors, false);
+        }
         let Some(view) = memory.machine_views.get(&machine) else {
             continue;
         };
@@ -1764,8 +1919,11 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         }
     }
 
+    stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
+    stop_after_state!("pull requests");
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
+    stop_after_state!("routines");
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {
         Ok((_settings, _)) => {
@@ -1788,11 +1946,13 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // D5 recovery and delivery (X1 to X5), then rounds, asks and the
     // board (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.
+    stop_after_state!("ops");
     errors.extend(
         crate::ops::tick(ctx, project)
             .err()
             .map(|e| e.context("ops")),
     );
+    stop_after_state!("rounds");
     errors.extend(
         crate::round::tick(ctx, project)
             .err()
@@ -1802,7 +1962,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
     }
-    errors
+    (errors, true)
 }
 
 #[cfg(test)]
@@ -2431,7 +2591,19 @@ mod tests {
             .open(lock_path(&root))
             .unwrap();
         holder.lock().unwrap();
-        holder.write_all(br#"{"version":"old","pid":1}"#).unwrap();
+        holder
+            .write_all(br#"{"version":"old","pid":1,"started":"pass-1"}"#)
+            .unwrap();
+        project::write_json(
+            &progress_path(&root),
+            &Progress {
+                pid: 1,
+                started: "pass-1".into(),
+                sequence: 4,
+                step: "machine oci".into(),
+            },
+        )
+        .unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         let ctx = Ctx {
@@ -2445,7 +2617,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("timed out") && error.contains("old"),
+            error.contains("timed out") && error.contains("old") && error.contains("machine oci"),
             "{error}"
         );
         assert!(stop_path(&root).exists());
@@ -2462,6 +2634,157 @@ mod tests {
         assert_eq!(lock_state(&root), LockState::Free);
         ensure(&ctx).unwrap();
         assert!(!stop_path(&root).exists());
+    }
+
+    #[test]
+    fn install_wait_resets_only_when_the_holder_reaches_another_step() {
+        let root = tempfile::tempdir().unwrap();
+        let mut holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(root.path()))
+            .unwrap();
+        holder.lock().unwrap();
+        let info = Info {
+            version: "old".into(),
+            pid: 123,
+            started: "this-run".into(),
+            ..Info::default()
+        };
+        holder
+            .write_all(serde_json::to_string(&info).unwrap().as_bytes())
+            .unwrap();
+        let progress = Progress {
+            pid: info.pid,
+            started: info.started,
+            sequence: 1,
+            step: "cheap project demo".into(),
+        };
+        project::write_json(&progress_path(root.path()), &progress).unwrap();
+        let path = progress_path(root.path());
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(65));
+            project::write_json(
+                &path,
+                &Progress {
+                    sequence: 2,
+                    step: "machine oci".into(),
+                    ..progress
+                },
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(65));
+            drop(holder);
+        });
+        let start = Instant::now();
+        assert_eq!(
+            request_stop_with_progress(root.path(), Duration::from_millis(100), true).unwrap(),
+            StopOutcome::Stopped
+        );
+        assert!(start.elapsed() >= Duration::from_millis(115));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stop_between_projects_skips_the_second_even_if_it_would_block() {
+        use std::cell::Cell;
+        struct BlockingSecond<'a> {
+            fake: &'a FakeRunner,
+            root: &'a Path,
+            agent_lists: Cell<usize>,
+        }
+        impl crate::runner::Runner for BlockingSecond<'_> {
+            fn run(&self, cmd: &crate::runner::Cmd) -> Result<crate::runner::Output> {
+                if cmd.display().contains("agent list") {
+                    let next = self.agent_lists.get() + 1;
+                    self.agent_lists.set(next);
+                    if next == 1 {
+                        // Arrives during the first project's cheap step.
+                        std::fs::write(stop_path(self.root), b"")?;
+                    } else {
+                        // A real second project could wait here on SSH.
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                }
+                self.fake.run(cmd)
+            }
+            fn socket_request(
+                &self,
+                socket: &Path,
+                line: &str,
+                timeout: Duration,
+            ) -> Result<String> {
+                self.fake.socket_request(socket, line, timeout)
+            }
+        }
+        let fixture = fixture(false);
+        let blocked = project::create(&fixture.root, "zzz-blocked", "", vec![]).unwrap();
+        blocked
+            .update_coordinator(|record| {
+                *record = fixture.project.coordinator().unwrap();
+            })
+            .unwrap();
+        let fake = FakeRunner::new();
+        fake.on("agent list", ok(NO_AGENTS));
+        fake.on("pane list", ok(&with_cwd(PANE, &fixture)));
+        let runner = BlockingSecond {
+            fake: &fake,
+            root: &fixture.root,
+            agent_lists: Cell::new(0),
+        };
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let log = Log {
+            path: fixture.root.join("test.log"),
+        };
+        let mut memory = Memory::new(&ctx);
+        let start = Instant::now();
+        let result = tick_with_steps(&ctx, &log, &mut memory, &mut |_| {
+            !stop_path(&fixture.root).exists()
+        });
+        assert_eq!(result, None);
+        assert!(start.elapsed() < Duration::from_millis(200));
+        assert_eq!(runner.agent_lists.get(), 1);
+    }
+
+    #[test]
+    fn stop_during_a_slow_project_skips_its_remaining_work() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let seen = Seen {
+            socket: String::new(),
+            agents: vec![],
+            panes: vec![],
+            session_lost: false,
+        };
+        let mut memory = Memory::new(&ctx);
+        let mut steps = Vec::new();
+        let (errors, completed) =
+            tick_slow_with_steps(&ctx, &fixture.project, &seen, &mut memory, &mut |name| {
+                steps.push(name.to_string());
+                if name == "escalation" {
+                    std::fs::write(stop_path(&fixture.root), b"").unwrap();
+                }
+                !stop_path(&fixture.root).exists() || name == "escalation"
+            });
+        assert!(!completed);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(steps, ["escalation", "coordinator launch"]);
+        assert_eq!(runner.count("agent start"), 0);
     }
 
     #[test]
