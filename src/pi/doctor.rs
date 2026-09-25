@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, sh};
 
-const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const READINESS_CACHE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Deserialize)]

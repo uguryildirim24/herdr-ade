@@ -31,6 +31,7 @@ struct TimingState {
     commands: Vec<String>,
     command_time: Duration,
     rows: Vec<String>,
+    concurrent: Vec<String>,
 }
 
 impl<'a> Timings<'a> {
@@ -42,6 +43,7 @@ impl<'a> Timings<'a> {
                 commands: Vec::new(),
                 command_time: Duration::ZERO,
                 rows: Vec::new(),
+                concurrent: Vec::new(),
             }),
         }
     }
@@ -89,6 +91,12 @@ impl<'a> Timings<'a> {
         for row in &state.rows {
             let _ = writeln!(text, "{row}");
         }
+        if !state.concurrent.is_empty() {
+            let _ = writeln!(text, "Concurrent wall times (overlap the rows above):");
+            for row in &state.concurrent {
+                let _ = writeln!(text, "{row}");
+            }
+        }
     }
 
     fn command(&self, program: &str, elapsed: Duration) {
@@ -101,6 +109,14 @@ impl<'a> Timings<'a> {
 
     fn command_time(&self) -> Duration {
         self.state.lock().unwrap().command_time
+    }
+
+    fn concurrent(&self, label: &str, elapsed: Duration) {
+        self.state
+            .lock()
+            .unwrap()
+            .concurrent
+            .push(format!("  {label}: {:.3}s", elapsed.as_secs_f64()));
     }
 }
 
@@ -457,11 +473,24 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
     run_with_trace(ctx, session, None)
 }
 
-pub(crate) fn run_timed(ctx: &Ctx, session: &SessionFlags, enabled: bool) -> Result<DoctorOutcome> {
+pub(crate) fn run_timed_from(
+    ctx: &Ctx,
+    session: &SessionFlags,
+    enabled: bool,
+    cli_started: Option<Instant>,
+) -> Result<DoctorOutcome> {
     if !enabled {
         return run(ctx, session);
     }
     let timings = Timings::new(ctx.runner);
+    if let Some(started) = cli_started {
+        timings.state.lock().unwrap().last = started;
+        timings.command(
+            "CLI argument, root and workspace resolution",
+            started.elapsed(),
+        );
+        timings.row("doctor CLI startup");
+    }
     let traced = Ctx {
         env: ctx.env,
         root: ctx.root.clone(),
@@ -517,7 +546,7 @@ fn run_with_trace(
             )
         });
         if let Some(timings) = timings {
-            timings.command("pi readiness (provider probes, concurrent)", duration);
+            timings.concurrent("pi readiness (provider probes)", duration);
         }
         result
     } else {
@@ -590,6 +619,7 @@ fn run_with_trace(
         }
     }
     if let Some(timings) = timings {
+        timings.row("doctor report finalization");
         timings.print(&mut text);
     }
     Ok(DoctorOutcome {
@@ -828,7 +858,11 @@ fn report_with_checks(
             ),
         }
     }
-    match runner.run(&Cmd::new("gh", TOOL_TIMEOUT).args(["auth", "status"])) {
+    match runner.run(
+        &Cmd::new("gh", TOOL_TIMEOUT)
+            .args(["auth", "status"])
+            .own_group(),
+    ) {
         Ok(o) if o.success() => check(&mut out, Some(true), "gh auth", "logged in".into()),
         Ok(o) => check(
             &mut out,
@@ -1162,6 +1196,9 @@ fn report_with_checks(
         let mut prefetched = box_worker
             .and_then(|worker| worker.join().ok())
             .unwrap_or_default();
+        if let Some(timings) = timings {
+            timings.row("box snapshot wait (concurrent with local checks)");
+        }
         match machines_to_check(root, config_dir, runner, &bin)
             .and_then(|machines| Ok((machines, crate::launch::parse_launch_config(config_dir)?)))
         {
@@ -1200,10 +1237,16 @@ fn report_with_checks(
                             });
                             if let Some(timings) = timings {
                                 if overlapped {
-                                    timings.command("ssh (remote script, concurrent)", elapsed);
+                                    timings.concurrent(
+                                        &format!(
+                                            "box {} snapshot (ssh remote script)",
+                                            profile.label
+                                        ),
+                                        elapsed,
+                                    );
                                 }
                                 timings.remote_phases(&profile.label, &box_snapshot);
-                                timings.row(&format!("box {} snapshot", profile.label));
+                                timings.row(&format!("box {} snapshot result", profile.label));
                             }
                             for (ok, label, detail) in box_rows {
                                 check(&mut out, ok, &label, detail);
@@ -1471,7 +1514,7 @@ export -f inspect
     };
     let box_root = machine.root;
     bash.push_str(&format!(
-        "doctor_size_cache={}; mkdir -p \"$doctor_size_cache\"\ncached_size() {{ local path=$1 key=$2 stamp file cached; stamp=$(stat -c %y -- \"$path\" 2>/dev/null) || return 1; key=$(printf '%s' \"$key\" | sha256sum); key=${{key%% *}}; file=\"$doctor_size_cache/$key\"; if [[ -f $file ]]; then read -r cached < \"$file\"; if [[ $cached == \"$stamp \"* ]]; then printf '%s' \"${{cached#* }}\"; return; fi; fi; cached=$(timeout 2s du -sk -- \"$path\") || return 1; cached=${{cached%%[[:space:]]*}}; printf '%s %s\\n' \"$stamp\" \"$cached\" > \"$file.tmp.$$\"; mv -f \"$file.tmp.$$\" \"$file\"; printf '%s' \"$cached\"; }}\nexport doctor_size_cache; export -f cached_size\ndoctor_tmp=$(mktemp -d /tmp/herdr-doctor-batch.XXXXXXXX) || exit 1\ntrap 'rm -rf -- \"$doctor_tmp\"' EXIT\ndoctor_jobs=\ndoctor_index=0\n",
+        "doctor_size_cache={}; mkdir -p \"$doctor_size_cache\"\ncached_size() {{ local path=$1 key=$2 stamp file cached; stamp=$(stat -c %y -- \"$path\" 2>/dev/null) || return 1; key=$(printf '%s' \"$key\" | sha256sum); key=${{key%% *}}; file=\"$doctor_size_cache/$key\"; if [[ -f $file ]]; then read -r cached < \"$file\"; if [[ $cached == \"$stamp \"* ]]; then printf '%s' \"${{cached#\"$stamp \"}}\"; return; fi; fi; cached=$(timeout 2s du -sk -- \"$path\") || return 1; cached=${{cached%%[[:space:]]*}}; printf '%s %s\\n' \"$stamp\" \"$cached\" > \"$file.tmp.$$\"; mv -f \"$file.tmp.$$\" \"$file\"; printf '%s' \"$cached\"; }}\nexport doctor_size_cache; export -f cached_size\ndoctor_tmp=$(mktemp -d /tmp/herdr-doctor-batch.XXXXXXXX) || exit 1\ntrap 'rm -rf -- \"$doctor_tmp\"' EXIT\ndoctor_jobs=\ndoctor_index=0\n",
         crate::remote::quote(&format!("{box_root}/.doctor-sizes"))
     ));
     for (project, thread) in candidates {
@@ -2487,7 +2530,7 @@ done
         &profile.target,
         &script,
         None,
-        crate::remote::SSH_START_TIMEOUT,
+        Duration::from_secs(15),
     ) {
         Ok(out) if out.success() => {
             if let Some((_, snapshot)) = snapshot {
@@ -3418,17 +3461,32 @@ recipe = "claude_fable_xhigh"
             runner: &runner,
             detached_ticker: false,
         };
-        let result = run_timed(&ctx, &SessionFlags::default(), true).unwrap();
+        let result = run_timed_from(
+            &ctx,
+            &SessionFlags::default(),
+            true,
+            Some(Instant::now() - Duration::from_secs(2)),
+        )
+        .unwrap();
         assert!(result.message.contains("Timings (wall time"));
+        assert!(result.message.contains("  doctor CLI startup: 2."));
         assert!(result.message.contains("  herdr:"));
         assert!(result.message.contains("    herdr:"));
         assert!(result.message.contains("  branches:"));
         let timing = Timings::new(&runner);
+        timing.concurrent(
+            "box buildbox snapshot (ssh remote script)",
+            Duration::from_millis(250),
+        );
         timing.remote_phases("buildbox", "doctor_phase_builds\t250\n");
         timing.row("box buildbox snapshot");
         let mut detail = String::new();
         timing.print(&mut detail);
         assert!(detail.contains("  box buildbox snapshot:"), "{detail}");
+        assert!(
+            detail.contains("  box buildbox snapshot (ssh remote script): 0.250s"),
+            "{detail}"
+        );
         assert!(
             detail.contains("    box buildbox builds (find, grouped): 0.250s"),
             "{detail}"
@@ -4079,6 +4137,16 @@ recipe = "claude_fable_xhigh"
     fn batched_shell_preserves_nul_status_nested_and_sizes() {
         let home = tempfile::tempdir().unwrap();
         let config = machine_config(&["pi"]);
+        let declaration = config.path().join("config.toml");
+        let machine = std::fs::read_to_string(&declaration).unwrap();
+        std::fs::write(
+            &declaration,
+            machine.replace(
+                "/home/agent/.herdr-ade",
+                &home.path().join("box-root").display().to_string(),
+            ),
+        )
+        .unwrap();
         let repo = home.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -4177,6 +4245,25 @@ recipe = "claude_fable_xhigh"
                 .iter()
                 .any(|data| data.path == "target/nested" && data.bytes > 0)
         );
+        // The second invocation reads the timestamp-and-size cache. Both
+        // invocations must emit exactly the same NUL-framed numeric sizes.
+        let cached = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{}printf '__HERDR_BUILDS__\\n'\n",
+                remote_worktree_script(&ctx, &box_profile())
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            cached.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cached.stderr)
+        );
+        let cached = String::from_utf8(cached.stdout).unwrap();
+        let cached_inspection =
+            crate::worktrees::inspect_batched(&cached, &key, &[], false).unwrap();
+        assert_eq!(inspection, cached_inspection);
         let filtered =
             crate::worktrees::inspect_batched(&text, &key, &["target".into()], false).unwrap();
         assert!(
