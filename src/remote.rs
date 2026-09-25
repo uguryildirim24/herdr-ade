@@ -406,7 +406,9 @@ pub(crate) fn project_slice(slug: &str) -> Result<String> {
     {
         bail!("invalid project slug for systemd slice: {slug}");
     }
-    Ok(format!("herdr-ade-{slug}.slice"))
+    // A dash in a slice name creates a parent slice. Keep every project a
+    // direct sibling beneath herdr-ade.slice, even when its slug has dashes.
+    Ok(format!("herdr-ade-{}.slice", slug.replace('-', "_")))
 }
 
 pub(crate) fn prepare_project_slice(
@@ -761,6 +763,10 @@ mod tests {
             )]),
             ..Default::default()
         };
+        assert_eq!(
+            project_slice("prl-8-53").unwrap(),
+            "herdr-ade-prl_8_53.slice"
+        );
         let bin = prepare_project_slice(&runner, &machine, "demo", "pi").unwrap();
         assert!(bin.ends_with("/slices/demo/bin"));
         let command = runner.calls.borrow().last().unwrap().display();
