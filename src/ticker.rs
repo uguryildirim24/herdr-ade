@@ -881,21 +881,37 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
         t.failure_class = crate::contracts::FailureClass::Unknown;
         t.last_group = thread::Group::WaitingOnYou.token().into();
     })?;
-    if !thread.is_remote()
-        && let Some(coordinator) = input.project.coordinator()
-        && input
-            .agents
-            .iter()
-            .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
-        && let Ok(_writer) = crate::talk::writer_lock(input.project)
-    {
+    if !thread.is_remote() {
         let notice = format!(
             "{} did not become ready during startup: {reason}. Read `thread show {} {}` before retrying.",
             thread.id, input.project.slug, thread.id
         );
-        if crate::talk::mark_automated_prompt(input.project, &coordinator.pane_id, &notice).is_ok()
-        {
-            let _ = input.herdr.agent_prompt(&coordinator.pane_id, &notice);
+        let sent = input.project.coordinator().is_some_and(|coordinator| {
+            input
+                .agents
+                .iter()
+                .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
+                && crate::talk::writer_lock(input.project).is_ok_and(|_writer| {
+                    crate::talk::coordinator_prompt_clear(
+                        input.project,
+                        input.herdr,
+                        &coordinator.pane_id,
+                    )
+                    .unwrap_or(false)
+                        && crate::talk::mark_automated_prompt(
+                            input.project,
+                            &coordinator.pane_id,
+                            &notice,
+                        )
+                        .is_ok()
+                        && input
+                            .herdr
+                            .agent_prompt(&coordinator.pane_id, &notice)
+                            .is_ok()
+                })
+        });
+        if !sent {
+            crate::inbox::write(input.project, "lane-notice", &thread.id, &notice, "")?;
         }
     }
     Ok(())
@@ -1702,6 +1718,9 @@ fn nudge_idle_coordinator(
     }
     let text = idle_nudge_text(&next);
     let _writer = crate::talk::writer_lock(project)?;
+    if !crate::talk::coordinator_prompt_clear(project, herdr, &coordinator.pane_id)? {
+        return Ok(());
+    }
     crate::talk::mark_automated_prompt(project, &coordinator.pane_id, &text)?;
     // Keep the send start, not the return time: the prompted turn can read
     // context before a fast transport call returns, and that turn must count.
@@ -1784,12 +1803,15 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
         if record.prime_pending && !record.prime_sent && agent.ready() {
             let prompt = coordinator::priming_prompt(&prefix, slug);
-            crate::talk::mark_automated_prompt(project, &record.pane_id, &prompt)?;
-            match herdr.agent_prompt(&record.pane_id, &prompt) {
-                Ok(()) => {
-                    project.update_coordinator(|c| c.prime_sent = true)?;
+            let _writer = crate::talk::writer_lock(project)?;
+            if crate::talk::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
+                crate::talk::mark_automated_prompt(project, &record.pane_id, &prompt)?;
+                match herdr.agent_prompt(&record.pane_id, &prompt) {
+                    Ok(()) => {
+                        project.update_coordinator(|c| c.prime_sent = true)?;
+                    }
+                    Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
                 }
-                Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
             }
         }
         if refresh_tokens {
@@ -2662,6 +2684,10 @@ mod tests {
         runner.on(
             "agent start",
             ok(r#"{"error":{"code":"agent_not_ready","message":"blocked during startup"}}"#),
+        );
+        runner.on_fn(
+            |cmd| cmd.display().contains("pane read w1:p1"),
+            |_| Ok(ok("❯ \n")),
         );
         runner.on("pane read", ok("Trust this folder?\n  1. Yes\n  2. No\n"));
         runner.on("agent prompt", ok(r#"{"result":{}}"#));

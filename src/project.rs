@@ -192,11 +192,8 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             goal: String::new(),
-            // On by default: a coordinator that does not read its inbox is
-            // unreachable. A project that wants the old notification-only
-            // behaviour sets `nudge = false` in PROJECT.md. On herdr 0.9.1 a
-            // prompt merges with, and submits, text the user has half-typed;
-            // the project setting is the way out.
+            // On by default: idle and inbox nudges wait for the coordinator's
+            // input line to clear. Projects may opt out with `nudge = false`.
             nudge: true,
             task_states: default_task_states(),
             repos: Vec::new(),
@@ -960,6 +957,9 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         out.extend(waiting);
     }
 
+    if crate::talk::long_input_hold(project) {
+        out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending.\n");
+    }
     out.push_str("\n## Running now\n\n");
     let threads: Vec<_> = crate::thread::list(project)
         .into_iter()
