@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -322,11 +323,30 @@ impl Runner for RealRunner {
             std::thread::sleep(POLL);
         };
 
-        if let Some(thread) = stdin_thread {
+        // A parent can exit while a descendant still holds its pipes. Do not
+        // turn the command deadline into an unbounded reader-thread join.
+        while !timed_out
+            && (stdin_thread.as_ref().is_some_and(|t| !t.is_finished())
+                || stdout_thread.as_ref().is_some_and(|t| !t.is_finished())
+                || stderr_thread.as_ref().is_some_and(|t| !t.is_finished()))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(POLL);
+        }
+        if stdin_thread.as_ref().is_some_and(|t| !t.is_finished())
+            || stdout_thread.as_ref().is_some_and(|t| !t.is_finished())
+            || stderr_thread.as_ref().is_some_and(|t| !t.is_finished())
+        {
+            timed_out = true;
+            kill(&mut child, cmd.own_group);
+        }
+        if let Some(thread) = stdin_thread
+            && thread.is_finished()
+        {
             let _ = thread.join();
         }
-        let stdout = stdout_thread.map(join_text).unwrap_or_default();
-        let stderr = stderr_thread.map(join_text).unwrap_or_default();
+        let stdout = stdout_thread.map(PipeReader::text).unwrap_or_default();
+        let stderr = stderr_thread.map(PipeReader::text).unwrap_or_default();
 
         Ok(Output {
             code: if timed_out {
@@ -376,35 +396,54 @@ fn socket_round_trip(socket: &Path, line: &str, timeout: Duration) -> Result<Str
     Ok(reply)
 }
 
-fn read_all<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    })
+struct PipeReader {
+    content: Arc<Mutex<Vec<u8>>>,
+    thread: std::thread::JoinHandle<()>,
 }
 
-fn join_text(thread: std::thread::JoinHandle<Vec<u8>>) -> String {
-    String::from_utf8_lossy(&thread.join().unwrap_or_default()).into_owned()
+impl PipeReader {
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    fn text(self) -> String {
+        if self.thread.is_finished() {
+            let _ = self.thread.join();
+        }
+        // Even if a descendant kept the pipe open past the deadline, retain
+        // bytes already drained instead of discarding the entire answer.
+        String::from_utf8_lossy(&self.content.lock().unwrap()).into_owned()
+    }
+}
+
+fn read_all<R: Read + Send + 'static>(mut pipe: R) -> PipeReader {
+    let content = Arc::new(Mutex::new(Vec::new()));
+    let saved = Arc::clone(&content);
+    let thread = std::thread::spawn(move || {
+        let mut chunk = [0; 8192];
+        while let Ok(len) = pipe.read(&mut chunk) {
+            if len == 0 {
+                break;
+            }
+            saved.lock().unwrap().extend_from_slice(&chunk[..len]);
+        }
+    });
+    PipeReader { content, thread }
 }
 
 fn kill(child: &mut std::process::Child, own_group: bool) {
     if own_group {
         // The child is its group's leader, so its pid is the pgid. Grandchildren
         // hold the pipes open; killing only the child would leave readers hanging.
-        let _ = Command::new("/bin/kill")
-            .args(["-TERM", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        std::thread::sleep(Duration::from_millis(200));
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        #[cfg(unix)]
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            // Negative pid addresses the process group, including git's SSH
+            // child and descendants that inherited the output pipes.
+            let _ = kill(-(child.id() as i32), 9); // SIGKILL on Unix
+        }
     }
     let _ = child.kill();
 }
