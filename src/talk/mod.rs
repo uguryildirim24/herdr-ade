@@ -181,6 +181,15 @@ pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Resu
     // after the journal entry is durable, and never for automated prompts.
     if from_rolf {
         project.set_finished(false)?;
+        if project
+            .coordinator()
+            .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
+        {
+            project.update_coordinator(|c| {
+                c.closed_by_rolf_at.clear();
+                c.reopen_requested = true;
+            })?;
+        }
     }
     Ok(Some(seq))
 }

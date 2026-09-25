@@ -16,7 +16,6 @@ use crate::remote::quote;
 use crate::{inbox, ticker};
 
 pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(300);
-pub(crate) const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
 /// The digest is a work queue, not an archive.
 const DIGEST_ROWS: usize = 20;
@@ -225,6 +224,10 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 record.launch.recipe_id
             );
         }
+        project.update_coordinator(|c| {
+            c.closed_by_rolf_at.clear();
+            c.reopen_requested = false;
+        })?;
         crate::hook::install(ctx, &project, &record.launch.kind, &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
@@ -369,6 +372,10 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             pane_id,
             agent_name: name.clone(),
             cwd: cwd.clone(),
+            closed_by_rolf_at: String::new(),
+            reopen_requested: false,
+            server_socket_inode: crate::ticker::socket_inode(Path::new(&socket)),
+            last_agent_seen_at: String::new(),
             prime_pending: true,
             launch_attempts: 1,
             updated: String::new(),
@@ -1046,6 +1053,12 @@ fn digest_snapshot(
     if project.finished() {
         out.push_str("\nProject finished. Idle nudges are off until Rolf writes again.\n");
     }
+    if project
+        .coordinator()
+        .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
+    {
+        out.push_str("\n## Coordinator status\n\nClosed by Rolf. Run `ha open` to reopen it.\n");
+    }
     if crate::talk::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending; finish or clear the draft when ready.\n");
     }
@@ -1456,6 +1469,7 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
     project.update_coordinator(|coordinator| {
         coordinator.prime_pending = false;
         coordinator.bootstrap = "acknowledged".into();
+        coordinator.last_agent_seen_at = project::now();
     })?;
     Ok(())
 }
@@ -1463,6 +1477,18 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_status_survives_collapsed_standing_notes() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.closed_by_rolf_at = project::now())
+            .unwrap();
+        let (text, _, _) = digest_snapshot(&world.ctx(), &project, "ha").unwrap();
+        let compact = filter_page(&project, &text, true);
+        assert!(compact.contains("Closed by Rolf. Run `ha open`"));
+    }
 
     #[test]
     fn repeated_context_leads_with_changes_and_collapses_unchanged_standing() {
