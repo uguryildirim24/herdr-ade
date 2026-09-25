@@ -565,6 +565,11 @@ pub(crate) struct RoundRecord {
     /// bounded by `round::MAX_REVIEWER_START_FAILURES` (E3/D1).
     #[serde(default)]
     pub(crate) reviewer_start_failures: u32,
+    /// Next automatic retry of a reviewer that failed before any launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reviewer_retry_at: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) reviewer_start_error: String,
     /// REJECT verdicts observed before the round eventually merged. `None`
     /// means this historical round predates outcome tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
