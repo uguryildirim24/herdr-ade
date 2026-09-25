@@ -1056,7 +1056,9 @@ fn thread_pass(
             if state == "blocked" && !t.trust_answered {
                 // A refused trust check leaves the normal ready-window failure
                 // visible; only Claude itself may persist an accepted dialog.
-                if let Err(error) = crate::claude_trust::answer(input.ctx, project, t, herdr) {
+                if let Err(error) =
+                    crate::claude_trust::answer(input.ctx, project, t, herdr, agents, panes)
+                {
                     pass.error = pass
                         .error
                         .or(Some(error.context(format!("{}: trust dialog", t.id))));

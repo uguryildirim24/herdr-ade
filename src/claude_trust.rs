@@ -2,7 +2,7 @@
 //! persists the decision itself; ADE never writes its shared config file.
 use anyhow::Result;
 
-use crate::herdr::Herdr;
+use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::thread::{self, Kind, Thread};
@@ -48,7 +48,21 @@ fn eligible(ctx: &Ctx, project: &Project, t: &Thread, cwd: &str, screen: &str) -
     let Ok(common) = std::fs::canonicalize(repo.join(".git").join("worktrees")) else {
         return false;
     };
-    if std::fs::canonicalize(gitdir).ok().as_deref() != Some(common.join(&t.id).as_path()) {
+    let Ok(gitdir) = std::fs::canonicalize(gitdir) else {
+        return false;
+    };
+    if gitdir != common.join(&t.id)
+        || std::fs::read_to_string(gitdir.join("gitdir"))
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path.trim()).ok())
+            .as_ref()
+            != Some(&marker)
+        || std::fs::read_to_string(gitdir.join("HEAD"))
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            != Some(format!("ref: refs/heads/{}", t.branch).as_str())
+    {
         return false;
     }
     // Only a canonical root explicitly listed in a project's PROJECT.md is
@@ -69,23 +83,52 @@ fn eligible(ctx: &Ctx, project: &Project, t: &Thread, cwd: &str, screen: &str) -
     // The dialog must actually name this worktree, not just its repo root or
     // a different folder. Resolve the displayed path (macOS may render /var
     // where canonicalize returns /private/var).
-    screen.contains("Trust this folder?")
-        && screen.lines().any(|line| {
+    let Some((_, dialog)) = screen.rsplit_once("Trust this folder?") else {
+        return false;
+    };
+    let Some((description, _)) = dialog.split_once("1. Yes") else {
+        return false;
+    };
+    // An earlier line in the terminal scrollback may mention this worktree
+    // while the current trust dialog is for a different directory.
+    let paths: Vec<_> = description
+        .lines()
+        .filter_map(|line| {
             let path = line.trim().strip_prefix("❯ ").unwrap_or(line.trim());
-            std::fs::canonicalize(path).ok().as_ref() == Some(&worktree)
+            std::fs::canonicalize(path).ok()
         })
-        && screen.contains("1. Yes")
+        .collect();
+    paths == [worktree]
 }
 
 /// Once per start, only while the agent is blocked on its exact trust dialog.
 /// A missing screen or identity evidence is a refusal, not a guessed approval.
-pub(crate) fn answer(ctx: &Ctx, project: &Project, t: &Thread, herdr: &Herdr<'_>) -> Result<bool> {
-    if t.trust_answered || t.launch.kind != "claude" || t.is_remote() {
+pub(crate) fn answer(
+    ctx: &Ctx,
+    project: &Project,
+    t: &Thread,
+    herdr: &Herdr<'_>,
+    agents: &[Agent],
+    panes: &[Pane],
+) -> Result<bool> {
+    // A recorded pane id and a blocked state alone are not ownership proof.
+    // Refuse if the live agent or the pane is not this lane's terminal.
+    if t.trust_answered
+        || t.launch.kind != "claude"
+        || t.is_remote()
+        || !agents
+            .iter()
+            .any(|agent| thread::agent_matches(t, agent) && agent.agent_status == "blocked")
+        || !panes.iter().any(|pane| thread::pane_matches(t, pane))
+    {
+        return Ok(false);
+    }
+    let pane = herdr.pane_get(&t.pane_id)?;
+    if !thread::pane_matches(t, &pane) {
         return Ok(false);
     }
     let screen = herdr.pane_read_text(&t.pane_id, "visible")?;
-    let cwd = herdr.pane_cwd(&t.pane_id)?;
-    if !eligible(ctx, project, t, &cwd, &screen) {
+    if !eligible(ctx, project, t, &pane.cwd, &screen) {
         return Ok(false);
     }
     // Persist before sending: a delayed next poll must not answer twice.
@@ -181,6 +224,9 @@ mod tests {
         let saved = thread::allocate(&project, |record| {
             *record = t.clone();
             record.pane_id = "w1:p2".into();
+            record.tab_id = "w1:t2".into();
+            record.workspace_id = "w1".into();
+            record.agent_name = thread::agent_name(&project.slug, id);
         })
         .unwrap();
         let fake = FakeRunner::new();
@@ -196,10 +242,52 @@ mod tests {
             detached_ticker: false,
         };
         let herdr = Herdr::new("herdr", "", &fake);
-        assert!(answer(&live_ctx, &project, &saved, &herdr).unwrap());
+        let agent = Agent {
+            pane_id: saved.pane_id.clone(),
+            tab_id: saved.tab_id.clone(),
+            workspace_id: saved.workspace_id.clone(),
+            cwd: saved.cwd.clone(),
+            name: saved.agent_name.clone(),
+            agent_status: "blocked".into(),
+            ..Agent::default()
+        };
+        let pane = Pane {
+            pane_id: saved.pane_id.clone(),
+            tab_id: saved.tab_id.clone(),
+            workspace_id: saved.workspace_id.clone(),
+            cwd: saved.cwd.clone(),
+        };
+        assert!(!answer(&live_ctx, &project, &saved, &herdr, &[], &[pane.clone()]).unwrap());
+        assert!(!answer(&live_ctx, &project, &saved, &herdr, &[agent.clone()], &[]).unwrap());
+        let wrong_pane = FakeRunner::new();
+        wrong_pane.on("pane get", ok(&format!(r#"{{"result":{{"pane":{{"pane_id":"w1:other","tab_id":"w1:t2","workspace_id":"w1","cwd":"{}"}}}}}}"#, worktree.display())));
+        let wrong_herdr = Herdr::new("herdr", "", &wrong_pane);
+        assert!(
+            !answer(
+                &live_ctx,
+                &project,
+                &saved,
+                &wrong_herdr,
+                &[agent.clone()],
+                &[pane.clone()]
+            )
+            .unwrap()
+        );
+        assert_eq!(wrong_pane.count("pane send-text"), 0);
+        assert!(
+            answer(
+                &live_ctx,
+                &project,
+                &saved,
+                &herdr,
+                &[agent.clone()],
+                &[pane.clone()]
+            )
+            .unwrap()
+        );
         let answered = thread::load(&project, id).unwrap();
         assert!(answered.trust_answered);
-        assert!(!answer(&live_ctx, &project, &answered, &herdr).unwrap());
+        assert!(!answer(&live_ctx, &project, &answered, &herdr, &[agent], &[pane]).unwrap());
         assert_eq!(fake.count("pane send-text"), 1);
         assert_eq!(fake.count("pane send-keys"), 1);
         assert!(!eligible(
@@ -216,6 +304,28 @@ mod tests {
             &t.cwd,
             "Trust this folder?\n  1. Yes"
         ));
+        assert!(!eligible(
+            &ctx,
+            &project,
+            &t,
+            &t.cwd,
+            &format!(
+                "{}\nTrust this folder?\n{}\n  1. Yes",
+                worktree.display(),
+                repo.display()
+            )
+        ));
+        assert!(!eligible(
+            &ctx,
+            &project,
+            &t,
+            &t.cwd,
+            &format!(
+                "Trust this folder?\n{}\n{}\n  1. Yes",
+                worktree.display(),
+                repo.display()
+            )
+        ));
         t.worktree_path = repo.join("other").to_string_lossy().into_owned();
         assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
         t.worktree_path = worktree.to_string_lossy().into_owned();
@@ -226,6 +336,17 @@ mod tests {
         assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
         std::fs::remove_file(&marker).unwrap();
         std::fs::write(&marker, target).unwrap();
+        let gitdir = repo.join(".git/worktrees").join(id);
+        let backpointer = gitdir.join("gitdir");
+        let original = std::fs::read_to_string(&backpointer).unwrap();
+        std::fs::write(&backpointer, format!("{}\n", repo.display())).unwrap();
+        assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
+        std::fs::write(&backpointer, original).unwrap();
+        let head = gitdir.join("HEAD");
+        let original = std::fs::read_to_string(&head).unwrap();
+        std::fs::write(&head, "ref: refs/heads/other\n").unwrap();
+        assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
+        std::fs::write(&head, original).unwrap();
         let unregistered = tmp.path().join("other-repo");
         std::fs::create_dir(&unregistered).unwrap();
         let run = |args: &[&str]| {
