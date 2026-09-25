@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::{self, MAX_LAUNCH_ATTEMPTS};
+use crate::coordinator;
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
@@ -618,6 +618,11 @@ fn tick_with_steps(
             continue;
         };
         if project.status() != Status::Active {
+            // Pausing a project stops its work, not cleanup of already
+            // accepted completions. Sweep its idle tabs on the first pass too.
+            if let Err(error) = threads::park_completed(ctx, &project) {
+                log.line(&format!("{slug}: parked-lane sweep: {error:#}"));
+            }
             continue;
         }
         match tick_cheap(
@@ -953,6 +958,9 @@ fn thread_pass(
             thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
         });
     for t in threads {
+        if t.parked {
+            continue;
+        }
         if t.queued_for_load {
             continue;
         }
@@ -1233,6 +1241,7 @@ fn thread_pass(
                 || thread::seconds_since(&after.startup_wait_started, now).max(0) as u64 * 1000
                     >= agent_start_timeout(&after.launch))
             && after.report_hash.is_empty()
+            && !threads::parkable(project, &after)
             && !live.pane_exists;
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
@@ -1579,6 +1588,7 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .into_iter()
         .filter(|t| {
             t.is_remote() == remote
+                && !t.parked
                 && !t.queued_for_load
                 && matches!(t.status, thread::Status::Open | thread::Status::Starting)
         })
@@ -1790,7 +1800,10 @@ fn nudge_idle_coordinator(
     agent: Option<&Agent>,
     live: (&[Agent], &[Pane]),
 ) -> Result<()> {
-    if coordinator.prime_pending || agent.is_none_or(|agent| !agent.ready()) {
+    if !coordinator.closed_by_rolf_at.is_empty()
+        || coordinator.prime_pending
+        || agent.is_none_or(|agent| !agent.ready())
+    {
         return Ok(());
     }
     if project.finished() || project.status() != project::Status::Active {
@@ -1824,20 +1837,32 @@ fn nudge_idle_coordinator(
     crate::ledger::coordinator_nudge(project, &next)
 }
 
+pub(crate) fn socket_inode(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |meta| meta.ino())
+}
+
+fn coordinator_retry_due(project: &Project, record: &crate::project::Coordinator) -> Result<bool> {
+    let mut state = steps::load_state(project);
+    if !state.coordinator_relaunch_last.is_empty()
+        && thread::seconds_since(&state.coordinator_relaunch_last, jiff::Timestamp::now()) < 3600
+    {
+        return Ok(false);
+    }
+    state.coordinator_relaunch_last = project::now();
+    steps::save_state(project, &state)?;
+    crate::ledger::coordinator_relaunch(project, &record.pane_id)?;
+    Ok(true)
+}
+
 fn relaunch_missing_coordinator(
     ctx: &Ctx,
     project: &Project,
     record: &crate::project::Coordinator,
 ) -> Result<()> {
-    let mut state = steps::load_state(project);
-    if !state.coordinator_relaunch_last.is_empty()
-        && thread::seconds_since(&state.coordinator_relaunch_last, jiff::Timestamp::now()) < 3600
-    {
+    if !coordinator_retry_due(project, record)? {
         return Ok(());
     }
-    state.coordinator_relaunch_last = project::now();
-    steps::save_state(project, &state)?;
-    crate::ledger::coordinator_relaunch(project, &record.pane_id)?;
     coordinator::open(
         ctx,
         &project.slug,
@@ -1852,6 +1877,32 @@ fn relaunch_missing_coordinator(
             recipe_basis: None,
         },
     )
+}
+
+fn restart_coordinator_agent(
+    project: &Project,
+    herdr: &Herdr,
+    record: &crate::project::Coordinator,
+) -> Result<()> {
+    if !coordinator_retry_due(project, record)? {
+        return Ok(());
+    }
+    project.update_coordinator(|c| {
+        c.launch_attempts += 1;
+        c.generation += 1;
+        c.prime_sent = false;
+    })?;
+    let launch = &record.launch;
+    herdr.agent_start_opts(&crate::herdr::AgentStart {
+        name: &record.agent_name,
+        kind: &launch.kind,
+        pane: &record.pane_id,
+        agent_args: &launch.args,
+        launch_bin: None,
+        parent: None,
+        ready_timeout_ms: launch.ready_timeout_ms,
+    })?;
+    Ok(())
 }
 
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
@@ -1892,6 +1943,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
 
     // The coordinator: deliver a pending priming prompt, refresh its tokens.
     if let Some(agent) = &agent {
+        if record.last_agent_seen_at.is_empty() {
+            project.update_coordinator(|c| c.last_agent_seen_at = project::now())?;
+        }
         // One priming line per binding. Transport is not the receipt: an ADE
         // binding clears `prime_pending` only on its `ha context` receipt, and
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
@@ -1941,6 +1995,11 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     }
     // The ops pass (A2) and the rounds pass (A3) run in the slow pass,
     // outside the project lock (SPEC-ADE item 57).
+    let pane_alive = panes.iter().any(|p| coordinator::pane_matches(&record, p));
+    let inode = socket_inode(Path::new(&record.socket));
+    if pane_alive && inode != 0 && record.server_socket_inode != inode {
+        project.update_coordinator(|c| c.server_socket_inode = inode)?;
+    }
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(
         coordinator_recorded == 1
@@ -1950,14 +2009,38 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     let recorded_panes = pass.recorded_panes + coordinator_recorded;
     let missing_panes = pass.missing_panes + coordinator_missing;
 
-    if coordinator_missing == 1
-        && project.status() == project::Status::Active
-        && !(recorded_panes >= 2 && missing_panes == recorded_panes)
-        && !agents.iter().any(|agent| agent.pane_id == record.pane_id)
-        && !panes.iter().any(|pane| pane.pane_id == record.pane_id)
-        && let Err(error) = relaunch_missing_coordinator(ctx, project, &record)
-    {
-        crate::ledger::observe(project, "coordinator-relaunch", slug, &format!("{error:#}"));
+    if coordinator_recorded == 1 && project.status() == project::Status::Active {
+        // Other projects may already have opened panes on the new server.
+        // Only the bound pane must be absent for this to be a lost binding.
+        let restarted = record.server_socket_inode != 0
+            && inode != 0
+            && record.server_socket_inode != inode
+            && !pane_alive;
+        if !pane_alive && agent.is_none() && !record.reopen_requested && !restarted {
+            if record.closed_by_rolf_at.is_empty() {
+                project.update_coordinator(|c| {
+                    if c.closed_by_rolf_at.is_empty() && !c.reopen_requested {
+                        c.closed_by_rolf_at = project::now();
+                    }
+                })?;
+            }
+        } else if record.closed_by_rolf_at.is_empty() && agent.is_none() {
+            let result = if pane_alive {
+                Ok(()) // the slow pass owns process restarts and launch capacity
+            } else if restarted || record.reopen_requested {
+                relaunch_missing_coordinator(ctx, project, &record)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                crate::ledger::observe(
+                    project,
+                    "coordinator-relaunch",
+                    slug,
+                    &format!("{error:#}"),
+                );
+            }
+        }
     }
 
     // Nudge (or notify) about inbox items `context` has not shown yet.
@@ -2193,36 +2276,23 @@ fn tick_slow_with_steps(
     if !step("coordinator launch") {
         return (errors, false);
     }
-    if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
-        let pane_alive = seen
+    if let Some(record) = project.coordinator()
+        && record.closed_by_rolf_at.is_empty()
+        && (record.prime_pending
+            || !record.last_agent_seen_at.is_empty()
+            || record.reopen_requested)
+        && seen
             .panes
             .iter()
-            .any(|p| coordinator::pane_matches(&record, p));
-        let pane_has_agent = seen.agents.iter().any(|a| a.pane_id == record.pane_id);
-        if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {
-            may_start = false;
-            let started = (|| -> Result<()> {
-                project.update_coordinator(|c| {
-                    c.launch_attempts += 1;
-                    c.generation += 1;
-                    c.prime_sent = false;
-                })?;
-                // The recipe stored at `open`, never rebuilt from settings
-                // that may have changed since (SPEC-ADE D2).
-                let launch = &record.launch;
-                herdr.agent_start_opts(&crate::herdr::AgentStart {
-                    name: &record.agent_name,
-                    kind: &launch.kind,
-                    pane: &record.pane_id,
-                    agent_args: &launch.args,
-                    launch_bin: None,
-                    parent: None,
-                    ready_timeout_ms: launch.ready_timeout_ms,
-                })?;
-                Ok(())
-            })();
-            errors.extend(started.err());
+            .any(|p| coordinator::pane_matches(&record, p))
+        && !seen.agents.iter().any(|a| a.pane_id == record.pane_id)
+        && {
+            let last = steps::load_state(project).coordinator_relaunch_last;
+            last.is_empty() || thread::seconds_since(&last, now) >= 3600
         }
+    {
+        may_start = false;
+        errors.extend(restart_coordinator_agent(project, &herdr, &record).err());
     }
 
     // Local threads: copy home when the report changed, then launches.
@@ -2371,6 +2441,7 @@ fn tick_slow_with_steps(
             .err()
             .map(|e| e.context("rounds")),
     );
+    errors.extend(crate::threads::park_completed(ctx, project).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
@@ -3654,6 +3725,7 @@ mod tests {
                 c.agent_name = "hp-demo-coordinator".into();
                 c.cwd = cwd;
                 c.prime_pending = pending;
+                c.server_socket_inode = socket_inode(&socket);
             })
             .unwrap();
         let env = Env::for_test(home.path(), &[]);
@@ -3699,6 +3771,109 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == "config-changed")
         );
+    }
+
+    #[test]
+    fn first_pass_sweeps_lanes_sealed_before_install_without_relaunching() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let lane = world.thread(&project, &cwd, |t| {
+            t.attempt = 1;
+            t.launch_attempts = 1;
+            t.bootstrap = "acknowledged".into();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", &lane.cwd)
+        );
+        let event = crate::contracts::Event {
+            id: format!("{}-1-1", lane.id),
+            op: "done".into(),
+            thread: lane.id.clone(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient::default(),
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                done: Some(crate::contracts::DonePayload {
+                    sha: "abc".into(),
+                    artifact: "report".into(),
+                    report_path: lane.report_path(),
+                    attestation: None,
+                }),
+                ..Default::default()
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        crate::events::append_delivery(
+            &project,
+            &event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )
+        .unwrap();
+        // A second project with an already-sealed lane shares this ticker pass.
+        let second = world.project("other", "b.sock");
+        let other = world.thread(&second, &cwd, |t| {
+            t.attempt = 1;
+            t.launch_attempts = 1;
+            t.bootstrap = "acknowledged".into();
+        });
+        let mut second_event = event.clone();
+        second_event.id = format!("{}-1-1", other.id);
+        second_event.thread = other.id.clone();
+        crate::events::seal_create_if_absent(&second, &second_event).unwrap();
+        crate::events::append_delivery(
+            &second,
+            &second_event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )
+        .unwrap();
+        // This pane was already closed by Rolf after sealing. It must not
+        // become a failed start just because no cached report hash exists.
+        let closed = world.project("closed", "c.sock");
+        let missing = world.thread(&closed, &cwd, |t| {
+            t.attempt = 1;
+            t.launch_attempts = 1;
+            t.pane_id = "w3:p1".into();
+            t.tab_id = "w3:t1".into();
+            t.workspace_id = "w3".into();
+        });
+        crate::events::seal_create_if_absent(&closed, &event).unwrap();
+        crate::events::append_delivery(
+            &closed,
+            &event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )
+        .unwrap();
+        world
+            .panes
+            .borrow_mut()
+            .insert_str(1, &format!("{},", world.coordinator_pane(&closed)));
+        let ctx = world.ctx();
+        assert_eq!(
+            crate::threads::rows(&ctx, &closed)[0].group,
+            thread::Group::Parked
+        );
+        let mut memory = Memory::new(&ctx);
+        // All records predate this binary; no new seal or manual command is needed.
+        assert!(tick_for_test(&ctx, &mut memory));
+        assert!(thread::load(&project, &lane.id).unwrap().parked);
+        assert!(thread::load(&second, &other.id).unwrap().parked);
+        let closed_lane = thread::load(&closed, &missing.id).unwrap();
+        assert!(closed_lane.parked);
+        assert_ne!(
+            closed_lane.failure_class,
+            crate::contracts::FailureClass::ProcessGone
+        );
+        assert_eq!(world.runner.count("workspace close w2"), 2);
+        assert_eq!(world.runner.count("workspace close w3"), 0);
+        assert!(tick_for_test(&ctx, &mut memory));
+        assert_eq!(world.runner.count("workspace close w2"), 2);
+        assert_eq!(world.runner.count("agent start"), 0);
     }
 
     #[test]
@@ -4529,7 +4704,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_prompt_pane_gets_at_most_three_launch_attempts() {
+    fn shell_prompt_pane_retries_at_most_hourly() {
         let f = fixture(true);
         let runner = FakeRunner::new();
         runner.on("agent list", ok(NO_AGENTS));
@@ -4548,19 +4723,48 @@ mod tests {
         for _ in 0..5 {
             let _ = tick_project(&ctx, &f.project);
         }
-        assert_eq!(runner.count("agent start"), 3);
+        assert_eq!(runner.count("agent start"), 1); // hourly bound, even after failure
         assert_eq!(runner.count("agent prompt"), 0);
     }
 
     #[test]
-    fn missing_coordinator_relaunch_is_recorded_and_throttled() {
+    fn dead_coordinator_agent_in_existing_pane_retries_hourly() {
         let f = fixture(false);
         f.project
             .update_coordinator(|c| {
-                c.launch.recipe_id = "recorded-recipe".into();
                 c.launch.kind = "claude".into();
+                c.last_agent_seen_at = project::now();
             })
             .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on(
+            "agent start",
+            fail(1, r#"{"error":{"code":"timeout","message":"no agent"}}"#),
+        );
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let _ = tick_project(&ctx, &f.project);
+        let _ = tick_project(&ctx, &f.project);
+        assert_eq!(runner.count("agent start"), 1);
+        assert!(
+            f.project
+                .coordinator()
+                .unwrap()
+                .closed_by_rolf_at
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn closed_coordinator_is_marked_once_and_not_relaunched() {
+        let f = fixture(false);
         let runner = FakeRunner::new();
         runner.on("agent list", ok(NO_AGENTS));
         runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
@@ -4571,12 +4775,52 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        // Even if the start fails, the attempt is recorded before launching.
+        let _ = tick_project(&ctx, &f.project);
+        let mark = f.project.coordinator().unwrap().closed_by_rolf_at;
+        assert!(!mark.is_empty());
+        let _ = tick_project(&ctx, &f.project);
+        assert_eq!(f.project.coordinator().unwrap().closed_by_rolf_at, mark);
+        assert_eq!(runner.count("workspace create"), 0);
+        assert!(
+            steps::load_state(&f.project)
+                .coordinator_relaunch_last
+                .is_empty()
+        );
+        let board = crate::board::compute(&ctx, &f.project);
+        assert!(
+            board
+                .iter()
+                .any(|(key, value)| key == "ade_stage" && value.contains("closed by Rolf"))
+        );
+    }
+
+    #[test]
+    fn restarted_server_with_all_panes_gone_relaunches_at_most_hourly() {
+        let f = fixture(false);
+        f.project
+            .update_coordinator(|c| {
+                c.launch.recipe_id = "recorded-recipe".into();
+                c.launch.kind = "claude".into();
+            })
+            .unwrap();
+        let socket = f.project.coordinator().unwrap().socket;
+        let replacement = f._home.path().join("new.sock");
+        std::fs::write(&replacement, b"").unwrap();
+        std::fs::rename(replacement, socket).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        // Even if open fails, the attempt is recorded before launching.
         let _ = tick_project(&ctx, &f.project);
         let last = steps::load_state(&f.project).coordinator_relaunch_last;
         assert!(!last.is_empty());
-        let ledger = std::fs::read_to_string(f.project.record_file("ledger.jsonl")).unwrap();
-        assert_eq!(ledger.matches("coordinator_relaunch").count(), 1);
         let _ = tick_project(&ctx, &f.project);
         assert_eq!(
             steps::load_state(&f.project).coordinator_relaunch_last,
@@ -4587,6 +4831,43 @@ mod tests {
         assert_eq!(
             f.project.coordinator().unwrap().launch.recipe_id,
             "recorded-recipe"
+        );
+    }
+
+    #[test]
+    fn restarted_server_with_other_projects_panes_recovers_coordinator() {
+        let f = fixture(false);
+        let socket = f.project.coordinator().unwrap().socket;
+        let replacement = f._home.path().join("new.sock");
+        std::fs::write(&replacement, b"").unwrap();
+        std::fs::rename(replacement, socket).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on(
+            "pane list",
+            ok(r#"{"result":{"panes":[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/other"}]}}"#),
+        );
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let _ = tick_project(&ctx, &f.project);
+        assert!(
+            f.project
+                .coordinator()
+                .unwrap()
+                .closed_by_rolf_at
+                .is_empty()
+        );
+        // The fixture has no coordinator recipe, so open can fail after the
+        // retry is recorded; it must not be mistaken for a manual closure.
+        assert!(
+            !steps::load_state(&f.project)
+                .coordinator_relaunch_last
+                .is_empty()
         );
     }
 
