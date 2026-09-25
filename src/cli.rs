@@ -2111,6 +2111,7 @@ fn partial_machine_result() -> (String, BTreeMap<String, serde_json::Value>) {
 }
 
 pub fn run() -> Result<()> {
+    let cli_started = std::time::Instant::now();
     let wants_json = std::env::args_os().any(|arg| arg == "--json");
     let matches = match Cli::command().try_get_matches() {
         Ok(matches) => matches,
@@ -2228,7 +2229,7 @@ pub fn run() -> Result<()> {
         crate::ledger::coordinator_command(project)?;
     }
     let subject = format!("ha {command_name}");
-    let result = dispatch(ctx, cli.command);
+    let result = dispatch_with_start(ctx, cli.command, Some(cli_started));
     if read_only {
         match &result {
             Err(error) if crate::refusal::is(error) => {
@@ -2283,7 +2284,16 @@ fn record_command_outcome(project: Option<&Project>, subject: &str, result: &Res
     }
 }
 
+#[cfg(test)]
 fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
+    dispatch_with_start(ctx, command, None)
+}
+
+fn dispatch_with_start(
+    ctx: Ctx<'_>,
+    command: Command,
+    cli_started: Option<std::time::Instant>,
+) -> Result<()> {
     match command {
         Command::New { name, goal, repos } => {
             let repos = repos
@@ -3119,7 +3129,7 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
                 println!("{}", crate::branches::doctor(&ctx, Some(&plan))?);
                 return Ok(());
             }
-            let result = doctor::run_timed(&ctx, &session.into(), timings)?;
+            let result = doctor::run_timed_from(&ctx, &session.into(), timings, cli_started)?;
             crate::output::success(
                 Some(if result.healthy {
                     "healthy"
