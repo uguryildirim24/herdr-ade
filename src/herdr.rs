@@ -485,14 +485,22 @@ impl<'a> Herdr<'a> {
         })
     }
 
-    /// `pane read` prints text, not a JSON reply, so this returns it verbatim.
+    /// `pane read` prints a terminal snapshot, not a JSON reply.
     pub(crate) fn pane_read_text(&self, pane: &str, source: &str) -> Result<String, HerdrError> {
+        self.pane_read(pane, source, "text")
+    }
+
+    pub(crate) fn pane_read_ansi(&self, pane: &str, source: &str) -> Result<String, HerdrError> {
+        self.pane_read(pane, source, "ansi")
+    }
+
+    fn pane_read(&self, pane: &str, source: &str, format: &str) -> Result<String, HerdrError> {
         let out = self
             .runner
             .run(
                 &self
                     .cmd(CALL_TIMEOUT)
-                    .args(["pane", "read", pane, "--source", source, "--format", "text"]),
+                    .args(["pane", "read", pane, "--source", source, "--format", format]),
             )
             .map_err(|e| HerdrError {
                 code: "unreachable".into(),
