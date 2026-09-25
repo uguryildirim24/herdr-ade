@@ -44,6 +44,8 @@ pub(crate) struct State {
     pub(crate) session_item_written: bool,
     /// Last successful automated prompt to continue the project.
     pub(crate) idle_nudge_last: String,
+    /// A working observation after a nudge, retained even when the agent is done.
+    pub(crate) coordinator_worked_at: String,
     /// Last automatic coordinator relaunch attempt, including failed starts.
     pub(crate) coordinator_relaunch_last: String,
 }
