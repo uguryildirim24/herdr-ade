@@ -2007,7 +2007,7 @@ mod tests {
         let fx = fixture();
         let (linked, _) = fx.lane(1);
         *fx.world.agents.borrow_mut() = r#"[
-            {"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
+            {"pane_id":"w1:p11","tab_id":"w1:t11","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
             .into();
         let gone = thread::allocate(&fx.project, |t| {
             t.title = "Gone".into();
@@ -2022,7 +2022,11 @@ mod tests {
         })
         .unwrap()
         .id;
-        *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+        *fx.world.panes.borrow_mut() = format!(
+            "[{},{{\"pane_id\":\"w1:p11\",\"tab_id\":\"w1:t11\",\"workspace_id\":\"w1\",\"cwd\":\"{}\"}}]",
+            fx.world.coordinator_pane(&fx.project),
+            thread::load(&fx.project, &linked).unwrap().cwd
+        );
         fx.world.runner.on(
             "tab create",
             ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t9","pane_id":"w1:p99","cwd":"/tmp"}}}"#),
