@@ -1589,6 +1589,19 @@ pub struct CancelOutcome {
     pub dissolved_batch: Vec<String>,
 }
 
+/// Releasing a batch or replacing its reviewer must not leave the old pane
+/// alive beside the restored round or replacement reviewer. A resolved thread
+/// with a pending pane close is retryable, but is not yet stopped.
+fn stop_batch_reviewer(ctx: &Ctx, project: &Project, reviewer: &str, reason: &str) -> Result<()> {
+    let cleanup = crate::threads::cancel(ctx, &project.slug, reviewer, reason)?;
+    if cleanup.pane == "cleanup_pending" {
+        bail!(
+            "reviewer_cleanup_pending: `{reviewer}` may still be running; retry when its pane is reachable"
+        );
+    }
+    Ok(())
+}
+
 /// Dissolve a selection without cancelling its members. The first round's
 /// integration review superseded its original verdict, so restore the sealed
 /// selection before releasing the merge turn. The project lock makes the
@@ -1614,7 +1627,7 @@ fn dissolve_batch(ctx: &Ctx, project: &Project, round: &str) -> Result<Vec<Strin
     {
         // Stop first: a crash must never release the batch and orphan its
         // still-running reviewer. A failed cleanup leaves the batch retryable.
-        cancel_superseded_reviewer(
+        stop_batch_reviewer(
             ctx,
             project,
             reviewer,
@@ -2095,7 +2108,7 @@ pub fn retry_on_machine(
         {
             bail!("batch_review_complete: `{round}` already has a sealed integration verdict");
         }
-        cancel_superseded_reviewer(ctx, &project, reviewer, reason)?;
+        stop_batch_reviewer(ctx, &project, reviewer, reason)?;
         let _lock = project.lock()?;
         let mut current = load(&project, round)?;
         if current.reviewer.as_deref() != Some(reviewer) {
@@ -6462,6 +6475,25 @@ mod tests {
             load(&fx.project, "r1").unwrap().reviewer.as_deref(),
             Some(retry.thread.as_str())
         );
+    }
+
+    #[test]
+    fn unreachable_reviewer_pane_keeps_batch_and_binding_until_stopped() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let rounds = ready_batch(&fx, 2);
+        reviewer_ready(&fx);
+        merge_batch_run(&ctx, "demo", &rounds, None).unwrap();
+        let owner = load(&fx.project, "r1").unwrap();
+        let id = owner.reviewer.unwrap();
+        fx.project.update_coordinator(|c| c.socket.clear()).unwrap();
+        let error =
+            retry_on_machine(&ctx, "demo", "r1", "move reviewer", Some("local")).unwrap_err();
+        assert!(format!("{error:#}").contains("reviewer_cleanup_pending"));
+        assert_eq!(load(&fx.project, "r1").unwrap().reviewer, Some(id.clone()));
+        assert!(load(&fx.project, "r1").unwrap().batch.is_some());
+        assert!(dissolve(&ctx, "demo", "r2").is_err());
+        assert!(load(&fx.project, "r1").unwrap().batch.is_some());
     }
 
     #[test]
