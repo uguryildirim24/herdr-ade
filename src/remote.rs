@@ -395,9 +395,9 @@ pub(crate) fn load_wait_reason(load: f64, cores: u32, limit: f64) -> Option<Stri
         .then(|| format!("box load {load:.1} exceeds {limit:.1} × {cores} cores"))
 }
 
-/// Each project gets one user slice; wrappers make Herdr's interactive agent
-/// command enter a scope in that slice without moving the server or the pane
-/// shell. All descendants, including tools started by the agent, stay there.
+/// Each project gets one user slice. Herdr's launch environment restricts
+/// executable lookup to its wrapper directory *at agent start*, after shell
+/// startup files have run. Descendants of the scoped agent stay in the slice.
 pub(crate) fn project_slice(slug: &str) -> Result<String> {
     if slug.is_empty()
         || !slug
@@ -451,13 +451,14 @@ pub(crate) fn prepare_project_slice(
     let script = with_path(
         &machine.path,
         &format!(
-            "set -e\nmkdir -p {folder} {bin}\nunit={unit_path}\ntmp=\"$unit.tmp-$$\"\nprintf '%s' {contents} > \"$tmp\"\nif [ -f \"$unit\" ] && ! grep -q '^# Managed by herdr-ade$' \"$unit\"; then rm -f \"$tmp\"; echo unmanaged_slice >&2; exit 8; fi\nif ! cmp -s \"$tmp\" \"$unit\"; then mv \"$tmp\" \"$unit\"; systemctl --user daemon-reload; else rm -f \"$tmp\"; fi\ncommand -v systemd-run >/dev/null || {{ echo missing_systemd_run >&2; exit 9; }}\n# Verify the user manager can actually create a scope in this slice.\nsystemd-run --user --scope --same-dir --quiet --collect --slice={slice} -- /bin/true\nfor name in {names}; do\n  real=$(command -v \"$name\" || true)\n  if [ -n \"$real\" ]; then\n    printf '#!/bin/sh\\nexec systemd-run --user --scope --same-dir --quiet --collect --slice=%s -- %s \"$@\"\\n' {slice} \"$real\" > {bin}/\"$name\"\n    chmod 755 {bin}/\"$name\"\n  else\n    rm -f {bin}/\"$name\"\n  fi\ndone\ntest -x {bin}/{executable} || {{ echo missing_slice_wrapper >&2; exit 9; }}\n",
+            "set -e\nmkdir -p {folder} {bin}\nunit={unit_path}\ntmp=\"$unit.tmp-$$\"\nprintf '%s' {contents} > \"$tmp\"\nif [ -f \"$unit\" ] && ! grep -q '^# Managed by herdr-ade$' \"$unit\"; then rm -f \"$tmp\"; echo unmanaged_slice >&2; exit 8; fi\nif ! cmp -s \"$tmp\" \"$unit\"; then mv \"$tmp\" \"$unit\"; systemctl --user daemon-reload; else rm -f \"$tmp\"; fi\ncommand -v systemd-run >/dev/null || {{ echo missing_systemd_run >&2; exit 9; }}\n# Verify the user manager can actually create a scope in this slice.\nsystemd-run --user --scope --same-dir --quiet --collect --slice={slice} -- /bin/true\nfor name in {names}; do\n  real=$(command -v \"$name\" || true)\n  if [ -n \"$real\" ]; then\n    printf '#!/bin/sh\\nPATH=%s exec /usr/bin/systemd-run --user --scope --same-dir --quiet --collect --slice=%s -- %s \"$@\"\\n' {runtime_path} {slice} \"$real\" > {bin}/\"$name\"\n    chmod 755 {bin}/\"$name\"\n  else\n    rm -f {bin}/\"$name\"\n  fi\ndone\ntest -x {bin}/{executable} || {{ echo missing_slice_wrapper >&2; exit 9; }}\n",
             folder = quote(&folder),
             bin = quote(&bin),
             unit_path = quote(&format!("{folder}/{slice}")),
             contents = quote(&unit),
             names = names,
             slice = quote(&slice),
+            runtime_path = quote(&machine.path),
             executable = quote(executable),
         ),
     );
@@ -466,6 +467,42 @@ pub(crate) fn prepare_project_slice(
         bail!("project slice on {}: {}", machine.label, out.error_text());
     }
     Ok(bin)
+}
+
+/// Verify the actual agent PID, not the pane shell or the wrapper's text.
+/// A missing process or an unreadable cgroup is a failed check, never a pass.
+pub(crate) fn check_agent_slice(
+    runner: &dyn Runner,
+    machine: &MachineDeclaration,
+    slug: &str,
+    pid: u32,
+) -> Result<String> {
+    let slice = project_slice(slug)?;
+    let out = ssh(
+        runner,
+        &machine.target,
+        &format!("cat /proc/{pid}/cgroup"),
+        None,
+        SSH_TIMEOUT,
+    )?;
+    if !out.success() {
+        bail!(
+            "agent pid {pid}: cannot read /proc/{pid}/cgroup: {}",
+            out.error_text()
+        );
+    }
+    verify_agent_slice(&slice, pid, &out.stdout)?;
+    Ok(slice)
+}
+
+fn verify_agent_slice(slice: &str, pid: u32, cgroup: &str) -> Result<()> {
+    if !cgroup.lines().any(|line| {
+        line.split_once("::")
+            .is_some_and(|(_, path)| path.split('/').any(|component| component == slice))
+    }) {
+        bail!("agent pid {pid} outside {slice}: /proc/{pid}/cgroup = {cgroup:?}");
+    }
+    Ok(())
 }
 
 /// One box start's git effect (SPEC-remote §4.2 step 3): the box fetches the
@@ -746,6 +783,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_slice_requires_exact_cgroup_component() {
+        let slice = "herdr-ade-demo.slice";
+        assert!(
+            verify_agent_slice(slice, 42, "0::/user.slice/herdr-ade-demo.slice/run.scope\n")
+                .is_ok()
+        );
+        let error = verify_agent_slice(slice, 42, "0::/app.slice/herdr.service\n").unwrap_err();
+        assert!(error.to_string().contains("app.slice/herdr.service"));
+        assert!(verify_agent_slice(slice, 42, "0::/herdr-ade-demo.slice-fake/run.scope").is_err());
+        assert!(verify_agent_slice(slice, 42, "").is_err());
+    }
+
+    #[test]
     fn project_slice_wrapper_and_cap_use_the_same_project_unit() {
         let runner = FakeRunner::new();
         runner.on("ssh", ok(""));
@@ -775,6 +825,7 @@ mod tests {
         assert!(command.contains("MemoryMax=16384M"));
         assert!(command.contains("systemd-run --user --scope --same-dir --quiet --collect"));
         assert!(command.contains("--slice=herdr-ade-demo.slice -- /bin/true"));
+        assert!(command.contains("PATH=%s exec /usr/bin/systemd-run"));
         assert!(command.contains("test -x"));
         assert!(load_wait_reason(24.1, 16, 1.5).is_some());
         assert_eq!(load_wait_reason(24.0, 16, 1.5), None);
