@@ -384,12 +384,115 @@ fn pending_prompt_path(project: &Project, pane: &str, text: &str) -> PathBuf {
         .join(format!("{:x}.json", hash.finalize()))
 }
 
-/// Marks a harness prompt for the prompt-submit hook so it is not recorded
-/// as Rolf's request. Kinds without hooks leave no marker.
-pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
-    if !crate::hook::captures(project, pane)? {
-        return Ok(());
+/// Inspect only the live editor near the bottom of herdr's visible snapshot,
+/// not earlier prompt lines in the scrollback. Unknown nonempty screens are
+/// held rather than risking an early submission of Rolf's draft.
+pub(crate) fn coordinator_input_clear(screen: &str) -> bool {
+    if screen.trim().is_empty() {
+        return false; // no readable editor: fail closed
     }
+    let lines: Vec<_> = screen.lines().collect();
+    let Some((index, line)) = lines.iter().enumerate().rev().find(|(_, line)| {
+        let line = line.trim_start();
+        ["❯", "›", ">", "⟩"]
+            .iter()
+            .any(|mark| line.starts_with(mark))
+    }) else {
+        return false;
+    };
+    // A transcript above the editor is not the current input. If the marker
+    // has scrolled away or another panel follows it, wait for a readable view.
+    if lines.len().saturating_sub(index) > 8 {
+        return false;
+    }
+    let line = line.trim_start();
+    let draft = line.trim_start_matches(['❯', '›', '>', '⟩']).trim();
+    // Codex/Claude show placeholder suggestions in an empty editor.
+    let placeholder = draft.is_empty()
+        || matches!(
+            draft,
+            "Ask Codex to do anything" | "Ask Claude anything" | "Type a message"
+        )
+        || draft == "Try \"debug this error\""
+        || draft == "Use /skills to list available skills";
+    placeholder
+        && lines[index + 1..].iter().all(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with('─') || line.contains(" · ")
+        })
+}
+
+/// A previous automated line left in the editor is not Rolf's draft. Only
+/// exact live markers for this pane count; never infer ownership from a prefix.
+pub(crate) fn coordinator_prompt_clear(
+    project: &Project,
+    herdr: &crate::herdr::Herdr<'_>,
+    pane: &str,
+) -> Result<bool> {
+    let screen = herdr.pane_read_text(pane, "visible")?;
+    if coordinator_input_clear(&screen) {
+        clear_input_hold(project);
+        return Ok(true);
+    }
+    let dir = talk_dir(project).join("prompts");
+    let entries = std::fs::read_dir(dir).ok();
+    let now = jiff::Timestamp::now().as_second();
+    let tail = screen
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    for entry in entries.into_iter().flatten().flatten() {
+        let Some(record) = project::read_json::<PendingPromptRecord>(&entry.path()) else {
+            continue;
+        };
+        if record.pane == pane
+            && now - record.at <= PENDING_PROMPT_SECS
+            && !record.text.is_empty()
+            && tail.lines().any(|line| {
+                let input = line.trim().trim_start_matches(['❯', '›', '>', '⟩']).trim();
+                input == record.text
+            })
+        {
+            clear_input_hold(project);
+            return Ok(true);
+        }
+    }
+    hold_input(project)?;
+    Ok(false)
+}
+
+fn input_hold_path(project: &Project) -> PathBuf {
+    project.state_dir().join("coordinator-input-hold.json")
+}
+
+fn clear_input_hold(project: &Project) {
+    let _ = std::fs::remove_file(input_hold_path(project));
+}
+
+fn hold_input(project: &Project) -> Result<()> {
+    let path = input_hold_path(project);
+    if !path.exists() {
+        project::write_json(&path, &jiff::Timestamp::now().as_second())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn long_input_hold(project: &Project) -> bool {
+    project::read_json::<i64>(&input_hold_path(project))
+        .is_some_and(|since| jiff::Timestamp::now().as_second() - since >= 30 * 60)
+}
+
+/// Marks a harness prompt so an exact leftover in the editor is recognised
+/// and the prompt-submit hook does not record it as Rolf's request.
+pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -> Result<()> {
+    // Check the hook binding as before, but keep the marker even for kinds
+    // without a submit hook: their unfinished automated drafts need ownership.
+    let _ = crate::hook::captures(project, pane)?;
     project.record_dir_for_write("talk")?;
     let path = pending_prompt_path(project, pane, text);
     if let Some(parent) = path.parent() {
@@ -612,6 +715,49 @@ fn fresh_request() -> String {
 mod tests {
     use super::*;
     use crate::round::testkit::fixture;
+
+    #[test]
+    fn a_harness_owned_leftover_is_not_a_rolf_draft() {
+        use crate::runner::fake::ok;
+        let fx = fixture();
+        let prompt =
+            "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items.";
+        let path = pending_prompt_path(&fx.project, "w1:p1", prompt);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        project::write_json(
+            &path,
+            &PendingPromptRecord {
+                at: jiff::Timestamp::now().as_second(),
+                pane: "w1:p1".into(),
+                text: prompt.into(),
+            },
+        )
+        .unwrap();
+        fx.world
+            .runner
+            .on("pane read", ok(&format!("❯ {prompt}\n")));
+        let herdr = crate::herdr::Herdr::new("herdr", "/missing.sock", &fx.world.runner);
+        assert!(coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
+        assert!(!coordinator_input_clear("❯ Rolf's unfinished sentence\n"));
+        assert!(coordinator_input_clear("❯ \n"));
+        project::write_json(
+            &input_hold_path(&fx.project),
+            &(jiff::Timestamp::now().as_second() - 31 * 60),
+        )
+        .unwrap();
+        assert!(long_input_hold(&fx.project));
+        let ctx = fx.world.ctx();
+        let board = crate::board::compute(&ctx, &fx.project);
+        assert!(
+            board
+                .iter()
+                .any(|(key, value)| key == "ade_needs_you" && value.contains("30 minutes"))
+        );
+        let context = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(context.contains("over 30 minutes"));
+    }
 
     #[test]
     fn a_cut_tail_is_skipped_terminated_and_reported_once() {
