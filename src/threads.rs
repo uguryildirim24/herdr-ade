@@ -1501,7 +1501,7 @@ pub struct RetryOutcome {
 /// process. Its durable failure class decides whether recovery stays on the
 /// same recipe, advances failed-work fallback routing, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::start, true)
+    retry_with_ticker(ctx, slug, id, reason, ticker::start)
 }
 
 /// Round recovery already holds the advance lock, so it must not replace and
@@ -1512,7 +1512,9 @@ pub(crate) fn retry_during_advance(
     id: &str,
     reason: &str,
 ) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, false)
+    // A manual round retry is the same coordinator decision as `thread
+    // retry`; only its ticker handling differs because advance_lock is held.
+    retry_with_ticker(ctx, slug, id, reason, ticker::ensure)
 }
 
 fn retry_with_ticker(
@@ -1521,7 +1523,6 @@ fn retry_with_ticker(
     id: &str,
     reason: &str,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
-    coordinator_unknown: bool,
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -1586,12 +1587,8 @@ fn retry_with_ticker(
         source_truncation: record.launch.source_truncation.as_ref(),
         ..Default::default()
     };
-    let selected = if coordinator_unknown {
-        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)
-    } else {
-        crate::launch::resolve_failure(ctx, &project, &input, record.failure_class)
-    };
-    let mut launch = selected?;
+    let mut launch =
+        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?;
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
