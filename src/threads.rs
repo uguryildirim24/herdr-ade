@@ -1,6 +1,7 @@
 //! The `thread` subcommands. Each is one deterministic mechanic; the
 //! coordinator decides whether, what and where.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -3130,6 +3131,17 @@ pub(crate) fn finished_worktree_reason(
     project: &Project,
     record: &Thread,
 ) -> Result<Option<String>> {
+    finished_worktree_reason_with_merged(ctx, project, record, None)
+}
+
+/// Doctor preloads the merged local branch names once per repository. Explicit
+/// removal still takes the individual SHA/ancestry path above and rechecks it.
+pub(crate) fn finished_worktree_reason_with_merged(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+    merged: Option<&BTreeSet<String>>,
+) -> Result<Option<String>> {
     if managed_git_folder(project, record) {
         let done = crate::events::list(project)
             .into_iter()
@@ -3169,6 +3181,14 @@ pub(crate) fn finished_worktree_reason(
             "work_not_done: no lane branch is recorded and no closed round contains the thread"
                 .into(),
         ));
+    }
+    if let Some(merged) = merged {
+        return Ok((!merged.contains(&record.branch)).then(|| {
+            format!(
+                "work_not_done: branch `{}` is not merged into the integration branch or is missing",
+                record.branch
+            )
+        }));
     }
     let Some(lane_head) = crate::git::branch_head(ctx.runner, &record.repo, &record.branch)? else {
         return Ok(Some(format!(
