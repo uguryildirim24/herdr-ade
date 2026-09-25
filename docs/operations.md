@@ -128,7 +128,6 @@ The starting table is:
 [routing]
 default = "pi_codex_sol_high"
 retries = 1
-fallback = []
 
 [[routing.rules]]
 workflow = "coordinator"
@@ -150,7 +149,7 @@ recipe = "claude_fable_xhigh"
 # "SHA256-of-exact-task-file-bytes" = "recipe-id"
 ```
 
-A rule may override the global recovery policy with `retries = N` and `fallback = ["recipe-a", "recipe-b"]`. `ha failed "<failure and evidence>"` reports failed work by default: it retries up to that bound, then tries each fallback once in order. `--class provider --provider-kind <kind>` and `--class lost_connection` use only bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. When recovery is exhausted, no other recipe is guessed.
+A rule may override the global recovery policy with `retries = N`. `ha failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
 
 Each launch record and dispatch-ledger row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. An explicit row also carries `recipe_basis` and `recipe_request`. Historical launch, dispatch and round records without those fields still load.
 

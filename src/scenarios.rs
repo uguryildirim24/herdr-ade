@@ -36,7 +36,7 @@ impl World {
         let root = home.path().join("root");
         let env = Env::for_test(home.path(), &[]);
         std::fs::create_dir_all(home.path().join("cfg")).unwrap();
-        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[machines.box]\ntarget = \"box\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [\"claude\"]\n").unwrap();
+        std::fs::write(home.path().join("cfg/config.toml"), "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[machines.box]\ntarget = \"box\"\nsession = \"default\"\nhome = \"/home/agent\"\nroot = \"/home/agent/.herdr-ade\"\nworktrees = \"/home/agent/projects\"\nbuild = \"/home/agent/build/lanes\"\npath = \"/home/agent/.local/bin:/usr/bin:/bin\"\nade_bin = \"/home/agent/.local/bin/herdr-ade\"\npi_bin = \"/home/agent/.local/bin/herdr-pi\"\nkinds = [\"claude\"]\n").unwrap();
         let world = World {
             env,
             root,
@@ -2043,7 +2043,7 @@ fn a_saved_machine_lookup_fault_never_becomes_a_lost_connection() {
     .unwrap();
     std::fs::write(
         world.home.path().join("cfg/config.toml"),
-        "[routing]\ndefault = \"test_claude\"\nretries = 1\nfallback = []\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+        "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
     )
     .unwrap();
     let ctx = world.ctx();
@@ -2391,16 +2391,8 @@ fn typed_provider_errors_reach_escalation_and_retry_the_same_recipe() {
 }
 
 #[test]
-fn provider_retries_do_not_consume_failed_work_retries_or_choose_a_fallback() {
+fn provider_retries_do_not_consume_failed_work_retries() {
     let world = World::new();
-    let config = world.home.path().join("cfg/config.toml");
-    let text = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(
-        &config,
-        text.replace("fallback = []", "fallback = [\"backup\"]")
-            + "\n[recipes.backup]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the backup helper\"\n",
-    )
-    .unwrap();
     let project = world.project("demo", "a.sock");
     let input = |previous, failure| crate::launch::ResolveInput {
         task: "Do the work.",
@@ -2432,14 +2424,14 @@ fn provider_retries_do_not_consume_failed_work_retries_or_choose_a_fallback() {
     assert_eq!(first_work.recipe_id, "test_claude");
     assert_eq!(first_work.escalations, 1);
     assert_eq!(first_work.same_recipe_retries, 0);
-    let fallback = crate::launch::resolve_failure(
+    let error = crate::launch::resolve_failure(
         &world.ctx(),
         &project,
         &input(Some(&first_work), Some("the retry failed")),
         crate::contracts::FailureClass::WorkFailed,
     )
-    .unwrap();
-    assert_eq!(fallback.recipe_id, "backup");
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("recovery_exhausted"));
 }
 
 #[test]

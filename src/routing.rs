@@ -15,7 +15,6 @@ pub struct Rule {
     pub capability: Option<String>,
     pub recipe: String,
     pub retries: Option<u32>,
-    pub fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +22,6 @@ pub struct Rule {
 pub struct Routing {
     pub default: String,
     pub retries: u32,
-    pub fallback: Vec<String>,
     pub pins: BTreeMap<String, String>,
     pub rules: Vec<Rule>,
 }
@@ -46,13 +44,9 @@ impl Routing {
     pub fn recipe_ids(&self) -> std::collections::BTreeSet<&str> {
         let mut ids = std::collections::BTreeSet::new();
         ids.insert(self.default.as_str());
-        ids.extend(self.fallback.iter().map(String::as_str));
         ids.extend(self.pins.values().map(String::as_str));
         for rule in &self.rules {
             ids.insert(rule.recipe.as_str());
-            if let Some(fallback) = &rule.fallback {
-                ids.extend(fallback.iter().map(String::as_str));
-            }
         }
         ids
     }
@@ -64,9 +58,6 @@ impl Routing {
             );
         }
         self.validate_recipe(recipes, &self.default)?;
-        for recipe in &self.fallback {
-            self.validate_recipe(recipes, recipe)?;
-        }
         for (hash, recipe) in &self.pins {
             if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 bail!("routing_pin_invalid: pins use SHA-256 brief hashes");
@@ -88,11 +79,6 @@ impl Routing {
                     "routing_capability_missing: rule[{index}] selects `{}` which does not declare `{capability}`",
                     rule.recipe
                 );
-            }
-            if let Some(fallback) = &rule.fallback {
-                for recipe in fallback {
-                    self.validate_recipe(recipes, recipe)?;
-                }
             }
         }
         Ok(())
@@ -152,37 +138,26 @@ impl Routing {
                     .as_ref()
                     .is_none_or(|value| work.capability.as_ref() == Some(value))
         });
-        let (base, retries, fallback, mut label) = if let Some((index, rule)) = matched {
+        let (base, retries, mut label) = if let Some((index, rule)) = matched {
             (
                 rule.recipe.as_str(),
                 rule.retries.unwrap_or(self.retries),
-                rule.fallback.as_ref().unwrap_or(&self.fallback),
                 format!("rule[{index}]"),
             )
         } else {
-            (
-                self.default.as_str(),
-                self.retries,
-                &self.fallback,
-                "default".to_string(),
-            )
+            (self.default.as_str(), self.retries, "default".to_string())
         };
         let pin = self.pins.get(brief_hash);
         if pin.is_some() {
             label = "pin".into();
         }
         let first = pin.map_or(base, String::as_str);
-        let recipe = if recovery <= retries {
-            first
-        } else {
-            let fallback_index = recovery.saturating_sub(retries).saturating_sub(1) as usize;
-            fallback.get(fallback_index).map(String::as_str).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "recovery_exhausted: {label} allowed {retries} retries and {} fallbacks; waiting for the coordinator",
-                    fallback.len()
-                )
-            })?
-        };
+        if recovery > retries {
+            bail!(
+                "recovery_exhausted: {label} allowed {retries} retries; waiting for the coordinator"
+            );
+        }
+        let recipe = first;
         Ok(Selection {
             recipe: recipe.to_string(),
             rule: label,
@@ -204,7 +179,7 @@ mod tests {
     }
 
     fn recipes() -> BTreeMap<String, Recipe> {
-        ["default", "rule", "pinned", "fallback"]
+        ["default", "rule", "pinned"]
             .into_iter()
             .map(|id| (id.to_string(), recipe()))
             .collect()
@@ -214,7 +189,6 @@ mod tests {
         Routing {
             default: "default".into(),
             retries: 1,
-            fallback: vec!["fallback".into()],
             pins: BTreeMap::new(),
             rules: vec![Rule {
                 workflow: Some("reviewer".into()),
@@ -251,18 +225,14 @@ mod tests {
     }
 
     #[test]
-    fn recovery_retries_then_falls_back_then_stops() {
+    fn recovery_retries_on_the_same_recipe_then_stops() {
         let table = routing();
         assert_eq!(
             table.select("hash", &work("lane"), 1).unwrap().recipe,
             "default"
         );
-        assert_eq!(
-            table.select("hash", &work("lane"), 2).unwrap().recipe,
-            "fallback"
-        );
         let error = table
-            .select("hash", &work("lane"), 3)
+            .select("hash", &work("lane"), 2)
             .unwrap_err()
             .to_string();
         assert!(error.contains("recovery_exhausted"), "{error}");

@@ -324,7 +324,7 @@ pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Res
 
 /// Apply the recovery policy without turning infrastructure evidence into
 /// failed work. Provider and connection failures get bounded same-recipe
-/// retries; a gone process restarts; only failed work may select a fallback.
+/// retries; a gone process restarts. Failed work retries its original recipe.
 pub fn resolve_failure(
     ctx: &Ctx,
     project: &Project,
@@ -366,7 +366,7 @@ pub fn resolve_failure(
 
 /// The coordinator may replace an unknown failed attempt after recording why.
 /// This is a bounded same-recipe retry; unknown evidence never selects a
-/// fallback recipe and automatic escalation still waits for this decision.
+/// different recipe and automatic recovery still waits for this decision.
 pub fn resolve_coordinator_retry(
     ctx: &Ctx,
     project: &Project,
@@ -464,7 +464,18 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
                 pinned: true,
             }
         }
-        (None, None) => config.routing.select(&hash, &work, recovery)?,
+        (None, None) => {
+            let selected = config.routing.select(&hash, &work, recovery)?;
+            if let Some(previous) = input.previous {
+                crate::routing::Selection {
+                    recipe: previous.recipe_id.clone(),
+                    rule: previous.routing_rule.clone(),
+                    pinned: selected.pinned,
+                }
+            } else {
+                selected
+            }
+        }
         (Some(_), Some(_)) => bail!("recipe_choice_ambiguous"),
     };
     let recipe = config

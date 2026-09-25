@@ -45,7 +45,6 @@ impl Default for ConfigRecipe {
 #[serde(default)]
 struct ConfigRouting {
     default: String,
-    fallback: Vec<String>,
     pins: BTreeMap<String, String>,
     rules: Vec<ConfigRule>,
 }
@@ -54,7 +53,6 @@ struct ConfigRouting {
 #[serde(default)]
 struct ConfigRule {
     recipe: String,
-    fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -107,13 +105,9 @@ fn uses_pi(config: &RecipeConfig, recipe: &ConfigRecipe) -> bool {
 fn routed_ids(routing: &ConfigRouting) -> BTreeSet<&str> {
     let mut ids = BTreeSet::new();
     ids.insert(routing.default.as_str());
-    ids.extend(routing.fallback.iter().map(String::as_str));
     ids.extend(routing.pins.values().map(String::as_str));
     for rule in &routing.rules {
         ids.insert(rule.recipe.as_str());
-        if let Some(fallback) = &rule.fallback {
-            ids.extend(fallback.iter().map(String::as_str));
-        }
     }
     ids
 }
