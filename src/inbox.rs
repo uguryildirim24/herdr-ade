@@ -136,11 +136,7 @@ pub(crate) fn write_event(
     }
     let _lock = project.lock()?;
     project.record_dir_for_write("inbox")?;
-    let id = if kind == "recipient-changed" {
-        format!("recipient-changed-{}", event.id)
-    } else {
-        format!("event-{}", event.id)
-    };
+    let id = format!("event-{}", event.id);
     validate_id(&id)?;
     let path = inbox_dir(project).join(format!("{id}.md"));
     if path.exists()
@@ -212,7 +208,7 @@ pub(crate) fn seen(project: &Project) -> BTreeSet<String> {
     project::read_json(&project.state_dir().join("inbox-seen.json")).unwrap_or_default()
 }
 
-/// Records that `context` showed these items, so they are nudged once only.
+/// Records that `context` showed these items, so they are announced once only.
 pub(crate) fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -239,14 +235,8 @@ pub(crate) fn acknowledge_events(
         .filter(|item| ids.contains(&item.id) && !item.event.is_empty())
     {
         let event = crate::events::load(project, &item.event)?;
-        let binding_matches = if item.kind == "recipient-changed" {
-            project.coordinator().is_some_and(|record| {
-                record.pane_id == pane && record.attempt() == coordinator_attempt
-            })
-        } else {
-            event.recipient.pane == pane
-                && event.recipient.coordinator_attempt == coordinator_attempt
-        };
+        let binding_matches = event.recipient.pane == pane
+            && event.recipient.coordinator_attempt == coordinator_attempt;
         if binding_matches {
             crate::events::append_delivery(
                 project,
@@ -343,18 +333,11 @@ pub(crate) fn done_bound(
             let Some((pane, attempt)) = binding else {
                 bail!("coordinator_binding_required: event item `{id}` needs its coordinator");
             };
-            let is_current = current
-                .as_ref()
-                .is_some_and(|(p, a)| p == pane && *a == attempt);
-            let own =
-                event.recipient.pane == pane && event.recipient.coordinator_attempt == attempt;
-            // The current coordinator also handles items of a binding it
-            // replaced; nobody else can.
-            let binding_matches = if item.kind == "recipient-changed" {
-                is_current
-            } else {
-                own || is_current
-            };
+            let binding_matches = event.recipient.pane == pane
+                && event.recipient.coordinator_attempt == attempt
+                || current
+                    .as_ref()
+                    .is_some_and(|(p, a)| p == pane && *a == attempt);
             if !binding_matches {
                 bail!("coordinator_binding_mismatch: event item `{id}` belongs to another binding");
             }
@@ -634,51 +617,6 @@ mod tests {
                 .moved
                 .len(),
             2
-        );
-    }
-
-    #[test]
-    fn replacement_coordinator_acknowledges_recipient_changed_item() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        project
-            .update_coordinator(|record| {
-                record.pane_id = "w2:p1".into();
-                record.generation = 3;
-            })
-            .unwrap();
-        let event = crate::contracts::Event {
-            id: "t-0001-1-1".into(),
-            op: "t-0001-1-1".into(),
-            thread: "t-0001".into(),
-            attempt: 1,
-            round: None,
-            recipient: crate::contracts::Recipient {
-                pane: "w1:p1".into(),
-                coordinator_attempt: 1,
-            },
-            created: project::now(),
-            payload: crate::contracts::EventPayload {
-                done: None,
-                waiting: Some(crate::contracts::WaitingPayload {
-                    text: "wait".into(),
-                    ..Default::default()
-                }),
-                failed: None,
-            },
-        };
-        crate::events::seal_create_if_absent(&project, &event).unwrap();
-        let item = write_event(
-            &project,
-            &event,
-            "recipient-changed",
-            "an earlier event needs review",
-        )
-        .unwrap();
-        acknowledge_events(&project, &[item], "w2:p1", 3).unwrap();
-        assert_eq!(
-            crate::events::states(&project, &event.id).unwrap(),
-            vec![crate::contracts::DeliveryState::Acknowledged]
         );
     }
 }
