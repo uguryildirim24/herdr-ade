@@ -1749,6 +1749,20 @@ fn box_rows_with_snapshot(
         path = crate::remote::quote(&machine_paths.path),
         home = crate::remote::quote(&machine_paths.home),
     );
+    script.push_str(r#"printf 'load\t%s\n' "$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || true)"
+samples=
+for unit in $(systemctl --user list-units --plain --no-legend --type=slice 'herdr-ade-*.slice' 2>/dev/null | awk '{print $1}'); do
+  first=$(systemctl --user show --value -p CPUUsageNSec "$unit" 2>/dev/null || true)
+  samples="$samples $unit:$first"
+done
+if [ -n "$samples" ]; then sleep 0.2; fi
+for sample in $samples; do
+  unit=${sample%%:*}; first=${sample#*:}
+  second=$(systemctl --user show --value -p CPUUsageNSec "$unit" 2>/dev/null || true)
+  rate=$(awk -v a="$first" -v b="$second" 'BEGIN { if (a ~ /^[0-9]+$/ && b ~ /^[0-9]+$/ && b >= a) printf "%.1f%%", (b-a)/2000000; else print "unknown" }')
+  printf 'slice_%s\t%s\n' "$unit" "$rate"
+done
+"#);
     for probe in natives.values() {
         script.push_str(&box_native_probe_script(probe, true, &machine_paths));
     }
@@ -1827,6 +1841,32 @@ fn box_rows_with_snapshot(
         }
     };
     let fact = |key: &str| facts.get(key).cloned().unwrap_or_default();
+    let load = fact("load");
+    let cores = fact("nproc");
+    let load_value = load.parse::<f64>().ok();
+    let core_count = cores.parse::<u32>().ok();
+    let overloaded = load_value.zip(core_count).and_then(|(load, cores)| {
+        crate::remote::load_wait_reason(load, cores, machine_paths.load_limit)
+    });
+    rows.push((
+        load_value.zip(core_count).map(|_| overloaded.is_none()),
+        format!("box {label} load"),
+        format!(
+            "1-minute load {load} on {cores} cores (queue above {:.1} × cores){}",
+            machine_paths.load_limit,
+            overloaded.map_or(String::new(), |reason| format!("; {reason}"))
+        ),
+    ));
+    for (key, value) in facts.iter().filter(|(key, _)| key.starts_with("slice_")) {
+        rows.push((
+            Some(true),
+            format!("box {label} project {}", key.trim_start_matches("slice_")),
+            format!(
+                "CPU use {value}; systemd user slice {}",
+                key.trim_start_matches("slice_")
+            ),
+        ));
+    }
     rows.push((
         env_bool(&fact("boot"), &["enabled"]),
         format!("box {label} boot"),
@@ -3885,6 +3925,8 @@ recipe = "claude_fable_xhigh"
             "server\therdr 0.9.1",
             "tailscale\t100.91.36.88",
             "nproc\t16",
+            "load\t1.0",
+            "slice_herdr-ade-demo.slice\t12.5%",
             "mem_avail_kb\t40000000",
             "df_free\t100000000000",
             "listeners\t2",
@@ -3975,6 +4017,13 @@ recipe = "claude_fable_xhigh"
         assert_eq!(
             find("box buildbox repo /home/agent/projects/herdr").0,
             Some(true)
+        );
+        assert_eq!(find("box buildbox load").0, Some(true));
+        assert!(find("box buildbox load").1.contains("1-minute load 1.0"));
+        assert!(
+            find("box buildbox project herdr-ade-demo.slice")
+                .1
+                .contains("CPU use 12.5%")
         );
         assert_eq!(find("box buildbox capacity").0, Some(true));
         assert!(
