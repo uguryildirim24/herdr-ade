@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::herdr::Herdr;
 use crate::paths::Ctx;
-use crate::project::{self, Project};
+use crate::project::Project;
 use crate::thread::{self, Kind, Thread};
 
 fn eligible(ctx: &Ctx, project: &Project, t: &Thread, cwd: &str, screen: &str) -> bool {
@@ -39,7 +39,7 @@ fn eligible(ctx: &Ctx, project: &Project, t: &Thread, cwd: &str, screen: &str) -
     if !std::fs::symlink_metadata(&marker).is_ok_and(|m| m.file_type().is_file()) {
         return false;
     }
-    let Ok(gitdir) = std::fs::read_to_string(marker) else {
+    let Ok(gitdir) = std::fs::read_to_string(&marker) else {
         return false;
     };
     let Some(gitdir) = gitdir.trim().strip_prefix("gitdir: ") else {
@@ -48,22 +48,31 @@ fn eligible(ctx: &Ctx, project: &Project, t: &Thread, cwd: &str, screen: &str) -
     let Ok(common) = std::fs::canonicalize(repo.join(".git").join("worktrees")) else {
         return false;
     };
-    if std::fs::canonicalize(gitdir).ok().as_deref() != Some(common.join(&t.id).as_path()) {
+    let registered_gitdir = common.join(&t.id);
+    if std::fs::canonicalize(gitdir).ok().as_deref() != Some(registered_gitdir.as_path())
+        || std::fs::read_to_string(registered_gitdir.join("gitdir"))
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path.trim()).ok())
+            .as_deref()
+            != Some(marker.as_path())
+        || std::fs::read_to_string(registered_gitdir.join("HEAD"))
+            .ok()
+            .is_none_or(|head| head.trim() != format!("ref: refs/heads/{}", t.branch))
+    {
         return false;
     }
-    // Only a canonical root explicitly listed in a project's PROJECT.md is
-    // eligible, even if the current project record happens to name the repo.
-    if !project::list_slugs(&ctx.root).iter().any(|slug| {
-        Project::load(&ctx.root, slug)
-            .ok()
-            .and_then(|p| p.read_project_md().ok())
-            .is_some_and(|(settings, _)| {
-                settings
-                    .repos
-                    .iter()
-                    .any(|r| std::fs::canonicalize(&r.path).ok().as_ref() == Some(&repo))
-            })
-    }) {
+    // The lane's own project must still register this repo. Another project's
+    // registration does not authorize this project's lane.
+    if !Project::load(&ctx.root, &project.slug)
+        .ok()
+        .and_then(|current| current.read_project_md().ok())
+        .is_some_and(|(settings, _)| {
+            settings
+                .repos
+                .iter()
+                .any(|r| std::fs::canonicalize(&r.path).ok().as_ref() == Some(&repo))
+        })
+    {
         return false;
     }
     // The dialog must actually name this worktree, not just its repo root or
@@ -97,7 +106,7 @@ pub(crate) fn answer(ctx: &Ctx, project: &Project, t: &Thread, herdr: &Herdr<'_>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::Repo;
+    use crate::project::{self, Repo};
     use crate::runner::fake::{FakeRunner, ok};
     use crate::thread::Status;
 
@@ -226,6 +235,20 @@ mod tests {
         assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
         std::fs::remove_file(&marker).unwrap();
         std::fs::write(&marker, target).unwrap();
+        let gitdir = repo.join(".git/worktrees").join(id);
+        let head = std::fs::read_to_string(gitdir.join("HEAD")).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/unrelated\n").unwrap();
+        assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
+        std::fs::write(gitdir.join("HEAD"), head).unwrap();
+        let backlink = std::fs::read_to_string(gitdir.join("gitdir")).unwrap();
+        std::fs::write(
+            gitdir.join("gitdir"),
+            repo.join(".git").display().to_string(),
+        )
+        .unwrap();
+        assert!(!eligible(&ctx, &project, &t, &t.cwd, &screen));
+        std::fs::write(gitdir.join("gitdir"), backlink).unwrap();
+        assert!(eligible(&ctx, &project, &t, &t.cwd, &screen));
         let unregistered = tmp.path().join("other-repo");
         std::fs::create_dir(&unregistered).unwrap();
         let run = |args: &[&str]| {
@@ -264,6 +287,18 @@ mod tests {
         t.worktree_path = t.cwd.clone();
         t.thread_dir = thread::thread_dir(&t.worktree_path, &project.slug, id);
         let other_screen = format!("Trust this folder?\n{}\n  1. Yes", other_wt.display());
+        assert!(!eligible(&ctx, &project, &t, &t.cwd, &other_screen));
+        // A different project's registration must not authorize this lane.
+        project::create(
+            tmp.path(),
+            "second",
+            "test",
+            vec![Repo {
+                path: unregistered.to_string_lossy().into_owned(),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
         assert!(!eligible(&ctx, &project, &t, &t.cwd, &other_screen));
     }
 }
