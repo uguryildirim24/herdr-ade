@@ -266,6 +266,7 @@ struct Candidate {
 
 fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
     let mut result = Vec::new();
+    let mut merged_by_repo = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
         let (settings, _) = project.read_project_md()?;
@@ -282,9 +283,24 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
                 Some(url) => refs(ctx.runner, &row.path, Some(url))?,
                 None => BTreeMap::new(),
             };
-            let base = row.branch.as_deref().unwrap_or("main");
             let mut names: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
             names.retain(|name| harness_ref(name) && !in_use.contains(name));
+            if names.is_empty() {
+                continue;
+            }
+            let base = row.branch.as_deref().unwrap_or("main");
+            // Traverse the base history once per repo/base. A merged branch
+            // can point at an ancestor that is no longer any local ref tip;
+            // remote-only refs can do so too, if the object is present here.
+            let key = (row.path.clone(), base.to_owned());
+            if !merged_by_repo.contains_key(&key) {
+                let history = git(ctx.runner, &row.path, &["rev-list", base])?
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                merged_by_repo.insert(key.clone(), history);
+            }
+            let merged = &merged_by_repo[&key];
             for name in names {
                 let resolved = threads.iter().any(|t| {
                     t.repo == row.path
@@ -306,9 +322,7 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
                     .get(&name)
                     .into_iter()
                     .chain(remote.get(&name))
-                    .all(|sha| {
-                        crate::git::is_ancestor(ctx.runner, &row.path, sha, base).unwrap_or(false)
-                    });
+                    .all(|sha| merged.contains(sha));
                 // An open thread still owns its ref, even when it has not
                 // diverged from the base yet.
                 let active = threads.iter().any(|t| {
@@ -384,7 +398,21 @@ pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::process::Command;
+
+    struct CountingRunner(Cell<usize>);
+    impl Runner for CountingRunner {
+        fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+            if cmd.program == "git" && cmd.args.iter().any(|arg| arg == "rev-list") {
+                self.0.set(self.0.get() + 1);
+            }
+            crate::runner::RealRunner.run(cmd)
+        }
+        fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
+            crate::runner::RealRunner.socket_request(socket, line, timeout)
+        }
+    }
     fn run(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
@@ -527,6 +555,52 @@ mod tests {
             !refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
                 .unwrap()
                 .contains_key("hp/demo/t-2")
+        );
+    }
+
+    #[test]
+    fn inventory_checks_base_history_once_for_many_branches() {
+        let (fx, _bare) = configured();
+        for index in 0..30 {
+            run(&fx.repo, &["branch", &format!("hp/demo/t-{index}"), "main"]);
+        }
+        let runner = CountingRunner(Cell::new(0));
+        let original = fx.world.ctx();
+        let ctx = Ctx {
+            runner: &runner,
+            ..original
+        };
+        let plan = doctor(&ctx, None).unwrap();
+        assert!(plan.contains("hp/demo/t-29"));
+        assert_eq!(runner.0.get(), 1);
+    }
+
+    #[test]
+    fn remote_tip_behind_base_with_no_local_ref_is_still_landed() {
+        let (fx, bare) = configured();
+        let old = run(&fx.repo, &["rev-parse", "main"]);
+        run(
+            &fx.repo,
+            &[
+                "push",
+                "-q",
+                bare.path().to_str().unwrap(),
+                &format!("{old}:refs/heads/hp/demo/t-old"),
+            ],
+        );
+        run(
+            &fx.repo,
+            &["commit", "--allow-empty", "-qm", "advance main"],
+        );
+        assert!(
+            !refs(fx.world.ctx().runner, fx.repo.to_str().unwrap(), None)
+                .unwrap()
+                .contains_key("hp/demo/t-old")
+        );
+        assert!(
+            doctor(&fx.world.ctx(), None)
+                .unwrap()
+                .contains("hp/demo/t-old")
         );
     }
 
