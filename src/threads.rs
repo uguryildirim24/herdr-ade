@@ -1616,6 +1616,24 @@ fn retry_with_ticker(
     if record.status == Status::Resolved {
         bail!("retry_resolved: {id} is resolved");
     }
+    if record.parked {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            bail!("retry_reason_missing: say why the parked lane is needed again");
+        }
+        // A correction to sealed work keeps the same branch and attempt.
+        // Routing recovery is only for a failed start or failed work.
+        let outcome = prompt(ctx, slug, id, reason)?;
+        return Ok(RetryOutcome {
+            thread: id.into(),
+            attempt: match outcome {
+                PromptOutcome::Queued { attempt } | PromptOutcome::Sent { attempt, .. } => attempt,
+            },
+            pane_id: thread::load(&project, id)?.pane_id,
+            recipe: record.launch.recipe_id,
+            screen: None,
+        });
+    }
     let reason = reason.trim();
     if reason.is_empty() {
         bail!("retry_reason_missing: say why the attempt is being replaced");
@@ -2372,6 +2390,28 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             });
         }
     }
+    let mut restored_context = None;
+    if record.parked {
+        let events = crate::round::sealed_events(&project)?;
+        let previous_group = record.last_group.clone();
+        thread::update(&project, id, |t| {
+            t.last_group = Group::Working.token().into()
+        })?;
+        if let Err(error) = crate::round::hold_for_follow_up(ctx, &project, id, &events) {
+            thread::update(&project, id, |t| t.last_group = previous_group)?;
+            return Err(error);
+        }
+        if !reopen_parked(ctx, &project, &record)? {
+            restored_context = Some(format!(
+                "Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
+                record.thread_dir,
+                record.report_path(),
+                text
+            ));
+        }
+        record = thread::load(&project, id)?;
+    }
+    let text = restored_context.as_deref().unwrap_or(text);
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
     let kind = if record.launch.kind.is_empty() {
@@ -3081,6 +3121,278 @@ pub(crate) fn fail_start(
 /// one unit, but a workspace containing another pane, tab, or agent is shared
 /// and only this lane's tab is closed. A tab herdr no longer knows, or a
 /// session it cannot reach, has nothing to close and is not an error.
+/// A completion is parkable only after its delivery has been submitted and no
+/// follow-up still expects another seal. This check also shields a manually
+/// closed completed pane from process-gone recovery before the next tick.
+pub(crate) fn parkable(project: &Project, record: &Thread) -> bool {
+    if record.status != Status::Open || record.prompt_pending {
+        return false;
+    }
+    let events = crate::events::list(project);
+    let Some(done) = crate::round::latest_done_event(&events, &record.id, record.attempt.max(1))
+    else {
+        return false;
+    };
+    !record.follow_ups.iter().any(|f| {
+        f.attempt == record.attempt.max(1)
+            && (matches!(f.state, FollowUpState::Queued | FollowUpState::Uncertain)
+                || (f.state == FollowUpState::Delivered && f.after_seal == done.id))
+    })
+}
+
+/// Bring a completed lane back without provisioning its branch or replacing
+/// its frozen task. The old agent session id is kept across the pane close.
+fn reopen_parked(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
+    let view = require_session(ctx, project)?;
+    let herdr = view.herdr.on_machine(record.machine_route());
+    let coordinator = project
+        .coordinator()
+        .context("project coordinator missing")?;
+    let machine = if record.is_remote() {
+        Some(remote::declaration_for_route(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?)
+    } else {
+        None
+    };
+    let spec = crate::contracts::RoleSpec {
+        kind: record.launch.kind.clone(),
+        args: record.launch.args.clone(),
+        env: record.launch.env.clone(),
+        ready_timeout_ms: record.launch.ready_timeout_ms,
+    };
+    let env = project::tab_env(
+        &project.slug,
+        &record.id,
+        record.attempt.max(1),
+        &record.launch.brief_hash,
+        machine.as_ref(),
+        &spec,
+    );
+    let folder = Path::new(&record.worktree_path);
+    let created = if record.is_remote() {
+        let _lock =
+            project::remote_workspace_lock(&ctx.root, &project.slug, record.machine_route())?;
+        let (settings, _) = project.read_project_md()?;
+        let label = project::display_name(&settings.name, &project.slug);
+        let workspaces: Vec<_> = herdr
+            .workspace_list()?
+            .into_iter()
+            .filter(|w| w.label == label)
+            .collect();
+        if workspaces.len() > 1 {
+            bail!("remote_workspace_duplicate: multiple workspaces for {label}");
+        }
+        match workspaces.first() {
+            Some(workspace) => {
+                herdr.tab_create_env(&workspace.workspace_id, folder, &record.id, false, &env)?
+            }
+            None => herdr.workspace_create_env(folder, &label, false, &env)?,
+        }
+    } else {
+        herdr.tab_create_env(&coordinator.workspace_id, folder, &record.id, false, &env)?
+    };
+    let cwd = herdr
+        .pane_cwd(&created.pane_id)
+        .unwrap_or_else(|_| record.worktree_path.clone());
+    let mut placed = record.clone();
+    placed.workspace_id = created.workspace_id;
+    placed.tab_id = created.tab_id;
+    placed.pane_id = created.pane_id;
+    placed.cwd = if cwd.is_empty() {
+        record.worktree_path.clone()
+    } else {
+        cwd
+    };
+    let old_session = record.identity.agent_session.as_deref();
+    let mut args = record.launch.args.clone();
+    let resuming = match (record.launch.kind.as_str(), old_session) {
+        ("pi", Some(id)) => {
+            args.extend(["--session".into(), id.into()]);
+            true
+        }
+        ("claude", Some(id)) => {
+            args.extend(["--resume".into(), id.into()]);
+            true
+        }
+        ("codex", Some(id)) => {
+            args.extend(["resume".into(), id.into()]);
+            true
+        }
+        _ => false,
+    };
+    // A fresh agent must read the old report and the new instruction, rather
+    // than silently starting from an empty conversation.
+    let result = (|| -> Result<bool> {
+        if let Some(machine) = &machine {
+            herdr.pane_set_parent(&placed.pane_id, &parent_token(record, &coordinator.pane_id))?;
+            // The box's `ha done` authenticates the pane against its lane
+            // card. Rebind that card before starting a resumed agent.
+            let profile = remote::machine_profile(
+                ctx.runner,
+                &ctx.env.herdr_bin(),
+                &ctx.config_dir,
+                record.machine_route(),
+            )?;
+            let (settings, _) = project.read_project_md()?;
+            let (box_repo, publish_url) =
+                box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+            let card = crate::contracts::LaneCard {
+                project: project.slug.clone(),
+                thread: record.id.clone(),
+                attempt: record.attempt.max(1),
+                brief_hash: record.launch.brief_hash.clone(),
+                role: record.role.clone(),
+                kind: record.launch.kind.clone(),
+                pane_id: placed.pane_id.clone(),
+                machine_label: record.machine.clone(),
+                machine_id: record.machine_id.clone(),
+                box_repo,
+                box_worktree: record.worktree_path.clone(),
+                brief_commit: record.base.clone(),
+                branch: record.branch.clone(),
+                publish_url,
+                recipient: crate::contracts::Recipient {
+                    pane: coordinator.pane_id.clone(),
+                    coordinator_attempt: coordinator.attempt(),
+                },
+                start_line: thread::launch_prompt(
+                    &format!("{} --root {}", machine.ade_bin, machine.root),
+                    &project.slug,
+                    record,
+                ),
+                created: project::now(),
+            };
+            remote::provision_card(
+                ctx.runner,
+                &profile.target,
+                &project.slug,
+                &format!(
+                    "{}/{}/.state/lanes/{}.toml",
+                    machine.root, project.slug, record.id
+                ),
+                &toml::to_string(&card)?,
+            )?;
+            remote::prepare_project_slice(ctx.runner, machine, &project.slug, &record.launch.kind)?;
+        }
+        let exclusive_bin = machine
+            .as_ref()
+            .map(|m| format!("{}/.state/slices/{}/bin", m.root, project.slug));
+        let agent = herdr.agent_start_opts(&crate::herdr::AgentStart {
+            name: &record.agent_name,
+            kind: &record.launch.kind,
+            pane: &placed.pane_id,
+            agent_args: &args,
+            launch_bin: exclusive_bin.as_deref(),
+            parent: if record.is_remote() {
+                None
+            } else {
+                Some(&coordinator.pane_id)
+            },
+            ready_timeout_ms: record.launch.ready_timeout_ms,
+        })?;
+        let process = herdr
+            .pane_process_info(&placed.pane_id)
+            .ok()
+            .and_then(|info| info.identity(&record.launch.kind));
+        if let Some(machine) = &machine {
+            let pid = process
+                .as_ref()
+                .context("reopened box agent process missing")?
+                .pid;
+            placed.checked_slice =
+                remote::check_agent_slice(ctx.runner, machine, &project.slug, pid)?;
+        }
+        thread::update_checked(project, &record.id, |t| {
+            if !t.parked || t.attempt != record.attempt {
+                bail!("reopen_stale: completion changed during reopen");
+            }
+            t.workspace_id = placed.workspace_id.clone();
+            t.tab_id = placed.tab_id.clone();
+            t.pane_id = placed.pane_id.clone();
+            t.cwd = placed.cwd.clone();
+            t.checked_slice = placed.checked_slice.clone();
+            t.parked = false;
+            t.last_group = Group::Working.token().into();
+            t.last_state = agent.agent_status.clone();
+            t.last_state_change = project::now();
+            let prior_session = t.identity.agent_session.clone();
+            thread::bind_identity(t, &coordinator.socket, &agent, process);
+            if t.identity.agent_session.is_none() {
+                t.identity.agent_session = prior_session;
+            }
+            Ok(())
+        })?;
+        Ok(resuming)
+    })();
+    if result.is_err() {
+        let _ = close_pane(ctx, project, &placed);
+    }
+    result
+}
+
+pub(crate) fn park_completed(ctx: &Ctx, project: &Project) -> Result<()> {
+    let mut first = None;
+    for record in thread::list(project) {
+        if let Err(error) = park_one(ctx, project, &record) {
+            first.get_or_insert(error.context(format!("{}: park", record.id)));
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+fn park_one(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if record.parked || !parkable(project, record) {
+        return Ok(());
+    }
+    let Some(done) = crate::round::latest_done_event(
+        &crate::events::list(project),
+        &record.id,
+        record.attempt.max(1),
+    )
+    .cloned() else {
+        return Ok(());
+    };
+    let delivered = crate::events::states(project, &done.id)?
+        .iter()
+        .any(|state| {
+            matches!(
+                state,
+                crate::contracts::DeliveryState::Submitted
+                    | crate::contracts::DeliveryState::Acknowledged
+                    | crate::contracts::DeliveryState::Handled
+            )
+        });
+    let adopted = crate::round::list(project).iter().any(|round| {
+        round.manifest.members.iter().any(|member| {
+            member.thread == record.id
+                && member.pin.as_ref().is_some_and(|pin| pin.event == done.id)
+        }) || round.reviewer.as_deref() == Some(&record.id)
+            && round
+                .verdict
+                .as_ref()
+                .is_some_and(|pin| pin.event == done.id)
+    });
+    if !delivered && !adopted {
+        return Ok(());
+    }
+    if !record.tab_id.is_empty() {
+        close_pane(ctx, project, record)?;
+    }
+    thread::update_checked(project, &record.id, |t| {
+        if t.attempt != record.attempt || !parkable(project, t) {
+            bail!("park_stale: lane changed while its pane closed");
+        }
+        t.parked = true;
+        t.last_group = Group::Parked.token().into();
+        Ok(())
+    })?;
+    Ok(())
+}
+
 pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
     if record.tab_id.is_empty() {
         return Ok(false);
@@ -3785,7 +4097,14 @@ pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
     let now = jiff::Timestamp::now();
     thread::list(project)
         .into_iter()
-        .map(|t| row(&t, view.as_ref(), now))
+        .map(|t| {
+            let mut result = row(&t, view.as_ref(), now);
+            if result.note.starts_with("process gone:") && parkable(project, &t) {
+                result.group = Group::Parked;
+                result.note = "pane parked until requested".into();
+            }
+            result
+        })
         .collect()
 }
 
@@ -3802,6 +4121,13 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
             } else {
                 t.resolved_reason.clone()
             },
+        };
+    }
+    if t.parked {
+        return Row {
+            thread: t.clone(),
+            group: Group::Parked,
+            note: "pane parked until requested".into(),
         };
     }
     if t.queued_for_load {
@@ -4175,6 +4501,79 @@ mod tests {
     }
 
     #[test]
+    fn sealed_lane_reopens_on_prompt_and_retry_in_same_folder_with_session() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, agent_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let folder = world.home.path().join("lane");
+        std::fs::create_dir_all(&folder).unwrap();
+        let lane = world.thread(&project, &folder, |t| {
+            t.attempt = 1;
+            t.parked = true;
+            t.last_group = Group::Parked.token().into();
+            t.bootstrap = "acknowledged".into();
+            t.prompt_pending = false;
+            t.launch.kind = "pi".into();
+            t.launch.recipe_id = "test_pi".into();
+            t.launch.brief_hash = "brief".into();
+            t.agent = "pi".into();
+            t.identity.agent_session = Some("session-42".into());
+        });
+        thread::update(&project, &lane.id, |t| t.bootstrap = "acknowledged".into()).unwrap();
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        let cwd = folder.to_string_lossy();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w1", "w1:t2", "w1:p2", &cwd, &lane.agent_name, "idle")
+        );
+        world.runner.on("tab create", ok(&format!(
+            r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{cwd}"}}}}}}"#
+        )));
+        world.runner.on(
+            "pane cwd",
+            ok(&format!(r#"{{"result":{{"cwd":"{cwd}"}}}}"#)),
+        );
+        world.runner.on("agent start", ok(&format!(
+            r#"{{"result":{{"agent":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{cwd}","name":"{}","agent_status":"idle"}}}}}}"#,
+            lane.agent_name
+        )));
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        world.runner.on(
+            "pane process-info",
+            ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+        );
+        let ctx = world.ctx();
+        let outcome = prompt(&ctx, "demo", &lane.id, "Fix the rejection").unwrap();
+        assert!(matches!(outcome, PromptOutcome::Sent { .. }), "{outcome:?}");
+        let reopened = thread::load(&project, &lane.id).unwrap();
+        assert!(!reopened.parked);
+        assert_eq!(reopened.worktree_path, lane.worktree_path);
+        assert_eq!(reopened.attempt, 1);
+        assert!(world.runner.calls.borrow().iter().any(|c| {
+            let text = c.display();
+            text.contains("agent start") && text.contains("--session session-42")
+        }));
+        // Round retry uses the same reopen path instead of spending a new attempt.
+        thread::update(&project, &lane.id, |t| {
+            t.parked = true;
+            t.last_group = Group::Parked.token().into();
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+        })
+        .unwrap();
+        let retried = retry_during_advance(&ctx, "demo", &lane.id, "Repair the conflict").unwrap();
+        assert_eq!(retried.attempt, 1);
+        assert_eq!(retried.pane_id, "w1:p2");
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().worktree_path,
+            lane.worktree_path
+        );
+        assert_eq!(world.runner.count("agent prompt"), 2);
+    }
+
+    #[test]
     fn token_values_and_ranks() {
         let tokens = thread_tokens(&worktree_thread(), "demo", Group::WaitingOnYou);
         assert_eq!(
@@ -4183,7 +4582,7 @@ mod tests {
                 ("project".to_string(), "demo".to_string()),
                 ("thread".to_string(), "t-0001".to_string()),
                 ("review".to_string(), "waiting-on-you".to_string()),
-                ("rank".to_string(), "2".to_string()),
+                ("rank".to_string(), "3".to_string()),
             ]
         );
     }

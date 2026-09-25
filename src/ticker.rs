@@ -618,6 +618,11 @@ fn tick_with_steps(
             continue;
         };
         if project.status() != Status::Active {
+            // Pausing a project stops its work, not cleanup of already
+            // accepted completions. Sweep its idle tabs on the first pass too.
+            if let Err(error) = threads::park_completed(ctx, &project) {
+                log.line(&format!("{slug}: parked-lane sweep: {error:#}"));
+            }
             continue;
         }
         match tick_cheap(
@@ -953,6 +958,9 @@ fn thread_pass(
             thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
         });
     for t in threads {
+        if t.parked {
+            continue;
+        }
         if t.queued_for_load {
             continue;
         }
@@ -1233,6 +1241,7 @@ fn thread_pass(
                 || thread::seconds_since(&after.startup_wait_started, now).max(0) as u64 * 1000
                     >= agent_start_timeout(&after.launch))
             && after.report_hash.is_empty()
+            && !threads::parkable(project, &after)
             && !live.pane_exists;
         if process_gone && !whole_session_missing {
             let recover = !t.launch.recipe_id.is_empty();
@@ -1579,6 +1588,7 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .into_iter()
         .filter(|t| {
             t.is_remote() == remote
+                && !t.parked
                 && !t.queued_for_load
                 && matches!(t.status, thread::Status::Open | thread::Status::Starting)
         })
@@ -2371,6 +2381,7 @@ fn tick_slow_with_steps(
             .err()
             .map(|e| e.context("rounds")),
     );
+    errors.extend(crate::threads::park_completed(ctx, project).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
@@ -3699,6 +3710,109 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == "config-changed")
         );
+    }
+
+    #[test]
+    fn first_pass_sweeps_lanes_sealed_before_install_without_relaunching() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let lane = world.thread(&project, &cwd, |t| {
+            t.attempt = 1;
+            t.launch_attempts = 1;
+            t.bootstrap = "acknowledged".into();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", &lane.cwd)
+        );
+        let event = crate::contracts::Event {
+            id: format!("{}-1-1", lane.id),
+            op: "done".into(),
+            thread: lane.id.clone(),
+            attempt: 1,
+            round: None,
+            recipient: crate::contracts::Recipient::default(),
+            created: project::now(),
+            payload: crate::contracts::EventPayload {
+                done: Some(crate::contracts::DonePayload {
+                    sha: "abc".into(),
+                    artifact: "report".into(),
+                    report_path: lane.report_path(),
+                    attestation: None,
+                }),
+                ..Default::default()
+            },
+        };
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        crate::events::append_delivery(
+            &project,
+            &event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )
+        .unwrap();
+        // A second project with an already-sealed lane shares this ticker pass.
+        let second = world.project("other", "b.sock");
+        let other = world.thread(&second, &cwd, |t| {
+            t.attempt = 1;
+            t.launch_attempts = 1;
+            t.bootstrap = "acknowledged".into();
+        });
+        let mut second_event = event.clone();
+        second_event.id = format!("{}-1-1", other.id);
+        second_event.thread = other.id.clone();
+        crate::events::seal_create_if_absent(&second, &second_event).unwrap();
+        crate::events::append_delivery(
+            &second,
+            &second_event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )
+        .unwrap();
+        // This pane was already closed by Rolf after sealing. It must not
+        // become a failed start just because no cached report hash exists.
+        let closed = world.project("closed", "c.sock");
+        let missing = world.thread(&closed, &cwd, |t| {
+            t.attempt = 1;
+            t.launch_attempts = 1;
+            t.pane_id = "w3:p1".into();
+            t.tab_id = "w3:t1".into();
+            t.workspace_id = "w3".into();
+        });
+        crate::events::seal_create_if_absent(&closed, &event).unwrap();
+        crate::events::append_delivery(
+            &closed,
+            &event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )
+        .unwrap();
+        world
+            .panes
+            .borrow_mut()
+            .insert_str(1, &format!("{},", world.coordinator_pane(&closed)));
+        let ctx = world.ctx();
+        assert_eq!(
+            crate::threads::rows(&ctx, &closed)[0].group,
+            thread::Group::Parked
+        );
+        let mut memory = Memory::new(&ctx);
+        // All records predate this binary; no new seal or manual command is needed.
+        assert!(tick_for_test(&ctx, &mut memory));
+        assert!(thread::load(&project, &lane.id).unwrap().parked);
+        assert!(thread::load(&second, &other.id).unwrap().parked);
+        let closed_lane = thread::load(&closed, &missing.id).unwrap();
+        assert!(closed_lane.parked);
+        assert_ne!(
+            closed_lane.failure_class,
+            crate::contracts::FailureClass::ProcessGone
+        );
+        assert_eq!(world.runner.count("workspace close w2"), 2);
+        assert_eq!(world.runner.count("workspace close w3"), 0);
+        assert!(tick_for_test(&ctx, &mut memory));
+        assert_eq!(world.runner.count("workspace close w2"), 2);
+        assert_eq!(world.runner.count("agent start"), 0);
     }
 
     #[test]
