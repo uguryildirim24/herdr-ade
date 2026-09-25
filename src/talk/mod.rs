@@ -531,10 +531,23 @@ pub(crate) fn coordinator_input_clear(screen: &str) -> bool {
                 | "Use /skills to list available skills"
         );
     let placeholder = draft.is_empty() || faint_suggestion || codex_hint;
+    // Claude can render extra status rows below the editor (compaction,
+    // background shells and the working index). They are not draft text.
+    let status = &lines[index + 1..];
     placeholder
-        && lines[index + 1..].iter().all(|line| {
-            let line = line.text.trim();
-            line.is_empty() || separator(line) || line.contains(" · ")
+        && status.iter().all(|line| {
+            let row = line.text.trim();
+            row.is_empty()
+                || separator(row)
+                || row.contains(" · ")
+                || row.ends_with("until auto-compact") && row.contains('%')
+                || row.split_once(' ').is_some_and(|(n, rest)| {
+                    n.parse::<u32>().is_ok() && matches!(rest, "shell" | "shells")
+                })
+                || row.ends_with("index")
+                    && status
+                        .iter()
+                        .any(|line| line.text.contains("until auto-compact"))
         })
 }
 
@@ -852,6 +865,12 @@ mod tests {
         let border = "\x1b[38;2;178;148;187m────────────────\x1b[0m";
         let pi = format!("{border}\n\x1b[0m\x1b[7m \x1b[0m   \n{border}\n");
         assert!(coordinator_input_clear(&pi));
+        assert!(coordinator_input_clear(
+            "❯ \x1b[0m\x1b[2msnap latch, and keep the small body\x1b[0m\n5% until auto-compact\n1 shell\nworking index\n"
+        ));
+        assert!(!coordinator_input_clear(
+            "❯ \x1b[0mRolf's draft\n5% until auto-compact\n1 shell\nworking index\n"
+        ));
         assert!(!coordinator_input_clear(
             &pi.replace("\x1b[7m \x1b[0m", "hello")
         ));
