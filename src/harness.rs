@@ -548,17 +548,23 @@ struct Running {
 impl Running {
     fn capture() -> Result<Running> {
         let current = std::env::current_exe().context("could not find the running executable")?;
-        let path = std::fs::canonicalize(&current)
-            .or_else(|error| {
+        let path = match std::fs::canonicalize(&current) {
+            Ok(path) => path,
+            Err(error) => {
                 // Linux appends this suffix when a concurrent build unlinks the
                 // running image. Its inode remains readable via /proc/self/exe.
                 #[cfg(target_os = "linux")]
                 if let Some(path) = current.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-                    return Ok(PathBuf::from(path));
+                    PathBuf::from(path)
+                } else {
+                    return Err(error)
+                        .with_context(|| format!("could not resolve {}", current.display()));
                 }
-                Err(error)
-            })
-            .with_context(|| format!("could not resolve {}", current.display()))?;
+                #[cfg(not(target_os = "linux"))]
+                return Err(error)
+                    .with_context(|| format!("could not resolve {}", current.display()));
+            }
+        };
         #[cfg(target_os = "linux")]
         let image = Path::new("/proc/self/exe");
         #[cfg(not(target_os = "linux"))]
