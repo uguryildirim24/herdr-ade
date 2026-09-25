@@ -620,10 +620,15 @@ fn relevant_config(ctx: &Ctx, project: &Project) -> BTreeMap<String, String> {
         }
     }
     for thread in threads.iter().filter(|t| t.is_remote()) {
-        let row =
-            crate::remote::box_repo_for(&ctx.config_dir, thread.machine_route(), &thread.repo)
-                .ok()
-                .flatten();
+        let row = crate::remote::box_repo_for_route(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            thread.machine_route(),
+            &thread.repo,
+        )
+        .ok()
+        .flatten();
         parts.insert(
             format!("repo:{}:{}", thread.machine_route(), thread.repo),
             format!("{row:?}"),

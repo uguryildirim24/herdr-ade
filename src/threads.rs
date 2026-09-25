@@ -590,7 +590,8 @@ pub(crate) fn box_launch_ready_for(
 }
 
 fn box_capacity_reason(ctx: &Ctx, machine: &str) -> Result<Option<String>> {
-    let declaration = remote::machine_declaration(&ctx.config_dir, machine)?;
+    let declaration =
+        remote::declaration_for_route(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
     Ok(match remote::box_load(ctx.runner, &declaration) {
         Ok((load, cores)) => remote::load_wait_reason(load, cores, declaration.load_limit),
         Err(error) => Some(format!("load could not be measured: {error:#}")),
@@ -605,7 +606,7 @@ pub(crate) fn start_queued(ctx: &Ctx, project: &Project) -> Result<()> {
         .into_iter()
         .filter(|t| t.queued_for_load && t.status == Status::Starting)
     {
-        if let Some(reason) = box_capacity_reason(ctx, &record.machine)? {
+        if let Some(reason) = box_capacity_reason(ctx, record.machine_route())? {
             thread::update(project, &record.id, |t| {
                 t.placement_reason = format!("queued for `{}`: {reason}", t.machine);
             })?;
