@@ -1288,7 +1288,7 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
             .collect::<Vec<_>>()
             .join(" ");
         bash.push_str(&format!(
-            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; (inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
+            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; du -sk -- {path} | while read -r kib rest; do printf 'size_{key}\\t%s\\n' \"$kib\"; done; (inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
         ));
     }
     format!("bash -c {}\n", crate::remote::quote(&bash))
@@ -1378,14 +1378,50 @@ fn finished_worktrees_impl(
         } else {
             crate::threads::inspect_worktree_for_removal(ctx, &project, &thread)
         };
+        let size = if let Some(snapshot) = snapshot {
+            let key = crate::thread::sha256_hex(path.as_bytes());
+            snapshot.lines().find_map(|line| {
+                line.strip_prefix(&format!("size_{key}\t"))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|kib| kib * 1024)
+            })
+        } else {
+            std::process::Command::new("du")
+                .args(["-sk", "--", path])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .and_then(|out| {
+                    out.split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+                .map(|kib| kib * 1024)
+        };
+        let size = size
+            .map(crate::worktrees::human_size)
+            .unwrap_or_else(|| "size unknown".into());
         match inspection {
-            Ok(inspection) if !inspection.dirty.is_empty() => leftovers.push(path.clone()),
-            Ok(inspection) if !inspection.ignored_data.is_empty() => data_kept.push(format!(
-                "{} ({})",
-                path,
-                crate::worktrees::describe_data(&inspection.ignored_data)
+            Ok(inspection) if !inspection.dirty.is_empty() => {
+                leftovers.push(format!(
+                    "{} ({}; tracked changes: {}; remove exactly this worktree and branch: ha doctor --remove-kept-worktree {}/{})",
+                    path, size, inspection.dirty.join(", "), project.slug, thread.id
+                ));
+            }
+            Ok(inspection) if !inspection.ignored_data.is_empty() => {
+                data_kept.push(format!(
+                    "{} ({}; kept by {}; remove exactly this worktree and branch: ha doctor --remove-kept-worktree {}/{})",
+                    path,
+                    size,
+                    crate::worktrees::describe_data(&inspection.ignored_data),
+                    project.slug, thread.id
+                ));
+            }
+            Ok(_) => leftovers.push(format!(
+                "{} ({}; remove exactly this worktree and branch: ha doctor --remove-kept-worktree {}/{})",
+                path, size, project.slug, thread.id
             )),
-            Ok(_) => leftovers.push(path.clone()),
             Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
         }
     }
@@ -3489,11 +3525,13 @@ recipe = "claude_fable_xhigh"
         let (leftovers, data, errors) =
             finished_worktrees_with_snapshot(&ctx, &box_profile(), &captured);
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(leftovers, [paths[0]]);
+        assert_eq!(leftovers.len(), 1);
+        assert!(leftovers[0].contains(paths[0]));
+        assert!(leftovers[0].contains("--remove-kept-worktree demo/t-0001"));
         assert_eq!(
             data,
             [format!(
-                "{} (safe: 3.0 KiB, target/nested: 4.0 KiB)",
+                "{} (size unknown; kept by safe: 3.0 KiB, target/nested: 4.0 KiB; remove exactly this worktree and branch: ha doctor --remove-kept-worktree demo/t-0002)",
                 paths[1]
             )]
         );

@@ -250,6 +250,109 @@ pub(crate) fn release_review_fixes(
     Ok(())
 }
 
+/// Refuse an explicit retained-worktree removal if its checkout contains
+/// commits not at the published branch tip. No implicit force-push or loss.
+pub(crate) fn require_published_tip(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+) -> Result<String> {
+    if record.branch.is_empty() || !harness_ref(&record.branch) {
+        bail!("{} has no owned branch", record.id);
+    }
+    let (settings, _) = project.read_project_md()?;
+    let (tip, url) = if record.is_remote() {
+        let profile = crate::remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        let (_, url) =
+            crate::threads::box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+        let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        let script = crate::remote::with_path(
+            &machine.path,
+            &format!(
+                "cd {} && git symbolic-ref --quiet HEAD && git rev-parse HEAD && git rev-parse --verify {}",
+                crate::remote::quote(&record.worktree_path),
+                crate::remote::quote(&format!("refs/heads/{}", record.branch))
+            ),
+        );
+        let out = crate::remote::ssh(ctx.runner, &profile.target, &script, None, TIMEOUT)?;
+        if !out.success() {
+            bail!(
+                "box checkout {}: {}",
+                record.worktree_path,
+                out.error_text()
+            );
+        }
+        let mut lines = out.stdout.lines();
+        let checked_out = lines.next().unwrap_or_default();
+        let head = lines.next().unwrap_or_default();
+        let tip = lines.next().unwrap_or_default();
+        if checked_out != format!("refs/heads/{}", record.branch) || head != tip || tip.is_empty() {
+            bail!(
+                "{} is no longer checked out at the published branch tip; not removing it",
+                record.worktree_path
+            );
+        }
+        (tip.to_string(), Some(url))
+    } else {
+        let checked_out = git(
+            ctx.runner,
+            &record.worktree_path,
+            &["symbolic-ref", "--quiet", "HEAD"],
+        )?;
+        if checked_out.trim() != format!("refs/heads/{}", record.branch) {
+            bail!(
+                "{} no longer checks out {}; not removing it",
+                record.worktree_path,
+                record.branch
+            );
+        }
+        let head = git(ctx.runner, &record.worktree_path, &["rev-parse", "HEAD"])?;
+        let tip = git(
+            ctx.runner,
+            &record.repo,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}", record.branch),
+            ],
+        )?;
+        if head.trim() != tip.trim() {
+            bail!(
+                "{} has moved since the branch check; not removing it",
+                record.worktree_path
+            );
+        }
+        let url = settings
+            .repos
+            .iter()
+            .find(|row| row.path == record.repo)
+            .and_then(|row| row.publish_url.clone().or_else(|| row.push_remote.clone()));
+        (tip.trim().to_string(), url)
+    };
+    let Some(url) = url else {
+        bail!(
+            "no publication destination for {}; cannot prove commits are pushed",
+            record.branch
+        );
+    };
+    if refs(ctx.runner, &record.repo, Some(&url))?.get(&record.branch) != Some(&tip)
+        || refs(ctx.runner, &record.repo, None)?
+            .get(&record.branch)
+            .is_some_and(|local| local != &tip)
+    {
+        bail!(
+            "branch {} has unpushed commits or has moved since publication",
+            record.branch
+        );
+    }
+    Ok(tip)
+}
+
 /// Called after a worktree has gone. A failed deletion remains retryable via
 /// the thread's durable cleanup_pending marker.
 pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
@@ -270,7 +373,18 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
             record.branch
         );
     }
+    let expected = record
+        .cleanup_reason
+        .strip_prefix("retained worktree removal: ");
     let local = refs(ctx.runner, &record.repo, None)?;
+    if let (Some(expected), Some(actual)) = (expected, local.get(&record.branch))
+        && actual != expected
+    {
+        bail!(
+            "branch {} moved since retained worktree removal",
+            record.branch
+        );
+    }
     let (settings, _) = project.read_project_md()?;
     let row = settings.repos.iter().find(|row| row.path == record.repo);
     let url = if record.is_remote() {
@@ -284,10 +398,16 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
             crate::threads::box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
         let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
         let refname = crate::remote::quote(&format!("refs/heads/{}", record.branch));
+        let pin = expected.map_or(String::new(), |sha| {
+            format!(
+                "if [ -n \"$old\" ] && [ \"$old\" != {} ]; then echo 'box branch moved since retained worktree removal' >&2; exit 1; fi; ",
+                crate::remote::quote(sha)
+            )
+        });
         let script = crate::remote::with_path(
             &machine.path,
             &format!(
-                "cd {} || exit $?; worktrees=$(git worktree list --porcelain) || exit $?; if printf '%s\\n' \"$worktrees\" | grep -Fqx -- {}; then echo 'branch still checked out' >&2; exit 1; fi; old=$(git for-each-ref --format='%(objectname)' {}) || exit $?; if [ -n \"$old\" ]; then git update-ref -d {} \"$old\" || {{ after=$(git for-each-ref --format='%(objectname)' {}) || exit $?; [ -z \"$after\" ] || exit 1; }}; fi",
+                "cd {} || exit $?; worktrees=$(git worktree list --porcelain) || exit $?; if printf '%s\\n' \"$worktrees\" | grep -Fqx -- {}; then echo 'branch still checked out' >&2; exit 1; fi; old=$(git for-each-ref --format='%(objectname)' {}) || exit $?; {pin}if [ -n \"$old\" ]; then git update-ref -d {} \"$old\" || {{ after=$(git for-each-ref --format='%(objectname)' {}) || exit $?; [ -z \"$after\" ] || exit 1; }}; fi",
                 crate::remote::quote(&box_repo),
                 crate::remote::quote(&format!("branch refs/heads/{}", record.branch)),
                 refname,
@@ -303,14 +423,23 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     } else {
         row.and_then(|r| r.publish_url.clone().or_else(|| r.push_remote.clone()))
     };
+    let remote = match &url {
+        Some(url) => refs(ctx.runner, &record.repo, Some(url))?,
+        None => BTreeMap::new(),
+    };
+    if let (Some(expected), Some(actual)) = (expected, remote.get(&record.branch))
+        && actual != expected
+    {
+        bail!(
+            "published branch {} moved since retained worktree removal",
+            record.branch
+        );
+    }
     if let Some(sha) = local.get(&record.branch) {
         delete_local(ctx.runner, &record.repo, &record.branch, sha)?;
     }
-    if let Some(url) = url {
-        let remote = refs(ctx.runner, &record.repo, Some(&url))?;
-        if let Some(sha) = remote.get(&record.branch) {
-            delete_remote(ctx.runner, &record.repo, &url, &record.branch, sha)?;
-        }
+    if let (Some(url), Some(sha)) = (url, remote.get(&record.branch)) {
+        delete_remote(ctx.runner, &record.repo, &url, &record.branch, sha)?;
     }
     Ok(())
 }
@@ -364,7 +493,8 @@ pub(crate) fn closed_round(
     let rounds = crate::round::checked_list(project)?;
     for name in names.into_iter().filter(|name| harness_ref(name)) {
         if in_use.contains(&name) {
-            bail!("review branch {name} is still checked out; not removing it anywhere");
+            // A retained checkout owns its ref until the worktree is removed.
+            continue;
         }
         // An unfinished reviewer must never lose a branch on a batch retry.
         if threads
@@ -396,6 +526,7 @@ pub(crate) fn closed_round(
             && t.review_round == record.round
             && t.status == Status::Resolved
             && !t.cleanup_pending
+            && t.worktree_path.is_empty()
     }) {
         resolved_thread(ctx, project, reviewer)?;
     }
@@ -664,11 +795,152 @@ mod tests {
             review_branch: Some("review/r1".into()),
             ..Default::default()
         };
-        assert!(closed_round(&fx.world.ctx(), &fx.project, &round).is_err());
+        closed_round(&fx.world.ctx(), &fx.project, &round).unwrap();
+        closed_round(&fx.world.ctx(), &fx.project, &round).unwrap();
         assert!(
             refs(fx.world.ctx().runner, &round.repo, Some(url))
                 .unwrap()
                 .contains_key("review/r1")
+        );
+        run(&fx.repo, &["checkout", "-q", "main"]);
+        closed_round(&fx.world.ctx(), &fx.project, &round).unwrap();
+        assert!(
+            !refs(fx.world.ctx().runner, &round.repo, Some(url))
+                .unwrap()
+                .contains_key("review/r1")
+        );
+    }
+
+    #[test]
+    fn retained_lane_branch_waits_without_a_ledger_failure_and_removes_with_its_worktree() {
+        let (fx, bare) = configured();
+        let branch = "hp/demo/t-kept";
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let checkout = fx.repo.join(".worktrees").join("kept");
+        run(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                branch,
+                checkout.to_str().unwrap(),
+                "main",
+            ],
+        );
+        run(
+            &fx.repo,
+            &["push", "-q", bare.path().to_str().unwrap(), branch],
+        );
+        std::fs::write(checkout.join(".gitignore"), "kept-data/\n").unwrap();
+        // The ignored directory, rather than a tracked change, retains this checkout.
+        run(&fx.repo, &["checkout", "-q", "main"]);
+        // Restore a clean checkout and create an ignored directory via the repo's exclude file.
+        std::fs::remove_file(checkout.join(".gitignore")).unwrap();
+        let exclude = fx.repo.join(".git/info/exclude");
+        std::fs::write(&exclude, "kept-data/\n").unwrap();
+        std::fs::create_dir(checkout.join("kept-data")).unwrap();
+        std::fs::write(checkout.join("kept-data/raw.bin"), b"data").unwrap();
+        let lane = thread::allocate(&fx.project, |t| {
+            t.repo = repo.clone();
+            t.branch = branch.into();
+            t.kind = thread::Kind::Worktree;
+            t.status = Status::Resolved;
+            t.worktree_path = checkout.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let round = crate::contracts::RoundRecord {
+            phase: crate::contracts::RoundPhase::Abandoned,
+            abandoned_reason: Some("closed".into()),
+            repo: repo.clone(),
+            round: "r1".into(),
+            manifest: crate::contracts::AdmissionManifest {
+                members: vec![crate::contracts::ManifestMember {
+                    thread: lane.id.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        std::fs::create_dir_all(crate::round::rounds_dir(&fx.project)).unwrap();
+        std::fs::write(
+            crate::round::round_path(&fx.project, "r1"),
+            toml::to_string(&round).unwrap(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            closed_round(&fx.world.ctx(), &fx.project, &round).unwrap();
+        }
+        assert!(
+            !crate::ledger::list(&fx.project)
+                .unwrap()
+                .iter()
+                .any(|entry| { !entry.closed && entry.kind == "round-branch-cleanup" })
+        );
+        assert!(
+            refs(
+                fx.world.ctx().runner,
+                &repo,
+                Some(bare.path().to_str().unwrap())
+            )
+            .unwrap()
+            .contains_key(branch)
+        );
+        run(&checkout, &["commit", "--allow-empty", "-qm", "unpushed"]);
+        assert!(
+            crate::threads::remove_kept_worktree(&fx.world.ctx(), &fx.project.slug, &lane.id)
+                .unwrap_err()
+                .to_string()
+                .contains("unpushed")
+        );
+        assert!(checkout.exists());
+        run(&checkout, &["reset", "--hard", "HEAD~1"]);
+        run(&checkout, &["checkout", "--detach", "-q"]);
+        run(
+            &checkout,
+            &["commit", "--allow-empty", "-qm", "detached work"],
+        );
+        assert!(
+            crate::threads::remove_kept_worktree(&fx.world.ctx(), &fx.project.slug, &lane.id)
+                .is_err()
+        );
+        assert!(checkout.exists());
+        run(&checkout, &["checkout", "-q", branch]);
+        let result =
+            crate::threads::remove_kept_worktree(&fx.world.ctx(), &fx.project.slug, &lane.id)
+                .unwrap();
+        assert!(result.contains(branch));
+        assert!(!checkout.exists());
+        assert!(
+            !refs(
+                fx.world.ctx().runner,
+                &repo,
+                Some(bare.path().to_str().unwrap())
+            )
+            .unwrap()
+            .contains_key(branch)
+        );
+        // A retry after worktree removal must not delete a branch newly
+        // advanced while cleanup was pending.
+        run(&fx.repo, &["checkout", "-qb", branch, "main"]);
+        run(&fx.repo, &["commit", "--allow-empty", "-qm", "new work"]);
+        run(&fx.repo, &["checkout", "-q", "main"]);
+        let pinned = thread::load(&fx.project, &lane.id).unwrap();
+        let pinned = Thread {
+            cleanup_reason: format!(
+                "retained worktree removal: {}",
+                git(fx.world.ctx().runner, &repo, &["rev-parse", "main"])
+                    .unwrap()
+                    .trim()
+            ),
+            ..pinned
+        };
+        assert!(resolved_thread(&fx.world.ctx(), &fx.project, &pinned).is_err());
+        assert!(
+            refs(fx.world.ctx().runner, &repo, None)
+                .unwrap()
+                .contains_key(branch)
         );
     }
 
