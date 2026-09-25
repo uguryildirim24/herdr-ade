@@ -337,6 +337,19 @@ pub(crate) fn run(ctx: &Ctx, session: &SessionFlags) -> Result<DoctorOutcome> {
             let _ = writeln!(text, "[FAIL] pi: {detail}");
         }
     }
+    match crate::branches::doctor(ctx, None) {
+        Ok(branches) => text.push_str(&branches),
+        Err(error) => {
+            healthy = false;
+            let detail = format!("branch inventory: {error:#}");
+            checks.push(CheckResult {
+                status: "failed".into(),
+                label: "branches".into(),
+                detail: detail.clone(),
+            });
+            let _ = writeln!(text, "[FAIL] {detail}");
+        }
+    }
     Ok(DoctorOutcome {
         healthy,
         checks,
