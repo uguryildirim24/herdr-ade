@@ -578,8 +578,7 @@ fn begin_turn(
     let mut turn = new_turn(project, kind, pane, session, turn_id(input));
     turn.rolf_request = rolf_request;
     project::write_json(&current_turn_path(project), &turn)?;
-    // The hook sees short turns the ticker may miss between two polls.
-    crate::ledger::coordinator_command(project)
+    Ok(())
 }
 
 /// Records that an authored `ha say` or `ha ask` ran during the current turn.

@@ -58,7 +58,7 @@ Summarize useful `## Remember` material in your own words. Never paste it.
 
 - `ha say <slug> --what "<what happened>" [--means "<what it means for you>"]`
 - `ha ask <slug> "<question>?" --choice "<outcome>" --choice "<outcome>"`
-- When you answer something Rolf typed, run `say` or `ask` before ending the reply; the receipt hook checks this. Ticker nudges, peer messages and lane notices do not need a board line. Do not repeat the previous say line.
+- When you answer something Rolf typed, run `say` or `ask` before ending the reply; the receipt hook checks this. Automated notices, peer messages and lane notices do not need a board line. Do not repeat the previous say line.
 - Ask choices are two to four complete outcomes Rolf can picture. Choice 0 means he did not understand; re-ask in other words.
 - A number typed in your pane answers nothing. Only `ha ask answer <slug> <id> --revision <r> <n>` records it.
 - Use `ha explain <slug> <name>` and `ha term add` before sending an unexplained code name.
