@@ -284,6 +284,9 @@ enum Command {
     Doctor {
         #[command(flatten)]
         session: SessionArgs,
+        /// Remove only the exact leftover refs printed by the last doctor run
+        #[arg(long)]
+        prune_branches: Option<String>,
     },
     /// Rounds: open, review and merge related lanes
     #[command(
@@ -3038,7 +3041,14 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
             }
             _ => bail!("unknown plugin event `{id}`"),
         },
-        Command::Doctor { session } => {
+        Command::Doctor {
+            session,
+            prune_branches,
+        } => {
+            if let Some(plan) = prune_branches {
+                println!("{}", crate::branches::doctor(&ctx, Some(&plan))?);
+                return Ok(());
+            }
             let result = doctor::run(&ctx, &session.into())?;
             crate::output::success(
                 Some(if result.healthy {
@@ -3466,6 +3476,7 @@ mod tests {
             ctx,
             Command::Doctor {
                 session: SessionArgs::default(),
+                prune_branches: None,
             },
         );
         let error = result.as_ref().unwrap_err();
