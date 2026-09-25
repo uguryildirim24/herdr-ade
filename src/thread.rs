@@ -142,6 +142,10 @@ pub(crate) struct Thread {
     pub(crate) observation_error: String,
     pub(crate) last_group: String,
     pub(crate) report_hash: String,
+    #[serde(default)]
+    pub(crate) final_report_hash: String,
+    #[serde(default)]
+    pub(crate) final_report_seal: String,
     pub(crate) last_report_change: String,
     /// Incomplete report/library copy, kept with the report it describes.
     pub(crate) copy_notes: Vec<String>,
@@ -257,6 +261,16 @@ pub(crate) fn sealed_report_path(project: &Project, thread: &Thread) -> Option<P
         })
         .max_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)))
         .map(|(_, _, hash)| (crate::events::artifact_path(project, &hash), hash))?;
+    // A rewritten copy is valid only for the seal from which it was made.
+    if thread.final_report_seal == hash && !thread.final_report_hash.is_empty() {
+        let final_path = crate::events::artifact_path(project, &thread.final_report_hash);
+        if regular_file(&final_path)
+            && std::fs::read(&final_path)
+                .is_ok_and(|bytes| sha256_hex(&bytes) == thread.final_report_hash)
+        {
+            return Some(final_path);
+        }
+    }
     (regular_file(&path) && std::fs::read(&path).is_ok_and(|bytes| sha256_hex(&bytes) == hash))
         .then_some(path)
 }
@@ -1889,6 +1903,7 @@ mod tests {
         ];
         let gates = vec![crate::project::Gate {
             command: "cargo test".into(),
+            paths: None,
             env: std::collections::BTreeMap::from([("RUST_BACKTRACE".into(), "1".into())]),
         }];
         let brief = compose_brief(&BriefInput {

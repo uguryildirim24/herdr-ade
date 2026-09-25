@@ -129,6 +129,8 @@ pub(crate) fn now() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct Gate {
     pub(crate) command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
 }
@@ -1248,7 +1250,7 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
     // skeleton is never picked up by `list` or the ticker.
     write_atomic(
         &project.project_md(),
-        format!("+++\n{front}+++\n").as_bytes(),
+        format!("+++\n# Repository gates: {{ command = \"...\", paths = [\"src/**\"] }}. Omit paths to always run.\n# Paths are repository-relative: * and ? match within a segment; ** is a whole directory segment.\n{front}+++\n").as_bytes(),
     )?;
     refresh_page(&project)?;
     Ok(project)

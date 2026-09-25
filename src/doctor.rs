@@ -964,6 +964,45 @@ fn report_with_checks(
         }
         if let Ok((settings, _)) = project.read_project_md() {
             for repo in &settings.repos {
+                if let Some(gates) = &repo.gates {
+                    for gate in gates {
+                        if gate.paths.as_ref().is_some_and(Vec::is_empty) {
+                            check(
+                                &mut out,
+                                Some(false),
+                                &format!("{label} gate {}", gate.command),
+                                "paths = [] selects no files; omit paths to always run".into(),
+                            );
+                        }
+                        for pattern in gate.paths.iter().flatten() {
+                            let result = crate::gate_paths::validate(pattern).and_then(|()| {
+                                let files = crate::round::repo::Git::new(runner, &repo.path)
+                                    .run(&["ls-files", "-z", "--"])?;
+                                Ok(files
+                                    .split('\0')
+                                    .any(|file| crate::gate_paths::matches(pattern, file)))
+                            });
+                            match result {
+                                Ok(true) => {}
+                                Ok(false) => check(
+                                    &mut out,
+                                    Some(false),
+                                    &format!("{label} gate {}", gate.command),
+                                    format!(
+                                        "`{pattern}` matches no tracked files in {}",
+                                        repo.path
+                                    ),
+                                ),
+                                Err(error) => check(
+                                    &mut out,
+                                    Some(false),
+                                    &format!("{label} gate {}", gate.command),
+                                    format!("`{pattern}`: {error:#}"),
+                                ),
+                            }
+                        }
+                    }
+                }
                 if repo.box_path.is_some()
                     && repo
                         .publish_url
@@ -4428,6 +4467,58 @@ recipe = "claude_fable_xhigh"
         assert!(!healthy);
         assert!(
             text.contains("[FAIL] project demo repo /repo: box_path has no publish_url"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn doctor_flags_scoped_gate_glob_with_no_tracked_match() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "README.md"])
+            .status()
+            .unwrap();
+        assert!(add.success());
+        let root = home.path().join("root");
+        crate::project::create(
+            &root,
+            "demo",
+            "",
+            vec![crate::project::Repo {
+                path: repo.to_string_lossy().into_owned(),
+                gates: Some(vec![crate::project::Gate {
+                    command: "full".into(),
+                    paths: Some(vec!["srrc/**".into()]),
+                    env: Default::default(),
+                }]),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "git",
+            |cmd| crate::runner::RealRunner.run(cmd),
+        );
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(!healthy);
+        assert!(
+            text.contains("`srrc/**` matches no tracked files"),
             "{text}"
         );
     }
