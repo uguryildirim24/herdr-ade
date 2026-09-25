@@ -1600,7 +1600,7 @@ fn retry_with_ticker(
     // same selected attempt. It must not spend another routing recovery.
     if record.escalation_pending {
         ensure_ticker(ctx)?;
-        place_escalation(ctx, &project, &record)?;
+        place_prelaunch_escalation(ctx, &project, &record)?;
         let placed = thread::load(&project, id)?;
         return Ok(RetryOutcome {
             thread: placed.id,
@@ -1664,8 +1664,13 @@ fn retry_with_ticker(
         source_truncation: record.launch.source_truncation.as_ref(),
         ..Default::default()
     };
-    let mut launch =
-        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?;
+    // No agent was submitted: retry the same selection without spending a
+    // process/provider recovery allowance.
+    let mut launch = if record.launch_attempts == 0 {
+        record.launch.clone()
+    } else {
+        crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?
+    };
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
@@ -1738,7 +1743,7 @@ fn retry_with_ticker(
     })?;
 
     ensure_ticker(ctx)?;
-    place_escalation(ctx, &project, &thread::load(&project, id)?)?;
+    place_prelaunch_escalation(ctx, &project, &thread::load(&project, id)?)?;
     let placed = thread::load(&project, id)?;
     Ok(RetryOutcome {
         thread: placed.id,
@@ -1747,6 +1752,26 @@ fn retry_with_ticker(
         recipe: selected_recipe,
         screen,
     })
+}
+
+// Placement counts its own tries; if it failed before submitting an agent,
+// keep the launch counter at zero so round recovery never calls it process gone.
+// A reviewer is retried by the round's clock, not the ticker's immediate
+// escalation pass (which would bypass that clock and exhaust placement).
+fn place_prelaunch_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    let result = place_escalation(ctx, project, record);
+    if let Err(error) = &result
+        && record.launch_attempts == 0
+    {
+        thread::update(project, &record.id, |t| {
+            t.launch_attempts = 0;
+            if t.role == "reviewer" {
+                t.escalation_pending = false;
+                t.error = format!("{error:#}");
+            }
+        })?;
+    }
+    result
 }
 
 /// Resume after a server/session interruption. This is not failed-work
@@ -3105,7 +3130,8 @@ pub(crate) fn fail_start(
     recover: bool,
 ) -> Result<Thread> {
     let provider_kind = None;
-    let (recovery, recovery_error) = if !recover {
+    let (recovery, recovery_error) = if !recover || thread::load(project, id)?.launch_attempts == 0
+    {
         (None, None)
     } else {
         let record = thread::load(project, id)?;
@@ -4775,6 +4801,34 @@ mod tests {
             pane_id: "w2:p1".into(),
             ..Thread::default()
         }
+    }
+
+    #[test]
+    fn failed_reviewer_placement_waits_for_round_retry_instead_of_ticker_escalation() {
+        let world = crate::scenarios::World::new();
+        let project = crate::project::create(&world.root, "demo", "", vec![]).unwrap();
+        let reviewer = thread::allocate(&project, |t| {
+            t.role = "reviewer".into();
+            t.status = Status::Failed;
+            t.escalation_pending = true;
+            t.launch_attempts = 0;
+        })
+        .unwrap();
+        let error = place_prelaunch_escalation(&world.ctx(), &project, &reviewer).unwrap_err();
+        assert!(error.to_string().contains("not reachable"), "{error:#}");
+        let failed = thread::load(&project, &reviewer.id).unwrap();
+        assert_eq!(failed.launch_attempts, 0);
+        assert_eq!(failed.status, Status::Failed);
+        assert!(!failed.escalation_pending);
+        assert!(failed.error.contains("not reachable"));
+        // The next ticker pass cannot place this reviewer ahead of its clock.
+        crate::escalation::tick(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            thread::load(&project, &reviewer.id)
+                .unwrap()
+                .launch_attempts,
+            0
+        );
     }
 
     #[test]

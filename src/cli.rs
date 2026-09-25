@@ -505,7 +505,7 @@ enum RoundCommand {
         slug: String,
         round: String,
     },
-    /// Stop the round, its lanes and reviewer, and retry pending cleanup
+    /// Stop the round and its reviewers, keeping member lanes for later rounds
     Cancel {
         #[arg(value_name = "PROJECT")]
         slug: String,
