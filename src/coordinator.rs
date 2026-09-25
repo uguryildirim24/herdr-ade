@@ -1028,6 +1028,10 @@ fn digest_snapshot(
         }
     }
 
+    if project.finished() {
+        out.push_str("\nProject finished. Idle nudges are off until Rolf writes again.\n");
+    }
+
     if let Ok((settings, _)) = project.read_project_md()
         && !settings.repos.is_empty()
     {
