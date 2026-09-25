@@ -1335,15 +1335,6 @@ fn nudge_idle_coordinator(
     if thread::list(project)
         .iter()
         .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
-        || crate::round::list(project).iter().any(|round| {
-            matches!(
-                round.phase,
-                crate::contracts::RoundPhase::PreparingReview
-                    | crate::contracts::RoundPhase::UnderReview
-                    | crate::contracts::RoundPhase::Merging
-                    | crate::contracts::RoundPhase::Checkpointing
-            )
-        })
     {
         return Ok(());
     }
@@ -3020,6 +3011,46 @@ mod tests {
             empty.contains("Ask Rolf only for what truly needs him"),
             "{empty}"
         );
+    }
+
+    #[test]
+    fn stalled_review_does_not_silence_an_idle_coordinator() {
+        let f = fixture(false);
+        let round = crate::contracts::RoundRecord {
+            round: "r1".into(),
+            phase: crate::contracts::RoundPhase::UnderReview,
+            ..Default::default()
+        };
+        std::fs::create_dir_all(crate::round::rounds_dir(&f.project)).unwrap();
+        std::fs::write(
+            crate::round::round_path(&f.project, "r1"),
+            toml::to_string(&round).unwrap(),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let record = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, &runner);
+        nudge_idle_coordinator(
+            &ctx,
+            &f.project,
+            &mut steps::State::default(),
+            &herdr,
+            &record,
+            Some(&Agent {
+                agent_status: "idle".into(),
+                ..Agent::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
     }
 
     #[test]
