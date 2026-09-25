@@ -2336,10 +2336,11 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     }
     // The brief and every follow-up have one ordered delivery path. Once one
     // message is queued, later messages join it until the ticker drains them.
-    if record.status == Status::Starting
-        || record.prompt_pending
-        || awaiting_bootstrap(&record)
-        || awaiting_follow_up(&record)
+    if !record.parked
+        && (record.status == Status::Starting
+            || record.prompt_pending
+            || awaiting_bootstrap(&record)
+            || awaiting_follow_up(&record))
     {
         let events_before_send = crate::round::sealed_events(&project)?;
         // Keep the queued message invisible to the ticker until every round
@@ -2390,7 +2391,6 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             });
         }
     }
-    let mut restored_context = None;
     if record.parked {
         let events = crate::round::sealed_events(&project)?;
         let previous_group = record.last_group.clone();
@@ -2401,17 +2401,14 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             thread::update(&project, id, |t| t.last_group = previous_group)?;
             return Err(error);
         }
-        if !reopen_parked(ctx, &project, &record)? {
-            restored_context = Some(format!(
-                "Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
-                record.thread_dir,
-                record.report_path(),
-                text
-            ));
-        }
-        record = thread::load(&project, id)?;
+        // Queue the correction in the same durable update that un-parks the
+        // new pane. Otherwise a ticker pass between starting the agent and
+        // sending the text can close it against the previous done seal.
+        reopen_parked(ctx, &project, &record, text, &events)?;
+        return Ok(PromptOutcome::Queued {
+            attempt: record.attempt.max(1),
+        });
     }
-    let text = restored_context.as_deref().unwrap_or(text);
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
     let kind = if record.launch.kind.is_empty() {
@@ -3142,7 +3139,13 @@ pub(crate) fn parkable(project: &Project, record: &Thread) -> bool {
 
 /// Bring a completed lane back without provisioning its branch or replacing
 /// its frozen task. The old agent session id is kept across the pane close.
-fn reopen_parked(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
+fn reopen_parked(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+    text: &str,
+    events: &[crate::contracts::Event],
+) -> Result<()> {
     let view = require_session(ctx, project)?;
     let herdr = view.herdr.on_machine(record.machine_route());
     let coordinator = project
@@ -3226,7 +3229,7 @@ fn reopen_parked(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> 
     };
     // A fresh agent must read the old report and the new instruction, rather
     // than silently starting from an empty conversation.
-    let result = (|| -> Result<bool> {
+    let result = (|| -> Result<()> {
         if let Some(machine) = &machine {
             herdr.pane_set_parent(&placed.pane_id, &parent_token(record, &coordinator.pane_id))?;
             // The box's `ha done` authenticates the pane against its lane
@@ -3317,6 +3320,28 @@ fn reopen_parked(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> 
             t.checked_slice = placed.checked_slice.clone();
             t.parked = false;
             t.last_group = Group::Working.token().into();
+            // A sealed completion proves the old brief was consumed. Even
+            // older records lacking a bootstrap receipt can now drain this
+            // correction without resending the frozen task.
+            t.bootstrap = "acknowledged".into();
+            t.follow_ups.push(FollowUp {
+                attempt: t.attempt.max(1),
+                text: if resuming {
+                    text.to_string()
+                } else {
+                    format!(
+                        "Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
+                        record.thread_dir,
+                        record.report_path(),
+                        text
+                    )
+                },
+                state: FollowUpState::Queued,
+                waiting_event: latest_waiting_event_id(events, &record.id, record.attempt.max(1))
+                    .unwrap_or_default(),
+                queued_at: project::now(),
+                ..FollowUp::default()
+            });
             t.last_state = agent.agent_status.clone();
             t.last_state_change = project::now();
             let prior_session = t.identity.agent_session.clone();
@@ -3326,7 +3351,7 @@ fn reopen_parked(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> 
             }
             Ok(())
         })?;
-        Ok(resuming)
+        Ok(())
     })();
     if result.is_err() {
         let _ = close_pane(ctx, project, &placed);
@@ -4259,8 +4284,10 @@ fn placement_summary(record: &Thread) -> String {
 pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
-    let view = session_view(ctx, &project);
-    let row = row(&record, view.as_ref(), jiff::Timestamp::now());
+    let row = rows(ctx, &project)
+        .into_iter()
+        .find(|row| row.thread.id == id)
+        .context("thread disappeared while reading its live state")?;
     println!("group = {:?}", row.group.label());
     println!("live = {:?}", row.note);
     print!("{}", placement_summary(&record));
@@ -4545,9 +4572,17 @@ mod tests {
         );
         let ctx = world.ctx();
         let outcome = prompt(&ctx, "demo", &lane.id, "Fix the rejection").unwrap();
-        assert!(matches!(outcome, PromptOutcome::Sent { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, PromptOutcome::Queued { .. }),
+            "{outcome:?}"
+        );
         let reopened = thread::load(&project, &lane.id).unwrap();
         assert!(!reopened.parked);
+        assert_eq!(reopened.follow_ups.len(), 1);
+        assert_eq!(reopened.follow_ups[0].text, "Fix the rejection");
+        assert!(!parkable(&project, &reopened));
+        park_completed(&ctx, &project).unwrap();
+        assert!(!thread::load(&project, &lane.id).unwrap().parked);
         assert_eq!(reopened.worktree_path, lane.worktree_path);
         assert_eq!(reopened.attempt, 1);
         assert!(world.runner.calls.borrow().iter().any(|c| {
@@ -4556,6 +4591,8 @@ mod tests {
         }));
         // Round retry uses the same reopen path instead of spending a new attempt.
         thread::update(&project, &lane.id, |t| {
+            // Model a newer seal after the queued correction was handled.
+            t.follow_ups.clear();
             t.parked = true;
             t.last_group = Group::Parked.token().into();
             t.pane_id = "w2:p1".into();
@@ -4570,7 +4607,10 @@ mod tests {
             thread::load(&project, &lane.id).unwrap().worktree_path,
             lane.worktree_path
         );
-        assert_eq!(world.runner.count("agent prompt"), 2);
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        let retried_lane = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(retried_lane.follow_ups.len(), 1);
+        assert_eq!(retried_lane.follow_ups[0].text, "Repair the conflict");
     }
 
     #[test]
