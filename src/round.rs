@@ -2439,7 +2439,8 @@ pub fn adopt(ctx: &Ctx, slug: &str, round: &str, id: &str) -> Result<RecoveryOut
             current.rejections = Some(current.rejections.unwrap_or(0) + 1);
         }
         current.reviewer = Some(id.to_string());
-        current.verdict = Some(pin);
+        current.verdict = Some(pin.clone());
+        update_verdict_gates(&git, &mut current, &pin.sha)?;
         current.reviewer_awaiting_report_after = None;
         current.verdict_kind = Some(verdict_kind);
         current.phase = RoundPhase::VerdictIn;
@@ -4229,6 +4230,19 @@ fn reviewer_completion(
     Ok(Some(pin))
 }
 
+/// Keep the stored gate summary consistent with the verified candidate tree.
+fn update_verdict_gates(git: &Git, record: &mut RoundRecord, candidate: &str) -> Result<()> {
+    if record.selected_gates.is_some() {
+        let files = changed_files(
+            git,
+            record.expected_head.as_deref().context("review_missing")?,
+            candidate,
+        )?;
+        select_gates(record, &files);
+    }
+    Ok(())
+}
+
 /// Accept the reviewer's exact current sealed completion. Before a merge
 /// intent exists, a later completion supersedes an accepted older verdict.
 fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<String> {
@@ -4289,14 +4303,7 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         })
         .map(|pin| pin.sha.clone());
     current.verdict = Some(pin.clone());
-    if current.selected_gates.is_some() {
-        let files = changed_files(
-            git,
-            current.expected_head.as_deref().context("review_missing")?,
-            &pin.sha,
-        )?;
-        select_gates(&mut current, &files);
-    }
+    update_verdict_gates(git, &mut current, &pin.sha)?;
     current.reviewer_awaiting_report_after = None;
     current.verdict_kind = Some(verdict_kind.clone());
     if changed && verdict_kind == "REJECT" {
@@ -4334,6 +4341,8 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         }
         let mut latest = latest;
         latest.verdict = current.verdict;
+        latest.selected_gates = current.selected_gates;
+        latest.skipped_gates = current.skipped_gates;
         latest.verdict_kind = current.verdict_kind;
         latest.rejections = current.rejections;
         latest.reviewer_awaiting_report_after = None;
@@ -7858,6 +7867,45 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rejected_candidate_records_its_actual_gate_selection() {
+        let fx = fixture();
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![scoped_gate("full", &["src/**"])])
+        });
+        open_r1(&fx);
+        let (lane, sha) = fx.lane(1);
+        admit(&fx.world.ctx(), "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# code\n");
+        review(&fx.world.ctx(), "demo", "r1").unwrap();
+        assert_eq!(
+            load(&fx.project, "r1")
+                .unwrap()
+                .selected_gates
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        let wt = fx.repo.join(".worktrees/review-r1");
+        git(&wt, &["merge", "-q", "--no-edit", &sha]);
+        git(&wt, &["revert", "--no-edit", &sha]);
+        let candidate = git(&wt, &["rev-parse", "HEAD"]);
+        let record = load(&fx.project, "r1").unwrap();
+        let report = format!(
+            "+++\nverdict = \"REJECT\"\nround = \"r1\"\ncandidate = \"{candidate}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n",
+            record.manifest_hash.as_ref().unwrap(),
+            record.policy_hash
+        );
+        let reviewer = fx.thread("Reviewer");
+        fx.seal_done(&reviewer, 1, 1, &candidate, &report);
+        bind_reviewer(&fx.world.ctx(), "demo", "r1", &reviewer).unwrap();
+        advance(&fx.world.ctx(), "demo").unwrap();
+        let accepted = load(&fx.project, "r1").unwrap();
+        assert!(accepted.selected_gates.as_ref().unwrap().is_empty());
+        assert_eq!(accepted.skipped_gates, vec![0]);
     }
 
     #[test]
