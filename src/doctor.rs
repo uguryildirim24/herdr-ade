@@ -1410,7 +1410,7 @@ export -f inspect
     };
     let box_root = machine.root;
     bash.push_str(&format!(
-        "doctor_size_cache={}; mkdir -p \"$doctor_size_cache\"\ncached_size() {{ local path=$1 key=$2 stamp file cached; stamp=$(stat -c %Y -- \"$path\" 2>/dev/null) || return 1; key=$(printf '%s' \"$key\" | sha256sum); key=${{key%% *}}; file=\"$doctor_size_cache/$key\"; if [[ -f $file ]]; then read -r cached < \"$file\"; if [[ $cached == \"$stamp \"* ]]; then printf '%s' \"${{cached#* }}\"; return; fi; fi; cached=$(timeout 2s du -sk -- \"$path\") || return 1; cached=${{cached%%[[:space:]]*}}; printf '%s %s\\n' \"$stamp\" \"$cached\" > \"$file.tmp.$$\"; mv -f \"$file.tmp.$$\" \"$file\"; printf '%s' \"$cached\"; }}\nexport doctor_size_cache; export -f cached_size\ndoctor_tmp=$(mktemp -d /tmp/herdr-doctor-batch.XXXXXXXX) || exit 1\ntrap 'rm -rf -- \"$doctor_tmp\"' EXIT\ndoctor_jobs=\ndoctor_index=0\n",
+        "doctor_size_cache={}; mkdir -p \"$doctor_size_cache\"\ncached_size() {{ local path=$1 key=$2 stamp file cached; stamp=$(stat -c %y -- \"$path\" 2>/dev/null) || return 1; key=$(printf '%s' \"$key\" | sha256sum); key=${{key%% *}}; file=\"$doctor_size_cache/$key\"; if [[ -f $file ]]; then read -r cached < \"$file\"; if [[ $cached == \"$stamp \"* ]]; then printf '%s' \"${{cached#* }}\"; return; fi; fi; cached=$(timeout 2s du -sk -- \"$path\") || return 1; cached=${{cached%%[[:space:]]*}}; printf '%s %s\\n' \"$stamp\" \"$cached\" > \"$file.tmp.$$\"; mv -f \"$file.tmp.$$\" \"$file\"; printf '%s' \"$cached\"; }}\nexport doctor_size_cache; export -f cached_size\ndoctor_tmp=$(mktemp -d /tmp/herdr-doctor-batch.XXXXXXXX) || exit 1\ntrap 'rm -rf -- \"$doctor_tmp\"' EXIT\ndoctor_jobs=\ndoctor_index=0\n",
         crate::remote::quote(&format!("{box_root}/.doctor-sizes"))
     ));
     for (project, thread) in candidates {
@@ -1633,7 +1633,9 @@ fn finished_worktrees_impl(
                 output.success().then(|| {
                     (
                         thread.worktree_path.clone(),
-                        output.stdout.trim().to_string(),
+                        // Porcelain -z starts with a space for worktree-only
+                        // changes; trimming shifts its two-byte status field.
+                        output.stdout,
                     )
                 })
             })
