@@ -43,11 +43,10 @@ pub(crate) struct State {
     /// unread. Reset when the set is read or a different set is announced.
     pub(crate) unread_passes: u32,
     pub(crate) session_item_written: bool,
-    /// Last successful automated prompt to continue open work.
+    /// Last successful automated prompt to continue the project.
     pub(crate) idle_nudge_last: String,
-    /// Last next action announced for each task. An unchanged action is not
-    /// useful a second time, even after the coordinator reads context.
-    pub(crate) idle_nudge_next: BTreeMap<String, String>,
+    /// Last automatic coordinator relaunch attempt, including failed starts.
+    pub(crate) coordinator_relaunch_last: String,
 }
 
 pub(crate) fn load_state(project: &Project) -> State {
