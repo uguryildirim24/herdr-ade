@@ -39,7 +39,7 @@ fn eligible(ctx: &Ctx, project: &Project, t: &Thread, cwd: &str, screen: &str) -
     if !std::fs::symlink_metadata(&marker).is_ok_and(|m| m.file_type().is_file()) {
         return false;
     }
-    let Ok(gitdir) = std::fs::read_to_string(marker) else {
+    let Ok(gitdir) = std::fs::read_to_string(&marker) else {
         return false;
     };
     let Some(gitdir) = gitdir.trim().strip_prefix("gitdir: ") else {
