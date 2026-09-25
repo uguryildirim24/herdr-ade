@@ -218,6 +218,9 @@ pub(crate) struct AgentStart<'a> {
     pub(crate) kind: &'a str,
     pub(crate) pane: &'a str,
     pub(crate) agent_args: &'a [String],
+    /// Exclusive lookup directory for a box agent. Passed at launch (after
+    /// shell startup), not at pane creation where bashrc can override it.
+    pub(crate) launch_bin: Option<&'a str>,
     pub(crate) parent: Option<&'a str>,
     pub(crate) ready_timeout_ms: u64,
 }
@@ -524,6 +527,10 @@ impl<'a> Herdr<'a> {
         if let Some(parent) = opts.parent.filter(|p| !p.is_empty()) {
             args.push("--parent".into());
             args.push(parent.to_string());
+        }
+        if let Some(bin) = opts.launch_bin {
+            args.push("--env".into());
+            args.push(format!("PATH={bin}"));
         }
         if !opts.agent_args.is_empty() {
             args.push("--".into());
@@ -846,6 +853,7 @@ mod tests {
                 kind: "cursor",
                 pane: "w2:p1",
                 agent_args: &args,
+                launch_bin: Some("/slice/bin"),
                 parent: Some("w1:p1"),
                 ready_timeout_ms: 30_000,
             })
@@ -854,6 +862,8 @@ mod tests {
         let call = runner.calls.borrow();
         let line = call[0].display();
         assert!(line.contains("--parent w1:p1"), "{line}");
+        assert!(line.contains("--env PATH=/slice/bin"), "{line}");
+        assert!(!line.contains("PATH=/slice/bin:"), "{line}");
         assert!(line.contains("--timeout 30000"), "{line}");
         assert!(line.contains("--force"), "{line}");
     }
