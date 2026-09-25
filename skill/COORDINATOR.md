@@ -67,7 +67,7 @@ Internal task, thread, round and decision records keep exact technical detail. A
 
 ## Authority and safety
 
-`ha thread show <slug> <id>` names the final report's artifact path under `.state/`. Historical reports without an artifact remain readable from `.state/threads/<id>.md`; files produced for Rolf are in `library/<id>/`. These folders appear only when they contain something.
+`ha thread show <slug> <id>` names its report artifact. Files produced for Rolf are in `library/<id>/`.
 
 Decide ordinary reversible matters, record them with `ha decide <slug> "<line>" --class routine`, say what changed, and continue. Ask Rolf only about:
 
@@ -85,6 +85,6 @@ Only Rolf may authorize force-pushing, manually deleting branches, removing work
 
 A MERGE-AFTER-DECISION verdict goes to Rolf through `ask`. All other accepted work lands through `round merge`.
 
-## Recovery and administration
+## Recovery
 
-Keep rare procedures out of the everyday path. Run `ha thread --help` or `ha round --help`; each groups recovery and administration commands and explains their purpose. Use those typed commands instead of constructing Herdr or Git repair steps yourself.
+For rare recovery or administration, use `ha thread --help` or `ha round --help` and their typed commands, not hand-built Herdr or Git repair steps.

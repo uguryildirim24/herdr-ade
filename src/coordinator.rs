@@ -1137,44 +1137,6 @@ fn digest_snapshot(
         overflow_count(&mut out, failures.len());
     }
 
-    let mut worktrees = BTreeMap::new();
-    let retained: Vec<_> = crate::thread::list(project)
-        .into_iter()
-        .filter(|thread| {
-            if thread.status != crate::thread::Status::Resolved || thread.worktree_path.is_empty() {
-                return false;
-            }
-            if thread.is_remote() {
-                return true;
-            }
-            if !std::path::Path::new(&thread.worktree_path).is_dir() {
-                return false;
-            }
-            let paths: &Vec<String> = worktrees.entry(thread.repo.clone()).or_insert_with(|| {
-                crate::git::worktree_list(ctx.runner, &thread.repo)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(path, _)| path.to_string_lossy().into_owned())
-                    .collect()
-            });
-            paths.contains(&thread.worktree_path)
-        })
-        .collect();
-    if !retained.is_empty() {
-        let _ = writeln!(out, "\n## Retained worktrees");
-        for thread in retained.iter().take(DIGEST_ROWS) {
-            let _ = writeln!(
-                out,
-                "- {} on {}: {} holds {}; `ha doctor` shows size and the exact removal command",
-                thread.id,
-                thread.machine_route(),
-                thread.worktree_path,
-                thread.branch
-            );
-        }
-        overflow_count(&mut out, retained.len());
-    }
-
     let events = crate::events::list(project);
     let mut shown_events = Vec::new();
     let rows = crate::threads::rows(ctx, project);
