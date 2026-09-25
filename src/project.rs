@@ -304,6 +304,15 @@ pub(crate) struct Coordinator {
     pub(crate) pane_id: String,
     pub(crate) agent_name: String,
     pub(crate) cwd: String,
+    /// Set once when the bound pane disappears on a still-running server.
+    pub(crate) closed_by_rolf_at: String,
+    /// A new message asks the ticker to reopen a previously closed pane.
+    pub(crate) reopen_requested: bool,
+    /// Socket inode of the server that hosted this pane. A changed inode is
+    /// evidence of a server restart, not a manually closed pane.
+    pub(crate) server_socket_inode: u64,
+    /// Evidence that an agent ran here, before reporting this pane's process dead.
+    pub(crate) last_agent_seen_at: String,
     pub(crate) prime_pending: bool,
     pub(crate) launch_attempts: u32,
     pub(crate) updated: String,

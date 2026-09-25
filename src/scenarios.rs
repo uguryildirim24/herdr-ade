@@ -124,6 +124,7 @@ impl World {
                 c.pane_id = "w1:p1".into();
                 c.agent_name = format!("hp-{slug}-coordinator");
                 c.cwd = cwd;
+                c.server_socket_inode = ticker::socket_inode(&socket);
             })
             .unwrap();
         project
@@ -303,16 +304,17 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
         let _ = ticker::tick_project(&ctx, &project);
         assert_eq!(
             world.runner.count("agent start"),
-            tick + 1,
-            "one lane start per tick plus the missing coordinator relaunch"
+            tick,
+            "one lane start per tick; a closed coordinator is not relaunched"
         );
     }
-    // Six lane starts: three each, plus one missing coordinator relaunch.
+    // Six lane starts: three each. The absent coordinator stays closed.
     // Absent agent state in the listed lane panes is still unknown.
     let _ = ticker::tick_project(&ctx, &project);
     let _ = ticker::tick_project(&ctx, &project);
-    assert_eq!(world.runner.count("agent start"), 7);
+    assert_eq!(world.runner.count("agent start"), 6);
     assert_eq!(world.runner.count("tab close"), 0);
+    assert!(!project.coordinator().unwrap().closed_by_rolf_at.is_empty());
     for id in ["t-0001", &second.id] {
         let t = thread::load(&project, id).unwrap();
         assert_eq!(t.status, Status::Open, "{id}");
@@ -2695,6 +2697,56 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
 }
 
 #[test]
+fn open_reopens_a_closed_coordinator_and_a_new_message_requests_reopen() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    project
+        .update_coordinator(|c| c.closed_by_rolf_at = project::now())
+        .unwrap();
+    world.runner.on(
+        "workspace create",
+        ok(r#"{"result":{"root_pane":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
+    );
+    world.runner.on(
+        "agent start hp-demo-coordinator",
+        fail(
+            1,
+            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
+        ),
+    );
+    let options = coordinator::OpenOptions {
+        session: crate::paths::SessionFlags {
+            session: None,
+            socket: Some(world.home.path().join("a.sock")),
+        },
+        reprime: false,
+        rebind: false,
+        recipe: None,
+        recipe_basis: None,
+    };
+    coordinator::open(&world.ctx(), "demo", &options).unwrap();
+    let record = project.coordinator().unwrap();
+    assert_eq!(record.pane_id, "w2:p1");
+    assert!(record.closed_by_rolf_at.is_empty());
+    project
+        .update_coordinator(|c| c.closed_by_rolf_at = project::now())
+        .unwrap();
+    crate::talk::append(
+        &project,
+        None,
+        crate::talk::Entry::Rolf {
+            request: "q-1".into(),
+            text: "Continue".into(),
+            answer: None,
+        },
+    )
+    .unwrap();
+    let record = project.coordinator().unwrap();
+    assert!(record.closed_by_rolf_at.is_empty());
+    assert!(record.reopen_requested);
+}
+
+#[test]
 fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -2705,6 +2757,9 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
             c.launch.args = vec!["--model".into(), "recorded".into()];
         })
         .unwrap();
+    let replacement = world.home.path().join("new.sock");
+    std::fs::write(&replacement, b"").unwrap();
+    std::fs::rename(replacement, project.coordinator().unwrap().socket).unwrap();
     world.runner.on(
         "workspace create",
         ok(r#"{"result":{"root_pane":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
