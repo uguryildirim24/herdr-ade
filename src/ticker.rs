@@ -1271,43 +1271,6 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .collect()
 }
 
-fn open_work_next_steps(project: &Project) -> BTreeMap<String, String> {
-    let now = jiff::Timestamp::now();
-    if thread::list(project)
-        .iter()
-        .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
-    {
-        return BTreeMap::new();
-    }
-    crate::task::views(project)
-        .0
-        .into_iter()
-        .filter(|view| {
-            !view.terminal(project) && !view.next.starts_with("wait for the queued follow-up")
-        })
-        .filter_map(|view| {
-            if let Some(wait) = crate::task::active_wait(project, &view.record) {
-                if wait.kind != "event" {
-                    return None;
-                }
-                let today = project::now().chars().take(10).collect::<String>();
-                if wait.since.starts_with(&today) {
-                    return None;
-                }
-                return Some((
-                    view.record.id.clone(),
-                    format!(
-                        "{} (still waiting on {}: {}; {today})",
-                        view.next, wait.kind, wait.target
-                    ),
-                ));
-            }
-            let suffix = view.record.wait.as_ref().map_or("", |_| " (hold resolved)");
-            Some((view.record.id, format!("{}{suffix}", view.next)))
-        })
-        .collect()
-}
-
 fn idle_nudge_due(
     project: &Project,
     state: &steps::State,
@@ -1327,6 +1290,33 @@ fn idle_nudge_due(
     Ok(matches!((context, last), (Some(context), Some(last)) if context > last))
 }
 
+fn idle_task_lines(project: &Project) -> Vec<String> {
+    crate::task::views(project)
+        .0
+        .into_iter()
+        .filter(|view| !view.terminal(project))
+        .map(|view| {
+            let block = crate::task::active_wait(project, &view.record)
+                .map(|wait| format!("waiting on {}: {}", wait.kind, wait.target))
+                .unwrap_or_else(|| view.next);
+            format!("{}: {}", view.record.id, block)
+        })
+        .collect()
+}
+
+fn idle_nudge_text(lines: &[String]) -> String {
+    let blocks = if lines.is_empty() {
+        "No open tasks.".to_string()
+    } else {
+        lines.join("; ")
+    };
+    format!(
+        "{} {} Find and start the next useful step toward the project goal now. Ask Rolf only for what truly needs him; keep other work moving.",
+        steps::TICKER_PROMPT_PREFIX,
+        blocks
+    )
+}
+
 fn nudge_idle_coordinator(
     ctx: &Ctx,
     project: &Project,
@@ -1338,15 +1328,26 @@ fn nudge_idle_coordinator(
     if coordinator.prime_pending || agent.is_none_or(|agent| agent.agent_status != "idle") {
         return Ok(());
     }
-    let current = open_work_next_steps(project);
-    let next: Vec<_> = current
-        .iter()
-        .filter(|(id, action)| state.idle_nudge_next.get(*id) != Some(*action))
-        .map(|(id, action)| format!("{id}: {action}"))
-        .collect();
-    if next.is_empty() {
+    if project.finished() || project.status() != project::Status::Active {
         return Ok(());
     }
+    let now = jiff::Timestamp::now();
+    if thread::list(project)
+        .iter()
+        .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
+        || crate::round::list(project).iter().any(|round| {
+            matches!(
+                round.phase,
+                crate::contracts::RoundPhase::PreparingReview
+                    | crate::contracts::RoundPhase::UnderReview
+                    | crate::contracts::RoundPhase::Merging
+                    | crate::contracts::RoundPhase::Checkpointing
+            )
+        })
+    {
+        return Ok(());
+    }
+    let next = idle_task_lines(project);
     let settings = crate::project::coordinator_settings(&ctx.config_dir)?;
     if !idle_nudge_due(
         project,
@@ -1356,11 +1357,7 @@ fn nudge_idle_coordinator(
     )? {
         return Ok(());
     }
-    let text = format!(
-        "{} Continue open work: {}.",
-        steps::TICKER_PROMPT_PREFIX,
-        next.join("; ")
-    );
+    let text = idle_nudge_text(&next);
     let _writer = crate::talk::writer_lock(project)?;
     crate::talk::mark_automated_prompt(project, &coordinator.pane_id, &text)?;
     // Keep the send start, not the return time: the prompted turn can read
@@ -1368,8 +1365,37 @@ fn nudge_idle_coordinator(
     let sent_at = project::now();
     herdr.agent_prompt(&coordinator.pane_id, &text)?;
     state.idle_nudge_last = sent_at;
-    state.idle_nudge_next = current;
     crate::ledger::coordinator_nudge(project, &next)
+}
+
+fn relaunch_missing_coordinator(
+    ctx: &Ctx,
+    project: &Project,
+    record: &crate::project::Coordinator,
+) -> Result<()> {
+    let mut state = steps::load_state(project);
+    if !state.coordinator_relaunch_last.is_empty()
+        && thread::seconds_since(&state.coordinator_relaunch_last, jiff::Timestamp::now()) < 3600
+    {
+        return Ok(());
+    }
+    state.coordinator_relaunch_last = project::now();
+    steps::save_state(project, &state)?;
+    crate::ledger::coordinator_relaunch(project, &record.pane_id)?;
+    coordinator::open(
+        ctx,
+        &project.slug,
+        &coordinator::OpenOptions {
+            session: crate::paths::SessionFlags {
+                session: None,
+                socket: Some(record.socket.clone().into()),
+            },
+            reprime: false,
+            rebind: false,
+            recipe: None,
+            recipe_basis: None,
+        },
+    )
 }
 
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
@@ -1462,6 +1488,16 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     let recorded_panes = pass.recorded_panes + coordinator_recorded;
     let missing_panes = pass.missing_panes + coordinator_missing;
 
+    if coordinator_missing == 1
+        && project.status() == project::Status::Active
+        && !(recorded_panes >= 2 && missing_panes == recorded_panes)
+        && !agents.iter().any(|agent| agent.pane_id == record.pane_id)
+        && !panes.iter().any(|pane| pane.pane_id == record.pane_id)
+        && let Err(error) = relaunch_missing_coordinator(ctx, project, &record)
+    {
+        crate::ledger::observe(project, "coordinator-relaunch", slug, &format!("{error:#}"));
+    }
+
     // Nudge (or notify) about inbox items `context` has not shown yet.
     if let Ok((settings, _)) = project.read_project_md() {
         let mut state = steps::load_state(project);
@@ -1474,7 +1510,8 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
             first_error = first_error.or(Some(error.context("nudge")));
         }
         let inbox_prompted = settings.nudge && state.nudged != before.nudged;
-        if !inbox_prompted
+        if settings.nudge
+            && !inbox_prompted
             && let Err(error) =
                 nudge_idle_coordinator(ctx, project, &mut state, &herdr, &record, agent.as_ref())
         {
@@ -2939,14 +2976,14 @@ mod tests {
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 1);
 
-        // Reading context used to make the unchanged task eligible again once
-        // the time interval elapsed. Only a new or changed next action wakes it.
+        // A new context read and an elapsed interval permit another nudge,
+        // even when the next action has not changed.
         let mut state = steps::load_state(&f.project);
         state.idle_nudge_last = "2026-01-01T00:00:00Z".into();
         steps::save_state(&f.project, &state).unwrap();
         crate::ledger::context_read(&f.project, &project::now()).unwrap();
         assert!(tick_project(&ctx, &f.project).unwrap());
-        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(runner.count("agent prompt"), 2);
 
         let calls = runner.calls.borrow();
         let prompt = calls
@@ -2963,211 +3000,75 @@ mod tests {
     }
 
     #[test]
-    fn task_holds_suppress_nudges_until_target_changes_and_events_repeat_daily() {
+    fn waiting_tasks_and_empty_queue_explain_the_next_step() {
         let f = fixture(false);
         write_task(&f.project, Vec::new());
-        let lane = thread::allocate(&f.project, |lane| {
-            lane.status = thread::Status::Open;
-            lane.attempt = 1;
-        })
-        .unwrap();
-        let mut round = crate::contracts::RoundRecord {
-            round: "r1".into(),
-            ..Default::default()
-        };
-        std::fs::create_dir_all(crate::round::rounds_dir(&f.project)).unwrap();
-        let file = crate::round::round_path(&f.project, "r1");
-        std::fs::write(&file, toml::to_string(&round).unwrap()).unwrap();
-        for (kind, target) in [("round", "r1"), ("lane", lane.id.as_str())] {
-            crate::task::set_wait(&f.project, "job-0001", kind, target).unwrap();
-            assert!(open_work_next_steps(&f.project).is_empty(), "{kind}");
-        }
-        thread::update(&f.project, &lane.id, |lane| {
-            lane.status = thread::Status::Resolved
-        })
-        .unwrap();
-        assert!(open_work_next_steps(&f.project)["job-0001"].contains("hold resolved"));
+        crate::task::set_wait(&f.project, "job-0001", "event", "next response").unwrap();
+        let waiting = idle_nudge_text(&idle_task_lines(&f.project));
         assert!(
-            crate::task::render(
-                &f.project,
-                &crate::task::view(
-                    &f.project,
-                    crate::task::load(&f.project, "job-0001").unwrap()
-                )
-            )
-            .contains("hold resolved: lane")
+            waiting.contains("job-0001: waiting on event: next response"),
+            "{waiting}"
         );
-        crate::task::set_wait(&f.project, "job-0001", "round", "r1").unwrap();
-        assert!(open_work_next_steps(&f.project).is_empty());
-        round.phase = crate::contracts::RoundPhase::Abandoned;
-        std::fs::write(&file, toml::to_string(&round).unwrap()).unwrap();
-        assert!(open_work_next_steps(&f.project)["job-0001"].contains("hold resolved"));
-        let ask_dir = f.project.state_dir().join("asks/a-1");
-        std::fs::create_dir_all(&ask_dir).unwrap();
-        let ask = crate::contracts::Ask {
-            id: "a-1".into(),
-            revision: 1,
-            project: "demo".into(),
-            question: "Choose one?".into(),
-            choices: vec!["One".into()],
-            asked: project::now(),
-            ..Default::default()
+        assert!(
+            waiting.contains("Find and start the next useful step"),
+            "{waiting}"
+        );
+        crate::task::drop_task(&f.project, "job-0001", "Done.").unwrap();
+        let empty = idle_nudge_text(&idle_task_lines(&f.project));
+        assert!(empty.contains("No open tasks."), "{empty}");
+        assert!(
+            empty.contains("Ask Rolf only for what truly needs him"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn finished_project_stops_nudges_until_rolf_writes() {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
         };
-        std::fs::write(ask_dir.join("r1.toml"), toml::to_string(&ask).unwrap()).unwrap();
-        crate::task::set_wait(&f.project, "job-0001", "ask", "a-1").unwrap();
-        assert!(open_work_next_steps(&f.project).is_empty());
-        std::fs::write(
-            ask_dir.join("r1.answer.toml"),
-            toml::to_string(&crate::ask::Answer {
-                id: "a-1".into(),
-                revision: 1,
-                choice: 1,
-                text: "One".into(),
-                not_understood: false,
-                answered: project::now(),
-                by: "Rolf".into(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(open_work_next_steps(&f.project)["job-0001"].contains("hold resolved"));
-        crate::task::set_wait(&f.project, "job-0001", "event", "next Claude lane start").unwrap();
-        assert!(open_work_next_steps(&f.project).is_empty());
-        let mut task = crate::task::load(&f.project, "job-0001").unwrap();
-        task.wait.as_mut().unwrap().since = "2020-01-01T00:00:00Z".into();
-        std::fs::write(
-            f.project.state_dir().join("tasks/job-0001.toml"),
-            toml::to_string(&task).unwrap(),
-        )
-        .unwrap();
-        let today = project::now().chars().take(10).collect::<String>();
-        assert!(open_work_next_steps(&f.project)["job-0001"].contains(&today));
-        crate::task::clear_wait(&f.project, "job-0001").unwrap();
-        assert!(!open_work_next_steps(&f.project)["job-0001"].contains("waiting"));
-    }
-
-    #[test]
-    fn dropped_tasks_are_not_actionable_work() {
-        let f = fixture(false);
-        write_task(&f.project, Vec::new());
-        crate::task::drop_task(&f.project, "job-0001", "The premise was wrong.").unwrap();
-
-        assert!(open_work_next_steps(&f.project).is_empty());
-    }
-
-    #[test]
-    fn withdrawing_the_last_unverified_condition_stops_work_nudges() {
-        let f = fixture(false);
-        let (mut settings, body) = f.project.read_project_md().unwrap();
-        settings.task_states = vec!["finished".into(), "verified".into()];
-        let front = toml::to_string(&settings).unwrap();
-        std::fs::write(f.project.project_md(), format!("+++\n{front}+++\n\n{body}")).unwrap();
-
-        let lane = thread::allocate(&f.project, |lane| {
-            lane.status = thread::Status::Resolved;
-            lane.attempt = 1;
-        })
-        .unwrap();
-        let task = crate::task::Task {
-            id: "job-0001".into(),
-            title: "Keep the project moving.".into(),
-            authority: vec!["request:q-1".into()],
-            acceptance: vec!["First.".into(), "Replaced.".into(), "Third.".into()],
-            attempts: vec![lane.id.clone()],
-            verified: vec![crate::task::Evidence {
-                at: project::now(),
-                command: "checked first and third".into(),
-                acceptance: vec![1, 3],
-                machine: None,
-                build: None,
-            }],
-            created: project::now(),
-            ..crate::task::Task::default()
+        let record = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, &runner);
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Agent::default()
         };
-        std::fs::write(
-            f.project.state_dir().join("tasks/job-0001.toml"),
-            toml::to_string(&task).unwrap(),
-        )
-        .unwrap();
-        crate::events::seal_create_if_absent(
-            &f.project,
-            &crate::contracts::Event {
-                id: "done-1".into(),
-                op: "done-1".into(),
-                thread: lane.id,
-                attempt: 1,
-                round: None,
-                recipient: crate::contracts::Recipient::default(),
-                created: project::now(),
-                payload: crate::contracts::EventPayload {
-                    done: Some(crate::contracts::DonePayload {
-                        sha: "lane-sha".into(),
-                        report_path: ".reports/lane.md".into(),
-                        artifact: "report-hash".into(),
-                        attestation: None,
-                    }),
-                    ..crate::contracts::EventPayload::default()
-                },
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            open_work_next_steps(&f.project),
-            BTreeMap::from([("job-0001".into(), "verify 1 acceptance condition(s)".into())])
+        f.project.set_finished(true).unwrap();
+        assert!(
+            coordinator::digest(&ctx, &f.project, "ha")
+                .unwrap()
+                .0
+                .contains("Idle nudges are off")
         );
-        crate::task::withdraw_acceptance(
+        nudge_idle_coordinator(
+            &ctx,
             &f.project,
-            "job-0001",
-            vec![2],
-            "A newer choice replaced it.",
+            &mut steps::State::default(),
+            &herdr,
+            &record,
+            Some(&agent),
         )
         .unwrap();
-        assert!(open_work_next_steps(&f.project).is_empty());
-    }
-
-    #[test]
-    fn work_nudge_waits_when_a_lane_is_working_but_lane_waits_need_the_coordinator() {
-        let f = fixture(false);
-        let lane = thread::allocate(&f.project, |lane| {
-            lane.status = thread::Status::Open;
-            lane.last_group = thread::Group::Working.token().into();
-            lane.attempt = 1;
-        })
-        .unwrap();
-        write_task(&f.project, vec![lane.id.clone()]);
-        assert!(open_work_next_steps(&f.project).is_empty());
-
-        thread::update(&f.project, &lane.id, |lane| {
-            lane.last_group = thread::Group::Idle.token().into();
-        })
-        .unwrap();
-        crate::events::seal_create_if_absent(
+        assert_eq!(runner.count("agent prompt"), 0);
+        crate::talk::record_pane_request(&f.project, "Please continue.").unwrap();
+        assert!(!f.project.finished());
+        nudge_idle_coordinator(
+            &ctx,
             &f.project,
-            &crate::contracts::Event {
-                id: "wait-1".into(),
-                op: "op-1".into(),
-                thread: lane.id,
-                attempt: 1,
-                round: None,
-                recipient: crate::contracts::Recipient::default(),
-                created: project::now(),
-                payload: crate::contracts::EventPayload {
-                    waiting: Some(crate::contracts::WaitingPayload {
-                        text: "Choose the final colour.".into(),
-                        ..crate::contracts::WaitingPayload::default()
-                    }),
-                    ..crate::contracts::EventPayload::default()
-                },
-            },
+            &mut steps::State::default(),
+            &herdr,
+            &record,
+            Some(&agent),
         )
         .unwrap();
-        assert_eq!(
-            open_work_next_steps(&f.project)
-                .get("job-0001")
-                .map(String::as_str),
-            Some("answer the lane wait: Choose the final colour.")
-        );
+        assert_eq!(runner.count("agent prompt"), 1);
     }
 
     #[test]
@@ -3329,6 +3230,44 @@ mod tests {
         }
         assert_eq!(runner.count("agent start"), 3);
         assert_eq!(runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn missing_coordinator_relaunch_is_recorded_and_throttled() {
+        let f = fixture(false);
+        f.project
+            .update_coordinator(|c| {
+                c.launch.recipe_id = "recorded-recipe".into();
+                c.launch.kind = "claude".into();
+            })
+            .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        // Even if the start fails, the attempt is recorded before launching.
+        let _ = tick_project(&ctx, &f.project);
+        let last = steps::load_state(&f.project).coordinator_relaunch_last;
+        assert!(!last.is_empty());
+        let ledger = std::fs::read_to_string(f.project.record_file("ledger.jsonl")).unwrap();
+        assert_eq!(ledger.matches("coordinator_relaunch").count(), 1);
+        let _ = tick_project(&ctx, &f.project);
+        assert_eq!(
+            steps::load_state(&f.project).coordinator_relaunch_last,
+            last
+        );
+        let ledger = std::fs::read_to_string(f.project.record_file("ledger.jsonl")).unwrap();
+        assert_eq!(ledger.matches("coordinator_relaunch").count(), 1);
+        assert_eq!(
+            f.project.coordinator().unwrap().launch.recipe_id,
+            "recorded-recipe"
+        );
     }
 
     #[test]

@@ -39,6 +39,7 @@ enum Line {
     ContextRead { at: String },
     Recovered { kind: String, subject: String },
     CoordinatorNudge { at: String, next: Vec<String> },
+    CoordinatorRelaunch { at: String, pane: String },
 }
 
 #[derive(Default)]
@@ -100,7 +101,7 @@ fn load(project: &Project) -> Result<State> {
             Line::Recovered { kind, subject } => {
                 state.pending.remove(&(kind, subject));
             }
-            Line::CoordinatorNudge { .. } => {}
+            Line::CoordinatorNudge { .. } | Line::CoordinatorRelaunch { .. } => {}
         }
     }
     Ok(state)
@@ -342,6 +343,17 @@ pub(crate) fn coordinator_nudge(project: &Project, next: &[String]) -> Result<()
         &Line::CoordinatorNudge {
             at: jiff::Timestamp::now().to_string(),
             next: next.to_vec(),
+        },
+    )
+}
+
+pub(crate) fn coordinator_relaunch(project: &Project, pane: &str) -> Result<()> {
+    let _lock = lock(project)?;
+    append(
+        project,
+        &Line::CoordinatorRelaunch {
+            at: jiff::Timestamp::now().to_string(),
+            pane: pane.to_string(),
         },
     )
 }

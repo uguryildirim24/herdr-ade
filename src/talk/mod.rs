@@ -160,6 +160,7 @@ pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Resu
         out.push('\n');
     }
     seq += 1;
+    let from_rolf = matches!(entry, Entry::Rolf { .. });
     let text = serde_json::to_string(&Line {
         seq,
         key: key.map(str::to_string),
@@ -176,6 +177,11 @@ pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Resu
     out.push('\n');
     file.write_all(out.as_bytes())?;
     file.sync_all()?;
+    // A fresh message from Rolf resumes a completed project. Do this only
+    // after the journal entry is durable, and never for automated prompts.
+    if from_rolf {
+        project.set_finished(false)?;
+    }
     Ok(Some(seq))
 }
 
