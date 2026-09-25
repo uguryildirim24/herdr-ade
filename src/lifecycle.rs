@@ -1,6 +1,6 @@
 //! pause, resume, archive, unarchive and delete.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -100,21 +100,6 @@ pub(crate) fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ProLane {
-    name: String,
-    cwd: String,
-    parent: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ProTurn {
-    tag: String,
-    lane: String,
-}
-
 #[derive(Serialize, Deserialize)]
 struct DeleteIntent {
     slug: String,
@@ -131,8 +116,6 @@ struct OtherProjectOwnership {
     repos: Vec<Repo>,
     threads: Vec<thread::Thread>,
     paths: BTreeSet<PathBuf>,
-    pro_names: BTreeSet<String>,
-    coordinator_pane: Option<String>,
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -173,15 +156,6 @@ fn readable_threads(project: &Project) -> Result<Vec<thread::Thread>> {
     }
 }
 
-fn pro_thread_names(threads: &[thread::Thread]) -> BTreeSet<String> {
-    threads
-        .iter()
-        .filter(|record| record.role == "pro" || record.launch.kind == "pro")
-        .flat_map(|record| [record.agent_name.clone(), record.agent.clone()])
-        .filter(|name| !name.is_empty())
-        .collect()
-}
-
 fn owned_paths(project: &Project, threads: &[thread::Thread]) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::from([project.dir()]);
     paths.extend(
@@ -207,8 +181,6 @@ fn other_ownership(ctx: &Ctx, slug: &str) -> Result<Vec<OtherProjectOwnership>> 
             slug: other_slug,
             repos: settings.repos,
             paths: owned_paths(&project, &threads),
-            pro_names: pro_thread_names(&threads),
-            coordinator_pane: project.coordinator().map(|record| record.pane_id),
             threads,
         });
     }
@@ -461,106 +433,6 @@ fn prune_remote_worktrees(ctx: &Ctx, machine: &str, repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn pro_lane_belongs<'a>(
-    lane: &ProLane,
-    project_paths: impl IntoIterator<Item = &'a PathBuf>,
-    thread_names: &BTreeSet<String>,
-    coordinator_pane: Option<&str>,
-) -> bool {
-    let cwd = Path::new(&lane.cwd);
-    thread_names.contains(&lane.name)
-        || lane
-            .parent
-            .as_deref()
-            .zip(coordinator_pane)
-            .is_some_and(|(parent, coordinator)| parent == coordinator)
-        || project_paths.into_iter().any(|base| cwd == base.as_path())
-}
-
-fn stop_pro_lanes(
-    ctx: &Ctx,
-    project_paths: &[PathBuf],
-    thread_names: &BTreeSet<String>,
-    coordinator_pane: Option<&str>,
-    others: &[OtherProjectOwnership],
-) -> Result<()> {
-    let root = ctx.root.join("pro-bridge");
-    let lanes = root.join("lanes");
-    let mut names = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir(&lanes) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(lane) = toml::from_str::<ProLane>(&text) else {
-                continue;
-            };
-            if !pro_lane_belongs(&lane, project_paths, thread_names, coordinator_pane) {
-                continue;
-            }
-            let shared_with: Vec<_> = others
-                .iter()
-                .filter(|owner| {
-                    pro_lane_belongs(
-                        &lane,
-                        &owner.paths,
-                        &owner.pro_names,
-                        owner.coordinator_pane.as_deref(),
-                    )
-                })
-                .map(|owner| owner.slug.as_str())
-                .collect();
-            if shared_with.is_empty() {
-                names.insert(lane.name);
-            } else {
-                println!(
-                    "kept shared Pro lane {} (also owned by {})",
-                    lane.name,
-                    shared_with.join(", ")
-                );
-            }
-        }
-    }
-
-    let mut turn_tags: BTreeMap<String, String> = BTreeMap::new();
-    if let Ok(entries) = std::fs::read_dir(root.join("turns")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            if let Ok(turn) = toml::from_str::<ProTurn>(&text)
-                && names.contains(&turn.lane)
-            {
-                turn_tags.insert(turn.tag, turn.lane);
-            }
-        }
-    }
-
-    for name in &names {
-        let out = ctx
-            .runner
-            .run(&Cmd::new("herdr-pro", Duration::from_secs(20)).args(["stop", name]))?;
-        if !out.success() {
-            bail!("could not stop Pro lane `{name}`: {}", out.error_text());
-        }
-        println!("stopped Pro lane: {name}");
-        trash(ctx, &lanes.join(format!("{name}.toml")), "Pro lane record")?;
-    }
-    for (tag, _) in turn_tags {
-        for path in [
-            root.join("turns").join(format!("{tag}.toml")),
-            root.join("turns").join(format!("{tag}.collector.lock")),
-            root.join("packets").join(format!("{tag}.md")),
-            root.join("inflight").join(format!("{tag}.lock")),
-        ] {
-            trash(ctx, &path, "Pro bridge file")?;
-        }
-    }
-    Ok(())
-}
-
 fn pi_session_name(path: &Path) -> String {
     format!(
         "--{}--",
@@ -623,7 +495,6 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
     }
 
     let project_paths: Vec<_> = owned_paths(&project, &threads).into_iter().collect();
-    let pro_names = pro_thread_names(&threads);
 
     if preview {
         println!("Archive keeps `{slug}` and its files available for unarchive.");
@@ -742,14 +613,6 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
     for round in open_rounds {
         println!("cancelled round: {round}");
     }
-
-    stop_pro_lanes(
-        ctx,
-        &project_paths,
-        &pro_names,
-        coordinator.as_ref().map(|record| record.pane_id.as_str()),
-        &others,
-    )?;
 
     let mut owned_repos = Vec::new();
     for repo in &settings.repos {
@@ -1109,61 +972,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_keeps_logs_and_pro_files_another_project_claims() {
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        let first_cwd = world.home.path().join("lane.with-dot");
-        thread::allocate(&project, |record| {
-            record.status = thread::Status::Resolved;
-            record.role = "pro".into();
-            record.agent_name = "shared-pro".into();
-            record.worktree_path = first_cwd.display().to_string();
-            record.cwd = record.worktree_path.clone();
-        })
-        .unwrap();
-
-        let other = crate::project::create(&world.root, "second", "", vec![]).unwrap();
-        let other_cwd = world.home.path().join("lane-with-dot");
-        thread::allocate(&other, |record| {
-            record.status = thread::Status::Open;
-            record.role = "pro".into();
-            record.agent_name = "shared-pro".into();
-            record.cwd = other_cwd.display().to_string();
-        })
-        .unwrap();
-
-        let pro = world.root.join("pro-bridge/lanes");
-        std::fs::create_dir_all(&pro).unwrap();
-        std::fs::write(
-            pro.join("shared-pro.toml"),
-            "name = \"shared-pro\"\ncwd = \"/somewhere\"\nparent = \"w1:p1\"\n",
-        )
-        .unwrap();
-        let shared_log = world
-            .home
-            .path()
-            .join(".claude/projects")
-            .join(claude_session_name(&first_cwd));
-        assert_eq!(
-            claude_session_name(&first_cwd),
-            claude_session_name(&other_cwd)
-        );
-        std::fs::create_dir_all(&shared_log).unwrap();
-        world.runner.on("/usr/bin/trash", ok(""));
-
-        delete(&world.ctx(), "demo", false, false).unwrap();
-
-        assert_eq!(world.runner.count("herdr-pro stop shared-pro"), 0);
-        assert!(!world.runner.calls.borrow().iter().any(|call| {
-            call.program == "/usr/bin/trash"
-                && call
-                    .args
-                    .iter()
-                    .any(|arg| arg == &shared_log.display().to_string())
-        }));
-    }
-
-    #[test]
     fn delete_keeps_other_projects_old_trash_copies() {
         let world = World::new();
         world.project("demo", "a.sock");
@@ -1210,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_sessions_pro_files_and_github_only_when_explicit() {
+    fn delete_removes_sessions_and_github_only_when_explicit() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
         let repo = world.home.path().join("demo-code");
@@ -1227,21 +1035,6 @@ mod tests {
         )
         .unwrap();
 
-        let pro = world.root.join("pro-bridge");
-        for dir in ["lanes", "turns", "packets"] {
-            std::fs::create_dir_all(pro.join(dir)).unwrap();
-        }
-        std::fs::write(
-            pro.join("lanes/pro-demo.toml"),
-            "name = \"pro-demo\"\ncwd = \"/somewhere\"\nparent = \"w1:p1\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            pro.join("turns/pro-demo-01.toml"),
-            "tag = \"pro-demo-01\"\nlane = \"pro-demo\"\n",
-        )
-        .unwrap();
-        std::fs::write(pro.join("packets/pro-demo-01.md"), "packet").unwrap();
         let pi_session = world
             .root
             .join("pi/agent/sessions")
@@ -1254,13 +1047,11 @@ mod tests {
         std::fs::create_dir_all(&pi_session).unwrap();
         std::fs::create_dir_all(&claude_session).unwrap();
 
-        world.runner.on("herdr-pro stop pro-demo", ok(""));
         world.runner.on("gh repo delete acme/demo --yes", ok(""));
         world.runner.on("/usr/bin/trash", ok(""));
 
         delete(&world.ctx(), "demo", true, false).unwrap();
 
-        assert_eq!(world.runner.count("herdr-pro stop pro-demo"), 1);
         assert_eq!(world.runner.count("gh repo delete acme/demo --yes"), 1);
         let calls = world.runner.calls.borrow();
         for path in [repo, pi_session, claude_session] {
@@ -1272,13 +1063,6 @@ mod tests {
                         .any(|arg| arg == &path.display().to_string())
             }));
         }
-        assert!(calls.iter().any(|call| {
-            call.program == "/usr/bin/trash"
-                && call
-                    .args
-                    .iter()
-                    .any(|arg| arg.ends_with("pro-bridge/packets/pro-demo-01.md"))
-        }));
     }
 
     #[test]

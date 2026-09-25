@@ -9,16 +9,6 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 - Do not edit project memory. Put durable lessons in your report for the coordinator to decide.
 - Never add a throwaway tab or pane to your lane workspace or to the watched session. Run visual checks and probes in the isolated session `herdr --session scratch-<lane id> ...` on your lane's machine. When done, run `herdr session stop scratch-<lane id>` and `herdr session delete scratch-<lane id>`; resolve also removes a leftover session.
 
-## Pictures
-
-A lane can ask Codex for one mock-up picture. Write the prompt to a file and run:
-
-```text
-herdr-pro image --prompt-file <file> --size <WxH> --out <png> [--with <png>]...
-```
-
-The command starts (or reuses) a picture lane on Codex's own backend, spends one Codex turn, and saves the PNG to `--out`; it takes a few minutes. Attach a screenshot or reference picture with `--with <png>` (up to four) instead of describing it. Ask for a picture only when the brief says pictures are wanted. Name the exact pixel size in `--size`; if the tool only offers fixed sizes it picks the nearest and says which one it used.
-
 ## If this attempt fails
 
 When your approach fails, preserve the git folder and run:
