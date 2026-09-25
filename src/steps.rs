@@ -939,6 +939,16 @@ pub(crate) fn remote_attention(
 
     let mut signals = Vec::new();
     for lane in threads {
+        // Placement creates the pane before the ticker has launched an
+        // agent. A missing agent (or even a reboot) at that boundary is not
+        // evidence of a gone process and must not spend recovery retries.
+        // Also discard a prior attempt's gone marker so this attempt can be
+        // observed independently once its launch begins.
+        if lane.launch_attempts == 0 && lane.startup_wait_started.is_empty() {
+            state.missing.remove(&lane.id);
+            state.gone.remove(&lane.id);
+            continue;
+        }
         let live = thread::live_state(lane, agents, panes, now);
         let blocked = live.agent_state.as_deref() == Some("blocked");
         if blocked {
@@ -1664,12 +1674,95 @@ mod tests {
     }
 
     #[test]
+    fn courier_does_not_fail_a_placed_reviewer_before_agent_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let lane = thread::allocate(&project, |t| {
+            t.role = "reviewer".into();
+            t.machine = "buildbox".into();
+            t.machine_id = "abc".into();
+            t.pane_id = "w9:p9".into();
+            t.workspace_id = "w9".into();
+            t.tab_id = "w9:t9".into();
+            t.cwd = "/box/review".into();
+            t.status = thread::Status::Starting;
+            t.attempt = 2;
+            t.launch.attempt = 2;
+            t.launch.same_recipe_retries = 1;
+            t.launch_attempts = 0;
+            t.startup_wait_started.clear();
+        })
+        .unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().to_path_buf(),
+            config_dir: root.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let now = at("2026-09-19T00:00:00Z");
+        let mut stale = events::remote_state(&project, "abc");
+        stale.boot_id = "boot-1".into();
+        stale.gone.insert(lane.id.clone());
+        stale.missing.insert(lane.id.clone(), 2);
+        events::save_remote_state(&project, "abc", &stale).unwrap();
+        for _ in 0..3 {
+            let errors = remote_attention(
+                &ctx,
+                &project,
+                RemoteView {
+                    machine_id: "abc",
+                    threads: std::slice::from_ref(&lane),
+                    agents: &[],
+                    panes: &[],
+                    boot_id: "boot-2",
+                    now,
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        let state = events::remote_state(&project, "abc");
+        assert!(!state.gone.contains(&lane.id));
+        assert!(!state.missing.contains_key(&lane.id));
+        let unchanged = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(unchanged.attempt, 2);
+        assert_eq!(unchanged.launch.same_recipe_retries, 1);
+        assert_eq!(unchanged.status, thread::Status::Starting);
+
+        // After the ticker starts the agent, absence is evidence again.
+        let mut launched = lane;
+        launched.launch_attempts = 1;
+        let _ = remote_attention(
+            &ctx,
+            &project,
+            RemoteView {
+                machine_id: "abc",
+                threads: &[launched],
+                agents: &[],
+                panes: &[],
+                boot_id: "boot-2",
+                now,
+            },
+        );
+        assert_eq!(
+            events::remote_state(&project, "abc")
+                .missing
+                .values()
+                .next(),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn a_box_lane_signal_waits_until_the_coordinator_can_receive_it() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let lane = thread::allocate(&project, |t| {
             t.machine = "buildbox".into();
             t.machine_id = "abc".into();
+            t.launch_attempts = 1;
             t.pane_id = "w9:p9".into();
             t.workspace_id = "w9".into();
             t.tab_id = "w9:t9".into();
