@@ -2723,7 +2723,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
 
     // Every path that resolves a thread performs a final copy first.
     let mut removal_refusal = None;
-    let (final_copy, copy_notes) = if args.skip_copy {
+    let (mut final_copy, mut copy_notes) = if args.skip_copy {
         ("skipped".to_string(), Vec::new())
     } else {
         let copied = final_copy(ctx, &project, &record);
@@ -2745,6 +2745,19 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             }
         }
     };
+
+    // Even an explicit copy override cannot delete linked files that were not
+    // preserved. The sealed report is still available when --skip-copy is set.
+    {
+        let preserved = thread::load(&project, id)?;
+        if let Err(error) = preserve_report_links(ctx, &project, &preserved) {
+            let detail = format!("linked_files_not_kept: {error:#}");
+            crate::ledger::observe(&project, "thread-cleanup", id, &detail);
+            copy_notes.push(detail.clone());
+            final_copy = "partial".into();
+            removal_refusal = Some(detail);
+        }
+    }
 
     let mut pane_closed = false;
     let mut worktree_removed = false;
@@ -2803,9 +2816,14 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         false
     };
     thread::update(&project, id, |t| {
-        t.cleanup_pending = fix_cleanup_failed;
+        t.cleanup_pending = fix_cleanup_failed
+            || removal_refusal
+                .as_ref()
+                .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
         t.cleanup_reason = if fix_cleanup_failed {
             "reviewer fix".into()
+        } else if t.cleanup_pending {
+            "linked files".into()
         } else {
             String::new()
         };
@@ -2829,8 +2847,8 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     };
     let (worktree, worktree_reason) = if worktree_removed {
         ("removed", None)
-    } else if let Some(reason) = removal_refusal {
-        ("kept", Some(reason))
+    } else if let Some(reason) = &removal_refusal {
+        ("kept", Some(reason.clone()))
     } else if resolved.kind == Kind::Worktree || managed_git_folder(&project, &resolved) {
         ("not_recorded", None)
     } else {
@@ -2839,7 +2857,12 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     refresh_plan(ctx, &project);
     Ok(ResolveOutcome {
         thread: id.to_string(),
-        state: if fix_cleanup_failed {
+        state: if resolved.cleanup_pending
+            || removal_refusal
+                .as_ref()
+                .is_some_and(|r| r.starts_with("linked_files_not_kept:"))
+            || fix_cleanup_failed
+        {
             "cleanup_pending"
         } else {
             "resolved"
@@ -3131,8 +3154,9 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     }
 }
 
-/// Finds the final report hash and copies real deliverables, without making a
-/// second report. A box lane's sealed artifact arrives through the Mac courier;
+/// Finds the sealed report hash and copies library deliverables. Linked files
+/// and any rewritten report are preserved at resolve time. A box lane's sealed
+/// artifact arrives through the Mac courier;
 /// until then the copy is partial.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
     let copied = if record.is_remote() {
@@ -3151,11 +3175,261 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
     copied
 }
 
+/// Preserve relative Markdown links before the worktree can be removed. The
+/// seal is immutable, so the rewritten report is a separate addressed copy.
+const LINKED_FILES_CAP: u64 = 200 * 1024 * 1024;
+
+fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let bytes = report.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        // Inline links/images and reference definitions: [text](path),
+        // ![alt](path), and [label]: path. Preserve titles and fragments.
+        let html = [b"src=\"".as_slice(), b"href=\"", b"src='", b"href='"]
+            .into_iter()
+            .find(|attr| bytes[i..].starts_with(attr));
+        let start = if let Some(attr) = html {
+            Some(i + attr.len())
+        } else if bytes[i] == b']' && bytes[i + 1] == b'(' {
+            Some(i + 2)
+        } else if bytes[i] == b']' && bytes[i + 1] == b':' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            Some(j)
+        } else {
+            None
+        };
+        if let Some(mut start) = start {
+            let quote = html.map(|_| bytes[start - 1]);
+            let angle = bytes.get(start) == Some(&b'<');
+            if angle {
+                start += 1;
+            }
+            let mut end = start;
+            let mut depth = 0_u32;
+            while end < bytes.len() {
+                let b = bytes[end];
+                if quote == Some(b)
+                    || matches!(b, b'\n' | b'\r')
+                    || (quote.is_none() && !angle && matches!(b, b' ' | b'\t'))
+                    || (angle && b == b'>')
+                {
+                    break;
+                }
+                if quote.is_none() && !angle && b == b')' {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                } else if quote.is_none() && !angle && b == b'(' {
+                    depth += 1;
+                }
+                end += 1;
+            }
+            if end > start && report.is_char_boundary(start) && report.is_char_boundary(end) {
+                found.push((start..end, report[start..end].to_string()));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+fn linked_relative_path(
+    project: &Project,
+    record: &Thread,
+    dest: &str,
+) -> Option<std::path::PathBuf> {
+    let raw = dest.split(['#', '?']).next()?;
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.contains("://")
+        || raw.starts_with("data:")
+        || raw.starts_with("mailto:")
+    {
+        return None;
+    }
+    let prefix = format!(".herdr-project/{}-{}/", project.slug, record.id);
+    let raw = raw.strip_prefix(&prefix).unwrap_or(raw);
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    let bytes = raw.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (
+                (bytes[index + 1] as char).to_digit(16),
+                (bytes[index + 2] as char).to_digit(16),
+            )
+        {
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).unwrap_or_else(|_| raw.to_string());
+    let mut path = std::path::PathBuf::new();
+    for component in std::path::Path::new(&decoded).components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            std::path::Component::CurDir => (),
+            std::path::Component::ParentDir => {
+                if !path.pop() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<Vec<u8>> {
+    let root = std::path::Path::new(&record.thread_dir);
+    let path = root.join(relative);
+    if !record.is_remote() {
+        let canonical_root = root.canonicalize()?;
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("linked file missing: {}", path.display()))?;
+        if !canonical.starts_with(&canonical_root) || !std::fs::symlink_metadata(&path)?.is_file() {
+            bail!(
+                "linked file is not a regular file inside the thread folder: {}",
+                path.display()
+            );
+        }
+        if std::fs::metadata(&path)?.len() > LINKED_FILES_CAP {
+            bail!("linked files exceed 200 MiB; worktree kept");
+        }
+        return std::fs::read(&path)
+            .with_context(|| format!("could not read linked file {}", path.display()));
+    }
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        record.machine_route(),
+    )?;
+    let script = format!(
+        "root=$(realpath -e -- {root}) || exit 2; file=$(realpath -e -- {file}) || exit 2; case \"$file\" in \"$root\"/*) ;; *) exit 3;; esac; test -f \"$file\" || exit 4; size=$(wc -c < \"$file\"); test \"$size\" -le 209715200 || {{ echo 'linked files exceed 200 MiB' >&2; exit 5; }}; printf '%s\\n' \"$size\"; od -An -tx1 -v \"$file\"",
+        root = remote::quote(&root.to_string_lossy()),
+        file = remote::quote(&path.to_string_lossy()),
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        std::time::Duration::from_secs(90),
+    )?;
+    if !out.success() {
+        bail!(
+            "linked file missing or inaccessible on {}: {} ({})",
+            profile.label,
+            path.display(),
+            out.error_text()
+        );
+    }
+    let mut parts = out.stdout.split_whitespace();
+    let size: u64 = parts
+        .next()
+        .context("remote linked file has no size")?
+        .parse()?;
+    if size > LINKED_FILES_CAP {
+        bail!("linked files exceed 200 MiB");
+    }
+    let bytes: Vec<u8> = parts
+        .map(|hex| u8::from_str_radix(hex, 16))
+        .collect::<std::result::Result<_, _>>()?;
+    if bytes.len() as u64 != size {
+        bail!("remote linked file changed during copy: {}", path.display());
+    }
+    Ok(bytes)
+}
+
+fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if thread::sealed_report_path(project, record).is_none() {
+        if !record.is_remote() {
+            let draft = std::path::Path::new(&record.thread_dir).join("report.md");
+            if let Ok(text) = std::fs::read_to_string(draft)
+                && report_destinations(&text)
+                    .iter()
+                    .any(|(_, dest)| linked_relative_path(project, record, dest).is_some())
+            {
+                bail!("the report links to files but has no sealed artifact; worktree kept");
+            }
+        }
+        return Ok(());
+    }
+    // Read the seal, not an earlier rewritten report, for repeatable retries.
+    let sealed = crate::events::list(project)
+        .into_iter()
+        .filter(|e| e.thread == record.id && e.attempt == record.attempt.max(1))
+        .filter_map(|e| e.payload.done.map(|d| (e.created, e.id, d.artifact)))
+        .max_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+        .map(|(_, _, hash)| hash)
+        .context("sealed report event is missing")?;
+    let bytes = std::fs::read(crate::events::artifact_path(project, &sealed))?;
+    if thread::sha256_hex(&bytes) != sealed {
+        bail!("sealed report artifact is damaged: {sealed}");
+    }
+    let text = String::from_utf8(bytes)?;
+    let destinations = report_destinations(&text);
+    let mut replacements = Vec::new();
+    let mut files = std::collections::BTreeMap::new();
+    let mut total = 0_u64;
+    for (range, dest) in destinations {
+        let Some(relative) = linked_relative_path(project, record, &dest) else {
+            continue;
+        };
+        let bytes = if let Some(bytes) = files.get(&relative) {
+            bytes
+        } else {
+            let bytes = linked_bytes(ctx, record, &relative)?;
+            total = total
+                .checked_add(bytes.len() as u64)
+                .context("linked files size overflow")?;
+            if total > LINKED_FILES_CAP {
+                bail!("linked files exceed 200 MiB; worktree kept");
+            }
+            files.insert(relative.clone(), bytes);
+            &files[&relative]
+        };
+        let hash = thread::sha256_hex(bytes);
+        let suffix = &dest[dest.split(['#', '?']).next().unwrap_or(&dest).len()..];
+        replacements.push((range, format!("{hash}{suffix}")));
+    }
+    for (relative, bytes) in files {
+        thread::store_artifact(project, &bytes)
+            .with_context(|| format!("could not preserve {}", relative.display()))?;
+    }
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let mut rewritten = text;
+    for (range, dest) in replacements.into_iter().rev() {
+        rewritten.replace_range(range, &dest);
+    }
+    let hash = thread::store_artifact(project, rewritten.as_bytes())?;
+    thread::update(project, &record.id, |t| {
+        t.final_report_hash = hash.clone();
+        t.final_report_seal = sealed.clone();
+    })?;
+    Ok(())
+}
+
 /// A box lane's report arrives as the courier's imported artifact
 /// (SPEC-remote §4.3). Once the current attempt has a sealed `done` whose
-/// artifact is on the Mac and hashes to its name, the copy is complete: no box
-/// path is copied and there is no second transport. The D4 removal gate reads
-/// this same artifact.
+/// artifact is on the Mac and hashes to its name, the report copy is complete.
+/// Linked files are transported separately before worktree removal. The D4
+/// removal gate reads the sealed artifact.
 fn imported_report(project: &Project, record: &Thread) -> thread::Copied {
     let attempt = record.attempt.max(1);
     let hash = crate::events::list(project)
