@@ -1737,29 +1737,43 @@ pub(crate) fn cleanup_review_worktrees(
     lines
 }
 
-/// Clear the round-level bridge marker once every owned thread has its own
-/// durable resolved record. A thread whose external cleanup failed retains
-/// its per-thread marker for the ticker.
+/// Every reviewer started for this round, including superseded and batch
+/// integration reviewers, owns cleanup even after the current pin changes.
+pub(crate) fn cleanup_thread_ids(project: &Project, record: &RoundRecord) -> Vec<String> {
+    let mut ids: Vec<_> = record
+        .manifest
+        .members
+        .iter()
+        .map(|member| member.thread.clone())
+        .collect();
+    if let Some(reviewer) = &record.reviewer
+        && !ids.contains(reviewer)
+    {
+        ids.push(reviewer.clone());
+    }
+    for reviewer in thread::list(project)
+        .into_iter()
+        .filter(|thread| thread.role == "reviewer" && thread.review_round == record.round)
+    {
+        if !ids.contains(&reviewer.id) {
+            ids.push(reviewer.id);
+        }
+    }
+    ids
+}
+
+/// Clear the round-level bridge marker only once every owned thread has
+/// finished its external cleanup, including published branches.
 pub(crate) fn finish_cleanup_marker(project: &Project, round: &str) -> Result<()> {
     let _lock = project.lock()?;
     let mut record = load(project, round)?;
     if !record.cleanup_pending {
         return Ok(());
     }
-    let mut ids: Vec<_> = record
-        .manifest
-        .members
-        .iter()
-        .map(|member| member.thread.as_str())
-        .collect();
-    if let Some(reviewer) = record.reviewer.as_deref()
-        && !ids.contains(&reviewer)
-    {
-        ids.push(reviewer);
-    }
-    if ids.iter().all(|id| {
-        crate::thread::load(project, id)
-            .is_ok_and(|thread| thread.status == crate::thread::Status::Resolved)
+    if cleanup_thread_ids(project, &record).iter().all(|id| {
+        crate::thread::load(project, id).is_ok_and(|thread| {
+            thread.status == crate::thread::Status::Resolved && !thread.cleanup_pending
+        })
     }) {
         record.cleanup_pending = false;
         save(project, &record)?;
@@ -4488,27 +4502,27 @@ fn finalize_round(ctx: &Ctx, project: &Project, slug: &str, round: &str) {
     for line in cleanup_review_worktrees(ctx, project, &record) {
         println!("{line}");
     }
-    let mut ids: Vec<_> = record
-        .manifest
-        .members
-        .iter()
-        .map(|member| member.thread.clone())
-        .collect();
-    if let Some(reviewer) = &record.reviewer
-        && !ids.contains(reviewer)
-    {
-        ids.push(reviewer.clone());
-    }
-    for id in ids {
-        let cleanup = crate::threads::resolve_automatically(ctx, project, &id, "merged");
-        if cleanup.state == "cleanup_pending" {
-            eprintln!("{}", cleanup_retry_message(&id));
+    for id in cleanup_thread_ids(project, &record) {
+        if thread::load(project, &id)
+            .is_ok_and(|thread| thread.status != thread::Status::Resolved || thread.cleanup_pending)
+        {
+            let cleanup = crate::threads::resolve_automatically(ctx, project, &id, "merged");
+            if cleanup.state == "cleanup_pending" {
+                eprintln!("{}", cleanup_retry_message(&id));
+            }
         }
     }
     if let Err(error) = crate::branches::closed_round(ctx, project, &record) {
+        crate::ledger::observe(
+            project,
+            "round-branch-cleanup",
+            round,
+            &format!("{error:#}"),
+        );
         eprintln!("branch cleanup pending for {round}: {error:#}");
         return;
     }
+    crate::ledger::recovered(project, "round-branch-cleanup", round);
     if let Err(error) = finish_cleanup_marker(project, round) {
         eprintln!("cleanup marker pending for {round}: {error:#}");
     }
@@ -7231,6 +7245,76 @@ mod tests {
         assert!(load(&fx.project, "r1").unwrap().attention.contains("42928"));
         finish_publication_with(&ctx, &fx.project, "r1", |_| Ok(install.clone())).unwrap();
         assert!(load(&fx.project, "r1").unwrap().attention.is_empty());
+    }
+
+    #[test]
+    fn merge_removes_published_lane_and_reviewer_branches_and_retries_a_rejected_delete() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        let reviewer = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let bare = fx.world.home.path().join("publish.git");
+        std::fs::create_dir(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]);
+        let url = bare.to_str().unwrap();
+        update_repo(&fx, |row| row.publish_url = Some(url.into()));
+        let review_branch = format!("hp/demo/{reviewer}");
+        git(&fx.repo, &["branch", &review_branch, "main"]);
+        git(&fx.repo, &["push", "-q", url, &review_branch]);
+        thread::update(&fx.project, &reviewer, |t| {
+            t.role = "reviewer".into();
+            t.review_round = "r1".into();
+            t.repo = fx.repo.to_string_lossy().into_owned();
+            t.branch = review_branch.clone();
+        })
+        .unwrap();
+        for (id, _) in &lanes {
+            let lane = thread::load(&fx.project, id).unwrap();
+            let branch = format!("hp/demo/{id}");
+            git(
+                &std::path::PathBuf::from(&lane.worktree_path),
+                &["branch", "-m", &branch],
+            );
+            git(&fx.repo, &["push", "-q", url, &branch]);
+            thread::update(&fx.project, id, |t| t.branch = branch).unwrap();
+        }
+        // A superseded reviewer was already resolved, but its published ref
+        // was stranded. The closed round still owns that ref.
+        let old = thread::allocate(&fx.project, |t| {
+            t.role = "reviewer".into();
+            t.review_round = "r1".into();
+            t.status = thread::Status::Resolved;
+            t.repo = fx.repo.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let old_branch = format!("hp/demo/{}", old.id);
+        git(&fx.repo, &["branch", &old_branch, "main"]);
+        git(&fx.repo, &["push", "-q", url, &old_branch]);
+        thread::update(&fx.project, &old.id, |t| t.branch = old_branch).unwrap();
+        // The fake publish remote rejects all deletes on the first pass.
+        git(&bare, &["config", "receive.denyDeletes", "true"]);
+        merge(&ctx, "demo", "r1", None).unwrap();
+        assert!(load(&fx.project, "r1").unwrap().cleanup_pending);
+        assert!(crate::ledger::list(&fx.project).unwrap().iter().any(|e| {
+            !e.closed && (e.kind == "thread-cleanup" || e.kind == "round-branch-cleanup")
+        }));
+        git(&bare, &["config", "receive.denyDeletes", "false"]);
+        crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
+        assert!(!load(&fx.project, "r1").unwrap().cleanup_pending);
+        let remote = git(&fx.repo, &["ls-remote", "--heads", url]);
+        assert!(!remote.contains("refs/heads/hp/"), "{remote}");
+        for (id, _) in &lanes {
+            assert!(!thread::load(&fx.project, id).unwrap().cleanup_pending);
+        }
+        assert!(
+            !thread::load(&fx.project, &reviewer)
+                .unwrap()
+                .cleanup_pending
+        );
+        assert!(!crate::ledger::list(&fx.project).unwrap().iter().any(|e| {
+            !e.closed && (e.kind == "thread-cleanup" || e.kind == "round-branch-cleanup")
+        }));
     }
 
     #[test]

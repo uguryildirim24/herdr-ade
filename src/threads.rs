@@ -1749,7 +1749,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         }
     }
     if pane != "cleanup_pending" {
-        if worktree == "removed" {
+        if worktree == "removed" || !removable_folder(&project, &record) {
             crate::branches::resolved_thread(ctx, &project, &record)?;
         }
         remove_finished_build_folder(ctx, &project, &record)?;
@@ -1816,6 +1816,7 @@ pub(crate) fn resolve_automatically(
     let attempted = resolve(ctx, &project.slug, id, &ResolveArgs::default());
     match attempted {
         Ok(outcome) => {
+            crate::ledger::recovered(project, "thread-cleanup", id);
             let _ = thread::update(project, id, |t| {
                 t.resolved_reason = reason.to_string();
                 t.cleanup_pending = false;
@@ -1825,6 +1826,7 @@ pub(crate) fn resolve_automatically(
         }
         Err(error) => {
             let detail = format!("{error:#}");
+            crate::ledger::observe(project, "thread-cleanup", id, &detail);
             let before = thread::load(project, id).unwrap_or_default();
             refresh_plan(ctx, project);
             ResolveOutcome {
@@ -1876,19 +1878,10 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         } else {
             "cancelled"
         };
-        let mut ids: Vec<_> = round
-            .manifest
-            .members
-            .iter()
-            .map(|member| member.thread.clone())
-            .collect();
-        if let Some(reviewer) = round.reviewer.clone()
-            && !ids.contains(&reviewer)
-        {
-            ids.push(reviewer);
-        }
-        for id in ids {
-            if thread::load(project, &id).is_ok_and(|record| record.status != Status::Resolved) {
+        for id in crate::round::cleanup_thread_ids(project, &round) {
+            if thread::load(project, &id)
+                .is_ok_and(|record| record.status != Status::Resolved || record.cleanup_pending)
+            {
                 resolve_automatically(ctx, project, &id, reason);
             }
         }
@@ -1896,9 +1889,16 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             println!("{line}");
         }
         if let Err(error) = crate::branches::closed_round(ctx, project, &round) {
+            crate::ledger::observe(
+                project,
+                "round-branch-cleanup",
+                &round.round,
+                &format!("{error:#}"),
+            );
             eprintln!("branch cleanup pending for {}: {error:#}", round.round);
             continue;
         }
+        crate::ledger::recovered(project, "round-branch-cleanup", &round.round);
         crate::round::finish_cleanup_marker(project, &round.round)?;
     }
     Ok(())
@@ -2520,7 +2520,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             worktree_removed = true;
         }
     }
-    if worktree_removed {
+    if worktree_removed || !removable {
         crate::branches::resolved_thread(ctx, &project, &record)?;
     }
     let resolved = thread::update(&project, id, |t| {
