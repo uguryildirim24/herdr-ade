@@ -55,6 +55,13 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
             .args(["-C", repo])
             .args(args.iter().copied()),
     )?;
+    if out.timed_out {
+        bail!(
+            "git {}: timed out; repo activity at timeout: {}",
+            args.join(" "),
+            crate::git::repo_activity(repo)
+        );
+    }
     if !out.success() {
         bail!("git {}: {}", args.join(" "), out.error_text());
     }
@@ -1432,6 +1439,17 @@ fn retry_with_ticker(
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
+    if record.role == "reviewer" && !record.review_round.is_empty() {
+        let round = crate::round::load(&project, &record.review_round)?;
+        if let Some(bound) = round.reviewer.as_deref()
+            && bound != id
+        {
+            bail!(
+                "reviewer_already_bound: `{bound}` is bound to `{}`; the round's own retry handles its reviewer",
+                record.review_round
+            );
+        }
+    }
     // A crash after the attempt transition but before placement resumes the
     // same selected attempt. It must not spend another routing recovery.
     if record.escalation_pending {
@@ -1491,6 +1509,38 @@ fn retry_with_ticker(
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
+    // Local placement also stores an empty machine. Its placement reason is
+    // the evidence that it was selected (possibly by an explicit --machine
+    // local), so only dispatch again when no placement was recorded at all.
+    let unplaced = record.machine.is_empty()
+        && record.placement_reason.is_empty()
+        && record.pane_id.is_empty()
+        && record.tab_id.is_empty()
+        && record.worktree_path.is_empty();
+    let placement = if unplaced {
+        launch.machine = crate::launch::parse_launch_config(&ctx.config_dir)?
+            .dispatch
+            .machine;
+        let (settings, _) = project.read_project_md()?;
+        let listed = settings.repos.iter().find(|row| {
+            std::fs::canonicalize(&row.path).is_ok_and(|path| path.to_string_lossy() == record.repo)
+        });
+        let placement =
+            resolve_placement(ctx, None, &record.role, &launch, Some(&record.repo), listed)?;
+        crate::launch::ledger(
+            &project,
+            serde_json::json!({"kind":"placement", "recipe":launch.recipe_id,
+                "machine":placement.ledger_machine(), "reason":placement.reason,
+                "tried":placement.tried}),
+        )?;
+        if placement.fell_back {
+            fallback_say(ctx, slug, &placement)?;
+        }
+        launch.machine = placement.ledger_machine().to_string();
+        Some(placement)
+    } else {
+        None
+    };
     let selected_recipe = launch.recipe_id.clone();
     thread::update_checked(&project, id, |t| {
         if t.attempt != record.attempt || t.pane_id != record.pane_id {
@@ -1498,15 +1548,21 @@ fn retry_with_ticker(
         }
         t.attempt = launch.attempt;
         t.agent = launch.kind.clone();
-        let machine = if t.machine.is_empty() {
-            "local"
+        if let Some(placement) = &placement {
+            t.machine = placement.machine.clone();
+            t.machine_id = placement.machine_id.clone();
+            t.placement_reason = format!("retry: {}", placement.reason);
         } else {
-            &t.machine
-        };
-        t.placement_reason = format!(
-            "retry on `{machine}` with recipe `{}`; machine kept from the previous attempt",
-            launch.recipe_id
-        );
+            let machine = if t.machine.is_empty() {
+                "local"
+            } else {
+                &t.machine
+            };
+            t.placement_reason = format!(
+                "retry on `{machine}` with recipe `{}`; machine kept from the previous attempt",
+                launch.recipe_id
+            );
+        }
         t.launch = launch;
         t.status = Status::Failed;
         t.prompt_pending = false;
@@ -1699,6 +1755,17 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         t.cleanup_pending = true;
         t.cleanup_reason = "cancelled".into();
     })?;
+    let fix_cleanup_failed = if !record.repo.is_empty() && record.role != "reviewer" {
+        match crate::branches::release_review_fixes(ctx, &project, &record.repo, id, None) {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!("note: reviewer fix cleanup pending for {id}: {error:#}");
+                true
+            }
+        }
+    } else {
+        false
+    };
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &record);
     }
@@ -1762,12 +1829,13 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             Ok(())
         })();
         match cleanup {
-            Ok(()) => {
+            Ok(()) if !fix_cleanup_failed => {
                 thread::update(&project, id, |t| {
                     t.cleanup_pending = false;
                     t.cleanup_reason.clear();
                 })?;
             }
+            Ok(()) => {}
             Err(error) => {
                 cleanup_failed = true;
                 worktree_reason = Some(format!("cleanup pending: {error:#}"));
@@ -1777,7 +1845,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
         thread: id.to_string(),
-        state: if pane == "cleanup_pending" || cleanup_failed {
+        state: if pane == "cleanup_pending" || cleanup_failed || fix_cleanup_failed {
             "cleanup_pending"
         } else {
             "cancelled"
@@ -1830,13 +1898,17 @@ pub(crate) fn resolve_automatically(
     }
     let attempted = resolve(ctx, &project.slug, id, &ResolveArgs::default());
     match attempted {
-        Ok(outcome) => {
-            crate::ledger::recovered(project, "thread-cleanup", id);
-            let _ = thread::update(project, id, |t| {
-                t.resolved_reason = reason.to_string();
-                t.cleanup_pending = false;
-                t.cleanup_reason.clear();
-            });
+        Ok(mut outcome) => {
+            let pending = thread::load(project, id).is_ok_and(|t| t.cleanup_pending);
+            if !pending {
+                crate::ledger::recovered(project, "thread-cleanup", id);
+                let _ = thread::update(project, id, |t| {
+                    t.resolved_reason = reason.to_string();
+                    t.cleanup_reason.clear();
+                });
+            } else {
+                outcome.state = "cleanup_pending".into();
+            }
             outcome
         }
         Err(error) => {
@@ -1873,7 +1945,10 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         .filter(|record| record.cleanup_pending)
     {
         if !record.cancellation_reason.is_empty() {
-            cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)?;
+            if let Err(error) = cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)
+            {
+                eprintln!("note: cleanup pending for {}: {error:#}", record.id);
+            }
         } else {
             let reason = if record.cleanup_reason.is_empty() {
                 "automatic"
@@ -1884,10 +1959,31 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         }
     }
 
-    for round in crate::round::checked_list(project)?
-        .into_iter()
-        .filter(|round| round.cleanup_pending)
-    {
+    let mut rounds = crate::round::checked_list(project)?;
+    rounds.sort_by_key(|r| {
+        crate::round::round_number(&r.round)
+            .parse::<u64>()
+            .unwrap_or(u64::MAX)
+    });
+    // The newest admission is the durable retry marker for older fixes.
+    // Never use an older round to retire a newer rejected correction.
+    let mut newest = std::collections::BTreeMap::new();
+    for round in &rounds {
+        for member in &round.manifest.members {
+            newest.insert(
+                (round.repo.clone(), member.thread.clone()),
+                round.round.clone(),
+            );
+        }
+    }
+    for ((repo, lane), round) in newest {
+        if let Err(error) =
+            crate::branches::release_review_fixes(ctx, project, &repo, &lane, Some(&round))
+        {
+            eprintln!("note: reviewer fix cleanup pending for {lane}: {error:#}");
+        }
+    }
+    for round in rounds.into_iter().filter(|round| round.cleanup_pending) {
         let reason = if round.phase == crate::contracts::RoundPhase::Merged {
             "merged"
         } else {
@@ -1913,8 +2009,14 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             eprintln!("branch cleanup pending for {}: {error:#}", round.round);
             continue;
         }
-        crate::ledger::recovered(project, "round-branch-cleanup", &round.round);
-        crate::round::finish_cleanup_marker(project, &round.round)?;
+        if let Err(error) = crate::round::finish_cleanup_marker(project, &round.round) {
+            eprintln!(
+                "note: cleanup marker pending for {}: {error:#}",
+                round.round
+            );
+        } else {
+            crate::ledger::recovered(project, "round-branch-cleanup", &round.round);
+        }
     }
     Ok(())
 }
@@ -2543,6 +2645,25 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         t.resolved_reason = "manual".into();
         t.prompt_pending = false;
     })?;
+    let fix_cleanup_failed = if !resolved.repo.is_empty() && resolved.role != "reviewer" {
+        match crate::branches::release_review_fixes(ctx, &project, &resolved.repo, id, None) {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!("note: reviewer fix cleanup pending for {id}: {error:#}");
+                true
+            }
+        }
+    } else {
+        false
+    };
+    thread::update(&project, id, |t| {
+        t.cleanup_pending = fix_cleanup_failed;
+        t.cleanup_reason = if fix_cleanup_failed {
+            "reviewer fix".into()
+        } else {
+            String::new()
+        };
+    })?;
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &resolved);
     }
@@ -2572,7 +2693,12 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     refresh_plan(ctx, &project);
     Ok(ResolveOutcome {
         thread: id.to_string(),
-        state: "resolved".into(),
+        state: if fix_cleanup_failed {
+            "cleanup_pending"
+        } else {
+            "resolved"
+        }
+        .into(),
         final_copy,
         copy_notes,
         pane: pane.into(),
@@ -4477,6 +4603,82 @@ mod tests {
         assert_eq!(default_machine("research", "buildbox", Some("/r")), None);
         assert_eq!(default_machine("lane", "", Some("/r")), None);
         assert_eq!(default_machine("lane", "buildbox", None), None);
+    }
+
+    #[test]
+    fn retry_places_an_unlaunched_reviewer_but_keeps_a_placed_machine() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, &lane_config());
+        stub_box(&fx);
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.workflow = Some("reviewer".into());
+        let started = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(started.machine, "buildbox");
+        // A placed attempt keeps its saved machine when retried.
+        thread::update(&fx.project, &started.id, |t| {
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(&fx.world.ctx(), "demo", &started.id, "process disappeared").unwrap();
+        let placed = thread::load(&fx.project, &started.id).unwrap();
+        assert_eq!(placed.machine, "buildbox");
+        assert!(placed.placement_reason.contains("machine kept"));
+
+        // A selected local machine is also a placement even though its saved
+        // machine is empty. Do not move an explicitly local start to the box.
+        let mut local_args = start_args(
+            Some(fx.repo.to_string_lossy().into_owned()),
+            Some("local".into()),
+        );
+        local_args.base = Some("main".into());
+        let local = start(&fx.world.ctx(), "demo", local_args).unwrap();
+        crate::round::testkit::git(
+            &fx.repo,
+            &["worktree", "remove", "--force", &local.worktree_path],
+        );
+        crate::round::testkit::git(&fx.repo, &["branch", "-D", &local.branch]);
+        thread::update(&fx.project, &local.id, |t| {
+            t.pane_id.clear();
+            t.tab_id.clear();
+            t.worktree_path.clear();
+            t.base = "main".into();
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(&fx.world.ctx(), "demo", &local.id, "failed before launch").unwrap();
+        let retried_local = thread::load(&fx.project, &local.id).unwrap();
+        assert!(retried_local.machine.is_empty());
+        assert_eq!(retried_local.launch.machine, "local");
+        assert!(retried_local.placement_reason.contains("machine kept"));
+
+        // A failed start before it acquired any machine or work is dispatched
+        // again, using the current routing pick and the box mapping.
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.workflow = Some("reviewer".into());
+        let unplaced = start(&fx.world.ctx(), "demo", args).unwrap();
+        thread::update(&fx.project, &unplaced.id, |t| {
+            t.machine.clear();
+            t.machine_id.clear();
+            t.placement_reason.clear();
+            t.launch.machine = "local".into();
+            t.pane_id.clear();
+            t.tab_id.clear();
+            t.workspace_id.clear();
+            t.worktree_path.clear();
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(
+            &fx.world.ctx(),
+            "demo",
+            &unplaced.id,
+            "git timed out before launch",
+        )
+        .unwrap();
+        let retried = thread::load(&fx.project, &unplaced.id).unwrap();
+        assert_eq!(retried.machine, "buildbox");
+        assert_eq!(retried.launch.machine, "buildbox");
+        assert!(retried.placement_reason.contains("retry: recipe"));
     }
 
     #[test]

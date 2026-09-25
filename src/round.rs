@@ -1434,6 +1434,15 @@ pub fn open_with_lanes(
     }
     for id in &threads {
         crate::task::link_round_for_thread(&project, &round, id)?;
+        if let Err(error) = crate::branches::release_review_fixes(
+            ctx,
+            &project,
+            &selected.to_string_lossy(),
+            id,
+            Some(&round),
+        ) {
+            eprintln!("note: older reviewer fix cleanup pending for {id}: {error:#}");
+        }
     }
     let record = load(&project, &round)?;
     stamp_workspace(ctx, &project, &record);
@@ -1538,6 +1547,11 @@ pub fn admit(ctx: &Ctx, slug: &str, round: &str, thread_id: &str) -> Result<Roun
         )?;
     }
     crate::task::link_round_for_thread(&project, round, thread_id)?;
+    if let Err(error) =
+        crate::branches::release_review_fixes(ctx, &project, &record.repo, thread_id, Some(round))
+    {
+        eprintln!("note: older reviewer fix cleanup pending for {thread_id}: {error:#}");
+    }
     if let Err(e) = crate::plan::refresh(ctx, &project) {
         eprintln!("note: the plan refresh failed: {e:#}");
     }
@@ -2307,7 +2321,21 @@ fn advance_inner(ctx: &Ctx, slug: &str, refresh_page: bool) -> Result<AdvanceOut
                     &project,
                     &round,
                     &format!("verdict:{verdict}"),
-                    &verdict_summary(&round, &verdict),
+                    &if verdict == "REJECT" {
+                        let fixes = record
+                            .manifest
+                            .members
+                            .iter()
+                            .map(|m| format!("review-fix/{slug}/{round}/{}", m.thread))
+                            .collect::<Vec<_>>();
+                        format!(
+                            "{}; reviewer fix {} stays available to merge until its lane's next round or resolve",
+                            verdict_summary(&round, &verdict),
+                            fixes.join(", ")
+                        )
+                    } else {
+                        verdict_summary(&round, &verdict)
+                    },
                     (verdict == "MERGE").then(|| verdict_say(&record)),
                 )?;
                 continue;
@@ -3873,13 +3901,53 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         .map(|verdict| verdict.verdict)
         .context("verdict_unreadable: validated verdict disappeared")?;
     let changed = current.verdict.as_ref() != Some(&pin);
+    let previous = current.verdict.as_ref().map(|pin| pin.sha.clone());
     current.verdict = Some(pin.clone());
     current.reviewer_awaiting_report_after = None;
     current.verdict_kind = Some(verdict_kind.clone());
-    current.phase = RoundPhase::VerdictIn;
     if changed && verdict_kind == "REJECT" {
         *current.rejections.get_or_insert(0) += 1;
     }
+    if verdict_kind == "REJECT" && changed {
+        // Publishing can wait on a remote; never hold the project record lock
+        // while preserving the fix for a box lane.
+        drop(_lock);
+        crate::branches::keep_rejected_fix(
+            git.runner,
+            project,
+            &current.repo,
+            &current.round,
+            &current
+                .manifest
+                .members
+                .iter()
+                .map(|m| m.thread.clone())
+                .collect::<Vec<_>>(),
+            &pin.sha,
+            previous.as_deref(),
+        )?;
+        let _lock = project.lock()?;
+        let latest = load(project, &record.round)?;
+        if latest.reviewer != current.reviewer
+            || latest.manifest_hash != current.manifest_hash
+            || latest.manifest != record.manifest
+            || latest.verdict != record.verdict
+            || latest.reviewer_awaiting_report_after != record.reviewer_awaiting_report_after
+            || latest.phase != record.phase
+            || latest.review_intent.is_some()
+        {
+            bail!("review_stale: review changed while preserving the rejected fix");
+        }
+        let mut latest = latest;
+        latest.verdict = current.verdict;
+        latest.verdict_kind = current.verdict_kind;
+        latest.rejections = current.rejections;
+        latest.reviewer_awaiting_report_after = None;
+        latest.phase = RoundPhase::VerdictIn;
+        save(project, &latest)?;
+        return Ok(pin.sha);
+    }
+    current.phase = RoundPhase::VerdictIn;
     save(project, &current)?;
     Ok(pin.sha)
 }
@@ -8078,7 +8146,7 @@ mod tests {
         let first_cleanup = std::rc::Rc::new(std::cell::Cell::new(true));
         let fail_once = first_cleanup.clone();
         fx.world.runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("git branch -D"),
+            |cmd| cmd.program == "ssh" && cmd.display().contains("git update-ref -d"),
             move |_| {
                 if fail_once.replace(false) {
                     Ok(crate::runner::fake::fail(
@@ -8166,7 +8234,7 @@ mod tests {
                 .filter(|call| {
                     call.program == "ssh"
                         && call.display().contains("/box/repo")
-                        && call.display().contains("git branch -D")
+                        && call.display().contains("git update-ref -d")
                 })
                 .count(),
             2,
@@ -8449,6 +8517,78 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn failing_pending_cleanup_does_not_block_an_unrelated_round() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        open_r1(&fx);
+        let mut stale = load(&fx.project, "r1").unwrap();
+        stale.phase = RoundPhase::Abandoned;
+        stale.repo = "/missing/repo-for-pending-cleanup".into();
+        stale.cleanup_pending = true;
+        save(&fx.project, &stale).unwrap();
+        crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
+        assert!(load(&fx.project, "r1").unwrap().cleanup_pending);
+        let lane_a = thread::allocate(&fx.project, |t| {
+            t.status = crate::thread::Status::Starting;
+            t.launch.kind = "pi".into();
+            t.repo = fx.repo.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane_a.id, "Please check the result").unwrap(),
+            crate::threads::PromptOutcome::Queued { .. }
+        ));
+        let next = open(
+            &ctx,
+            "demo",
+            OpenArgs {
+                round: "r2".into(),
+                branch: "main".into(),
+                plain: Some(PLAIN.into()),
+                repo: Some(fx.repo.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(next.round, "r2");
+    }
+
+    #[test]
+    fn rejected_reviewer_fix_survives_review_branch_removal_until_next_round() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lanes, _) = reviewed(&fx);
+        let record = load(&fx.project, "r1").unwrap();
+        let wt = fx.repo.join(".worktrees/review-r1");
+        let mut args = vec!["merge", "-q", "--no-edit"];
+        args.extend(lanes.iter().map(|(_, sha)| sha.as_str()));
+        git(&wt, &args);
+        git(&wt, &["commit", "--allow-empty", "-qm", "reviewer fix"]);
+        let fix = git(&wt, &["rev-parse", "HEAD"]);
+        let reviewer = fx.thread("Reviewer with fix");
+        fx.seal_done(&reviewer, 1, 1, &fix, &front("REJECT", "r1")(&fix, &record));
+        bind_reviewer(&ctx, "demo", "r1", &reviewer).unwrap();
+        let git_repo = Git::new(ctx.runner, &fx.repo);
+        verdict_commit(&fx.project, &load(&fx.project, "r1").unwrap(), &git_repo).unwrap();
+        let name = format!("review-fix/demo/r1/{}", lanes[0].0);
+        assert_eq!(git(&fx.repo, &["rev-parse", &name]), fix);
+        git(&wt, &["checkout", "-q", "--detach"]);
+        git(&fx.repo, &["branch", "-D", "review/r1"]);
+        assert_eq!(git(&fx.repo, &["rev-parse", &name]), fix);
+        let mut next = record.clone();
+        next.round = "r2".into();
+        save(&fx.project, &next).unwrap();
+        crate::branches::release_review_fixes(
+            &ctx,
+            &fx.project,
+            &record.repo,
+            &lanes[0].0,
+            Some("r2"),
+        )
+        .unwrap();
+        assert!(git_repo.branch_head(&name).unwrap().is_none());
     }
 
     /// A REJECT is repaired with `round review`; the next `advance` starts
@@ -8838,6 +8978,29 @@ mod tests {
     /// and its reviewer task names the earlier candidate and sealed verdict.
     /// A resolved or gone reviewer is replaced; a live bound reviewer keeps
     /// the same refusal.
+    #[test]
+    fn retry_refuses_reviewer_replaced_by_the_round() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        let bound = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let stale = fx.thread("Earlier failed reviewer");
+        thread::update(&fx.project, &stale, |t| {
+            t.role = "reviewer".into();
+            t.review_round = "r1".into();
+        })
+        .unwrap();
+        let error = err(crate::threads::retry(
+            &fx.world.ctx(),
+            "demo",
+            &stale,
+            "failed start",
+        ));
+        assert!(error.contains("reviewer_already_bound"), "{error}");
+        assert!(error.contains(&bound), "{error}");
+        assert!(error.contains("round's own retry"), "{error}");
+    }
+
     #[test]
     fn bind_reviewer_replaces_a_gone_reviewer_but_not_a_live_one() {
         let fx = fixture();

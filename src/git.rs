@@ -31,10 +31,89 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
             .args(["-C", repo])
             .args(args.iter().copied()),
     )?;
+    if out.timed_out {
+        bail!(
+            "git {}: timed out; repo activity at timeout: {}",
+            args.join(" "),
+            repo_activity(repo)
+        );
+    }
     if !out.success() {
         bail!("git {}: {}", args.join(" "), out.error_text());
     }
     Ok(out.stdout.trim().to_string())
+}
+
+/// Snapshot the repository without invoking git again: the timed-out git may
+/// itself be blocking on repository state. A worktree's .git is a pointer to
+/// its private gitdir; commondir then leads to the shared locks.
+pub(crate) fn repo_activity(repo: &str) -> String {
+    let dotgit = Path::new(repo).join(".git");
+    let gitdir = if dotgit.is_file() {
+        std::fs::read_to_string(&dotgit)
+            .ok()
+            .and_then(|text| text.trim().strip_prefix("gitdir: ").map(str::to_string))
+            .map(|path| {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    Path::new(repo).join(path)
+                }
+            })
+    } else if dotgit.is_dir() {
+        Some(dotgit)
+    } else {
+        None
+    };
+    let mut evidence = Vec::new();
+    if let Some(dir) = gitdir {
+        let common = std::fs::read_to_string(dir.join("commondir"))
+            .ok()
+            .map(|path| dir.join(path.trim()))
+            .unwrap_or_else(|| dir.clone());
+        for location in [&dir, &common] {
+            for name in [
+                "index.lock",
+                "packed-refs.lock",
+                "gc.pid",
+                "HEAD.lock",
+                "config.lock",
+                "shallow.lock",
+            ] {
+                let path = location.join(name);
+                if path.exists() {
+                    evidence.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    evidence.sort();
+    evidence.dedup();
+    let locks = if evidence.is_empty() {
+        "no lock markers found".to_string()
+    } else {
+        format!("lock markers: {}", evidence.join(", "))
+    };
+    let processes = std::process::Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| {
+                    line.contains(repo) && (line.contains("git ") || line.contains("git-"))
+                })
+                .take(8)
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|lines| !lines.is_empty())
+        .unwrap_or_else(|| "no other git processes observed".to_string());
+    format!("{locks}; processes: {processes}")
 }
 
 /// Absolute `git-common-dir` for `repo`.
@@ -466,6 +545,29 @@ mod tests {
         fake.on_fn(|_| true, |_| Err(anyhow::anyhow!("could not spawn git")));
         assert!(is_ancestor(&crate::ledger::RecordingRunner(&fake), "/repo", "a", "b").is_err());
         assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn timeout_reports_repository_lock_snapshot() {
+        let (_dir, repo) = repo_with_commit();
+        let lock = repo.join(".git/packed-refs.lock");
+        std::fs::write(&lock, "").unwrap();
+        let fake = FakeRunner::new();
+        fake.on(
+            "for-each-ref",
+            crate::runner::Output {
+                timed_out: true,
+                ..Default::default()
+            },
+        );
+        let error = branch_head(&fake, &repo.to_string_lossy(), "main")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("timed out; repo activity at timeout:"),
+            "{error}"
+        );
+        assert!(error.contains("packed-refs.lock"), "{error}");
     }
 
     #[test]
