@@ -495,6 +495,15 @@ enum RoundCommand {
         round: String,
         #[arg(long)]
         reason: String,
+        /// Place a replacement reviewer on this machine
+        #[arg(long)]
+        machine: Option<String>,
+    },
+    /// Release an unmerged batch and its integration reviewer, keeping all member rounds
+    Dissolve {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        round: String,
     },
     /// Stop the round, its lanes and reviewer, and retry pending cleanup
     Cancel {
@@ -888,12 +897,29 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 slug,
                 round: id,
                 reason,
+                machine,
             } => {
-                let result = round::retry(ctx, &slug, &id, &reason)?;
+                let result = if let Some(machine) = machine.as_deref() {
+                    round::retry_on_machine(ctx, &slug, &id, &reason, Some(machine))?
+                } else {
+                    round::retry(ctx, &slug, &id, &reason)?
+                };
                 crate::output::success(
                     Some(&result.action),
                     &result,
                     &format!("{} {} with {}\n", result.action, id, result.thread),
+                    "",
+                )
+            }
+            RoundCommand::Dissolve { slug, round: id } => {
+                let members = round::dissolve(ctx, &slug, &id)?;
+                crate::output::success(
+                    Some("dissolved"),
+                    &members,
+                    &format!(
+                        "dissolved batch {}; each round can merge alone or join another batch\n",
+                        members.join(", ")
+                    ),
                     "",
                 )
             }
@@ -908,10 +934,15 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     .iter()
                     .filter(|thread| thread.state == "cleanup_pending")
                     .count();
-                let message = if pending == 0 {
-                    format!("cancelled {id}: {}\n", result.reason)
+                let batch = if result.dissolved_batch.is_empty() {
+                    String::new()
                 } else {
-                    format!("cancelled {id}; cleanup pending for {pending} thread(s)\n")
+                    format!("; dissolved batch {}", result.dissolved_batch.join(", "))
+                };
+                let message = if pending == 0 {
+                    format!("cancelled {id}: {}{batch}\n", result.reason)
+                } else {
+                    format!("cancelled {id}{batch}; cleanup pending for {pending} thread(s)\n")
                 };
                 crate::output::success(
                     Some(if pending == 0 {
