@@ -228,7 +228,7 @@ With `nudge = true`, the ticker also prompts an idle coordinator to find the nex
 
 ## Lane completion deliveries
 
-A lane's typed event line is the wake-up: the ticker types it once into the coordinator's ready pane. `context` reads the current attempt's sealed completion evidence directly, alongside thread and round records. Local and courier completions write no duplicate inbox item; a changed recipient leaves a `recipient-changed` message. Only a command the bound coordinator runs (`context`, or `inbox done` for messages) acknowledges a delivery; `--peek` and automation never do. Old thread/round inbox projections are ignored on read, not migrated.
+A lane's typed event line is the wake-up: the ticker types it once into the coordinator's ready pane. `context` reads the current attempt's sealed completion evidence directly, alongside thread and round records. Local and courier completions write no duplicate inbox item; a replacement coordinator reads the same sealed work in context. Only a command the bound coordinator runs (`context`, or `inbox done` for messages) acknowledges a delivery; `--peek` and automation never do. Old thread/round inbox projections are ignored on read, not migrated.
 
 ## Routines
 
