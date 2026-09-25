@@ -59,6 +59,14 @@ fn checked_out(runner: &dyn Runner, repo: &str) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+fn checked_threads(project: &Project) -> Result<Vec<Thread>> {
+    let (threads, errors) = thread::list_with_errors(project);
+    if let Some(error) = errors.first() {
+        bail!("thread records unreadable: {error:#}");
+    }
+    Ok(threads)
+}
+
 fn harness_ref(name: &str) -> bool {
     (name.starts_with("hp/") || name.starts_with("review/"))
         && !name.contains("..")
@@ -105,6 +113,20 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     if record.repo.is_empty() || !harness_ref(&record.branch) {
         return Ok(());
     }
+    if checked_threads(project)?.iter().any(|t| {
+        t.id != record.id
+            && t.repo == record.repo
+            && t.branch == record.branch
+            && t.status != Status::Resolved
+    }) {
+        bail!("branch {} still belongs to an active thread", record.branch);
+    }
+    if checked_out(ctx.runner, &record.repo)?.contains(&record.branch) {
+        bail!(
+            "branch {} is still checked out; not removing it anywhere",
+            record.branch
+        );
+    }
     let local = refs(ctx.runner, &record.repo, None)?;
     let (settings, _) = project.read_project_md()?;
     let row = settings.repos.iter().find(|row| row.path == record.repo);
@@ -135,14 +157,14 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     } else {
         row.and_then(|r| r.publish_url.clone().or_else(|| r.push_remote.clone()))
     };
+    if let Some(sha) = local.get(&record.branch) {
+        delete_local(ctx.runner, &record.repo, &record.branch, sha)?;
+    }
     if let Some(url) = url {
         let remote = refs(ctx.runner, &record.repo, Some(&url))?;
         if let Some(sha) = remote.get(&record.branch) {
             delete_remote(ctx.runner, &record.repo, &url, &record.branch, sha)?;
         }
-    }
-    if let Some(sha) = local.get(&record.branch) {
-        delete_local(ctx.runner, &record.repo, &record.branch, sha)?;
     }
     Ok(())
 }
@@ -163,28 +185,61 @@ pub(crate) fn closed_round(
         .iter()
         .find(|r| r.path == record.repo)
         .and_then(|r| r.publish_url.as_ref().or(r.push_remote.as_ref()));
+    let local = refs(ctx.runner, &record.repo, None)?;
+    let remote = match url {
+        Some(url) => refs(ctx.runner, &record.repo, Some(url))?,
+        None => BTreeMap::new(),
+    };
+    let root = format!("review/{}", record.round);
+    let numbered = format!("{root}-");
     let mut names = BTreeSet::new();
+    names.extend(
+        local
+            .keys()
+            .chain(remote.keys())
+            .filter(|name| {
+                *name == &root
+                    || name.strip_prefix(&numbered).is_some_and(|suffix| {
+                        suffix
+                            .parse::<u32>()
+                            .is_ok_and(|number| number >= 2 && number.to_string() == suffix)
+                    })
+            })
+            .cloned(),
+    );
     names.extend(record.review_branch.iter().cloned());
     names.extend(record.previous_review_branch.iter().cloned());
     if let Some(batch) = &record.batch {
         names.extend(batch.selection_review_branch.iter().cloned());
         names.extend(batch.review_branch.iter().cloned());
     }
+    let in_use = checked_out(ctx.runner, &record.repo)?;
+    let threads = checked_threads(project)?;
+    let rounds = crate::round::checked_list(project)?;
     for name in names.into_iter().filter(|name| harness_ref(name)) {
+        if in_use.contains(&name) {
+            bail!("review branch {name} is still checked out; not removing it anywhere");
+        }
         // An unfinished reviewer must never lose a branch on a batch retry.
-        if thread::list(project)
+        if threads
             .iter()
             .any(|t| t.repo == record.repo && t.branch == name && t.status != Status::Resolved)
+            || rounds.iter().any(|r| {
+                r.repo == record.repo
+                    && !r.phase.closed()
+                    && (r.review_branch.as_deref() == Some(&name)
+                        || r.previous_review_branch.as_deref() == Some(&name))
+            })
         {
             continue;
         }
+        if let Some(sha) = local.get(&name) {
+            delete_local(ctx.runner, &record.repo, &name, sha)?;
+        }
         if let Some(url) = url
-            && let Some(sha) = refs(ctx.runner, &record.repo, Some(url))?.get(&name)
+            && let Some(sha) = remote.get(&name)
         {
             delete_remote(ctx.runner, &record.repo, url, &name, sha)?;
-        }
-        if let Some(sha) = refs(ctx.runner, &record.repo, None)?.get(&name) {
-            delete_local(ctx.runner, &record.repo, &name, sha)?;
         }
     }
     Ok(())
@@ -203,8 +258,8 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
         let (settings, _) = project.read_project_md()?;
-        let threads = thread::list(&project);
-        let rounds = crate::round::list(&project);
+        let threads = checked_threads(&project)?;
+        let rounds = crate::round::checked_list(&project)?;
         for row in settings.repos {
             if !Path::new(&row.path).is_dir() {
                 continue;
@@ -290,11 +345,11 @@ pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
             bail!("branch plan changed; run `ha doctor` again");
         }
         for item in &plan {
-            if let Some((url, sha)) = &item.remote {
-                delete_remote(ctx.runner, &item.repo, url, &item.branch, sha)?;
-            }
             if let Some(sha) = &item.local {
                 delete_local(ctx.runner, &item.repo, &item.branch, sha)?;
+            }
+            if let Some((url, sha)) = &item.remote {
+                delete_remote(ctx.runner, &item.repo, url, &item.branch, sha)?;
             }
         }
         return Ok(format!(
@@ -351,7 +406,7 @@ mod tests {
     #[test]
     fn a_closed_round_removes_its_current_and_superseded_reviews() {
         let (fx, bare) = configured();
-        for name in ["review/r1", "review/r1-2"] {
+        for name in ["review/r1", "review/r1-2", "review/r1-3"] {
             run(&fx.repo, &["branch", name, "main"]);
             run(
                 &fx.repo,
@@ -361,8 +416,9 @@ mod tests {
         let round = crate::contracts::RoundRecord {
             phase: crate::contracts::RoundPhase::Merged,
             repo: fx.repo.to_string_lossy().into_owned(),
-            review_branch: Some("review/r1-2".into()),
-            previous_review_branch: Some("review/r1".into()),
+            round: "r1".into(),
+            review_branch: Some("review/r1-3".into()),
+            previous_review_branch: Some("review/r1-2".into()),
             ..Default::default()
         };
         closed_round(&fx.world.ctx(), &fx.project, &round).unwrap();
@@ -380,6 +436,28 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_checked_out_review_is_not_deleted_remotely() {
+        let (fx, bare) = configured();
+        let url = bare.path().to_str().unwrap();
+        run(&fx.repo, &["branch", "review/r1", "main"]);
+        run(&fx.repo, &["push", "-q", url, "review/r1"]);
+        run(&fx.repo, &["checkout", "-q", "review/r1"]);
+        let round = crate::contracts::RoundRecord {
+            round: "r1".into(),
+            phase: crate::contracts::RoundPhase::Merged,
+            repo: fx.repo.to_string_lossy().into_owned(),
+            review_branch: Some("review/r1".into()),
+            ..Default::default()
+        };
+        assert!(closed_round(&fx.world.ctx(), &fx.project, &round).is_err());
+        assert!(
+            refs(fx.world.ctx().runner, &round.repo, Some(url))
+                .unwrap()
+                .contains_key("review/r1")
         );
     }
 
@@ -426,6 +504,13 @@ mod tests {
         // The normal resolve path uses the same deletion against the fake remote.
         thread::update(&fx.project, &done.id, |t| t.branch = "hp/demo/t-2".into()).unwrap();
         let updated = thread::load(&fx.project, &done.id).unwrap();
+        assert!(resolved_thread(&ctx, &fx.project, &updated).is_err());
+        assert!(
+            refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
+                .unwrap()
+                .contains_key("hp/demo/t-2")
+        );
+        thread::update(&fx.project, &_active.id, |t| t.status = Status::Resolved).unwrap();
         resolved_thread(&ctx, &fx.project, &updated).unwrap();
         assert!(
             !refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))

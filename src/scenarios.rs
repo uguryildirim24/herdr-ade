@@ -1063,6 +1063,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     world
         .runner
         .on("for-each-ref --format=%(objectname) %(refname)", ok(""));
+    world.runner.on("worktree list --porcelain", ok(""));
     world.runner.on("ls-remote --heads", ok(""));
     world.runner.on(
         "machine list --json",
