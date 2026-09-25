@@ -1509,10 +1509,11 @@ fn retry_with_ticker(
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
-    // A failed start with no machine or materialized work has no placement to
-    // preserve. Re-run the same dispatch/recipe readiness checks as a start,
-    // rather than interpreting the empty machine as an intentional Mac pick.
+    // Local placement also stores an empty machine. Its placement reason is
+    // the evidence that it was selected (possibly by an explicit --machine
+    // local), so only dispatch again when no placement was recorded at all.
     let unplaced = record.machine.is_empty()
+        && record.placement_reason.is_empty()
         && record.pane_id.is_empty()
         && record.tab_id.is_empty()
         && record.worktree_path.is_empty();
@@ -4553,6 +4554,33 @@ mod tests {
         assert_eq!(placed.machine, "buildbox");
         assert!(placed.placement_reason.contains("machine kept"));
 
+        // A selected local machine is also a placement even though its saved
+        // machine is empty. Do not move an explicitly local start to the box.
+        let mut local_args = start_args(
+            Some(fx.repo.to_string_lossy().into_owned()),
+            Some("local".into()),
+        );
+        local_args.base = Some("main".into());
+        let local = start(&fx.world.ctx(), "demo", local_args).unwrap();
+        crate::round::testkit::git(
+            &fx.repo,
+            &["worktree", "remove", "--force", &local.worktree_path],
+        );
+        crate::round::testkit::git(&fx.repo, &["branch", "-D", &local.branch]);
+        thread::update(&fx.project, &local.id, |t| {
+            t.pane_id.clear();
+            t.tab_id.clear();
+            t.worktree_path.clear();
+            t.base = "main".into();
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(&fx.world.ctx(), "demo", &local.id, "failed before launch").unwrap();
+        let retried_local = thread::load(&fx.project, &local.id).unwrap();
+        assert!(retried_local.machine.is_empty());
+        assert_eq!(retried_local.launch.machine, "local");
+        assert!(retried_local.placement_reason.contains("machine kept"));
+
         // A failed start before it acquired any machine or work is dispatched
         // again, using the current routing pick and the box mapping.
         let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
@@ -4561,6 +4589,7 @@ mod tests {
         thread::update(&fx.project, &unplaced.id, |t| {
             t.machine.clear();
             t.machine_id.clear();
+            t.placement_reason.clear();
             t.launch.machine = "local".into();
             t.pane_id.clear();
             t.tab_id.clear();
