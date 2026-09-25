@@ -497,6 +497,33 @@ pub(crate) fn coordinator_input_clear(screen: &str) -> bool {
     }) {
         return true;
     }
+    // Claude's status, shell and background-agent rows follow the lower
+    // rule. Only text inside the two editor rules can be a draft.
+    let borders: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| separator(&line.text).then_some(i))
+        .collect();
+    if let Some(&bottom) = borders.last()
+        && let Some(&top) = borders.iter().rev().nth(1)
+        && lines[top + 1..bottom].iter().any(|line| {
+            ['❯', '›', '>', '⟩']
+                .iter()
+                .any(|mark| line.text.trim_start().starts_with(*mark))
+        })
+    {
+        return lines[top + 1..bottom].iter().all(|line| {
+            let trimmed = line.text.trim_start();
+            let marker = ['❯', '›', '>', '⟩']
+                .iter()
+                .find(|mark| trimmed.starts_with(**mark));
+            let start = marker.map_or(0, |mark| line.text.len() - trimmed.len() + mark.len_utf8());
+            line.text
+                .char_indices()
+                .zip(&line.faint)
+                .all(|((byte, ch), faint)| byte < start || ch.is_whitespace() || *faint)
+        });
+    }
     let Some((index, line)) = lines.iter().enumerate().rev().find(|(_, line)| {
         ["❯", "›", ">", "⟩"]
             .iter()
@@ -861,6 +888,26 @@ mod tests {
             "❯ \x1b[0m\x1b[2many news?\x1b[22m and my words\n"
         ));
         assert!(!coordinator_input_clear("unfamiliar editor\n"));
+    }
+
+    #[test]
+    fn claude_agents_panel_never_becomes_editor_text() {
+        let rule = "\x1b[38;2;136;136;136m────────────────────────────\x1b[0m";
+        for count in 1..=6 {
+            let panel = (0..count)
+                .map(|_| "\x1b[0m  ◯ general-purpose  Verifying excluded files · 20m\n")
+                .collect::<String>();
+            let screen = format!(
+                "{rule}\n\x1b[0m\x1b[38;2;153;153;153m❯ \x1b[0m                    \n{rule}\n  /home/agent/.herdr-ade/adeherdr > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n\n  ● main\n{panel}"
+            );
+            assert!(coordinator_input_clear(&screen), "agents: {count}");
+            assert!(!coordinator_input_clear(
+                &screen.replace("❯ ", "❯ Rolf's draft ")
+            ));
+            assert!(coordinator_input_clear(
+                &screen.replace("❯ ", "❯ \x1b[2msuggestion\x1b[22m ")
+            ));
+        }
     }
 
     #[test]
