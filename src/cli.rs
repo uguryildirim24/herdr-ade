@@ -292,6 +292,9 @@ enum Command {
         /// Remove only the exact leftover refs printed by the last doctor run
         #[arg(long)]
         prune_branches: Option<String>,
+        /// Remove exactly one resolved retained worktree and its branch
+        #[arg(long, value_name = "PROJECT/THREAD")]
+        remove_kept_worktree: Option<String>,
     },
     /// Rounds: open, review and merge related lanes
     #[command(
@@ -3058,7 +3061,15 @@ fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
         Command::Doctor {
             session,
             prune_branches,
+            remove_kept_worktree,
         } => {
+            if let Some(target) = remove_kept_worktree {
+                let (slug, id) = target
+                    .split_once('/')
+                    .ok_or_else(|| anyhow::anyhow!("expected PROJECT/THREAD"))?;
+                println!("{}", crate::threads::remove_kept_worktree(&ctx, slug, id)?);
+                return Ok(());
+            }
             if let Some(plan) = prune_branches {
                 println!("{}", crate::branches::doctor(&ctx, Some(&plan))?);
                 return Ok(());
@@ -3502,6 +3513,7 @@ mod tests {
             Command::Doctor {
                 session: SessionArgs::default(),
                 prune_branches: None,
+                remove_kept_worktree: None,
             },
         );
         let error = result.as_ref().unwrap_err();
