@@ -17,8 +17,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::{
-    BatchMerge, CheckpointIntent, CompletionPin, Event, ManifestMember, MergeIntent, MergePhase,
-    PinnedGate, RoundPhase, RoundRecord,
+    BatchMerge, CheckpointIntent, CompletionPin, Event, GateSelection, ManifestMember, MergeIntent,
+    MergePhase, PinnedGate, RoundPhase, RoundRecord,
 };
 use crate::paths::Ctx;
 use crate::project::{self, Project, write_atomic};
@@ -1110,6 +1110,14 @@ pub fn manifest_hash(record: &RoundRecord) -> String {
             text.push_str("gates=configured\n");
             for gate in gates {
                 text.push_str(&format!("gate={}\n", gate.command()));
+                if let PinnedGate::Typed(gate) = gate
+                    && let Some(paths) = &gate.paths
+                {
+                    text.push_str("gate-paths=configured\n");
+                    for path in paths {
+                        text.push_str(&format!("gate-path={path}\n"));
+                    }
+                }
                 if let Some(env) = gate.env() {
                     for (key, value) in env {
                         text.push_str(&format!("gate-env={key}={value}\n"));
@@ -1182,8 +1190,116 @@ pub fn policy(
         .gates
         .clone()
         .map(|gates| gates.into_iter().map(PinnedGate::Typed).collect::<Vec<_>>());
+    for gate in row.gates.iter().flatten() {
+        if let Some(paths) = &gate.paths {
+            for path in paths {
+                crate::gate_paths::validate(path)?;
+            }
+        }
+    }
     let bytes = toml::to_string(&row)?;
     Ok((gates, sha256_hex(bytes.as_bytes()), row))
+}
+
+fn select_gates(record: &mut RoundRecord, files: &[String]) {
+    let mut selected = Vec::new();
+    let mut skipped = Vec::new();
+    for (index, gate) in record
+        .gates
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let paths = match gate {
+            PinnedGate::Legacy(_) => None,
+            PinnedGate::Typed(gate) => gate.paths.as_deref(),
+        };
+        let matching: Vec<_> = files
+            .iter()
+            .filter(|file| {
+                paths.is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| crate::gate_paths::matches(path, file))
+                })
+            })
+            .cloned()
+            .collect();
+        if paths.is_none() || !matching.is_empty() {
+            selected.push(GateSelection {
+                index,
+                files: matching,
+            });
+        } else {
+            skipped.push(index);
+        }
+    }
+    record.selected_gates = Some(selected);
+    record.skipped_gates = skipped;
+}
+
+fn changed_files(git: &Git<'_>, base: &str, candidate: &str) -> Result<Vec<String>> {
+    let range = format!("{base}...{candidate}");
+    Ok(git
+        .run(&["diff", "--no-renames", "--name-only", "-z", &range, "--"])?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn review_changed_files(
+    git: &Git<'_>,
+    record: &RoundRecord,
+    base: &str,
+    earlier: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut files = std::collections::BTreeSet::new();
+    if let Some(batch) = &record.batch {
+        files.extend(changed_files(git, base, &batch.candidate)?);
+    }
+    for member in &record.manifest.members {
+        if let Some(pin) = &member.pin {
+            files.extend(changed_files(git, base, &pin.sha)?);
+        }
+    }
+    if let Some(previous) = earlier {
+        files.extend(changed_files(git, base, previous)?);
+    }
+    Ok(files.into_iter().collect())
+}
+
+pub(crate) fn gate_summary(record: &RoundRecord) -> String {
+    let gates = record.gates.as_deref().unwrap_or_default();
+    let selected = record.selected_gates.as_ref();
+    let selected_line = gates
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| selected.is_none_or(|s| s.iter().any(|g| g.index == *i)))
+        .map(|(_, g)| g.command())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let skipped_line = record
+        .skipped_gates
+        .iter()
+        .filter_map(|i| gates.get(*i))
+        .map(PinnedGate::command)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "selected gates: {}\nskipped gates: {}\n",
+        if selected_line.is_empty() {
+            "(none)"
+        } else {
+            &selected_line
+        },
+        if skipped_line.is_empty() {
+            "(none)"
+        } else {
+            &skipped_line
+        }
+    )
 }
 
 fn parsed_round_number(id: &str) -> Result<u64> {
@@ -3506,7 +3622,7 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
     // explicit repair ingests newer lane completions. This also records each
     // REJECT exactly once even when `round advance` did not observe it first.
     let earlier_before_refresh = completed_review(&project, &before_refresh, &git);
-    let record = {
+    let mut record = {
         let _lock = project.lock()?;
         let mut record = load(&project, round)?;
         require_mutable(&record)?;
@@ -3557,18 +3673,31 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
         ));
     }
     let hash = manifest_hash(&record);
+    let base = git
+        .branch_head(&record.branch)?
+        .context("review base branch missing")?;
+    let earlier = earlier_before_refresh.or_else(|| completed_review(&project, &record, &git));
+    let files = review_changed_files(
+        &git,
+        &record,
+        &base,
+        earlier.as_ref().map(|(c, _)| c.as_str()),
+    )?;
+    select_gates(&mut record, &files);
     let prefix =
         crate::coordinator::current_prefix(&ctx.root).unwrap_or_else(|_| "herdr-ade".into());
     let brief = compose_review_brief(&record, &hash, &reports, &prefix);
 
     // A repair only supersedes a completed review. Without a sealed verdict,
     // a repeated manual command must not clear the live reviewer.
-    let earlier = earlier_before_refresh.or_else(|| completed_review(&project, &record, &git));
     let (b, review_branch, worktree, repair, review_artifact) = {
         let _repo = repo_lock(&git)?;
         let head = git
             .branch_head(&record.branch)?
             .with_context(|| format!("branch_missing: `{}`", record.branch))?;
+        if head != base {
+            bail!("review_stale: review base moved while selecting gates");
+        }
         let same_frozen_manifest = record.frozen_revision == Some(record.manifest.revision)
             && record.manifest_hash.as_deref() == Some(hash.as_str());
         if same_frozen_manifest && earlier.is_none() && record.review_intent.is_none() {
@@ -3621,6 +3750,8 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
                     bail!("review_stale: `{round}` changed before review preparation");
                 }
                 current.phase = RoundPhase::PreparingReview;
+                current.selected_gates = record.selected_gates.clone();
+                current.skipped_gates = record.skipped_gates.clone();
                 current.review_intent = Some(intent.clone());
                 save(&project, &current)?;
                 intent
@@ -3690,6 +3821,8 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
             current.previous_review_branch = current.review_branch.clone();
         }
         current.phase = RoundPhase::UnderReview;
+        current.selected_gates = record.selected_gates.clone();
+        current.skipped_gates = record.skipped_gates.clone();
         current.review_intent = None;
         current.verdict = None;
         current.reviewer_awaiting_report_after = None;
@@ -3730,14 +3863,31 @@ pub fn review(ctx: &Ctx, slug: &str, round: &str) -> Result<ReviewOutcome> {
 }
 
 fn write_gates(out: &mut String, record: &RoundRecord) {
+    out.push_str(&gate_summary(record));
     match &record.gates {
         None => out.push_str("- Not configured for this repository.\n"),
         Some(gates) if gates.is_empty() => {
             out.push_str("- This repository is explicitly gate-free.\n")
         }
         Some(gates) => {
-            for gate in gates {
-                out.push_str(&format!("- `{}`", gate.command()));
+            for (index, gate) in gates.iter().enumerate() {
+                let chosen = record
+                    .selected_gates
+                    .as_ref()
+                    .and_then(|selection| selection.iter().find(|item| item.index == index));
+                if record.selected_gates.is_some() && chosen.is_none() {
+                    out.push_str(&format!(
+                        "- Skipped `{}` (no matching changed files)\n",
+                        gate.command()
+                    ));
+                    continue;
+                }
+                out.push_str(&format!("- Selected `{}`", gate.command()));
+                if let Some(chosen) = chosen
+                    && !chosen.files.is_empty()
+                {
+                    out.push_str(&format!(" (changed files: {})", chosen.files.join(", ")));
+                }
                 if let Some(env) = gate.env().filter(|env| !env.is_empty()) {
                     out.push_str(" with environment ");
                     out.push_str(
@@ -3800,7 +3950,14 @@ fn compose_review_brief(
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|gate| {
+        .enumerate()
+        .filter(|(index, _)| {
+            record
+                .selected_gates
+                .as_ref()
+                .is_none_or(|selection| selection.iter().any(|item| item.index == *index))
+        })
+        .map(|(_, gate)| {
             format!(
                 "{{ command = {}, exit = 0 }}",
                 toml::Value::String(gate.command().to_string())
@@ -3825,7 +3982,7 @@ fn compose_review_brief(
         "\n## What to do\n\n\
 1. {merge_step}\n\
 2. Fix in place as `review(<pkg>):` commits.\n\
-3. Run every gate above with its pinned environment and keep the actual output in your report.\n\
+3. Run only the selected gates above with their pinned environment and keep the actual output in your report.\n\
 4. When the last code commit is candidate C, start your report with exactly this front matter:\n\n\
 ```\n+++\nverdict = \"MERGE\"  # or \"MERGE-AFTER-DECISION\" or \"REJECT\"\nround = \"{r}\"\ncandidate = \"<C>\"\nmanifest_hash = \"{hash}\"\npolicy_hash = \"{policy}\"\ngates = {gates_toml}\n+++\n```\n\n\
 5. Follow the reviewer skill's Done instructions, then run `{prefix} done --report <your report> --sha <C>`. The sealed report artifact is the verdict proof; do not add a review file to the repository.\n\n\
@@ -4132,6 +4289,14 @@ fn verdict_commit(project: &Project, record: &RoundRecord, git: &Git) -> Result<
         })
         .map(|pin| pin.sha.clone());
     current.verdict = Some(pin.clone());
+    if current.selected_gates.is_some() {
+        let files = changed_files(
+            git,
+            current.expected_head.as_deref().context("review_missing")?,
+            &pin.sha,
+        )?;
+        select_gates(&mut current, &files);
+    }
     current.reviewer_awaiting_report_after = None;
     current.verdict_kind = Some(verdict_kind.clone());
     if changed && verdict_kind == "REJECT" {
@@ -4257,7 +4422,24 @@ fn validate_verdict_inner(
             "verdict_manifest_mismatch: the verdict's manifest or policy hash is not this round's",
         ));
     }
-    let expected = record.gates.as_deref().unwrap_or_default();
+    let mut candidate_selection = record.clone();
+    let candidate_files = changed_files(git, b, &c)?;
+    select_gates(&mut candidate_selection, &candidate_files);
+    let expected: Vec<_> = record
+        .gates
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            record.selected_gates.is_none()
+                || candidate_selection
+                    .selected_gates
+                    .as_ref()
+                    .is_some_and(|selection| selection.iter().any(|item| item.index == *index))
+        })
+        .map(|(_, gate)| gate)
+        .collect();
     let coverage_matches = expected.len() == verdict.gates.len()
         && expected
             .iter()
@@ -4270,9 +4452,10 @@ fn validate_verdict_inner(
                 _ => false,
             });
     if !coverage_matches {
-        return Err(crate::refusal::error(
-            "verdict_gate_coverage: the verdict must declare every pinned gate exactly once, with its command and a zero exit",
-        ));
+        return Err(crate::refusal::error(format!(
+            "verdict_gate_coverage: the verdict must declare every selected gate exactly once, with its command and a zero exit; {}",
+            gate_summary(&candidate_selection).trim()
+        )));
     }
     if !git.is_ancestor(b, &c)? {
         return Err(crate::refusal::error(format!(
@@ -5593,6 +5776,7 @@ pub fn show(ctx: &Ctx, slug: &str, round: &str) -> Result<String> {
             .unwrap_or_default()
     );
     out.push_str(&format!("phase: {:?}\n", record.phase));
+    out.push_str(&gate_summary(&record));
     out.push_str(&format!("manifest hash: {}\n", manifest_hash(&record)));
     if record.phase == RoundPhase::Merged && record.push_remote.is_some() && !record.published {
         out.push_str("publish: pending\n");
@@ -6009,6 +6193,7 @@ mod tests {
         update_repo(&fx, |repo| {
             repo.gates = Some(vec![crate::project::Gate {
                 command: "cargo test".into(),
+                paths: None,
                 env: env.clone(),
             }]);
         });
@@ -7545,6 +7730,7 @@ mod tests {
         update_repo(&fx, |repo| {
             repo.gates = Some(vec![crate::project::Gate {
                 command: "cargo test".into(),
+                paths: None,
                 env: Default::default(),
             }]);
         });
@@ -7558,6 +7744,141 @@ mod tests {
         });
         let error = err(advance(&fx.world.ctx(), "demo"));
         assert!(error.starts_with("verdict_gate_coverage"), "{error}");
+    }
+
+    fn scoped_gate(command: &str, paths: &[&str]) -> crate::project::Gate {
+        crate::project::Gate {
+            command: command.into(),
+            paths: (!paths.is_empty()).then(|| paths.iter().map(|s| (*s).into()).collect()),
+            env: Default::default(),
+        }
+    }
+
+    #[test]
+    fn paper_only_selects_plain_gate_and_verdict_omits_skipped_gate() {
+        let fx = fixture();
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![
+                scoped_gate("quick", &[]),
+                scoped_gate("full", &["src/**"]),
+            ])
+        });
+        open_r1(&fx);
+        let (lane, _) = fx.lane(1);
+        let wt = fx.repo.join(".worktrees/lane-1");
+        git(&wt, &["rm", "src/lane1.rs"]);
+        let sha = commit_file(&wt, "paper/section.md", "Words\n", "paper only");
+        admit(&fx.world.ctx(), "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        review(&fx.world.ctx(), "demo", "r1").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            record
+                .selected_gates
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|g| g.index)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(record.skipped_gates, vec![1]);
+        let brief = String::from_utf8(
+            thread::artifact(&fx.project, record.review_artifact.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(brief.contains("Skipped `full`"));
+        assert!(brief.contains("Selected `quick`"));
+        assert!(
+            show(&fx.world.ctx(), "demo", "r1")
+                .unwrap()
+                .contains("skipped gates: full")
+        );
+        let lanes = vec![(lane, sha)];
+        verdict(&fx, &lanes, |c, r| {
+            format!(
+                "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = [{{ command = \"quick\", exit = 0 }}]\n+++\n",
+                r.manifest_hash.as_ref().unwrap(),
+                r.policy_hash
+            )
+        });
+        advance(&fx.world.ctx(), "demo").unwrap();
+        let candidate = git(&fx.repo, &["rev-parse", "review/r1"]);
+        validate_verdict_inner(
+            &fx.project,
+            &Git::new(fx.world.ctx().runner, &fx.repo),
+            &load(&fx.project, "r1").unwrap(),
+            &candidate,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn code_diff_selects_both_and_missing_selected_gate_is_refused() {
+        let fx = fixture();
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![
+                scoped_gate("quick", &[]),
+                scoped_gate("full", &["src/**"]),
+            ])
+        });
+        let (lanes, _) = reviewed(&fx);
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(record.selected_gates.as_ref().unwrap().len(), 2);
+        assert!(record.skipped_gates.is_empty());
+        verdict(&fx, &lanes, |c, r| {
+            format!(
+                "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = [{{ command = \"quick\", exit = 0 }}]\n+++\n",
+                r.manifest_hash.as_ref().unwrap(),
+                r.policy_hash
+            )
+        });
+        let error = err(advance(&fx.world.ctx(), "demo"));
+        assert!(error.starts_with("verdict_gate_coverage"), "{error}");
+    }
+
+    #[test]
+    fn repair_adding_code_reselects_scoped_gate() {
+        let fx = fixture();
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![
+                scoped_gate("quick", &[]),
+                scoped_gate("full", &["src/**"]),
+            ])
+        });
+        open_r1(&fx);
+        let (lane, _) = fx.lane(1);
+        let wt = fx.repo.join(".worktrees/lane-1");
+        git(&wt, &["rm", "src/lane1.rs"]);
+        let paper = commit_file(&wt, "paper/page.md", "words\n", "paper");
+        admit(&fx.world.ctx(), "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &paper, "# paper\n");
+        review(&fx.world.ctx(), "demo", "r1").unwrap();
+        let lanes = vec![(lane.clone(), paper)];
+        verdict(&fx, &lanes, |c, r| {
+            format!(
+                "+++\nverdict = \"REJECT\"\nround = \"r1\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = [{{ command = \"quick\", exit = 0 }}]\n+++\n",
+                r.manifest_hash.as_ref().unwrap(),
+                r.policy_hash
+            )
+        });
+        advance(&fx.world.ctx(), "demo").unwrap();
+        let fix = commit_file(&wt, "src/fix.rs", "// fix\n", "repair code");
+        fx.seal_done(&lane, 1, 2, &fix, "# repair\n");
+        review(&fx.world.ctx(), "demo", "r1").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert_eq!(
+            record
+                .selected_gates
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|g| g.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(record.skipped_gates.is_empty());
     }
 
     #[test]
