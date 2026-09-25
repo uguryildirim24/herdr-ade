@@ -1,0 +1,18 @@
+id = "rundown"
+name = "Rundown"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Each project's steps as a plain to-do list: what it is, what is done, what is next."
+platforms = ["macos", "linux"]
+
+# `ha harness install` builds the binary with the rest of the repo and links
+# this folder. `ha open` opens the pane as a tab in each project's workspace,
+# passing HERDR_RUNDOWN_PROJECT, HERDR_RUNDOWN_TITLE and HERDR_ADE_ROOT.
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "--manifest-path", "../Cargo.toml", "--bin", "herdr-rundown"]
+
+[[panes]]
+id = "rundown"
+title = "Rundown"
+placement = "tab"
+command = ["../target/release/herdr-rundown"]

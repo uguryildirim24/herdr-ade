@@ -84,7 +84,7 @@ enum Kind {
 impl Kind {
     fn binaries(self) -> &'static [&'static str] {
         match self {
-            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-pro"],
+            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-pro", "herdr-rundown"],
             Kind::Fork => &["herdr"],
         }
     }
@@ -387,7 +387,7 @@ fn box_binary(machine: &crate::remote::MachineDeclaration, bin: &str) -> Result<
     match bin {
         "herdr-ade" => Ok(machine.ade_bin.clone()),
         "herdr-pi" => Ok(machine.pi_bin.clone()),
-        "herdr-pro" => Path::new(&machine.ade_bin)
+        "herdr-pro" | "herdr-rundown" => Path::new(&machine.ade_bin)
             .parent()
             .map(|dir| dir.join(bin).to_string_lossy().into_owned())
             .context("machine ade_bin has no parent folder"),
@@ -1117,6 +1117,16 @@ pub(crate) fn install_with_reexec(
             root: ctx.root.join("pi"),
         })?;
     }
+    let mut warnings = Vec::new();
+    for (repo, kind) in repos.iter().zip(&kinds) {
+        if *kind == Kind::Plugin
+            && let Err(error) = crate::rundown::link_plugin(ctx, &repo.path)
+        {
+            warnings.push(format!(
+                "note: the Rundown tab plugin is not linked: {error:#}"
+            ));
+        }
+    }
 
     // Machine resolution belongs to the installer image built above. If that
     // image replaced this process, `reexec` never returns and the new image
@@ -1128,7 +1138,6 @@ pub(crate) fn install_with_reexec(
         .as_ref()
         .map(|(profile, _)| profile.target.clone());
     let box_paths = box_machine.map(|(_, declaration)| declaration);
-    let mut warnings = Vec::new();
     let mut box_plugin_installed = false;
     for ((repo, kind), installed_repo) in repos.iter().zip(kinds).zip(&mut installed) {
         match (&box_target, &repo.box_path) {

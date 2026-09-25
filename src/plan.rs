@@ -405,7 +405,7 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
                 "schema": 1,
                 "revision": 0,
                 "next_step": 0,
-                "goal": "",
+                "goal": project_goal(&project),
                 "kind": "",
                 "what_you_get": "",
                 "does": "",
