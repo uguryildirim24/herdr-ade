@@ -7,7 +7,7 @@ Install Herdr ADE, configure task routing, then open a project for its coordinat
 - macOS or Linux with [Herdr](https://herdr.dev) 0.9.1 or newer. Check both the client and running server with `herdr status`; restart a stale server after an update.
 - Rust 1.89 or newer, Cargo, a C compiler, and Git.
 - Access to `uguryildirim24/herdr-ade` and an agent CLI used by one of your configured recipes.
-- Optional: `gh` for pull-request follow-up, and SSH plus `rsync` for lanes on another machine.
+- Optional: `gh` for GitHub operations, and SSH plus `rsync` for lanes on another machine.
 
 ## 2. Install the plugin
 

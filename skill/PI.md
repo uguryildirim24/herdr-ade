@@ -65,7 +65,7 @@ done. The guard reports the pane `blocked` and seals one typed provider-failure
 event. Its provider kind is `limit`, `login`, `unreachable` or `error`.
 
 The event starts bounded recovery automatically. Every provider failure starts
-the same task as a new process on the same recipe; it never selects a fallback.
+the same task as a new process on the same recipe; it never switches recipes.
 An explicit `ha thread retry <slug> <id> --reason "<evidence>"` does the same and
 consumes the next bounded retry. It refuses after the limit is exhausted and
 waits for the coordinator. Never re-prompt or type recovery into the pane.

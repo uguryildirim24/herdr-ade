@@ -49,7 +49,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
         .context("escalation_brief_missing")?;
     // Provider outages and lost connections are infrastructure failures: retry
     // the exact recipe. A gone process restarts the attempt. Only failed work
-    // consumes the routing table's retries and ordered fallbacks.
+    // consumes the routing table's same-recipe work retry budget.
     let selected = launch::resolve_failure(
         ctx,
         project,

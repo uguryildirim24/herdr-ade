@@ -112,7 +112,7 @@ pub(crate) struct Launch {
     pub(crate) skill_hash: String,
     pub(crate) recipe_id: String,
     /// Number of failed-work recovery selections after the first launch.
-    /// Infrastructure retries never advance this fallback selector.
+    /// Infrastructure retries do not consume the failed-work retry budget.
     pub(crate) escalations: u32,
     /// Number of bounded same-recipe retries for provider, connection, and
     /// process failures.

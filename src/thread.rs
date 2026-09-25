@@ -1737,6 +1737,31 @@ mod tests {
     }
 
     #[test]
+    fn historical_pr_fields_do_not_prevent_loading_a_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let lane = allocate(&project, |lane| lane.title = "Old lane".into()).unwrap();
+        let path = record_path(&project, &lane.id);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let legacy = format!(
+            "pr = \"https://github.com/acme/demo/pull/1\"\npr_state = \"OPEN\"\npr_review = \"APPROVED\"\npr_note = \"\"\npr_summary = {{ state = \"OPEN\", comments = [] }}\n{saved}"
+        );
+        std::fs::write(&path, legacy).unwrap();
+        assert_eq!(load(&project, &lane.id).unwrap().title, "Old lane");
+        assert_eq!(list_with_errors(&project).0.len(), 1);
+        update(&project, &lane.id, |lane| {
+            lane.title = "Updated lane".into()
+        })
+        .unwrap();
+        assert_eq!(load(&project, &lane.id).unwrap().title, "Updated lane");
+        assert!(
+            !std::fs::read_to_string(path)
+                .unwrap()
+                .contains("pr_summary")
+        );
+    }
+
+    #[test]
     fn id_allocation_under_contention() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
