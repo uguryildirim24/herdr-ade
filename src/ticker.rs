@@ -2830,7 +2830,7 @@ mod tests {
         assert!(saved.startup_recovery_used);
         assert_eq!(saved.checked_slice, "herdr-ade-demo.slice");
         assert!(!saved.identity.pane_id.is_empty());
-        assert!(saved.startup_wait_started.is_empty());
+        assert!(!saved.startup_wait_started.is_empty());
 
         // A later submitted start can itself time out. It must not be
         // reclaimed again and thereby evade the launch limit indefinitely.
