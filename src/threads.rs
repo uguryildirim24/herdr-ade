@@ -1931,6 +1931,11 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             worktree = "removed".into();
         } else if pane == "cleanup_pending" {
             worktree = "kept".into();
+        } else if let Err(error) = preserve_report_links(ctx, &project, &record) {
+            let detail = format!("linked_files_not_kept: {error:#}");
+            crate::ledger::observe(&project, "thread-cleanup", id, &detail);
+            worktree = "kept".into();
+            worktree_reason = Some(detail);
         } else {
             let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
             let kept_reason = if !inspection.dirty.is_empty() {
@@ -1973,11 +1978,17 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             Ok(())
         })();
         match cleanup {
-            Ok(()) if !fix_cleanup_failed => {
+            Ok(())
+                if !fix_cleanup_failed
+                    && !worktree_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.starts_with("linked_files_not_kept:")) =>
+            {
                 thread::update(&project, id, |t| {
                     t.cleanup_pending = false;
                     t.cleanup_reason.clear();
                 })?;
+                crate::ledger::recovered(&project, "thread-cleanup", id);
             }
             Ok(()) => {}
             Err(error) => {
@@ -1989,7 +2000,13 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
         thread: id.to_string(),
-        state: if pane == "cleanup_pending" || cleanup_failed || fix_cleanup_failed {
+        state: if pane == "cleanup_pending"
+            || cleanup_failed
+            || fix_cleanup_failed
+            || worktree_reason
+                .as_ref()
+                .is_some_and(|reason| reason.starts_with("linked_files_not_kept:"))
+        {
             "cleanup_pending"
         } else {
             "cancelled"
@@ -2765,7 +2782,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         thread::update(&project, id, |t| t.worktree_path.clear())?;
         worktree_removed = true;
     } else if removable {
-        if args.keep_pane {
+        if args.keep_pane && removal_refusal.is_none() {
             removal_refusal = Some(
                 "worktree_in_use: the worktree was kept because --keep-pane leaves its pane open"
                     .into(),
@@ -3186,7 +3203,7 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
     while i + 2 < bytes.len() {
         // Inline links/images and reference definitions: [text](path),
         // ![alt](path), and [label]: path. Preserve titles and fragments.
-        let html = [b"src=\"".as_slice(), b"href=\"", b"src='", b"href='"]
+        let html = [b"src=".as_slice(), b"href=".as_slice()]
             .into_iter()
             .find(|attr| bytes[i..].starts_with(attr));
         let start = if let Some(attr) = html {
@@ -3203,7 +3220,13 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
             None
         };
         if let Some(mut start) = start {
-            let quote = html.map(|_| bytes[start - 1]);
+            let quote = html.and_then(|_| match bytes.get(start) {
+                Some(b'\'' | b'"') => Some(bytes[start]),
+                _ => None,
+            });
+            if quote.is_some() {
+                start += 1;
+            }
             let angle = bytes.get(start) == Some(&b'<');
             if angle {
                 start += 1;
@@ -3215,6 +3238,7 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
                 if quote == Some(b)
                     || matches!(b, b'\n' | b'\r')
                     || (quote.is_none() && !angle && matches!(b, b' ' | b'\t'))
+                    || (html.is_some() && quote.is_none() && b == b'>')
                     || (angle && b == b'>')
                 {
                     break;
@@ -3317,15 +3341,17 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
         &ctx.config_dir,
         record.machine_route(),
     )?;
-    let script = format!(
-        "root=$(realpath -e -- {root}) || exit 2; file=$(realpath -e -- {file}) || exit 2; case \"$file\" in \"$root\"/*) ;; *) exit 3;; esac; test -f \"$file\" || exit 4; size=$(wc -c < \"$file\"); test \"$size\" -le 209715200 || {{ echo 'linked files exceed 200 MiB' >&2; exit 5; }}; printf '%s\\n' \"$size\"; od -An -tx1 -v \"$file\"",
+    let check = format!(
+        "root=$(realpath -e -- {root}) || exit 2; file=$(realpath -e -- {file}) || exit 2; case \"$file\" in \"$root\"/*) ;; *) exit 3;; esac; test -f \"$file\" || exit 4",
         root = remote::quote(&root.to_string_lossy()),
         file = remote::quote(&path.to_string_lossy()),
     );
     let out = remote::ssh(
         ctx.runner,
         &profile.target,
-        &script,
+        &format!(
+            "{check}; size=$(wc -c < \"$file\"); test \"$size\" -le 209715200 || {{ echo 'linked files exceed 200 MiB' >&2; exit 5; }}; printf '%s ' \"$size\"; sha256sum \"$file\""
+        ),
         None,
         std::time::Duration::from_secs(90),
     )?;
@@ -3345,10 +3371,36 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
     if size > LINKED_FILES_CAP {
         bail!("linked files exceed 200 MiB");
     }
-    let bytes: Vec<u8> = parts
-        .map(|hex| u8::from_str_radix(hex, 16))
-        .collect::<std::result::Result<_, _>>()?;
-    if bytes.len() as u64 != size {
+    let expected_hash = parts.next().context("remote linked file has no hash")?;
+    // Runner's output is text. One full-size hex dump would multiply the
+    // 200 MiB cap several times in memory; fetch bounded pieces instead.
+    let mut bytes = Vec::new();
+    for offset in (0..size).step_by(8 * 1024 * 1024) {
+        let out = remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &format!(
+                "{check}; dd if=\"$file\" bs=1048576 skip={} count=8 status=none | od -An -tx1 -v",
+                offset / 1024 / 1024
+            ),
+            None,
+            std::time::Duration::from_secs(90),
+        )?;
+        if !out.success() {
+            bail!(
+                "could not fetch linked file {}: {}",
+                path.display(),
+                out.error_text()
+            );
+        }
+        for hex in out.stdout.split_whitespace() {
+            bytes.push(u8::from_str_radix(hex, 16)?);
+        }
+        if bytes.len() as u64 != (offset + 8 * 1024 * 1024).min(size) {
+            bail!("remote linked file changed during copy: {}", path.display());
+        }
+    }
+    if thread::sha256_hex(&bytes) != expected_hash {
         bail!("remote linked file changed during copy: {}", path.display());
     }
     Ok(bytes)
@@ -3356,15 +3408,71 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
 
 fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if thread::sealed_report_path(project, record).is_none() {
-        if !record.is_remote() {
-            let draft = std::path::Path::new(&record.thread_dir).join("report.md");
-            if let Ok(text) = std::fs::read_to_string(draft)
-                && report_destinations(&text)
+        if crate::events::list(project).into_iter().any(|event| {
+            event.thread == record.id
+                && event.attempt == record.attempt.max(1)
+                && event.payload.done.is_some()
+        }) {
+            bail!("the sealed report artifact is missing or damaged; worktree kept");
+        }
+        if record.is_remote() {
+            let profile = remote::machine_profile(
+                ctx.runner,
+                &ctx.env.herdr_bin(),
+                &ctx.config_dir,
+                record.machine_route(),
+            )?;
+            let root = remote::quote(&record.thread_dir);
+            let draft = remote::quote(&format!("{}/report.md", record.thread_dir));
+            let script = format!(
+                "root=$(realpath -e -- {root}) || exit 2; test -r \"$root\" && test -x \"$root\" || exit 3; if test -e {draft} || test -L {draft}; then printf '__HERDR_DRAFT_PRESENT__\\n'; else printf '__HERDR_DRAFT_ABSENT__\\n'; fi"
+            );
+            let out = remote::ssh(
+                ctx.runner,
+                &profile.target,
+                &script,
+                None,
+                std::time::Duration::from_secs(20),
+            )?;
+            if !out.success() {
+                bail!(
+                    "could not inspect box report: {}; worktree kept",
+                    out.error_text()
+                );
+            }
+            match out.stdout.trim() {
+                "__HERDR_DRAFT_ABSENT__" => return Ok(()),
+                "__HERDR_DRAFT_PRESENT__" => {
+                    let bytes = linked_bytes(ctx, record, std::path::Path::new("report.md"))?;
+                    let text = String::from_utf8(bytes)?;
+                    if report_destinations(&text)
+                        .iter()
+                        .any(|(_, dest)| linked_relative_path(project, record, dest).is_some())
+                    {
+                        bail!(
+                            "the box report links to files but has no sealed artifact; worktree kept"
+                        );
+                    }
+                    return Ok(());
+                }
+                _ => bail!("box report probe returned no presence answer; worktree kept"),
+            }
+        }
+        let draft = std::path::Path::new(&record.thread_dir).join("report.md");
+        match std::fs::read_to_string(&draft) {
+            Ok(text) => {
+                if report_destinations(&text)
                     .iter()
                     .any(|(_, dest)| linked_relative_path(project, record, dest).is_some())
-            {
-                bail!("the report links to files but has no sealed artifact; worktree kept");
+                {
+                    bail!("the report links to files but has no sealed artifact; worktree kept");
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => bail!(
+                "could not inspect {}: {error}; worktree kept",
+                draft.display()
+            ),
         }
         return Ok(());
     }
@@ -3711,6 +3819,8 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
     if finished_worktree_reason(ctx, &project, &record)?.is_some() {
         bail!("{id} is not finished; not removing its worktree");
     }
+    preserve_report_links(ctx, &project, &record)
+        .with_context(|| format!("linked_files_not_kept: cannot discard {id}'s worktree"))?;
     let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
     if !inspection.dirty.is_empty() {
         bail!("worktree_dirty: {}", inspection.dirty.join(", "));
