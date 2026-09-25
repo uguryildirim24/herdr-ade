@@ -292,6 +292,7 @@ impl std::fmt::Display for Status {
 #[serde(default)]
 struct ProjectState {
     status: Status,
+    finished: bool,
 }
 
 /// The coordinator's pane and the session the project belongs to.
@@ -511,12 +512,26 @@ impl Project {
             .status
     }
 
+    pub(crate) fn finished(&self) -> bool {
+        read_json::<ProjectState>(&self.state_dir().join("project.json"))
+            .unwrap_or_default()
+            .finished
+    }
+
+    pub(crate) fn set_finished(&self, finished: bool) -> Result<()> {
+        let _lock = self.lock()?;
+        let path = self.state_dir().join("project.json");
+        let mut state = read_json::<ProjectState>(&path).unwrap_or_default();
+        state.finished = finished;
+        write_json(&path, &state)
+    }
+
     pub(crate) fn set_status(&self, status: Status) -> Result<()> {
         let _lock = self.lock()?;
-        write_json(
-            &self.state_dir().join("project.json"),
-            &ProjectState { status },
-        )
+        let path = self.state_dir().join("project.json");
+        let mut state = read_json::<ProjectState>(&path).unwrap_or_default();
+        state.status = status;
+        write_json(&path, &state)
     }
 
     pub(crate) fn coordinator(&self) -> Option<Coordinator> {
