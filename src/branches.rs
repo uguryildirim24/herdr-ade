@@ -532,6 +532,23 @@ mod tests {
     }
 
     #[test]
+    fn local_branch_deletion_refuses_a_non_missing_git_error() {
+        let fx = crate::round::testkit::fixture();
+        let branch = "hp/demo/reviewer";
+        run(&fx.repo, &["branch", branch, "main"]);
+        run(&fx.repo, &["checkout", "-q", branch]);
+        let sha = run(&fx.repo, &["rev-parse", branch]);
+        let repo = fx.repo.to_str().unwrap();
+        let runner = crate::runner::RealRunner;
+        let error = delete_local(&runner, repo, branch, &sha).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot delete branch"),
+            "{error:#}"
+        );
+        assert_eq!(refs(&runner, repo, None).unwrap().get(branch), Some(&sha));
+    }
+
+    #[test]
     fn leased_cleanup_against_a_fake_remote() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
