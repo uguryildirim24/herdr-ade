@@ -1756,10 +1756,20 @@ fn retry_with_ticker(
 
 // Placement counts its own tries; if it failed before submitting an agent,
 // keep the launch counter at zero so round recovery never calls it process gone.
+// A reviewer is retried by the round's clock, not the ticker's immediate
+// escalation pass (which would bypass that clock and exhaust placement).
 fn place_prelaunch_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     let result = place_escalation(ctx, project, record);
-    if result.is_err() && record.launch_attempts == 0 {
-        thread::update(project, &record.id, |t| t.launch_attempts = 0)?;
+    if let Err(error) = &result
+        && record.launch_attempts == 0
+    {
+        thread::update(project, &record.id, |t| {
+            t.launch_attempts = 0;
+            if t.role == "reviewer" {
+                t.escalation_pending = false;
+                t.error = format!("{error:#}");
+            }
+        })?;
     }
     result
 }
@@ -4791,6 +4801,34 @@ mod tests {
             pane_id: "w2:p1".into(),
             ..Thread::default()
         }
+    }
+
+    #[test]
+    fn failed_reviewer_placement_waits_for_round_retry_instead_of_ticker_escalation() {
+        let world = crate::scenarios::World::new();
+        let project = crate::project::create(&world.root, "demo", "", vec![]).unwrap();
+        let reviewer = thread::allocate(&project, |t| {
+            t.role = "reviewer".into();
+            t.status = Status::Failed;
+            t.escalation_pending = true;
+            t.launch_attempts = 0;
+        })
+        .unwrap();
+        let error = place_prelaunch_escalation(&world.ctx(), &project, &reviewer).unwrap_err();
+        assert!(error.to_string().contains("not reachable"), "{error:#}");
+        let failed = thread::load(&project, &reviewer.id).unwrap();
+        assert_eq!(failed.launch_attempts, 0);
+        assert_eq!(failed.status, Status::Failed);
+        assert!(!failed.escalation_pending);
+        assert!(failed.error.contains("not reachable"));
+        // The next ticker pass cannot place this reviewer ahead of its clock.
+        crate::escalation::tick(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            thread::load(&project, &reviewer.id)
+                .unwrap()
+                .launch_attempts,
+            0
+        );
     }
 
     #[test]
