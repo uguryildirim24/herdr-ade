@@ -1,4 +1,4 @@
-//! The ticker's per-project steps: delivery, messages and pull requests.
+//! The ticker's per-project steps: delivery and messages.
 //! Thread facts update their owning records; only messages
 //! without a thread or round home enter the inbox.
 
@@ -11,21 +11,27 @@ use serde::{Deserialize, Serialize};
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
-use crate::thread::{self, CopyOutcome, Status, Thread};
-use crate::threads;
-use crate::{events, inbox, pr};
+use crate::thread::{self, Status, Thread};
+use crate::{events, inbox};
 
 pub(crate) const TICKER_PROMPT_PREFIX: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing]";
-const PR_INTERVAL_SECS: i64 = 120;
 pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
+
+pub(crate) fn short_error(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
 const DEFAULT_OUTAGE_SECS: i64 = 600;
 
 /// `.state/ticker.json`: what the ticker compared against last time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub(crate) struct State {
-    pub(crate) last_pr_check: String,
     /// Hashes of files a `config-error` item was already written for.
     pub(crate) config_errors: BTreeSet<String>,
     /// Hash of the unseen inbox item ids last announced.
@@ -382,7 +388,6 @@ pub(crate) struct MachineMemory {
 
 /// What the ticker process remembers between ticks (not persisted).
 pub(crate) struct Memory {
-    pub(crate) gh: Outage,
     pub(crate) outage_secs: i64,
     pub(crate) tick: u64,
     pub(crate) machines: BTreeMap<String, MachineMemory>,
@@ -396,7 +401,6 @@ pub(crate) struct Memory {
 impl Memory {
     pub(crate) fn new(ctx: &Ctx) -> Memory {
         Memory {
-            gh: Outage::default(),
             // Overridable so an outage can be exercised without waiting ten minutes.
             outage_secs: ctx
                 .env
@@ -452,7 +456,7 @@ pub(crate) fn write_machine_outage(
             let error = memory
                 .machines
                 .get(machine)
-                .map(|m| pr::sanitize(&m.outage.last_error))
+                .map(|m| short_error(&m.outage.last_error))
                 .unwrap_or_default();
             let summary = format!(
                 "machine `{machine}` has been unreachable for {} minutes; its threads keep their last known state. Last error: {error}",
@@ -1143,146 +1147,6 @@ pub(crate) fn announce_inbox(project: &Project, state: &mut State, herdr: &Herdr
     }
     state.announced = hash;
     Ok(())
-}
-
-/// Step 2, every two minutes.
-pub(crate) fn pull_requests(
-    ctx: &Ctx,
-    project: &Project,
-    state: &mut State,
-    memory: &mut Memory,
-    now: jiff::Timestamp,
-) -> Vec<anyhow::Error> {
-    let mut errors = Vec::new();
-    if thread::seconds_since(&state.last_pr_check, now) < PR_INTERVAL_SECS
-        && !state.last_pr_check.is_empty()
-    {
-        return errors;
-    }
-    state.last_pr_check = now.to_string();
-
-    for t in thread::list(project) {
-        if t.status != Status::Open {
-            continue;
-        }
-        // During work the `PR:` line is in the lane's draft. After cleanup,
-        // read the one final artifact (or an unmatched historical home copy).
-        let draft = std::path::Path::new(&t.thread_dir).join("report.md");
-        let report = std::fs::read_to_string(&draft).unwrap_or_else(|_| {
-            thread::final_report_path(project, &t)
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .unwrap_or_default()
-        });
-        let (url, note) = match pr::pr_line(&report) {
-            Ok(url) => (url.unwrap_or_default(), String::new()),
-            Err(note) => (String::new(), note),
-        };
-        if url != t.pr || (url.is_empty() && note != t.pr_note) {
-            errors.extend(
-                thread::update(project, &t.id, |t| {
-                    t.pr = url.clone();
-                    t.pr_note = note;
-                    t.pr_summary = None;
-                    t.pr_state.clear();
-                    t.pr_review.clear();
-                })
-                .err(),
-            );
-        }
-        if url.is_empty() {
-            continue;
-        }
-
-        let json = match pr::view(ctx.runner, &url) {
-            Ok(json) => {
-                if memory.gh.record(true, "", now, memory.outage_secs)
-                    == Some(OutageEvent::Recovered)
-                {
-                    errors.extend(
-                        inbox::write(
-                            project,
-                            "outage",
-                            "gh",
-                            "`gh` is working again; pull request follow-up has resumed",
-                            "",
-                        )
-                        .err(),
-                    );
-                }
-                json
-            }
-            Err(error) => {
-                let text = pr::sanitize(&format!("{error:#}"));
-                if memory.gh.record(false, &text, now, memory.outage_secs)
-                    == Some(OutageEvent::Down)
-                {
-                    let summary = format!(
-                        "`gh` has been failing for {} minutes; pull requests are not being followed. Last error: {text}",
-                        memory.outage_secs / 60
-                    );
-                    errors.extend(inbox::write(project, "outage", "gh", &summary, "").err());
-                }
-                continue;
-            }
-        };
-        match pr::reduce(&json, &t.branch, &t.origin) {
-            Err(error) => errors.push(error.context(format!("{}: gh output", t.id))),
-            Ok(pr::Checked::Ignored(reason)) => {
-                errors.extend(
-                    thread::update(project, &t.id, |t| {
-                        t.pr_note = format!("pull request ignored: {reason}");
-                        t.pr_summary = None;
-                        t.pr_state.clear();
-                        t.pr_review.clear();
-                    })
-                    .err(),
-                );
-            }
-            Ok(pr::Checked::Summary(summary)) => {
-                let old = t.pr_summary.clone();
-                if t.pr == url && t.pr_note.is_empty() && old.as_ref() == Some(&summary) {
-                    continue;
-                }
-                let (pr_state, pr_review) =
-                    (summary.state.clone(), summary.review_decision.clone());
-                errors.extend(
-                    thread::update(project, &t.id, |t| {
-                        t.pr_note.clear();
-                        t.pr_state = pr_state;
-                        t.pr_review = pr_review;
-                        t.pr_summary = Some(summary.clone());
-                    })
-                    .err(),
-                );
-                let merged = summary.state == "MERGED";
-                if merged {
-                    errors.extend(resolve_after_copy(ctx, project, &t, "merged").err());
-                }
-            }
-        }
-    }
-    errors
-}
-
-/// Resolve-on-pull-request-merge: the final copy first; if it fails the
-/// thread is not resolved and the next pull-request check tries again.
-fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) -> Result<bool> {
-    crate::round::require_resolvable(project, &t.id)?;
-    let copied = threads::final_copy(ctx, project, t);
-    if let CopyOutcome::Failed(error) = copied.outcome {
-        anyhow::bail!(
-            "{}: not resolved ({reason}) because the final copy failed: {error}",
-            t.id
-        );
-    }
-    let resolved = thread::update(project, &t.id, |t| {
-        t.status = Status::Resolved;
-        t.resolved_reason = reason.to_string();
-        t.prompt_pending = false;
-    })?;
-    threads::close_pane(ctx, project, &resolved)?;
-    threads::remove_scratch_session(ctx, &resolved)?;
-    Ok(true)
 }
 
 /// Step 3, plus `config-error` items for files that do not parse.

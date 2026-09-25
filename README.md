@@ -36,7 +36,7 @@ Keep your attention on decisions. Herdr ADE starts and tracks the threads, your 
 
 ### 📈 See every thread at a glance
 
-Each thread shows its project, its id and its group beside its session: `ready-for-review`, `waiting-on-you`, `working`, `landing` or `idle`. One action filters the sidebar to a single project, with the coordinator first and finished work next, and a text popup prints the same groups.
+Each thread shows its project, its id and its group beside its session: `ready-for-review`, `waiting-on-you`, `working` or `idle`. One action filters the sidebar to a single project, with the coordinator first and finished work next, and a text popup prints the same groups.
 
 ### ⚡ Stop briefing every agent yourself
 
@@ -44,7 +44,7 @@ Say what you want once. The coordinator starts the threads the work needs and te
 
 ### 💬 Know when a thread needs an answer
 
-A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. A background ticker follows pull requests. The coordinator reads thread, round, and courier event facts directly; its inbox holds messages, not copies of those facts.
+A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. The coordinator reads thread, round, and courier event facts directly; its inbox holds messages, not copies of those facts.
 
 ## Open your first project in three steps
 
@@ -60,7 +60,7 @@ A thread that waits on a permission prompt for more than 30 seconds moves to Wai
 
 <table align="center">
 <tr>
-<td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; A coordinator that delegates and never does the work itself<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Overview by what needs you, in the sidebar and as text<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Pull request follow-up<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
+<td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; A coordinator that delegates and never does the work itself<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Overview by what needs you, in the sidebar and as text<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
 </tr>
 <tr>
 <td align="center"><a href="https://github.com/uguryildirim24/herdr-ade/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></td>

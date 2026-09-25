@@ -670,7 +670,7 @@ fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail:
             if let Err(error) = thread::update(project, &lane.id, |record| {
                 record.observation_attempted = attempted.clone();
                 record.observation_source = "courier".into();
-                record.observation_error = crate::pr::sanitize(detail);
+                record.observation_error = steps::short_error(detail);
             }) {
                 log.line(&format!("{error:#}"));
             }
@@ -2130,7 +2130,7 @@ fn clean_managed_project_tabs(
         .collect()
 }
 
-/// Copies and launches, remote machines, then inbox items, pull requests,
+/// Copies and launches, remote machines, then inbox items,
 /// housekeeping.
 #[cfg(test)]
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
@@ -2287,8 +2287,6 @@ fn tick_slow_with_steps(
 
     stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
-    stop_after_state!("pull requests");
-    errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     // D5 recovery and delivery (X1 to X5), then rounds, asks and the
     // board (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.

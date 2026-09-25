@@ -84,7 +84,7 @@ enum Kind {
 impl Kind {
     fn binaries(self) -> &'static [&'static str] {
         match self {
-            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-pro", "herdr-rundown"],
+            Kind::Plugin => &["herdr-ade", "herdr-pi", "herdr-rundown"],
             Kind::Fork => &["herdr"],
         }
     }
@@ -387,7 +387,7 @@ fn box_binary(machine: &crate::remote::MachineDeclaration, bin: &str) -> Result<
     match bin {
         "herdr-ade" => Ok(machine.ade_bin.clone()),
         "herdr-pi" => Ok(machine.pi_bin.clone()),
-        "herdr-pro" | "herdr-rundown" => Path::new(&machine.ade_bin)
+        "herdr-rundown" => Path::new(&machine.ade_bin)
             .parent()
             .map(|dir| dir.join(bin).to_string_lossy().into_owned())
             .context("machine ade_bin has no parent folder"),

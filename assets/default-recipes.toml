@@ -47,10 +47,3 @@ provider = "opencode-go"
 args = ["--provider", "opencode-go", "--model", "muse-spark-1.3-contributor", "--thinking", "high", "--no-skills"]
 ready_timeout_ms = 300000
 plain = "the second coding helper"
-
-[recipes.pi_pro]
-kind = "pi"
-provider = "pro"
-args = ["--provider", "pro", "--model", "pro", "--thinking", "high", "--no-skills"]
-ready_timeout_ms = 300000
-plain = "the strongest paid chat model, used as a worker"

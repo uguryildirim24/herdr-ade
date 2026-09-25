@@ -526,13 +526,6 @@ pub(crate) fn doctor_rows_with(
     // each enabled provider: a login or a named missing-login failure.
     if layout.wrapper().is_file() {
         for provider in providers {
-            // The `pro` relay only exists on the machine running the bridge,
-            // so a missing provider row is informational. A `pro` provider
-            // that is present but not logged in stays a failure.
-            if *provider == "pro" && !provider::has_provider(&layout.models(), "pro") {
-                rows.push(Row::ok("provider pro", "not on this machine (no relay)"));
-                continue;
-            }
             match auth_check(runner, layout, provider) {
                 Ok(()) => rows.push(Row::ok(format!("provider {provider}"), "login ready")),
                 Err(error) if error.evidence == FailureEvidence::Provider => {
@@ -553,9 +546,6 @@ pub(crate) fn doctor_rows_with(
     } else {
         rows.push(Row::fail("providers", "no wrapper; run `herdr-pi setup`"));
     }
-
-    // ~/.codex: the bridge base url must not leak into Codex (pro-bridge risk 2).
-    rows.push(codex_row(env));
 
     // ~/.pi: existence only, never read further.
     if env.home.join(".pi").exists() {
@@ -795,9 +785,6 @@ pub(crate) fn provider_row(
     provider_id: &str,
     model: &str,
 ) -> Row {
-    if provider_id == "pro" && !provider::has_provider(&layout.models(), "pro") {
-        return Row::ok("provider pro", "not on this machine (no relay)");
-    }
     let label = format!("provider {provider_id}/{model}");
     match auth_check_model(runner, layout, provider_id, Some(model)) {
         Ok(()) => Row::ok(label, "login ready"),
@@ -985,7 +972,6 @@ fn probe_model(provider: &str) -> Result<&'static str> {
         "openai-codex" => Ok("gpt-5.6-sol"),
         "opencode-go" => Ok("deepseek-v4.1-flash"),
         "kimi-coding" => Ok("k3"),
-        "pro" => Ok("pro"),
         _ => anyhow::bail!("pi_args_forbidden: `{provider}` is not a pi provider"),
     }
 }
@@ -1205,28 +1191,6 @@ fn cursor_artifacts(layout: &Layout) -> Vec<String> {
     found
 }
 
-fn codex_row(env: &Env) -> Row {
-    let path = env.home.join(".codex/config.toml");
-    if !path.exists() {
-        return Row::ok("~/.codex", "no config.toml");
-    }
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Row::warn("~/.codex", format!("{} is unreadable", path.display()));
-    };
-    let Ok(value) = text.parse::<toml::Table>() else {
-        return Row::warn("~/.codex", format!("{} does not parse", path.display()));
-    };
-    let base = value.get("openai_base_url").and_then(|v| v.as_str());
-    match base {
-        Some(url) if url.contains("127.0.0.1:17841") => Row::fail(
-            "~/.codex",
-            format!("openai_base_url points at the bridge ({url}); remove it (pro-bridge risk 2)"),
-        ),
-        Some(url) => Row::ok("~/.codex", format!("openai_base_url {url}")),
-        None => Row::ok("~/.codex", "no openai_base_url override"),
-    }
-}
-
 fn parse_node(version: &str) -> Option<(u32, u32, u32)> {
     let v = version.trim().trim_start_matches('v');
     let mut parts = v.split('.');
@@ -1296,14 +1260,6 @@ mod tests {
     fn link_into(env: &Env, layout: &Layout) {
         std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
         std::os::unix::fs::symlink(layout.wrapper(), env.home.join(".local/bin/pi")).unwrap();
-    }
-
-    /// Merge the `pro` relay provider into the shared `models.json`.
-    fn add_pro(layout: &Layout) {
-        let text = std::fs::read_to_string(layout.models()).unwrap();
-        let mut value: Value = serde_json::from_str(&text).unwrap();
-        value["providers"]["pro"] = serde_json::json!({"apiKey": "tok"});
-        std::fs::write(layout.models(), serde_json::to_string(&value).unwrap()).unwrap();
     }
 
     #[test]
@@ -1426,52 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pro_row_is_informational_when_the_relay_is_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = installed_layout(dir.path());
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        let runner = scripted(&env);
-        let rows = doctor_rows_with(&env, &layout, &runner, &["pro"]);
-        let row = rows.iter().find(|r| r.label == "provider pro").unwrap();
-        assert_eq!(row.level, Level::Ok, "{row:?}");
-        assert_eq!(row.detail, "not on this machine (no relay)");
-        assert_eq!(runner.count("auth check"), 0);
-        assert_eq!(runner.count("--print"), 0);
-    }
-
-    #[test]
-    fn a_present_pro_provider_still_needs_a_login() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = installed_layout(dir.path());
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        add_pro(&layout);
-
-        let runner = scripted(&env);
-        runner.on("auth check --provider pro", ok(r#"{"status":"ready"}"#));
-        let rows = doctor_rows_with(&env, &layout, &runner, &["pro"]);
-        let row = rows.iter().find(|r| r.label == "provider pro").unwrap();
-        assert_eq!(row.level, Level::Ok, "{row:?}");
-        assert_eq!(row.detail, "login ready");
-
-        std::fs::remove_file(probe_cache_path(&layout, "pro")).unwrap();
-        let runner = scripted(&env);
-        runner.on(
-            "auth check --provider pro",
-            fail(
-                1,
-                r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
-            ),
-        );
-        let rows = doctor_rows_with(&env, &layout, &runner, &["pro"]);
-        let row = rows
-            .iter()
-            .find(|r| r.label == "provider pro login")
-            .unwrap();
-        assert_eq!(row.level, Level::Fail, "{row:?}");
-        assert!(row.detail.contains("credentials_not_configured"), "{row:?}");
-    }
-
-    #[test]
     fn a_caret_pin_and_a_true_trust_entry_fail() {
         let dir = tempfile::tempdir().unwrap();
         let layout = installed_layout(dir.path());
@@ -1580,20 +1490,6 @@ mod tests {
             cursor.contains("[FAIL]") && cursor.contains("@cursor/sdk"),
             "{cursor}"
         );
-    }
-
-    #[test]
-    fn the_codex_bridge_url_is_a_failure_and_an_absent_file_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::for_test(dir.path(), &[]);
-        assert_eq!(codex_row(&env).level, Level::Ok);
-        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
-        std::fs::write(
-            dir.path().join(".codex/config.toml"),
-            "openai_base_url = \"http://127.0.0.1:17841/v1\"\n",
-        )
-        .unwrap();
-        assert_eq!(codex_row(&env).level, Level::Fail);
     }
 
     #[test]

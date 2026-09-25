@@ -73,22 +73,6 @@ pub(crate) fn write_overrides(path: &Path, deepseek_models: &[String]) -> Result
     Ok(())
 }
 
-/// Whether `models.json` names `provider` in its `providers` table. The `pro`
-/// relay is written into `models.json` only on the machine running the
-/// bridge, so doctor treats an absent `pro` as informational, not a failure.
-pub(crate) fn has_provider(path: &Path, provider: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    value
-        .get("providers")
-        .and_then(Value::as_object)
-        .is_some_and(|providers| providers.contains_key(provider))
-}
-
 /// The DeepSeek recipe models whose `models.json` `contextWindow` is missing
 /// or is not [`DEEPSEEK_CONTEXT_WINDOW`]. Doctor prints the names.
 pub(crate) fn missing_overrides(path: &Path, deepseek_models: &[String]) -> Result<Vec<String>> {
@@ -190,18 +174,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(missing_overrides(&path, &models()).unwrap(), models());
-    }
-
-    #[test]
-    fn has_provider_reads_the_table_and_ignores_a_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent/models.json");
-        assert!(!has_provider(&path, "pro"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{"providers":{"pro":{"apiKey":"tok"}}}"#).unwrap();
-        assert!(has_provider(&path, "pro"));
-        assert!(!has_provider(&path, "kimi-coding"));
-        std::fs::write(&path, "not json").unwrap();
-        assert!(!has_provider(&path, "pro"));
     }
 }

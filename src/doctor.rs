@@ -64,7 +64,7 @@ impl<'a> Timings<'a> {
     fn remote_phases(&self, label: &str, snapshot: &str) {
         let facts = parse_facts(snapshot);
         for (phase, commands) in [
-            ("facts", "host, load, slices, disk, gh auth"),
+            ("facts", "host, load, slices, disk"),
             ("readiness", "provider probes, command -v"),
             ("herdr", "workspace list, agent list, tab list"),
             ("builds", "find"),
@@ -137,7 +137,6 @@ fn command_name(cmd: &Cmd) -> String {
         ("git", "status" | "ls-remote" | "for-each-ref" | "worktree" | "rev-list") => {
             format!("git {verb}")
         }
-        ("gh", "auth") => "gh auth status".into(),
         ("herdr", "agent" | "pane" | "tab" | "workspace" | "machine" | "session") => {
             format!(
                 "herdr {verb} {}",
@@ -851,24 +850,6 @@ fn report_with_checks(
             ),
         }
     }
-    match runner.run(
-        &Cmd::new("gh", TOOL_TIMEOUT)
-            .args(["auth", "status"])
-            .own_group(),
-    ) {
-        Ok(o) if o.success() => check(&mut out, Some(true), "gh auth", "logged in".into()),
-        Ok(o) => check(
-            &mut out,
-            None,
-            "gh auth",
-            format!(
-                "{}; pull request follow-up will not work",
-                o.error_text().lines().next().unwrap_or("not logged in")
-            ),
-        ),
-        Err(_) => check(&mut out, None, "gh auth", "gh is not installed".into()),
-    }
-
     let doctor_config = match crate::launch::doctor_config(config_dir) {
         Ok(config) => config,
         Err(error) => {
@@ -2397,7 +2378,6 @@ fn box_rows_with_snapshot(
          printf 'listeners\\t%s\\n' \"$(ss -tln 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')\"\n\
          printf 'git_name\\t%s\\n' \"$(git config --global user.name 2>/dev/null || true)\"\n\
          printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
-         printf 'gh\\t%s\\n' \"$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)\"\n\
          printf 'rules\\t%s\\n' \"$(sha256sum {home}/.config/herdr-ade/RULES.md 2>/dev/null | cut -d' ' -f1 || true)\"\n\
 ",
         path = crate::remote::quote(&machine_paths.path),
@@ -2596,11 +2576,6 @@ done
         },
         format!("box {label} git"),
         git,
-    ));
-    rows.push((
-        env_bool(&fact("gh"), &["ok"]),
-        format!("box {label} gh"),
-        format!("gh auth status: {}", fact("gh")),
     ));
     for probe in natives.values() {
         let kind = &probe.kind;
@@ -3173,7 +3148,6 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(healthy, "{text}");
-        assert!(text.contains("[warn] gh auth"));
         assert!(text.contains("[warn] root"));
         assert!(text.contains(&format!("root:       {}", root.display())));
         assert!(!root.exists(), "doctor must not create the root");
@@ -5003,8 +4977,7 @@ recipe = "claude_fable_xhigh"
             .replace(
                 "pane_tool_claude\t/home/agent/.local/bin/claude",
                 "pane_tool_claude\t",
-            )
-            .replace("pi_pro/pro\tok", "pi_pro/pro\tfail");
+            );
         runner.on("ssh", ok(&facts));
         runner.on(
             "workspace create",
@@ -5033,7 +5006,6 @@ recipe = "claude_fable_xhigh"
         assert_eq!(find("box buildbox tools").0, Some(false));
         assert!(find("box buildbox tools").2.contains("agy claude"));
         assert!(!find("box buildbox tools").2.contains("codex"));
-        assert_eq!(find("box buildbox pi pro/pro").0, Some(false));
     }
 
     #[test]
