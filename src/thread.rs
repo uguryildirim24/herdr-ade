@@ -1889,6 +1889,7 @@ mod tests {
         ];
         let gates = vec![crate::project::Gate {
             command: "cargo test".into(),
+            paths: None,
             env: std::collections::BTreeMap::from([("RUST_BACKTRACE".into(), "1".into())]),
         }];
         let brief = compose_brief(&BriefInput {

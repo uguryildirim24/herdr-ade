@@ -139,7 +139,7 @@ fn action_rows_are_bounded_without_raw_storage_pointers() {
 }
 
 #[test]
-fn only_rounds_needing_action_get_details_after_the_page() {
+fn reviewing_rounds_show_gate_selection_in_context() {
     let p = Project::new();
     p.write(
         ".state/rounds/r1.toml",
@@ -152,5 +152,7 @@ fn only_rounds_needing_action_get_details_after_the_page() {
     let text = p.context(false);
     let actions = text.split("## Rounds needing action").nth(1).unwrap();
     assert!(actions.contains("r2 [Admitting]"), "{actions}");
-    assert!(!actions.contains("r1 [UnderReview]"), "{actions}");
+    assert!(actions.contains("r1 [UnderReview]"), "{actions}");
+    assert!(actions.contains("selected gates: (none)"), "{actions}");
+    assert!(actions.contains("skipped gates: (none)"), "{actions}");
 }
