@@ -28,5 +28,11 @@ path = "src/bin/herdr-pi.rs"
 name = "herdr-pro"
 path = "src/bin/herdr-pro.rs"
 
+# The Rundown tab (W132): one project's plan card as a plain to-do list, opened
+# by `ha open` as the `rundown` plugin pane. Compiles `src/rundown/view.rs`.
+[[bin]]
+name = "herdr-rundown"
+path = "src/bin/herdr-rundown.rs"
+
 [dev-dependencies]
 tempfile = "3"
