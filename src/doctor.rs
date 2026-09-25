@@ -338,7 +338,7 @@ fn box_native_probe_script(
          if [ $((probe_now-probe_then)) -le {ttl} ]; then probe_status=$(cat \"$probe_cache\" 2>/dev/null || true); fi\n\
          if [ -z \"$probe_status\" ]; then\n\
            if ! command -v {program} >/dev/null 2>&1; then probe_status=missing;\n\
-           elif {command} >/dev/null 2>&1; then probe_status=ok;\n\
+           elif timeout 8s {command} >/dev/null 2>&1; then probe_status=ok;\n\
            else probe_status=failed; fi\n\
            mkdir -p \"$probe_dir\"\n\
            printf '%s\\n' \"$probe_status\" > \"$probe_cache.tmp.$$\"\n\
@@ -989,8 +989,10 @@ fn report_with_checks(
             .and_then(|machines| Ok((machines, crate::launch::parse_launch_config(config_dir)?)))
         {
             Ok((machines, config)) => {
+                let mut checked_ids = BTreeSet::new();
                 for machine in machines {
                     match crate::remote::machine_profile(runner, &bin, config_dir, &machine) {
+                        Ok(profile) if !checked_ids.insert(profile.id.clone()) => continue,
                         Ok(profile) if profile.is_local() => check(
                             &mut out,
                             Some(true),
@@ -1001,7 +1003,7 @@ fn report_with_checks(
                             check(
                                 &mut out,
                                 Some(true),
-                                &format!("machine {machine}"),
+                                &format!("machine {} ({})", profile.id, profile.label),
                                 format!("ssh target {}", profile.target),
                             );
                             let mut box_snapshot = String::new();
@@ -1242,13 +1244,17 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
     // sizes, even when a resolved checkout remains on disk.
     let mut bash = String::from(
         r#"inspect() {
-  local path=$1 key=$2 record rel root line kib
+  local path=$1 key=$2 record rel root line kib tmpdir
   local -A roots=()
   cd "$path" || return 1
+  tmpdir=$(mktemp -d /tmp/herdr-doctor.XXXXXXXX) || return 1
+  trap "rm -rf -- '$tmpdir'" EXIT
+  timeout 4s git status --porcelain --ignored --untracked-files=all -z > "$tmpdir/status" || return 1
+  timeout 3s find . -mindepth 2 -name .git -prune -print0 > "$tmpdir/nested" || return 1
   printf '\0__HERDR_INSPECT_%s__\0' "$key"
-  git status --porcelain --ignored --untracked-files=all -z || return 1
+  cat "$tmpdir/status"
   printf '\0__HERDR_NESTED__\0'
-  find . -mindepth 2 -name .git -print0 || return 1
+  cat "$tmpdir/nested"
   printf '\0__HERDR_SIZES__\0'
   while IFS= read -r -d '' record; do
     if [[ $record == '!! '* ]]; then
@@ -1256,22 +1262,23 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
       root=${rel%%/*}
       [[ -z $root ]] || roots["$root"]=1
     fi
-  done < <(git status --porcelain --ignored --untracked-files=all -z)
+  done < "$tmpdir/status"
   while IFS= read -r -d '' record; do
     rel=${record#./}
     rel=${rel%/.git}
     [[ -z $rel ]] || roots["$rel"]=1
-  done < <(find . -mindepth 2 -name .git -print0)
+  done < "$tmpdir/nested"
   for rel in "${!roots[@]}"; do
     for skip in "${@:3}"; do
       [[ $rel == "$skip" ]] && continue 2
     done
-    line=$(du -sk -- "$rel") || return 1
+    line=$(timeout 2s du -sk -- "$rel") || return 1
     kib=${line%%[[:space:]]*}
     printf '%s\0%s\0' "$rel" "$kib"
   done
   printf '\0__HERDR_INSPECT_DONE_%s__\0' "$key"
 }
+export -f inspect
 "#,
     );
     for (project, thread) in candidates {
@@ -1288,7 +1295,7 @@ fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile)
             .collect::<Vec<_>>()
             .join(" ");
         bash.push_str(&format!(
-            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; du -sk -- {path} | while read -r kib rest; do printf 'size_{key}\\t%s\\n' \"$kib\"; done; (inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
+            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; printf 'doctor_active\\tworktree {key}\\n'; timeout 2s du -sk -- {path} | while read -r kib rest; do printf 'size_{key}\\t%s\\n' \"$kib\"; done; timeout 6s bash -c 'inspect \"$@\"' _ {path} {key} {skips} || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
         ));
     }
     format!("bash -c {}\n", crate::remote::quote(&bash))
@@ -1304,6 +1311,68 @@ fn finished_worktrees_with_snapshot(
 
 fn finished_worktrees(ctx: &Ctx) -> (Vec<String>, Vec<String>, Vec<String>) {
     finished_worktrees_impl(ctx, None, None)
+}
+
+/// Two Git batches per repository replace repeated branch-head, integration
+/// head and ancestry subprocesses for each resolved local checkout. Only the
+/// doctor uses this inventory; explicit cleanup rechecks individual commits.
+fn local_merged_branches(
+    ctx: &Ctx,
+    candidates: &[(project::Project, crate::thread::Thread)],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let repos: BTreeSet<String> = candidates
+        .iter()
+        .filter(|(project, thread)| {
+            !crate::threads::managed_git_folder(project, thread) && !thread.branch.is_empty()
+        })
+        .map(|(_, thread)| thread.repo.clone())
+        .collect();
+    let commands: Vec<_> = repos
+        .iter()
+        .map(|repo| {
+            Cmd::new("git", TOOL_TIMEOUT).args(["-C", repo, "symbolic-ref", "--short", "HEAD"])
+        })
+        .collect();
+    let mut heads = Vec::new();
+    for (repo, answer) in repos.iter().zip(ctx.runner.run_parallel(&commands)) {
+        if let Ok(output) = answer
+            && output.success()
+            && !output.stdout.trim().is_empty()
+        {
+            heads.push((repo.clone(), output.stdout.trim().to_string()));
+        }
+    }
+    let commands: Vec<_> = heads
+        .iter()
+        .map(|(repo, head)| {
+            Cmd::new("git", TOOL_TIMEOUT).args([
+                "-C",
+                repo,
+                "for-each-ref",
+                "--format=%(refname)",
+                "--merged",
+                head,
+                "refs/heads",
+            ])
+        })
+        .collect();
+    let mut merged = BTreeMap::new();
+    for ((repo, _), answer) in heads.into_iter().zip(ctx.runner.run_parallel(&commands)) {
+        if let Ok(output) = answer
+            && output.success()
+        {
+            merged.insert(
+                repo,
+                output
+                    .stdout
+                    .lines()
+                    .filter_map(|name| name.strip_prefix("refs/heads/"))
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+    }
+    merged
 }
 
 fn finished_worktrees_impl(
@@ -1353,6 +1422,11 @@ fn finished_worktrees_impl(
             .collect()
     });
 
+    let merged = if remote.is_none() {
+        local_merged_branches(ctx, &candidates)
+    } else {
+        BTreeMap::new()
+    };
     let mut leftovers = Vec::new();
     let mut data_kept = Vec::new();
     for (index, (project, thread)) in candidates.into_iter().enumerate() {
@@ -1363,7 +1437,12 @@ fn finished_worktrees_impl(
         if !exists {
             continue;
         }
-        match crate::threads::finished_worktree_reason(ctx, &project, &thread) {
+        match crate::threads::finished_worktree_reason_with_merged(
+            ctx,
+            &project,
+            &thread,
+            merged.get(&thread.repo),
+        ) {
             Ok(None) => {}
             Ok(Some(_)) => continue,
             Err(error) => {
@@ -1955,6 +2034,7 @@ fn box_rows_with_snapshot(
     let mut script = format!(
         "set -u\n\
          PATH={path}; export PATH\n\
+         printf 'doctor_active\\tfacts\\n'\n\
          doctor_start=$(date +%s%3N)\n\
          printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
          printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
@@ -1988,8 +2068,13 @@ for sample in $samples; do
 done
 "#);
     script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_facts\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
+    script.push_str(
+        "printf 'doctor_active\\treadiness (parallel provider probes)\\n'\ndoctor_jobs=\n",
+    );
     for probe in natives.values() {
+        script.push_str("(\n");
         script.push_str(&box_native_probe_script(probe, true, &machine_paths));
+        script.push_str(") & doctor_jobs=\"$doctor_jobs $!\"\n");
     }
     // The lane shell receives this exact PATH. Check the first pi hit and
     // required executables in the same box invocation as the other facts.
@@ -2009,7 +2094,7 @@ done
         let provider = crate::remote::quote(provider);
         let model = crate::remote::quote(model);
         script.push_str(&format!(
-            "HERDR_ADE_ROOT={root} {pi_bin} check {provider} --model {model} >/dev/null 2>&1 && printf 'pi_%s/%s\\tok\\n' {provider} {model} || printf 'pi_%s/%s\\tfail\\n' {provider} {model}\n",
+            "( HERDR_ADE_ROOT={root} timeout 8s {pi_bin} check {provider} --model {model} >/dev/null 2>&1 && printf 'pi_%s/%s\\tok\\n' {provider} {model} || printf 'pi_%s/%s\\tfail\\n' {provider} {model} ) & doctor_jobs=\"$doctor_jobs $!\"\n",
             root = crate::remote::quote(&machine_paths.root),
             pi_bin = crate::remote::quote(&machine_paths.pi_bin),
         ));
@@ -2023,10 +2108,13 @@ done
             "if [ -d {path}/.git ]; then printf 'repo %s\\tok\\n' {path}; else printf 'repo %s\\tmissing\\n' {path}; fi\n"
         ));
     }
+    script.push_str("for doctor_job in $doctor_jobs; do wait \"$doctor_job\"; done\n");
     if let Some((ctx, _)) = &snapshot {
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_readiness\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
+        script.push_str("printf 'doctor_active\\tworktrees\\n'\n");
         script.push_str(&remote_worktree_script(ctx, profile));
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_worktrees\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
+        script.push_str("printf 'doctor_active\\tbuilds\\n'\n");
         script.push_str(&build_folder_script(&machine_paths.build));
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_builds\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
         for (key, command) in [
@@ -2035,7 +2123,7 @@ done
             ("tabs", "tab list"),
         ] {
             script.push_str(&format!(
-                "printf 'herdr_{key}\\t%s\\n' \"$(HERDR_SESSION={session} \"$herdr_bin\" {command} 2>/dev/null | tr '\\n\\t' '  ')\"\n",
+                "printf 'doctor_active\\therdr {key}\\n'; printf 'herdr_{key}\\t%s\\n' \"$(HERDR_SESSION={session} \"$herdr_bin\" {command} 2>/dev/null | tr '\\n\\t' '  ')\"\n",
                 session = crate::remote::quote(&profile.session),
             ));
         }
@@ -2055,11 +2143,15 @@ done
             parse_facts(&out.stdout)
         }
         Ok(out) => {
-            return vec![(
-                Some(false),
-                format!("box {label}"),
-                format!("unreachable: {}", out.error_text()),
-            )];
+            let phase = parse_facts(&out.stdout).get("doctor_active").cloned();
+            let detail = if out.timed_out
+                && let Some(phase) = phase
+            {
+                format!("slow: snapshot timed out while running {phase}")
+            } else {
+                format!("unreachable: {}", out.error_text())
+            };
+            return vec![(Some(false), format!("box {label}"), detail)];
         }
         Err(error) => {
             return vec![(
@@ -3038,6 +3130,69 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
+    fn local_worktrees_share_one_branch_inventory_per_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let mut candidates = Vec::new();
+        for branch in ["merged", "diverged"] {
+            let thread = crate::thread::allocate(&project, |thread| {
+                thread.kind = crate::thread::Kind::Worktree;
+                thread.status = crate::thread::Status::Resolved;
+                thread.repo = "/shared/repo".into();
+                thread.branch = branch.into();
+                thread.worktree_path = format!("/shared/repo/.worktrees/{branch}");
+            })
+            .unwrap();
+            candidates.push((project.clone(), thread));
+        }
+        let runner = FakeRunner::new();
+        runner.on("symbolic-ref", ok("main\n"));
+        runner.on("for-each-ref", ok("refs/heads/merged\nrefs/heads/main\n"));
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let merged = local_merged_branches(&ctx, &candidates);
+        let inventory = merged.get("/shared/repo").unwrap();
+        assert!(inventory.contains("merged"));
+        assert!(!inventory.contains("diverged"));
+        assert!(
+            crate::threads::finished_worktree_reason_with_merged(
+                &ctx,
+                &project,
+                &candidates[0].1,
+                Some(inventory)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            crate::threads::finished_worktree_reason_with_merged(
+                &ctx,
+                &project,
+                &candidates[1].1,
+                Some(inventory)
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.program == "git")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn a_resolved_thread_with_a_gone_worktree_is_not_probed() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
@@ -3363,6 +3518,13 @@ recipe = "claude_fable_xhigh"
         let env = Env::for_test(home.path(), &[]);
         write_routing_config(&home.path().join("cfg"));
         write_machine_config(&home.path().join("cfg"));
+        let path = home.path().join("cfg/config.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            path,
+            format!("{config}\n[dispatch]\nmachine = \"buildbox-id\"\n"),
+        )
+        .unwrap();
         let machines = r#"[{"id":"buildbox-id","label":"buildbox","target":"me@box","session":"default","enabled":true}]"#;
         let runner = runner_with_machine_list("herdr 0.9.1\n", machines);
         runner.on(
@@ -3380,7 +3542,7 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(
-            text.contains("[ok  ] machine buildbox: ssh target me@box"),
+            text.contains("[ok  ] machine buildbox-id (buildbox): ssh target me@box"),
             "{text}"
         );
         assert!(text.contains("[ok  ] box buildbox capacity"), "{text}");
@@ -4009,6 +4171,34 @@ recipe = "claude_fable_xhigh"
         assert!(
             text.contains("[FAIL] box buildbox: unreachable: ssh: connect timed out"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn ssh_answering_but_snapshot_stalling_reports_its_last_part() {
+        let config = machine_config(&["pi"]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            crate::runner::Output {
+                timed_out: true,
+                stdout:
+                    "doctor_active\tfacts\ndoctor_phase_facts\t120\ndoctor_active\therdr tabs\n"
+                        .into(),
+                ..Default::default()
+            },
+        );
+        let rows = box_rows(
+            &runner,
+            "herdr",
+            config.path(),
+            &box_profile(),
+            &default_recipes(),
+            12.0,
+        );
+        assert_eq!(
+            rows[0].2,
+            "slow: snapshot timed out while running herdr tabs"
         );
     }
 

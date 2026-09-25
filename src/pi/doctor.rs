@@ -838,15 +838,19 @@ fn auth_check_model(
     provider: &str,
     model: Option<&str>,
 ) -> AuthResult {
-    if model.is_none()
-        && let Some(cached) = read_cached_probe(layout, provider)
-    {
+    let key = match model {
+        Some(model) => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("{provider}\0{model}").as_bytes());
+            format!("model-{:x}", digest)[..22].to_string()
+        }
+        None => provider.to_string(),
+    };
+    if let Some(cached) = read_cached_probe(layout, &key) {
         return cached;
     }
     let result = auth_check_uncached(runner, layout, provider, model);
-    if model.is_none() {
-        write_cached_probe(layout, provider, &result);
-    }
+    write_cached_probe(layout, &key, provider, &result);
     result
 }
 
@@ -1011,7 +1015,7 @@ fn read_cached_probe(layout: &Layout, provider: &str) -> Option<AuthResult> {
     }
 }
 
-fn write_cached_probe(layout: &Layout, provider: &str, result: &AuthResult) {
+fn write_cached_probe(layout: &Layout, key: &str, provider: &str, result: &AuthResult) {
     if !layout.root.is_dir() {
         return;
     }
@@ -1023,7 +1027,7 @@ fn write_cached_probe(layout: &Layout, provider: &str, result: &AuthResult) {
         .err()
         .is_some_and(|error| error.evidence == FailureEvidence::Unknown)
     {
-        let _ = std::fs::remove_file(probe_cache_path(layout, provider));
+        let _ = std::fs::remove_file(probe_cache_path(layout, key));
         return;
     }
     let checked = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -1058,10 +1062,10 @@ fn write_cached_probe(layout: &Layout, provider: &str, result: &AuthResult) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
-    let path = probe_cache_path(layout, provider);
+    let path = probe_cache_path(layout, key);
     let staged = layout
         .root
-        .join(format!(".readiness-{provider}-{}", std::process::id()));
+        .join(format!(".readiness-{key}-{}", std::process::id()));
     if std::fs::write(&staged, bytes).is_ok() {
         let _ = std::fs::rename(&staged, path);
     }
@@ -1483,6 +1487,25 @@ mod tests {
             text.iter().any(|l| l.contains("[FAIL] trust.json")),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn named_model_readiness_reuses_only_the_same_recent_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[]);
+        let runner = scripted(&env);
+        runner.on(
+            "auth check --provider opencode-go",
+            ok(r#"{"status":"ready"}"#),
+        );
+        assert!(auth_check_model(&runner, &layout, "opencode-go", Some("first")).is_ok());
+        assert!(auth_check_model(&runner, &layout, "opencode-go", Some("first")).is_ok());
+        assert_eq!(runner.count("auth check --provider opencode-go"), 1);
+        assert_eq!(runner.count("--print Reply OK."), 1);
+        assert!(auth_check_model(&runner, &layout, "opencode-go", Some("second")).is_ok());
+        assert_eq!(runner.count("auth check --provider opencode-go"), 2);
+        assert_eq!(runner.count("--print Reply OK."), 2);
     }
 
     #[test]
