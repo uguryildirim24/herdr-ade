@@ -232,6 +232,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
         report_tokens(&herdr, slug, &record.pane_id);
+        crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label);
         if options.reprime {
             deliver_or_defer(&project, &herdr, &agent, &prompt)?;
         }
@@ -433,6 +434,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         ),
     }
     report_tokens(&herdr, slug, &record.pane_id);
+    crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label);
     ticker::start(ctx)?;
     crate::output::insert("workspace_id", record.workspace_id.clone());
     crate::output::insert("pane_id", record.pane_id.clone());
