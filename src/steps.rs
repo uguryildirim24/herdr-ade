@@ -957,6 +957,7 @@ pub(crate) fn remote_attention(
         if lane.launch_attempts == 0 && lane.startup_wait_started.is_empty() {
             state.missing.remove(&lane.id);
             state.gone.remove(&lane.id);
+            state.pending_gone.remove(&lane.id);
             continue;
         }
         let live = thread::live_state(lane, agents, panes, now);
@@ -1784,6 +1785,7 @@ mod tests {
         }
         let state = events::remote_state(&project, "abc");
         assert!(!state.gone.contains(&lane.id));
+        assert!(!state.pending_gone.contains(&lane.id));
         assert!(!state.missing.contains_key(&lane.id));
         let unchanged = thread::load(&project, &lane.id).unwrap();
         assert_eq!(unchanged.attempt, 2);
