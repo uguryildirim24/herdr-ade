@@ -26,10 +26,9 @@ pub(crate) struct Step {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Card {
     pub(crate) title: String,
-    /// The one line saying what the project is.
-    pub(crate) headline: String,
-    /// What Rolf has at the end, when the headline did not already say it.
-    pub(crate) finish: String,
+    /// Ways to say what the project is, best first. The tab shows the first
+    /// that fits beside the name on one line, or none.
+    pub(crate) about: Vec<String>,
     pub(crate) steps: Vec<Step>,
 }
 
@@ -38,16 +37,21 @@ impl Card {
     /// just its `data.result`.
     pub(crate) fn from_plan(title: &str, reply: &Value) -> Card {
         let plan = reply.pointer("/data/result").unwrap_or(reply);
-        let text = |key: &str| plan[key].as_str().unwrap_or_default().trim().to_string();
-        let goal = without_attribution(&text("goal"));
-        let does = text("does");
-        let (headline, finish) = if !goal.is_empty() && !technical(&goal) {
-            (goal, plain(&does))
-        } else if !does.is_empty() && !technical(&does) {
-            (does, String::new())
-        } else {
-            (plain(&goal), plain(&does))
-        };
+        let text = |key: &str| without_attribution(plan[key].as_str().unwrap_or_default());
+        let mut about: Vec<String> = Vec::new();
+        for sentence in [text("goal"), text("does")] {
+            let clause = sentence
+                .split([':', ';', '—'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            for line in [sentence, clause] {
+                let line = line.trim().trim_end_matches(['.', ',']).trim().to_string();
+                if !line.is_empty() && !technical(&line) && !about.contains(&line) {
+                    about.push(line);
+                }
+            }
+        }
         let steps = plan["steps"]
             .as_array()
             .map(Vec::as_slice)
@@ -59,14 +63,15 @@ impl Card {
                     "running" => Mark::Now,
                     _ => Mark::Later,
                 },
-                text: plain(step["text"].as_str().unwrap_or_default()),
+                text: plain(step["text"].as_str().unwrap_or_default())
+                    .trim_end_matches('.')
+                    .to_string(),
             })
             .filter(|step| !step.text.is_empty())
             .collect();
         Card {
             title: title.trim().to_string(),
-            headline,
-            finish,
+            about,
             steps,
         }
     }
@@ -167,140 +172,222 @@ fn plain(text: &str) -> String {
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[38;5;71m";
-const AMBER: &str = "\x1b[38;5;179m";
-const GREY: &str = "\x1b[38;5;245m";
-const TRACK: &str = "\x1b[38;5;238m";
 
-/// The left margin and the gap between a mark and its text.
-const MARGIN: usize = 3;
-const MARK_GAP: usize = 3;
-/// Lines stay readable on a wide screen.
-const MAX_TEXT: usize = 76;
+/// A soft palette: warm text on the terminal's own background.
+const TITLE: Rgb = Rgb(245, 224, 220);
+const TEXT: Rgb = Rgb(205, 214, 244);
+const QUIET: Rgb = Rgb(147, 153, 178);
+const FAINT: Rgb = Rgb(88, 91, 112);
+const FRAME: Rgb = Rgb(69, 71, 90);
+const SURFACE: Rgb = Rgb(36, 39, 58);
+const TRACK: Rgb = Rgb(49, 50, 68);
+const INK: Rgb = Rgb(30, 30, 46);
+const GREEN: Rgb = Rgb(166, 227, 161);
+const TEAL: Rgb = Rgb(148, 226, 213);
+const AMBER: Rgb = Rgb(249, 226, 175);
+const ACCENT: Rgb = Rgb(203, 166, 247);
+const SKY: Rgb = Rgb(137, 180, 250);
 
-/// The styled lines for a `width` × `height` pane. `note` is a quiet line at
-/// the bottom (for example when the last refresh failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rgb(u8, u8, u8);
+
+impl Rgb {
+    fn fg(self) -> String {
+        format!("\x1b[38;2;{};{};{}m", self.0, self.1, self.2)
+    }
+
+    fn bg(self) -> String {
+        format!("\x1b[48;2;{};{};{}m", self.0, self.1, self.2)
+    }
+
+    /// The colour `t` (0 to 1) of the way from `self` to `to`.
+    fn toward(self, to: Rgb, t: f32) -> Rgb {
+        let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+        Rgb(mix(self.0, to.0), mix(self.1, to.1), mix(self.2, to.2))
+    }
+}
+
+/// The panel never grows past this, so a wide pane keeps a compact list.
+const MAX_PANEL: usize = 76;
+/// Space between the panel's frame and what is inside it.
+const PAD: usize = 3;
+
+/// The styled lines for a `width` × `height` pane: one framed panel with the
+/// project's name and what it is, a progress bar, and the steps as a
+/// to-do list joined by a thin line. `note` is a quiet line under the panel
+/// (for example when the last refresh failed).
 pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Vec<String> {
-    let pad = " ".repeat(MARGIN);
-    let text_width = width.saturating_sub(MARGIN * 2).clamp(20, MAX_TEXT);
-    let mut lines = vec![String::new()];
+    let panel = width.saturating_sub(4).clamp(28, MAX_PANEL);
+    let inner = panel - 2 - PAD * 2;
+    let indent = " ".repeat(width.saturating_sub(panel) / 2);
 
     let title = if card.title.is_empty() {
         "Rundown"
     } else {
         &card.title
     };
-    lines.push(format!("{pad}{BOLD}{title}{RESET}"));
-    for line in wrap(&card.headline, text_width) {
-        lines.push(format!("{pad}{line}"));
+    let about = match card.about.iter().find(|a| len(a) <= inner) {
+        Some(about) => about.clone(),
+        None => card
+            .about
+            .first()
+            .map(|a| cut(a, inner))
+            .unwrap_or_default(),
+    };
+    let mut header = vec![String::new(), shine(&cut(title, inner))];
+    if !about.is_empty() {
+        header.push(format!("{}{about}", QUIET.fg()));
     }
-    lines.push(String::new());
-
+    header.push(String::new());
+    let mut body = vec![String::new()];
     if card.steps.is_empty() {
-        lines.push(format!("{pad}{GREY}No steps written down yet.{RESET}"));
+        body.push(format!("{}No steps yet{RESET}", QUIET.fg()));
+        body.push(String::new());
     } else {
-        lines.push(format!("{pad}{}", progress(card, text_width)));
-        lines.push(String::new());
-        let hang = " ".repeat(MARGIN + 1 + MARK_GAP);
-        let gap = " ".repeat(MARK_GAP);
-        for step in &card.steps {
-            let (mark, style) = match step.mark {
-                Mark::Done => (format!("{GREEN}✓{RESET}"), GREY),
-                Mark::Now => (format!("{AMBER}{BOLD}▸{RESET}"), BOLD),
-                Mark::Later => (format!("{GREY}○{RESET}"), ""),
-            };
-            let rows = wrap(&step.text, text_width.saturating_sub(1 + MARK_GAP).max(10));
-            for (i, row) in rows.iter().enumerate() {
-                if i == 0 {
-                    lines.push(format!("{pad}{mark}{gap}{style}{row}{RESET}"));
+        body.push(progress(card, inner));
+        body.push(String::new());
+        body.push(String::new());
+        // A blank line (carrying the joining line) between steps while the
+        // pane has the height; a short pane packs them.
+        let fixed = header.len() + body.len() + 4 + usize::from(!note.is_empty());
+        let spaced = height == 0 || fixed + card.steps.len() * 2 - 1 <= height;
+        for (i, step) in card.steps.iter().enumerate() {
+            if spaced && i > 0 {
+                let color = if card.steps[i - 1].mark == Mark::Done {
+                    GREEN.toward(INK, 0.45)
                 } else {
-                    lines.push(format!("{hang}{style}{row}{RESET}"));
-                }
+                    FAINT
+                };
+                body.push(format!(" {}│{RESET}", color.fg()));
             }
+            body.push(row(step, inner));
         }
+        body.push(String::new());
     }
 
-    if !card.finish.is_empty() {
-        lines.push(String::new());
-        let finish = format!("At the end: {}", card.finish);
-        for line in wrap(&finish, text_width) {
-            lines.push(format!("{pad}{GREY}{line}{RESET}"));
-        }
+    let rule = "─".repeat(panel - 2);
+    let frame = FRAME.fg();
+    let mut lines = vec![String::new(), format!("{indent}{frame}╭{rule}╮{RESET}")];
+    let pad = " ".repeat(PAD);
+    let band = SURFACE.bg();
+    for content in header {
+        let fill = " ".repeat(inner.saturating_sub(len(&visible(&content))));
+        lines.push(format!(
+            "{indent}{frame}│{band}{pad}{content}{band}{fill}{pad}{RESET}{frame}│{RESET}"
+        ));
     }
+    for content in body {
+        let fill = " ".repeat(inner.saturating_sub(len(&visible(&content))));
+        lines.push(format!(
+            "{indent}{frame}│{RESET}{pad}{content}{fill}{pad}{frame}│{RESET}"
+        ));
+    }
+    lines.push(format!("{indent}{frame}╰{rule}╯{RESET}"));
     if !note.is_empty() {
-        lines.push(String::new());
-        lines.push(format!("{pad}{DIM}{note}{RESET}"));
+        lines.push(format!(
+            "{indent}   {}{}{RESET}",
+            QUIET.fg(),
+            cut(note, panel - 3)
+        ));
     }
-
+    // A tall pane shows the panel a little above the middle.
+    if height > lines.len() + 2 {
+        let top = (height - lines.len()) / 3;
+        lines.splice(0..1, std::iter::repeat_n(String::new(), top.max(1)));
+    }
     if height > 0 && lines.len() > height {
         lines.truncate(height.saturating_sub(1));
-        lines.push(format!("{pad}{GREY}…{RESET}"));
+        lines.push(format!("{indent}   {}…{RESET}", QUIET.fg()));
     }
     lines
 }
 
-/// `━━━━━━━━──── 5 of 7 done`, or a finished line when every step is done.
+/// The project's name in bold, its letters shading from violet to sky.
+fn shine(title: &str) -> String {
+    let count = len(title).max(2) - 1;
+    let mut out = String::from(BOLD);
+    for (i, c) in title.chars().enumerate() {
+        out.push_str(&ACCENT.toward(SKY, i as f32 / count as f32).fg());
+        out.push(c);
+    }
+    out.push_str(RESET);
+    out
+}
+
+/// One step: a coloured box with its mark, then a few words.
+fn row(step: &Step, width: usize) -> String {
+    let text = cut(&step.text, width.saturating_sub(5));
+    match step.mark {
+        Mark::Done => format!(
+            "{}{}{BOLD} ✓ {RESET}  {}{text}{RESET}",
+            GREEN.bg(),
+            INK.fg(),
+            QUIET.fg()
+        ),
+        Mark::Now => format!(
+            "{}{}{BOLD} ▸ {RESET}  {BOLD}{}{text}{RESET}",
+            AMBER.bg(),
+            INK.fg(),
+            AMBER.fg()
+        ),
+        Mark::Later => format!("{}   {RESET}  {}{text}{RESET}", TRACK.bg(), TEXT.fg()),
+    }
+}
+
+/// A chunky bar that warms from teal to green as it fills, and the count.
 fn progress(card: &Card, width: usize) -> String {
     let total = card.steps.len();
     let done = card.count(Mark::Done);
-    let now = card.count(Mark::Now);
-    let label = if done == total && total == 1 {
-        format!("{GREEN}Done{RESET}")
-    } else if done == total {
-        format!("{GREEN}All {total} steps done{RESET}")
-    } else if now > 0 {
-        format!("{done} of {total} done {GREY}·{RESET} {AMBER}{now} under way{RESET}")
-    } else {
-        format!("{done} of {total} done")
-    };
-    let bar_width = width.saturating_sub(24).clamp(10, 36);
-    let filled = (bar_width * done + total / 2) / total.max(1);
-    format!(
-        "{GREEN}{}{TRACK}{}{RESET}  {label}",
-        "━".repeat(filled),
-        "━".repeat(bar_width - filled)
-    )
+    let label = format!("{done} of {total}");
+    let bar = width.saturating_sub(len(&label) + 3).min(44);
+    let filled = (bar * done + total / 2) / total.max(1);
+    let mut out = String::new();
+    for i in 0..bar {
+        let color = if i < filled {
+            TEAL.toward(GREEN, i as f32 / bar.max(2) as f32)
+        } else {
+            TRACK
+        };
+        out.push_str(&color.fg());
+        out.push('█');
+    }
+    let count = if done == total { GREEN } else { TITLE };
+    format!("{out}{RESET}   {BOLD}{}{label}{RESET}", count.fg())
 }
 
-/// Word wrap by characters. A word longer than the width is cut.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut len = 0;
+fn len(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// `text` on one line of at most `width` characters: cut at a word boundary
+/// and ended with "…" when it is too long.
+fn cut(text: &str, width: usize) -> String {
+    if len(text) <= width {
+        return text.to_string();
+    }
+    let room = width.saturating_sub(1);
+    let mut out = String::new();
     for word in text.split_whitespace() {
-        let mut word: String = word.to_string();
-        let mut word_len = word.chars().count();
-        while word_len > width {
-            if len > 0 {
-                rows.push(std::mem::take(&mut row));
-                len = 0;
-            }
-            let head: String = word.chars().take(width).collect();
-            word = word.chars().skip(width).collect();
-            word_len -= width;
-            rows.push(head);
+        let next = if out.is_empty() {
+            len(word)
+        } else {
+            len(&out) + 1 + len(word)
+        };
+        if next > room {
+            break;
         }
-        if len > 0 && len + 1 + word_len > width {
-            rows.push(std::mem::take(&mut row));
-            len = 0;
+        if !out.is_empty() {
+            out.push(' ');
         }
-        if len > 0 {
-            row.push(' ');
-            len += 1;
-        }
-        row.push_str(&word);
-        len += word_len;
+        out.push_str(word);
     }
-    if len > 0 || rows.is_empty() {
-        rows.push(row);
+    if out.is_empty() {
+        out = text.chars().take(room).collect();
     }
-    rows
+    format!("{}…", out.trim_end_matches([',', ';', ':', '.', '-', ' ']))
 }
 
 /// The text a person sees: every escape sequence removed.
-#[cfg(test)]
 pub(crate) fn visible(line: &str) -> String {
     let mut out = String::new();
     let mut chars = line.chars();
@@ -354,29 +441,35 @@ mod tests {
                 "Your job dashboard shows postings sorted into skip, review and look first.",
                 &[
                     ("done", "Tidy the dashboard screens."),
-                    ("running", "Fix how jobs come in."),
-                    ("left", "Switch the sorting on."),
+                    ("running", "Fix how jobs come in"),
+                    ("left", "Switch the sorting on"),
                 ],
             ),
         );
         let text = screen(&card, 80);
         assert!(text.contains("Venator"), "{text}");
         assert!(
-            text.contains("Rolf's job pipeline: bring in the right postings."),
+            text.contains("Rolf's job pipeline: bring in the right postings"),
             "{text}"
         );
-        assert!(text.contains("✓   Tidy the dashboard screens."), "{text}");
-        assert!(text.contains("▸   Fix how jobs come in."), "{text}");
-        assert!(text.contains("○   Switch the sorting on."), "{text}");
-        assert!(text.contains("1 of 3 done · 1 under way"), "{text}");
-        assert!(text.contains("At the end: Your job dashboard"), "{text}");
-        for word in ["2026", "s-1", "t-0001", "running", "left"] {
+        assert!(text.contains(" ✓   Tidy the dashboard screens "), "{text}");
+        assert!(text.contains(" ▸   Fix how jobs come in"), "{text}");
+        assert!(text.contains("     Switch the sorting on"), "{text}");
+        assert!(text.contains("█   1 of 3"), "{text}");
+        for word in [
+            "2026",
+            "s-1",
+            "t-0001",
+            "running",
+            "left",
+            "dashboard shows",
+        ] {
             assert!(!text.contains(word), "`{word}` shows: {text}");
         }
     }
 
     #[test]
-    fn a_goal_with_a_file_name_gives_way_to_what_rolf_gets() {
+    fn a_goal_with_a_file_name_gives_way_to_its_plain_first_part() {
         let card = Card::from_plan(
             "Elicio",
             &reply(
@@ -386,22 +479,24 @@ mod tests {
             ),
         );
         assert_eq!(
-            card.headline,
-            "Photo-style pictures and a 3D model of the finished earpiece."
+            card.about,
+            [
+                "Design the earpiece",
+                "Photo-style pictures and a 3D model of the finished earpiece",
+            ]
         );
-        assert!(card.finish.is_empty());
         let text = screen(&card, 80);
         assert!(!text.contains("docs/"), "{text}");
-        assert!(text.contains("━━  Done"), "{text}");
+        assert!(text.contains("1 of 1"), "{text}");
     }
 
     #[test]
     fn a_project_without_a_plan_card_shows_its_goal_only() {
         let card = Card::from_plan("Somebody", &reply("A private writing model.", "", &[]));
         let text = screen(&card, 60);
-        assert!(text.contains("A private writing model."), "{text}");
-        assert!(text.contains("No steps written down yet."), "{text}");
-        assert!(!text.contains("At the end"), "{text}");
+        assert!(text.contains("A private writing model"), "{text}");
+        assert!(text.contains("No steps yet"), "{text}");
+        assert!(!text.contains(" of "), "{text}");
     }
 
     #[test]
@@ -437,22 +532,73 @@ mod tests {
     }
 
     #[test]
-    fn long_steps_wrap_under_their_text_and_a_short_pane_is_cut() {
-        let long = "word ".repeat(40);
+    fn every_line_fits_and_a_long_step_is_cut_at_a_word() {
+        let long = "Make the long step read well on one line even when the pane is narrow";
         let card = Card::from_plan(
             "Demo",
-            &reply("A demo.", "", &[("left", &long), ("left", "Last.")]),
+            &reply(
+                "A demo project whose goal is also much too long to fit beside anything at all here",
+                "",
+                &[("left", long), ("done", "Last")],
+            ),
         );
-        let lines: Vec<String> = render(&card, 40, 0, "")
+        for width in [40, 80, 90, 160, 200] {
+            let lines: Vec<String> = render(&card, width, 0, "")
+                .iter()
+                .map(|l| visible(l))
+                .collect();
+            assert!(
+                lines.iter().all(|l| l.chars().count() <= width),
+                "{width}: {lines:#?}"
+            );
+            let step = lines.iter().find(|l| l.contains("Make the")).unwrap();
+            assert!(!step.contains(long), "{step}");
+            assert!(step.trim_end_matches([' ', '│']).ends_with('…'), "{step}");
+        }
+        assert_eq!(cut("One reviewer for the pile", 14), "One reviewer…");
+        assert_eq!(cut("Short", 14), "Short");
+        let six = Card::from_plan(
+            "Demo",
+            &reply(
+                "A demo.",
+                "",
+                &[
+                    ("done", "One"),
+                    ("done", "Two"),
+                    ("running", "Three"),
+                    ("left", "Four"),
+                    ("left", "Five"),
+                    ("left", "Six"),
+                ],
+            ),
+        );
+        // 12 rows around the list: 6 packed steps fit in 20, spaced do not.
+        let packed: Vec<String> = render(&six, 80, 20, "")
             .iter()
             .map(|l| visible(l))
             .collect();
-        let first = lines.iter().position(|l| l.contains("○")).unwrap();
-        assert!(lines[first + 1].starts_with("       word"), "{lines:#?}");
-        assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:#?}");
-        let cut = render(&card, 40, 6, "");
-        assert_eq!(cut.len(), 6);
-        assert_eq!(visible(cut.last().unwrap()).trim(), "…");
+        assert!(packed.iter().any(|l| l.contains("Six")), "{packed:#?}");
+        assert!(!packed.iter().any(|l| l.trim() == "…"), "{packed:#?}");
+        let spaced: Vec<String> = render(&six, 80, 23, "")
+            .iter()
+            .map(|l| visible(l))
+            .collect();
+        assert!(spaced.iter().any(|l| l.contains("Six")), "{spaced:#?}");
+        assert!(
+            spaced.iter().any(|l| l.trim_start().starts_with("│    │")),
+            "{spaced:#?}"
+        );
+        let short = render(&card, 80, 8, "");
+        assert_eq!(short.len(), 8);
+        assert_eq!(visible(short.last().unwrap()).trim(), "…");
+    }
+
+    #[test]
+    fn a_tall_pane_sets_the_panel_a_little_above_the_middle() {
+        let card = Card::from_plan("Demo", &reply("A demo.", "", &[("left", "One")]));
+        let lines = render(&card, 80, 60, "");
+        let top = lines.iter().position(|l| visible(l).contains('╭')).unwrap();
+        assert!(top > 5 && top < 30, "{top}");
     }
 
     #[test]
