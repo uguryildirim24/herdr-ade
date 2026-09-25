@@ -4,7 +4,7 @@
 //! clean enough to remove. ADE does: only ignored paths covered by the
 //! global or repository-specific disposable lists may be discarded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 use std::time::Duration;
 
@@ -292,6 +292,65 @@ pub(crate) fn inspect_local(
             Ok(DataPath {
                 path: relative,
                 bytes,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Inspection {
+        dirty,
+        ignored_data,
+    })
+}
+
+/// Decode one checkout from doctor's single machine snapshot. Missing frames
+/// or sizes are unknown, never evidence that an ignored folder is disposable.
+pub(crate) fn inspect_batched(
+    snapshot: &str,
+    key: &str,
+    disposable: &[String],
+    report_artifact_stored: bool,
+) -> Result<Inspection> {
+    let start = format!("\0__HERDR_INSPECT_{key}__\0");
+    let end = format!("\0__HERDR_INSPECT_DONE_{key}__\0");
+    let (_, tail) = snapshot
+        .split_once(&start)
+        .context("box worktree inspection is missing")?;
+    let (payload, _) = tail
+        .split_once(&end)
+        .context("box worktree inspection is incomplete")?;
+    let (status, rest) = payload
+        .split_once("\0__HERDR_NESTED__\0")
+        .context("box worktree status is incomplete")?;
+    let (nested, sizes) = rest
+        .split_once("\0__HERDR_SIZES__\0")
+        .context("box worktree nested checkout list is incomplete")?;
+    let (dirty, ignored) = parse_status(status);
+    let nested = nested
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("./"))
+        .filter_map(|entry| entry.strip_suffix("/.git"))
+        .map(str::to_owned)
+        .collect();
+    let mut measured = BTreeMap::new();
+    let mut fields = sizes.split('\0');
+    while let (Some(relative), Some(kib)) = (fields.next(), fields.next()) {
+        if relative.is_empty() {
+            continue;
+        }
+        measured.insert(
+            relative,
+            kib.parse::<u64>()
+                .context("box worktree size was invalid")?,
+        );
+    }
+    let ignored_data = roots(ignored, nested, disposable, report_artifact_stored)
+        .into_iter()
+        .map(|relative| {
+            let kib = measured
+                .get(relative.as_str())
+                .with_context(|| format!("box worktree size missing for {relative}"))?;
+            Ok(DataPath {
+                path: relative,
+                bytes: kib.saturating_mul(1024),
             })
         })
         .collect::<Result<Vec<_>>>()?;
