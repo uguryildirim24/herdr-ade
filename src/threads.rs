@@ -146,16 +146,17 @@ pub fn check_birth_plain(text: &str) -> Result<()> {
 }
 
 /// Creates the worktree or tab, the thread directory and the brief, then
-/// returns. The agent is launched by the ticker, so there is one delivery path.
+/// launches its agent and delivers its brief in the same call. The ticker
+/// resumes any unfinished startup using the same launch and delivery paths.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::start, None)
+    start_with_ticker(ctx, slug, args, ticker::start, None, true)
 }
 
 /// Starts a thread while `round advance` holds its lock. This must not wait for
 /// a ticker replacement: the running ticker may itself be waiting for that
 /// lock. Ordinary starts still replace a stale ticker through [`start`].
 pub(crate) fn start_during_advance(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::ensure, None)
+    start_with_ticker(ctx, slug, args, ticker::ensure, None, true)
 }
 
 pub(crate) fn start_during_advance_bounded(
@@ -164,7 +165,14 @@ pub(crate) fn start_during_advance_bounded(
     args: StartArgs,
     source_truncation: serde_json::Value,
 ) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::ensure, Some(source_truncation))
+    start_with_ticker(
+        ctx,
+        slug,
+        args,
+        ticker::ensure,
+        Some(source_truncation),
+        true,
+    )
 }
 
 fn start_with_ticker(
@@ -173,6 +181,7 @@ fn start_with_ticker(
     args: StartArgs,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
     source_truncation: Option<serde_json::Value>,
+    launch_now: bool,
 ) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let status = project.status();
@@ -339,6 +348,9 @@ fn start_with_ticker(
     match place_and_brief(ctx, &project, &view, &id, false) {
         Ok(thread) => {
             refresh_plan(ctx, &project);
+            if launch_now {
+                ticker::launch_thread_now(ctx, &project, &id)?;
+            }
             if thread.is_remote()
                 && let Err(error) =
                     ticker::request_remote_poll(&ctx.root, &project, thread.machine_route())
@@ -1510,7 +1522,7 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
         // Only this lane's failed attempt is stopped, never a coordinator.
         let panes = herdr.pane_list()?;
         if let Some(pane) = panes.iter().find(|p| p.pane_id == record.pane_id) {
-            if !thread::pane_matches(record, pane) {
+            if pane.workspace_id != record.workspace_id || pane.tab_id != record.tab_id {
                 bail!("escalation_identity_mismatch: old pane was reused");
             }
             close_pane(ctx, project, record)?;
@@ -1560,7 +1572,7 @@ pub struct RetryOutcome {
 /// process. Its durable failure class decides whether recovery stays on the
 /// same recipe, advances failed-work fallback routing, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::start)
+    retry_with_ticker(ctx, slug, id, reason, ticker::start, true)
 }
 
 /// Round recovery already holds the advance lock, so it must not replace and
@@ -1573,7 +1585,7 @@ pub(crate) fn retry_during_advance(
 ) -> Result<RetryOutcome> {
     // A manual round retry is the same coordinator decision as `thread
     // retry`; only its ticker handling differs because advance_lock is held.
-    retry_with_ticker(ctx, slug, id, reason, ticker::ensure)
+    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, true)
 }
 
 fn retry_with_ticker(
@@ -1582,6 +1594,7 @@ fn retry_with_ticker(
     id: &str,
     reason: &str,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
+    launch_now: bool,
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -1601,6 +1614,9 @@ fn retry_with_ticker(
     if record.escalation_pending {
         ensure_ticker(ctx)?;
         place_escalation(ctx, &project, &record)?;
+        if launch_now {
+            ticker::launch_thread_now(ctx, &project, id)?;
+        }
         let placed = thread::load(&project, id)?;
         return Ok(RetryOutcome {
             thread: placed.id,
@@ -1739,6 +1755,9 @@ fn retry_with_ticker(
 
     ensure_ticker(ctx)?;
     place_escalation(ctx, &project, &thread::load(&project, id)?)?;
+    if launch_now {
+        ticker::launch_thread_now(ctx, &project, id)?;
+    }
     let placed = thread::load(&project, id)?;
     Ok(RetryOutcome {
         thread: placed.id,
@@ -3010,7 +3029,7 @@ pub(crate) fn remove_scratch_session(ctx: &Ctx, record: &Thread) -> Result<()> {
 
 fn refuse_busy_retry(herdr: &Herdr<'_>, record: &Thread) -> Result<()> {
     let still_starting = (record.status == Status::Starting
-        || !record.startup_wait_started.is_empty())
+        || (record.launch_attempts > 0 && !record.startup_wait_started.is_empty()))
         && (record.startup_wait_started.is_empty()
             || (thread::seconds_since(&record.startup_wait_started, jiff::Timestamp::now()).max(0)
                 as u64
@@ -3029,7 +3048,8 @@ fn refuse_busy_retry(herdr: &Herdr<'_>, record: &Thread) -> Result<()> {
         .map(|agent| agent.agent_status);
     if still_starting
         || agent_state.as_deref() == Some("working")
-        || (record.prompt_pending
+        || (record.launch_attempts > 0
+            && record.prompt_pending
             && agent_state
                 .as_deref()
                 .is_some_and(crate::herdr::ready_state))
@@ -3476,7 +3496,13 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     let agents = herdr
         .agent_list()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let owns_pane = panes.iter().any(|pane| thread::pane_matches(record, pane));
+    // The terminal may have changed cwd since placement. The three stable
+    // Herdr ids still identify the exact tab this attempt created.
+    let owns_pane = panes.iter().any(|pane| {
+        pane.pane_id == record.pane_id
+            && pane.tab_id == record.tab_id
+            && pane.workspace_id == record.workspace_id
+    });
     let holds_something_else = panes
         .iter()
         .any(|pane| pane.workspace_id == record.workspace_id && pane.pane_id != record.pane_id)
@@ -6429,6 +6455,38 @@ mod tests {
     }
 
     #[test]
+    fn retry_cleanup_closes_its_tab_even_after_the_shell_changes_directory() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |_| {});
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", "/somewhere/else")
+        );
+        assert!(close_pane(&world.ctx(), &project, &lane).unwrap());
+        assert_eq!(world.runner.count("workspace close"), 1);
+    }
+
+    #[test]
+    fn retry_accepts_a_placed_pane_without_a_launch_attempt() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        let herdr = Herdr::new("herdr", "", &runner);
+        let record = Thread {
+            id: "t-0001".into(),
+            pane_id: "w1:p2".into(),
+            prompt_pending: true,
+            status: Status::Open,
+            ..Thread::default()
+        };
+        refuse_busy_retry(&herdr, &record).unwrap();
+    }
+
+    #[test]
     fn retry_refuses_a_starting_or_working_agent_with_its_visible_screen() {
         use crate::runner::fake::{FakeRunner, ok};
         for (state, starting) in [("blocked", true), ("working", false)] {
@@ -6444,6 +6502,7 @@ mod tests {
                 cwd: "/repo".into(),
                 agent_name: "hp-demo-t-0001".into(),
                 status: Status::Open,
+                launch_attempts: 1,
                 startup_wait_started: if starting {
                     project::now()
                 } else {
