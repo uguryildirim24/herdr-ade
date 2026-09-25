@@ -55,6 +55,13 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
             .args(["-C", repo])
             .args(args.iter().copied()),
     )?;
+    if out.timed_out {
+        bail!(
+            "git {}: timed out; repo activity at timeout: {}",
+            args.join(" "),
+            crate::git::repo_activity(repo)
+        );
+    }
     if !out.success() {
         bail!("git {}: {}", args.join(" "), out.error_text());
     }
@@ -1432,6 +1439,17 @@ fn retry_with_ticker(
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
+    if record.role == "reviewer" && !record.review_round.is_empty() {
+        let round = crate::round::load(&project, &record.review_round)?;
+        if let Some(bound) = round.reviewer.as_deref()
+            && bound != id
+        {
+            bail!(
+                "reviewer_already_bound: `{bound}` is bound to `{}`; the round's own retry handles its reviewer",
+                record.review_round
+            );
+        }
+    }
     // A crash after the attempt transition but before placement resumes the
     // same selected attempt. It must not spend another routing recovery.
     if record.escalation_pending {
@@ -1491,6 +1509,37 @@ fn retry_with_ticker(
     launch.attempt = record.attempt.max(1).saturating_add(1);
     launch.brief_hash = record.launch.brief_hash.clone();
 
+    // A failed start with no machine or materialized work has no placement to
+    // preserve. Re-run the same dispatch/recipe readiness checks as a start,
+    // rather than interpreting the empty machine as an intentional Mac pick.
+    let unplaced = record.machine.is_empty()
+        && record.pane_id.is_empty()
+        && record.tab_id.is_empty()
+        && record.worktree_path.is_empty();
+    let placement = if unplaced {
+        launch.machine = crate::launch::parse_launch_config(&ctx.config_dir)?
+            .dispatch
+            .machine;
+        let (settings, _) = project.read_project_md()?;
+        let listed = settings.repos.iter().find(|row| {
+            std::fs::canonicalize(&row.path).is_ok_and(|path| path.to_string_lossy() == record.repo)
+        });
+        let placement =
+            resolve_placement(ctx, None, &record.role, &launch, Some(&record.repo), listed)?;
+        crate::launch::ledger(
+            &project,
+            serde_json::json!({"kind":"placement", "recipe":launch.recipe_id,
+                "machine":placement.ledger_machine(), "reason":placement.reason,
+                "tried":placement.tried}),
+        )?;
+        if placement.fell_back {
+            fallback_say(ctx, slug, &placement)?;
+        }
+        launch.machine = placement.ledger_machine().to_string();
+        Some(placement)
+    } else {
+        None
+    };
     let selected_recipe = launch.recipe_id.clone();
     thread::update_checked(&project, id, |t| {
         if t.attempt != record.attempt || t.pane_id != record.pane_id {
@@ -1498,15 +1547,21 @@ fn retry_with_ticker(
         }
         t.attempt = launch.attempt;
         t.agent = launch.kind.clone();
-        let machine = if t.machine.is_empty() {
-            "local"
+        if let Some(placement) = &placement {
+            t.machine = placement.machine.clone();
+            t.machine_id = placement.machine_id.clone();
+            t.placement_reason = format!("retry: {}", placement.reason);
         } else {
-            &t.machine
-        };
-        t.placement_reason = format!(
-            "retry on `{machine}` with recipe `{}`; machine kept from the previous attempt",
-            launch.recipe_id
-        );
+            let machine = if t.machine.is_empty() {
+                "local"
+            } else {
+                &t.machine
+            };
+            t.placement_reason = format!(
+                "retry on `{machine}` with recipe `{}`; machine kept from the previous attempt",
+                launch.recipe_id
+            );
+        }
         t.launch = launch;
         t.status = Status::Failed;
         t.prompt_pending = false;
@@ -4477,6 +4532,54 @@ mod tests {
         assert_eq!(default_machine("research", "buildbox", Some("/r")), None);
         assert_eq!(default_machine("lane", "", Some("/r")), None);
         assert_eq!(default_machine("lane", "buildbox", None), None);
+    }
+
+    #[test]
+    fn retry_places_an_unlaunched_reviewer_but_keeps_a_placed_machine() {
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, &lane_config());
+        stub_box(&fx);
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.workflow = Some("reviewer".into());
+        let started = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(started.machine, "buildbox");
+        // A placed attempt keeps its saved machine when retried.
+        thread::update(&fx.project, &started.id, |t| {
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(&fx.world.ctx(), "demo", &started.id, "process disappeared").unwrap();
+        let placed = thread::load(&fx.project, &started.id).unwrap();
+        assert_eq!(placed.machine, "buildbox");
+        assert!(placed.placement_reason.contains("machine kept"));
+
+        // A failed start before it acquired any machine or work is dispatched
+        // again, using the current routing pick and the box mapping.
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.workflow = Some("reviewer".into());
+        let unplaced = start(&fx.world.ctx(), "demo", args).unwrap();
+        thread::update(&fx.project, &unplaced.id, |t| {
+            t.machine.clear();
+            t.machine_id.clear();
+            t.launch.machine = "local".into();
+            t.pane_id.clear();
+            t.tab_id.clear();
+            t.workspace_id.clear();
+            t.worktree_path.clear();
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(
+            &fx.world.ctx(),
+            "demo",
+            &unplaced.id,
+            "git timed out before launch",
+        )
+        .unwrap();
+        let retried = thread::load(&fx.project, &unplaced.id).unwrap();
+        assert_eq!(retried.machine, "buildbox");
+        assert_eq!(retried.launch.machine, "buildbox");
+        assert!(retried.placement_reason.contains("retry: recipe"));
     }
 
     #[test]
