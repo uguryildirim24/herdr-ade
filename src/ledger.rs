@@ -479,6 +479,20 @@ fn command_subject(cmd: &Cmd) -> String {
         .unwrap_or_else(|| command_line(cmd))
 }
 
+/// A deferred deletion is a failure only after its ref was rechecked and is
+/// still at the expected tip. Timeouts and spawn errors were recorded already.
+pub(crate) fn unresolved_deferred(cmd: &Cmd, out: &Output) {
+    if cmd.exit_meaning == crate::runner::ExitMeaning::Deferred
+        && out.code.is_some()
+        && !out.timed_out
+        && !out.success()
+    {
+        let mut required = cmd.clone();
+        required.exit_meaning = crate::runner::ExitMeaning::Required;
+        command_finished(&required, &command_subject(cmd), &Ok(out.clone()));
+    }
+}
+
 fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
     match result {
         Ok(out) if cmd.exit_meaning.answered(out) => PROJECTS.with(|projects| {

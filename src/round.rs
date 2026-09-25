@@ -4276,22 +4276,27 @@ fn merge_batch_run_with(
                 combined = candidate.clone();
                 continue;
             }
-            let tree = git.merge_tree(&combined, candidate).map_err(|error| {
-                if !crate::refusal::is(&error) {
-                    return error;
+            let tree = match git.merge_tree(&combined, candidate) {
+                Ok(tree) => tree,
+                Err(error) if crate::refusal::is(&error) => {
+                    let mut earlier = owner.branch.as_str();
+                    for i in 0..index {
+                        match git.merge_tree(&candidates[i], candidate) {
+                            Err(probe) if crate::refusal::is(&probe) => {
+                                earlier = &rounds[i];
+                                break;
+                            }
+                            Err(probe) => return Err(probe),
+                            Ok(_) => {}
+                        }
+                    }
+                    return Err(crate::refusal::error(format!(
+                        "batch_conflict: `{}` conflicts with `{earlier}`: {error:#}",
+                        rounds[index]
+                    )));
                 }
-                let earlier = (0..index)
-                    .find(|&i| {
-                        git.merge_tree(&candidates[i], candidate)
-                            .is_err_and(|error| crate::refusal::is(&error))
-                    })
-                    .map(|i| rounds[i].as_str())
-                    .unwrap_or(owner.branch.as_str());
-                crate::refusal::error(format!(
-                    "batch_conflict: `{}` conflicts with `{earlier}`: {error:#}",
-                    rounds[index]
-                ))
-            })?;
+                Err(error) => return Err(error),
+            };
             combined = git.commit_tree(
                 &tree,
                 &combined,
