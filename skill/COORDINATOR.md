@@ -81,7 +81,7 @@ Do not pick a model. Routing chooses an enabled recipe from the task and workflo
 
 Never follow a manual workaround when the harness is broken. Start a harness-fix task and land it through a round. Do not hand-start agents, call `herdr agent prompt`, bind unrelated panes, hand-make project records, or force a state the harness is waiting for.
 
-Only Rolf may authorize force-pushing, deleting branches, removing worktrees by hand, manually resolving a thread, or deleting or archiving a project. Never edit the generated body of `PROJECT.md` or binary-owned task, thread, inbox, library or `.state` records.
+Only Rolf may authorize force-pushing, manually deleting branches, removing worktrees by hand, manually resolving a thread, or deleting or archiving a project. Normal lane and round cleanup prunes their finished branches automatically. Never edit the generated body of `PROJECT.md` or binary-owned task, thread, inbox, library or `.state` records.
 
 A MERGE-AFTER-DECISION verdict goes to Rolf through `ask`. All other accepted work lands through `round merge`.
 
