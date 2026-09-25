@@ -808,6 +808,7 @@ fn place_box_worktree(
         t.worktree_path = box_worktree.clone();
         t.thread_dir = dir.clone();
         t.launch.brief_hash = brief_hash.clone();
+        t.checked_slice.clear();
         t.partial = Some("worktree_add".into());
     })?;
 
@@ -818,8 +819,7 @@ fn place_box_worktree(
     let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     // Verify the selected executable and user scope before creating a box
     // worktree. A broken user manager cannot leave a provisioned but idle lane.
-    let wrapper_bin =
-        remote::prepare_project_slice(runner, &machine, &project.slug, &record.launch.kind)?;
+    remote::prepare_project_slice(runner, &machine, &project.slug, &record.launch.kind)?;
     if record.failure_event.is_empty() {
         remote::provision(
             runner,
@@ -855,7 +855,7 @@ fn place_box_worktree(
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
     let attempt = record.attempt.max(1);
-    let mut env = project::tab_env(
+    let env = project::tab_env(
         &project.slug,
         &record.id,
         attempt,
@@ -863,8 +863,8 @@ fn place_box_worktree(
         Some(&machine),
         &spec,
     );
-    env.retain(|value| !value.starts_with("PATH="));
-    env.push(format!("PATH={wrapper_bin}:{}", machine.path));
+    // The agent launch supplies its exclusive wrapper PATH after bashrc has
+    // run. A pane-level PATH cannot enforce this on an interactive shell.
     // One project owns one workspace on this machine. Starts can provision
     // repositories independently, but find-or-create is serialized so two
     // simultaneous lanes cannot both observe "missing" and create duplicates.
