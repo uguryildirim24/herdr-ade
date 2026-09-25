@@ -1255,6 +1255,64 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
 }
 
 #[test]
+fn linked_files_over_cap_or_missing_keep_the_worktree_and_explain_why() {
+    for missing in [false, true] {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |_| {});
+        let dir = Path::new(&lane.thread_dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let report = "![capture](figma/a.png)\n";
+        std::fs::write(dir.join("report.md"), report).unwrap();
+        if !missing {
+            std::fs::create_dir_all(dir.join("figma")).unwrap();
+            let file = std::fs::File::create(dir.join("figma/a.png")).unwrap();
+            file.set_len(201 * 1024 * 1024).unwrap();
+        }
+        let hash = crate::events::store_artifact(&project, report.as_bytes()).unwrap();
+        crate::events::seal_create_if_absent(
+            &project,
+            &Event {
+                id: "t-0001-1-done".into(),
+                op: "t-0001-1-done".into(),
+                thread: lane.id.clone(),
+                attempt: 1,
+                round: None,
+                recipient: Recipient::default(),
+                created: project::now(),
+                payload: EventPayload {
+                    done: Some(DonePayload {
+                        sha: "sealed".into(),
+                        report_path: lane.report_path(),
+                        artifact: hash,
+                        attestation: None,
+                    }),
+                    ..EventPayload::default()
+                },
+            },
+        )
+        .unwrap();
+        let outcome =
+            threads::resolve(&world.ctx(), "demo", &lane.id, &ResolveArgs::default()).unwrap();
+        assert_eq!(outcome.worktree, "kept");
+        assert!(
+            outcome
+                .copy_notes
+                .join(" ")
+                .contains(if missing { "missing" } else { "200 MiB" })
+        );
+        assert!(
+            outcome
+                .worktree_reason
+                .unwrap()
+                .contains("linked_files_not_kept")
+        );
+        assert!(thread::load(&project, &lane.id).unwrap().cleanup_pending);
+        assert_eq!(world.runner.count("worktree remove"), 0);
+    }
+}
+
+#[test]
 fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -1266,12 +1324,14 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
         t.base = "brief-sha".into();
     });
     std::fs::create_dir_all(&lane.thread_dir).unwrap();
-    std::fs::write(
-        Path::new(&lane.thread_dir).join("report.md"),
-        "report only\n",
-    )
-    .unwrap();
-    let artifact = crate::events::store_artifact(&project, b"report only\n").unwrap();
+    let report = "report only ![a](figma/a.png) [notes](notes/b.md)\n";
+    for (name, bytes) in [("figma/a.png", "png"), ("notes/b.md", "notes")] {
+        let path = Path::new(&lane.thread_dir).join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::write(Path::new(&lane.thread_dir).join("report.md"), report).unwrap();
+    let artifact = crate::events::store_artifact(&project, report.as_bytes()).unwrap();
     let event = Event {
         id: "t-0001-1-done".into(),
         op: "t-0001-1-done".into(),
@@ -1345,8 +1405,19 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
     assert!(!thread::home_report_path(&project, &lane.id).exists());
     assert_eq!(
         std::fs::read(crate::events::artifact_path(&project, &artifact)).unwrap(),
-        b"report only\n"
+        report.as_bytes()
     );
+    let stored = thread::sealed_report_path(&project, &closed).unwrap();
+    let rewritten = std::fs::read_to_string(stored.clone()).unwrap();
+    for (name, bytes) in [("figma/a.png", "png"), ("notes/b.md", "notes")] {
+        let hash = thread::sha256_hex(bytes.as_bytes());
+        assert!(!rewritten.contains(name));
+        assert!(rewritten.contains(&format!("]({hash})")));
+        assert_eq!(
+            std::fs::read(stored.parent().unwrap().join(hash)).unwrap(),
+            bytes.as_bytes()
+        );
+    }
     assert_eq!(world.runner.count("workspace close w2"), 1);
 }
 
