@@ -579,7 +579,7 @@ fn report_with_checks(
             runner,
             detached_ticker: false,
         };
-        let (leftovers, data_kept, errors) = finished_worktrees(&ctx, None);
+        let (leftovers, data_kept, errors) = finished_worktrees(&ctx);
         check(
             &mut out,
             worktree_check_status(&leftovers, &errors),
@@ -1035,13 +1035,70 @@ fn finished_worktree_candidates(
 
 fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile) -> String {
     let (candidates, _) = finished_worktree_candidates(ctx, Some(profile));
-    candidates.iter().map(|(_, thread)| {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    // NUL framing is shared with worktrees::inspect_batched. All inspections
+    // run inside this one box script; no follow-up SSH is needed for ignored
+    // sizes, even when a resolved checkout remains on disk.
+    let mut bash = String::from(
+        r#"inspect() {
+  local path=$1 key=$2 record rel root line kib
+  local -A roots=()
+  cd "$path" || return 1
+  printf '\0__HERDR_INSPECT_%s__\0' "$key"
+  git status --porcelain --ignored --untracked-files=all -z || return 1
+  printf '\0__HERDR_NESTED__\0'
+  find . -mindepth 2 -name .git -print0 || return 1
+  printf '\0__HERDR_SIZES__\0'
+  while IFS= read -r -d '' record; do
+    if [[ $record == '!! '* ]]; then
+      rel=${record:3}
+      root=${rel%%/*}
+      [[ -z $root ]] || roots["$root"]=1
+    fi
+  done < <(git status --porcelain --ignored --untracked-files=all -z)
+  while IFS= read -r -d '' record; do
+    rel=${record#./}
+    rel=${rel%/.git}
+    [[ -z $rel ]] || roots["$rel"]=1
+  done < <(find . -mindepth 2 -name .git -print0)
+  for rel in "${!roots[@]}"; do
+    for skip in "${@:3}"; do
+      [[ $rel == "$skip" ]] && continue 2
+    done
+    line=$(du -sk -- "$rel") || return 1
+    kib=${line%%[[:space:]]*}
+    printf '%s\0%s\0' "$rel" "$kib"
+  done
+  printf '\0__HERDR_INSPECT_DONE_%s__\0' "$key"
+}
+"#,
+    );
+    for (project, thread) in candidates {
         let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
-        format!(
-            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; else printf 'worktree_{key}\\t0\\n'; fi\n",
-            path = crate::remote::quote(&thread.worktree_path),
-        )
-    }).collect()
+        let path = crate::remote::quote(&thread.worktree_path);
+        let inspect = matches!(
+            crate::threads::finished_worktree_reason(ctx, &project, &thread),
+            Ok(None)
+        );
+        let skips = crate::worktrees::disposable(&ctx.config_dir, &project, &thread.repo)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.contains('/') && !entry.contains('*'))
+            .map(|entry| crate::remote::quote(&entry))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bash.push_str(&format!(
+            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; {inspect}; else printf 'worktree_{key}\\t0\\n'; fi\nprintf '\\n'\n",
+            inspect = if inspect {
+                format!("(inspect {path} {key} {skips}) || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0'")
+            } else {
+                ":".into()
+            },
+        ));
+    }
+    format!("bash -c {}\n", crate::remote::quote(&bash))
 }
 
 fn finished_worktrees_with_snapshot(
@@ -1052,11 +1109,8 @@ fn finished_worktrees_with_snapshot(
     finished_worktrees_impl(ctx, Some(profile), Some(snapshot))
 }
 
-fn finished_worktrees(
-    ctx: &Ctx,
-    remote: Option<&crate::contracts::MachineProfile>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    finished_worktrees_impl(ctx, remote, None)
+fn finished_worktrees(ctx: &Ctx) -> (Vec<String>, Vec<String>, Vec<String>) {
+    finished_worktrees_impl(ctx, None, None)
 }
 
 fn finished_worktrees_impl(
@@ -1071,79 +1125,39 @@ fn finished_worktrees_impl(
     // healthy "gone" result cannot enter the command-failure ledger and a
     // transport failure remains distinguishable from a negative answer.
     let remote_exists = remote.map(|profile| {
-        let script = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, (_, thread))| {
-                format!(
-                    "if [ -d {} ]; then printf '{}\\t1\\n'; else printf '{}\\t0\\n'; fi",
-                    crate::remote::quote(&thread.worktree_path),
-                    index,
-                    index
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-        let answer = if let Some(snapshot) = snapshot {
-            Ok(crate::runner::Output {
-                code: Some(0),
-                stdout: snapshot.to_owned(),
-                ..Default::default()
-            })
-        } else {
-            crate::remote::ssh(ctx.runner, &profile.target, &script, None, TOOL_TIMEOUT)
+        let Some(snapshot) = snapshot else {
+            errors.push(format!("{}: box snapshot missing", profile.label));
+            return vec![false; candidates.len()];
         };
-        match answer {
-            Ok(output) if output.success() => {
-                let facts: BTreeMap<String, bool> = output
-                    .stdout
-                    .lines()
-                    .filter_map(|line| {
-                        let (index, exists) = line.split_once('\t')?;
-                        let key = if snapshot.is_some() {
-                            index.strip_prefix("worktree_")?.to_owned()
-                        } else {
-                            let index: usize = index.parse().ok()?;
-                            crate::thread::sha256_hex(
-                                candidates.get(index)?.1.worktree_path.as_bytes(),
-                            )
-                        };
-                        let exists = match exists {
-                            "0" => false,
-                            "1" => true,
-                            _ => return None,
-                        };
-                        Some((key, exists))
-                    })
-                    .collect();
-                let mut answers = Vec::with_capacity(candidates.len());
-                for (_, thread) in &candidates {
-                    let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
-                    match facts.get(&key) {
-                        Some(exists) => answers.push(*exists),
-                        None => {
-                            errors.push(format!(
-                                "{}: box worktree existence answer was missing",
-                                thread.worktree_path
-                            ));
-                            answers.push(false);
-                        }
+        let facts: BTreeMap<String, bool> = snapshot
+            .lines()
+            .filter_map(|line| {
+                let (key, exists) = line.split_once('\t')?;
+                let key = key.strip_prefix("worktree_")?;
+                let exists = match exists {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                Some((key.to_owned(), exists))
+            })
+            .collect();
+        candidates
+            .iter()
+            .map(|(_, thread)| {
+                let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
+                match facts.get(&key) {
+                    Some(exists) => *exists,
+                    None => {
+                        errors.push(format!(
+                            "{}: box worktree existence answer was missing",
+                            thread.worktree_path
+                        ));
+                        false
                     }
                 }
-                answers
-            }
-            Ok(output) => {
-                errors.push(format!("box worktree check: {}", output.error_text()));
-                vec![false; candidates.len()]
-            }
-            Err(error) => {
-                errors.push(format!("box worktree check: {error:#}"));
-                vec![false; candidates.len()]
-            }
-        }
+            })
+            .collect()
     });
 
     let mut leftovers = Vec::new();
@@ -1164,7 +1178,14 @@ fn finished_worktrees_impl(
                 continue;
             }
         }
-        match crate::threads::inspect_worktree_for_removal(ctx, &project, &thread) {
+        let inspection = if let Some(snapshot) = snapshot
+            && thread.is_remote()
+        {
+            crate::threads::inspect_worktree_from_snapshot(ctx, &project, &thread, snapshot)
+        } else {
+            crate::threads::inspect_worktree_for_removal(ctx, &project, &thread)
+        };
+        match inspection {
             Ok(inspection) if !inspection.dirty.is_empty() => leftovers.push(path.clone()),
             Ok(inspection) if !inspection.ignored_data.is_empty() => data_kept.push(format!(
                 "{} ({})",
@@ -1991,6 +2012,7 @@ fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
+    use std::io::Write as _;
 
     const ROUTING_CONFIG: &str = r#"[routing]
 default = "pi_codex_sol_high"
@@ -2640,7 +2662,12 @@ recipe = "claude_fable_xhigh"
         // Without round completion evidence the old code probed git in each
         // absent worktree before asking the box whether the path existed.
         let fake = FakeRunner::new();
-        fake.on("ssh", ok("0\t0\n1\t0\n"));
+        let snapshot = (1..=2)
+            .map(|number| {
+                let key = crate::thread::sha256_hex(format!("/box/worktree-{number}").as_bytes());
+                format!("worktree_{key}\t0\n")
+            })
+            .collect::<String>();
         let recording = crate::ledger::RecordingRunner(&fake);
         let ctx = Ctx {
             env: &env,
@@ -2657,12 +2684,12 @@ recipe = "claude_fable_xhigh"
             target: "me@box".into(),
             session: "default".into(),
         };
-        let (leftovers, data, errors) = finished_worktrees(&ctx, Some(&profile));
+        let (leftovers, data, errors) = finished_worktrees_with_snapshot(&ctx, &profile, &snapshot);
 
         assert!(leftovers.is_empty());
         assert!(data.is_empty());
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(fake.count("ssh"), 1);
+        assert_eq!(fake.count("ssh"), 0);
         assert!(fake.calls.borrow().iter().all(|call| call.program != "git"));
         assert!(crate::ledger::list(&project).unwrap().is_empty());
         assert!(!project.state_dir().join("ledger.jsonl").exists());
@@ -2733,7 +2760,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let (leftovers, data, errors) = finished_worktrees(&ctx, None);
+        let (leftovers, data, errors) = finished_worktrees(&ctx);
 
         assert!(leftovers.is_empty());
         assert!(data.is_empty());
@@ -3085,6 +3112,228 @@ recipe = "claude_fable_xhigh"
             "{leftovers:?} {data:?} {errors:?}"
         );
         assert_eq!(runner.count("ssh"), 0);
+    }
+
+    #[test]
+    fn one_ssh_inspects_present_box_worktrees_and_keeps_dirty_and_ignored_data() {
+        let home = tempfile::tempdir().unwrap();
+        let config = machine_config(&["pi"]);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(config.path().join("config.toml"))
+            .unwrap()
+            .write_all(b"\n[worktrees]\ndisposable = [\"target\"]\n")
+            .unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.test"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["commit", "--allow-empty", "-qm", "initial"]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let paths = ["/box/t-a", "/box/t-b"];
+        for path in paths {
+            crate::thread::allocate(&project, |thread| {
+                thread.status = crate::thread::Status::Resolved;
+                thread.kind = crate::thread::Kind::Worktree;
+                thread.machine = "buildbox".into();
+                thread.machine_id = "abc".into();
+                thread.repo = repo.to_string_lossy().into_owned();
+                thread.branch = "main".into();
+                thread.worktree_path = path.into();
+            })
+            .unwrap();
+        }
+        let key_a = crate::thread::sha256_hex(paths[0].as_bytes());
+        let key_b = crate::thread::sha256_hex(paths[1].as_bytes());
+        let snapshot = format!(
+            "{}worktree_{key_a}\t1\n\0__HERDR_INSPECT_{key_a}__\0 M file\0\0__HERDR_NESTED__\0\0__HERDR_SIZES__\0\0__HERDR_INSPECT_DONE_{key_a}__\0\nworktree_{key_b}\t1\n\0__HERDR_INSPECT_{key_b}__\0!! target/file\0!! safe/file\0\0__HERDR_NESTED__\0./target/nested/.git\0\0__HERDR_SIZES__\0safe\03\0target/nested\04\0\0__HERDR_INSPECT_DONE_{key_b}__\0\n",
+            box_facts(),
+        );
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(&snapshot));
+        runner.on_fn(
+            |cmd| cmd.program == "git",
+            |cmd| crate::runner::RealRunner.run(cmd),
+        );
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: config.path().into(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let mut captured = String::new();
+        box_rows_with_snapshot(
+            &runner,
+            config.path(),
+            &box_profile(),
+            &BTreeMap::new(),
+            12.0,
+            Some((&ctx, &mut captured)),
+        );
+        let (leftovers, data, errors) =
+            finished_worktrees_with_snapshot(&ctx, &box_profile(), &captured);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(leftovers, [paths[0]]);
+        assert_eq!(
+            data,
+            [format!(
+                "{} (safe: 3.0 KiB, target/nested: 4.0 KiB)",
+                paths[1]
+            )]
+        );
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "ssh")
+                .count(),
+            1
+        );
+        let ssh = runner
+            .calls
+            .borrow()
+            .iter()
+            .find(|cmd| cmd.program == "ssh")
+            .unwrap()
+            .display();
+        assert!(ssh.contains("git status --porcelain --ignored"));
+        assert!(ssh.contains("du -sk"));
+    }
+
+    #[test]
+    fn batched_shell_preserves_nul_status_nested_and_sizes() {
+        let home = tempfile::tempdir().unwrap();
+        let config = machine_config(&["pi"]);
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.test"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join(".gitignore"), "target/\nsafe/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "initial"]);
+        std::fs::write(repo.join(".gitignore"), "target/\nsafe/\n# changed\n").unwrap();
+        std::fs::create_dir_all(repo.join("target/nested")).unwrap();
+        std::fs::create_dir_all(repo.join("safe")).unwrap();
+        std::fs::write(repo.join("target/nested/.git"), "gitdir: /nowhere\n").unwrap();
+        std::fs::write(repo.join("safe/keep"), "keep").unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.machine = "buildbox".into();
+            thread.machine_id = "abc".into();
+            thread.repo = repo.to_string_lossy().into_owned();
+            thread.branch = "main".into();
+            thread.worktree_path = repo.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let missing = home.path().join("gone");
+        crate::thread::allocate(&project, |thread| {
+            thread.status = crate::thread::Status::Resolved;
+            thread.kind = crate::thread::Kind::Worktree;
+            thread.machine = "buildbox".into();
+            thread.machine_id = "abc".into();
+            thread.repo = repo.to_string_lossy().into_owned();
+            thread.branch = "main".into();
+            thread.worktree_path = missing.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = crate::runner::RealRunner;
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: config.path().into(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let script = format!(
+            "{}printf '__HERDR_BUILDS__\\n'\n",
+            remote_worktree_script(&ctx, &box_profile())
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).unwrap();
+        let key = crate::thread::sha256_hex(repo.to_string_lossy().as_bytes());
+        assert!(
+            text.lines()
+                .any(|line| line == format!("worktree_{key}\t1"))
+        );
+        let absent = crate::thread::sha256_hex(missing.to_string_lossy().as_bytes());
+        assert!(
+            text.lines()
+                .any(|line| line == format!("worktree_{absent}\t0"))
+        );
+        assert!(text.lines().any(|line| line == "__HERDR_BUILDS__"));
+        let inspection = crate::worktrees::inspect_batched(&text, &key, &[], false).unwrap();
+        assert!(inspection.dirty.iter().any(|path| path == ".gitignore"));
+        assert!(
+            inspection
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "safe" && data.bytes > 0)
+        );
+        assert!(
+            inspection
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "target/nested" && data.bytes > 0)
+        );
+        let filtered =
+            crate::worktrees::inspect_batched(&text, &key, &["target".into()], false).unwrap();
+        assert!(
+            !filtered
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "target")
+        );
+        assert!(
+            filtered
+                .ignored_data
+                .iter()
+                .any(|data| data.path == "target/nested" && data.bytes > 0)
+        );
     }
 
     #[test]
