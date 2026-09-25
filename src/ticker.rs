@@ -2453,6 +2453,13 @@ mod tests {
         // The old pass finishes and observes the stop request. The next
         // command can start the installed binary without a manual stop.
         drop(holder);
+        // Concurrent tests may fork while this descriptor is locked. A child
+        // briefly inherits it until exec, so wait for the observed release.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock_state(&root) != LockState::Free && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lock_state(&root), LockState::Free);
         ensure(&ctx).unwrap();
         assert!(!stop_path(&root).exists());
     }
