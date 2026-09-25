@@ -1607,25 +1607,26 @@ fn idle_task_lines(project: &Project) -> Vec<String> {
 
 fn idle_lane_lines(project: &Project, agents: &[Agent], panes: &[Pane]) -> Option<Vec<String>> {
     let mut lines = Vec::new();
+    let now = jiff::Timestamp::now();
     for lane in thread::list(project) {
         if lane.status == thread::Status::Resolved {
             continue;
         }
-        if lane.queued_for_load && lane.status == thread::Status::Starting {
-            return None;
-        }
-        // A recorded group can be stale even after a report lands. Use the
-        // current agent view for local lanes, and the last courier observation
-        // for remote lanes that have not yet reported.
+        // A cached Working group may outlive a report. Keep startup and
+        // pending prompts working, but use the observed agent state for open
+        // lanes instead of that cached group.
         let working = if lane.status == thread::Status::Failed {
             false
+        } else if lane.status == thread::Status::Starting {
+            thread::recorded_group(&lane, now) == thread::Group::Working
         } else if lane.is_remote() {
-            lane.last_state == "working" && lane.report_hash.is_empty()
+            !lane.startup_wait_started.is_empty()
+                || lane.prompt_pending
+                || (lane.report_hash.is_empty()
+                    && matches!(lane.last_state.as_str(), "working" | "blocked"))
         } else {
-            thread::live_state(&lane, agents, panes, jiff::Timestamp::now())
-                .agent_state
-                .as_deref()
-                == Some("working")
+            let live = thread::live_state(&lane, agents, panes, now);
+            thread::group(&lane, &live, now) == thread::Group::Working
         };
         if working {
             return None;
@@ -1658,7 +1659,7 @@ fn idle_nudge_text(lines: &[String]) -> String {
     let next = if !lines.is_empty() && lines.iter().all(|line| line.starts_with("held: ")) {
         "Everything open is held. Find new work toward the project goal or mark the project finished with ha finish."
     } else if lines.iter().any(|line| line.starts_with("held: ")) {
-        "Leave held tasks alone; find and start other useful work toward the project goal."
+        "Leave held tasks alone; act on listed lanes that need you, then find and start other useful work toward the project goal."
     } else {
         "Find and start the next useful step toward the project goal now."
     };
@@ -4012,6 +4013,40 @@ mod tests {
         }
         state = steps::load_state(&f.project);
         assert_ne!(state.idle_nudge_last, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn active_lanes_do_not_trigger_a_coordinator_nudge() {
+        let f = fixture(false);
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Starting;
+            lane.queued_for_load = true;
+            lane.created = project::now();
+        })
+        .unwrap();
+        assert!(idle_lane_lines(&f.project, &[], &[]).is_none());
+
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.status = thread::Status::Open;
+            lane.queued_for_load = false;
+            lane.machine = "oci".into();
+            lane.last_state = "blocked".into();
+            lane.last_group = "working".into();
+        })
+        .unwrap();
+        assert!(idle_lane_lines(&f.project, &[], &[]).is_none());
+
+        thread::update(&f.project, &lane.id, |lane| {
+            lane.report_hash = "report".into();
+            // A sealed report is stronger than a stale courier observation.
+        })
+        .unwrap();
+        assert!(
+            idle_lane_lines(&f.project, &[], &[])
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("ready for review"))
+        );
     }
 
     #[test]
