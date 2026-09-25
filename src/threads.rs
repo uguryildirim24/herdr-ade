@@ -3259,6 +3259,108 @@ fn worktree_exists(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool
     Ok(false)
 }
 
+/// Explicitly discard only ignored data after safety checks, then retire the ref.
+pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<String> {
+    let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    if record.status != Status::Resolved || record.worktree_path.is_empty() {
+        bail!("{id} has no resolved, retained worktree");
+    }
+    if !removable_folder(&project, &record) || !worktree_exists(ctx, &project, &record)? {
+        bail!("{id} has no removable worktree at {}", record.worktree_path);
+    }
+    if finished_worktree_reason(ctx, &project, &record)?.is_some() {
+        bail!("{id} is not finished; not removing its worktree");
+    }
+    let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
+    if !inspection.dirty.is_empty() {
+        bail!("worktree_dirty: {}", inspection.dirty.join(", "));
+    }
+    // Compare the checked-out tip to its published tip before discarding the
+    // checkout. A retained box branch may have moved since the lane sealed.
+    crate::branches::require_published_tip(ctx, &project, &record)?;
+    removal_in_use_gate(ctx, &project, &record)?;
+    close_pane(ctx, &project, &record)?;
+    // The marker makes ref retirement retryable even if the process dies
+    // between removing the checkout and deleting the published branch.
+    thread::update(&project, id, |t| {
+        t.cleanup_pending = true;
+        t.cleanup_reason = "retained worktree removal".into();
+    })?;
+    remove_worktree_force_ignored(ctx, &project, &record)?;
+    thread::update(&project, id, |t| t.worktree_path.clear())?;
+    crate::branches::resolved_thread(ctx, &project, &record)?;
+    thread::update(&project, id, |t| {
+        t.cleanup_pending = false;
+        t.cleanup_reason.clear();
+    })?;
+    crate::ledger::recovered(&project, "thread-cleanup", id);
+    Ok(format!(
+        "removed {} and branch {}",
+        record.worktree_path, record.branch
+    ))
+}
+
+fn remove_worktree_force_ignored(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if managed_git_folder(project, record) {
+        return remove_worktree(ctx, project, record);
+    }
+    let repo = if record.is_remote() {
+        let (settings, _) = project.read_project_md()?;
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?.0
+    } else {
+        record.repo.clone()
+    };
+    if !record.is_remote() {
+        let out = ctx.runner.run(
+            &crate::runner::Cmd::new("git", Duration::from_secs(30)).args([
+                "-C",
+                &repo,
+                "worktree",
+                "remove",
+                "--force",
+                &record.worktree_path,
+            ]),
+        )?;
+        if !out.success() {
+            bail!("{}", out.error_text());
+        }
+    } else {
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        let script = remote::with_path(
+            &machine.path,
+            &format!(
+                "cd {} && git worktree remove --force {}",
+                remote::quote(&repo),
+                remote::quote(&record.worktree_path)
+            ),
+        );
+        let out = remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &script,
+            None,
+            Duration::from_secs(40),
+        )?;
+        if !out.success() {
+            bail!("{}", out.error_text());
+        }
+    }
+    Ok(())
+}
+
 /// Never forces. Git's refusal is reported unchanged.
 fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if managed_git_folder(project, record) {
