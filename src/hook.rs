@@ -358,7 +358,7 @@ fn verify_owned_entry(
         })
         .sum();
     if found != names.len() || !value.to_string().contains(pane) {
-        bail!("hook_install_failed: owned Stop entry did not verify");
+        bail!("hook_install_failed: owned prompt entry did not verify");
     }
     Ok(())
 }
@@ -596,7 +596,7 @@ mod tests {
         };
         let old = project.dir().join(".pi/hooks.json");
         std::fs::create_dir_all(old.parent().unwrap()).unwrap();
-        std::fs::write(&old, r#"{"hooks":{"Stop":[{"hooks":[{"command":"ha hook --kind pi"}]}],"UserPromptSubmit":[{"hooks":[{"command":"ha hook --kind pi --phase prompt"}]}]}}"#).unwrap();
+        std::fs::write(&old, r#"{"hooks":{"Stop":[{"hooks":[{"command":"ha plain hook --kind pi"}]}],"UserPromptSubmit":[{"hooks":[{"command":"ha plain hook --kind pi --phase prompt"}]}]}}"#).unwrap();
         install(&ctx, &project, "pi", "w1:p1").unwrap();
         assert!(!old.exists(), "pi never reads hooks.json");
         let path = project.dir().join(".pi/herdr-ade-hooks.json");

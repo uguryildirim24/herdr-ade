@@ -21,8 +21,7 @@ use crate::project::{self, Project, write_atomic};
 /// The standing extra choice every ask carries (D17 item 4).
 pub(crate) const NOT_UNDERSTOOD: &str = "I did not understand the question";
 
-/// Fixed notices: the only text a `Notice` can publish. Every text passes the
-/// checker with an empty registry (tested).
+/// Fixed notices: the only text a `Notice` can publish.
 const NOTICES: &[(&str, &str)] = &[
     (
         "journal_tail",
@@ -841,7 +840,7 @@ pub(crate) fn publish_notice_keyed(
     })
 }
 
-/// A plugin notification whose title and body are checked texts.
+/// A plugin notification with the full question and its choices.
 fn notify(ctx: &Ctx, project: &Project, title: &str, body: &str) -> bool {
     let body = format!("{body}0. {NOT_UNDERSTOOD}");
     let Some(coord) = project.coordinator().filter(|c| !c.socket.is_empty()) else {
