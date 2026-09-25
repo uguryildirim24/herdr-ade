@@ -1593,12 +1593,15 @@ fn idle_task_lines(project: &Project) -> Vec<String> {
         .0
         .into_iter()
         .filter(|view| !view.terminal(project))
-        .map(|view| {
-            let block = crate::task::active_wait(project, &view.record)
-                .map(|wait| format!("waiting on {}: {}", wait.kind, wait.target))
-                .unwrap_or_else(|| view.next);
-            format!("{}: {}", view.record.id, block)
-        })
+        .map(
+            |view| match crate::task::active_wait(project, &view.record) {
+                Some(wait) => format!(
+                    "held: {} waits on {} {}",
+                    view.record.id, wait.kind, wait.target
+                ),
+                None => format!("{}: {}", view.record.id, view.next),
+            },
+        )
         .collect()
 }
 
@@ -1652,10 +1655,18 @@ fn idle_nudge_text(lines: &[String]) -> String {
     } else {
         lines.join("; ")
     };
+    let next = if !lines.is_empty() && lines.iter().all(|line| line.starts_with("held: ")) {
+        "Everything open is held. Find new work toward the project goal or mark the project finished with ha finish."
+    } else if lines.iter().any(|line| line.starts_with("held: ")) {
+        "Leave held tasks alone; find and start other useful work toward the project goal."
+    } else {
+        "Find and start the next useful step toward the project goal now."
+    };
     format!(
-        "{} {} Find and start the next useful step toward the project goal now. Ask Rolf only for what truly needs him; keep other work moving.",
+        "{} {} {} Ask Rolf only for what truly needs him; keep other work moving.",
         steps::TICKER_PROMPT_PREFIX,
-        blocks
+        blocks,
+        next
     )
 }
 
@@ -4010,19 +4021,56 @@ mod tests {
         crate::task::set_wait(&f.project, "job-0001", "event", "next response").unwrap();
         let waiting = idle_nudge_text(&idle_task_lines(&f.project));
         assert!(
-            waiting.contains("job-0001: waiting on event: next response"),
+            waiting.contains("held: job-0001 waits on event next response"),
             "{waiting}"
         );
-        assert!(
-            waiting.contains("Find and start the next useful step"),
-            "{waiting}"
-        );
+        assert!(waiting.contains("Everything open is held"), "{waiting}");
+        assert!(waiting.contains("ha finish"), "{waiting}");
         crate::task::drop_task(&f.project, "job-0001", "Done.").unwrap();
         let empty = idle_nudge_text(&idle_task_lines(&f.project));
         assert!(empty.contains("No open tasks."), "{empty}");
         assert!(
             empty.contains("Ask Rolf only for what truly needs him"),
             "{empty}"
+        );
+    }
+
+    #[test]
+    fn held_tasks_are_listed_once_without_being_offered_as_work() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        crate::task::set_wait(&f.project, "job-0001", "event", "provider response").unwrap();
+        let mut lines = idle_task_lines(&f.project);
+        let only_held = idle_nudge_text(&lines);
+        assert_eq!(only_held.matches("held: job-0001").count(), 1);
+        assert!(only_held.contains("Everything open is held"), "{only_held}");
+        assert!(only_held.contains("ha finish"), "{only_held}");
+        assert!(!only_held.contains("job-0001: verify"), "{only_held}");
+
+        let task = crate::task::Task {
+            id: "job-0002".into(),
+            title: "Check another step".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["The other step is complete.".into()],
+            created: project::now(),
+            ..crate::task::Task::default()
+        };
+        std::fs::write(
+            f.project.state_dir().join("tasks/job-0002.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+        lines = idle_task_lines(&f.project);
+        let with_work = idle_nudge_text(&lines);
+        assert_eq!(with_work.matches("held: job-0001").count(), 1);
+        assert!(with_work.contains("job-0002: verify"), "{with_work}");
+        assert!(
+            with_work.contains("find and start other useful work"),
+            "{with_work}"
+        );
+        assert!(
+            !with_work.contains("Everything open is held"),
+            "{with_work}"
         );
     }
 
