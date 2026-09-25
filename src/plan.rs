@@ -19,9 +19,6 @@ use crate::round;
 use crate::thread;
 use crate::threads;
 
-/// At most seven active steps (SPEC-talk §6.5).
-const MAX_STEPS: usize = 7;
-
 pub(crate) fn plan_path(project: &Project) -> PathBuf {
     project.record_file("plan.toml")
 }
@@ -101,8 +98,7 @@ fn check_task_refs(project: &Project, tasks: &[String]) -> Result<()> {
 }
 
 /// The whole candidate card, including preserved text and generated
-/// sentences. Refuses invalid language, duplicate identifiers and excess
-/// steps before anything is written (SPEC-talk §6.5).
+/// sentences. Refuses invalid language and duplicate identifiers before writing.
 fn plan_kind_error(kind: &str) -> String {
     format!(
         "plan_kind: `{kind}` is not a result kind (possible values: {})",
@@ -126,12 +122,6 @@ fn validate(_project: &Project, plan: &Plan) -> Result<()> {
         }
     } else if !plan.what_you_get.is_empty() {
         bail!("plan_result: what_you_get is set without a result kind");
-    }
-    if plan.steps.len() > MAX_STEPS {
-        bail!(
-            "plan_steps: at most {MAX_STEPS} steps, got {}",
-            plan.steps.len()
-        );
     }
     let mut ids = BTreeSet::new();
     for step in &plan.steps {
@@ -765,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn at_most_seven_steps_and_removal_never_reuses_an_identifier() {
+    fn steps_have_no_cap_and_removal_never_reuses_an_identifier() {
         let fx = fixture();
         set(
             &fx.world.ctx(),
@@ -780,16 +770,18 @@ mod tests {
             add(&fx, &format!("Step number {n}."), expect);
             expect += 1;
         }
-        let e = format!(
-            "{:#}",
-            step_add(&fx.world.ctx(), "demo", "One too many.", vec![], expect).unwrap_err()
-        );
-        assert!(e.starts_with("plan_steps"), "{e}");
-        let plan =
-            step_remove(&fx.world.ctx(), "demo", "s-3", "It is not needed.", expect).unwrap();
-        assert_eq!(plan.steps.len(), 6);
+        let plan = add(&fx, "An eighth step.", expect);
+        let plan = step_remove(
+            &fx.world.ctx(),
+            "demo",
+            "s-3",
+            "It is not needed.",
+            plan.revision,
+        )
+        .unwrap();
+        assert_eq!(plan.steps.len(), 7);
         let plan = add(&fx, "A replacement step.", plan.revision);
-        assert!(plan.steps.iter().any(|s| s.id == "s-8"), "{:?}", plan.steps);
+        assert!(plan.steps.iter().any(|s| s.id == "s-9"), "{:?}", plan.steps);
         assert!(!plan.steps.iter().any(|s| s.id == "s-3"));
     }
 

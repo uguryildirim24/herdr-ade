@@ -61,13 +61,9 @@ fn ask_dir(project: &Project, id: &str) -> PathBuf {
     asks_dir(project).join(id)
 }
 
-/// At most three open asks, including one whose publication is still pending
-/// (SPEC-talk §6.7).
-const MAX_OPEN_ASKS: usize = 3;
-
 /// The shared ask-set lock, `<project>/.state/asks/.open.lock`. Creation, re-asking
 /// and answering take it inside the project lock so concurrent writers cannot
-/// each claim the third slot.
+/// allocate the same id.
 struct AskSetLock {
     _file: std::fs::File,
 }
@@ -81,27 +77,6 @@ fn ask_set_lock(project: &Project) -> Result<AskSetLock> {
         .open(dir.join(".open.lock"))?;
     file.lock()?;
     Ok(AskSetLock { _file: file })
-}
-
-/// Refuses a fourth co-existing open ask. Re-asking an existing id replaces
-/// its revision and does not count as a new ask.
-fn enforce_ask_cap(project: &Project, reask: Option<&str>) -> Result<()> {
-    let open = open_asks(project);
-    if let Some(id) = reask {
-        // Only the newest open ask can absorb the next consequential need.
-        // Unknown and closed ids keep their more specific errors below.
-        if open.iter().any(|ask| ask.id == id) && open.last().is_some_and(|ask| ask.id != id) {
-            bail!("ask_reask_not_newest: `{id}` is not the newest open ask");
-        }
-        return Ok(());
-    }
-    if open.len() >= MAX_OPEN_ASKS {
-        bail!(
-            "ask_cap: {} asks are already open; reask the newest one as one merged question",
-            open.len()
-        );
-    }
-    Ok(())
 }
 
 fn rev_path(project: &Project, id: &str, revision: u32) -> PathBuf {
@@ -392,7 +367,6 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
         let _lock = project.lock()?;
         let _set = ask_set_lock(&project)?;
         refuse_repeated_question(&project, &new)?;
-        enforce_ask_cap(&project, new.reask.as_deref())?;
         let (id, revision) = match &new.reask {
             Some(id) => {
                 validate_ask_id(id)?;
@@ -1336,31 +1310,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fourth_open_ask_is_refused_without_a_partial_record() {
+    fn open_asks_have_no_cap() {
         let fx = fixture();
-        let ctx = fx.world.ctx();
-        for _ in 0..3 {
+        for _ in 0..4 {
             ask_again(&fx).unwrap();
         }
-        assert_eq!(open_asks(&fx.project).len(), 3);
-        let journal = journal_kinds(&fx.project).len();
-        let e = format!("{:#}", ask_again(&fx).unwrap_err());
-        assert!(e.starts_with("ask_cap"), "{e}");
-        assert_eq!(open_asks(&fx.project).len(), 3);
-        assert_eq!(
-            journal_kinds(&fx.project).len(),
-            journal,
-            "no partial record"
-        );
-        assert!(!rev_path(&fx.project, "a-4", 1).exists());
-        // Answering one frees a slot.
-        answer(&ctx, "demo", "a-1", 1, 1, "test").unwrap();
-        ask_again(&fx).unwrap();
-        assert_eq!(open_asks(&fx.project).len(), 3);
+        assert_eq!(open_asks(&fx.project).len(), 4);
+        assert!(rev_path(&fx.project, "a-4", 1).exists());
     }
 
     #[test]
-    fn a_pending_publication_counts_against_the_cap() {
+    fn a_pending_publication_does_not_block_a_new_question() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
         // No board or notification rule: each ask is recorded but unpublished.
@@ -1371,47 +1331,39 @@ mod tests {
         assert!(!publication_complete(
             &project::read_json::<Publication>(&publication_path(&project, "ask:a-1@1")).unwrap()
         ));
-        let e = format!(
-            "{:#}",
-            ask(&world.ctx(), "demo", keep_or_stop()).unwrap_err()
-        );
-        assert!(e.starts_with("ask_cap"), "{e}");
-        assert_eq!(open_asks(&project).len(), 3);
+        ask(&world.ctx(), "demo", keep_or_stop()).unwrap();
+        assert_eq!(open_asks(&project).len(), 4);
     }
 
     #[test]
-    fn reasking_the_newest_keeps_the_identifier_and_the_cap() {
+    fn reasking_an_open_question_keeps_its_identifier() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         for _ in 0..3 {
             ask_again(&fx).unwrap();
         }
-        let e = format!(
-            "{:#}",
-            ask(
-                &ctx,
-                "demo",
-                NewAsk {
-                    reask: Some("a-1".into()),
-                    ..keep_or_stop()
-                },
-            )
-            .unwrap_err()
-        );
-        assert!(e.starts_with("ask_reask_not_newest"), "{e}");
-        assert_eq!(latest_revision(&fx.project, "a-1"), 1);
+        let first = ask(
+            &ctx,
+            "demo",
+            NewAsk {
+                reask: Some("a-1".into()),
+                ..distinct_ask(5)
+            },
+        )
+        .unwrap();
+        assert_eq!((first.id.as_str(), first.revision), ("a-1", 2));
 
         let merged = ask(
             &ctx,
             "demo",
             NewAsk {
                 reask: Some("a-3".into()),
-                ..keep_or_stop()
+                ..distinct_ask(6)
             },
         )
         .unwrap();
         assert_eq!((merged.id.as_str(), merged.revision), ("a-3", 2));
-        assert_eq!(open_asks(&fx.project).len(), 3, "the cap is unchanged");
+        assert_eq!(open_asks(&fx.project).len(), 3);
         assert!(journal_kinds(&fx.project).contains(&"ask a-3@2".to_string()));
         let ids: Vec<String> = open_asks(&fx.project).into_iter().map(|a| a.id).collect();
         assert!(ids.contains(&"a-1".to_string()) && ids.contains(&"a-2".to_string()));
