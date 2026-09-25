@@ -480,12 +480,6 @@ impl<'a> Herdr<'a> {
         })
     }
 
-    /// Types one command line into a pane's own shell (SPEC-remote §3.3).
-    pub(crate) fn pane_run(&self, pane: &str, command: &str) -> Result<(), HerdrError> {
-        self.call(&["pane", "run", pane, command], CALL_TIMEOUT)
-            .map(|_| ())
-    }
-
     /// `pane read` prints text, not a JSON reply, so this returns it verbatim.
     pub(crate) fn pane_read_text(&self, pane: &str, source: &str) -> Result<String, HerdrError> {
         let out = self
