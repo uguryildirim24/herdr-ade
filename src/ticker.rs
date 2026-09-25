@@ -916,6 +916,9 @@ fn thread_pass(
             thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
         });
     for t in threads {
+        if t.queued_for_load {
+            continue;
+        }
         if t.status == thread::Status::Starting && t.startup_wait_started.is_empty() {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
                 threads::fail_start(
@@ -1381,6 +1384,7 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .into_iter()
         .filter(|t| {
             t.is_remote() == remote
+                && !t.queued_for_load
                 && matches!(t.status, thread::Status::Open | thread::Status::Starting)
         })
         .collect()
@@ -1560,6 +1564,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         }
     }
 
+    if let Err(error) = crate::threads::start_queued(ctx, project) {
+        first_error = first_error.or(Some(error.context("queued box start")));
+    }
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
         first_error = first_error.or(Some(error.context("pending thread cleanup")));
     }
