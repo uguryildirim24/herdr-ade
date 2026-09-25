@@ -1061,6 +1061,15 @@ fn thread_pass(
             }
         }
         if !t.startup_wait_started.is_empty() {
+            if state == "blocked" && !t.trust_answered {
+                // A refused trust check leaves the normal ready-window failure
+                // visible; only Claude itself may persist an accepted dialog.
+                if let Err(error) = crate::claude_trust::answer(input.ctx, project, t, herdr) {
+                    pass.error = pass
+                        .error
+                        .or(Some(error.context(format!("{}: trust dialog", t.id))));
+                }
+            }
             if ready {
                 thread::update(project, &t.id, |t| {
                     t.startup_wait_started.clear();
@@ -1430,6 +1439,7 @@ fn launch_pass(
         }
         match thread::update(pass.project, &t.id, |t| {
             t.launch_attempts += 1;
+            t.trust_answered = false;
             t.startup_wait_started = project::now();
         }) {
             Ok(_) => {

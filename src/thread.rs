@@ -97,6 +97,9 @@ pub(crate) struct Thread {
     /// `agent_not_ready`. A blocked startup is not a failed attempt yet.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) startup_wait_started: String,
+    /// Trust prompt answered once for this launch, never replayed on a poll.
+    #[serde(default)]
+    pub(crate) trust_answered: bool,
     pub(crate) failure_event: String,
     pub(crate) last_failure: String,
     /// Classification of the current failure evidence. Old records load as
