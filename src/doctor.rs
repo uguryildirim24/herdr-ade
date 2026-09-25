@@ -3173,6 +3173,12 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
         let mut captured = String::new();
+        let prior_git = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|cmd| cmd.program == "git")
+            .count();
         box_rows_with_snapshot(
             &runner,
             config.path(),
@@ -3182,8 +3188,13 @@ recipe = "claude_fable_xhigh"
             Some((&ctx, &mut captured)),
         );
         assert_eq!(
-            runner.count("git"),
-            0,
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "git")
+                .count(),
+            prior_git,
             "box snapshot creation must not probe completion before checking existence"
         );
         let (leftovers, data, errors) =
