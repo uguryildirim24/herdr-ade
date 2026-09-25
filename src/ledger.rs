@@ -479,9 +479,26 @@ fn command_subject(cmd: &Cmd) -> String {
         .unwrap_or_else(|| command_line(cmd))
 }
 
+/// A deferred deletion is a failure only after its ref was rechecked and is
+/// still at the expected tip. Timeouts and spawn errors were recorded already.
+pub(crate) fn unresolved_deferred(cmd: &Cmd, out: &Output) {
+    if cmd.exit_meaning == crate::runner::ExitMeaning::Deferred
+        && out.code.is_some()
+        && !out.timed_out
+        && !out.success()
+    {
+        let mut required = cmd.clone();
+        required.exit_meaning = crate::runner::ExitMeaning::Required;
+        command_finished(&required, &command_subject(cmd), &Ok(out.clone()));
+    }
+}
+
 fn command_finished(cmd: &Cmd, subject: &str, result: &Result<Output>) {
     match result {
         Ok(out) if cmd.exit_meaning.answered(out) => PROJECTS.with(|projects| {
+            if cmd.exit_meaning == crate::runner::ExitMeaning::Deferred && !out.success() {
+                return;
+            }
             for project in projects.borrow().iter() {
                 match command_recovery_needed(project, subject) {
                     Ok(true) => recovered(project, "command-failed", subject),
@@ -688,16 +705,37 @@ mod tests {
         let (_root, p) = fixture();
         let _scope = Scope::new(&[&p]);
         let runner = RecordingRunner(&crate::runner::RealRunner);
-        // The shell builtin tests a fixed value: all normal statuses answer
-        // this question. This is not a wrapper around a possibly broken tool.
+        // The shell builtin tests a fixed value with the boolean contract.
         let cmd = Cmd::new("/bin/sh", Duration::from_secs(5))
             .args(["-c", "test x = y"])
-            .exit_meaning(crate::runner::ExitMeaning::Answer);
+            .exit_meaning(crate::runner::ExitMeaning::Boolean);
         for _ in 0..2 {
             assert!(!runner.run(&cmd).unwrap().success());
         }
         assert!(list(&p).unwrap().is_empty());
         assert!(!p.state_dir().join("ledger.jsonl").exists());
+    }
+
+    #[test]
+    fn merge_tree_conflict_is_an_answer_but_other_exits_are_failures() {
+        let (_root, p) = fixture();
+        let _scope = Scope::new(&[&p]);
+        let runner = RecordingRunner(&crate::runner::RealRunner);
+        let cmd = |script| {
+            Cmd::new("/bin/sh", Duration::from_secs(5))
+                .args(["-c", script])
+                .exit_meaning(crate::runner::ExitMeaning::MergeTree)
+                .ledger_subject("merge-tree:fixture")
+        };
+        assert!(
+            !runner
+                .run(&cmd("printf 'CONFLICT (content): file\\n'; exit 1"))
+                .unwrap()
+                .success()
+        );
+        assert!(list(&p).unwrap().is_empty());
+        assert!(!runner.run(&cmd("exit 2")).unwrap().success());
+        assert_eq!(list(&p).unwrap().len(), 1);
     }
 
     #[test]
