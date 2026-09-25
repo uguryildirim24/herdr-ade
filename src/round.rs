@@ -8979,6 +8979,29 @@ mod tests {
     /// A resolved or gone reviewer is replaced; a live bound reviewer keeps
     /// the same refusal.
     #[test]
+    fn retry_refuses_reviewer_replaced_by_the_round() {
+        let fx = fixture();
+        let (lanes, _) = reviewed(&fx);
+        verdict(&fx, &lanes, front("MERGE", "r1"));
+        let bound = load(&fx.project, "r1").unwrap().reviewer.unwrap();
+        let stale = fx.thread("Earlier failed reviewer");
+        thread::update(&fx.project, &stale, |t| {
+            t.role = "reviewer".into();
+            t.review_round = "r1".into();
+        })
+        .unwrap();
+        let error = err(crate::threads::retry(
+            &fx.world.ctx(),
+            "demo",
+            &stale,
+            "failed start",
+        ));
+        assert!(error.contains("reviewer_already_bound"), "{error}");
+        assert!(error.contains(&bound), "{error}");
+        assert!(error.contains("round's own retry"), "{error}");
+    }
+
+    #[test]
     fn bind_reviewer_replaces_a_gone_reviewer_but_not_a_live_one() {
         let fx = fixture();
         let ctx = fx.world.ctx();
