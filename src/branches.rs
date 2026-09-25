@@ -272,27 +272,24 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
                 Some(url) => refs(ctx.runner, &row.path, Some(url))?,
                 None => BTreeMap::new(),
             };
-            let base = row.branch.as_deref().unwrap_or("main");
-            // Enumerate merged tips in one traversal, instead of spawning git
-            // once for every local and published ref. A published SHA that is
-            // absent locally cannot be proven merged without fetching it.
-            let merged = if let Some(merged) = merged_by_repo.get(&(row.path.clone(), base.into()))
-            {
-                merged.clone()
-            } else {
-                let merged: BTreeSet<String> = git(
-                    ctx.runner,
-                    &row.path,
-                    &["for-each-ref", "--merged", base, "--format=%(objectname)"],
-                )?
-                .lines()
-                .map(str::to_owned)
-                .collect();
-                merged_by_repo.insert((row.path.clone(), base.into()), merged.clone());
-                merged
-            };
             let mut names: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
             names.retain(|name| harness_ref(name) && !in_use.contains(name));
+            if names.is_empty() {
+                continue;
+            }
+            let base = row.branch.as_deref().unwrap_or("main");
+            // Traverse the base history once per repo/base. A merged branch
+            // can point at an ancestor that is no longer any local ref tip;
+            // remote-only refs can do so too, if the object is present here.
+            let key = (row.path.clone(), base.to_owned());
+            if !merged_by_repo.contains_key(&key) {
+                let history = git(ctx.runner, &row.path, &["rev-list", base])?
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                merged_by_repo.insert(key.clone(), history);
+            }
+            let merged = &merged_by_repo[&key];
             for name in names {
                 let resolved = threads.iter().any(|t| {
                     t.repo == row.path
@@ -396,7 +393,7 @@ mod tests {
     struct CountingRunner(Cell<usize>);
     impl Runner for CountingRunner {
         fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
-            if cmd.program == "git" && cmd.args.iter().any(|arg| arg == "--merged") {
+            if cmd.program == "git" && cmd.args.iter().any(|arg| arg == "rev-list") {
                 self.0.set(self.0.get() + 1);
             }
             crate::runner::RealRunner.run(cmd)
@@ -551,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_checks_merged_refs_once_for_many_branches() {
+    fn inventory_checks_base_history_once_for_many_branches() {
         let (fx, _bare) = configured();
         for index in 0..30 {
             run(&fx.repo, &["branch", &format!("hp/demo/t-{index}"), "main"]);
@@ -565,6 +562,35 @@ mod tests {
         let plan = doctor(&ctx, None).unwrap();
         assert!(plan.contains("hp/demo/t-29"));
         assert_eq!(runner.0.get(), 1);
+    }
+
+    #[test]
+    fn remote_tip_behind_base_with_no_local_ref_is_still_landed() {
+        let (fx, bare) = configured();
+        let old = run(&fx.repo, &["rev-parse", "main"]);
+        run(
+            &fx.repo,
+            &[
+                "push",
+                "-q",
+                bare.path().to_str().unwrap(),
+                &format!("{old}:refs/heads/hp/demo/t-old"),
+            ],
+        );
+        run(
+            &fx.repo,
+            &["commit", "--allow-empty", "-qm", "advance main"],
+        );
+        assert!(
+            !refs(fx.world.ctx().runner, fx.repo.to_str().unwrap(), None)
+                .unwrap()
+                .contains_key("hp/demo/t-old")
+        );
+        assert!(
+            doctor(&fx.world.ctx(), None)
+                .unwrap()
+                .contains("hp/demo/t-old")
+        );
     }
 
     #[test]
