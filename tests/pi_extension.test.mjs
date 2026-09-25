@@ -13,12 +13,11 @@ function fixture() {
 process.stdin.on('end', () => {
   require('fs').appendFileSync(process.argv[2], JSON.stringify({phase: process.argv[3], ...JSON.parse(data)}) + '\\n');
   if (process.argv[3] === 'prompt' && JSON.parse(data).prompt === 'Second') console.log('request q-2');
-  if (process.argv[3] === 'stop') console.log(JSON.stringify({decision: 'block', reason: 'Run ha say before you finish'}));
 });`);
   const log = join(cwd, 'hooks.jsonl');
   const argv = [process.execPath, script, log];
   writeFileSync(join(cwd, '.pi/herdr-ade-hooks.json'), JSON.stringify({
-    pane: 'w1:p1', prompt: [...argv, 'prompt'], activate: [...argv, 'activate'], stop: [...argv, 'stop'],
+    pane: 'w1:p1', prompt: [...argv, 'prompt'],
   }));
   const handlers = new Map();
   const sent = [];
@@ -50,35 +49,7 @@ test('submitted pane text reaches the prompt hook with pi session and cwd', asyn
   } finally { f.close(); }
 });
 
-test('stop block is returned to the model without recording the correction as a request', async () => {
-  const f = fixture();
-  try {
-    await f.emit('input', {source: 'interactive', text: 'Check this.'});
-    await f.emit('agent_settled', {});
-    assert.deepEqual(f.sent, ['Run ha say before you finish']);
-    await f.emit('input', {source: 'extension', text: f.sent[0]});
-    assert.deepEqual(f.lines().map(row => row.phase), ['prompt', 'stop']);
-  } finally { f.close(); }
-});
-
-test('a queued request does not activate its turn until pi starts that message', async () => {
-  const f = fixture();
-  try {
-    await f.emit('input', {source: 'interactive', text: 'First'});
-    await f.emit('input', {source: 'interactive', text: 'Second', streamingBehavior: 'followUp'});
-    assert.deepEqual(f.lines().map(row => [row.phase, row.prompt, row.queued]),
-      [['prompt', 'First', false], ['prompt', 'Second', true]]);
-    await f.emit('message_start', {message: {role: 'user', content: [{type: 'text', text: 'First'}]}});
-    assert.equal(f.lines().length, 2);
-    await f.emit('message_start', {message: {role: 'user', content: [{type: 'text', text: 'Second'}]}});
-    await f.emit('agent_settled', {});
-    assert.deepEqual(f.lines().map(row => [row.phase, row.prompt]),
-      [['prompt', 'First'], ['prompt', 'Second'], ['activate', 'Second'], ['stop', 'Second']]);
-    assert.equal(f.lines()[2].rolf_request, true);
-  } finally { f.close(); }
-});
-
-test('provider failure never prompts a correction or invokes the stop hook', async () => {
+test('provider failure never prompts a correction', async () => {
   const f = fixture();
   try {
     await f.emit('input', {source: 'interactive', text: 'Check this.'});

@@ -750,57 +750,6 @@ pub(crate) fn parent_on_start_supported(bin: &str, runner: &dyn Runner) -> bool 
 
 pub(crate) const SOURCE: &str = "herdr-ade";
 
-impl<'a> Herdr<'a> {
-    fn request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, HerdrError> {
-        let line = serde_json::json!({ "id": "herdr-ade", "method": method, "params": params })
-            .to_string();
-        let reply = self
-            .runner
-            .socket_request(&self.socket, &line, CALL_TIMEOUT)
-            .map_err(|e| HerdrError {
-                code: "unreachable".into(),
-                message: format!("{e:#}"),
-            })?;
-        let reply: serde_json::Value =
-            serde_json::from_str(reply.trim()).map_err(|e| HerdrError {
-                code: "failed".into(),
-                message: format!("herdr's reply to {method} did not parse: {e}"),
-            })?;
-        match reply.get("error") {
-            Some(error) => Err(HerdrError {
-                code: error["code"].as_str().unwrap_or("failed").to_string(),
-                message: error["message"].as_str().unwrap_or("").to_string(),
-            }),
-            None => Ok(reply["result"].clone()),
-        }
-    }
-
-    /// Filters the sidebar's agents to one project and sorts them by attention:
-    /// the coordinator (rank 0) first, then by the group's display-order digit.
-    /// herdr holds one transient view, so this replaces any other tool's view.
-    pub(crate) fn agent_view_set_project(&self, slug: &str) -> Result<(), HerdrError> {
-        self.request(
-            "agent.view.set",
-            serde_json::json!({
-                "source": SOURCE,
-                "label": format!("project: {slug}"),
-                "filter": { "op": "eq", "field": { "token": "project" }, "value": slug },
-                "sort": [{ "field": { "token": "rank" }, "order": "asc" }],
-            }),
-        )
-        .map(|_| ())
-    }
-
-    pub(crate) fn agent_view_clear(&self) -> Result<(), HerdrError> {
-        self.request("agent.view.clear", serde_json::json!({}))
-            .map(|_| ())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::contracts::{Plan, PlanStep, StepState, plan_kind_sentence};
-use crate::glossary;
 use crate::paths::Ctx;
 use crate::project::{Project, write_atomic};
 use crate::round;
@@ -115,7 +114,7 @@ fn plan_kind_error(kind: &str) -> String {
     )
 }
 
-fn validate(project: &Project, plan: &Plan) -> Result<()> {
+fn validate(_project: &Project, plan: &Plan) -> Result<()> {
     if plan.schema != 1 {
         bail!("plan_schema: expected schema 1, got {}", plan.schema);
     }
@@ -127,9 +126,6 @@ fn validate(project: &Project, plan: &Plan) -> Result<()> {
         }
     } else if !plan.what_you_get.is_empty() {
         bail!("plan_result: what_you_get is set without a result kind");
-    }
-    if !plan.does.is_empty() {
-        glossary::check_sentence(project, "does", &plan.does)?;
     }
     if plan.steps.len() > MAX_STEPS {
         bail!(
@@ -148,7 +144,6 @@ fn validate(project: &Project, plan: &Plan) -> Result<()> {
         if !ids.insert(step.id.clone()) {
             bail!("plan_step_id: duplicate step id `{}`", step.id);
         }
-        glossary::check_sentence(project, &format!("step {}", step.id), &step.text)?;
         for t in &step.threads {
             thread::validate_id(t)?;
         }
@@ -215,7 +210,7 @@ pub(crate) fn set(
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let sentence = plan_kind_sentence(kind).with_context(|| plan_kind_error(kind))?;
-    let does = glossary::check_sentence(&project, "does", does)?;
+    let does = does.trim().to_string();
     let goal = project_goal(&project);
     let (plan, ()) = with_plan(&project, expect, |plan| {
         plan.kind = kind.to_string();
@@ -235,7 +230,7 @@ pub(crate) fn step_add(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let text = glossary::check_sentence(&project, "step", text)?;
+    let text = text.trim().to_string();
     check_task_refs(&project, &tasks)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         if plan.next_step == 0 {
@@ -271,7 +266,7 @@ pub(crate) fn step_edit(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let text = glossary::check_sentence(&project, "step", text)?;
+    let text = text.trim().to_string();
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
         step.text = text.clone();
@@ -309,14 +304,13 @@ pub(crate) fn step_unlink(
     slug: &str,
     id: &str,
     tasks: Vec<String>,
-    why: &str,
+    _why: &str,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     if tasks.is_empty() {
         bail!("plan_unlink: at least one --task is required");
     }
-    glossary::check_sentence(&project, "why", why)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
         step.tasks.retain(|task| !tasks.contains(task));
@@ -329,11 +323,10 @@ pub(crate) fn step_remove(
     ctx: &Ctx,
     slug: &str,
     id: &str,
-    why: &str,
+    _why: &str,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    glossary::check_sentence(&project, "why", why)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let before = plan.steps.len();
         plan.steps.retain(|s| s.id != id);
@@ -659,16 +652,6 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_result_sentences_pass_an_empty_registry_check() {
-        let g = crate::plain::Glossary::default();
-        for (kind, sentence) in crate::contracts::PLAN_KINDS {
-            let r = crate::plain::check(sentence, &g);
-            assert!(r.passed(), "{kind}: {:?}", r.violations);
-            assert_eq!(plan_kind_sentence(kind), Some(*sentence));
-        }
-    }
-
-    #[test]
     fn set_copies_the_exact_goal_and_generates_the_result_sentence() {
         let fx = fixture();
         goal(&fx, "I want to build a trading bot with Jeff.");
@@ -782,29 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn a_normal_set_keeps_zero_steps_valid_but_refuses_bad_values() {
-        let fx = fixture();
-        let e = format!(
-            "{:#}",
-            set(&fx.world.ctx(), "demo", "gadget", "It does a thing.", 0).unwrap_err()
-        );
-        assert!(e.starts_with("plan_kind"), "{e}");
-        let e = format!(
-            "{:#}",
-            set(
-                &fx.world.ctx(),
-                "demo",
-                "screen",
-                "Run the zorbulate gate now.",
-                0
-            )
-            .unwrap_err()
-        );
-        assert!(e.starts_with("plain_refused"), "{e}");
-        assert!(load(&fx.project).unwrap().is_none());
-    }
-
-    #[test]
     fn at_most_seven_steps_and_removal_never_reuses_an_identifier() {
         let fx = fixture();
         set(
@@ -831,34 +791,6 @@ mod tests {
         let plan = add(&fx, "A replacement step.", plan.revision);
         assert!(plan.steps.iter().any(|s| s.id == "s-8"), "{:?}", plan.steps);
         assert!(!plan.steps.iter().any(|s| s.id == "s-3"));
-    }
-
-    #[test]
-    fn removing_or_unlinking_requires_a_checked_why() {
-        let fx = fixture();
-        set(
-            &fx.world.ctx(),
-            "demo",
-            "screen",
-            "It shows pretend trades.",
-            0,
-        )
-        .unwrap();
-        add(&fx, "A step to drop.", 1);
-        let e = format!(
-            "{:#}",
-            step_remove(
-                &fx.world.ctx(),
-                "demo",
-                "s-1",
-                "Because the zorbulate is gone.",
-                2
-            )
-            .unwrap_err()
-        );
-        assert!(e.starts_with("plain_refused"), "{e}");
-        // The step is still there; nothing was removed.
-        assert_eq!(load(&fx.project).unwrap().unwrap().steps.len(), 1);
     }
 
     #[test]

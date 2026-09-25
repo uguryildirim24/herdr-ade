@@ -46,7 +46,7 @@ Edit only the front matter of the new `PROJECT.md` for repositories and project 
 
 ## 4. Start work
 
-Tell the coordinator what you want. In the default `auto` mode it starts the lanes the work needs and tells you what it started. Set a project's `start_threads` safety row to `propose` if you want it to describe lanes and wait for your go-ahead. Each repository lane gets:
+Tell the coordinator what you want. It starts the lanes the work needs and tells you what it started. Each repository lane gets:
 
 - a content-addressed brief in project state, tied to the exact starting commit and materialized only in the ignored runtime folder;
 - a branch and worktree under `<repo>/.worktrees/`;
@@ -70,4 +70,4 @@ herdr-ade ticker status
 - **The coordinator needs its instructions again:** run `open <project> --reprime`.
 - **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and `doctor` lists what was kept; only configured rebuildable paths are discarded. Removal is not forced.
 
-See [Operations](operations.md) for records, routing, rounds, safety settings, remote lanes, and the complete command surface.
+See [Operations](operations.md) for records, routing, rounds, remote lanes, and the complete command surface.

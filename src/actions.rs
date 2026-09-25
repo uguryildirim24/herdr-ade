@@ -134,13 +134,6 @@ pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
                 },
             ),
         },
-        "focus" => match current_slug(ctx) {
-            Some(slug) => overview::focus(ctx, &slug),
-            None => bail!(
-                "this workspace does not belong to a project; run `focus <slug>` from a terminal"
-            ),
-        },
-        "unfocus" => overview::unfocus(ctx, &SessionFlags::default()),
         "adopt-workspace" => {
             // The originating pane is captured here, before any popup opens.
             let pane = ctx

@@ -18,7 +18,7 @@ pub(crate) struct Item {
     pub(crate) summary: String,
     /// Sealed event id when this item is a delivery projection.
     pub(crate) event: String,
-    /// Empty except for `routine` items.
+    /// Optional message body.
     #[serde(skip)]
     pub(crate) body: String,
 }
@@ -54,7 +54,7 @@ fn removed_kind(kind: &str) -> bool {
     )
 }
 
-/// File-name-safe form of a subject (a thread id, routine name, machine label).
+/// File-name-safe form of a subject (a thread id or machine label).
 fn safe_subject(subject: &str) -> String {
     let cleaned: String = subject
         .chars()
@@ -77,7 +77,7 @@ fn safe_subject(subject: &str) -> String {
 
 /// Writes one item. The id is `<UTC timestamp>-<kind>-<subject>-<n>`, where
 /// `<n>` is a counter allocated under the project lock, so two events in one
-/// tick never share a name. `body` is empty except for `routine` items.
+/// tick never share a name. `body` is optional.
 pub(crate) fn write(
     project: &Project,
     kind: &str,
@@ -373,7 +373,7 @@ mod tests {
     fn write_item(project: &Project, id: &str, body: &str) {
         std::fs::create_dir_all(inbox_dir(project)).unwrap();
         let text = format!(
-            "+++\nid = \"{id}\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"2026-09-17T00:00:00Z\"\nsummary = \"s\"\n+++\n{body}"
+            "+++\nid = \"{id}\"\nkind = \"note\"\nsubject = \"r\"\ncreated = \"2026-09-17T00:00:00Z\"\nsummary = \"s\"\n+++\n{body}"
         );
         std::fs::write(inbox_dir(project).join(format!("{id}.md")), text).unwrap();
     }
@@ -382,8 +382,8 @@ mod tests {
     fn lists_marks_seen_and_moves_to_done() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        write_item(&project, "20260917T000002Z-routine-r-2", "\nbody text\n");
-        write_item(&project, "20260917T000001Z-routine-r-1", "");
+        write_item(&project, "20260917T000002Z-note-r-2", "\nbody text\n");
+        write_item(&project, "20260917T000001Z-note-r-1", "");
         let items = unhandled(&project);
         assert_eq!(items.len(), 2);
         assert!(items[0].id.ends_with("-1"));
@@ -419,10 +419,10 @@ mod tests {
         std::fs::create_dir_all(inbox_dir(&project)).unwrap();
         for (id, created) in [
             ("event-t-0001-1-1", "2026-09-17T00:00:00Z"),
-            ("20260917T000100Z-routine-r-1", "2026-09-17T00:01:00Z"),
+            ("20260917T000100Z-note-r-1", "2026-09-17T00:01:00Z"),
         ] {
             let text = format!(
-                "+++\nid = \"{id}\"\nkind = \"routine\"\ncreated = \"{created}\"\nsummary = \"due\"\n+++\n"
+                "+++\nid = \"{id}\"\nkind = \"note\"\ncreated = \"{created}\"\nsummary = \"due\"\n+++\n"
             );
             std::fs::write(inbox_dir(&project).join(format!("{id}.md")), text).unwrap();
         }
@@ -433,11 +433,11 @@ mod tests {
     fn done_kind_only_moves_matching_items() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let first = write(&project, "routine", "first", "due", "").unwrap();
+        let first = write(&project, "note", "first", "due", "").unwrap();
         write(&project, "outage", "box", "offline", "").unwrap();
-        let second = write(&project, "routine", "second", "due", "").unwrap();
+        let second = write(&project, "note", "second", "due", "").unwrap();
         assert_eq!(
-            done_kind_bound(&project, "routine", None).unwrap().moved,
+            done_kind_bound(&project, "note", None).unwrap().moved,
             [first, second]
         );
         assert_eq!(unhandled(&project).len(), 1);
@@ -448,11 +448,11 @@ mod tests {
     fn two_events_in_one_tick_get_two_items() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let a = write(&project, "routine", "nightly", "first", "").unwrap();
-        let b = write(&project, "routine", "nightly", "second\nline", "").unwrap();
+        let a = write(&project, "note", "nightly", "first", "").unwrap();
+        let b = write(&project, "note", "nightly", "second\nline", "").unwrap();
         assert_ne!(a, b);
-        assert!(a.ends_with("-routine-nightly-1"), "{a}");
-        assert!(b.ends_with("-routine-nightly-2"), "{b}");
+        assert!(a.ends_with("-note-nightly-1"), "{a}");
+        assert!(b.ends_with("-note-nightly-2"), "{b}");
         let items = unhandled(&project);
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].summary, "second line");
@@ -462,28 +462,6 @@ mod tests {
             done_bound(&project, &[a], false, None).unwrap().moved.len(),
             1
         );
-    }
-
-    #[test]
-    fn routine_items_carry_a_body_and_subjects_are_made_file_safe() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let id = write(&project, "outage", "Elias MacBook/../x", "down", "").unwrap();
-        assert!(id.contains("-outage-elias-macbook----x-"), "{id}");
-        write(
-            &project,
-            "routine",
-            "nightly",
-            "due",
-            "Check the build.\n\n```\nout\n```",
-        )
-        .unwrap();
-        let routine = unhandled(&project)
-            .into_iter()
-            .find(|i| i.kind == "routine")
-            .unwrap();
-        assert!(routine.body.starts_with("Check the build."));
-        assert!(routine.body.ends_with("```"));
     }
 
     #[test]
@@ -510,7 +488,7 @@ mod tests {
             assert!(unhandled(&project).is_empty());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
-        write(&project, "routine", "nightly", "due", "work").unwrap();
+        write(&project, "note", "nightly", "due", "work").unwrap();
         assert_eq!(unhandled(&project).len(), 1);
         assert_eq!(
             done_bound(&project, &[], true, None).unwrap().moved.len(),
@@ -601,14 +579,14 @@ mod tests {
         };
         crate::events::seal_create_if_absent(&project, &old).unwrap();
         let old_item = write_event(&project, &old, "courier-delivery", "lane waits").unwrap();
-        write_item(&project, "routine-1", "body");
+        write_item(&project, "note-1", "body");
         project
             .update_coordinator(|c| {
                 c.pane_id = "w1:p3".into();
                 c.generation = 3;
             })
             .unwrap();
-        let both = ["routine-1".to_string(), old_item.clone()];
+        let both = ["note-1".to_string(), old_item.clone()];
         assert!(done_bound(&project, &both, false, Some(("w1:p9", 1))).is_err());
         assert_eq!(unhandled(&project).len(), 2);
         assert_eq!(

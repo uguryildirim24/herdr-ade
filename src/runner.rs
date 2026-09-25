@@ -1,7 +1,7 @@
 //! Every external command (herdr, git, gh, ssh, scp, rsync, sh) goes through `Runner`.
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -204,11 +204,6 @@ pub(crate) trait Runner {
     fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
         commands.iter().map(|command| self.run(command)).collect()
     }
-
-    /// One JSON line to a herdr socket, one line back. The single exception to
-    /// "talk to herdr through its CLI" (client decision during the build):
-    /// herdr 0.9.1 has no CLI command for `agent.view.set` / `agent.view.clear`.
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String>;
 }
 
 /// Gives every child an explicit stable working directory. Commands that
@@ -249,10 +244,6 @@ impl Runner for CwdRunner<'_> {
     fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
         let commands: Vec<_> = commands.iter().map(|cmd| self.rooted(cmd)).collect();
         self.inner.run_parallel(&commands)
-    }
-
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-        self.inner.socket_request(socket, line, timeout)
     }
 }
 
@@ -376,24 +367,6 @@ impl Runner for RealRunner {
                 .collect()
         })
     }
-
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-        socket_round_trip(socket, line, timeout)
-    }
-}
-
-fn socket_round_trip(socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("could not connect to {}", socket.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    Ok(reply)
 }
 
 struct PipeReader {
@@ -462,8 +435,6 @@ pub(crate) mod fake {
     pub(crate) struct FakeRunner {
         rules: RefCell<Vec<(Matcher, Answer)>>,
         pub(crate) calls: RefCell<Vec<Cmd>>,
-        /// (socket, request line) of every socket request.
-        pub(crate) socket_requests: RefCell<Vec<(PathBuf, String)>>,
     }
 
     impl FakeRunner {
@@ -592,19 +563,13 @@ pub(crate) mod fake {
             }
             anyhow::bail!("FakeRunner: no rule for `{}`", cmd.display())
         }
-
-        fn socket_request(&self, socket: &Path, line: &str, _timeout: Duration) -> Result<String> {
-            self.socket_requests
-                .borrow_mut()
-                .push((socket.to_path_buf(), line.to_string()));
-            Ok(r#"{"id":"hp","result":{"type":"agent_view","active":true}}"#.to_string())
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn stable_cwd_is_added_without_overriding_an_explicit_directory() {
