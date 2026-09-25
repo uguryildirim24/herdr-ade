@@ -7815,6 +7815,52 @@ mod tests {
     }
 
     #[test]
+    fn paper_only_round_with_only_a_scoped_gate_accepts_no_gate_results() {
+        let fx = fixture();
+        update_repo(&fx, |repo| {
+            repo.gates = Some(vec![scoped_gate(
+                "full",
+                &["src/**", "tests/**", "data/**"],
+            )]);
+        });
+        open_r1(&fx);
+        let (lane, _) = fx.lane(1);
+        let wt = fx.repo.join(".worktrees/lane-1");
+        git(&wt, &["rm", "src/lane1.rs"]);
+        let sha = commit_file(&wt, "paper/section.md", "Words\n", "paper only");
+        admit(&fx.world.ctx(), "demo", "r1", &lane).unwrap();
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        review(&fx.world.ctx(), "demo", "r1").unwrap();
+        let record = load(&fx.project, "r1").unwrap();
+        assert!(record.selected_gates.as_ref().unwrap().is_empty());
+        assert_eq!(record.skipped_gates, vec![0]);
+        let brief = String::from_utf8(
+            thread::artifact(&fx.project, record.review_artifact.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(brief.contains("Skipped `full`"));
+        assert!(brief.contains("gates = []"));
+        let lanes = vec![(lane, sha)];
+        verdict(&fx, &lanes, |c, r| {
+            format!(
+                "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nReviewed the paper diff.\n",
+                r.manifest_hash.as_ref().unwrap(),
+                r.policy_hash
+            )
+        });
+        advance(&fx.world.ctx(), "demo").unwrap();
+        let candidate = git(&fx.repo, &["rev-parse", "review/r1"]);
+        validate_verdict_inner(
+            &fx.project,
+            &Git::new(fx.world.ctx().runner, &fx.repo),
+            &load(&fx.project, "r1").unwrap(),
+            &candidate,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn code_diff_selects_both_and_missing_selected_gate_is_refused() {
         let fx = fixture();
         update_repo(&fx, |repo| {
