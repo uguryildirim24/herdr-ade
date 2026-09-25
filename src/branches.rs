@@ -242,6 +242,17 @@ pub(crate) fn closed_round(
             delete_remote(ctx.runner, &record.repo, url, &name, sha)?;
         }
     }
+    // Reviewers publish on their own hp/ branch, not on review/<round>.
+    // Include superseded reviewers and the integration reviewer of a batch:
+    // the current round.reviewer alone is not a complete ownership list.
+    for reviewer in threads.iter().filter(|t| {
+        t.role == "reviewer"
+            && t.review_round == record.round
+            && t.status == Status::Resolved
+            && !t.cleanup_pending
+    }) {
+        resolved_thread(ctx, project, reviewer)?;
+    }
     Ok(())
 }
 
