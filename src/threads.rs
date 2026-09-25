@@ -1565,7 +1565,7 @@ pub struct RetryOutcome {
 /// Start the same task as a new bounded recovery attempt. Unlike the removed
 /// `restart` command this deliberately replaces a live, blocked, or stuck
 /// process. Its durable failure class decides whether recovery stays on the
-/// same recipe, advances failed-work fallback routing, or waits for evidence.
+/// same recipe within its retry budget, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
     retry_with_ticker(ctx, slug, id, reason, ticker::start, true)
 }

@@ -4311,7 +4311,6 @@ recipe = "claude_fable_xhigh"
         runner.on("ssh -V", ok(""));
         runner.on("rsync --version", ok("rsync 3\n"));
         runner.on("gh --version", ok("gh version 2\n"));
-        runner.on("gh auth status", fail(1, "not logged in"));
 
         let (text, healthy, checks) = report_with_checks(
             &env,

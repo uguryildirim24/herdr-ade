@@ -1156,6 +1156,25 @@ mod tests {
     use crate::runner::Runner as _;
     use crate::scenarios::{World, agent_json};
 
+    #[test]
+    fn historical_pr_check_in_ticker_state_does_not_prevent_loading() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let path = project.state_dir().join("ticker.json");
+        std::fs::write(
+            &path,
+            r#"{"last_pr_check":"2026-01-01T00:00:00Z","announced":"known"}"#,
+        )
+        .unwrap();
+        assert_eq!(load_state(&project).announced, "known");
+        save_state(&project, &load_state(&project)).unwrap();
+        assert!(
+            !std::fs::read_to_string(path)
+                .unwrap()
+                .contains("last_pr_check")
+        );
+    }
+
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
     }
