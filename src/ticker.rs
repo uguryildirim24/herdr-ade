@@ -1119,7 +1119,9 @@ fn thread_pass(
                     Ok(()) => {
                         delivered = true;
                         thread::update_checked(project, &t.id, |record| {
-                            if record.attempt == current.attempt && record.pane_id == current.pane_id {
+                            if record.attempt == current.attempt
+                                && record.pane_id == current.pane_id
+                            {
                                 record.prompt_pending = false;
                             }
                             Ok(())
