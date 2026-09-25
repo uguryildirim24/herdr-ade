@@ -157,7 +157,7 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
         let script = crate::remote::with_path(
             &machine.path,
             &format!(
-                "cd {} && git show-ref --verify --quiet {refname}; status=$?; if [ \"$status\" -eq 0 ]; then error=$(git branch -D -- {branch} 2>&1) || {{ git show-ref --verify --quiet {refname}; status=$?; if [ \"$error\" = {missing} ] && [ \"$status\" -eq 1 ]; then :; else printf '%s\\n' \"$error\" >&2; exit 1; fi; }}; elif [ \"$status\" -ne 1 ]; then exit \"$status\"; fi",
+                "cd {} || exit $?; git show-ref --verify --quiet {refname}; status=$?; if [ \"$status\" -eq 0 ]; then error=$(git branch -D -- {branch} 2>&1) || {{ git show-ref --verify --quiet {refname}; status=$?; if [ \"$error\" = {missing} ] && [ \"$status\" -eq 1 ]; then :; else printf '%s\\n' \"$error\" >&2; exit 1; fi; }}; elif [ \"$status\" -ne 1 ]; then exit \"$status\"; fi",
                 crate::remote::quote(&box_repo),
             ),
         );
