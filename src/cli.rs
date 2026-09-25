@@ -2819,7 +2819,8 @@ fn dispatch_with_start(
                 }
                 let mut result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
                 if crate::harness::install_in_progress(&ctx.config_dir) {
-                    let note = "the lane is recorded and launches when the harness install finishes";
+                    let note =
+                        "the lane is recorded and launches when the harness install finishes";
                     result["note"] = note.into();
                     crate::output::insert("note", note);
                 }
