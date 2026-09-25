@@ -1593,13 +1593,60 @@ fn idle_task_lines(project: &Project) -> Vec<String> {
         .0
         .into_iter()
         .filter(|view| !view.terminal(project))
-        .map(|view| {
-            let block = crate::task::active_wait(project, &view.record)
-                .map(|wait| format!("waiting on {}: {}", wait.kind, wait.target))
-                .unwrap_or_else(|| view.next);
-            format!("{}: {}", view.record.id, block)
-        })
+        .map(
+            |view| match crate::task::active_wait(project, &view.record) {
+                Some(wait) => format!(
+                    "held: {} waits on {} {}",
+                    view.record.id, wait.kind, wait.target
+                ),
+                None => format!("{}: {}", view.record.id, view.next),
+            },
+        )
         .collect()
+}
+
+fn idle_lane_lines(project: &Project, agents: &[Agent], panes: &[Pane]) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    for lane in thread::list(project) {
+        if lane.status == thread::Status::Resolved {
+            continue;
+        }
+        if lane.queued_for_load && lane.status == thread::Status::Starting {
+            return None;
+        }
+        // A recorded group can be stale even after a report lands. Use the
+        // current agent view for local lanes, and the last courier observation
+        // for remote lanes that have not yet reported.
+        let working = if lane.status == thread::Status::Failed {
+            false
+        } else if lane.is_remote() {
+            lane.last_state == "working" && lane.report_hash.is_empty()
+        } else {
+            thread::live_state(&lane, agents, panes, jiff::Timestamp::now())
+                .agent_state
+                .as_deref()
+                == Some("working")
+        };
+        if working {
+            return None;
+        }
+        let (status, action) = if lane.status == thread::Status::Failed {
+            ("failed", "inspect the failure and recover or resolve it")
+        } else if !lane.report_hash.is_empty()
+            && (lane.report_hash != lane.acked_report_hash || lane.pr_state == "open")
+        {
+            ("ready for review", "open a round")
+        } else if lane.status == thread::Status::Starting
+            || lane.prompt_pending
+            || lane.last_group == thread::Group::WaitingOnYou.token()
+        {
+            ("waiting on you", "inspect the block and take the next step")
+        } else {
+            ("idle", "check its result and take the next step")
+        };
+        lines.push(format!("{} is {status}: {action}", lane.id));
+    }
+    Some(lines)
 }
 
 fn idle_nudge_text(lines: &[String]) -> String {
@@ -1608,10 +1655,18 @@ fn idle_nudge_text(lines: &[String]) -> String {
     } else {
         lines.join("; ")
     };
+    let next = if !lines.is_empty() && lines.iter().all(|line| line.starts_with("held: ")) {
+        "Everything open is held. Find new work toward the project goal or mark the project finished with ha finish."
+    } else if lines.iter().any(|line| line.starts_with("held: ")) {
+        "Leave held tasks alone; find and start other useful work toward the project goal."
+    } else {
+        "Find and start the next useful step toward the project goal now."
+    };
     format!(
-        "{} {} Find and start the next useful step toward the project goal now. Ask Rolf only for what truly needs him; keep other work moving.",
+        "{} {} {} Ask Rolf only for what truly needs him; keep other work moving.",
         steps::TICKER_PROMPT_PREFIX,
-        blocks
+        blocks,
+        next
     )
 }
 
@@ -1622,6 +1677,7 @@ fn nudge_idle_coordinator(
     herdr: &Herdr,
     coordinator: &crate::project::Coordinator,
     agent: Option<&Agent>,
+    live: (&[Agent], &[Pane]),
 ) -> Result<()> {
     if coordinator.prime_pending || agent.is_none_or(|agent| !agent.ready()) {
         return Ok(());
@@ -1629,14 +1685,11 @@ fn nudge_idle_coordinator(
     if project.finished() || project.status() != project::Status::Active {
         return Ok(());
     }
-    let now = jiff::Timestamp::now();
-    if thread::list(project)
-        .iter()
-        .any(|lane| thread::recorded_group(lane, now) == thread::Group::Working)
-    {
+    let Some(lanes) = idle_lane_lines(project, live.0, live.1) else {
         return Ok(());
-    }
-    let next = idle_task_lines(project);
+    };
+    let mut next = idle_task_lines(project);
+    next.extend(lanes);
     let settings = crate::project::coordinator_settings(&ctx.config_dir)?;
     if !idle_nudge_due(
         project,
@@ -1804,8 +1857,15 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         let inbox_prompted = settings.nudge && state.nudged != before.nudged;
         if settings.nudge
             && !inbox_prompted
-            && let Err(error) =
-                nudge_idle_coordinator(ctx, project, &mut state, &herdr, &record, agent.as_ref())
+            && let Err(error) = nudge_idle_coordinator(
+                ctx,
+                project,
+                &mut state,
+                &herdr,
+                &record,
+                agent.as_ref(),
+                (&agents, &panes),
+            )
         {
             first_error = first_error.or(Some(error.context("idle coordinator nudge")));
         }
@@ -3782,6 +3842,7 @@ mod tests {
                 &herdr,
                 &coordinator,
                 Some(&agent),
+                (&[], &[]),
             )
             .unwrap();
         }
@@ -3856,25 +3917,160 @@ mod tests {
     }
 
     #[test]
+    fn finished_lanes_with_an_idle_agent_nudge_the_done_coordinator() {
+        let f = fixture(false);
+        let mut agents = vec![serde_json::json!({
+            "pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1",
+            "name": "hp-demo-coordinator", "agent": "claude", "agent_status": "done",
+            "cwd": f.project.dir().to_string_lossy(),
+        })];
+        let mut panes = vec![serde_json::json!({
+            "pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1",
+            "cwd": f.project.dir().to_string_lossy(),
+        })];
+        let dir = thread::threads_dir_for_write(&f.project).unwrap();
+        for n in 95..=98 {
+            let id = format!("t-{n:04}");
+            let pane_id = format!("w1:p{n}");
+            let lane = thread::Thread {
+                id: id.clone(),
+                status: thread::Status::Open,
+                report_hash: format!("report-{n}"),
+                last_group: if n == 95 {
+                    "working"
+                } else {
+                    "ready-for-review"
+                }
+                .into(),
+                last_state: if n == 95 { "idle" } else { "done" }.into(),
+                // This lane's courier observation was idle, but the cached
+                // group still says working. The cheap pass does not re-group
+                // remote lanes before the coordinator nudge.
+                machine: if n == 95 { "oci" } else { "" }.into(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                pane_id: pane_id.clone(),
+                agent_name: format!("hp-demo-{id}"),
+                cwd: f.project.dir().to_string_lossy().into_owned(),
+                ..thread::Thread::default()
+            };
+            std::fs::write(
+                dir.join(format!("{id}.toml")),
+                toml::to_string(&lane).unwrap(),
+            )
+            .unwrap();
+            agents.push(serde_json::json!({
+                "pane_id": pane_id, "tab_id": "w1:t1", "workspace_id": "w1",
+                "name": lane.agent_name, "agent": "claude",
+                "agent_status": if n == 95 { "idle" } else { "done" },
+                "cwd": lane.cwd,
+            }));
+            panes.push(serde_json::json!({
+                "pane_id": lane.pane_id, "tab_id": "w1:t1", "workspace_id": "w1",
+                "cwd": f.project.dir().to_string_lossy(),
+            }));
+        }
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent list",
+            ok(&serde_json::json!({"result": {"agents": agents}}).to_string()),
+        );
+        runner.on(
+            "pane list",
+            ok(&serde_json::json!({"result": {"panes": panes}}).to_string()),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on("report-metadata", ok("{}"));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let mut state = steps::State {
+            idle_nudge_last: "2026-01-01T00:00:00Z".into(),
+            ..steps::State::default()
+        };
+        steps::save_state(&f.project, &state).unwrap();
+        crate::ledger::context_read(&f.project, "2026-01-01T00:05:00Z").unwrap();
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        assert!(tick_project(&ctx, &f.project).unwrap());
+        assert_eq!(runner.count("agent prompt"), 1);
+        let prompt = runner
+            .calls
+            .borrow()
+            .iter()
+            .find(|call| call.display().contains("agent prompt"))
+            .unwrap()
+            .display();
+        for n in 95..=98 {
+            assert!(
+                prompt.contains(&format!("t-{n:04} is ready for review: open a round")),
+                "{prompt}"
+            );
+        }
+        state = steps::load_state(&f.project);
+        assert_ne!(state.idle_nudge_last, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
     fn waiting_tasks_and_empty_queue_explain_the_next_step() {
         let f = fixture(false);
         write_task(&f.project, Vec::new());
         crate::task::set_wait(&f.project, "job-0001", "event", "next response").unwrap();
         let waiting = idle_nudge_text(&idle_task_lines(&f.project));
         assert!(
-            waiting.contains("job-0001: waiting on event: next response"),
+            waiting.contains("held: job-0001 waits on event next response"),
             "{waiting}"
         );
-        assert!(
-            waiting.contains("Find and start the next useful step"),
-            "{waiting}"
-        );
+        assert!(waiting.contains("Everything open is held"), "{waiting}");
+        assert!(waiting.contains("ha finish"), "{waiting}");
         crate::task::drop_task(&f.project, "job-0001", "Done.").unwrap();
         let empty = idle_nudge_text(&idle_task_lines(&f.project));
         assert!(empty.contains("No open tasks."), "{empty}");
         assert!(
             empty.contains("Ask Rolf only for what truly needs him"),
             "{empty}"
+        );
+    }
+
+    #[test]
+    fn held_tasks_are_listed_once_without_being_offered_as_work() {
+        let f = fixture(false);
+        write_task(&f.project, Vec::new());
+        crate::task::set_wait(&f.project, "job-0001", "event", "provider response").unwrap();
+        let mut lines = idle_task_lines(&f.project);
+        let only_held = idle_nudge_text(&lines);
+        assert_eq!(only_held.matches("held: job-0001").count(), 1);
+        assert!(only_held.contains("Everything open is held"), "{only_held}");
+        assert!(only_held.contains("ha finish"), "{only_held}");
+        assert!(!only_held.contains("job-0001: verify"), "{only_held}");
+
+        let task = crate::task::Task {
+            id: "job-0002".into(),
+            title: "Check another step".into(),
+            authority: vec!["request:q-1".into()],
+            acceptance: vec!["The other step is complete.".into()],
+            created: project::now(),
+            ..crate::task::Task::default()
+        };
+        std::fs::write(
+            f.project.state_dir().join("tasks/job-0002.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+        lines = idle_task_lines(&f.project);
+        let with_work = idle_nudge_text(&lines);
+        assert_eq!(with_work.matches("held: job-0001").count(), 1);
+        assert!(with_work.contains("job-0002: verify"), "{with_work}");
+        assert!(
+            with_work.contains("find and start other useful work"),
+            "{with_work}"
+        );
+        assert!(
+            !with_work.contains("Everything open is held"),
+            "{with_work}"
         );
     }
 
@@ -3913,6 +4109,7 @@ mod tests {
                 agent_status: "idle".into(),
                 ..Agent::default()
             }),
+            (&[], &[]),
         )
         .unwrap();
         assert_eq!(runner.count("agent prompt"), 1);
@@ -3950,6 +4147,7 @@ mod tests {
             &herdr,
             &record,
             Some(&agent),
+            (&[], &[]),
         )
         .unwrap();
         assert_eq!(runner.count("agent prompt"), 0);
@@ -3962,6 +4160,7 @@ mod tests {
             &herdr,
             &record,
             Some(&agent),
+            (&[], &[]),
         )
         .unwrap();
         assert_eq!(runner.count("agent prompt"), 1);
