@@ -449,7 +449,7 @@ pub(crate) fn prepare_project_slice(
     let script = with_path(
         &machine.path,
         &format!(
-            "set -e\nmkdir -p {folder} {bin}\nunit={unit_path}\ntmp=\"$unit.tmp-$$\"\nprintf '%s' {contents} > \"$tmp\"\nif [ -f \"$unit\" ] && ! grep -q '^# Managed by herdr-ade$' \"$unit\"; then rm -f \"$tmp\"; echo unmanaged_slice >&2; exit 8; fi\nif ! cmp -s \"$tmp\" \"$unit\"; then mv \"$tmp\" \"$unit\"; systemctl --user daemon-reload; else rm -f \"$tmp\"; fi\nfor name in {names}; do\n  real=$(command -v \"$name\" || true)\n  if [ -n \"$real\" ]; then\n    printf '#!/bin/sh\\nexec systemd-run --user --scope --same-dir --quiet --collect --slice=%s -- %s \"$@\"\\n' {slice} \"$real\" > {bin}/\"$name\"\n    chmod 755 {bin}/\"$name\"\n  fi\ndone\ntest -x {bin}/{executable} || {{ echo missing_slice_wrapper >&2; exit 9; }}\n",
+            "set -e\nmkdir -p {folder} {bin}\nunit={unit_path}\ntmp=\"$unit.tmp-$$\"\nprintf '%s' {contents} > \"$tmp\"\nif [ -f \"$unit\" ] && ! grep -q '^# Managed by herdr-ade$' \"$unit\"; then rm -f \"$tmp\"; echo unmanaged_slice >&2; exit 8; fi\nif ! cmp -s \"$tmp\" \"$unit\"; then mv \"$tmp\" \"$unit\"; systemctl --user daemon-reload; else rm -f \"$tmp\"; fi\ncommand -v systemd-run >/dev/null || {{ echo missing_systemd_run >&2; exit 9; }}\n# Verify the user manager can actually create a scope in this slice.\nsystemd-run --user --scope --same-dir --quiet --collect --slice={slice} -- /bin/true\nfor name in {names}; do\n  real=$(command -v \"$name\" || true)\n  if [ -n \"$real\" ]; then\n    printf '#!/bin/sh\\nexec systemd-run --user --scope --same-dir --quiet --collect --slice=%s -- %s \"$@\"\\n' {slice} \"$real\" > {bin}/\"$name\"\n    chmod 755 {bin}/\"$name\"\n  fi\ndone\ntest -x {bin}/{executable} || {{ echo missing_slice_wrapper >&2; exit 9; }}\n",
             folder = quote(&folder),
             bin = quote(&bin),
             unit_path = quote(&format!("{folder}/{slice}")),
@@ -768,6 +768,7 @@ mod tests {
         assert!(command.contains("CPUQuota=400%"));
         assert!(command.contains("MemoryMax=16384M"));
         assert!(command.contains("systemd-run --user --scope --same-dir --quiet --collect"));
+        assert!(command.contains("--slice=herdr-ade-demo.slice -- /bin/true"));
         assert!(command.contains("test -x"));
         assert!(load_wait_reason(24.1, 16, 1.5).is_some());
         assert_eq!(load_wait_reason(24.0, 16, 1.5), None);
