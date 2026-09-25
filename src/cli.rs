@@ -2217,6 +2217,16 @@ pub fn run() -> Result<()> {
         .and_then(|s| Project::load(&ctx.root, s).ok());
     let _scope = (!read_only)
         .then(|| crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>()));
+    // Only commands issued in the bound coordinator pane count as a response
+    // to an idle nudge. A background ticker or a lane must not open the gate.
+    if let Some(project) = &observed_project
+        && project
+            .coordinator()
+            .is_some_and(|record| ctx.env.var("HERDR_PANE_ID") == Some(record.pane_id.as_str()))
+        && !command_name.starts_with("plain hook")
+    {
+        crate::ledger::coordinator_command(project)?;
+    }
     let subject = format!("ha {command_name}");
     let result = dispatch(ctx, cli.command);
     if read_only {

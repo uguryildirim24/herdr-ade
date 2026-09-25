@@ -1585,23 +1585,116 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .collect()
 }
 
+fn idle_nudge_gate(
+    project: &Project,
+    state: &steps::State,
+    minutes: u64,
+    now: jiff::Timestamp,
+) -> Result<Option<String>> {
+    if state.idle_nudge_last.is_empty() {
+        return Ok(None);
+    }
+    let interval_secs = minutes.saturating_mul(60).min(i64::MAX as u64) as i64;
+    let last = state.idle_nudge_last.parse::<jiff::Timestamp>().ok();
+    if thread::seconds_since(&state.idle_nudge_last, now) < interval_secs {
+        let until = last.and_then(|last| {
+            jiff::Timestamp::from_second(last.as_second().saturating_add(interval_secs)).ok()
+        });
+        return Ok(Some(format!(
+            "not due until {}",
+            until.map_or_else(|| "unknown".into(), |t| t.to_string())
+        )));
+    }
+    let command = crate::ledger::latest_coordinator_turn(project)?;
+    let turned = [command.as_str(), state.coordinator_worked_at.as_str()]
+        .iter()
+        .filter_map(|time| time.parse::<jiff::Timestamp>().ok())
+        .any(|time| last.is_some_and(|last| time > last));
+    Ok((!turned).then(|| "no turn since last nudge".into()))
+}
+
 fn idle_nudge_due(
     project: &Project,
     state: &steps::State,
     minutes: u64,
     now: jiff::Timestamp,
 ) -> Result<bool> {
-    if state.idle_nudge_last.is_empty() {
-        return Ok(true);
-    }
-    let interval_secs = minutes.saturating_mul(60).min(i64::MAX as u64) as i64;
-    if thread::seconds_since(&state.idle_nudge_last, now) < interval_secs {
-        return Ok(false);
-    }
-    let context = crate::ledger::latest_context_read(project)?;
-    let last = state.idle_nudge_last.parse::<jiff::Timestamp>().ok();
-    let context = context.parse::<jiff::Timestamp>().ok();
-    Ok(matches!((context, last), (Some(context), Some(last)) if context > last))
+    Ok(idle_nudge_gate(project, state, minutes, now)?.is_none())
+}
+
+/// One explanation for both the ticker and the two human surfaces.
+pub(crate) fn idle_nudge_status(
+    project: &Project,
+    state: &steps::State,
+    policy: (&crate::project::Settings, u64),
+    agent: Option<&Agent>,
+    live: (&[Agent], &[Pane]),
+    input_clear: Option<bool>,
+    now: jiff::Timestamp,
+) -> Result<String> {
+    let reason = if !policy.0.nudge {
+        Some("nudge off".into())
+    } else if project.finished() || project.status() != project::Status::Active {
+        Some("finished or paused".into())
+    } else if project
+        .coordinator()
+        .is_some_and(|record| record.prime_pending)
+        || agent.is_none_or(|agent| !agent.ready())
+    {
+        Some("agent working".into())
+    } else if idle_lane_lines(project, live.0, live.1).is_none() {
+        Some("lane working".into())
+    } else if let Some(reason) = idle_nudge_gate(project, state, policy.1, now)? {
+        Some(reason)
+    } else if input_clear == Some(false) {
+        Some("input held".into())
+    } else if input_clear.is_none() {
+        Some("input unavailable".into())
+    } else {
+        None
+    };
+    Ok(format!(
+        "last idle nudge: {}; {}",
+        if state.idle_nudge_last.is_empty() {
+            "never"
+        } else {
+            &state.idle_nudge_last
+        },
+        reason.unwrap_or_else(|| "due".into())
+    ))
+}
+
+pub(crate) fn idle_nudge_line(
+    project: &Project,
+    config_dir: &std::path::Path,
+    herdr: &Herdr<'_>,
+) -> Result<String> {
+    let state = steps::load_state(project);
+    let (settings, _) = project.read_project_md()?;
+    let minutes = crate::project::coordinator_settings(config_dir)?.idle_nudge_minutes;
+    let record = project.coordinator();
+    // Without a live view the ticker cannot send; an empty invented view
+    // would misreport a transport failure as an agent or lane still working.
+    let agents = herdr.agent_list()?;
+    let panes = herdr.pane_list()?;
+    let agent = record.as_ref().and_then(|record| {
+        agents
+            .iter()
+            .find(|agent| crate::coordinator::agent_matches(record, agent))
+    });
+    let input_clear = record
+        .as_ref()
+        .and_then(|record| herdr.pane_read_ansi(&record.pane_id, "visible").ok())
+        .map(|screen| crate::talk::coordinator_input_clear(&screen));
+    idle_nudge_status(
+        project,
+        &state,
+        (&settings, minutes),
+        agent,
+        (&agents, &panes),
+        input_clear,
+        jiff::Timestamp::now(),
+    )
 }
 
 fn idle_task_lines(project: &Project) -> Vec<String> {
@@ -1639,6 +1732,7 @@ fn idle_lane_lines(project: &Project, agents: &[Agent], panes: &[Pane]) -> Optio
             !lane.startup_wait_started.is_empty()
                 || lane.prompt_pending
                 || (lane.report_hash.is_empty()
+                    && lane.last_group == thread::Group::Working.token()
                     && matches!(lane.last_state.as_str(), "working" | "blocked"))
         } else {
             let live = thread::live_state(&lane, agents, panes, now);
@@ -1870,6 +1964,11 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     if let Ok((settings, _)) = project.read_project_md() {
         let mut state = steps::load_state(project);
         let before = state.clone();
+        if agent.as_ref().is_some_and(|a| a.agent_status == "working")
+            && !state.idle_nudge_last.is_empty()
+        {
+            state.coordinator_worked_at = project::now();
+        }
         let ready_pane = agent
             .as_ref()
             .filter(|a| a.ready())
@@ -3893,6 +3992,53 @@ mod tests {
 
         state.idle_nudge_last = "2026-01-01T00:06:00Z".into();
         assert!(!idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+        state.coordinator_worked_at = "2026-01-01T00:07:00Z".into();
+        assert!(idle_nudge_due(&f.project, &state, 20, at_thirty).unwrap());
+        state.coordinator_worked_at.clear();
+        crate::ledger::coordinator_command(&f.project).unwrap();
+        assert!(idle_nudge_due(&f.project, &state, 20, jiff::Timestamp::now()).unwrap());
+        state.idle_nudge_last = project::now();
+        assert!(
+            idle_nudge_gate(&f.project, &state, 20, jiff::Timestamp::now())
+                .unwrap()
+                .unwrap()
+                .starts_with("not due until")
+        );
+    }
+
+    #[test]
+    fn idle_nudge_status_explains_the_blocking_check() {
+        let f = fixture(false);
+        let (settings, _) = f.project.read_project_md().unwrap();
+        let now = "2026-01-01T00:30:00Z".parse().unwrap();
+        let state = steps::State {
+            idle_nudge_last: "2026-01-01T00:00:00Z".into(),
+            ..steps::State::default()
+        };
+        let agent = Agent {
+            agent_status: "done".into(),
+            ..Agent::default()
+        };
+        let line = |state: &steps::State, clear| {
+            idle_nudge_status(
+                &f.project,
+                state,
+                (&settings, 20),
+                Some(&agent),
+                (&[], &[]),
+                clear,
+                now,
+            )
+            .unwrap()
+        };
+        assert!(line(&state, Some(true)).ends_with("no turn since last nudge"));
+        let state = steps::State {
+            coordinator_worked_at: "2026-01-01T00:05:00Z".into(),
+            ..state
+        };
+        assert!(line(&state, Some(false)).ends_with("input held"));
+        assert!(line(&state, None).ends_with("input unavailable"));
+        assert!(line(&state, Some(true)).ends_with("due"));
     }
 
     #[test]
@@ -4039,6 +4185,24 @@ mod tests {
         }
         state = steps::load_state(&f.project);
         assert_ne!(state.idle_nudge_last, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn remote_idle_group_does_not_keep_an_old_blocked_state_working() {
+        let f = fixture(false);
+        let lane = thread::allocate(&f.project, |lane| {
+            lane.status = thread::Status::Open;
+            lane.machine = "oci".into();
+            lane.last_state = "blocked".into();
+            lane.last_group = thread::Group::Idle.token().into();
+        })
+        .unwrap();
+        let lines = idle_lane_lines(&f.project, &[], &[]).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("{} is idle", lane.id)))
+        );
     }
 
     #[test]

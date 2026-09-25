@@ -183,6 +183,39 @@ pub(crate) fn check_on_machine(
     .into())
 }
 
+/// Real model probes run concurrently, each with a rooted runner and
+/// independent cache key. Scripted runners keep deterministic call order.
+fn doctor_rows_parallel(
+    env: &Env,
+    layout: &Layout,
+    runner: &dyn sh::Runner,
+    models: &[(&str, &str)],
+    root: &Path,
+) -> Vec<doctor::Row> {
+    if !layout.wrapper().is_file() {
+        return doctor::doctor_rows_with_models(env, layout, runner, models);
+    }
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = models
+            .iter()
+            .map(|&(provider, model)| {
+                scope.spawn(move || {
+                    let real = crate::runner::RealRunner;
+                    let rooted = crate::runner::CwdRunner::new(&real, root);
+                    doctor::provider_row(&Adapter(&rooted), layout, provider, model)
+                })
+            })
+            .collect();
+        let mut rows = doctor::doctor_rows_with(env, layout, runner, &[]);
+        rows.extend(
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("provider probe panicked")),
+        );
+        rows
+    })
+}
+
 /// The pi doctor rows through the plugin's runner, for `doctor`.
 pub(crate) fn doctor_rows_with(
     runner: &dyn crate::runner::Runner,
@@ -195,7 +228,11 @@ pub(crate) fn doctor_rows_with(
         .iter()
         .map(|(provider, model)| (provider.as_str(), model.as_str()))
         .collect();
-    let rows = doctor::doctor_rows_with_models(&env, &layout(root), &Adapter(&rooted), &models);
+    let rows = if runner.is_real() {
+        doctor_rows_parallel(&env, &layout(root), &Adapter(&rooted), &models, root)
+    } else {
+        doctor::doctor_rows_with_models(&env, &layout(root), &Adapter(&rooted), &models)
+    };
     let ok = doctor::healthy(&rows);
     Ok((rows, ok))
 }

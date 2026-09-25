@@ -283,7 +283,18 @@ pub(crate) fn inspect_local(
     report_artifact_stored: bool,
 ) -> Result<Inspection> {
     let text = crate::git::worktree_status_with_ignored(runner, repo, path)?;
-    let (dirty, ignored) = parse_status(&text);
+    inspect_local_status(&text, path, disposable, report_artifact_stored)
+}
+
+/// Decode a status captured in doctor's parallel git batch. The same
+/// classification and kept-data walk is used by explicit removal.
+pub(crate) fn inspect_local_status(
+    text: &str,
+    path: &str,
+    disposable: &[String],
+    report_artifact_stored: bool,
+) -> Result<Inspection> {
+    let (dirty, ignored) = parse_status(text);
     let nested = nested_worktrees(Path::new(path))?;
     let ignored_data = roots(ignored, nested, disposable, report_artifact_stored)
         .into_iter()
