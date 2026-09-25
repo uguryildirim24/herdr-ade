@@ -7,24 +7,29 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-/// The caller's contract, not a command-name or diagnostic allowlist. Use
-/// `Answer` only when *every normal exit* answers the question. Ambiguous probes
-/// (for example SSH checks) must keep `Required`.
+/// The caller's contract, not a command-name or diagnostic allowlist.
+/// Ambiguous probes (for example SSH checks) must keep `Required`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitMeaning {
     Required,
-    Answer,
+    /// The caller checks a postcondition before interpreting a nonzero exit
+    /// (for example a branch removed concurrently). The intermediate exit
+    /// alone is not evidence of failure.
+    Deferred,
     /// The command answered with its documented JSON result or refusal.
     Structured,
     /// Zero means yes; one with empty stderr means no. Every other outcome
     /// is an error. Only for commands with this precise contract (git ancestry).
     Boolean,
+    /// `git merge-tree --write-tree`: exit 1 with conflict diagnostics is a
+    /// valid conflict answer. Other nonzero exits are command failures.
+    MergeTree,
 }
 
 impl ExitMeaning {
     pub(crate) fn answered(self, out: &Output) -> bool {
         out.success()
-            || (self == Self::Answer && out.code.is_some() && !out.timed_out)
+            || (self == Self::Deferred && out.code.is_some() && !out.timed_out)
             || (self == Self::Structured
                 && out.code.is_some()
                 && !out.timed_out
@@ -36,6 +41,7 @@ impl ExitMeaning {
                         })
                 }))
             || (self == Self::Boolean && out.boolean_answer().is_some())
+            || (self == Self::MergeTree && out.merge_tree_conflict())
     }
 }
 
@@ -159,6 +165,12 @@ impl Output {
             Some(1) if self.stderr.is_empty() => Some(false),
             _ => None,
         }
+    }
+
+    pub(crate) fn merge_tree_conflict(&self) -> bool {
+        !self.timed_out
+            && self.code == Some(1)
+            && (self.stdout.contains("CONFLICT (") || self.stderr.contains("CONFLICT ("))
     }
 
     /// stderr when it has text, else stdout, trimmed; for error messages.
