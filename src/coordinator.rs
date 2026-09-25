@@ -1049,6 +1049,23 @@ fn digest_snapshot(
     if crate::talk::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending; finish or clear the draft when ready.\n");
     }
+    if let Some(record) = project.coordinator() {
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+        if let Ok(line) = crate::ticker::idle_nudge_line(project, &ctx.config_dir, &herdr) {
+            let _ = writeln!(out, "\n{line}");
+        }
+    } else {
+        let state = crate::steps::load_state(project);
+        let _ = writeln!(
+            out,
+            "\nlast idle nudge: {}; agent working",
+            if state.idle_nudge_last.is_empty() {
+                "never"
+            } else {
+                &state.idle_nudge_last
+            }
+        );
+    }
 
     if let Ok((settings, _)) = project.read_project_md()
         && !settings.repos.is_empty()
@@ -1672,6 +1689,7 @@ mod tests {
             crate::runner::fake::ok("## main...origin/main [ahead 6, behind 2]\n M file\n"),
         );
         let (text, _) = digest(&world.ctx(), &project, "ha").unwrap();
+        assert!(text.contains("last idle nudge: never"), "{text}");
         assert!(
             text.contains(&format!(
                 "{}: main, dirty, ahead 6, behind 2 origin/main; documents: STATE.md, HANDOFF.md",

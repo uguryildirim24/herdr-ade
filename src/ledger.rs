@@ -39,6 +39,7 @@ enum Line {
     ContextRead { at: String },
     Recovered { kind: String, subject: String },
     CoordinatorNudge { at: String, next: Vec<String> },
+    CoordinatorCommand { at: String },
     CoordinatorRelaunch { at: String, pane: String },
 }
 
@@ -46,6 +47,7 @@ enum Line {
 struct State {
     entries: BTreeMap<String, Entry>,
     context_read: String,
+    coordinator_command: String,
     pending: BTreeSet<(String, String)>,
 }
 
@@ -100,6 +102,11 @@ fn load(project: &Project) -> Result<State> {
             }
             Line::Recovered { kind, subject } => {
                 state.pending.remove(&(kind, subject));
+            }
+            Line::CoordinatorCommand { at } => {
+                if time_cmp(&at, &state.coordinator_command).is_gt() {
+                    state.coordinator_command = at;
+                }
             }
             Line::CoordinatorNudge { .. } | Line::CoordinatorRelaunch { .. } => {}
         }
@@ -329,9 +336,26 @@ pub(crate) fn context_read(project: &Project, at: &str) -> Result<()> {
     append(project, &Line::ContextRead { at: at.into() })
 }
 
-pub(crate) fn latest_context_read(project: &Project) -> Result<String> {
+pub(crate) fn latest_coordinator_turn(project: &Project) -> Result<String> {
     let _lock = lock(project)?;
-    Ok(load(project)?.context_read)
+    let state = load(project)?;
+    Ok(
+        if time_cmp(&state.context_read, &state.coordinator_command).is_gt() {
+            state.context_read
+        } else {
+            state.coordinator_command
+        },
+    )
+}
+
+pub(crate) fn coordinator_command(project: &Project) -> Result<()> {
+    let _lock = lock(project)?;
+    append(
+        project,
+        &Line::CoordinatorCommand {
+            at: jiff::Timestamp::now().to_string(),
+        },
+    )
 }
 
 /// Records a successful automated continue prompt without turning it into a
