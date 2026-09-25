@@ -40,7 +40,11 @@ fn refs(runner: &dyn Runner, repo: &str, remote: Option<&str>) -> Result<BTreeMa
             ],
         )?
     };
-    Ok(output
+    Ok(parse_refs(&output))
+}
+
+fn parse_refs(output: &str) -> BTreeMap<String, String> {
+    output
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -48,7 +52,7 @@ fn refs(runner: &dyn Runner, repo: &str, remote: Option<&str>) -> Result<BTreeMa
             let name = fields.next()?.strip_prefix("refs/heads/")?;
             Some((name.to_string(), sha.to_string()))
         })
-        .collect())
+        .collect()
 }
 
 fn checked_out(runner: &dyn Runner, repo: &str) -> Result<BTreeSet<String>> {
@@ -407,6 +411,32 @@ struct Candidate {
 }
 
 fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
+    // Fetch each distinct remote once, in parallel; sequential ls-remote calls
+    // previously serialized network latency across projects.
+    let mut urls = BTreeSet::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        let (settings, _) = project.read_project_md()?;
+        for row in settings.repos {
+            if Path::new(&row.path).is_dir()
+                && let Some(url) = row.publish_url.or(row.push_remote)
+            {
+                urls.insert((row.path, url));
+            }
+        }
+    }
+    let commands: Vec<_> = urls
+        .iter()
+        .map(|(repo, url)| Cmd::new("git", TIMEOUT).args(["-C", repo, "ls-remote", "--heads", url]))
+        .collect();
+    let mut remotes = BTreeMap::new();
+    for ((repo, url), output) in urls.into_iter().zip(ctx.runner.run_parallel(&commands)) {
+        let output = output?;
+        if !output.success() {
+            bail!("git ls-remote --heads in {repo}: {}", output.error_text());
+        }
+        remotes.insert((repo, url), parse_refs(&output.stdout));
+    }
     let mut result = Vec::new();
     let mut merged_by_repo = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -421,10 +451,10 @@ fn candidates(ctx: &Ctx) -> Result<Vec<Candidate>> {
             let local = refs(ctx.runner, &row.path, None)?;
             let in_use = checked_out(ctx.runner, &row.path)?;
             let remote_url = row.publish_url.as_ref().or(row.push_remote.as_ref());
-            let remote = match remote_url {
-                Some(url) => refs(ctx.runner, &row.path, Some(url))?,
-                None => BTreeMap::new(),
-            };
+            let remote = remote_url
+                .and_then(|url| remotes.get(&(row.path.clone(), url.clone())))
+                .cloned()
+                .unwrap_or_default();
             let mut names: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
             names.retain(|name| harness_ref(name) && !in_use.contains(name));
             if names.is_empty() {
