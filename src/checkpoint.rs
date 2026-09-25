@@ -1294,6 +1294,11 @@ fn pickup_project(
         .map_err(|e| anyhow::anyhow!("herdr agent list: {}", e.message))?;
     let agents = listed["agents"].as_array().cloned().unwrap_or_default();
     let by_pane = by_key(&agents, "pane_id");
+    let panes = h
+        .call(&["pane", "list"], CALL)
+        .map_err(|e| anyhow::anyhow!("herdr pane list: {}", e.message))?;
+    let panes = panes["panes"].as_array().cloned().unwrap_or_default();
+    let panes_by_id = by_key(&panes, "pane_id");
     let now = jiff::Timestamp::now();
     let (mut relinked, mut already) = (Vec::new(), Vec::new());
     let mut parked = Vec::new();
@@ -1350,7 +1355,14 @@ fn pickup_project(
         }
         let live = by_pane.get(&t.pane_id).filter(|a| {
             let name = s(a, "name");
-            t.agent_name.is_empty() || name.is_empty() || name == t.agent_name
+            s(a, "workspace_id") == t.workspace_id
+                && s(a, "tab_id") == t.tab_id
+                && (t.agent_name.is_empty() || name.is_empty() || name == t.agent_name)
+                && panes_by_id.get(&t.pane_id).is_some_and(|p| {
+                    s(p, "workspace_id") == t.workspace_id
+                        && s(p, "tab_id") == t.tab_id
+                        && s(p, "cwd") == t.cwd
+                })
         });
         let Some(a) = live else {
             gone.push(t);
@@ -1699,9 +1711,14 @@ mod tests {
         })
         .unwrap();
         *fx.world.agents.borrow_mut() = r#"[
-            {"pane_id":"w1:p11","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"working"},
-            {"pane_id":"w1:p12","tab_id":"w1:t3","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
+            {"pane_id":"w1:p11","tab_id":"w1:t11","workspace_id":"w1","name":"","agent":"claude","agent_status":"working"},
+            {"pane_id":"w1:p12","tab_id":"w1:t12","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]"#
             .into();
+        *fx.world.panes.borrow_mut() = format!(
+            r#"[{{"pane_id":"w1:p11","tab_id":"w1:t11","workspace_id":"w1","cwd":"{}"}},{{"pane_id":"w1:p12","tab_id":"w1:t12","workspace_id":"w1","cwd":"{}"}}]"#,
+            thread::load(&fx.project, &live).unwrap().cwd,
+            thread::load(&fx.project, &linked).unwrap().cwd
+        );
         let ctx = fx.world.ctx();
         let dry = pickup(
             &ctx,
@@ -1751,6 +1768,21 @@ mod tests {
         for verb in ["agent start", "agent prompt", "tab create", "pane run"] {
             assert_eq!(fx.world.runner.count(verb), 0, "pickup ran `{verb}`");
         }
+        // A reused pane id with the wrong working directory is not our lane.
+        *fx.world.panes.borrow_mut() = r#"[{"pane_id":"w1:p11","tab_id":"w1:t11","workspace_id":"w1","cwd":"/other/project"}]"#.into();
+        let out = pickup(
+            &ctx,
+            PickupArgs {
+                slug: Some("demo"),
+                pane: Some("w1:p9"),
+                dry_run: false,
+                all: false,
+                start: false,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("gone (not live"), "{out}");
+        assert_eq!(fx.world.runner.count("pane report-metadata w1:p11"), 1);
     }
 
     #[test]

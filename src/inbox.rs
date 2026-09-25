@@ -208,7 +208,7 @@ pub(crate) fn seen(project: &Project) -> BTreeSet<String> {
     project::read_json(&project.state_dir().join("inbox-seen.json")).unwrap_or_default()
 }
 
-/// Records that `context` showed these items, so they are nudged once only.
+/// Records that `context` showed these items, so they are announced once only.
 pub(crate) fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
