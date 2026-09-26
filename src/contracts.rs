@@ -69,7 +69,7 @@ pub(crate) struct LaneCard {
     pub(crate) role: String,
     pub(crate) kind: String,
     pub(crate) pane_id: String,
-    /// The renameable label the board shows.
+    /// The renameable machine label.
     pub(crate) machine_label: String,
     /// The stable profile id the Mac supplied (SPEC-remote §4.1).
     pub(crate) machine_id: String,
@@ -126,7 +126,7 @@ pub(crate) struct Launch {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) recipe_request: String,
     pub(crate) reason: String,
-    /// The compact `<job> runs on <plain>` sentence for the board's
+    /// The compact `<job> runs on <plain>` sentence for the
     /// `ade_last` token (D17 item 14), stored on the record so the ticker
     /// never rereads live config.
     pub(crate) compact_reason: String,

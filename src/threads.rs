@@ -4009,20 +4009,6 @@ pub(crate) fn report_artifact_stored(project: &Project, record: &Thread) -> Resu
     Ok(false)
 }
 
-/// Interpret the inspection already captured by doctor's machine-wide SSH
-/// script, using the same keep/disposable rules as explicit worktree removal.
-pub(crate) fn inspect_worktree_from_snapshot(
-    ctx: &Ctx,
-    project: &Project,
-    record: &Thread,
-    snapshot: &str,
-) -> Result<crate::worktrees::Inspection> {
-    let stored = report_artifact_stored(project, record)?;
-    let disposable = crate::worktrees::disposable(&ctx.config_dir, project, &record.repo)?;
-    let key = crate::thread::sha256_hex(record.worktree_path.as_bytes());
-    crate::worktrees::inspect_batched(snapshot, &key, &disposable, stored)
-}
-
 pub(crate) fn inspect_worktree_for_removal(
     ctx: &Ctx,
     project: &Project,
@@ -4244,7 +4230,7 @@ fn remove_worktree_force_ignored(ctx: &Ctx, project: &Project, record: &Thread) 
 }
 
 /// Never forces. Git's refusal is reported unchanged.
-fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+pub(crate) fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if managed_git_folder(project, record) {
         match std::fs::remove_dir_all(&record.worktree_path) {
             Ok(()) => {}

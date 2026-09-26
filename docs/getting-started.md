@@ -68,6 +68,6 @@ herdr-ade ticker status
 - **A lane failed, blocked, or got stuck:** inspect `thread show`, then use `thread retry --reason "<why>"`. It replaces the process; only automatic retries are bounded. Use `thread cancel` to stop it or `thread rebind` when its verified process is already live elsewhere.
 - **A provider is not ready:** use the provider's login flow on the same machine and rerun `doctor`.
 - **The coordinator needs its instructions again:** run `open <project> --reprime`.
-- **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and `doctor` lists what was kept; only configured rebuildable paths are discarded. Removal is not forced.
+- **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and keeps its worktree; only configured rebuildable paths are discarded. Removal is not forced.
 
 See [Operations](operations.md) for records, routing, pile reviews, remote lanes, and the complete command surface.
