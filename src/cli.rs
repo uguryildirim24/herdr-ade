@@ -188,7 +188,6 @@ enum Command {
     /// (run by the courier helper on the box)
     #[command(hide = true)]
     Recover,
-    /// Handle a plugin event using its Herdr identity envelope
     #[command(hide = true)]
     Event { id: String },
     /// Run inside a plugin popup pane
@@ -1077,6 +1076,10 @@ pub fn run() -> Result<()> {
         machine_outcome(&result_command),
         result_data,
     );
+    // A running herdr server may still fire the old manifest until reload.
+    if matches!(&cli.command, Command::Event { id } if id == "review-advance") {
+        return Ok(crate::output::finish_success()?);
+    }
     let mut leaf = &matches;
     let mut explicit_slug = None;
     loop {
@@ -1766,6 +1769,8 @@ fn dispatch_with_start(
         Command::Action { id } => actions::run_action(&ctx, &id),
         Command::Recover => crate::ops::recover_box(&ctx),
         Command::Pane { id } => actions::run_pane(&ctx, &id),
+        Command::Event { id } if id == "review-advance" => Ok(()),
+        Command::Event { id } => bail!("unknown plugin event `{id}`"),
         Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
         Command::Waiting {
             class,
@@ -1785,19 +1790,6 @@ fn dispatch_with_start(
             binding,
             phase,
         } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
-        Command::Event { id } => match id.as_str() {
-            "review-advance" => {
-                for slug in project::list_slugs(&ctx.root) {
-                    let project = Project::load(&ctx.root, &slug)?;
-                    if project.status() == project::Status::Active {
-                        crate::review::tick(&ctx, &project)?;
-                    }
-                }
-                Ok(())
-            }
-
-            _ => bail!("unknown plugin event `{id}`"),
-        },
         Command::Doctor {
             session,
             timings,
@@ -2141,9 +2133,6 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["herdr-ade", "plan", "show", "--project", "demo"]).is_err());
-        assert!(
-            Cli::try_parse_from(["herdr-ade", "event", "review-advance"]).is_ok(),
-            "the manifest's event-only command must remain valid"
-        );
+        assert!(Cli::try_parse_from(["herdr-ade", "event", "review-advance"]).is_ok());
     }
 }
