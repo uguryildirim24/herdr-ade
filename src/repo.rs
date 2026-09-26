@@ -93,9 +93,10 @@ impl<'a> Git<'a> {
             .runner
             .run(&self.cmd_in(&self.repo, &["merge-tree", "--write-tree", into, other]))?;
         if out.merge_tree_conflict() {
-            return Err(crate::refusal::error(format!(
-                "merge_conflict: {other} does not merge cleanly into {into}"
-            )));
+            return Err(crate::refusal::error(
+                format!("merge_conflict: {other} does not merge cleanly into {into}"),
+                "resolve the merge conflict in the integration repository, then retry the merge",
+            ));
         }
         if !out.success() {
             bail!(

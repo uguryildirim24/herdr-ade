@@ -198,7 +198,13 @@ pub(crate) fn retire(
     reason: &str,
 ) -> Result<Retirement> {
     if reason.trim().is_empty() {
-        bail!("note_retirement: a reason is required");
+        return Err(crate::refusal::error(
+            "note_retirement: a reason is required",
+            format!(
+                "ha note retire {} {id} --request {request} --reason \"<reason>\"",
+                project.slug
+            ),
+        ));
     }
     let reference = if request.starts_with("request:") {
         request.to_string()
@@ -209,10 +215,19 @@ pub(crate) fn retire(
     let _replacement_lock = replacement_lock(project)?;
     let _lock = project.lock()?;
     if !read(project).iter().any(|note| note.id == id) {
-        bail!("note_retirement: no note `{id}` exists");
+        return Err(crate::refusal::error(
+            format!("note_retirement: no note `{id}` exists"),
+            format!(
+                "ha note add {} \"<note>\" --kind memory --request {request}",
+                project.slug
+            ),
+        ));
     }
     if replacement_map(&rows(project)).contains_key(id) {
-        bail!("note_retirement: `{id}` is already replaced or retired");
+        return Err(crate::refusal::error(
+            format!("note_retirement: `{id}` is already replaced or retired"),
+            format!("ha context {}", project.slug),
+        ));
     }
     let record = Retirement {
         id: id.to_string(),
@@ -254,7 +269,17 @@ pub(crate) fn add(
     tasks: Vec<String>,
 ) -> Result<Note> {
     if text.trim().is_empty() {
-        return Err(crate::refusal::error("note_text: a note is required"));
+        return Err(crate::refusal::error(
+            "note_text: a note is required",
+            format!(
+                "ha note add {} \"<note>\" --kind {} --request {request}",
+                project.slug,
+                match kind {
+                    Kind::Memory => "memory",
+                    Kind::Instruction => "instruction",
+                }
+            ),
+        ));
     }
     let reference = if request.starts_with("request:") {
         request.to_string()
@@ -271,11 +296,17 @@ pub(crate) fn add(
     let _replacement_lock = replaces.map(|_| replacement_lock(project)).transpose()?;
     if let Some(old) = replaces {
         if !target_exists(project, old) {
-            bail!("note_replacement: no note `{old}` exists");
+            return Err(crate::refusal::error(
+                format!("note_replacement: no note `{old}` exists"),
+                format!("ha context {}", project.slug),
+            ));
         }
         let rows = rows(project);
         if replacement_map(&rows).contains_key(old) {
-            bail!("note_replacement: `{old}` already has a replacement");
+            return Err(crate::refusal::error(
+                format!("note_replacement: `{old}` already has a replacement"),
+                format!("ha context {}", project.slug),
+            ));
         }
     }
     let _lock = project.lock()?;

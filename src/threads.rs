@@ -188,7 +188,13 @@ fn start_with_ticker(
         role,
         "lane" | "reviewer" | "critic" | "drafter" | "research" | "planner"
     ) {
-        bail!("workflow_unknown: `{role}` does not name a lane instruction set");
+        return Err(crate::refusal::error(
+            format!("workflow_unknown: `{role}` does not name a lane instruction set"),
+            format!(
+                "ha thread start {} --workflow lane --job <job> --task-file <file>",
+                project.slug
+            ),
+        ));
     }
     // A box lane still commits and pushes from the Mac clone, so every
     // explicit repository is a local path and follows the same allowlist,
@@ -197,10 +203,32 @@ fn start_with_ticker(
         Some(repo) => repo,
         None => match settings.repos.as_slice() {
             [only] => &only.path,
-            [] => bail!(
-                "repo_required: this project has no listed repository; pass --repo after listing one"
-            ),
-            _ => bail!("repo_ambiguous: this project lists several repositories; pass --repo"),
+            [] => {
+                return Err(crate::refusal::error(
+                    "repo_required: this project has no listed repository; pass --repo after listing one",
+                    format!(
+                        "ha thread start {} --repo <repository-path> --job <job> --task-file <file>",
+                        project.slug
+                    ),
+                ));
+            }
+            _ => {
+                return Err(crate::refusal::error(
+                    format!(
+                        "repo_ambiguous: this project lists several repositories; pass --repo: {}",
+                        settings
+                            .repos
+                            .iter()
+                            .map(|repo| repo.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    format!(
+                        "ha thread start {} --repo {} --job <job> --task-file <file>",
+                        project.slug, settings.repos[0].path
+                    ),
+                ));
+            }
         },
     };
     let repo = std::fs::canonicalize(requested_repo)
@@ -208,9 +236,15 @@ fn start_with_ticker(
         .to_string_lossy()
         .into_owned();
     if !crate::harness::allowed_repo(&settings, &ctx.config_dir, &repo)? {
-        bail!(
-            "repo_not_listed: {repo} is not listed in `repos` in PROJECT.md and is not a harness repository"
-        );
+        return Err(crate::refusal::error(
+            format!(
+                "repo_not_listed: {repo} is not listed in `repos` in PROJECT.md and is not a harness repository"
+            ),
+            format!(
+                "ha thread start {} --repo <listed-repository-path> --job <job> --task-file <file>",
+                project.slug
+            ),
+        ));
     }
     let listed = settings.repos.iter().find(|row| {
         std::fs::canonicalize(&row.path).is_ok_and(|path| path.to_string_lossy() == repo)
@@ -226,7 +260,13 @@ fn start_with_ticker(
             args.recipe_basis.as_deref().unwrap_or_default(),
         )?),
         None if args.recipe_basis.is_some() => {
-            bail!("recipe_basis_without_recipe: --basis is only valid with --recipe")
+            return Err(crate::refusal::error(
+                "recipe_basis_without_recipe: --basis is only valid with --recipe",
+                format!(
+                    "ha thread start {} --job <job> --task-file <file> --recipe <recipe> --basis \"<Rolf quote>\"",
+                    project.slug
+                ),
+            ));
         }
         None => None,
     };
@@ -1041,9 +1081,10 @@ fn place_ade_worktree(
         record.base.clone()
     };
     if crate::git::branch_head(runner, &record.repo, &integration)?.is_none() {
-        return Err(crate::refusal::error(format!(
-            "integration_branch_required: `{integration}` is not a local branch"
-        )));
+        return Err(crate::refusal::error(
+            format!("integration_branch_required: `{integration}` is not a local branch"),
+            "ha thread start <project> --base <existing-branch> --job <job> --task-file <file>",
+        ));
     }
     let branch = thread::branch_name(&project.slug, &record.id, &record.title);
     let task = std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
@@ -1509,15 +1550,24 @@ fn retry_with_ticker(
         });
     }
     if record.kind == Kind::Adopted {
-        bail!("retry_adopted: an adopted process has no launch recipe; use `thread rebind`");
+        return Err(crate::refusal::error(
+            "retry_adopted: an adopted process has no launch recipe; use `thread rebind`",
+            format!("ha thread rebind {slug} {id} --pane <verified-pane>"),
+        ));
     }
     if record.status == Status::Resolved {
-        bail!("retry_resolved: {id} is resolved");
+        return Err(crate::refusal::error(
+            format!("retry_resolved: {id} is resolved"),
+            format!("ha thread show {slug} {id}"),
+        ));
     }
     if record.parked {
         let reason = reason.trim();
         if reason.is_empty() {
-            bail!("retry_reason_missing: say why the parked lane is needed again");
+            return Err(crate::refusal::error(
+                "retry_reason_missing: say why the parked lane is needed again",
+                format!("ha thread retry {slug} {id} --reason \"<why needed again>\""),
+            ));
         }
         // A correction to sealed work keeps the same branch and attempt.
         // Routing recovery is only for a failed start or failed work.
@@ -1534,7 +1584,10 @@ fn retry_with_ticker(
     }
     let reason = reason.trim();
     if reason.is_empty() {
-        bail!("retry_reason_missing: say why the attempt is being replaced");
+        return Err(crate::refusal::error(
+            "retry_reason_missing: say why the attempt is being replaced",
+            format!("ha thread retry {slug} {id} --reason \"<why replace attempt>\""),
+        ));
     }
     let view = require_session(ctx, &project)?;
     let herdr = view.herdr.on_machine(record.machine_route());
@@ -1687,7 +1740,10 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if record.status == Status::Resolved {
-        bail!("rebind_resolved: {id} is resolved");
+        return Err(crate::refusal::error(
+            format!("rebind_resolved: {id} is resolved"),
+            format!("ha thread show {slug} {id}"),
+        ));
     }
     let view = require_session(ctx, &project)?;
     let herdr = view.herdr.on_machine(record.machine_route());
@@ -1788,7 +1844,10 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     let project = Project::load(&ctx.root, slug)?;
     let reason = reason.trim();
     if reason.is_empty() {
-        bail!("cancel_reason_missing: say why {id} is being stopped");
+        return Err(crate::refusal::error(
+            format!("cancel_reason_missing: say why {id} is being stopped"),
+            format!("ha thread cancel {slug} {id} --reason \"<why stop>\""),
+        ));
     }
     crate::review::require_resolvable(&project, id)?;
     let before = thread::load(&project, id)?;
@@ -2186,8 +2245,18 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         bail!("the text is empty");
     }
     match record.status {
-        Status::Resolved => return Err(crate::refusal::error(format!("{id} is resolved"))),
-        Status::Failed => return Err(crate::refusal::error(format!("{id} is gone"))),
+        Status::Resolved => {
+            return Err(crate::refusal::error(
+                format!("{id} is resolved"),
+                format!("ha thread show {slug} {id}"),
+            ));
+        }
+        Status::Failed => {
+            return Err(crate::refusal::error(
+                format!("{id} is gone"),
+                format!("ha thread retry {slug} {id} --reason \"<why replace attempt>\""),
+            ));
+        }
         Status::Starting | Status::Open => {}
     }
     // The brief and every follow-up have one ordered delivery path. Once one
@@ -2216,9 +2285,17 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         record = thread::update_checked(&project, id, |thread| {
             match thread.status {
                 Status::Resolved => {
-                    return Err(crate::refusal::error(format!("{id} is resolved")));
+                    return Err(crate::refusal::error(
+                        format!("{id} is resolved"),
+                        format!("ha thread show {slug} {id}"),
+                    ));
                 }
-                Status::Failed => return Err(crate::refusal::error(format!("{id} is gone"))),
+                Status::Failed => {
+                    return Err(crate::refusal::error(
+                        format!("{id} is gone"),
+                        format!("ha thread retry {slug} {id} --reason \"<why replace attempt>\""),
+                    ));
+                }
                 Status::Starting | Status::Open => {}
             }
             if thread.status == Status::Starting
@@ -2341,15 +2418,18 @@ pub fn prompt_state(
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread retry`)", record.id))?;
     match agent.agent_status.as_str() {
         "blocked" if !blocked_error_resumable || record.error.is_empty() => {
-            Err(crate::refusal::error(format!(
-                "agent_blocked: {} is waiting on the user in its pane ({})",
-                record.id, record.pane_id
-            )))
+            Err(crate::refusal::error(
+                format!(
+                    "agent_blocked: {} is waiting on the user in its pane ({})",
+                    record.id, record.pane_id
+                ),
+                "wait for the user to answer in the agent pane; then retry the command",
+            ))
         }
-        "unknown" => Err(crate::refusal::error(format!(
-            "{}'s agent state is unknown; not sending",
-            record.id
-        ))),
+        "unknown" => Err(crate::refusal::error(
+            format!("{}'s agent state is unknown; not sending", record.id),
+            "wait for the agent process to report a known state; a live state update clears this refusal",
+        )),
         state => Ok(state.to_string()),
     }
 }
@@ -2370,28 +2450,34 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
     if reason.is_empty() {
         return Err(crate::refusal::error(
             "attest_reason_missing: --reason is required",
+            "ha thread attest <project> <thread> --reason \"<reason>\"",
         ));
     }
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if record.status != Status::Resolved {
-        return Err(crate::refusal::error(format!(
-            "attest_not_resolved: {id} is not resolved"
-        )));
+        return Err(crate::refusal::error(
+            format!("attest_not_resolved: {id} is not resolved"),
+            format!("ha thread show {slug} {id}"),
+        ));
     }
     if !record.cancellation_reason.is_empty() {
-        return Err(crate::refusal::error(format!(
-            "attest_cancelled: {id} was cancelled"
-        )));
+        return Err(crate::refusal::error(
+            format!("attest_cancelled: {id} was cancelled"),
+            format!("ha thread show {slug} {id}"),
+        ));
     }
     let attempt = record.attempt.max(1);
     if crate::events::checked(&project)?
         .iter()
         .any(|event| event.thread == id && event.attempt == attempt && event.payload.done.is_some())
     {
-        return Err(crate::refusal::error(format!(
-            "attest_already_done: {id} already has sealed done evidence for attempt {attempt}"
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "attest_already_done: {id} already has sealed done evidence for attempt {attempt}"
+            ),
+            format!("ha thread show {slug} {id}"),
+        ));
     }
 
     let draft_path =
@@ -2402,23 +2488,29 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         .chain(std::iter::once(&historical_path))
         .find(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
         .ok_or_else(|| {
-            crate::refusal::error(format!(
-                "attest_report_missing: {} has no preserved report draft",
-                id
-            ))
+            crate::refusal::error(
+                format!(
+                    "attest_report_missing: {} has no preserved report draft",
+                    id
+                ),
+                format!("ha thread show {slug} {id}"),
+            )
         })?;
     let bytes = std::fs::read(report_path)
         .with_context(|| format!("could not read report {}", report_path.display()))?;
     let actual_hash = thread::sha256_hex(&bytes);
     if record.report_hash.is_empty() || actual_hash != record.report_hash {
-        return Err(crate::refusal::error(format!(
-            "attest_report_mismatch: stored report hashes to {actual_hash}, record names {}",
-            if record.report_hash.is_empty() {
-                "no hash"
-            } else {
-                &record.report_hash
-            }
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "attest_report_mismatch: stored report hashes to {actual_hash}, record names {}",
+                if record.report_hash.is_empty() {
+                    "no hash"
+                } else {
+                    &record.report_hash
+                }
+            ),
+            format!("ha thread show {slug} {id}"),
+        ));
     }
 
     let git_folder = [&record.worktree_path, &record.cwd]
@@ -2433,7 +2525,10 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         .coordinator()
         .filter(|coordinator| !coordinator.pane_id.is_empty())
         .ok_or_else(|| {
-            crate::refusal::error("attest_coordinator_missing: project has no coordinator binding")
+            crate::refusal::error(
+                "attest_coordinator_missing: project has no coordinator binding",
+                "wait for the project coordinator to bind a pane before attesting",
+            )
         })?;
     let coordinator_name = if coordinator.agent_name.is_empty() {
         coordinator.pane_id.clone()
@@ -2668,11 +2763,14 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         if removal_refusal.is_none() {
             let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
             if !inspection.dirty.is_empty() {
-                return Err(crate::refusal::error(format!(
-                    "worktree_dirty: uncommitted changes in {}; not removing ({})",
-                    record.worktree_path,
-                    inspection.dirty.join(", ")
-                )));
+                return Err(crate::refusal::error(
+                    format!(
+                        "worktree_dirty: uncommitted changes in {}; not removing ({})",
+                        record.worktree_path,
+                        inspection.dirty.join(", ")
+                    ),
+                    format!("ha thread show {slug} {id}"),
+                ));
             }
             removal_refusal = inspection.ignored_reason(&record.worktree_path);
         }
