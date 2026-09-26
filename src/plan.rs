@@ -620,18 +620,16 @@ fn with_subtasks(
 fn has_own_work(
     project: &Project,
     step: &PlanStep,
-    evidence: &crate::task::EvidenceSnapshot,
+    _evidence: &crate::task::EvidenceSnapshot,
 ) -> bool {
     !step.threads.is_empty()
         || crate::task::list_with_errors(project)
             .0
             .into_iter()
-            .filter(|task| {
-                task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
-            })
             .any(|task| {
-                crate::task::view_with_evidence(project, task, evidence).state
-                    != crate::task::State::Dropped
+                task.dropped.is_empty()
+                    && (task.plan_step.as_deref() == Some(step.id.as_str())
+                        || step.tasks.contains(&task.id))
             })
 }
 
