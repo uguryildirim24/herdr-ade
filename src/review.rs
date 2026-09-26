@@ -82,6 +82,9 @@ pub(crate) struct Review {
     pub close: bool,
     pub prune: bool,
     pub attention: String,
+    /// Review-owned wake-ups survive resolution of the reviewer and members.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notices: Vec<crate::steps::Notice>,
 }
 
 pub(crate) fn dir(project: &Project) -> PathBuf {
@@ -103,7 +106,7 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Review> {
     }
     Ok(record)
 }
-fn save(project: &Project, record: &Review) -> Result<()> {
+pub(crate) fn save(project: &Project, record: &Review) -> Result<()> {
     std::fs::create_dir_all(dir(project))?;
     project::write_atomic(
         &path(project, &record.id),
@@ -113,6 +116,16 @@ fn save(project: &Project, record: &Review) -> Result<()> {
     std::fs::File::open(project.state_dir())?.sync_all()?;
     Ok(())
 }
+pub(crate) fn mark_notice_submitted(project: &Project, id: &str, line: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut review = load(project, id)?;
+    if let Some(notice) = review.notices.iter_mut().find(|n| n.line == line) {
+        notice.submitted = true;
+        save(project, &review)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn list(project: &Project) -> Result<Vec<Review>> {
     let entries = match std::fs::read_dir(dir(project)) {
         Ok(entries) => entries,
@@ -137,12 +150,34 @@ pub(crate) fn list(project: &Project) -> Result<Vec<Review>> {
     });
     Ok(records)
 }
+fn queue_notice(review: &mut Review, line: String) {
+    if !review.notices.iter().any(|n| n.line == line) {
+        review.notices.push(crate::steps::Notice {
+            line,
+            submitted: false,
+        });
+    }
+}
+
+fn needs_coordinator(project: &Project, review: &mut Review, reason: &str) -> Result<()> {
+    let attention = crate::steps::short_error(reason);
+    review.attention = reason.into();
+    queue_notice(
+        review,
+        format!(
+            "REVIEW {} needs you: {attention} — next: ha review retry {}",
+            review.id, project.slug
+        ),
+    );
+    save(project, review)
+}
+
 fn operation_lock(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
     let file = lock_file(ctx, repo)?;
     file.lock()?;
     Ok(file)
 }
-fn try_operation_lock(ctx: &Ctx, repo: &str) -> Result<Option<std::fs::File>> {
+pub(crate) fn try_operation_lock(ctx: &Ctx, repo: &str) -> Result<Option<std::fs::File>> {
     let file = lock_file(ctx, repo)?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
@@ -534,6 +569,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         close: false,
         prune: false,
         attention: String::new(),
+        notices: Vec::new(),
     };
     save(project, &review)?;
     drop(allocation);
@@ -824,6 +860,14 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         if reviewer.status == Status::Resolved && !reviewer.cancellation_reason.is_empty() {
             bail!("reviewer was cancelled; use review retry or review cancel");
         }
+        if reviewer.status == Status::Failed && !reviewer.recovery_pending {
+            needs_coordinator(
+                project,
+                review,
+                &format!("reviewer {} failed: {}", reviewer.id, reviewer.error),
+            )?;
+            return Ok(());
+        }
         // Recheck a historical refusal caused by the old exact gate-list check.
         let Some(event) = sealed(&events, &reviewer).filter(|e| {
             e.id != review.reviewer_after
@@ -868,7 +912,7 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             Err(error) => {
                 review.checked_event = event.id.clone();
                 review.attention = format!("{error:#}");
-                save(project, review)?;
+                needs_coordinator(project, review, &review.attention.clone())?;
                 return Err(error);
             }
         };
@@ -893,6 +937,13 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             .is_some_and(|v| v.verdict == "REJECT")
         {
             review.phase = Phase::Rejected;
+            let reason = review
+                .verdict
+                .as_ref()
+                .map(|v| v.without.values().cloned().collect::<Vec<_>>().join("; "))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "reviewer rejected the pile".into());
+            queue_notice(review, format!("REVIEW {} rejected: {reason}", review.id));
             // Write barriers before closing the review so a crash cannot return
             // unchanged rejected lanes to automatic review.
             defer_members(project, review)?;
@@ -1065,6 +1116,26 @@ fn land_with_install(
         save(project, review)?;
     }
     review.phase = Phase::Complete;
+    let members = review
+        .members
+        .iter()
+        .filter(|m| !excluded(review, &m.thread))
+        .map(|m| m.thread.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let published = if review.push_remote.is_some() {
+        ", pushed"
+    } else {
+        ""
+    };
+    queue_notice(
+        review,
+        format!(
+            "REVIEW {} merged {members} ({}{published})",
+            review.id,
+            &candidate[..candidate.len().min(7)]
+        ),
+    );
     review.attention.clear();
     save(project, review)?;
     project::refresh_page(project)
