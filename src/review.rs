@@ -138,6 +138,19 @@ pub(crate) fn list(project: &Project) -> Result<Vec<Review>> {
     Ok(records)
 }
 fn operation_lock(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
+    let file = lock_file(ctx, repo)?;
+    file.lock()?;
+    Ok(file)
+}
+fn try_operation_lock(ctx: &Ctx, repo: &str) -> Result<Option<std::fs::File>> {
+    let file = lock_file(ctx, repo)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+fn lock_file(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
     let root = ctx.root.join(".review-locks");
     std::fs::create_dir_all(&root)?;
     let repo = repo_identity(repo);
@@ -146,7 +159,6 @@ fn operation_lock(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
         .truncate(false)
         .write(true)
         .open(root.join(thread::sha256_hex(repo.to_string_lossy().as_bytes())))?;
-    file.lock()?;
     Ok(file)
 }
 /// Read Git's worktree pointers without invoking Git on idle ticker passes.
@@ -1130,7 +1142,9 @@ pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: boo
         }
         let done = event.payload.done.as_ref().expect("sealed done");
         let row = repository(ctx, project, Some(&lane.repo))?;
-        let _lock = operation_lock(ctx, &row.path)?;
+        let Some(_lock) = try_operation_lock(ctx, &row.path)? else {
+            continue;
+        };
         let git = Git::new(ctx.runner, &row.path);
         let tip = if let Some(tip) = heads.get(&row.path) {
             tip.clone()
@@ -1220,7 +1234,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     }
     let mut first = None;
     for old in list(project)?.into_iter().filter(|r| !r.phase.closed()) {
-        let _lock = operation_lock(ctx, &old.repo)?;
+        let Some(_lock) = try_operation_lock(ctx, &old.repo)? else {
+            continue;
+        };
         let mut record = load(project, &old.id)?;
         if let Err(error) = advance(ctx, project, &mut record) {
             record.attention = format!("{error:#}");
@@ -1253,7 +1269,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             }) {
                 continue;
             }
-            let _lock = operation_lock(ctx, &repo)?;
+            let Some(_lock) = try_operation_lock(ctx, &repo)? else {
+                continue;
+            };
             if active_for_repo(ctx, &repo)?.is_none()
                 && let Err(error) =
                     start_locked(ctx, project, repository(ctx, project, Some(&repo))?)

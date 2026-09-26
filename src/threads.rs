@@ -146,11 +146,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     start_with_ticker(ctx, slug, args, ticker::start, None, true)
 }
 
-/// Starts a thread while `review` holds its lock. This must not wait for
-/// a ticker replacement: the running ticker may itself be waiting for that
-/// lock. Ordinary starts still replace a stale ticker through [`start`].
+/// Place the reviewer while `review` holds its lock. The ticker launches the
+/// durable pending attempt on its next pass, outside the repository lock.
 pub(crate) fn start_during_advance(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::ensure, None, true)
+    start_with_ticker(ctx, slug, args, ticker::ensure, None, false)
 }
 
 fn start_with_ticker(

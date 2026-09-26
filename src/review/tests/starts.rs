@@ -19,6 +19,112 @@ fn repository_worktrees_share_one_review_lock() {
 }
 
 #[test]
+fn plugin_manifest_has_no_review_event() {
+    let manifest: toml::Value = toml::from_str(include_str!("../../../herdr-plugin.toml")).unwrap();
+    assert!(manifest.get("events").is_none());
+}
+
+#[test]
+fn ticker_skips_locked_pile_then_advances_after_release() {
+    let fx = configured();
+    lane(&fx, 1);
+    project::write_atomic(
+        &fx.project.state_dir().join("reviews-enabled"),
+        b"enabled\n",
+    )
+    .unwrap();
+    let held = operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap()).unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert!(list(&fx.project).unwrap().is_empty());
+    drop(held);
+
+    // Recover an already allocated reviewer rather than placing a new pane.
+    let reviewer = fx.thread("pile reviewer");
+    thread::update(&fx.project, &reviewer, |t| {
+        t.role = "reviewer".into();
+        t.review_id = "review-1".into();
+    })
+    .unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_eq!(
+        list(&fx.project).unwrap()[0].reviewer.as_deref(),
+        Some(reviewer.as_str())
+    );
+}
+
+#[test]
+fn reviewer_placement_leaves_launch_pending_and_releases_the_lock() {
+    let fx = configured();
+    lane(&fx, 1);
+    *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+    fx.world.runner.on("HERDR_ADE_LAUNCH", crate::runner::fake::ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#));
+    let review = start(&fx.world.ctx(), "demo", None).unwrap().unwrap();
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    assert!(
+        reviewer.prompt_pending,
+        "ticker must own the pending launch"
+    );
+    let held = try_operation_lock(&fx.world.ctx(), &review.repo).unwrap();
+    assert!(held.is_some(), "review lock must be free before launch");
+    drop(held);
+    // A second ticker pass can enter while startup remains pending.
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_eq!(list(&fx.project).unwrap()[0].reviewer, review.reviewer);
+}
+
+#[test]
+fn historical_read_skips_a_locked_repository() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    thread::update(&fx.project, &id, |t| t.status = Status::Resolved).unwrap();
+    let held = operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap()).unwrap();
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert!(
+        thread::load(&fx.project, &id)
+            .unwrap()
+            .historical_seal
+            .is_empty()
+    );
+    drop(held);
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert!(
+        !thread::load(&fx.project, &id)
+            .unwrap()
+            .historical_seal
+            .is_empty()
+    );
+}
+
+#[test]
+fn ticker_pass_finishes_with_box_reviewer_launch_pending() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let id = review.reviewer.as_deref().unwrap();
+    thread::update(&fx.project, id, |t| {
+        t.machine = "buildbox".into();
+        t.machine_id = "buildbox-id".into();
+        t.prompt_pending = true;
+        t.status = Status::Open;
+    })
+    .unwrap();
+    project::write_atomic(
+        &fx.project.state_dir().join("reviews-enabled"),
+        b"enabled\n",
+    )
+    .unwrap();
+    // The remote agent has not become ready. Review advancement must leave its
+    // pending launch to the remote startup pass, not start/wait inline.
+    crate::ticker::tick_project(&fx.world.ctx(), &fx.project).unwrap();
+    assert!(thread::load(&fx.project, id).unwrap().prompt_pending);
+    assert!(
+        try_operation_lock(&fx.world.ctx(), &review.repo)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn published_descendant_is_a_successful_push_postcondition() {
     let fx = configured();
     let candidate = git(&fx.repo, &["rev-parse", "main"]);
