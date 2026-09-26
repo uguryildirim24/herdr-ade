@@ -96,7 +96,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
             // coordinator instead of selecting another recipe.
             let detail = format!("{e:#}");
             let exhausted = detail.starts_with("recovery_exhausted:");
-            launch::ledger(
+            launch::dispatch(
                 project,
                 json!({"kind": if exhausted { "recovery-exhausted" } else { "recovery-refused" },
                 "event":event.id, "thread":record.id, "failure":failure.text, "error":detail}),

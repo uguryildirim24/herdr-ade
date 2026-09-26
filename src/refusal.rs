@@ -4,7 +4,7 @@
 //! guard, or a completed health report refusing to declare the system healthy.
 //! It still exits unsuccessfully and keeps its message, but it is not evidence
 //! that the harness failed. Unexpected I/O, subprocess and invariant errors use
-//! ordinary `anyhow::Error` values and remain eligible for the failure ledger.
+//! ordinary `anyhow::Error` values.
 
 use std::fmt;
 

@@ -103,11 +103,6 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
-    /// Observed harness failures in the current project
-    Ledger {
-        #[command(subcommand)]
-        command: LedgerCommand,
-    },
     /// Inbox items
     Inbox {
         #[command(subcommand)]
@@ -800,33 +795,6 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
 }
 
 #[derive(Subcommand)]
-enum LedgerCommand {
-    /// Open failures, worst repeat count first
-    List {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-    },
-    /// Show a failure and its evidence
-    Show {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-    },
-    /// Close a failure
-    Done {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-    },
-    /// Print an actionable task brief to standard output
-    Task {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum InboxCommand {
     /// List unhandled inbox items, oldest first
     List {
@@ -1126,9 +1094,8 @@ fn machine_outcome(command: &str) -> String {
         "thread prompt" => "prompted",
         "thread resolve" => "resolved",
         "thread ack" => "acknowledged",
-        "thread list" | "ledger list" => "listed",
-        "thread show" | "ledger show" | "ledger task" => "shown",
-        "ledger done" => "closed",
+        "thread list" => "listed",
+        "thread show" => "shown",
         "ask" => "asked",
         "ask answer" => "answered",
         "ask withdraw" => "withdrawn",
@@ -1196,57 +1163,21 @@ pub fn run() -> Result<()> {
         result_data,
     );
     let mut leaf = &matches;
-    let mut command_path = Vec::new();
     let mut explicit_slug = None;
     loop {
         if let Ok(Some(slug)) = leaf.try_get_one::<String>("slug") {
             explicit_slug = Some(slug.clone());
         }
         match leaf.subcommand() {
-            Some((name, args)) => {
-                command_path.push(name);
-                leaf = args;
-            }
+            Some((_, args)) => leaf = args,
             None => break,
-        }
-    }
-    let mut command_name = command_path.join(" ");
-    let flag = |name: &str| leaf.try_get_one::<bool>(name).ok().flatten() == Some(&true);
-    let read_only = matches!(
-        command_name.as_str(),
-        "list"
-            | "overview"
-            | "ledger list"
-            | "ledger show"
-            | "ledger task"
-            | "task show"
-            | "task list"
-            | "thread list"
-            | "thread show"
-            | "doctor"
-            | "plan show"
-            | "ticker status"
-    ) || command_name == "context" && flag("peek")
-        || command_name == "delete" && flag("preview")
-        || command_name == "board" && flag("print");
-    // Identify the object of a refusal/retry, not just its verb. Do not copy
-    // task text, prompts, flags or environment into the CLI-level subject.
-    for key in ["review", "id", "name"] {
-        if let Ok(Some(value)) = leaf.try_get_one::<String>(key) {
-            command_name.push(' ');
-            command_name.push_str(value);
         }
     }
     let env = Env::from_process()?;
     let config_dir = env.config_dir();
     let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
     let real_runner = RealRunner;
-    let recording_runner = crate::ledger::RecordingRunner(&real_runner);
-    let runner: &dyn crate::runner::Runner = if read_only {
-        &real_runner
-    } else {
-        &recording_runner
-    };
+    let runner: &dyn crate::runner::Runner = &real_runner;
     let ctx = Ctx {
         env: &env,
         root,
@@ -1272,49 +1203,25 @@ pub fn run() -> Result<()> {
     let observed_project = observed_slug
         .as_deref()
         .and_then(|s| Project::load(&ctx.root, s).ok());
-    let _scope = (!read_only)
-        .then(|| crate::ledger::Scope::new(&observed_project.iter().collect::<Vec<_>>()));
-    let subject = format!("ha {command_name}");
     let result = dispatch_with_start(ctx, cli.command, Some(cli_started));
-    if read_only {
-        match &result {
-            Err(error) if crate::refusal::is(error) => {
-                crate::output::set_outcome("refused");
-                crate::output::set_failure_class(None);
-            }
-            Err(_) if observed_project.is_some() => {
-                crate::output::set_outcome("failed");
-                crate::output::set_failure_class(Some("unknown"));
-            }
-            Err(_) => {
-                crate::output::set_outcome("refused");
-                crate::output::set_failure_class(None);
-            }
-            Ok(()) => {}
-        }
-    } else {
-        record_command_outcome(observed_project.as_ref(), &subject, &result);
-    }
+    record_command_outcome(observed_project.as_ref(), &result);
     if result.is_ok() {
         crate::output::finish_success()?;
     }
     result
 }
 
-/// Only unexpected command errors belong in the failure ledger. A designed
-/// refusal still returns its error to the caller, but its structural marker
-/// keeps the safety/authority outcome out of defect counts.
-fn record_command_outcome(project: Option<&Project>, subject: &str, result: &Result<()>) {
+/// Keep refusal and error outcomes distinct without filing a separate failure.
+fn record_command_outcome(project: Option<&Project>, result: &Result<()>) {
     match result {
         Err(error) if crate::refusal::is(error) => {
             crate::output::set_outcome("refused");
             crate::output::set_failure_class(None);
         }
-        Err(error) => {
-            if let Some(project) = project {
+        Err(_) => {
+            if project.is_some() {
                 crate::output::set_outcome("failed");
                 crate::output::set_failure_class(Some("unknown"));
-                crate::ledger::observe(project, "command-failed", subject, &format!("{error:#}"));
             } else {
                 // With no project binding this is a rejected invocation (for
                 // example a missing project), not evidence of failed work.
@@ -1322,17 +1229,8 @@ fn record_command_outcome(project: Option<&Project>, subject: &str, result: &Res
                 crate::output::set_failure_class(None);
             }
         }
-        Ok(()) => {
-            if let Some(project) = project {
-                crate::ledger::recovered(project, "command-failed", subject);
-            }
-        }
+        Ok(()) => {}
     }
-}
-
-#[cfg(test)]
-fn dispatch(ctx: Ctx<'_>, command: Command) -> Result<()> {
-    dispatch_with_start(ctx, command, None)
 }
 
 fn dispatch_with_start(
@@ -1413,60 +1311,6 @@ fn dispatch_with_start(
             history,
             wait,
         } => overview::run(&ctx, Some(&slug), history, wait),
-        Command::Ledger { command } => {
-            match command {
-                LedgerCommand::List { slug } => {
-                    let project = Project::load(&ctx.root, &slug)?;
-                    let entries = crate::ledger::list(&project)?;
-                    if crate::output::structured() {
-                        crate::output::insert("result", serde_json::to_value(&entries)?);
-                    }
-                    for entry in entries {
-                        println!("{}", crate::ledger::summary(&entry));
-                    }
-                }
-                LedgerCommand::Show { slug, id } => {
-                    let project = Project::load(&ctx.root, &slug)?;
-                    let record = crate::ledger::show(&project, &id)?;
-                    let message = format!("{}\n", serde_json::to_string_pretty(&record)?);
-                    crate::output::success(
-                        Some("shown"),
-                        &serde_json::json!({ "record": record }),
-                        &message,
-                        "",
-                    )?;
-                }
-                LedgerCommand::Done { slug, id } => {
-                    let project = Project::load(&ctx.root, &slug)?;
-                    let closed = crate::ledger::done(&project, &id)?;
-                    let (outcome, message) = if closed.changed {
-                        ("closed", format!("{} closed\n", closed.record.id))
-                    } else {
-                        (
-                            "already_closed",
-                            format!("{} was already closed\n", closed.record.id),
-                        )
-                    };
-                    crate::output::success(
-                        Some(outcome),
-                        &serde_json::json!({
-                            "record": closed.record,
-                            "changed": closed.changed,
-                        }),
-                        &message,
-                        "",
-                    )?;
-                }
-                LedgerCommand::Task { slug, id } => {
-                    let project = Project::load(&ctx.root, &slug)?;
-                    print!(
-                        "{}",
-                        crate::ledger::task(&crate::ledger::show(&project, &id)?)
-                    )
-                }
-            }
-            Ok(())
-        }
         Command::Inbox { command } => match command {
             InboxCommand::List { slug } => {
                 let project = Project::load(&ctx.root, &slug)?;
@@ -2378,7 +2222,6 @@ mod tests {
             &["plan", "show"],
             &["overview"],
             &["say", "--what", "This was checked."],
-            &["ledger", "list"],
             &["review"],
             &[
                 "plan", "step", "link", "demo", "s-1", "--thread", "t-0001", "--expect", "1",
@@ -2408,77 +2251,5 @@ mod tests {
             Cli::try_parse_from(["herdr-ade", "event", "review-advance"]).is_ok(),
             "the manifest's event-only command must remain valid"
         );
-    }
-
-    #[test]
-    fn an_unhealthy_doctor_reports_without_recording_itself() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let _scope = crate::ledger::Scope::new(&[&project]);
-        // Probe failures remain observable; only the completed doctor's own
-        // nonzero report is exempt, not its children or arbitrary errors.
-        let runner = crate::ledger::RecordingRunner(&world.runner);
-        let mut ctx = world.ctx();
-        ctx.runner = &runner;
-        let result = dispatch(
-            ctx,
-            Command::Doctor {
-                session: SessionArgs::default(),
-                prune_branches: None,
-                timings: false,
-                remove_kept_worktree: None,
-            },
-        );
-        let error = result.as_ref().unwrap_err();
-        assert_eq!(error.to_string(), "some checks failed");
-        assert!(crate::refusal::is(error));
-        let before = crate::ledger::list(&project).unwrap();
-        assert!(!before.is_empty());
-        for _ in 0..2 {
-            record_command_outcome(Some(&project), "ha doctor", &result);
-        }
-        let after = crate::ledger::list(&project).unwrap();
-        assert_eq!(before.len(), after.len());
-        assert!(after.iter().all(|entry| entry.subject != "ha doctor"));
-
-        // Neither the command name nor the message text suppresses real faults.
-        let failure = Err(anyhow::anyhow!("some checks failed"));
-        record_command_outcome(Some(&project), "ha doctor", &failure);
-        let rows = crate::ledger::list(&project).unwrap();
-        assert!(
-            rows.iter()
-                .any(|entry| { entry.kind == "command-failed" && entry.subject == "ha doctor" })
-        );
-        record_command_outcome(Some(&project), "ha doctor", &result);
-        assert_eq!(rows.len(), crate::ledger::list(&project).unwrap().len());
-    }
-
-    #[test]
-    fn designed_refusals_are_not_failures_but_real_command_errors_are() {
-        let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
-        let refusal: Result<()> = Err(crate::refusal::error(
-            "harness_install_stale_self: run the command again",
-        ));
-        record_command_outcome(Some(&project), "ha harness install", &refusal);
-        assert!(crate::ledger::list(&project).unwrap().is_empty());
-
-        let failure: Result<()> = Err(anyhow::anyhow!("compiler process crashed"));
-        record_command_outcome(Some(&project), "ha harness install", &failure);
-        let entries = crate::ledger::list(&project).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, "command-failed");
-        assert_eq!(entries[0].subject, "ha harness install");
-        assert!(entries[0].detail.contains("compiler process crashed"));
-
-        // A later guard refusal is neither a retry nor proof that the real
-        // failure recovered. A successful re-entry closes the same entry.
-        record_command_outcome(Some(&project), "ha harness install", &refusal);
-        assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
-        record_command_outcome(Some(&project), "ha harness install", &Ok(()));
-        assert!(crate::ledger::list(&project).unwrap().is_empty());
-        let closed = crate::ledger::show(&project, &entries[0].id).unwrap();
-        assert!(closed.closed_at.is_some());
-        assert_eq!(closed.count, 1);
     }
 }

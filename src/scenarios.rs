@@ -2445,8 +2445,6 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
         .collect::<Vec<_>>();
     assert_eq!(starts.len(), 1, "{starts:?}");
     assert!(starts[0].contains("--model recorded"), "{starts:?}");
-    let ledger = std::fs::read_to_string(project.record_file("ledger.jsonl")).unwrap();
-    assert_eq!(ledger.matches("coordinator_relaunch").count(), 1);
     ticker::tick_project(&world.ctx(), &project).unwrap();
     assert_eq!(world.runner.count("agent start hp-demo-coordinator"), 1);
 }

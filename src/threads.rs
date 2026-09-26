@@ -26,7 +26,6 @@ pub struct SessionView<'a> {
 
 /// `None` when the project was never opened or its session is unreachable.
 pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'a>> {
-    let _scope = crate::ledger::Scope::new(&[project]);
     let record = project.coordinator()?;
     if record.socket.is_empty() || !Path::new(&record.socket).exists() {
         return None;
@@ -258,7 +257,7 @@ fn start_with_ticker(
     ) {
         Ok(placement) => placement,
         Err(error) => {
-            crate::launch::ledger(
+            crate::launch::dispatch(
                 &project,
                 serde_json::json!({"kind":"placement-refused", "recipe":launch.recipe_id,
                     "explicit":explicit_machine, "error":format!("{error:#}")}),
@@ -266,10 +265,10 @@ fn start_with_ticker(
             return Err(error);
         }
     };
-    crate::launch::ledger(
+    crate::launch::dispatch(
         &project,
         serde_json::json!({"kind":"placement", "recipe":launch.recipe_id,
-            "machine":placement.ledger_machine(), "reason":placement.reason,
+            "machine":placement.dispatch_machine(), "reason":placement.reason,
             "tried":placement.tried}),
     )?;
     if placement.fell_back {
@@ -279,7 +278,7 @@ fn start_with_ticker(
     // Selection initially carries the configured dispatch candidate because
     // placement needs it. The durable lane launch names where this attempt was
     // actually placed, including an explicit or fallback local placement.
-    launch.machine = placement.ledger_machine().to_string();
+    launch.machine = placement.dispatch_machine().to_string();
 
     // Recipe and repository readiness both ran on the selected machine
     // during placement, before a thread record exists.
@@ -373,7 +372,7 @@ struct Placement {
 }
 
 impl Placement {
-    fn ledger_machine(&self) -> &str {
+    fn dispatch_machine(&self) -> &str {
         if self.machine.is_empty() {
             crate::contracts::MACHINE_LOCAL
         } else {
@@ -1717,16 +1716,16 @@ fn retry_with_ticker(
         });
         let placement =
             resolve_placement(ctx, None, &record.role, &launch, Some(&record.repo), listed)?;
-        crate::launch::ledger(
+        crate::launch::dispatch(
             &project,
             serde_json::json!({"kind":"placement", "recipe":launch.recipe_id,
-                "machine":placement.ledger_machine(), "reason":placement.reason,
+                "machine":placement.dispatch_machine(), "reason":placement.reason,
                 "tried":placement.tried}),
         )?;
         if placement.fell_back {
             fallback_say(ctx, slug, &placement)?;
         }
-        launch.machine = placement.ledger_machine().to_string();
+        launch.machine = placement.dispatch_machine().to_string();
         Some(placement)
     } else {
         None
@@ -1958,7 +1957,6 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             worktree = "kept".into();
         } else if let Err(error) = preserve_report_links(ctx, &project, &record) {
             let detail = format!("linked_files_not_kept: {error:#}");
-            crate::ledger::observe(&project, "thread-cleanup", id, &detail);
             worktree = "kept".into();
             worktree_reason = Some(detail);
         } else {
@@ -2012,7 +2010,6 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
                     t.cleanup_pending = false;
                     t.cleanup_reason.clear();
                 })?;
-                crate::ledger::recovered(&project, "thread-cleanup", id);
             }
             Ok(()) => {}
             Err(error) => {
@@ -2020,6 +2017,13 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
                 worktree_reason = Some(format!("cleanup pending: {error:#}"));
             }
         }
+    }
+    if let Some(detail) = &worktree_reason {
+        thread::update(&project, id, |t| {
+            if t.cleanup_pending && !t.cleanup_reason.starts_with("retained worktree removal: ") {
+                t.cleanup_reason = detail.clone();
+            }
+        })?;
     }
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
@@ -2087,7 +2091,6 @@ pub(crate) fn resolve_automatically(
         Ok(mut outcome) => {
             let pending = thread::load(project, id).is_ok_and(|t| t.cleanup_pending);
             if !pending {
-                crate::ledger::recovered(project, "thread-cleanup", id);
                 let _ = thread::update(project, id, |t| {
                     t.resolved_reason = reason.to_string();
                     t.cleanup_reason.clear();
@@ -2099,7 +2102,12 @@ pub(crate) fn resolve_automatically(
         }
         Err(error) => {
             let detail = format!("{error:#}");
-            crate::ledger::observe(project, "thread-cleanup", id, &detail);
+            let _ = thread::update(project, id, |t| {
+                if t.cleanup_pending && !t.cleanup_reason.starts_with("retained worktree removal: ")
+                {
+                    t.cleanup_reason = detail.clone();
+                }
+            });
             let before = thread::load(project, id).unwrap_or_default();
             refresh_plan(ctx, project);
             ResolveOutcome {
@@ -2763,7 +2771,6 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         let preserved = thread::load(&project, id)?;
         if let Err(error) = preserve_report_links(ctx, &project, &preserved) {
             let detail = format!("linked_files_not_kept: {error:#}");
-            crate::ledger::observe(&project, "thread-cleanup", id, &detail);
             copy_notes.push(detail.clone());
             final_copy = "partial".into();
             removal_refusal = Some(detail);
@@ -2820,7 +2827,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             .as_ref()
             .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
         t.cleanup_reason = if t.cleanup_pending {
-            "linked files".into()
+            removal_refusal.clone().unwrap_or_default()
         } else {
             String::new()
         };
@@ -4170,7 +4177,6 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
         t.cleanup_pending = false;
         t.cleanup_reason.clear();
     })?;
-    crate::ledger::recovered(&project, "thread-cleanup", id);
     Ok(format!(
         "removed {} and branch {}",
         record.worktree_path, record.branch
@@ -4517,7 +4523,6 @@ pub struct Row {
 }
 
 pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
-    let _scope = crate::ledger::Scope::new(&[project]);
     let view = session_view(ctx, project);
     let now = jiff::Timestamp::now();
     thread::list(project)
@@ -5949,15 +5954,15 @@ mod tests {
         assert_eq!(agy.launch.machine, "local");
         assert!(agy.launch.args.iter().any(|arg| arg == "--new-project"));
 
-        let ledger =
+        let dispatch =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
         assert!(
-            ledger.contains("does not run adapter kind `claude`"),
-            "{ledger}"
+            dispatch.contains("does not run adapter kind `claude`"),
+            "{dispatch}"
         );
         assert!(
-            ledger.contains("does not run adapter kind `agy`"),
-            "{ledger}"
+            dispatch.contains("does not run adapter kind `agy`"),
+            "{dispatch}"
         );
         assert!(
             fx.world
@@ -6019,9 +6024,9 @@ mod tests {
         assert!(error.contains("buildbox"), "{error}");
         assert!(error.contains("does not run adapter kind `agy`"), "{error}");
         assert!(thread::list(&fx.project).is_empty());
-        let ledger =
+        let dispatch =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
-        assert!(ledger.contains("placement-refused"), "{ledger}");
+        assert!(dispatch.contains("placement-refused"), "{dispatch}");
         assert!(
             fx.world
                 .runner
@@ -6186,9 +6191,9 @@ mod tests {
                     .to_string()
             ]
         );
-        let ledger =
+        let dispatch =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
-        assert!(ledger.contains("box_publish_url_missing"), "{ledger}");
+        assert!(dispatch.contains("box_publish_url_missing"), "{dispatch}");
 
         let error = start(
             &fx.world.ctx(),

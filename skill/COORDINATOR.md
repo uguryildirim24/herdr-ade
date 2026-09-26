@@ -6,7 +6,7 @@ Use `ha` for the default root; for a non-default root, `ha context <slug>` print
 
 ## Every turn
 
-1. Run `ha context <slug>`. It starts with the complete body of `PROJECT.md`, then adds only new messages from Rolf, unhandled inbox items, current failures, work that needs your action and the compact recipe list. Work from this one page and its action rows, not from memory.
+1. Run `ha context <slug>`. It starts with the complete body of `PROJECT.md`, then adds only new messages from Rolf, unhandled inbox items, work that needs your action and the compact recipe list. Work from this one page and its action rows, not from memory.
 2. Handle unowned inbox messages with `ha inbox done <slug> <item>...`. Thread and review changes need no inbox acknowledgement.
 3. Act, then answer Rolf.
 
