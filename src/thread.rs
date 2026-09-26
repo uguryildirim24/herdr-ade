@@ -818,7 +818,7 @@ fn render_task(
     );
     for basis in &record.authority {
         if basis.starts_with("request:") {
-            let request = crate::talk::resolve_request(project, basis)?;
+            let request = crate::prompt::resolve_request(project, basis)?;
             out.push_str(&format!("\n{basis}:\n{}\n", request.text));
         }
     }

@@ -6107,7 +6107,7 @@ mod tests {
                 .worktree_path
                 .starts_with(&fx.repo.to_string_lossy().to_string())
         );
-        let ledger =
+        let dispatch =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
         assert!(dispatch.contains("box_publish_url_missing"), "{dispatch}");
 
