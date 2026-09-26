@@ -1344,9 +1344,11 @@ fn thread_pass(
             // retry can place a tab after the pass took its snapshot. Absence
             // must be observed again after placement before closing anything.
             let current = thread::load(project, &t.id)?;
-            if current.attempt != t.attempt
+            if current.status != thread::Status::Open
+                || current.attempt != t.attempt
                 || current.pane_id != t.pane_id
                 || current.tab_id != t.tab_id
+                || current.workspace_id != t.workspace_id
             {
                 continue;
             }
@@ -1370,13 +1372,14 @@ fn thread_pass(
                 }
             }
             let recover = !t.launch.recipe_id.is_empty();
-            if let Err(error) = threads::fail_start(
+            if let Err(error) = threads::fail_start_checked(
                 ctx,
                 project,
                 &t.id,
                 "the pane or agent is gone without a report",
                 crate::contracts::FailureClass::ProcessGone,
                 recover,
+                Some(&current),
             ) {
                 pass.error = pass
                     .error
@@ -2969,6 +2972,68 @@ mod tests {
             failed.failure_class,
             crate::contracts::FailureClass::ProcessGone
         );
+    }
+
+    #[test]
+    fn a_replacement_placed_during_the_recheck_is_not_failed() {
+        let fixture = fixture(false);
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Open;
+            t.workspace_id = "w1".into();
+            t.tab_id = "w1:t2".into();
+            t.pane_id = "w1:p2".into();
+            t.cwd = "/work/lane".into();
+        })
+        .unwrap();
+        let project = fixture.project.clone();
+        let id = record.id.clone();
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.display().contains("pane list"),
+            move |_| {
+                thread::update(&project, &id, |t| {
+                    t.attempt += 1;
+                    t.tab_id = "w1:t3".into();
+                    t.pane_id = "w1:p3".into();
+                })?;
+                Ok(ok(r#"{"result":{"panes":[{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","cwd":"/work/lane"}]}}"#))
+            },
+        );
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let coordinator_pane = Pane {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            pane_id: "w1:p1".into(),
+            cwd: fixture.project.dir().to_string_lossy().into_owned(),
+        };
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&record),
+                agents: &[],
+                panes: &[coordinator_pane],
+            },
+            "ha",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pass.error.is_none());
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Open);
+        assert_eq!(saved.attempt, record.attempt + 1);
+        assert_eq!(saved.pane_id, "w1:p3");
+        assert_eq!(runner.count("pane list"), 1);
+        assert_eq!(runner.count("tab close"), 0);
     }
 
     #[test]
