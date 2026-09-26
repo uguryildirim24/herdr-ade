@@ -293,9 +293,17 @@ pub(crate) fn subtask_add(
     with_plan(&project, expect, |plan| {
         let Some(at) = plan.steps.iter().position(|s| s.id == under) else {
             if all_steps(plan).any(|s| s.id == under) {
-                bail!("plan_step_depth: `{under}` is a subtask; a subtask cannot have subtasks");
+                return Err(crate::refusal::error(
+                    format!(
+                        "plan_step_depth: `{under}` is a subtask; a subtask cannot have subtasks"
+                    ),
+                    format!("ha plan show {slug}"),
+                ));
             }
-            bail!("plan_step_unknown: `{under}` is not a step of this plan");
+            return Err(crate::refusal::error(
+                format!("plan_step_unknown: `{under}` is not a step of this plan"),
+                format!("ha plan show {slug}"),
+            ));
         };
         let id = next_id(plan);
         plan.steps[at].subtasks.push(PlanStep {
@@ -335,7 +343,10 @@ pub(crate) fn step_link(
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     if tasks.is_empty() {
-        bail!("plan_link: at least one --task is required");
+        return Err(crate::refusal::error(
+            "plan_link: at least one --task is required",
+            format!("ha plan step link {slug} {id} --task <job-id>"),
+        ));
     }
     check_task_refs(&project, &tasks)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
@@ -360,7 +371,10 @@ pub(crate) fn step_unlink(
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     if tasks.is_empty() {
-        bail!("plan_unlink: at least one --task is required");
+        return Err(crate::refusal::error(
+            "plan_unlink: at least one --task is required",
+            format!("ha plan step unlink {slug} {id} --task <job-id>"),
+        ));
     }
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
@@ -384,7 +398,10 @@ pub(crate) fn step_remove(
             step.subtasks.retain(|s| s.id != id);
         }
         if all_steps(plan).count() == before {
-            bail!("plan_step_unknown: `{id}` is not a step of this plan");
+            return Err(crate::refusal::error(
+                format!("plan_step_unknown: `{id}` is not a step of this plan"),
+                format!("ha plan show {slug}"),
+            ));
         }
         Ok(())
     })?;
