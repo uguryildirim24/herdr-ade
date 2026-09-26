@@ -18,6 +18,71 @@ pub(crate) const TICKER_PROMPT_PREFIX: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing]";
 pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
 
+/// A transition-owned wake-up, independent of the lane's eventual status.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub(crate) struct Notice {
+    pub(crate) line: String,
+    pub(crate) submitted: bool,
+}
+
+pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result<()> {
+    let Some(coordinator) = project.coordinator() else {
+        return Ok(());
+    };
+    let reviews = crate::review::list(project)?;
+    let lanes = thread::list(project);
+    if !reviews
+        .iter()
+        .any(|r| r.notices.iter().any(|n| !n.submitted))
+        && !lanes
+            .iter()
+            .any(|t| t.start_notices.iter().any(|n| !n.submitted))
+    {
+        return Ok(());
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
+    let ready = herdr.agent_list()?.into_iter().any(|agent| {
+        agent.pane_id == coordinator.pane_id
+            && agent.name == coordinator.agent_name
+            && agent.ready()
+    });
+    if !ready {
+        return Ok(());
+    }
+    for old in reviews {
+        let Some(_lock) = crate::review::try_operation_lock(ctx, &old.repo)? else {
+            continue;
+        };
+        let review = crate::review::load(project, &old.id)?;
+        for notice in review.notices.iter().filter(|n| !n.submitted) {
+            if !deliver_coordinator_prompt(project, &herdr, &coordinator.pane_id, &notice.line)? {
+                return Ok(());
+            }
+            crate::review::mark_notice_submitted(project, &review.id, &notice.line)?;
+        }
+    }
+    for lane in lanes {
+        for index in 0..lane.start_notices.len() {
+            if !lane.start_notices[index].submitted {
+                if !deliver_coordinator_prompt(
+                    project,
+                    &herdr,
+                    &coordinator.pane_id,
+                    &lane.start_notices[index].line,
+                )? {
+                    return Ok(());
+                }
+                thread::update(project, &lane.id, |t| {
+                    if let Some(notice) = t.start_notices.get_mut(index) {
+                        notice.submitted = true;
+                    }
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn short_error(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control())
@@ -93,13 +158,17 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
             first.get_or_insert(error.context(format!("adopt event {}", event.id)));
         }
     }
+    deliver_transition_notices(ctx, project)?;
     for event in sealed {
         if event.payload.failed.is_some() {
             continue;
         }
-        // A changed code lane joins the review pile. The reviewer's seal is
-        // the coordinator wake-up for the whole pile, not each member's seal.
-        if pile_member(project, &event) {
+        // A changed code lane joins the review pile. The review record owns
+        // the wake-up, not the member's or reviewer's DONE seal.
+        if pile_member(project, &event)
+            || (event.payload.done.is_some()
+                && thread::load(project, &event.thread).is_ok_and(|lane| lane.role == "reviewer"))
+        {
             continue;
         }
         // A resolved lane is finished: its delivery journal is never replayed.
@@ -145,7 +214,10 @@ pub(crate) fn deliver_event(
     event: &crate::contracts::Event,
 ) -> Result<()> {
     adopt_report(project, event)?;
-    if pile_member(project, event) {
+    if pile_member(project, event)
+        || (event.payload.done.is_some()
+            && thread::load(project, &event.thread).is_ok_and(|lane| lane.role == "reviewer"))
+    {
         return Ok(());
     }
     deliver_notice(ctx, project, event)
@@ -1526,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn pile_member_seals_do_not_wake_but_review_seal_wakes_once() {
+    fn review_notice_survives_resolved_reviewer_and_busy_coordinator() {
         let (world, project) = delivery_world();
         let lane = thread::allocate(&project, |t| {
             t.status = Status::Open;
@@ -1545,15 +1617,91 @@ mod tests {
             t.repo = "/repo".into();
         })
         .unwrap();
-        let review = sealed_done(&project, &reviewer.id);
+        let review_event = sealed_done(&project, &reviewer.id);
+        let review = crate::review::Review {
+            id: "review-1".into(),
+            repo: "/repo".into(),
+            integration: "main".into(),
+            base: "base".into(),
+            candidate_branch: "candidate".into(),
+            members: vec![],
+            gates: vec![],
+            selected_gates: vec![],
+            reviewer: Some(reviewer.id.clone()),
+            phase: crate::review::Phase::Complete,
+            verdict: None,
+            verdict_event: String::new(),
+            reviewer_after: String::new(),
+            checked_event: String::new(),
+            retry_attempt: None,
+            retry_generation: 0,
+            moved: 0,
+            refresh_tip: None,
+            push_remote: None,
+            install_required: false,
+            fast_forward: true,
+            push: true,
+            install: true,
+            close: true,
+            prune: true,
+            attention: String::new(),
+            notices: vec![Notice {
+                line: "REVIEW review-1 merged t-0001 (abc, pushed)".into(),
+                submitted: false,
+            }],
+        };
+        crate::review::save(&project, &review).unwrap();
+        thread::update(&project, &reviewer.id, |t| t.status = Status::Resolved).unwrap();
+        let screen = std::rc::Rc::new(std::cell::RefCell::new("❯ busy draft\n".to_string()));
+        let read = screen.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("pane read") && cmd.display().contains("--source visible"),
+            move |_| Ok(crate::runner::fake::ok(&read.borrow())),
+        );
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert!(typed_lines(&world).is_empty());
+        *screen.borrow_mut() = "❯ \n".into();
         deliver_events(&world.ctx(), &project).unwrap();
         deliver_events(&world.ctx(), &project).unwrap();
         assert_eq!(typed_lines(&world).len(), 1);
+        assert!(typed_lines(&world)[0].contains("REVIEW review-1 merged"));
         assert!(
-            events::states(&project, &review.id)
+            events::states(&project, &review_event.id)
                 .unwrap()
-                .contains(&crate::contracts::DeliveryState::Submitted)
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn final_start_failure_wakes_once_but_recovery_pending_does_not() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Starting;
+            t.launch_attempts = 0;
+        })
+        .unwrap();
+        thread::update(&project, &lane.id, |t| {
+            t.provider_wait_started = project::now();
+        })
+        .unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert!(typed_lines(&world).is_empty());
+        crate::threads::fail_start(
+            &world.ctx(),
+            &project,
+            &lane.id,
+            "provider_wait_expired",
+            crate::contracts::FailureClass::Provider,
+            false,
+        )
+        .unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+        assert!(typed_lines(&world)[0].contains(&format!(
+            "FAILED {}: provider_wait_expired — next: ha thread retry demo {}",
+            lane.id, lane.id
+        )));
     }
 
     #[test]
