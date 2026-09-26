@@ -107,6 +107,7 @@ impl Default for Task {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum State {
     Open,
+    Dropped,
     Working,
     Finished,
     Merged,
@@ -116,6 +117,7 @@ impl State {
     pub(crate) fn word(self) -> &'static str {
         match self {
             Self::Open => "open",
+            Self::Dropped => "dropped",
             Self::Working => "working",
             Self::Finished => "finished",
             Self::Merged => "merged",
@@ -531,13 +533,14 @@ pub(crate) fn view_with_evidence(
         failure_class: None,
         provider_kind: None,
     };
-    if !view.record.installed.is_empty() {
-        view.state = State::Installed;
+    if !view.record.dropped.is_empty() {
+        view.state = State::Dropped;
         view.next = "none".into();
         return view;
     }
-    if !view.record.dropped.is_empty() {
-        view.next = "dropped".into();
+    if !view.record.installed.is_empty() {
+        view.state = State::Installed;
+        view.next = "none".into();
         return view;
     }
     let Some(id) = view.record.attempts.last() else {
@@ -575,8 +578,16 @@ pub(crate) fn view_with_evidence(
         Ok(None) => {}
     }
     if !lane.merged_sha.is_empty() {
-        view.state = State::Merged;
-        view.next = "none".into();
+        view.state = if !lane.installed_sha.is_empty() {
+            State::Installed
+        } else {
+            State::Merged
+        };
+        view.next = if lane.historical_install_required && lane.installed_sha.is_empty() {
+            "finish the pile installation".into()
+        } else {
+            "none".into()
+        };
         return view;
     }
     if crate::review::sealed(&evidence.events, &lane).is_some() {

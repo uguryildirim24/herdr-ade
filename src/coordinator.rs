@@ -1449,7 +1449,7 @@ mod tests {
                 .contains("## Recently finished or dropped tasks")
         );
         let text = compact_page(&project, body, Some(&before), &now);
-        assert!(text.contains("- `job-0002` [open] New"), "{text}");
+        assert!(text.contains("- `job-0002` [dropped] New"), "{text}");
         assert!(!text.contains("job-0001"), "{text}");
         assert!(!text.contains("secret"), "{text}");
         assert!(

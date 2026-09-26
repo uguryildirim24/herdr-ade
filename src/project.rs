@@ -145,8 +145,7 @@ pub(crate) struct Repo {
     /// The only remote to which a completed integration branch may be pushed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) push_remote: Option<String>,
-    /// `None` means gates are not configured; `Some([])` explicitly makes the
-    /// repository gate-free.
+    /// Missing and empty gate lists both make the repository gate-free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gates: Option<Vec<Gate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1202,8 +1201,8 @@ mod tests {
         }
         refresh_page(&project).unwrap();
         let (_, page) = project.read_project_md().unwrap();
-        assert!(page.contains("`job-0000` [open]"));
-        assert!(page.contains("`job-0010` [open]"));
+        assert!(page.contains("`job-0000` [dropped]"));
+        assert!(page.contains("`job-0010` [dropped]"));
     }
 
     #[test]

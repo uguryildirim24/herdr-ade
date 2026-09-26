@@ -178,7 +178,15 @@ pub(crate) struct Thread {
     pub(crate) review_sources: std::collections::BTreeMap<String, String>,
     pub(crate) has_changes: Option<bool>,
     pub(crate) changes_seal: String,
+    /// One-time integration check for a sealed historical attempt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) historical_seal: String,
     pub(crate) merged_sha: String,
+    /// Historical seal covered by an installed harness build.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) installed_sha: String,
+    #[serde(default)]
+    pub(crate) historical_install_required: bool,
     pub(crate) merged_review: String,
     pub(crate) review_after: String,
     pub(crate) review_reason: String,

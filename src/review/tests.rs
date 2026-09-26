@@ -118,6 +118,65 @@ fn job(fx: &Fx, id: &str) -> crate::task::Task {
 }
 
 #[test]
+fn missing_repo_gates_means_gate_free_review() {
+    let fx = configured();
+    let (mut settings, body) = fx.project.read_project_md().unwrap();
+    settings.repos[0].gates = None;
+    std::fs::write(
+        fx.project.project_md(),
+        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+    )
+    .unwrap();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    assert!(review.gates.is_empty());
+    assert!(review.selected_gates.is_empty());
+}
+
+#[test]
+fn resolved_historical_seals_are_classified_once_without_old_rounds() {
+    let fx = configured();
+    let (id, sha) = lane(&fx, 1);
+    let task = job(&fx, &id);
+    git(&fx.repo, &["merge", "--ff-only", &sha]);
+    thread::update(&fx.project, &id, |t| t.status = Status::Resolved).unwrap();
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    let record = thread::load(&fx.project, &id).unwrap();
+    assert_eq!(record.has_changes, Some(true));
+    assert!(!record.merged_sha.is_empty());
+    assert_eq!(
+        crate::task::view(&fx.project, task).state,
+        crate::task::State::Merged
+    );
+    let calls = fx.world.runner.calls.borrow().len();
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert_eq!(calls, fx.world.runner.calls.borrow().len());
+}
+
+#[test]
+fn old_no_change_seal_finishes_without_merge_even_when_resolved() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let record = thread::load(&fx.project, &id).unwrap();
+    fx.seal_done(&id, 1, 2, &record.base, "Nothing to merge");
+    thread::update(&fx.project, &id, |t| t.status = Status::Resolved).unwrap();
+    let task = job(&fx, &id);
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    let record = thread::load(&fx.project, &id).unwrap();
+    assert_eq!(record.has_changes, Some(false));
+    assert!(record.merged_sha.is_empty());
+    assert!(crate::review::lane_done(
+        &fx.project,
+        &record,
+        &crate::events::list(&fx.project)
+    ));
+    assert_eq!(
+        crate::task::view(&fx.project, task).state,
+        crate::task::State::Finished
+    );
+}
+
+#[test]
 fn whole_pile_lands_pushes_closes_and_prunes_once() {
     let fx = configured();
     let (first, a) = lane(&fx, 1);

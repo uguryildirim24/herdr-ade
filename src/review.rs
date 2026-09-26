@@ -263,7 +263,7 @@ pub(crate) fn lane_done(
         return !review.install_required || review.install;
     }
     if !lane.merged_sha.is_empty() && lane.merged_review.is_empty() {
-        return true;
+        return !lane.historical_install_required || !lane.installed_sha.is_empty();
     }
     sealed(events, lane).is_some_and(|e| changes(lane, e) == Some(false))
 }
@@ -328,10 +328,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
     if pile.is_empty() {
         return Ok(None);
     }
-    let gates = row
-        .gates
-        .clone()
-        .context("review gates are not configured; set gates = [] for a gate-free repository")?;
+    let gates = row.gates.clone().unwrap_or_default();
     for gate in &gates {
         if let Some(paths) = &gate.paths {
             for path in paths {
@@ -1101,7 +1098,118 @@ pub(crate) fn require_resolvable(project: &Project, id: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Classify old seals outside the open pile. The seal id is the cache key: a
+/// later attempt/follow-up can be classified afresh, but idle passes do no git.
+pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: bool) -> Result<()> {
+    let events = crate::events::checked(project)?;
+    let harness = crate::harness::repos(&ctx.config_dir)?;
+    let tasks = crate::task::list_with_errors(project).0;
+    let mut heads: BTreeMap<String, String> = BTreeMap::new();
+    for lane in thread::list(project) {
+        if lane.role == "reviewer" || lane.repo.is_empty() || !lane.merged_sha.is_empty() {
+            continue;
+        }
+        let Some(event) = sealed(&events, &lane) else {
+            continue;
+        };
+        if lane.historical_seal == event.id {
+            continue;
+        }
+        // The ticker leaves open piles to review start. Explicit reads can
+        // classify unknown seals even when the lane remains open.
+        if lane.status != Status::Resolved && (!include_open || changes(&lane, event).is_some()) {
+            continue;
+        }
+        let done = event.payload.done.as_ref().expect("sealed done");
+        let row = repository(ctx, project, Some(&lane.repo))?;
+        let _lock = operation_lock(ctx, &row.path)?;
+        let git = Git::new(ctx.runner, &row.path);
+        let tip = if let Some(tip) = heads.get(&row.path) {
+            tip.clone()
+        } else {
+            let branch = row
+                .branch
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| crate::git::symbolic_head(ctx.runner, &row.path))?;
+            let tip = git
+                .branch_head(&branch)?
+                .context("integration branch is missing")?;
+            heads.insert(row.path.clone(), tip.clone());
+            tip
+        };
+        let has_changes = if let Some(known) = changes(&lane, event) {
+            known
+        } else if lane.base.is_empty() {
+            // No base survives: ancestry still proves a landed seal, but
+            // cannot distinguish a no-op from a change.
+            if !git.is_ancestor(&done.sha, &tip)? {
+                continue;
+            }
+            true
+        } else {
+            !git.run(&[
+                "rev-list",
+                "--max-count=1",
+                &format!("{}..{}", lane.base, done.sha),
+            ])?
+            .is_empty()
+        };
+        let merged = has_changes && git.is_ancestor(&done.sha, &tip)?;
+        let harness_repo = harness.iter().any(|r| same_repo(&r.path, &row.path));
+        let installed = if merged && harness_repo {
+            let builds = tasks
+                .iter()
+                .filter(|t| t.attempts.contains(&lane.id))
+                .flat_map(|t| t.installed.iter().filter_map(|e| e.build.as_deref()));
+            // Task install evidence is enough; otherwise inspect the installed
+            // build record for this harness repository.
+            let mut covered = false;
+            for build in builds {
+                if !build.is_empty() && git.is_ancestor(&done.sha, build.trim()).unwrap_or(false) {
+                    covered = true;
+                    break;
+                }
+            }
+            if !covered {
+                let bin = if row.path.ends_with("/herdr-ade") {
+                    "herdr-ade"
+                } else {
+                    "herdr"
+                };
+                if let Ok(build) = std::fs::read_to_string(
+                    ctx.env
+                        .home
+                        .join(".local/bin")
+                        .join(format!(".{bin}.installed-commit")),
+                ) {
+                    covered = git.is_ancestor(&done.sha, build.trim()).unwrap_or(false);
+                }
+            }
+            covered
+        } else {
+            false
+        };
+        thread::update(project, &lane.id, |t| {
+            t.changes_seal = event.id.clone();
+            t.historical_seal = event.id.clone();
+            t.has_changes = Some(has_changes);
+            if merged {
+                t.merged_sha = tip.clone();
+                t.historical_install_required = harness_repo;
+                if installed {
+                    t.installed_sha = tip.clone();
+                }
+            }
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    if project.state_dir().join("reviews-enabled").exists() {
+        classify_old_seals(ctx, project, false)?;
+    }
     let mut first = None;
     for old in list(project)?.into_iter().filter(|r| !r.phase.closed()) {
         let _lock = operation_lock(ctx, &old.repo)?;
