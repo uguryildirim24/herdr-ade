@@ -191,7 +191,13 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     if lane.is_remote()
         && let Some(done) = &event.payload.done
     {
-        verify_published_sha(ctx, project, &lane, &done.sha)?;
+        verify_published_sha(
+            ctx,
+            project,
+            &lane,
+            &done.sha,
+            done.published_ref.as_deref(),
+        )?;
     }
 
     // A box lane's tokens were set by the box's own `ha done`; the Mac has no
@@ -344,7 +350,13 @@ fn publish_url_for(
 /// URL-matched GitHub remote and checks the event's sha is reachable there
 /// (SPEC-remote §4.3, gate R5). A failed fetch or an absent commit leaves the
 /// event undelivered; the next pass retries.
-fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) -> Result<()> {
+fn verify_published_sha(
+    ctx: &Ctx,
+    project: &Project,
+    lane: &Thread,
+    sha: &str,
+    published_ref: Option<&str>,
+) -> Result<()> {
     if sha.is_empty() {
         bail!("published_sha_missing: the done event has no sha");
     }
@@ -365,12 +377,19 @@ fn verify_published_sha(ctx: &Ctx, project: &Project, lane: &Thread, sha: &str) 
         "fetch",
         "--quiet",
         remote.as_str(),
-        &format!("refs/heads/{}", lane.branch),
+        &format!("refs/heads/{}", published_ref.unwrap_or(&lane.branch)),
     ])?;
     if !out.success() {
         bail!("published_fetch_failed: {url}: {}", out.error_text());
     }
-    if !crate::git::is_ancestor(ctx.runner, &lane.repo, sha, "FETCH_HEAD")? {
+    let matches = if published_ref.is_some() {
+        git(&["rev-parse", "FETCH_HEAD"])?.stdout.trim() == sha
+    } else {
+        // Historical seals pointed at a mutable lane branch; their commit
+        // may be an ancestor of its current tip.
+        crate::git::is_ancestor(ctx.runner, &lane.repo, sha, "FETCH_HEAD")?
+    };
+    if !matches {
         bail!("published_sha_missing: {sha} is not reachable on {url}");
     }
     Ok(())
@@ -1260,6 +1279,7 @@ mod tests {
                     report_path: ".reports/lane.md".into(),
                     artifact: "def".into(),
                     attestation: None,
+                    published_ref: None,
                 }),
                 waiting: None,
                 failed: None,
@@ -1875,6 +1895,7 @@ mod tests {
                     report_path: ".reports/t-0001.md".into(),
                     artifact: artifact.into(),
                     attestation: None,
+                    published_ref: None,
                 }),
                 waiting: None,
                 failed: None,
@@ -2097,7 +2118,7 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
             crate::runner::fake::fail(1, "could not fetch"),
         );
         let ctx = courier_ctx(root.path(), &env, &fetch_fails);
-        let error = verify_published_sha(&ctx, &project, &lane, "abc")
+        let error = verify_published_sha(&ctx, &project, &lane, "abc", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("published_fetch_failed"), "{error}");
@@ -2115,9 +2136,35 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
         );
         let runner = sha_absent;
         let ctx = courier_ctx(root.path(), &env, &runner);
-        let error = verify_published_sha(&ctx, &project, &lane, "abc")
+        let error = verify_published_sha(&ctx, &project, &lane, "abc", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("published_sha_missing"), "{error}");
+
+        let second = crate::runner::fake::FakeRunner::new();
+        second.on(
+            "git -C /repo remote get-url fork",
+            crate::runner::fake::ok("https://github.com/uguryildirim24/herdr-ade.git\n"),
+        );
+        second.on("git -C /repo remote", crate::runner::fake::ok("fork\n"));
+        second.on("git -C /repo fetch", crate::runner::fake::ok(""));
+        second.on(
+            "git -C /repo rev-parse FETCH_HEAD",
+            crate::runner::fake::ok("abc\n"),
+        );
+        let ctx = courier_ctx(root.path(), &env, &second);
+        verify_published_sha(
+            &ctx,
+            &project,
+            &lane,
+            "abc",
+            Some("seals/hp/demo/t-0001/abc"),
+        )
+        .unwrap();
+        assert!(second.calls.borrow().iter().any(|call| {
+            call.args
+                .iter()
+                .any(|arg| arg == "refs/heads/seals/hp/demo/t-0001/abc")
+        }));
     }
 }

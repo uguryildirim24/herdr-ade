@@ -3938,6 +3938,7 @@ mod tests {
                     artifact: "report".into(),
                     report_path: lane.report_path(),
                     attestation: None,
+                    published_ref: None,
                 }),
                 ..Default::default()
             },
