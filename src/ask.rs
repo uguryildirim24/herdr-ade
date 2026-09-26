@@ -761,7 +761,10 @@ mod tests {
         let a = answer(&ctx, "demo", "a-1", 1, 0, "test").unwrap();
         assert!(a.not_understood);
         assert_eq!(a.text, NOT_UNDERSTOOD);
-        assert_eq!(not_understood_count(&fx.project), 1);
+        assert_eq!(
+            project::read_json::<u64>(&fx.project.state_dir().join("not-understood.json")),
+            Some(1)
+        );
         let e = format!(
             "{:#}",
             answer(&ctx, "demo", "a-1", 1, 1, "test").unwrap_err()
