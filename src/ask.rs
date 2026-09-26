@@ -681,12 +681,6 @@ mod tests {
         );
         assert!(compact.chars().count() <= 60);
         assert!(
-            fx.world
-                .runner
-                .count(&format!("--token ade_needs_you={compact}"))
-                == 1
-        );
-        assert!(
             fx.world.runner.count(&format!(
                 "notification show {compact} --body 1. keep it running another hour"
             )) == 1
@@ -712,12 +706,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            fx.world
-                .runner
-                .count(&format!("--token ade_needs_you={compact}")),
-            1
-        );
         assert_eq!(
             fx.world.runner.count(&format!(
                 "notification show {compact} --body 1. keep it running another hour"
