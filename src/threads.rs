@@ -3444,7 +3444,70 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
 const LINKED_FILES_CAP: u64 = 200 * 1024 * 1024;
 
 fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let bytes = report.as_bytes();
+    // Mask code without changing byte offsets: the ranges below still index the
+    // original report. Fences may use either CommonMark marker and any length.
+    let mut visible = report.as_bytes().to_vec();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut offset = 0;
+    for line in report.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let indent = content.bytes().take_while(|b| *b == b' ').count();
+        let marker = content.as_bytes().get(indent).copied();
+        let run = marker.map_or(0, |m| {
+            content.as_bytes()[indent..]
+                .iter()
+                .take_while(|b| **b == m)
+                .count()
+        });
+        let rest = &content[indent + run..];
+        let close = fence.is_some_and(|(m, n)| {
+            indent <= 3 && marker == Some(m) && run >= n && rest.trim().is_empty()
+        });
+        let open = fence.is_none()
+            && indent <= 3
+            && matches!(marker, Some(b'`' | b'~'))
+            && run >= 3
+            && (marker != Some(b'`') || !rest.contains('`'));
+        if fence.is_some() || open {
+            visible[offset..offset + line.len()].fill(b' ');
+        }
+        if close {
+            fence = None;
+        } else if open {
+            fence = Some((marker.unwrap(), run));
+        }
+        offset += line.len();
+    }
+    let mut i = 0;
+    while i < visible.len() {
+        if visible[i] == b'`' {
+            let start = i;
+            while i < visible.len() && visible[i] == b'`' {
+                i += 1;
+            }
+            let count = i - start;
+            let mut end = i;
+            while end < visible.len() {
+                if visible[end] == b'`' {
+                    let mut next = end;
+                    while next < visible.len() && visible[next] == b'`' {
+                        next += 1;
+                    }
+                    if next - end == count {
+                        visible[start..next].fill(b' ');
+                        i = next;
+                        break;
+                    }
+                    end = next;
+                } else {
+                    end += 1;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let bytes = &visible;
     let mut found = Vec::new();
     let mut i = 0;
     while i + 2 < bytes.len() {
@@ -3610,6 +3673,49 @@ fn linked_relative_path(
     (!path.as_os_str().is_empty()).then_some(path)
 }
 
+fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<bool> {
+    let path = std::path::Path::new(&record.thread_dir).join(relative);
+    if !record.is_remote() {
+        return match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        };
+    }
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        record.machine_route(),
+    )?;
+    let script = format!(
+        "if test -e {file} || test -L {file}; then printf 'present'; else printf 'missing'; fi",
+        file = remote::quote(&path.to_string_lossy())
+    );
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &script,
+        None,
+        std::time::Duration::from_secs(20),
+    )?;
+    if !out.success() {
+        bail!(
+            "could not inspect linked file {}: {}",
+            path.display(),
+            out.error_text()
+        );
+    }
+    match out.stdout.trim() {
+        "missing" => Ok(true),
+        "present" => Ok(false),
+        _ => bail!(
+            "linked file probe returned no presence answer: {}",
+            path.display()
+        ),
+    }
+}
+
 fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<Vec<u8>> {
     let root = std::path::Path::new(&record.thread_dir);
     let path = root.join(relative);
@@ -3701,6 +3807,29 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
     Ok(bytes)
 }
 
+fn draft_has_existing_links(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+    text: &str,
+) -> Result<bool> {
+    let mut missing = Vec::new();
+    let mut existing = false;
+    for (_, dest) in report_destinations(text) {
+        if let Some(relative) = linked_relative_path(project, record, &dest) {
+            if linked_file_missing(ctx, record, &relative)? {
+                missing.push(dest);
+            } else {
+                existing = true;
+            }
+        }
+    }
+    thread::update(project, &record.id, |t| {
+        t.missing_report_links = missing.clone()
+    })?;
+    Ok(existing)
+}
+
 fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if thread::sealed_report_path(project, record).is_none() {
         if crate::events::list(project).into_iter().any(|event| {
@@ -3740,10 +3869,7 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
                 "__HERDR_DRAFT_PRESENT__" => {
                     let bytes = linked_bytes(ctx, record, std::path::Path::new("report.md"))?;
                     let text = String::from_utf8(bytes)?;
-                    if report_destinations(&text)
-                        .iter()
-                        .any(|(_, dest)| linked_relative_path(project, record, dest).is_some())
-                    {
+                    if draft_has_existing_links(ctx, project, record, &text)? {
                         bail!(
                             "the box report links to files but has no sealed artifact; worktree kept"
                         );
@@ -3756,10 +3882,7 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         let draft = std::path::Path::new(&record.thread_dir).join("report.md");
         match std::fs::read_to_string(&draft) {
             Ok(text) => {
-                if report_destinations(&text)
-                    .iter()
-                    .any(|(_, dest)| linked_relative_path(project, record, dest).is_some())
-                {
+                if draft_has_existing_links(ctx, project, record, &text)? {
                     bail!("the report links to files but has no sealed artifact; worktree kept");
                 }
             }
@@ -3788,10 +3911,15 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     let mut replacements = Vec::new();
     let mut files = std::collections::BTreeMap::new();
     let mut total = 0_u64;
+    let mut missing = Vec::new();
     for (range, dest) in destinations {
         let Some(relative) = linked_relative_path(project, record, &dest) else {
             continue;
         };
+        if linked_file_missing(ctx, record, &relative)? {
+            missing.push(dest);
+            continue;
+        }
         let bytes = if let Some(bytes) = files.get(&relative) {
             bytes
         } else {
@@ -3809,6 +3937,9 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         let suffix = &dest[dest.split(['#', '?']).next().unwrap_or(&dest).len()..];
         replacements.push((range, format!("{hash}{suffix}")));
     }
+    thread::update(project, &record.id, |t| {
+        t.missing_report_links = missing.clone()
+    })?;
     for (relative, bytes) in files {
         thread::store_artifact(project, &bytes)
             .with_context(|| format!("could not preserve {}", relative.display()))?;
@@ -4679,6 +4810,16 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_error_and_code_spans_do_not_create_report_links() {
+        let report = "```text\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'yaml' imported from ...\n![x](hidden.png)\n```\n~~~\n[missing]: also-hidden.png\n~~~\n`![inline](inline.png)` and ``[label]: invisible.png``\n![real](visible.png)\n";
+        let links = report_destinations(report);
+        assert_eq!(
+            links.into_iter().map(|(_, dest)| dest).collect::<Vec<_>>(),
+            vec!["visible.png"]
+        );
+    }
 
     fn worktree_thread() -> Thread {
         Thread {

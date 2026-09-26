@@ -1198,11 +1198,19 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
 }
 
 #[test]
-fn linked_files_over_cap_or_missing_keep_the_worktree_and_explain_why() {
+fn linked_files_over_cap_are_kept_but_missing_files_are_recorded_and_removed() {
     for missing in [false, true] {
         let world = World::new();
         let project = world.project("demo", "a.sock");
-        let lane = world.thread(&project, world.home.path(), |_| {});
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.repo = "/repo".into();
+            t.branch = "lane".into();
+            t.merged_sha = "landed".into();
+        });
+        world
+            .runner
+            .on("status --porcelain --ignored --untracked-files=all", ok(""));
+        world.runner.on("worktree remove", ok(""));
         let dir = Path::new(&lane.thread_dir);
         std::fs::create_dir_all(dir).unwrap();
         let report = "![capture](figma/a.png)\n";
@@ -1237,21 +1245,24 @@ fn linked_files_over_cap_or_missing_keep_the_worktree_and_explain_why() {
         .unwrap();
         let outcome =
             threads::resolve(&world.ctx(), "demo", &lane.id, &ResolveArgs::default()).unwrap();
-        assert_eq!(outcome.worktree, "kept");
-        assert!(
-            outcome
-                .copy_notes
-                .join(" ")
-                .contains(if missing { "missing" } else { "200 MiB" })
-        );
-        assert!(
-            outcome
-                .worktree_reason
-                .unwrap()
-                .contains("linked_files_not_kept")
-        );
-        assert!(thread::load(&project, &lane.id).unwrap().cleanup_pending);
-        assert_eq!(world.runner.count("worktree remove"), 0);
+        let record = thread::load(&project, &lane.id).unwrap();
+        if missing {
+            assert_eq!(outcome.worktree, "removed", "{outcome:?}");
+            assert_eq!(record.missing_report_links, vec!["figma/a.png"]);
+            assert!(!record.cleanup_pending);
+            assert_eq!(world.runner.count("worktree remove"), 1);
+        } else {
+            assert_eq!(outcome.worktree, "kept");
+            assert!(outcome.copy_notes.join(" ").contains("200 MiB"));
+            assert!(
+                outcome
+                    .worktree_reason
+                    .unwrap()
+                    .contains("linked_files_not_kept")
+            );
+            assert!(record.cleanup_pending);
+            assert_eq!(world.runner.count("worktree remove"), 0);
+        }
     }
 }
 
@@ -1265,6 +1276,10 @@ fn copy_overrides_do_not_discard_unsealed_or_unavailable_linked_reports() {
         std::fs::create_dir_all(dir).unwrap();
         let report = "![capture](figma/a.png)\n";
         std::fs::write(dir.join("report.md"), report).unwrap();
+        if !missing_seal {
+            std::fs::create_dir_all(dir.join("figma")).unwrap();
+            std::fs::write(dir.join("figma/a.png"), "image").unwrap();
+        }
         if missing_seal {
             let hash = crate::events::store_artifact(&project, report.as_bytes()).unwrap();
             crate::events::seal_create_if_absent(
