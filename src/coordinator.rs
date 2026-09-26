@@ -464,8 +464,8 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// leaves `prime_pending` set so the ticker delivers it. One delivery path.
 fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &str) -> Result<()> {
     let sent = agent.ready() && {
-        let _writer = crate::talk::writer_lock(project)?;
-        if !crate::talk::coordinator_prompt_clear(project, herdr, &agent.pane_id)? {
+        let _writer = crate::prompt::writer_lock(project)?;
+        if !crate::prompt::coordinator_prompt_clear(project, herdr, &agent.pane_id)? {
             return project
                 .update_coordinator(|c| {
                     c.prime_pending = true;
@@ -473,7 +473,7 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
                 })
                 .map(|_| ());
         }
-        crate::talk::mark_automated_prompt(project, &agent.pane_id, prompt)?;
+        crate::prompt::mark_automated_prompt(project, &agent.pane_id, prompt)?;
         match herdr.agent_prompt(&agent.pane_id, prompt) {
             Ok(()) => true,
             Err(error) => {
@@ -507,6 +507,9 @@ struct ContextCursor {
     pane: String,
     standing: String,
     messages: BTreeMap<String, String>,
+    asks: BTreeMap<String, String>,
+    tasks: BTreeMap<String, String>,
+    plan: BTreeMap<String, String>,
     lanes: BTreeMap<String, String>,
     reviews: BTreeMap<String, String>,
     inbox: BTreeMap<String, String>,
@@ -533,20 +536,63 @@ impl ContextCursor {
             .into_iter()
             .map(|review| (review.id, format!("{:?}", review.phase)))
             .collect();
-        let messages = crate::talk::read(project)
-            .lines
+        let messages = crate::prompt::recent_requests(project, usize::MAX)
             .into_iter()
-            .filter_map(|line| {
-                if let crate::talk::Entry::Rolf { request, text, .. } = line.entry {
-                    Some((request, request_preview(&text)))
-                } else {
-                    None
-                }
-            })
+            .map(|(request, text)| (request, request_preview(&text)))
             .collect();
+        let asks = crate::ask::open_asks(project)
+            .into_iter()
+            .map(|ask| (ask.id, ask.question))
+            .collect();
+        let tasks = crate::task::views_with_evidence(
+            project,
+            &crate::task::EvidenceSnapshot::load(project),
+        )
+        .0
+        .into_iter()
+        .map(|view| {
+            (
+                view.record.id,
+                format!(
+                    "{}: {} — {}",
+                    view.state.word(),
+                    view.record.title,
+                    view.next
+                ),
+            )
+        })
+        .collect();
+        let plan = crate::plan::load(project)
+            .ok()
+            .flatten()
+            .map(|plan| {
+                let mut rows = BTreeMap::new();
+                rows.insert("outcome".into(), format!("{}: {}", plan.kind, plan.does));
+                for step in &plan.steps {
+                    rows.insert(
+                        step.id.clone(),
+                        format!("{}: {}", step.state.word(), step.text),
+                    );
+                    for subtask in &step.subtasks {
+                        rows.insert(
+                            subtask.id.clone(),
+                            format!("{}: {}", subtask.state.word(), subtask.text),
+                        );
+                    }
+                }
+                rows
+            })
+            .unwrap_or_default();
         let inbox = inbox::unhandled(project)
             .into_iter()
-            .map(|item| (item.id, format!("[{}] {}", item.kind, item.summary)))
+            .map(|item| {
+                let detail = if item.body.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", item.body)
+                };
+                (item.id, format!("[{}] {}{detail}", item.kind, item.summary))
+            })
             .collect();
         let standing = project
             .read_project_md()
@@ -599,6 +645,9 @@ impl ContextCursor {
             pane: coordinator.pane_id,
             standing: crate::thread::sha256_hex(standing.as_bytes()),
             messages,
+            asks,
+            tasks,
+            plan,
             lanes,
             reviews,
             inbox,
@@ -678,6 +727,9 @@ fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> S
     let mut changes = Vec::new();
     for (label, old, new) in [
         ("Rolf", &previous.messages, &current.messages),
+        ("Ask", &previous.asks, &current.asks),
+        ("Task", &previous.tasks, &current.tasks),
+        ("Plan", &previous.plan, &current.plan),
         ("Lane", &previous.lanes, &current.lanes),
         ("Review", &previous.reviews, &current.reviews),
         ("Inbox", &previous.inbox, &current.inbox),
@@ -686,6 +738,16 @@ fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> S
             if old.get(id) != Some(value) {
                 changes.push(format!("- {label} {id}: {value}"));
             }
+        }
+    }
+    for id in previous.asks.keys() {
+        if !current.asks.contains_key(id) {
+            changes.push(format!("- Ask {id} closed."));
+        }
+    }
+    for id in previous.plan.keys() {
+        if !current.plan.contains_key(id) {
+            changes.push(format!("- Plan {id} removed."));
         }
     }
     if previous.standing != current.standing {
@@ -864,7 +926,11 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
         );
     }
     let changes = changes_since(previous.as_ref().filter(|_| same_session), &current);
-    print!("{changes}{text}");
+    if !full && same_session {
+        print!("{changes}");
+    } else {
+        print!("{changes}{text}");
+    }
     let coordinator = project.coordinator();
     let owns_read = coordinator.as_ref().is_none_or(|record| {
         std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
@@ -1001,7 +1067,7 @@ fn digest_snapshot(
     {
         out.push_str("\n## Coordinator status\n\nClosed by Rolf. Run `ha open` to reopen it.\n");
     }
-    if crate::talk::long_input_hold(project) {
+    if crate::prompt::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending; finish or clear the draft when ready.\n");
     }
     if let Ok((settings, _)) = project.read_project_md()
@@ -1014,7 +1080,7 @@ fn digest_snapshot(
     }
 
     // Rolf's own words, each under its request id.
-    let requests = crate::talk::recent_requests(project, REQUEST_ROWS);
+    let requests = crate::prompt::recent_requests(project, REQUEST_ROWS);
     if !requests.is_empty() {
         let _ = writeln!(
             out,

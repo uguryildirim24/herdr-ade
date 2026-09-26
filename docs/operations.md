@@ -65,7 +65,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder with its one current page. |
 | `list [--all]` | Projects with status and thread counts by group. |
 | `open <project> [--recipe ID --basis request:<id>] [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. A basis may name another project's request as `request:<project>/<id>`. The binding keeps the chosen recipe and basis when its process relaunches. |
-| `context <project> [--peek]` | The `PROJECT.md` body followed by new messages from Rolf, unhandled inbox items, work needing action and the compact recipe list. `--peek` records nothing. |
+| `context <project> [--peek] [--full]` | First read shows the project page; subsequent reads show changes since the last read. `--full` shows the complete page; `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
 | `task add`, `task show`, `task list`, `task drop` | Stable intent and acceptance conditions. State comes from the lane seal and pile review: open, working, finished, merged, installed. A no-change seal finishes immediately. `task drop --acceptance N --reason` withdraws a replaced condition. |
 | `note add <project> <text> --kind memory\|instruction --request <id> [--task <job>] [--replaces <id>]` | The only fact and instruction writer. It may scope the row to a task or explicitly replace an older row. |
@@ -75,9 +75,8 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `thread resolve <project> <id> [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy and close the pane and tab. A landed worktree is removed only when it has no changes or non-disposable ignored data. Changes refuse resolution; ignored data resolves the thread but keeps the worktree with folder sizes. Cleanup prunes the branch if the worktree is removed; a kept worktree keeps its branch. |
 | `overview <project> [--history] [--wait]` | Active threads grouped by what needs you. `--history` also shows resolved threads. |
 | `plan show <project>`, `plan set <project>`, `plan step add\|edit\|link\|unlink\|remove\|move <project>`, `plan sync <project>` | The plan card: goal, end result and any number of steps. `plan step add <project> "<text>" --under <step>` adds a subtask one level deep. New links use repeatable `--task`; a task may link to several steps or subtasks. Historical thread and task-side step bindings still load. |
-| `ask <project> "<question>?" --choice "<sentence>" --choice "<sentence>"` | Record a question; return one line with its id first. A normalized duplicate of another open question is refused with the existing id. |
-| `ask withdraw <project> <id> "<reason>"` | Withdraw an open question, retaining its record and withdrawal reason, actor (`USER`) and time. Answered questions cannot be withdrawn. |
-| `say <project> --what S [--means S]` | One line in the journal, returning its say id. |
+| `ask <project> "<question>?" --choice "<sentence>" --choice "<sentence>" [--task JOB]` | Record a question; a task-linked open ask closes when its task closes. A normalized duplicate is refused. |
+| `ask close <project> <id> --choice <number-or-sentence> \| --withdraw "<reason>"` | Answer or withdraw an open ask in one command. An answer is task authority. |
 | `review <project> [--repo PATH]` | Start or show the repository pile review; this first explicit call opts the project into automatic review. |
 | `review retry <project> [--repo PATH]` | Replace a stuck or dead reviewer in its checkout. |
 | `review cancel <project> [--repo PATH]` | Cancel an unlanded review and return its lanes to the pile. |
@@ -93,9 +92,9 @@ The project keeps a plan card. Reading it never changes a plan, resolves a lane 
 
 - **The plan card** is `<project>/.state/plan.toml`, written under `<project>/.state/plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, one of seven end-result kinds and any number of ordered steps. New bindings name stable tasks in each step, so one task may support several steps. A step's state is projected from those tasks. Historical thread bindings and task-side `plan_step` links still project from current lane/task records. Old round links are ignored. `plan sync` is the manual refresh.
 
-Every message Rolf sends the coordinator is a request with an id in `.state/talk/journal.jsonl`. A prompt-submit hook records text Rolf types into the coordinator pane; `ha say` and `ha ask` publish authored journal entries and question notifications. Harness prompts are automated and never count as Rolf's request. `context` lists the latest request ids.
+Every message Rolf sends the coordinator gets a request id from the prompt-submit hook and a record under `.state/requests/`. Historical request ids in the old talk journal remain readable; nothing writes that journal now. Automated harness prompts do not count as Rolf's requests; `context` shows new request ids. `ha ask` notifies Rolf of a question.
 
-There is no cap on plan steps or open questions. Ask creation, re-asking and answering serialize through `.state/asks/.open.lock`; duplicate open questions remain refused.
+There is no cap on plan steps or open questions. Ask creation and closure serialize through `.state/asks/.open.lock`; duplicate open questions remain refused.
 
 **Recovery.** A plan write is atomic, so a reader sees an old or a new complete record. A stale `--expect` fails and changes nothing. A failed plan refresh is reported on its own line and never rolls back a merge; the project page reads the authoritative records and shows that the plan needs to catch up until persistence catches up.
 

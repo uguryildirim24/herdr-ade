@@ -6,7 +6,7 @@ Use `ha` for the default root; for a non-default root, `ha context <slug>` print
 
 ## Every turn
 
-1. Run `ha context <slug>`. It starts with the complete body of `PROJECT.md`, then adds only new messages from Rolf, unhandled inbox items, work that needs your action and the compact recipe list. Work from this one page and its action rows, not from memory.
+1. Run `ha context <slug>`. It shows changes since your last read; use `--full` for the entire page. Work from the changes and their action rows, not from memory.
 2. Handle unowned inbox messages with `ha inbox done <slug> <item>...`. Thread and review changes need no inbox acknowledgement.
 3. Act, then answer Rolf.
 
@@ -50,21 +50,20 @@ Record durable facts only with:
 ha note add <slug> "<fact>" --kind memory|instruction --request <id> [--task <job>] [--replaces <note>]
 ```
 
-Summarize useful `## Remember` material in your own words. Never paste it.
+Notes hold rules and decisions only, never progress or status. Summarize useful `## Remember` material in your own words. Never paste it.
 
 ## Talking to Rolf
 
-`say` and `ask` write journal records (and notify Rolf about questions), not your reply prose.
+Reply to Rolf in this chat; the Rundown tab shows progress. Ask only about spend, irreversible steps, or steps that leave this machine.
 
-- `ha say <slug> --what "<what happened>" [--means "<what it means for you>"]`
-- `ha ask <slug> "<question>?" --choice "<outcome>" --choice "<outcome>"`
-- Ask choices are two to four complete outcomes Rolf can picture. Choice 0 means he did not understand; re-ask in other words.
-- A number typed in your pane answers nothing. Only `ha ask answer <slug> <id> --revision <r> <n>` records it.
+- `ha ask <slug> "<question>?" --choice "<outcome>" --choice "<outcome>" [--task <job>]`
+- Ask choices are two to four complete outcomes Rolf can picture. A linked open ask drops when its task closes.
+- `ha ask close <slug> <id> --choice <number-or-exact-sentence>` answers; `--withdraw "<reason>"` withdraws. Choice 0 means he did not understand. An answered ask can authorize work as `ask:<id>@<revision>`.
 ## Authority and safety
 
 `ha thread show <slug> <id>` names its report artifact. Files produced for Rolf are in `library/<id>/`.
 
-Make ordinary reversible choices and continue. Ask Rolf before spending beyond what he requested, taking irreversible or off-machine actions, or changing the outcome he will get. Never ask again for a choice he already made; keep unrelated work moving while an ask is open.
+Make ordinary reversible choices and continue. Ask Rolf only about spend, irreversible steps or steps that leave this machine. Never ask again for a choice he already made; keep unrelated work moving while an ask is open. The harness wakes you when a lane or pile needs action; do not poll with `thread show`, `pane read` or sleep loops.
 
 Do not pick a model. Routing chooses an enabled recipe from the task and workflow. If Rolf names a coordinator recipe for a project, use `ha open <project> --recipe <id> --basis request:<id>` when that coordinator is stopped; use `request:<project>/<id>` when his message belongs to another project, and its relaunches keep the choice. If Rolf names one for a lane, use `--recipe <id> --basis "<his exact words>"`; those words must occur in the task's request.
 

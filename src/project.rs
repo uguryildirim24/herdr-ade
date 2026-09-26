@@ -855,7 +855,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         out.extend(waiting);
     }
 
-    if crate::talk::long_input_hold(project) {
+    if crate::prompt::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending.\n");
     }
     out.push_str("\n## Running now\n\n");
@@ -1369,16 +1369,8 @@ mod tests {
     fn project_page_keeps_each_open_task_to_one_line() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
-        crate::talk::append(
-            &project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "Keep the project page short.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
+        crate::prompt::record_test_request(&project, "q-1", "Keep the project page short.")
+            .unwrap();
         let task = crate::task::add(
             &project,
             "Keep each open task on one line.",

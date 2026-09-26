@@ -1,113 +1,54 @@
-//! The conversation journal: checked say, ask, answer and notice entries,
-//! plus Rolf's requests from the coordinator prompt hook.
-//!
-//! One append owner: every writer appends under `talk/journal.lock`,
-//! fsyncs and releases. A trailing incomplete line is terminated, skipped by
-//! readers, and reported once as a `journal_tail` notice.
+//! Coordinator prompt delivery and Rolf's request ids. Old talk journal
+//! records remain readable as historical request authority, but new messages
+//! are written to the request store only.
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::contracts::TalkInbound;
 use crate::project::{self, Project};
 
-/// Entries are bounded (D18 item 6).
-pub(crate) const MAX_ENTRY_BYTES: usize = 64 * 1024;
-
-/// One journal entry. Serialized flattened next to `seq`, so an inbound line
-/// is `{"seq":n,...,"inbound":{...}}` and also parses as A0's
-/// `TalkJournalRecord`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Entry {
-    Inbound(TalkInbound),
-    /// Rolf's own line, shown as typed.
-    Rolf {
-        request: String,
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        answer: Option<AnswerRef>,
-    },
-    Say {
-        what: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        means: Option<String>,
-    },
-    Ask {
-        id: String,
-        revision: u32,
-    },
-    Answer {
-        id: String,
-        revision: u32,
-        choice: u32,
-    },
-    Notice {
-        id: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct AnswerRef {
-    pub(crate) id: String,
-    pub(crate) revision: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct Line {
-    pub(crate) seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) key: Option<String>,
+// Old journal lines are read only for request authority. Unrelated entries,
+// malformed lines and a cut tail cannot create requests.
+#[derive(Deserialize)]
+struct HistoricalLine {
     #[serde(default)]
-    pub(crate) at: String,
-    #[serde(flatten)]
-    pub(crate) entry: Entry,
+    at: String,
+    rolf: Option<HistoricalRequest>,
 }
 
-pub(crate) fn talk_dir(project: &Project) -> PathBuf {
+#[derive(Deserialize)]
+struct HistoricalRequest {
+    request: String,
+    text: String,
+}
+
+fn talk_dir(project: &Project) -> PathBuf {
     project.record_dir("talk")
 }
 
-pub(crate) fn journal_path(project: &Project) -> PathBuf {
+fn journal_path(project: &Project) -> PathBuf {
     talk_dir(project).join("journal.jsonl")
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct Journal {
-    pub(crate) lines: Vec<Line>,
-    /// Complete lines that did not parse (a terminated partial tail).
-    pub(crate) skipped: usize,
-    /// The file ends without a newline: a write was cut.
-    pub(crate) tail_incomplete: bool,
-}
-
-pub(crate) fn parse(bytes: &[u8]) -> Journal {
-    let mut journal = Journal::default();
-    let text = String::from_utf8_lossy(bytes);
-    journal.tail_incomplete = !text.is_empty() && !text.ends_with('\n');
-    let mut parts: Vec<&str> = text.split('\n').collect();
-    // The last piece is "" after a final newline, or the incomplete tail.
-    parts.pop();
-    for part in parts {
-        if part.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Line>(part) {
-            Ok(line) => journal.lines.push(line),
-            Err(_) => journal.skipped += 1,
-        }
-    }
-    journal
-}
-
-pub(crate) fn read(project: &Project) -> Journal {
-    parse(&std::fs::read(journal_path(project)).unwrap_or_default())
+fn historical_requests(project: &Project) -> Vec<RequestRecord> {
+    let bytes = std::fs::read(journal_path(project)).unwrap_or_default();
+    bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| line.ends_with(b"\n"))
+        .filter_map(|line| serde_json::from_slice::<HistoricalLine>(line).ok())
+        .filter_map(|line| {
+            line.rolf.map(|rolf| RequestRecord {
+                id: rolf.request,
+                text: rolf.text,
+                at: line.at,
+            })
+        })
+        .collect()
 }
 
 struct Locked {
@@ -123,67 +64,6 @@ fn lock_file(project: &Project, name: &str) -> Result<Locked> {
         .open(talk_dir(project).join(name))?;
     file.lock()?;
     Ok(Locked { _file: file })
-}
-
-/// Appends one entry under the journal lock and fsyncs. With `key`, an entry
-/// already carrying that key is not appended again (`Ok(None)`).
-pub(crate) fn append(project: &Project, key: Option<&str>, entry: Entry) -> Result<Option<u64>> {
-    let _lock = lock_file(project, "journal.lock")?;
-    let path = journal_path(project);
-    let bytes = std::fs::read(&path).unwrap_or_default();
-    let journal = parse(&bytes);
-    if let Some(key) = key
-        && journal.lines.iter().any(|l| l.key.as_deref() == Some(key))
-    {
-        return Ok(None);
-    }
-    let mut file = File::options().create(true).append(true).open(&path)?;
-    let mut seq = journal.lines.last().map_or(0, |l| l.seq);
-    let mut out = String::new();
-    if journal.tail_incomplete {
-        // Terminate the cut line so it stays a skipped line of its own, then
-        // report it once. It is never an acknowledgement or a result.
-        out.push('\n');
-        seq += 1;
-        out.push_str(&serde_json::to_string(&Line {
-            seq,
-            key: None,
-            at: project::now(),
-            entry: Entry::Notice {
-                id: "journal_tail".into(),
-            },
-        })?);
-        out.push('\n');
-    }
-    seq += 1;
-    let from_rolf = matches!(entry, Entry::Rolf { .. });
-    let text = serde_json::to_string(&Line {
-        seq,
-        key: key.map(str::to_string),
-        at: project::now(),
-        entry,
-    })?;
-    if text.len() > MAX_ENTRY_BYTES {
-        bail!(
-            "talk_entry_too_large: {} bytes, at most {MAX_ENTRY_BYTES}",
-            text.len()
-        );
-    }
-    out.push_str(&text);
-    out.push('\n');
-    file.write_all(out.as_bytes())?;
-    file.sync_all()?;
-    if from_rolf
-        && project
-            .coordinator()
-            .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
-    {
-        project.update_coordinator(|c| {
-            c.closed_by_rolf_at.clear();
-            c.reopen_requested = true;
-        })?;
-    }
-    Ok(Some(seq))
 }
 
 // -------------------------------------------------- coordinator-pane prompts
@@ -769,15 +649,42 @@ pub(crate) fn writer_lock(project: &Project) -> Result<WriterLock> {
     })
 }
 
-/// Rolf's exact words for one durable request id.
+#[derive(Debug, Serialize, Deserialize)]
+struct RequestRecord {
+    id: String,
+    text: String,
+    at: String,
+}
+
+fn requests_dir(project: &Project) -> PathBuf {
+    project.record_dir("requests")
+}
+
+fn requests(project: &Project) -> Vec<RequestRecord> {
+    let Ok(entries) = std::fs::read_dir(requests_dir(project)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path()).ok()?;
+            serde_json::from_str(&text).ok()
+        })
+        .collect()
+}
+
+/// Rolf's exact words for one durable request id, including historical ids.
 pub(crate) fn request_text(project: &Project, id: &str) -> Option<String> {
-    read(project)
-        .lines
+    requests(project)
         .into_iter()
-        .rev()
-        .find_map(|line| match line.entry {
-            Entry::Rolf { request, text, .. } if request == id => human_request_text(&text),
-            _ => None,
+        .find(|row| row.id == id)
+        .and_then(|row| human_request_text(&row.text))
+        .or_else(|| {
+            historical_requests(project)
+                .into_iter()
+                .rev()
+                .find(|row| row.id == id)
+                .and_then(|row| human_request_text(&row.text))
         })
 }
 
@@ -835,45 +742,66 @@ pub(crate) fn resolve_request(project: &Project, basis: &str) -> Result<Resolved
 }
 
 pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, String)> {
-    let journal = read(project);
-    let mut found: Vec<(String, String)> = journal
-        .lines
-        .iter()
-        .filter_map(|line| match &line.entry {
-            Entry::Rolf { request, text, .. } => {
-                human_request_text(text).map(|text| (request.clone(), text))
-            }
-            _ => None,
-        })
+    let mut found: Vec<_> = historical_requests(project)
+        .into_iter()
+        .filter_map(|row| human_request_text(&row.text).map(|text| (row.at, row.id, text)))
         .collect();
-    if found.len() > limit {
-        found.drain(..found.len() - limit);
-    }
+    found.extend(
+        requests(project)
+            .into_iter()
+            .filter_map(|row| human_request_text(&row.text).map(|text| (row.at, row.id, text))),
+    );
+    found.sort_by(|a, b| a.0.cmp(&b.0));
     found
+        .into_iter()
+        .rev()
+        .take(limit)
+        .map(|(_, id, text)| (id, text))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 /// Records a message Rolf typed straight into the coordinator pane, verbatim,
 /// under a new request id the coordinator can cite.
 pub(crate) fn record_pane_request(project: &Project, text: &str) -> Result<String> {
-    let request = fresh_request();
-    append(
-        project,
-        None,
-        Entry::Rolf {
-            request: request.clone(),
-            text: text.to_string(),
-            answer: None,
-        },
-    )?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let request = format!(
+        "q-{}-{}-{}",
+        jiff::Timestamp::now().as_millisecond(),
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    save_request(project, &request, text)?;
     Ok(request)
 }
 
-fn fresh_request() -> String {
-    format!(
-        "q-{}-{}",
-        jiff::Timestamp::now().as_millisecond(),
-        std::process::id()
-    )
+#[cfg(test)]
+pub(crate) fn record_test_request(project: &Project, request: &str, text: &str) -> Result<()> {
+    save_request(project, request, text)
+}
+
+fn save_request(project: &Project, request: &str, text: &str) -> Result<()> {
+    let dir = project.record_dir_for_write("requests")?;
+    project::write_atomic(
+        &dir.join(format!("{request}.json")),
+        &serde_json::to_vec(&RequestRecord {
+            id: request.to_string(),
+            text: text.to_string(),
+            at: project::now(),
+        })?,
+    )?;
+    if project
+        .coordinator()
+        .is_some_and(|c| !c.closed_by_rolf_at.is_empty())
+    {
+        project.update_coordinator(|c| {
+            c.closed_by_rolf_at.clear();
+            c.reopen_requested = true;
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -979,72 +907,25 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_tail_is_skipped_terminated_and_reported_once() {
+    fn historical_requests_resolve_without_writing_to_the_journal() {
         let fx = fixture();
-        append(
-            &fx.project,
-            None,
-            Entry::Say {
-                what: "One.".into(),
-                means: None,
-            },
+        let path = journal_path(&fx.project);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"seq\":1,\"rolf\":{\"request\":\"q-old\",\"text\":\"Keep this request\"}}\n",
         )
         .unwrap();
-        let mut f = File::options()
-            .append(true)
-            .open(journal_path(&fx.project))
-            .unwrap();
-        f.write_all(br#"{"seq":2,"say":{"wh"#).unwrap();
-        drop(f);
-        let j = read(&fx.project);
-        assert!(j.tail_incomplete);
-        assert_eq!(j.lines.len(), 1, "the cut line is never read as an entry");
-        append(
-            &fx.project,
-            None,
-            Entry::Say {
-                what: "Two.".into(),
-                means: None,
-            },
-        )
-        .unwrap();
-        append(
-            &fx.project,
-            None,
-            Entry::Say {
-                what: "Three.".into(),
-                means: None,
-            },
-        )
-        .unwrap();
-        let j = read(&fx.project);
-        assert!(!j.tail_incomplete);
-        assert_eq!(j.skipped, 1);
-        assert!(
-            j.lines
-                .iter()
-                .any(|l| matches!(&l.entry, Entry::Notice { id } if id == "journal_tail"))
+        assert_eq!(
+            request_text(&fx.project, "q-old").as_deref(),
+            Some("Keep this request")
         );
-        let seqs: Vec<u64> = j.lines.iter().map(|l| l.seq).collect();
-        assert_eq!(seqs, [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn a_keyed_entry_is_appended_once_and_oversize_is_refused() {
-        let fx = fixture();
-        let e = || Entry::Notice {
-            id: "journal_tail".into(),
-        };
-        assert_eq!(append(&fx.project, Some("k"), e()).unwrap(), Some(1));
-        assert_eq!(append(&fx.project, Some("k"), e()).unwrap(), None);
-        let big = Entry::Say {
-            what: "x".repeat(MAX_ENTRY_BYTES),
-            means: None,
-        };
-        assert!(
-            format!("{:#}", append(&fx.project, None, big).unwrap_err())
-                .starts_with("talk_entry_too_large")
+        let before = std::fs::read(&path).unwrap();
+        let new = record_pane_request(&fx.project, "This is new").unwrap();
+        assert_eq!(
+            request_text(&fx.project, &new).as_deref(),
+            Some("This is new")
         );
-        assert_eq!(read(&fx.project).lines.len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

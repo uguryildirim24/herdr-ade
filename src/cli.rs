@@ -289,24 +289,14 @@ enum Command {
         /// One sentence: what it means for Rolf
         #[arg(long)]
         means: Option<String>,
-        /// Ask an existing question again as its next revision
-        #[arg(long, value_name = "ASK_ID")]
-        reask: Option<String>,
+        /// Drop this ask when the task closes
+        #[arg(long, value_name = "TASK_ID")]
+        task: Option<String>,
     },
     /// The plan card: goal, end result and steps
     Plan {
         #[command(subcommand)]
         command: PlanCommand,
-    },
-    /// Record one checked update in the journal
-    Say {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        #[arg(long)]
-        what: String,
-        #[arg(long)]
-        means: Option<String>,
     },
     /// The background ticker
     Ticker {
@@ -441,9 +431,6 @@ enum PlanStepCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
         id: String,
-        /// Why this step or link is removed
-        #[arg(long)]
-        why: String,
         /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
         expect: Option<u64>,
@@ -465,27 +452,17 @@ enum PlanStepCommand {
 
 #[derive(Subcommand)]
 enum AskCommand {
-    /// Withdraw an open question, keeping its history
-    Withdraw {
-        /// Project slug
+    /// Answer or withdraw an open ask
+    Close {
         #[arg(value_name = "PROJECT")]
         slug: String,
-        /// Ask id
         id: String,
-        /// Reason for withdrawing it
-        reason: String,
-    },
-    /// Answer an ask by id and revision
-    Answer {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        /// Ask id
-        id: String,
-        #[arg(long)]
-        revision: u32,
         /// Choice number (0 means not understood), or exact choice sentence
-        choice: String,
+        #[arg(long, conflicts_with = "withdraw")]
+        choice: Option<String>,
+        /// Reason for withdrawing instead of answering
+        #[arg(long, conflicts_with = "choice")]
+        withdraw: Option<String>,
     },
 }
 
@@ -499,9 +476,14 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
             choices,
             what,
             means,
-            reask,
+            task,
         } => match command {
-            Some(AskCommand::Withdraw { slug, id, reason }) => {
+            Some(AskCommand::Close {
+                slug,
+                id,
+                choice: None,
+                withdraw: Some(reason),
+            }) => {
                 let by = ctx
                     .env
                     .var("USER")
@@ -511,12 +493,14 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                 println!("{id} withdrawn: {reason}");
                 Ok(())
             }
-            Some(AskCommand::Answer {
+            Some(AskCommand::Close {
                 slug,
                 id,
-                revision,
-                choice,
+                choice: Some(choice),
+                withdraw: None,
             }) => {
+                let project = crate::project::Project::load(&ctx.root, &slug)?;
+                let revision = ask::latest_revision(&project, &id);
                 let answer = ask::answer_text(ctx, &slug, &id, revision, &choice, "command")?;
                 crate::output::success(
                     Some("answered"),
@@ -539,7 +523,7 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                         choices,
                         what,
                         means,
-                        reask,
+                        task,
                     },
                 )?;
                 crate::output::insert("ask", a.id.clone());
@@ -554,6 +538,7 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                 );
                 Ok(())
             }
+            Some(AskCommand::Close { .. }) => anyhow::bail!("pass --choice or --withdraw"),
         },
         Command::Plan { command } => match command {
             PlanCommand::Show { slug } => {
@@ -668,13 +653,8 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                         "",
                     )
                 }
-                PlanStepCommand::Remove {
-                    slug,
-                    id,
-                    why,
-                    expect,
-                } => {
-                    let p = plan::step_remove(ctx, &slug, &id, &why, expect)?;
+                PlanStepCommand::Remove { slug, id, expect } => {
+                    let p = plan::step_remove(ctx, &slug, &id, expect)?;
                     crate::output::success(
                         None,
                         &serde_json::json!({
@@ -728,12 +708,6 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
         },
-        Command::Say { slug, what, means } => {
-            let id = ask::say(ctx, &slug, &what, means.as_deref())?;
-            crate::output::insert("say", id.clone());
-            println!("{id} said");
-            Ok(())
-        }
         _ => unreachable!("run_project_commands only receives project commands"),
     }
 }
@@ -1041,9 +1015,7 @@ fn machine_outcome(command: &str) -> String {
         "thread list" => "listed",
         "thread show" => "shown",
         "ask" => "asked",
-        "ask answer" => "answered",
-        "ask withdraw" => "withdrawn",
-        "say" => "said",
+        "ask close" => "closed",
         "done" | "waiting" | "failed" => "sealed",
         "doctor" => "healthy",
         "harness install" => "installed",
@@ -1868,7 +1840,7 @@ fn dispatch_with_start(
             }
             Ok(())
         }
-        command @ (Command::Ask { .. } | Command::Plan { .. } | Command::Say { .. }) => {
+        command @ (Command::Ask { .. } | Command::Plan { .. }) => {
             run_project_commands(&ctx, command)
         }
         Command::Review {
@@ -2059,11 +2031,10 @@ mod tests {
             Cli::try_parse_from([
                 "herdr-ade",
                 "ask",
-                "answer",
+                "close",
                 "demo",
                 "a-1",
-                "--revision",
-                "1",
+                "--choice",
                 "Take the first option."
             ])
             .is_ok()
@@ -2112,17 +2083,7 @@ mod tests {
                 "--expect",
                 "1",
             ],
-            &[
-                "plan",
-                "step",
-                "remove",
-                "demo",
-                "s-1",
-                "--why",
-                "No longer needed.",
-                "--expect",
-                "1",
-            ],
+            &["plan", "step", "remove", "demo", "s-1", "--expect", "1"],
             &[
                 "plan", "step", "move", "demo", "s-1", "--before", "s-2", "--expect", "1",
             ],
@@ -2136,9 +2097,15 @@ mod tests {
                 "--choice",
                 "Wait for later.",
             ],
-            &["ask", "withdraw", "demo", "a-1", "No longer needed."],
-            &["ask", "answer", "demo", "a-1", "--revision", "1", "1"],
-            &["say", "demo", "--what", "This was checked."],
+            &[
+                "ask",
+                "close",
+                "demo",
+                "a-1",
+                "--withdraw",
+                "No longer needed.",
+            ],
+            &["ask", "close", "demo", "a-1", "--choice", "1"],
         ];
         for args in cases {
             let mut argv = vec!["herdr-ade"];

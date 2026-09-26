@@ -899,14 +899,14 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
                 .agents
                 .iter()
                 .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
-                && crate::talk::writer_lock(input.project).is_ok_and(|_writer| {
-                    crate::talk::coordinator_prompt_clear(
+                && crate::prompt::writer_lock(input.project).is_ok_and(|_writer| {
+                    crate::prompt::coordinator_prompt_clear(
                         input.project,
                         input.herdr,
                         &coordinator.pane_id,
                     )
                     .unwrap_or(false)
-                        && crate::talk::mark_automated_prompt(
+                        && crate::prompt::mark_automated_prompt(
                             input.project,
                             &coordinator.pane_id,
                             &notice,
@@ -1853,9 +1853,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
         if record.prime_pending && !record.prime_sent && agent.ready() {
             let prompt = coordinator::priming_prompt(&prefix, slug);
-            let _writer = crate::talk::writer_lock(project)?;
-            if crate::talk::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
-                crate::talk::mark_automated_prompt(project, &record.pane_id, &prompt)?;
+            let _writer = crate::prompt::writer_lock(project)?;
+            if crate::prompt::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
+                crate::prompt::mark_automated_prompt(project, &record.pane_id, &prompt)?;
                 match herdr.agent_prompt(&record.pane_id, &prompt) {
                     Ok(()) => {
                         project.update_coordinator(|c| c.prime_sent = true)?;

@@ -271,9 +271,6 @@ fn start_with_ticker(
             "machine":placement.dispatch_machine(), "reason":placement.reason,
             "tried":placement.tried}),
     )?;
-    if placement.fell_back {
-        fallback_say(ctx, slug, &placement)?;
-    }
     let machine = placement.machine.clone();
     // Selection initially carries the configured dispatch candidate because
     // placement needs it. The durable lane launch names where this attempt was
@@ -518,44 +515,6 @@ fn resolve_placement(
         "recipe_unavailable: recipe `{}` cannot run; tried {details}",
         launch.recipe_id
     )
-}
-
-/// The one plain line when a default box start falls back to this Mac
-/// (SPEC-remote §4.1, d-0005).
-fn fallback_say(ctx: &Ctx, slug: &str, placement: &Placement) -> Result<()> {
-    let missing = placement
-        .tried
-        .iter()
-        .find_map(|row| row["missing"].as_str())
-        .unwrap_or_default();
-    let what = if missing.contains("box_publish_url_missing") {
-        "the box has no publishing address for this repository, so this lane runs here"
-    } else if missing.contains("box_path_missing") {
-        "the box has no folder for this repository, so this lane runs here"
-    } else if missing.contains("box_repo_unmapped") {
-        "this repository has no box location, so this lane runs here"
-    } else if missing.contains("machine_kind_unavailable") {
-        "the box does not run this kind of helper, so this lane runs here"
-    } else {
-        "the box was not ready, so this lane runs here"
-    };
-    let project = Project::load(&ctx.root, slug)?;
-    if crate::talk::read(&project)
-        .lines
-        .iter()
-        .rev()
-        .find_map(|line| {
-            if let crate::talk::Entry::Say { what, means, .. } = &line.entry {
-                Some((what.as_str(), means.as_deref()))
-            } else {
-                None
-            }
-        })
-        == Some((what, None))
-    {
-        return Ok(());
-    }
-    crate::ask::say(ctx, slug, what, None).map(|_| ())
 }
 
 /// Recipe readiness on a box is owned by the doctor probes.
@@ -1722,9 +1681,6 @@ fn retry_with_ticker(
                 "machine":placement.dispatch_machine(), "reason":placement.reason,
                 "tried":placement.tried}),
         )?;
-        if placement.fell_back {
-            fallback_say(ctx, slug, &placement)?;
-        }
         launch.machine = placement.dispatch_machine().to_string();
         Some(placement)
     } else {
@@ -5242,14 +5198,10 @@ mod tests {
         )
         .unwrap();
 
-        crate::talk::append(
+        crate::prompt::record_test_request(
             &project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-brief".into(),
-                text: "Keep the complete lead brief with the task.".into(),
-                answer: None,
-            },
+            "q-brief",
+            "Keep the complete lead brief with the task.",
         )
         .unwrap();
         let stable_task = crate::task::add(
@@ -5719,17 +5671,6 @@ mod tests {
         }
     }
 
-    fn say_lines(project: &Project) -> Vec<String> {
-        crate::talk::read(project)
-            .lines
-            .iter()
-            .filter_map(|line| match &line.entry {
-                crate::talk::Entry::Say { what, .. } => Some(what.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn only_lane_and_reviewer_default_to_the_box() {
         assert_eq!(
@@ -5877,10 +5818,6 @@ mod tests {
             started
                 .worktree_path
                 .starts_with("/home/agent/projects/repo/.worktrees/")
-        );
-        assert!(
-            say_lines(&fx.project).is_empty(),
-            "a box start says nothing"
         );
         let second = start(
             &fx.world.ctx(),
@@ -6170,14 +6107,7 @@ mod tests {
                 .worktree_path
                 .starts_with(&fx.repo.to_string_lossy().to_string())
         );
-        assert_eq!(
-            say_lines(&fx.project),
-            vec![
-                "the box has no publishing address for this repository, so this lane runs here"
-                    .to_string()
-            ]
-        );
-        let dispatch =
+        let ledger =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
         assert!(dispatch.contains("box_publish_url_missing"), "{dispatch}");
 
@@ -6476,10 +6406,6 @@ mod tests {
         )
         .unwrap();
         assert!(started.machine.is_empty());
-        assert_eq!(
-            say_lines(&fx.project),
-            vec!["the box was not ready, so this lane runs here".to_string()]
-        );
     }
 
     #[test]
@@ -6504,10 +6430,6 @@ mod tests {
         )
         .unwrap();
         assert!(started.machine.is_empty());
-        assert_eq!(
-            say_lines(&fx.project),
-            vec!["the box was not ready, so this lane runs here".to_string()]
-        );
     }
 
     #[test]
