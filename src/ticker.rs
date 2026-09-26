@@ -1340,6 +1340,35 @@ fn thread_pass(
             && !threads::parkable(project, &after)
             && !live.pane_exists;
         if process_gone && !whole_session_missing {
+            // The pane list may predate this record: a concurrent start or
+            // retry can place a tab after the pass took its snapshot. Absence
+            // must be observed again after placement before closing anything.
+            let current = thread::load(project, &t.id)?;
+            if current.attempt != t.attempt
+                || current.pane_id != t.pane_id
+                || current.tab_id != t.tab_id
+            {
+                continue;
+            }
+            match herdr.pane_list() {
+                Ok(panes)
+                    if panes.iter().any(|pane| {
+                        pane.pane_id == current.pane_id
+                            && pane.tab_id == current.tab_id
+                            && pane.workspace_id == current.workspace_id
+                    }) =>
+                {
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    pass.error = pass.error.or(Some(anyhow::anyhow!(
+                        "{}: recheck missing pane: {error}",
+                        t.id
+                    )));
+                    continue;
+                }
+            }
             let recover = !t.launch.recipe_id.is_empty();
             if let Err(error) = threads::fail_start(
                 ctx,
@@ -2853,6 +2882,93 @@ mod tests {
         assert_eq!(saved.failure_class, crate::contracts::FailureClass::Unknown);
         assert_eq!(saved.last_group, thread::Group::Unknown.token());
         assert_eq!(runner.count("tab close"), 0);
+    }
+
+    #[test]
+    fn a_lane_placed_after_the_pane_snapshot_is_not_failed_or_closed() {
+        let fixture = fixture(false);
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Open;
+            t.workspace_id = "w1".into();
+            t.tab_id = "w1:t2".into();
+            t.pane_id = "w1:p2".into();
+            t.cwd = "/work/lane".into();
+        })
+        .unwrap();
+        let coordinator_pane = Pane {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            pane_id: "w1:p1".into(),
+            cwd: fixture.project.dir().to_string_lossy().into_owned(),
+        };
+        let live_json = r#"{"result":{"panes":[{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","cwd":"/work"},{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/elsewhere"}]}}"#;
+        let runner = FakeRunner::new();
+        runner.on("pane list", ok(live_json));
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&record),
+                agents: &[],
+                panes: std::slice::from_ref(&coordinator_pane), // snapshot before placement
+            },
+            "ha",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pass.error.is_none());
+        assert_eq!(runner.count("pane list"), 1);
+        assert_eq!(runner.count("tab close"), 0);
+        assert_eq!(
+            thread::load(&fixture.project, &record.id).unwrap().status,
+            thread::Status::Open
+        );
+
+        // A later pass whose fresh view really lacks the pane can still fail it.
+        let gone = FakeRunner::new();
+        gone.on("pane list", ok(&with_cwd(PANE, &fixture)));
+        gone.on("agent list", ok(NO_AGENTS));
+        let ctx = Ctx {
+            runner: &gone,
+            ..ctx
+        };
+        let herdr = Herdr::new(
+            "herdr",
+            &fixture.project.coordinator().unwrap().socket,
+            &gone,
+        );
+        let current = thread::load(&fixture.project, &record.id).unwrap();
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: &[current],
+                agents: &[],
+                panes: &[coordinator_pane],
+            },
+            "ha",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pass.error.is_none(), "{:?}", pass.error);
+        let failed = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert_eq!(
+            failed.failure_class,
+            crate::contracts::FailureClass::ProcessGone
+        );
     }
 
     #[test]
