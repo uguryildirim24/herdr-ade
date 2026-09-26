@@ -4045,6 +4045,7 @@ mod tests {
             close: false,
             prune: false,
             attention: String::new(),
+            notices: Vec::new(),
         };
         std::fs::create_dir_all(crate::review::dir(&f.project)).unwrap();
         std::fs::write(

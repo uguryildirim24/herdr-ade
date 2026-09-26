@@ -104,6 +104,9 @@ pub(crate) struct Thread {
     #[serde(default)]
     pub(crate) trust_answered: bool,
     pub(crate) failure_event: String,
+    /// Start failures awaiting a coordinator wake-up, even across manual retries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) start_notices: Vec<crate::steps::Notice>,
     pub(crate) last_failure: String,
     /// Classification of the current failure evidence. Old records load as
     /// unknown rather than guessing from prose.
