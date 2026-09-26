@@ -940,6 +940,14 @@ fn page_body(project: &Project, settings: &Settings) -> String {
                     step.state.word(),
                     step.text.trim()
                 ));
+                for sub in &step.subtasks {
+                    out.push_str(&format!(
+                        "  - `{}` [{}] {}\n",
+                        sub.id,
+                        sub.state.word(),
+                        sub.text.trim()
+                    ));
+                }
             }
         }
         _ => out.push_str("No steps are written down.\n"),
@@ -1502,6 +1510,36 @@ mod tests {
         .unwrap();
         let reads = crate::events::count_event_reads(|| refresh_page(&project).unwrap());
         assert_eq!(reads, 3, "page must load each of the three events once");
+    }
+
+    #[test]
+    fn page_lists_subtasks_beneath_their_step() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let plan = crate::contracts::Plan {
+            steps: vec![crate::contracts::PlanStep {
+                id: "s-1".into(),
+                text: "Build the screen".into(),
+                subtasks: vec![crate::contracts::PlanStep {
+                    id: "s-2".into(),
+                    text: "Draw the list".into(),
+                    ..crate::contracts::PlanStep::default()
+                }],
+                ..crate::contracts::PlanStep::default()
+            }],
+            ..crate::contracts::Plan::default()
+        };
+        std::fs::write(
+            crate::plan::plan_path(&project),
+            toml::to_string(&plan).unwrap(),
+        )
+        .unwrap();
+        refresh_page(&project).unwrap();
+        let (_, body) = project.read_project_md().unwrap();
+        assert!(
+            body.contains("## Plan\n\n- `s-1` [left] Build the screen\n  - `s-2` [left] Draw the list\n"),
+            "{body}"
+        );
     }
 
     #[test]
