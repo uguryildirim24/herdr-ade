@@ -97,4 +97,4 @@ command = ["target/release/herdr-pi", "login"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["target/release/herdr-ade", "event", "round-advance"]
+command = ["target/release/herdr-ade", "event", "review-advance"]

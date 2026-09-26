@@ -351,7 +351,6 @@ pub(crate) struct NewAsk {
     pub(crate) choices: Vec<String>,
     pub(crate) what: Option<String>,
     pub(crate) means: Option<String>,
-    pub(crate) round: Option<String>,
     /// Re-ask an existing id as revision `r+1`.
     pub(crate) reask: Option<String>,
 }
@@ -393,7 +392,6 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
             id: id.clone(),
             revision,
             project: project.slug.clone(),
-            round: new.round.clone(),
             question: new.question.trim().to_string(),
             choices: new.choices.iter().map(|c| c.trim().to_string()).collect(),
             what: new.what.clone(),
@@ -551,32 +549,6 @@ pub(crate) fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Res
             id: id.clone(),
             what: what.trim().to_string(),
             means: means.map(|m| m.trim().to_string()),
-            landed_round: None,
-        },
-    )?;
-    Ok(id)
-}
-
-/// The landing line for a merged round (SPEC-talk §6.1). It publishes under
-/// `landed:<round>` so a repeated merge publishes once, and it validates that
-/// the round actually merged and checkpointed.
-pub(crate) fn say_landed(
-    ctx: &Ctx,
-    slug: &str,
-    what: &str,
-    means: Option<&str>,
-    round: &str,
-) -> Result<String> {
-    let project = Project::load(&ctx.root, slug)?;
-    let id = format!("landed-{round}");
-    publish(
-        ctx,
-        &project,
-        &HumanMessage::Say {
-            id: id.clone(),
-            what: what.trim().to_string(),
-            means: means.map(|m| m.trim().to_string()),
-            landed_round: Some(round.to_string()),
         },
     )?;
     Ok(id)
@@ -646,16 +618,6 @@ fn publication_complete(publication: &Publication) -> bool {
     publication.journal && publication.board && publication.notified.unwrap_or(true)
 }
 
-fn journal_key(message: &HumanMessage, publication_key: &str) -> String {
-    match message {
-        HumanMessage::Say {
-            landed_round: Some(round),
-            ..
-        } => format!("landed:{round}"),
-        _ => publication_key.to_string(),
-    }
-}
-
 /// Publishes an authored say or ask under its canonical id. Each sink outcome
 /// is durable, so a retry runs only the sinks that have not yet succeeded.
 pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
@@ -664,16 +626,7 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     }
     let ask_record = match msg {
         HumanMessage::Ask { id, revision } => Some(open_revision(project, id, *revision)?),
-        HumanMessage::Say { landed_round, .. } => {
-            if let Some(round) = landed_round {
-                let merged = crate::round::read_merge(project, round)?
-                    .is_some_and(|merge| merge.phase == crate::contracts::MergePhase::Checkpointed);
-                if !merged {
-                    bail!("landed_round_unmerged: `{round}` has not merged and checkpointed");
-                }
-            }
-            None
-        }
+        HumanMessage::Say { .. } => None,
         HumanMessage::Notice { .. } => unreachable!(),
     };
     let board_value = match (msg, ask_record.as_ref()) {
@@ -693,7 +646,7 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     }
     let _publication = publication_lock(project)?;
     let key = publication_key(msg)?;
-    let journal_key = journal_key(msg, &key);
+    let journal_key = key.clone();
     let path = publication_path(project, &key);
     // Check the last authored line, not the board's shortened token. Keep
     // retrying the same publication id possible after a partial sink failure.
@@ -745,15 +698,9 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     let mut seq = None;
     if !state.journal {
         let entry = match msg {
-            HumanMessage::Say {
-                what,
-                means,
-                landed_round,
-                ..
-            } => crate::talk::Entry::Say {
+            HumanMessage::Say { what, means, .. } => crate::talk::Entry::Say {
                 what: what.clone(),
                 means: means.clone(),
-                landed_round: landed_round.clone(),
             },
             HumanMessage::Ask { id, revision } => crate::talk::Entry::Ask {
                 id: id.clone(),
@@ -859,9 +806,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::round::testkit::{Fx, fixture};
     use crate::runner::fake::ok;
     use crate::scenarios::World;
+    use crate::testkit::{Fx, fixture};
 
     fn keep_or_stop() -> NewAsk {
         NewAsk {
@@ -869,7 +816,6 @@ mod tests {
             choices: vec!["keep it running another hour".into(), "stop it now".into()],
             what: None,
             means: None,
-            round: None,
             reask: None,
         }
     }
@@ -1125,7 +1071,6 @@ mod tests {
             id: "s-7".into(),
             what: "The review is done.".into(),
             means: None,
-            landed_round: None,
         };
         let first = publish(&fx.world.ctx(), &fx.project, &msg).unwrap();
         let second = publish(&fx.world.ctx(), &fx.project, &msg).unwrap();

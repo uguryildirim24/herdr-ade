@@ -125,7 +125,7 @@ enum Command {
     },
     /// Threads: the project's worker agents
     #[command(
-        long_about = "Manage a project's worker agents.\n\nEveryday:\n  start, prompt, list, show\n\nRecovery:\n  retry replaces a failed or stuck attempt through bounded routing.\n  cancel stops an attempt. rebind attaches its verified live process.\n\nAdministration:\n  attest seals verified stored output. adopt records an existing pane.\n  ack records that a report was seen. resolve performs exceptional cleanup."
+        long_about = "Manage a project's worker agents.\n\nEveryday:\n  start, prompt, list, show\n\nRecovery:\n  retry replaces a failed or stuck attempt; only automatic retries are bounded.\n  cancel stops an attempt. rebind attaches its verified live process.\n\nAdministration:\n  attest seals verified stored output. adopt records an existing pane.\n  ack records that a report was seen. resolve performs exceptional cleanup."
     )]
     Thread {
         #[command(subcommand)]
@@ -258,56 +258,24 @@ enum Command {
         #[arg(long, value_name = "PROJECT/THREAD")]
         remove_kept_worktree: Option<String>,
     },
-    /// Rounds: open, review and merge related lanes
+    /// Start or show the repository's pile review
     #[command(
-        long_about = "Review and land related lanes.\n\nEveryday:\n  open, show, advance, merge\n\nRecovery:\n  retry replaces an interrupted reviewer. cancel stops the round.\n  rebind attaches a verified live reviewer. adopt accepts verified sealed work.\n\nAdministration:\n  admit and remove change membership. review manually prepares a new review revision.\n  tick runs one background pass."
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        subcommand_precedence_over_arg = true
     )]
-    Round {
+    Review {
+        #[arg(value_name = "PROJECT", required = true)]
+        slug: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
         #[command(subcommand)]
-        command: RoundCommand,
+        command: Option<ReviewCommand>,
     },
     /// Build and install the harness repositories after a merge
     Harness {
         #[command(subcommand)]
         command: HarnessCommand,
-    },
-    /// Seal the handoff pair as a project artifact tied to the current commit
-    Checkpoint {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        /// The coordinator pane (default: $HERDR_PANE_ID, then the record)
-        #[arg(long)]
-        pane: Option<String>,
-        #[arg(long, value_name = "DIR")]
-        repo: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Print the generated Herdr section; write nothing
-        #[arg(long, conflicts_with = "check")]
-        print: bool,
-        /// Check the current sealed handoff; write nothing
-        #[arg(long)]
-        check: bool,
-    },
-    /// Re-link live threads and print start lines for gone ones; --start restarts them
-    Pickup {
-        #[arg(
-            value_name = "PROJECT",
-            required_unless_present = "all",
-            conflicts_with = "all"
-        )]
-        #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
-        /// Cover every active project under the root
-        #[arg(long)]
-        all: bool,
-        /// Restart gone threads under an active project
-        #[arg(long)]
-        start: bool,
-        #[arg(long)]
-        pane: Option<String>,
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Ask Rolf a question with two to four choices he can picture
     #[command(
@@ -329,8 +297,6 @@ enum Command {
         /// One sentence: what it means for Rolf
         #[arg(long)]
         means: Option<String>,
-        #[arg(long)]
-        round: Option<String>,
         /// Ask an existing question again as its next revision
         #[arg(long, value_name = "ASK_ID")]
         reask: Option<String>,
@@ -349,9 +315,6 @@ enum Command {
         what: String,
         #[arg(long)]
         means: Option<String>,
-        /// Attach this line as landing evidence for a merged round
-        #[arg(long, value_name = "ROUND")]
-        landed_round: Option<String>,
     },
     /// Publish the board rows now, or print them
     Board {
@@ -371,108 +334,20 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum RoundCommand {
-    /// Open a round: its record, gate list and policy hash
-    Open {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        /// Optional round id followed by any lanes to admit
-        #[arg(value_name = "ROUND_OR_THREAD")]
-        members: Vec<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// One sentence that says what the round does (required)
-        #[arg(long)]
-        plain: Option<String>,
-        #[arg(long, value_name = "DIR")]
-        repo: Option<String>,
-    },
-    /// Admit a lane to the round's manifest
-    Admit {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: String,
-        thread: String,
-    },
-    /// Remove a lane from the round's manifest
-    Remove {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: String,
-        thread: String,
-    },
-    /// Replace this round's reviewer attempt without starting a duplicate
+enum ReviewCommand {
+    /// Replace a stuck or dead reviewer
     Retry {
         #[arg(value_name = "PROJECT")]
         slug: String,
-        round: String,
         #[arg(long)]
-        reason: String,
-        /// Place a replacement reviewer on this machine
-        #[arg(long)]
-        machine: Option<String>,
+        repo: Option<String>,
     },
-    /// Release an unmerged batch and its integration reviewer, keeping all member rounds
-    Dissolve {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: String,
-    },
-    /// Stop the round and its reviewers, keeping member lanes for later rounds
+    /// Drop the review and return its lanes to the pile
     Cancel {
         #[arg(value_name = "PROJECT")]
         slug: String,
-        round: String,
         #[arg(long)]
-        reason: String,
-    },
-    /// Bind an existing live reviewer thread to this round
-    Rebind {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: String,
-        #[arg(long, value_name = "THREAD")]
-        thread: String,
-    },
-    /// Accept a lane's sealed work or a reviewer's valid sealed verdict
-    Adopt {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: String,
-        #[arg(long, value_name = "THREAD")]
-        thread: String,
-    },
-    /// Manual repair only: commit the review brief B, freeze the manifest,
-    /// create the review branch. `round advance` does this on its own.
-    Review {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: String,
-    },
-    /// Merge on an exact MERGE verdict, then checkpoint; resumes after a crash
-    Merge {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        rounds: Vec<String>,
-        /// Test-only fault injection: stop after ref, merged, intent or commit
-        #[arg(long, hide = true, value_name = "PHASE")]
-        stop_after: Option<String>,
-    },
-    /// Start the review and reviewer for every ready round; announce verdicts
-    Advance {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-    },
-    /// Show one round's record and merge phase; omit ROUND to list all rounds
-    Show {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        round: Option<String>,
-    },
-    /// Run the ticker's pass for rounds, asks and the board once
-    Tick {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
+        repo: Option<String>,
     },
 }
 
@@ -629,388 +504,9 @@ enum AskCommand {
     },
 }
 
-fn repair_review_started(slug: &str, round: &str, branch: &str, reviewer: Option<&str>) -> String {
-    match reviewer {
-        Some(reviewer) => format!(
-            "integration base moved; started repair review {branch} with {reviewer}; after its verdict, run `ha round merge {slug} {round}`\n"
-        ),
-        None => format!(
-            "integration base moved; prepared repair review {branch}; its reviewer start will retry automatically; after its verdict, run `ha round merge {slug} {round}`\n"
-        ),
-    }
-}
-
-fn batch_review_started(
-    slug: &str,
-    rounds: &[String],
-    branch: &str,
-    reviewer: Option<&str>,
-) -> String {
-    let names = rounds.join(", ");
-    let command = rounds.join(" ");
-    match reviewer {
-        Some(reviewer) => format!(
-            "started one integration review of {names} on {branch} with {reviewer}; finish with `ha round merge {slug} {command}`\n"
-        ),
-        None => format!(
-            "prepared one integration review of {names} on {branch}; its reviewer start will retry automatically; finish with `ha round merge {slug} {command}`\n"
-        ),
-    }
-}
-
-fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
-    use crate::{ask, board, checkpoint, plan, round};
+fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
+    use crate::{ask, board, plan};
     match command {
-        Command::Round { command } => match command {
-            RoundCommand::Open {
-                slug,
-                mut members,
-                branch,
-                plain,
-                repo,
-            } => {
-                let id = members
-                    .first()
-                    .filter(|value| round::validate_round_id(value).is_ok())
-                    .cloned();
-                if id.is_some() {
-                    members.remove(0);
-                }
-                let r = round::open_with_lanes(ctx, &slug, id, branch, plain, repo, members)?;
-                crate::output::insert("phase", serde_json::to_value(r.phase)?);
-                let gates = match &r.gates {
-                    None => "not configured".to_string(),
-                    Some(gates) => gates.len().to_string(),
-                };
-                println!("opened {} on `{}` (gates: {gates})", r.round, r.branch);
-                if let Some(warning) = round::publication_warning(&r, &slug) {
-                    crate::output::insert("publication_warning", warning.clone());
-                    crate::output::write_stderr(format_args!("{warning}"));
-                }
-                Ok(())
-            }
-            RoundCommand::Admit {
-                slug,
-                round: id,
-                thread,
-            } => {
-                let r = round::admit(ctx, &slug, &id, &thread)?;
-                crate::output::insert("phase", serde_json::to_value(r.phase)?);
-                println!(
-                    "{thread} admitted to {id}; manifest revision {}",
-                    r.manifest.revision
-                );
-                Ok(())
-            }
-            RoundCommand::Remove {
-                slug,
-                round: id,
-                thread,
-            } => {
-                let r = round::remove(ctx, &slug, &id, &thread)?;
-                crate::output::insert("phase", serde_json::to_value(r.phase)?);
-                println!(
-                    "{thread} removed from {id}; manifest revision {}",
-                    r.manifest.revision
-                );
-                Ok(())
-            }
-            RoundCommand::Retry {
-                slug,
-                round: id,
-                reason,
-                machine,
-            } => {
-                let result = if let Some(machine) = machine.as_deref() {
-                    round::retry_on_machine(ctx, &slug, &id, &reason, Some(machine))?
-                } else {
-                    round::retry(ctx, &slug, &id, &reason)?
-                };
-                crate::output::success(
-                    Some(&result.action),
-                    &result,
-                    &format!("{} {} with {}\n", result.action, id, result.thread),
-                    "",
-                )
-            }
-            RoundCommand::Dissolve { slug, round: id } => {
-                let members = round::dissolve(ctx, &slug, &id)?;
-                crate::output::success(
-                    Some("dissolved"),
-                    &members,
-                    &format!(
-                        "dissolved batch {}; each round can merge alone or join another batch\n",
-                        members.join(", ")
-                    ),
-                    "",
-                )
-            }
-            RoundCommand::Cancel {
-                slug,
-                round: id,
-                reason,
-            } => {
-                let result = round::cancel(ctx, &slug, &id, &reason)?;
-                let pending = result
-                    .threads
-                    .iter()
-                    .filter(|thread| thread.state == "cleanup_pending")
-                    .count();
-                let batch = if result.dissolved_batch.is_empty() {
-                    String::new()
-                } else {
-                    format!("; dissolved batch {}", result.dissolved_batch.join(", "))
-                };
-                let message = if pending == 0 {
-                    format!("cancelled {id}: {}{batch}\n", result.reason)
-                } else {
-                    format!("cancelled {id}{batch}; cleanup pending for {pending} thread(s)\n")
-                };
-                crate::output::success(
-                    Some(if pending == 0 {
-                        "cancelled"
-                    } else {
-                        "cleanup_pending"
-                    }),
-                    &result,
-                    &message,
-                    "",
-                )
-            }
-            RoundCommand::Rebind {
-                slug,
-                round: id,
-                thread,
-            } => {
-                let result = round::rebind(ctx, &slug, &id, &thread)?;
-                crate::output::success(
-                    Some(&result.action),
-                    &result,
-                    &format!("{} is bound to {id}\n", result.thread),
-                    "",
-                )
-            }
-            RoundCommand::Adopt {
-                slug,
-                round: id,
-                thread,
-            } => {
-                let result = round::adopt(ctx, &slug, &id, &thread)?;
-                crate::output::success(
-                    Some(&result.action),
-                    &result,
-                    &format!("{}: {} into {id}\n", result.action, result.thread),
-                    "",
-                )
-            }
-            RoundCommand::Review { slug, round: id } => {
-                let o = round::review(ctx, &slug, &id)?;
-                crate::output::insert("brief_commit", o.brief_commit.clone());
-                crate::output::insert("review_branch", o.review_branch.clone());
-                crate::output::insert("manifest_hash", o.manifest_hash.clone());
-                println!(
-                    "review base {} (brief artifact {})",
-                    o.brief_commit, o.brief_path
-                );
-                println!(
-                    "review branch {} at {}",
-                    o.review_branch,
-                    o.worktree.display()
-                );
-                println!(
-                    "manifest revision {} frozen, hash {}",
-                    o.revision, o.manifest_hash
-                );
-                println!(
-                    "next: `round advance {slug}` starts and binds the reviewer after routing from its full brief and pinned changes; `round retry {slug} {id} --reason <why>` is the recovery command"
-                );
-                if let (Some(c), Some(v)) = (&o.earlier_candidate, &o.earlier_verdict) {
-                    println!(
-                        "repair: merge the earlier candidate {c} (verdict {v}) over the new base instead of the pinned shas; `round advance {slug}` starts a reviewer with that task"
-                    );
-                }
-                Ok(())
-            }
-            RoundCommand::Merge {
-                slug,
-                rounds,
-                stop_after,
-            } => {
-                let stop = stop_after.map(|s| s.parse()).transpose()?;
-                let run = round::merge_batch_run(ctx, &slug, &rounds, stop)?;
-                let id = rounds
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("round_missing: supply at least one round"))?;
-                let record = round::load(&Project::load(&ctx.root, &slug)?, id)?;
-                let mut message = String::new();
-                let outcome = match &run.merge {
-                    round::MergeOutcome::Checkpointed { head, lanes } => {
-                        message.push_str(&format!("merged and checkpointed at H {head}\n"));
-                        for lane in lanes {
-                            message.push_str(&format!("  {lane}\n"));
-                        }
-                        "merged"
-                    }
-                    round::MergeOutcome::NoOp { head } => {
-                        message.push_str(&format!("already checkpointed at H {head}\n"));
-                        if run.effects.published_now {
-                            "published"
-                        } else {
-                            "already_checkpointed"
-                        }
-                    }
-                    round::MergeOutcome::RepairReviewStarted {
-                        review_branch,
-                        reviewer: Some(reviewer),
-                    } => {
-                        if record.batch.is_some() {
-                            message.push_str(&batch_review_started(
-                                &slug,
-                                &rounds,
-                                review_branch,
-                                Some(reviewer),
-                            ));
-                            "integration_review_started"
-                        } else {
-                            message.push_str(&repair_review_started(
-                                &slug,
-                                id,
-                                review_branch,
-                                Some(reviewer),
-                            ));
-                            "repair_review_started"
-                        }
-                    }
-                    round::MergeOutcome::RepairReviewStarted {
-                        review_branch,
-                        reviewer: None,
-                    } => {
-                        if record.batch.is_some() {
-                            message.push_str(&batch_review_started(
-                                &slug,
-                                &rounds,
-                                review_branch,
-                                None,
-                            ));
-                            "integration_review_prepared"
-                        } else {
-                            message.push_str(&repair_review_started(
-                                &slug,
-                                id,
-                                review_branch,
-                                None,
-                            ));
-                            "repair_review_prepared"
-                        }
-                    }
-                    round::MergeOutcome::Stopped { phase } => {
-                        message.push_str(&format!(
-                            "stopped (test fault injection) at phase {phase:?}\n"
-                        ));
-                        "stopped"
-                    }
-                };
-                message.push_str(&run.effects.message());
-                let warning = round::publication_warning(&record, &slug).unwrap_or_default();
-                if !warning.is_empty() {
-                    crate::output::insert("publication_warning", warning.clone());
-                }
-                let warnings = format!("{}{warning}", run.effects.warnings());
-                crate::output::success(
-                    Some(outcome),
-                    &serde_json::json!({
-                        "merge": run.merge,
-                        "rounds": rounds,
-                        "effects": run.effects,
-                        "phase": record.phase,
-                        "published": record.published,
-                        "installed": record.installed,
-                    }),
-                    &message,
-                    &warnings,
-                )
-            }
-            RoundCommand::Advance { slug } => {
-                let outcome = round::advance(ctx, &slug)?;
-                crate::output::success(
-                    Some("advanced"),
-                    &serde_json::json!({
-                        "started": outcome.started,
-                        "starting": outcome.starting,
-                        "running": outcome.running,
-                        "verdicts": outcome.verdicts,
-                        "not_started": outcome.not_started,
-                        "attention": outcome.attention,
-                        "nothing": outcome.nothing,
-                    }),
-                    &outcome.message(),
-                    "",
-                )
-            }
-            RoundCommand::Show { slug, round: id } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                if let Some(id) = id {
-                    let record = round::load(&project, &id)?;
-                    crate::output::insert("record", serde_json::to_value(&record)?);
-                    print!("{}", round::show(ctx, &slug, &id)?);
-                } else {
-                    let rounds = round::list(&project);
-                    crate::output::insert("rounds", serde_json::to_value(&rounds)?);
-                    for record in rounds {
-                        println!("{}\t{:?}\t{}", record.round, record.phase, record.branch);
-                    }
-                }
-                Ok(())
-            }
-            RoundCommand::Tick { slug } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                round::tick(ctx, &project)
-            }
-        },
-        Command::Checkpoint {
-            slug,
-            pane,
-            repo,
-            branch,
-            print,
-            check,
-        } => {
-            let out = checkpoint::checkpoint(
-                ctx,
-                &slug,
-                checkpoint::CheckpointArgs {
-                    pane,
-                    repo,
-                    branch,
-                    print,
-                    check_only: check,
-                },
-            )?;
-            print!("{out}");
-            Ok(())
-        }
-        Command::Pickup {
-            slug,
-            all,
-            start,
-            pane,
-            dry_run,
-        } => {
-            print!(
-                "{}",
-                checkpoint::pickup(
-                    ctx,
-                    checkpoint::PickupArgs {
-                        slug: slug.as_deref(),
-                        pane: pane.as_deref(),
-                        dry_run,
-                        all,
-                        start,
-                    },
-                )?
-            );
-            Ok(())
-        }
         Command::Ask {
             slug,
             command,
@@ -1018,7 +514,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             choices,
             what,
             means,
-            round: r,
             reask,
         } => match command {
             Some(AskCommand::Withdraw { slug, id, reason }) => {
@@ -1059,7 +554,6 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                         choices,
                         what,
                         means,
-                        round: r,
                         reask,
                     },
                 )?;
@@ -1241,16 +735,8 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
         },
-        Command::Say {
-            slug,
-            what,
-            means,
-            landed_round,
-        } => {
-            let id = match landed_round {
-                Some(round) => ask::say_landed(ctx, &slug, &what, means.as_deref(), &round)?,
-                None => ask::say(ctx, &slug, &what, means.as_deref())?,
-            };
+        Command::Say { slug, what, means } => {
+            let id = ask::say(ctx, &slug, &what, means.as_deref())?;
             crate::output::insert("say", id.clone());
             println!("{id} said");
             Ok(())
@@ -1298,7 +784,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
             }
             Ok(())
         }
-        _ => unreachable!("run_rounds only receives this lane's commands"),
+        _ => unreachable!("run_project_commands only receives project commands"),
     }
 }
 
@@ -1380,22 +866,6 @@ enum TaskCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
     },
-    /// Hold a task until a round, ask or lane changes state, or a named live event
-    Wait {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-        #[arg(long, value_name = "ROUND|ASK|LANE|EVENT")]
-        on: String,
-        #[arg(long)]
-        target: String,
-    },
-    /// Clear a task hold
-    Unwait {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-    },
     /// Drop a task, or withdraw acceptance conditions replaced by a newer choice
     Drop {
         #[arg(value_name = "PROJECT")]
@@ -1405,24 +875,6 @@ enum TaskCommand {
         acceptance: Vec<usize>,
         #[arg(long)]
         reason: String,
-    },
-    /// Link a thread and its historical rounds to this task
-    Adopt {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-        #[arg(long)]
-        thread: String,
-    },
-    /// Record per-condition verification evidence
-    Evidence {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-        #[arg(long)]
-        command: String,
-        #[arg(long = "acceptance")]
-        acceptance: Vec<usize>,
     },
 }
 
@@ -1652,14 +1104,14 @@ enum TickerCommand {
 
 fn machine_outcome(command: &str) -> String {
     let outcome = match command {
-        "open" | "round open" => "opened",
-        "context" | "round show" | "plan show" => "shown",
+        "open" => "opened",
+        "context" | "plan show" => "shown",
         "thread start" => "started",
-        "thread retry" | "round retry" => "retried",
-        "thread cancel" | "round cancel" => "cancelled",
-        "thread rebind" | "round rebind" => "rebound",
+        "thread retry" => "retried",
+        "thread cancel" => "cancelled",
+        "thread rebind" => "rebound",
         "thread attest" => "attested",
-        "thread adopt" | "round adopt" => "adopted",
+        "thread adopt" => "adopted",
         "thread prompt" => "prompted",
         "thread resolve" => "resolved",
         "thread ack" => "acknowledged",
@@ -1671,12 +1123,6 @@ fn machine_outcome(command: &str) -> String {
         "ask withdraw" => "withdrawn",
         "say" => "said",
         "done" | "waiting" | "failed" => "sealed",
-        "round advance" => "advanced",
-        "round admit" => "admitted",
-        "round remove" => "removed",
-        "round review" => "review_prepared",
-        "round merge" => "merged",
-        "round tick" => "ticked",
         "doctor" => "healthy",
         "harness install" => "installed",
         "inbox done" => "moved",
@@ -1692,7 +1138,7 @@ fn machine_command(matches: &clap::ArgMatches) -> (String, BTreeMap<String, serd
     let mut data = BTreeMap::new();
     loop {
         for key in [
-            "slug", "project", "round", "thread", "id", "name", "sha", "report", "branch", "pane",
+            "slug", "project", "review", "thread", "id", "name", "sha", "report", "branch", "pane",
         ] {
             if let Ok(Some(value)) = leaf.try_get_one::<String>(key) {
                 data.insert(key.to_string(), serde_json::Value::String(value.clone()));
@@ -1767,17 +1213,14 @@ pub fn run() -> Result<()> {
             | "thread list"
             | "thread show"
             | "doctor"
-            | "round show"
             | "plan show"
             | "ticker status"
     ) || command_name == "context" && flag("peek")
         || command_name == "delete" && flag("preview")
-        || command_name == "checkpoint" && (flag("print") || flag("check"))
-        || command_name == "pickup" && flag("dry_run")
         || command_name == "board" && flag("print");
     // Identify the object of a refusal/retry, not just its verb. Do not copy
     // task text, prompts, flags or environment into the CLI-level subject.
-    for key in ["round", "id", "name"] {
+    for key in ["review", "id", "name"] {
         if let Ok(Some(value)) = leaf.try_get_one::<String>(key) {
             command_name.push(' ');
             command_name.push_str(value);
@@ -2223,31 +1666,6 @@ fn dispatch_with_start(
                     "",
                 )
             }
-            TaskCommand::Wait {
-                slug,
-                id,
-                on,
-                target,
-            } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let record = crate::task::set_wait(&project, &id, &on, &target)?;
-                crate::output::success(
-                    Some("waiting"),
-                    &serde_json::json!({ "task": record }),
-                    &format!("{id} waits on {on} {target}\n"),
-                    "",
-                )
-            }
-            TaskCommand::Unwait { slug, id } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let record = crate::task::clear_wait(&project, &id)?;
-                crate::output::success(
-                    Some("open"),
-                    &serde_json::json!({ "task": record }),
-                    &format!("{id} hold cleared\n"),
-                    "",
-                )
-            }
             TaskCommand::Drop {
                 slug,
                 id,
@@ -2288,33 +1706,6 @@ fn dispatch_with_start(
                         "",
                     )
                 }
-            }
-            TaskCommand::Adopt { slug, id, thread } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let record = crate::task::adopt(&project, &id, &thread)?;
-                let view = crate::task::view(&project, record);
-                crate::output::success(
-                    Some("adopted"),
-                    &serde_json::json!({ "task": view, "thread": thread }),
-                    &format!("{thread} adopted into {}\n", view.record.id),
-                    "",
-                )
-            }
-            TaskCommand::Evidence {
-                slug,
-                id,
-                command,
-                acceptance,
-            } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let record = crate::task::record_evidence(&project, &id, &command, acceptance)?;
-                let view = crate::task::view(&project, record);
-                crate::output::success(
-                    Some(view.state.word()),
-                    &serde_json::json!({ "task": view }),
-                    &format!("{} is {}\n", view.record.id, view.state.word()),
-                    "",
-                )
             }
         },
         Command::Thread { command } => match command {
@@ -2386,7 +1777,7 @@ fn dispatch_with_start(
                         recipe,
                         recipe_basis: basis,
                         task_id: task_id.clone(),
-                        review_round: String::new(),
+                        review_id: String::new(),
                     },
                 )?;
                 if !task_id.is_empty() {
@@ -2636,11 +2027,16 @@ fn dispatch_with_start(
             phase,
         } => crate::hook::run(&ctx, &kind, &project, &binding, &phase),
         Command::Event { id } => match id.as_str() {
-            "round-advance" => {
-                let outcome = crate::round::advance_event(&ctx)?;
-                crate::output::insert("started", serde_json::to_value(&outcome.started)?);
+            "review-advance" => {
+                for slug in project::list_slugs(&ctx.root) {
+                    let project = Project::load(&ctx.root, &slug)?;
+                    if project.status() == project::Status::Active {
+                        crate::review::tick(&ctx, &project)?;
+                    }
+                }
                 Ok(())
             }
+
             _ => bail!("unknown plugin event `{id}`"),
         },
         Command::Doctor {
@@ -2676,13 +2072,40 @@ fn dispatch_with_start(
             }
             Ok(())
         }
-        command @ (Command::Round { .. }
-        | Command::Checkpoint { .. }
-        | Command::Pickup { .. }
-        | Command::Ask { .. }
+        command @ (Command::Ask { .. }
         | Command::Plan { .. }
         | Command::Say { .. }
-        | Command::Board { .. }) => run_rounds(&ctx, command),
+        | Command::Board { .. }) => run_project_commands(&ctx, command),
+        Command::Review {
+            slug,
+            repo,
+            command,
+        } => {
+            let record = match command {
+                Some(ReviewCommand::Cancel { slug, repo }) => {
+                    crate::review::cancel(&ctx, &slug, repo.as_deref())?;
+                    None
+                }
+                Some(ReviewCommand::Retry { slug, repo }) => {
+                    crate::review::retry(&ctx, &slug, repo.as_deref())?
+                }
+                None => crate::review::start(
+                    &ctx,
+                    slug.as_deref().context("project required")?,
+                    repo.as_deref(),
+                )?,
+            };
+            let message = record
+                .as_ref()
+                .map(|r| format!("{}: {:?} ({} lanes)\n", r.id, r.phase, r.members.len()))
+                .unwrap_or_else(|| "no pile review running\n".into());
+            crate::output::success(
+                Some("review"),
+                &serde_json::json!({"review": record}),
+                &message,
+                "",
+            )
+        }
         Command::Harness { command } => match command {
             HarnessCommand::Install => {
                 let result = crate::harness::install(&ctx)?;
@@ -2764,23 +2187,6 @@ mod tests {
             ])
             .is_ok()
         );
-    }
-
-    #[test]
-    fn batch_merge_message_names_one_integration_review() {
-        let rounds = vec!["r147".to_string(), "r148".to_string()];
-        let review_branch = "review/r147-3";
-        let reviewer = "t-0402";
-        let message =
-            super::batch_review_started("adeherdr", &rounds, review_branch, Some(reviewer));
-        assert!(message.contains("one integration review of r147, r148"));
-        assert!(message.contains("t-0402"));
-        assert!(!message.contains("base moved"));
-        let repair =
-            super::repair_review_started("adeherdr", "r147", review_branch, Some(reviewer));
-        assert!(repair.contains("integration base moved; started repair review"));
-        assert!(repair.contains("ha round merge adeherdr r147"));
-        assert!(!repair.contains("one integration review"));
     }
 
     #[test]
@@ -2960,7 +2366,7 @@ mod tests {
             &["overview"],
             &["say", "--what", "This was checked."],
             &["ledger", "list"],
-            &["round", "advance"],
+            &["review"],
             &[
                 "plan", "step", "link", "demo", "s-1", "--thread", "t-0001", "--expect", "1",
             ],
@@ -2986,7 +2392,7 @@ mod tests {
 
         assert!(Cli::try_parse_from(["herdr-ade", "plan", "show", "--project", "demo"]).is_err());
         assert!(
-            Cli::try_parse_from(["herdr-ade", "event", "round-advance"]).is_ok(),
+            Cli::try_parse_from(["herdr-ade", "event", "review-advance"]).is_ok(),
             "the manifest's event-only command must remain valid"
         );
     }
@@ -3032,28 +2438,6 @@ mod tests {
         );
         record_command_outcome(Some(&project), "ha doctor", &result);
         assert_eq!(rows.len(), crate::ledger::list(&project).unwrap().len());
-    }
-
-    #[test]
-    fn repeating_round_cancel_does_not_record_a_failure() {
-        let fx = crate::round::testkit::fixture();
-        let ctx = fx.world.ctx();
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some("This round checks the work.".into()),
-                repo: None,
-            },
-        )
-        .unwrap();
-        crate::round::cancel(&ctx, "demo", "r1", "no longer needed").unwrap();
-        let result = crate::round::cancel(&ctx, "demo", "r1", "again").map(|_| ());
-        assert!(result.is_ok());
-        record_command_outcome(Some(&fx.project), "ha round cancel", &result);
-        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
     }
 
     #[test]

@@ -108,7 +108,8 @@ pub(crate) struct Thread {
     pub(crate) failure_class: crate::contracts::FailureClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider_failure_kind: Option<String>,
-    pub(crate) escalation_pending: bool,
+    #[serde(alias = "escalation_pending")]
+    pub(crate) recovery_pending: bool,
     pub(crate) kind: Kind,
     pub(crate) repo: String,
     pub(crate) origin: String,
@@ -162,17 +163,25 @@ pub(crate) struct Thread {
     pub(crate) cancellation_reason: String,
     /// Cleanup still owes the same final-copy, pane/tab, and folder work that
     /// `thread resolve` performs. The ticker retries it instead of making a
-    /// landed round wait on an external session.
+    /// landed review wait on an external session.
     pub(crate) cleanup_pending: bool,
     /// The resolved reason to record after automatic cleanup succeeds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) cleanup_reason: String,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub(crate) role: String,
-    /// Round this reviewer was started for. Empty on lanes and historical
-    /// reviewer records created before this identity was stored.
+    /// Pile review this reviewer belongs to.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) review_round: String,
+    pub(crate) review_id: String,
+    /// Source refs exported for a box reviewer, pinned for eventual cleanup.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) review_sources: std::collections::BTreeMap<String, String>,
+    pub(crate) has_changes: Option<bool>,
+    pub(crate) changes_seal: String,
+    pub(crate) merged_sha: String,
+    pub(crate) merged_review: String,
+    pub(crate) review_after: String,
+    pub(crate) review_reason: String,
     pub(crate) launch: crate::contracts::Launch,
     pub(crate) attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,6 +441,12 @@ pub(crate) fn update_checked(
         // must earn its own.
         thread.bootstrap.clear();
         thread.answered_waiting_event.clear();
+        thread.has_changes = None;
+        thread.changes_seal.clear();
+        thread.merged_sha.clear();
+        thread.merged_review.clear();
+        thread.review_after.clear();
+        thread.review_reason.clear();
         for follow_up in &mut thread.follow_ups {
             if follow_up.attempt == before.attempt.max(1)
                 && follow_up.state == FollowUpState::Queued
@@ -2037,7 +2052,7 @@ mod tests {
             .expect("the failure heading");
         let standing = &lane[..rules_end];
         assert!(
-            standing.contains("`round merge` publishes the integration branch"),
+            standing.contains("The pile review publishes the integration branch"),
             "{standing}"
         );
         assert!(
@@ -2141,11 +2156,11 @@ mod tests {
                 op: "done-1".into(),
                 thread: sealed.id.clone(),
                 attempt: 1,
-                round: None,
                 recipient: Recipient::default(),
                 created: project::now(),
                 payload: EventPayload {
                     done: Some(DonePayload {
+                        has_changes: None,
                         sha: "abc".into(),
                         report_path: "old/location".into(),
                         artifact: hash.clone(),

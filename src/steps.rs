@@ -1,6 +1,6 @@
 //! The ticker's per-project steps: delivery and messages.
 //! Thread facts update their owning records; only messages
-//! without a thread or round home enter the inbox.
+//! without a thread or review home enter the inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -39,7 +39,7 @@ pub(crate) struct State {
     pub(crate) session_item_written: bool,
     /// Last automatic coordinator relaunch attempt, including failed starts.
     pub(crate) coordinator_relaunch_last: String,
-    /// Coordinator pane whose live lanes were last reconciled by pickup.
+    /// Coordinator pane whose live lanes were last reconciled by the ticker.
     pub(crate) lanes_parented_to: String,
 }
 
@@ -1212,7 +1212,6 @@ mod tests {
             op: format!("{id}-1-1"),
             thread: id.into(),
             attempt: 1,
-            round: None,
             recipient: crate::contracts::Recipient {
                 pane: coordinator.pane_id.clone(),
                 coordinator_attempt: coordinator.attempt(),
@@ -1220,6 +1219,7 @@ mod tests {
             created: "2026-09-19T00:00:00Z".into(),
             payload: crate::contracts::EventPayload {
                 done: Some(crate::contracts::DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     report_path: ".reports/lane.md".into(),
                     artifact: "def".into(),
@@ -1799,7 +1799,6 @@ mod tests {
             op: id.into(),
             thread: "t-0001".into(),
             attempt: 1,
-            round: None,
             recipient: crate::contracts::Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
@@ -1807,6 +1806,7 @@ mod tests {
             created: "2026-09-19T00:00:00Z".into(),
             payload: crate::contracts::EventPayload {
                 done: Some(crate::contracts::DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     report_path: ".reports/t-0001.md".into(),
                     artifact: artifact.into(),
