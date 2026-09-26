@@ -608,7 +608,7 @@ fn tick_with_steps(
     step: &mut impl FnMut(&str) -> bool,
 ) -> Option<bool> {
     memory.tick += 1;
-    if let Err(error) = crate::branches::sweep_once(ctx) {
+    if let Err(error) = crate::branches::sweep_once(ctx, |message| log.line(message)) {
         log.line(&format!("one-time branch sweep: {error:#}"));
     }
     memory.machine_views.clear();
