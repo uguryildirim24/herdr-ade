@@ -1,8 +1,4 @@
-//! `ha ask`, `ha say` and the one typed publisher (SPEC-ADE D17 items 3 and
-//! 4, item 35).
-//!
-//! `publish(HumanMessage)` is the only way text reaches Rolf's plane: the
-//! board, the plugin's notifications and the journal. An `Ask` is
+//! `ha ask` and its publisher. An `Ask` is
 //! resolved to its stored record's exact question and ordered choices; a
 //! `Notice` is one of the fixed texts below; an arbitrary string cannot be
 //! published.
@@ -20,26 +16,6 @@ use crate::project::{self, Project, write_atomic};
 
 /// The standing extra choice every ask carries (D17 item 4).
 pub(crate) const NOT_UNDERSTOOD: &str = "I did not understand the question";
-
-/// Fixed notices: the only text a `Notice` can publish.
-const NOTICES: &[(&str, &str)] = &[
-    (
-        "journal_tail",
-        "A half written line was found at the end of this record and was left out.",
-    ),
-    (
-        "session_changed",
-        "The coordinator started a new chat. Open its pane to read its replies.",
-    ),
-    (
-        "hook_failed",
-        "A check of the last reply did not run. Open the pane of the coordinator to read it.",
-    ),
-];
-
-pub(crate) fn notice_text(id: &str) -> Option<&'static str> {
-    NOTICES.iter().find(|(k, _)| *k == id).map(|(_, v)| *v)
-}
 
 /// An answer, stored next to the revision it answers; create-if-absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,7 +75,6 @@ fn publication_path(project: &Project, key: &str) -> PathBuf {
 struct Publication {
     key: String,
     message: HumanMessage,
-    journal: bool,
     board: bool,
     /// `None` when this message has no notification sink.
     notified: Option<bool>,
@@ -244,6 +219,17 @@ pub(crate) fn open_asks(project: &Project) -> Vec<Ask> {
         .filter_map(|id| latest(project, &id).ok().flatten())
         .filter(|a| answer_of(project, &a.id, a.revision).is_none())
         .filter(|a| !is_withdrawn(project, &a.id, a.revision))
+        .filter(|a| {
+            a.task.as_ref().is_none_or(|id| {
+                crate::task::load(project, id).is_ok_and(|task| {
+                    task.dropped.is_empty()
+                        && matches!(
+                            crate::task::view(project, task).state,
+                            crate::task::State::Open | crate::task::State::Working
+                        )
+                })
+            })
+        })
         .collect();
     asks.sort_by(|a, b| (&a.asked, &a.id).cmp(&(&b.asked, &b.id)));
     asks
@@ -351,8 +337,7 @@ pub(crate) struct NewAsk {
     pub(crate) choices: Vec<String>,
     pub(crate) what: Option<String>,
     pub(crate) means: Option<String>,
-    /// Re-ask an existing id as revision `r+1`.
-    pub(crate) reask: Option<String>,
+    pub(crate) task: Option<String>,
 }
 
 /// `ha ask`: validate, write the immutable record, only then publish.
@@ -361,33 +346,18 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     if !(2..=4).contains(&new.choices.len()) {
         bail!("ask_choice_count: an ask takes two to four choices");
     }
+    if let Some(id) = &new.task {
+        crate::task::load(&project, id)?;
+    }
     let binding = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
     let record = {
         let _lock = project.lock()?;
         let _set = ask_set_lock(&project)?;
         refuse_repeated_question(&project, &new)?;
-        let (id, revision) = match &new.reask {
-            Some(id) => {
-                validate_ask_id(id)?;
-                let r = latest_revision(&project, id);
-                if r == 0 {
-                    bail!("ask_unknown: `{id}` has never been asked");
-                }
-                if is_withdrawn(&project, id, r) {
-                    bail!("ask_withdrawn: `{id}` is withdrawn; it cannot be asked again");
-                }
-                if answer_of(&project, id, r).is_some() {
-                    bail!("ask_closed: `{id}` revision {r} is already answered");
-                }
-                (id.clone(), r + 1)
-            }
-            None => {
-                let counter = project.state_dir().join("ask-counter.json");
-                let n: u64 = project::read_json::<u64>(&counter).unwrap_or(0) + 1;
-                project::write_json(&counter, &n)?;
-                (format!("a-{n}"), 1)
-            }
-        };
+        let counter = project.state_dir().join("ask-counter.json");
+        let n: u64 = project::read_json::<u64>(&counter).unwrap_or(0) + 1;
+        project::write_json(&counter, &n)?;
+        let (id, revision) = (format!("a-{n}"), 1);
         let record = Ask {
             id: id.clone(),
             revision,
@@ -398,6 +368,7 @@ pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
             means: new.means.clone(),
             asked: project::now(),
             coordinator_binding: binding,
+            task: new.task.clone(),
         };
         std::fs::create_dir_all(ask_dir(&project, &id))?;
         let path = rev_path(&project, &id, revision);
@@ -448,7 +419,7 @@ pub(crate) fn answer_text(
     answer(ctx, slug, id, revision, n, by)
 }
 
-/// `ha ask answer <id> --revision <r> <number-or-exact-sentence>`.
+/// Close an ask with a numbered or exact-text answer.
 pub(crate) fn answer(
     ctx: &Ctx,
     slug: &str,
@@ -474,7 +445,7 @@ pub(crate) fn answer(
                 "ask_revision_stale: `{id}` is at revision {latest}; revision {revision} is void"
             );
         }
-        let record = load_revision(&project, id, revision)?.context("ask_unknown")?;
+        let record = open_revision(&project, id, revision)?;
         if answer_of(&project, id, revision).is_some() {
             bail!("ask_closed: `{id}` revision {revision} is already answered");
         }
@@ -511,15 +482,6 @@ pub(crate) fn answer(
         }
         answer
     };
-    let _ = crate::talk::append(
-        &project,
-        Some(&format!("answer:{id}@{revision}")),
-        crate::talk::Entry::Answer {
-            id: id.to_string(),
-            revision,
-            choice,
-        },
-    );
     let _ = crate::board::refresh(ctx, &project);
     Ok(answer)
 }
@@ -530,55 +492,8 @@ pub(crate) fn not_understood_count(project: &Project) -> u64 {
     project::read_json::<u64>(&project.state_dir().join("not-understood.json")).unwrap_or(0)
 }
 
-fn next_say_id(project: &Project) -> Result<String> {
-    let _lock = project.lock()?;
-    let path = project.state_dir().join("say-counter.json");
-    let next = project::read_json::<u64>(&path).unwrap_or(0) + 1;
-    project::write_json(&path, &next)?;
-    Ok(format!("s-{next}"))
-}
-
-/// `ha say --what ... [--means ...]`.
-pub(crate) fn say(ctx: &Ctx, slug: &str, what: &str, means: Option<&str>) -> Result<String> {
-    let project = Project::load(&ctx.root, slug)?;
-    let id = next_say_id(&project)?;
-    publish(
-        ctx,
-        &project,
-        &HumanMessage::Say {
-            id: id.clone(),
-            what: what.trim().to_string(),
-            means: means.map(|m| m.trim().to_string()),
-        },
-    )?;
-    Ok(id)
-}
-
-/// The last line of `what` that fits a board token: cut at a word boundary.
-fn board_line(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for word in text.split_whitespace() {
-        let next = if out.is_empty() {
-            word.to_string()
-        } else {
-            format!("{out} {word}")
-        };
-        if next.chars().count() + 3 > max {
-            break;
-        }
-        out = next;
-    }
-    format!("{out}...")
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Published {
-    /// `None` when the journal already had this message (a duplicate).
-    pub(crate) seq: Option<u64>,
     pub(crate) board: bool,
     pub(crate) notified: bool,
 }
@@ -598,16 +513,23 @@ pub(crate) fn open_revision(project: &Project, id: &str, revision: u32) -> Resul
     if answer_of(project, id, revision).is_some() {
         bail!("ask_closed: `{id}` revision {revision} is answered");
     }
+    if record.task.as_ref().is_some_and(|task| {
+        !crate::task::load(project, task).is_ok_and(|task| {
+            task.dropped.is_empty()
+                && matches!(
+                    crate::task::view(project, task).state,
+                    crate::task::State::Open | crate::task::State::Working
+                )
+        })
+    }) {
+        bail!("ask_closed: `{id}` task is closed");
+    }
     Ok(record)
 }
 
-fn publication_key(message: &HumanMessage) -> Result<String> {
-    match message {
-        HumanMessage::Say { id, .. } if !id.trim().is_empty() => Ok(format!("say:{id}")),
-        HumanMessage::Ask { id, revision } => Ok(format!("ask:{id}@{revision}")),
-        HumanMessage::Say { .. } => bail!("say_id_missing: a say needs an id"),
-        HumanMessage::Notice { .. } => bail!("notice_key_missing: notices use their own publisher"),
-    }
+fn publication_key(message: &HumanMessage) -> String {
+    let HumanMessage::Ask { id, revision } = message;
+    format!("ask:{id}@{revision}")
 }
 
 fn save_publication(project: &Project, publication: &Publication) -> Result<()> {
@@ -615,69 +537,28 @@ fn save_publication(project: &Project, publication: &Publication) -> Result<()> 
 }
 
 fn publication_complete(publication: &Publication) -> bool {
-    publication.journal && publication.board && publication.notified.unwrap_or(true)
+    publication.board && publication.notified.unwrap_or(true)
 }
 
-/// Publishes an authored say or ask under its canonical id. Each sink outcome
+/// Publishes an ask under its canonical id. Each sink outcome
 /// is durable, so a retry runs only the sinks that have not yet succeeded.
 pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Result<Published> {
-    if let HumanMessage::Notice { id } = msg {
-        return publish_notice_keyed(ctx, project, id, None);
-    }
-    let ask_record = match msg {
-        HumanMessage::Ask { id, revision } => Some(open_revision(project, id, *revision)?),
-        HumanMessage::Say { .. } => None,
-        HumanMessage::Notice { .. } => unreachable!(),
-    };
-    let board_value = match (msg, ask_record.as_ref()) {
-        (HumanMessage::Say { what, .. }, _) => board_line(what, 80),
-        (HumanMessage::Ask { .. }, Some(record)) => compact_line(record),
-        _ => unreachable!(),
-    };
+    let HumanMessage::Ask { id, revision } = msg;
+    let ask_record = open_revision(project, id, *revision)?;
+    let board_value = compact_line(&ask_record);
 
     // Ask closure and all publication retries serialize with one another.
-    let _ask_set = matches!(msg, HumanMessage::Ask { .. })
-        .then(|| ask_set_lock(project))
-        .transpose()?;
-    if let HumanMessage::Ask { id, revision } = msg {
-        // Recheck after taking the ask-set lock so answer or withdrawal cannot
-        // race the board and notification sinks.
-        open_revision(project, id, *revision)?;
-    }
+    let _ask_set = ask_set_lock(project)?;
+    // Recheck after locking so closure cannot race publication.
+    open_revision(project, id, *revision)?;
     let _publication = publication_lock(project)?;
-    let key = publication_key(msg)?;
-    let journal_key = key.clone();
+    let key = publication_key(msg);
     let path = publication_path(project, &key);
-    // Check the last authored line, not the board's shortened token. Keep
-    // retrying the same publication id possible after a partial sink failure.
-    let journal = crate::talk::read(project);
-    if let HumanMessage::Say { what, means, .. } = msg
-        && !journal
-            .lines
-            .iter()
-            .any(|line| line.key.as_deref() == Some(&journal_key))
-        && let Some((previous_what, previous_means)) =
-            journal
-                .lines
-                .iter()
-                .rev()
-                .find_map(|line| match &line.entry {
-                    crate::talk::Entry::Say { what, means, .. } => Some((what, means)),
-                    _ => None,
-                })
-        && previous_what == what
-        && previous_means == means
-    {
-        return Err(crate::refusal::error(
-            "say_repeated: your previous board line already says this; write a new line only when something changed",
-        ));
-    }
     let mut state = project::read_json::<Publication>(&path).unwrap_or(Publication {
         key: key.clone(),
         message: msg.clone(),
-        journal: false,
         board: false,
-        notified: matches!(msg, HumanMessage::Ask { .. }).then_some(false),
+        notified: Some(false),
     });
     if state.key != key || state.message != *msg {
         bail!("publication_collision: `{key}` already names another message");
@@ -685,49 +566,15 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
     if !path.exists() {
         save_publication(project, &state)?;
     }
-    if state.journal
-        && !crate::talk::read(project)
-            .lines
-            .iter()
-            .any(|line| line.key.as_deref() == Some(&journal_key))
+    if !state.board
+        && crate::board::publish_value(ctx, project, "ade_needs_you", &board_value).is_ok()
     {
-        state.journal = false;
-        save_publication(project, &state)?;
-    }
-
-    let mut seq = None;
-    if !state.journal {
-        let entry = match msg {
-            HumanMessage::Say { what, means, .. } => crate::talk::Entry::Say {
-                what: what.clone(),
-                means: means.clone(),
-            },
-            HumanMessage::Ask { id, revision } => crate::talk::Entry::Ask {
-                id: id.clone(),
-                revision: *revision,
-            },
-            HumanMessage::Notice { .. } => unreachable!(),
-        };
-        seq = crate::talk::append(project, Some(&journal_key), entry)?;
-        state.journal = true;
-        save_publication(project, &state)?;
-    }
-    let board_key = if matches!(msg, HumanMessage::Ask { .. }) {
-        "ade_needs_you"
-    } else {
-        "ade_last"
-    };
-    if !state.board && crate::board::publish_value(ctx, project, board_key, &board_value).is_ok() {
         state.board = true;
-        if matches!(msg, HumanMessage::Say { .. }) {
-            crate::board::remember_last(project, &board_value);
-        }
         save_publication(project, &state)?;
     }
     if state.notified == Some(false) {
-        let record = ask_record.as_ref().expect("ask publication has a record");
         let mut body = String::new();
-        for (index, choice) in record.choices.iter().enumerate() {
+        for (index, choice) in ask_record.choices.iter().enumerate() {
             body.push_str(&format!("{}. {}\n", index + 1, choice));
         }
         if notify(ctx, project, &board_value, &body) {
@@ -736,28 +583,8 @@ pub(crate) fn publish(ctx: &Ctx, project: &Project, msg: &HumanMessage) -> Resul
         }
     }
     Ok(Published {
-        seq,
         board: state.board,
         notified: state.notified.unwrap_or(false),
-    })
-}
-
-pub(crate) fn publish_notice_keyed(
-    _ctx: &Ctx,
-    project: &Project,
-    id: &str,
-    key: Option<&str>,
-) -> Result<Published> {
-    notice_text(id).with_context(|| format!("notice_unknown: `{id}` is not a fixed notice"))?;
-    let seq = crate::talk::append(
-        project,
-        key,
-        crate::talk::Entry::Notice { id: id.to_string() },
-    )?;
-    Ok(Published {
-        seq,
-        board: false,
-        notified: false,
     })
 }
 
@@ -816,22 +643,8 @@ mod tests {
             choices: vec!["keep it running another hour".into(), "stop it now".into()],
             what: None,
             means: None,
-            reask: None,
+            task: None,
         }
-    }
-
-    fn journal_kinds(project: &Project) -> Vec<String> {
-        crate::talk::read(project)
-            .lines
-            .iter()
-            .map(|l| match &l.entry {
-                crate::talk::Entry::Say { .. } => "say".to_string(),
-                crate::talk::Entry::Ask { id, revision } => format!("ask {id}@{revision}"),
-                crate::talk::Entry::Notice { id } => format!("notice {id}"),
-                crate::talk::Entry::Answer { id, choice, .. } => format!("answer {id} {choice}"),
-                other => format!("{other:?}"),
-            })
-            .collect()
     }
 
     #[test]
@@ -906,7 +719,6 @@ mod tests {
                 "notification show {compact} --body 1. keep it running another hour"
             )) == 1
         );
-        assert_eq!(journal_kinds(&fx.project), ["ask a-1@1"]);
         assert!(publication_complete(
             &project::read_json::<Publication>(&publication_path(&fx.project, "ask:a-1@1"))
                 .unwrap()
@@ -928,7 +740,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(journal_kinds(&fx.project).len(), 1);
         assert_eq!(
             fx.world
                 .runner
@@ -962,11 +773,6 @@ mod tests {
             &project::read_json::<Publication>(&publication_path(&project, "ask:a-1@1")).unwrap()
         ));
         assert_eq!(world.runner.count("notification show"), 2);
-        assert_eq!(
-            journal_kinds(&project),
-            ["ask a-1@1"],
-            "one journal line across both tries"
-        );
     }
 
     #[test]
@@ -974,34 +780,19 @@ mod tests {
         let fx = fixture();
         let ctx = fx.world.ctx();
         ask(&ctx, "demo", keep_or_stop()).unwrap();
-        let again = ask(
-            &ctx,
-            "demo",
-            NewAsk {
-                question: "Keep the experiment running two more hours or stop now?".into(),
-                reask: Some("a-1".into()),
-                ..keep_or_stop()
-            },
-        )
-        .unwrap();
-        assert_eq!(again.revision, 2);
+
         let e = format!(
             "{:#}",
-            answer(&ctx, "demo", "a-1", 1, 2, "test").unwrap_err()
-        );
-        assert!(e.starts_with("ask_revision_stale"), "{e}");
-        let e = format!(
-            "{:#}",
-            answer(&ctx, "demo", "a-1", 2, 3, "test").unwrap_err()
+            answer(&ctx, "demo", "a-1", 1, 3, "test").unwrap_err()
         );
         assert!(e.starts_with("ask_choice_out_of_range"), "{e}");
-        let a = answer(&ctx, "demo", "a-1", 2, 0, "test").unwrap();
+        let a = answer(&ctx, "demo", "a-1", 1, 0, "test").unwrap();
         assert!(a.not_understood);
         assert_eq!(a.text, NOT_UNDERSTOOD);
         assert_eq!(not_understood_count(&fx.project), 1);
         let e = format!(
             "{:#}",
-            answer(&ctx, "demo", "a-1", 2, 1, "test").unwrap_err()
+            answer(&ctx, "demo", "a-1", 1, 1, "test").unwrap_err()
         );
         assert!(e.starts_with("ask_closed"), "{e}");
         assert!(open_asks(&fx.project).is_empty());
@@ -1012,7 +803,7 @@ mod tests {
                 &fx.project,
                 &HumanMessage::Ask {
                     id: "a-1".into(),
-                    revision: 2
+                    revision: 1
                 }
             )
             .unwrap_err()
@@ -1031,83 +822,6 @@ mod tests {
             .unwrap_err()
         );
         assert!(e.starts_with("ask_unknown"), "{e}");
-    }
-
-    #[test]
-    fn say_refuses_the_previous_line_with_the_same_what_and_means() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        say(
-            &ctx,
-            "demo",
-            "The first lane is done.",
-            Some("You can read it now."),
-        )
-        .unwrap();
-        let error = say(
-            &ctx,
-            "demo",
-            "The first lane is done.",
-            Some("You can read it now."),
-        )
-        .unwrap_err();
-        assert!(crate::refusal::is(&error));
-        assert!(format!("{error:#}").contains("previous board line"));
-        assert_eq!(journal_kinds(&fx.project), ["say"]);
-        say(
-            &ctx,
-            "demo",
-            "The first lane is done.",
-            Some("It is ready to merge."),
-        )
-        .unwrap();
-        assert_eq!(journal_kinds(&fx.project), ["say", "say"]);
-    }
-
-    #[test]
-    fn a_say_id_publishes_each_sink_once() {
-        let fx = fixture();
-        let msg = HumanMessage::Say {
-            id: "s-7".into(),
-            what: "The review is done.".into(),
-            means: None,
-        };
-        let first = publish(&fx.world.ctx(), &fx.project, &msg).unwrap();
-        let second = publish(&fx.world.ctx(), &fx.project, &msg).unwrap();
-        assert!(first.seq.is_some() && second.seq.is_none());
-        assert_eq!(journal_kinds(&fx.project), ["say"]);
-        assert_eq!(
-            fx.world
-                .runner
-                .count("--token ade_last=The review is done."),
-            1
-        );
-    }
-
-    #[test]
-    fn notices_are_fixed_ids_only() {
-        let fx = fixture();
-        let e = format!(
-            "{:#}",
-            publish(
-                &fx.world.ctx(),
-                &fx.project,
-                &HumanMessage::Notice {
-                    id: "anything".into()
-                }
-            )
-            .unwrap_err()
-        );
-        assert!(e.starts_with("notice_unknown"), "{e}");
-        let p = publish(
-            &fx.world.ctx(),
-            &fx.project,
-            &HumanMessage::Notice {
-                id: "journal_tail".into(),
-            },
-        )
-        .unwrap();
-        assert!(!p.board);
     }
 
     fn distinct_ask(n: usize) -> NewAsk {
@@ -1154,19 +868,6 @@ mod tests {
                 .to_string()
                 .starts_with("ask_withdrawn")
         );
-        assert!(
-            ask(
-                &ctx,
-                "demo",
-                NewAsk {
-                    reask: Some(a.id.clone()),
-                    ..keep_or_stop()
-                }
-            )
-            .unwrap_err()
-            .to_string()
-            .starts_with("ask_withdrawn")
-        );
         assert!(open_revision(&fx.project, &a.id, 1).is_err());
         assert!(withdraw(&ctx, "demo", &a.id, "Again.", "rolf").is_err());
         // A withdrawn question does not prevent a genuinely new card.
@@ -1205,7 +906,6 @@ mod tests {
         let fx = fixture();
         let ctx = fx.world.ctx();
         let a = ask(&ctx, "demo", keep_or_stop()).unwrap();
-        let before = journal_kinds(&fx.project);
         let duplicate = NewAsk {
             question: "  Keep, the experiment running another hour; or stop now?  ".into(),
             ..keep_or_stop()
@@ -1216,38 +916,10 @@ mod tests {
             "ask_duplicate: `a-1` already asks this question; answer: still open"
         );
         assert_eq!(open_asks(&fx.project), vec![a.clone()]);
-        assert_eq!(journal_kinds(&fx.project), before);
         assert!(!ask_dir(&fx.project, "a-2").exists());
         assert_eq!(
             project::read_json::<u64>(&fx.project.state_dir().join("ask-counter.json")).unwrap(),
             1
-        );
-        let same_id = ask(
-            &ctx,
-            "demo",
-            NewAsk {
-                reask: Some(a.id),
-                ..keep_or_stop()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(same_id.starts_with("ask_duplicate"), "{same_id}");
-
-        // A re-ask also cannot copy a different open question.
-        let b = ask(&ctx, "demo", distinct_ask(2)).unwrap();
-        assert!(
-            ask(
-                &ctx,
-                "demo",
-                NewAsk {
-                    reask: Some(b.id),
-                    ..keep_or_stop()
-                }
-            )
-            .unwrap_err()
-            .to_string()
-            .starts_with("ask_duplicate")
         );
         answer(&ctx, "demo", "a-1", 1, 1, "rolf").unwrap();
         let error = ask(&ctx, "demo", keep_or_stop()).unwrap_err().to_string();
@@ -1278,39 +950,5 @@ mod tests {
         ));
         ask(&world.ctx(), "demo", keep_or_stop()).unwrap();
         assert_eq!(open_asks(&project).len(), 4);
-    }
-
-    #[test]
-    fn reasking_an_open_question_keeps_its_identifier() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        for _ in 0..3 {
-            ask_again(&fx).unwrap();
-        }
-        let first = ask(
-            &ctx,
-            "demo",
-            NewAsk {
-                reask: Some("a-1".into()),
-                ..distinct_ask(5)
-            },
-        )
-        .unwrap();
-        assert_eq!((first.id.as_str(), first.revision), ("a-1", 2));
-
-        let merged = ask(
-            &ctx,
-            "demo",
-            NewAsk {
-                reask: Some("a-3".into()),
-                ..distinct_ask(6)
-            },
-        )
-        .unwrap();
-        assert_eq!((merged.id.as_str(), merged.revision), ("a-3", 2));
-        assert_eq!(open_asks(&fx.project).len(), 3);
-        assert!(journal_kinds(&fx.project).contains(&"ask a-3@2".to_string()));
-        let ids: Vec<String> = open_asks(&fx.project).into_iter().map(|a| a.id).collect();
-        assert!(ids.contains(&"a-1".to_string()) && ids.contains(&"a-2".to_string()));
     }
 }

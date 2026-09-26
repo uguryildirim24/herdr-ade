@@ -44,6 +44,8 @@ fn removed_kind(kind: &str) -> bool {
         "thread-state"
             | "report-available"
             | "preparation-abandoned"
+            | "config-changed"
+            | "recipient-changed"
             | "round-advance"
             | "merge-diverged"
             | "merge-pending"
@@ -88,8 +90,18 @@ pub(crate) fn write(
     if removed_kind(kind) {
         bail!("inbox_record_kind: `{kind}` belongs in its owning record");
     }
+    let summary: String = summary
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let body = body.trim_end();
     let _lock = project.lock()?;
     project.record_dir_for_write("inbox")?;
+    if let Some(existing) = unhandled(project).into_iter().find(|item| {
+        item.kind == kind && item.subject == subject && item.summary == summary && item.body == body
+    }) {
+        return Ok(existing.id);
+    }
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     project::write_json(&counter_path, &n)?;
@@ -103,10 +115,7 @@ pub(crate) fn write(
         subject: subject.to_string(),
         created: project::now(),
         // One line, no control characters: summaries are printed in the digest.
-        summary: summary
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect(),
+        summary,
         event: String::new(),
         body: String::new(),
     };
@@ -442,6 +451,18 @@ mod tests {
         );
         assert_eq!(unhandled(&project).len(), 1);
         assert_eq!(unhandled(&project)[0].kind, "outage");
+    }
+
+    #[test]
+    fn identical_unhandled_notice_is_written_once() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let id = write(&project, "outage", "box", "still\noffline", "check network").unwrap();
+        assert_eq!(
+            write(&project, "outage", "box", "still\noffline", "check network").unwrap(),
+            id
+        );
+        assert_eq!(unhandled(&project).len(), 1);
     }
 
     #[test]

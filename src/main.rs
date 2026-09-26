@@ -57,6 +57,7 @@ mod pi;
 mod pi_ade;
 mod plan;
 mod project;
+mod prompt;
 mod refusal;
 mod remote;
 mod repo;
@@ -66,7 +67,6 @@ mod runner;
 #[cfg(test)]
 mod scenarios;
 mod steps;
-mod talk;
 mod task;
 #[cfg(test)]
 mod testkit;
