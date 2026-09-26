@@ -158,6 +158,99 @@ fn resolved_historical_seals_are_classified_once_without_old_rounds() {
 }
 
 #[test]
+fn one_time_reclassification_corrects_old_empty_seals_but_keeps_real_changes() {
+    let fx = configured();
+    let (empty, _) = lane_unsealed(&fx, 1);
+    let record = thread::load(&fx.project, &empty).unwrap();
+    git(
+        Path::new(&record.worktree_path),
+        &["reset", "--hard", "main"],
+    );
+    git(
+        Path::new(&record.worktree_path),
+        &["commit", "-q", "--allow-empty", "-m", "empty"],
+    );
+    let sha = git(Path::new(&record.worktree_path), &["rev-parse", "HEAD"]);
+    let seal = fx.seal_done(&empty, 1, 1, &sha, "Empty seal");
+    let task = job(&fx, &empty);
+    thread::update(&fx.project, &empty, |t| {
+        t.status = Status::Resolved;
+        t.changes_seal = seal.clone();
+        t.has_changes = Some(true);
+    })
+    .unwrap();
+    // Old event payloads can also carry the obsolete classification.
+    let path = fx
+        .project
+        .state_dir()
+        .join("events")
+        .join(format!("{seal}.toml"));
+    let mut event: crate::contracts::Event =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    event.payload.done.as_mut().unwrap().has_changes = Some(true);
+    std::fs::write(path, toml::to_string(&event).unwrap()).unwrap();
+    let (changed, changed_sha) = lane_unsealed(&fx, 2);
+    let changed_seal = fx.seal_done(&changed, 1, 1, &changed_sha, "Real change");
+    thread::update(&fx.project, &changed, |t| {
+        t.status = Status::Resolved;
+        t.changes_seal = changed_seal.clone();
+        t.has_changes = Some(true);
+    })
+    .unwrap();
+
+    reclassify_old_changes(&fx.world.ctx(), |_| {}).unwrap();
+    assert!(fx.world.ctx().root.join(".change-reclass-v1.json").exists());
+    let record = thread::load(&fx.project, &empty).unwrap();
+    assert_eq!(record.has_changes, Some(false));
+    assert!(record.merged_sha.is_empty());
+    assert!(lane_done(
+        &fx.project,
+        &record,
+        &crate::events::checked(&fx.project).unwrap()
+    ));
+    assert_eq!(
+        crate::task::view(&fx.project, task).state,
+        crate::task::State::Finished
+    );
+    assert_eq!(
+        thread::load(&fx.project, &changed).unwrap().has_changes,
+        Some(true)
+    );
+    let calls = fx.world.runner.calls.borrow().len();
+    reclassify_old_changes(&fx.world.ctx(), |_| {}).unwrap();
+    assert_eq!(calls, fx.world.runner.calls.borrow().len());
+}
+
+#[test]
+fn reclassification_skips_missing_objects_and_logs_only_once() {
+    let fx = configured();
+    let (id, _) = lane_unsealed(&fx, 1);
+    let seal = fx.seal_done(
+        &id,
+        1,
+        1,
+        "0000000000000000000000000000000000000000",
+        "Gone",
+    );
+    thread::update(&fx.project, &id, |t| {
+        t.status = Status::Resolved;
+        t.changes_seal = seal.clone();
+        t.has_changes = Some(true);
+    })
+    .unwrap();
+    let mut logs = Vec::new();
+    reclassify_old_changes(&fx.world.ctx(), |line| logs.push(line.to_owned())).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].contains(&id));
+    assert_eq!(
+        thread::load(&fx.project, &id).unwrap().has_changes,
+        Some(true)
+    );
+    reclassify_old_changes(&fx.world.ctx(), |line| logs.push(line.to_owned())).unwrap();
+    assert_eq!(logs.len(), 1);
+}
+
+#[test]
 fn old_no_change_seal_finishes_without_merge_even_when_resolved() {
     let fx = configured();
     let (id, _) = lane(&fx, 1);
