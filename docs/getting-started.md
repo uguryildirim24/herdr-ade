@@ -53,9 +53,9 @@ Tell the coordinator what you want. It starts the lanes the work needs and tells
 - a tab under the coordinator workspace; and
 - the project's instructions and bounded memory.
 
-A lane reports through its file under `.herdr-project/`. The harness copies reports to the project record and groups each lane by what needs attention. When a round merges, the harness closes its member lanes and reviewers. Cancelling a round closes its reviewers but leaves member lanes available for a new round. A report-only lane closes as soon as its unchanged commit and report arrive. A changed lane stays visible until you put it in a round. `thread resolve` remains available for an exceptional manual close.
+A lane reports through its file under `.herdr-project/`. The harness copies reports to the project record and groups each lane by what needs attention. When a pile merges, the harness closes its member lanes and reviewers. Cancelling a review closes its reviewers but leaves member lanes available for a new pile. A report-only lane closes as soon as its unchanged commit and report arrive. A changed lane stays visible until its pile is reviewed. `thread resolve` remains available for an exceptional manual close.
 
-A finished lane's worktree is removed automatically after its commits land through a merged round, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored paths such as `target` and `node_modules` under global `[worktrees].disposable` in `config.toml`, or add `disposable` to one repository row in `PROJECT.md` (and to a harness repository row for harness-only output). Repository lists affect only that repository. `*` matches within one path part, so `runs/pytest-*` leaves other `runs/` output alone; with no matching list, all ignored files are kept. Nested worktrees are always kept. A kept worktree keeps its branch; cleanup prunes local and published branches after removing a finished worktree, without forcing worktree removal. Closed rounds prune their review branches.
+A finished lane's worktree is removed automatically after its commits land through a pile review, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored paths such as `target` and `node_modules` under global `[worktrees].disposable` in `config.toml`, or add `disposable` to one repository row in `PROJECT.md` (and to a harness repository row for harness-only output). Repository lists affect only that repository. `*` matches within one path part, so `runs/pytest-*` leaves other `runs/` output alone; with no matching list, all ignored files are kept. Nested worktrees are always kept. A kept worktree keeps its branch; cleanup prunes local and published branches after removing a finished worktree, without forcing worktree removal. Completed reviews prune their review branches.
 
 ## Check your setup
 
@@ -65,9 +65,9 @@ herdr-ade ticker status
 ```
 
 - **The project session is unreachable:** run `open` inside Herdr or pass the right `--session` or `--socket`. Use `--rebind` only when the recorded session is gone.
-- **A lane failed, blocked, or got stuck:** inspect `thread show`, then use `thread retry --reason "<why>"`. It replaces the process through bounded routing. Use `thread cancel` to stop it or `thread rebind` when its verified process is already live elsewhere.
+- **A lane failed, blocked, or got stuck:** inspect `thread show`, then use `thread retry --reason "<why>"`. It replaces the process; only automatic retries are bounded. Use `thread cancel` to stop it or `thread rebind` when its verified process is already live elsewhere.
 - **A provider is not ready:** use the provider's login flow on the same machine and rerun `doctor`.
 - **The coordinator needs its instructions again:** run `open <project> --reprime`.
 - **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and `doctor` lists what was kept; only configured rebuildable paths are discarded. Removal is not forced.
 
-See [Operations](operations.md) for records, routing, rounds, remote lanes, and the complete command surface.
+See [Operations](operations.md) for records, routing, pile reviews, remote lanes, and the complete command surface.

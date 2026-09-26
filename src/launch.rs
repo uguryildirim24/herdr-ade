@@ -331,7 +331,7 @@ pub fn resolve_failure(
         FailureClass::WorkFailed if previous.routing_rule == "explicit" => {
             let config = parse_launch_config(&ctx.config_dir)?;
             validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
-            let recovery = previous.escalations.saturating_add(1);
+            let recovery = previous.work_retries.saturating_add(1);
             if recovery > config.routing.retries {
                 return Err(crate::refusal::error(format!(
                     "recovery_exhausted: Rolf's one-off recipe allowed {} retries; waiting for the coordinator",
@@ -339,7 +339,7 @@ pub fn resolve_failure(
                 )));
             }
             let mut same = previous.clone();
-            same.escalations = recovery;
+            same.work_retries = recovery;
             ledger(
                 project,
                 json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
@@ -408,7 +408,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     let hash = crate::thread::sha256_hex(input.task.as_bytes());
     let recovery = input
         .previous
-        .map_or(0, |previous| previous.escalations.saturating_add(1));
+        .map_or(0, |previous| previous.work_retries.saturating_add(1));
     if input.previous.is_some()
         && input
             .failure
@@ -513,7 +513,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         policy_hash: config.policy_hash,
         attempt: 1,
         recipe_id: selected.recipe,
-        escalations: recovery,
+        work_retries: recovery,
         routing_rule: selected.rule,
         recipe_basis: input.recipe_basis.unwrap_or_default().to_string(),
         recipe_request: input.recipe_request.unwrap_or_default().to_string(),

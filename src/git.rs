@@ -263,7 +263,7 @@ pub(crate) fn is_ancestor(
 /// still means the query failed. Match the full name (git also lists prefixes).
 pub(crate) fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<String>> {
     // Keep the local-branch namespace even when the supplied name starts
-    // with `refs/`: round and worktree callers use short branch names.
+    // with `refs/`: review and worktree callers use short branch names.
     let want = format!("refs/heads/{branch}");
     let rows = git(
         runner,
@@ -275,39 +275,6 @@ pub(crate) fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Resu
         let (name, sha) = row.split_once(' ')?;
         (name == want).then(|| sha.to_string())
     }))
-}
-
-/// Porcelain worktree rows: `(path, branch)` where branch is `refs/heads/...` or empty.
-pub(crate) fn worktree_list(runner: &dyn Runner, repo: &str) -> Result<Vec<(PathBuf, String)>> {
-    let text = git(
-        runner,
-        repo,
-        &["worktree", "list", "--porcelain"],
-        Duration::from_secs(5),
-    )?;
-    let mut rows = Vec::new();
-    let mut path = PathBuf::new();
-    let mut branch = String::new();
-    let flush = |rows: &mut Vec<(PathBuf, String)>, path: &mut PathBuf, branch: &mut String| {
-        if !path.as_os_str().is_empty() {
-            rows.push((path.clone(), branch.clone()));
-        }
-        path.clear();
-        branch.clear();
-    };
-    for line in text.lines() {
-        if line.is_empty() {
-            flush(&mut rows, &mut path, &mut branch);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            path = PathBuf::from(rest);
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            branch = rest.to_string();
-        }
-    }
-    flush(&mut rows, &mut path, &mut branch);
-    Ok(rows)
 }
 
 pub(crate) fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Result<()> {

@@ -129,7 +129,7 @@ pub struct StartArgs {
     pub recipe_basis: Option<String>,
     pub task_id: String,
     /// Internal reviewer identity; empty for every non-reviewer start.
-    pub review_round: String,
+    pub review_id: String,
 }
 
 /// Internal birth description: required, with no vocabulary or length gate.
@@ -147,27 +147,11 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     start_with_ticker(ctx, slug, args, ticker::start, None, true)
 }
 
-/// Starts a thread while `round advance` holds its lock. This must not wait for
+/// Starts a thread while `review` holds its lock. This must not wait for
 /// a ticker replacement: the running ticker may itself be waiting for that
 /// lock. Ordinary starts still replace a stale ticker through [`start`].
 pub(crate) fn start_during_advance(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     start_with_ticker(ctx, slug, args, ticker::ensure, None, true)
-}
-
-pub(crate) fn start_during_advance_bounded(
-    ctx: &Ctx,
-    slug: &str,
-    args: StartArgs,
-    source_truncation: serde_json::Value,
-) -> Result<Thread> {
-    start_with_ticker(
-        ctx,
-        slug,
-        args,
-        ticker::ensure,
-        Some(source_truncation),
-        true,
-    )
 }
 
 fn start_with_ticker(
@@ -310,7 +294,7 @@ fn start_with_ticker(
         t.agent = launch.kind.clone();
         t.base = args.base.clone().unwrap_or_default();
         t.role = role.to_string();
-        t.review_round = args.review_round.clone();
+        t.review_id = args.review_id.clone();
         t.plain = args.plain.trim().to_string();
         t.attempt = 1;
         t.launch = launch.clone();
@@ -747,7 +731,7 @@ pub(crate) fn box_repo_row(
     )
 }
 
-/// Put the authoritative round and all named review sources on the box before
+/// Put the pinned report artifacts and source commits on the box before
 /// the reviewer process starts. Each transferred file is verified remotely.
 fn stage_box_review(
     ctx: &Ctx,
@@ -756,29 +740,53 @@ fn stage_box_review(
     box_root: &str,
     target: &str,
 ) -> Result<()> {
-    let record = crate::round::load(project, &reviewer.review_round)?;
-    let state = format!("{}/{}/.state", box_root, project.slug);
-    let manifest = crate::round::round_path(project, &reviewer.review_round);
-    let text = std::fs::read_to_string(&manifest)?;
-    remote::write_runtime_file(
+    let record = crate::review::load(project, &reviewer.review_id)?;
+    let state = format!(
+        "/{}/{}/.state",
+        box_root.trim_start_matches('/'),
+        project.slug
+    );
+    // A partially merged candidate (a conflict) may not contain every member
+    // object. Make every pinned source available before the box reviewer runs.
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        reviewer.machine_route(),
+    )?;
+    let settings = project.read_project_md()?.0;
+    let (box_repo, url) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+    let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let git = crate::repo::Git::new(ctx.runner, &record.repo);
+    let mut fetch = format!(
+        "git -C {} fetch {}",
+        remote::quote(&box_repo),
+        remote::quote(&url)
+    );
+    for member in &record.members {
+        thread::update(project, &member.thread, |t| {
+            t.review_sources.insert(url.clone(), member.sha.clone());
+        })?;
+        let reference = format!("refs/heads/{}", member.branch);
+        git.run(&["push", &url, &format!("{}:{reference}", member.sha)])?;
+        fetch.push(' ');
+        fetch.push_str(&remote::quote(&reference));
+    }
+    let out = remote::ssh(
         ctx.runner,
         target,
-        &format!("{state}/rounds/{}.toml", reviewer.review_round),
-        &text,
-        &thread::sha256_hex(text.as_bytes()),
+        &remote::with_path(&machine.path, &fetch),
+        None,
+        Duration::from_secs(120),
     )?;
-    let mut hashes = std::collections::BTreeSet::new();
-    if let Some(hash) = &record.review_artifact {
-        hashes.insert(hash.clone());
+    if !out.success() {
+        bail!("could not fetch pile inputs on box: {}", out.error_text());
     }
-    for member in &record.manifest.members {
-        if let Some(pin) = &member.pin {
-            hashes.insert(pin.artifact.clone());
-        }
-    }
-    if let Some(pin) = &record.previous_verdict {
-        hashes.insert(pin.artifact.clone());
-    }
+    let hashes: std::collections::BTreeSet<_> = record
+        .members
+        .iter()
+        .map(|member| member.artifact.clone())
+        .collect();
     for hash in hashes {
         let bytes = thread::artifact(project, &hash)?;
         let text = String::from_utf8(bytes).context("review source artifact is not UTF-8")?;
@@ -845,7 +853,7 @@ fn place_box_worktree(
         let brief = thread::brief_for(project, &stub, &task, restart)?;
         // A review task contains absolute artifact paths. Freeze paths for the
         // machine that will read them, not the coordinator's filesystem.
-        let brief = if record.role == "reviewer" && !record.review_round.is_empty() {
+        let brief = if record.role == "reviewer" && !record.review_id.is_empty() {
             brief.replace(
                 &project.state_dir().to_string_lossy().to_string(),
                 &format!("{}/{}/.state", machine.root, project.slug),
@@ -899,7 +907,7 @@ fn place_box_worktree(
             },
         )?;
     }
-    if record.role == "reviewer" && !record.review_round.is_empty() {
+    if record.role == "reviewer" && !record.review_id.is_empty() {
         stage_box_review(ctx, project, record, &machine.root, &target)?;
     }
     let frozen = thread::artifact(project, &brief_hash)?;
@@ -1474,7 +1482,7 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
         t.prompt_pending = true;
         t.launch_attempts = 0;
         t.startup_wait_started.clear();
-        t.escalation_pending = false;
+        t.recovery_pending = false;
         t.status = Status::Open;
         t.error.clear();
         t.last_state.clear();
@@ -1501,14 +1509,14 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
     ))
 }
 
-/// Resume a persisted escalation without re-picking or touching worktree files.
-pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+/// Resume a persisted recovery without re-picking or touching worktree files.
+pub fn place_recovery(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if record.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
         thread::update(project, &record.id, |t| {
-            t.escalation_pending = false;
-            t.error = "escalation_placement_exhausted: could not open the replacement lane".into();
+            t.recovery_pending = false;
+            t.error = "recovery_placement_exhausted: could not open the replacement lane".into();
         })?;
-        bail!("escalation_placement_exhausted");
+        bail!("recovery_placement_exhausted");
     }
     thread::update(project, &record.id, |t| t.launch_attempts += 1)?;
     let view = require_session(ctx, project)?;
@@ -1518,7 +1526,7 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
         let panes = herdr.pane_list()?;
         if let Some(pane) = panes.iter().find(|p| p.pane_id == record.pane_id) {
             if pane.workspace_id != record.workspace_id || pane.tab_id != record.tab_id {
-                bail!("escalation_identity_mismatch: old pane was reused");
+                bail!("recovery_identity_mismatch: old pane was reused");
             }
             close_pane(ctx, project, record)?;
         }
@@ -1545,7 +1553,7 @@ pub fn place_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result
             finish_placement(project, &view, &record.id)?;
         }
     }
-    thread::update(project, &record.id, |t| t.escalation_pending = false)?;
+    thread::update(project, &record.id, |t| t.recovery_pending = false)?;
     Ok(())
 }
 
@@ -1567,7 +1575,7 @@ pub struct RetryOutcome {
 /// process. Its durable failure class decides whether recovery stays on the
 /// same recipe within its retry budget, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::start, true)
+    retry_with_ticker(ctx, slug, id, reason, ticker::start, true, false)
 }
 
 /// Round recovery already holds the advance lock, so it must not replace and
@@ -1578,9 +1586,9 @@ pub(crate) fn retry_during_advance(
     id: &str,
     reason: &str,
 ) -> Result<RetryOutcome> {
-    // A manual round retry is the same coordinator decision as `thread
+    // A manual review retry is the same coordinator decision as `thread
     // retry`; only its ticker handling differs because advance_lock is held.
-    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, true)
+    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, true, true)
 }
 
 fn retry_with_ticker(
@@ -1590,25 +1598,29 @@ fn retry_with_ticker(
     reason: &str,
     ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
     launch_now: bool,
+    replace_busy: bool,
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
-    if record.role == "reviewer" && !record.review_round.is_empty() {
-        let round = crate::round::load(&project, &record.review_round)?;
-        if let Some(bound) = round.reviewer.as_deref()
+    if !replace_busy {
+        crate::review::require_resolvable(&project, id)?;
+    }
+    if record.role == "reviewer" && !record.review_id.is_empty() {
+        let review = crate::review::load(&project, &record.review_id)?;
+        if let Some(bound) = review.reviewer.as_deref()
             && bound != id
         {
             bail!(
-                "reviewer_already_bound: `{bound}` is bound to `{}`; the round's own retry handles its reviewer",
-                record.review_round
+                "reviewer_already_bound: `{bound}` is bound to `{}`; the review's own retry handles its reviewer",
+                record.review_id
             );
         }
     }
     // A crash after the attempt transition but before placement resumes the
     // same selected attempt. It must not spend another routing recovery.
-    if record.escalation_pending {
+    if record.recovery_pending {
         ensure_ticker(ctx)?;
-        place_prelaunch_escalation(ctx, &project, &record)?;
+        place_prelaunch_recovery(ctx, &project, &record)?;
         if launch_now {
             ticker::launch_thread_now(ctx, &project, id)?;
         }
@@ -1651,7 +1663,9 @@ fn retry_with_ticker(
     }
     let view = require_session(ctx, &project)?;
     let herdr = view.herdr.on_machine(record.machine_route());
-    refuse_busy_retry(&herdr, &record)?;
+    if !replace_busy {
+        refuse_busy_retry(&herdr, &record)?;
+    }
     let screen = if record.error.starts_with("agent_not_ready:") {
         same_startup_screen(&herdr, &record)?
     } else if !record.startup_wait_started.is_empty() {
@@ -1749,12 +1763,12 @@ fn retry_with_ticker(
         t.last_failure = reason.to_string();
         t.cleanup_pending = false;
         t.cleanup_reason.clear();
-        t.escalation_pending = true;
+        t.recovery_pending = true;
         Ok(())
     })?;
 
     ensure_ticker(ctx)?;
-    place_prelaunch_escalation(ctx, &project, &thread::load(&project, id)?)?;
+    place_prelaunch_recovery(ctx, &project, &thread::load(&project, id)?)?;
     if launch_now {
         ticker::launch_thread_now(ctx, &project, id)?;
     }
@@ -1769,59 +1783,23 @@ fn retry_with_ticker(
 }
 
 // Placement counts its own tries; if it failed before submitting an agent,
-// keep the launch counter at zero so round recovery never calls it process gone.
-// A reviewer is retried by the round's clock, not the ticker's immediate
-// escalation pass (which would bypass that clock and exhaust placement).
-fn place_prelaunch_escalation(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
-    let result = place_escalation(ctx, project, record);
+// keep the launch counter at zero so review recovery never calls it process gone.
+// A reviewer is retried by the review's retry, not the ticker's immediate
+// recovery pass (which would bypass that clock and exhaust placement).
+fn place_prelaunch_recovery(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    let result = place_recovery(ctx, project, record);
     if let Err(error) = &result
         && record.launch_attempts == 0
     {
         thread::update(project, &record.id, |t| {
             t.launch_attempts = 0;
             if t.role == "reviewer" {
-                t.escalation_pending = false;
+                t.recovery_pending = false;
                 t.error = format!("{error:#}");
             }
         })?;
     }
     result
-}
-
-/// Resume after a server/session interruption. This is not failed-work
-/// recovery: it preserves the selected recipe and does not consume routing's
-/// provider-failure budget. `pickup --start` is its only caller.
-pub(crate) fn resume_interrupted(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
-    let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
-    if record.kind == Kind::Adopted || record.status == Status::Resolved {
-        bail!("resume_refused: {id} has no resumable launch");
-    }
-    thread::update_checked(&project, id, |t| {
-        if t.attempt != record.attempt {
-            bail!("resume_stale: thread changed while pickup was recovering it");
-        }
-        t.attempt = t.attempt.max(1).saturating_add(1);
-        t.launch.attempt = t.attempt;
-        t.status = Status::Failed;
-        t.prompt_pending = false;
-        t.launch_attempts = 0;
-        t.bootstrap.clear();
-        Ok(())
-    })?;
-    ticker::start(ctx)?;
-    let view = require_session(ctx, &project)?;
-    let current = thread::load(&project, id)?;
-    if current.is_remote()
-        || current.worktree_path.is_empty() && current.kind == Kind::Worktree
-        || current.pane_id.is_empty() && current.kind == Kind::Tab
-    {
-        return place_and_brief(ctx, &project, &view, id, true);
-    }
-    place_ade_tab(ctx, &project, &view, &current)?;
-    let placed = thread::load(&project, id)?;
-    write_brief(ctx, &project, &placed)?;
-    finish_placement(&project, &view, id)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1940,6 +1918,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     if reason.is_empty() {
         bail!("cancel_reason_missing: say why {id} is being stopped");
     }
+    crate::review::require_resolvable(&project, id)?;
     let before = thread::load(&project, id)?;
     let recorded_reason = if before.cancellation_reason.is_empty() {
         reason.to_string()
@@ -1956,17 +1935,6 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
             t.cleanup_reason = "cancelled".into();
         }
     })?;
-    let fix_cleanup_failed = if !record.repo.is_empty() && record.role != "reviewer" {
-        match crate::branches::release_review_fixes(ctx, &project, &record.repo, id, None) {
-            Ok(()) => false,
-            Err(error) => {
-                eprintln!("note: reviewer fix cleanup pending for {id}: {error:#}");
-                true
-            }
-        }
-    } else {
-        false
-    };
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &record);
     }
@@ -2023,7 +1991,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     }
     let mut cleanup_failed = false;
     if pane != "cleanup_pending" {
-        // The round may already be held when a superseded reviewer reaches
+        // The review may already be cancelling when a superseded reviewer reaches
         // here. Keep cleanup retryable instead of failing its worker's prompt.
         let cleanup = (|| -> Result<()> {
             // A cleared worktree path still owes owned-ref retirement on retry.
@@ -2036,10 +2004,9 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         })();
         match cleanup {
             Ok(())
-                if !fix_cleanup_failed
-                    && !worktree_reason
-                        .as_ref()
-                        .is_some_and(|reason| reason.starts_with("linked_files_not_kept:")) =>
+                if !worktree_reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.starts_with("linked_files_not_kept:")) =>
             {
                 thread::update(&project, id, |t| {
                     t.cleanup_pending = false;
@@ -2059,7 +2026,6 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         thread: id.to_string(),
         state: if pane == "cleanup_pending"
             || cleanup_failed
-            || fix_cleanup_failed
             || worktree_reason
                 .as_ref()
                 .is_some_and(|reason| reason.starts_with("linked_files_not_kept:"))
@@ -2078,7 +2044,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
 
 /// Resolve through the same path as `thread resolve`, but make external
 /// cleanup failure durable instead of failing the operation which ended the
-/// round. The ticker can then retry the whole final-copy and cleanup path.
+/// review. The ticker can then retry the whole final-copy and cleanup path.
 pub(crate) fn resolve_automatically(
     ctx: &Ctx,
     project: &Project,
@@ -2157,8 +2123,7 @@ pub(crate) fn resolve_automatically(
 }
 
 /// Retry every durable cleanup left by cancellation or automatic resolution.
-/// Closed rounds are also reconciled so a process death between closing the
-/// round and marking its first thread cannot strand an unmarked cleanup.
+/// The review record separately resumes cleanup after a landed pile.
 pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> {
     for record in thread::list(project)
         .into_iter()
@@ -2179,89 +2144,40 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         }
     }
 
-    let mut rounds = crate::round::checked_list(project)?;
-    rounds.sort_by_key(|r| {
-        crate::round::round_number(&r.round)
-            .parse::<u64>()
-            .unwrap_or(u64::MAX)
-    });
-    // The newest admission is the durable retry marker for older fixes.
-    // Never use an older round to retire a newer rejected correction.
-    let mut newest = std::collections::BTreeMap::new();
-    for round in &rounds {
-        for member in &round.manifest.members {
-            newest.insert(
-                (round.repo.clone(), member.thread.clone()),
-                round.round.clone(),
-            );
-        }
-    }
-    for ((repo, lane), round) in newest {
-        if let Err(error) =
-            crate::branches::release_review_fixes(ctx, project, &repo, &lane, Some(&round))
-        {
-            eprintln!("note: reviewer fix cleanup pending for {lane}: {error:#}");
-        }
-    }
-    for round in rounds.into_iter().filter(|round| round.cleanup_pending) {
-        let reason = if round.phase == crate::contracts::RoundPhase::Merged {
-            "merged"
-        } else {
-            "cancelled"
-        };
-        for id in crate::round::cleanup_thread_ids(project, &round) {
-            if thread::load(project, &id)
-                .is_ok_and(|record| record.status != Status::Resolved || record.cleanup_pending)
-            {
-                resolve_automatically(ctx, project, &id, reason);
-            }
-        }
-        for line in crate::round::cleanup_review_worktrees(ctx, project, &round) {
-            println!("{line}");
-        }
-        if let Err(error) = crate::branches::closed_round(ctx, project, &round) {
-            crate::ledger::observe(
-                project,
-                "round-branch-cleanup",
-                &round.round,
-                &format!("{error:#}"),
-            );
-            eprintln!("branch cleanup pending for {}: {error:#}", round.round);
-            continue;
-        }
-        if let Err(error) = crate::round::finish_cleanup_marker(project, &round.round) {
-            eprintln!(
-                "note: cleanup marker pending for {}: {error:#}",
-                round.round
-            );
-        } else {
-            crate::ledger::recovered(project, "round-branch-cleanup", &round.round);
-        }
-    }
     Ok(())
 }
 
 /// A report-only code lane has nothing to review or land. Once its sealed
 /// report is available, close it immediately; changed lanes remain visible so
-/// the coordinator can put them in a round.
+/// the coordinator can put them in a pile.
 pub(crate) fn resolve_report_only(ctx: &Ctx, project: &Project) {
     let events = crate::events::list(project);
     for record in thread::list(project) {
-        if record.status == Status::Resolved
-            || record.role == "reviewer"
-            || record.base.is_empty()
-            || !crate::threads::carrying_rounds(project, &record.id).is_empty()
-        {
+        if record.status == Status::Resolved || record.role == "reviewer" {
             continue;
         }
-        let latest = crate::round::latest_event(&events, &record.id, record.attempt.max(1));
+        let latest = crate::events::latest_event(&events, &record.id, record.attempt.max(1));
         let unchanged = latest
             .and_then(|event| event.payload.done.as_ref())
-            .is_some_and(|done| done.sha == record.base);
-        // Report-only lanes have no round pin to hold them open. A queued
+            .is_some_and(|done| {
+                done.has_changes == Some(false)
+                    || record.changes_seal == latest.map(|e| e.id.as_str()).unwrap_or("")
+                        && record.has_changes == Some(false)
+            });
+        // Report-only lanes have no review pin to hold them open. A queued
         // correction or one delivered after this seal still needs a new seal.
-        if unchanged && !follow_up_pending_for_seal(&record, latest) {
-            resolve_automatically(ctx, project, &record.id, "report-only");
+        let already_merged = !record.merged_sha.is_empty() && record.merged_review.is_empty();
+        if (unchanged || already_merged) && !follow_up_pending_for_seal(&record, latest) {
+            resolve_automatically(
+                ctx,
+                project,
+                &record.id,
+                if already_merged {
+                    "merged before cutover"
+                } else {
+                    "report-only"
+                },
+            );
         }
     }
 }
@@ -2273,7 +2189,10 @@ pub enum PromptOutcome {
     Sent { attempt: u32, agent_state: String },
 }
 
-fn follow_up_pending_for_seal(record: &Thread, latest: Option<&crate::contracts::Event>) -> bool {
+pub(crate) fn follow_up_pending_for_seal(
+    record: &Thread,
+    latest: Option<&crate::contracts::Event>,
+) -> bool {
     record.follow_ups.iter().any(|f| {
         f.attempt == record.attempt.max(1)
             && (matches!(f.state, FollowUpState::Queued | FollowUpState::Uncertain)
@@ -2300,7 +2219,7 @@ fn awaiting_bootstrap(record: &Thread) -> bool {
         && record.bootstrap != "acknowledged"
 }
 
-/// Box lane state has no Mac round records. Publish the barriers before the
+/// Box lane state has no Mac review records. Publish the barriers before the
 /// correction prompt can reach its pane, or refuse to send the prompt.
 pub(crate) fn sync_box_corrections(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if !record.is_remote() || record.machine_route() == crate::contracts::MACHINE_LOCAL {
@@ -2398,16 +2317,15 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
             || awaiting_bootstrap(&record)
             || awaiting_follow_up(&record))
     {
-        let events_before_send = crate::round::sealed_events(&project)?;
-        // Keep the queued message invisible to the ticker until every round
+        let events_before_send = crate::events::checked(&project)?;
+        // Keep the queued message invisible to the ticker until every review
         // it affects is durably held. Working also closes the gap between this
         // thread update and that hold for an already accepted reviewer.
         let previous_group = record.last_group.clone();
         thread::update(&project, id, |thread| {
             thread.last_group = Group::Working.token().to_string();
         })?;
-        if let Err(error) = crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send)
-        {
+        if let Err(error) = crate::review::require_follow_up(&project, id) {
             thread::update(&project, id, |thread| {
                 thread.last_group = previous_group;
             })?;
@@ -2448,12 +2366,12 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         }
     }
     if record.parked {
-        let events = crate::round::sealed_events(&project)?;
+        let events = crate::events::checked(&project)?;
         let previous_group = record.last_group.clone();
         thread::update(&project, id, |t| {
             t.last_group = Group::Working.token().into()
         })?;
-        if let Err(error) = crate::round::hold_for_follow_up(ctx, &project, id, &events) {
+        if let Err(error) = crate::review::require_follow_up(&project, id) {
             thread::update(&project, id, |t| t.last_group = previous_group)?;
             return Err(error);
         }
@@ -2476,8 +2394,8 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         .is_ok_and(|adapter| adapter.blocked_error_resumable);
     let state = prompt_state(&record, &agents, resumable)?;
     let herdr = view.herdr.on_machine(record.machine_route());
-    let events_before_send = crate::round::sealed_events(&project)?;
-    // Mark the work before invalidating earlier round evidence. The merge
+    let events_before_send = crate::events::checked(&project)?;
+    // Mark the work before invalidating earlier review evidence. The merge
     // boundary sees either this working state or the durable hold. If an
     // already committed intent refuses the hold, restore the prior projection
     // and never deliver the text.
@@ -2485,7 +2403,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     thread::update(&project, id, |thread| {
         thread.last_group = Group::Working.token().to_string();
     })?;
-    if let Err(error) = crate::round::hold_for_follow_up(ctx, &project, id, &events_before_send) {
+    if let Err(error) = crate::review::require_follow_up(&project, id) {
         thread::update(&project, id, |thread| {
             thread.last_group = previous_group;
         })?;
@@ -2509,7 +2427,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     let attempt = record.attempt.max(1);
     let waiting = latest_waiting_event_id(&events_before_send, id, attempt).unwrap_or_default();
     record_answered_wait(&project, id, attempt, &waiting)?;
-    let after_seal = crate::round::latest_done_event(&events_before_send, id, attempt)
+    let after_seal = crate::events::latest_done_event(&events_before_send, id, attempt)
         .map(|event| event.id.clone())
         .unwrap_or_default();
     thread::update(&project, id, |thread| {
@@ -2586,7 +2504,7 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         )));
     }
     let attempt = record.attempt.max(1);
-    if crate::round::sealed_events(&project)?
+    if crate::events::checked(&project)?
         .iter()
         .any(|event| event.thread == id && event.attempt == attempt && event.payload.done.is_some())
     {
@@ -2648,7 +2566,6 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         op: event_id.clone(),
         thread: id.to_string(),
         attempt,
-        round: None,
         recipient: crate::contracts::Recipient {
             pane: coordinator.pane_id.clone(),
             coordinator_attempt: coordinator.attempt(),
@@ -2656,6 +2573,7 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
         created: project::now(),
         payload: crate::contracts::EventPayload {
             done: Some(crate::contracts::DonePayload {
+                has_changes: None,
                 sha: sha.clone().unwrap_or_default(),
                 report_path: crate::events::artifact_path(&project, &artifact)
                     .to_string_lossy()
@@ -2803,13 +2721,13 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
     let events = crate::events::list(&project);
     if follow_up_pending_for_seal(
         &record,
-        crate::round::latest_done_event(&events, id, record.attempt.max(1)),
+        crate::events::latest_done_event(&events, id, record.attempt.max(1)),
     ) {
         bail!(
             "follow_up_pending: {id} must finish the queued follow-up and seal again before resolution"
         );
     }
-    crate::round::require_resolvable(&project, id)?;
+    crate::review::require_resolvable(&project, id)?;
 
     let removable = removable_folder(&project, &record);
     let already_removed = removable && !worktree_exists(ctx, &project, &record)?;
@@ -2897,25 +2815,11 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         t.resolved_reason = "manual".into();
         t.prompt_pending = false;
     })?;
-    let fix_cleanup_failed = if !resolved.repo.is_empty() && resolved.role != "reviewer" {
-        match crate::branches::release_review_fixes(ctx, &project, &resolved.repo, id, None) {
-            Ok(()) => false,
-            Err(error) => {
-                eprintln!("note: reviewer fix cleanup pending for {id}: {error:#}");
-                true
-            }
-        }
-    } else {
-        false
-    };
     thread::update(&project, id, |t| {
-        t.cleanup_pending = fix_cleanup_failed
-            || removal_refusal
-                .as_ref()
-                .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
-        t.cleanup_reason = if fix_cleanup_failed {
-            "reviewer fix".into()
-        } else if t.cleanup_pending {
+        t.cleanup_pending = removal_refusal
+            .as_ref()
+            .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
+        t.cleanup_reason = if t.cleanup_pending {
             "linked files".into()
         } else {
             String::new()
@@ -2954,7 +2858,6 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             || removal_refusal
                 .as_ref()
                 .is_some_and(|r| r.starts_with("linked_files_not_kept:"))
-            || fix_cleanup_failed
         {
             "cleanup_pending"
         } else {
@@ -3182,7 +3085,7 @@ pub(crate) fn fail_start(
             t.launch = selected;
             // This transition is still evidence about the attempt that just
             // launched. Placement resets the counter for the next attempt.
-            t.escalation_pending = true;
+            t.recovery_pending = true;
         }
         t.last_group = Group::WaitingOnYou.token().to_string();
     })?;
@@ -3207,7 +3110,7 @@ pub(crate) fn parkable(project: &Project, record: &Thread) -> bool {
         return false;
     }
     let events = crate::events::list(project);
-    let Some(done) = crate::round::latest_done_event(&events, &record.id, record.attempt.max(1))
+    let Some(done) = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
     else {
         return false;
     };
@@ -3454,7 +3357,7 @@ fn park_one(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if record.parked || !parkable(project, record) {
         return Ok(());
     }
-    let Some(done) = crate::round::latest_done_event(
+    let Some(done) = crate::events::latest_done_event(
         &crate::events::list(project),
         &record.id,
         record.attempt.max(1),
@@ -3472,15 +3375,12 @@ fn park_one(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
                     | crate::contracts::DeliveryState::Handled
             )
         });
-    let adopted = crate::round::list(project).iter().any(|round| {
-        round.manifest.members.iter().any(|member| {
-            member.thread == record.id
-                && member.pin.as_ref().is_some_and(|pin| pin.event == done.id)
-        }) || round.reviewer.as_deref() == Some(&record.id)
-            && round
-                .verdict
-                .as_ref()
-                .is_some_and(|pin| pin.event == done.id)
+    let adopted = crate::review::list(project)?.iter().any(|review| {
+        review
+            .members
+            .iter()
+            .any(|m| m.thread == record.id && m.event == done.id)
+            || review.reviewer.as_deref() == Some(&record.id) && review.verdict_event == done.id
     });
     if !delivered && !adopted {
         return Ok(());
@@ -4035,25 +3935,20 @@ pub(crate) fn finished_worktree_reason_with_merged(
             )
         }));
     }
-    for round in crate::round::checked_list(project)? {
-        let member = round
-            .manifest
-            .members
-            .iter()
-            .any(|member| member.thread == record.id);
-        if member && round.phase.closed() {
-            return Ok(None);
-        }
-        if round.reviewer.as_deref() == Some(record.id.as_str())
-            && (round.verdict.is_some() || round.phase.closed())
-        {
-            return Ok(None);
-        }
+    if !record.merged_sha.is_empty() || crate::review::lane_review(project, record)?.is_some() {
+        return Ok(None);
+    }
+    if record.role == "reviewer"
+        && crate::review::list(project)?.iter().any(|r| {
+            r.reviewer.as_deref() == Some(&record.id) && (r.phase.closed() || r.fast_forward)
+        })
+    {
+        return Ok(None);
     }
 
     if record.branch.is_empty() {
         return Ok(Some(
-            "work_not_done: no lane branch is recorded and no closed round contains the thread"
+            "work_not_done: no lane branch is recorded and no landed review contains the thread"
                 .into(),
         ));
     }
@@ -4067,7 +3962,7 @@ pub(crate) fn finished_worktree_reason_with_merged(
     }
     let Some(lane_head) = crate::git::branch_head(ctx.runner, &record.repo, &record.branch)? else {
         return Ok(Some(format!(
-            "work_not_done: branch `{}` is missing and no closed round contains the thread",
+            "work_not_done: branch `{}` is missing and no landed review contains the thread",
             record.branch
         )));
     };
@@ -4078,7 +3973,7 @@ pub(crate) fn finished_worktree_reason_with_merged(
         Ok(None)
     } else {
         Ok(Some(format!(
-            "work_not_done: branch `{}` is not on integration branch `{integration}` and no closed round contains the thread",
+            "work_not_done: branch `{}` is not on integration branch `{integration}` and no landed review contains the thread",
             record.branch
         )))
     }
@@ -4086,7 +3981,7 @@ pub(crate) fn finished_worktree_reason_with_merged(
 
 pub(crate) fn report_artifact_stored(project: &Project, record: &Thread) -> Result<bool> {
     let attempt = record.attempt.max(1);
-    for event in crate::round::sealed_events(project)?
+    for event in crate::events::checked(project)?
         .into_iter()
         .filter(|event| event.thread == record.id && event.attempt == attempt)
     {
@@ -4531,6 +4426,52 @@ fn removal_in_use_gate(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
     Ok(())
 }
 
+/// Reparent only verified live lanes when the coordinator binding changes.
+pub(crate) fn relink_binding(ctx: &Ctx, project: &Project, pane: &str) -> Result<()> {
+    let view = require_session(ctx, project)?;
+    let mut observed = std::collections::BTreeMap::new();
+    for lane in thread::list(project) {
+        // The ordinary lineage pass below repairs local lanes using the same
+        // observation; this binding pass handles box lanes only.
+        if !lane.is_remote()
+            || lane.status == Status::Resolved
+            || lane.parked
+            || lane.pane_id.is_empty()
+        {
+            continue;
+        }
+        let machine = lane.machine_route().to_string();
+        if !observed.contains_key(&machine) {
+            let herdr = view.herdr.on_machine(&machine);
+            let agents = herdr.agent_list().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let panes = herdr.pane_list().map_err(|e| anyhow::anyhow!("{e}"))?;
+            observed.insert(machine.clone(), (agents, panes));
+        }
+        let (agents, panes) = &observed[&machine];
+        let Some(agent) = agents.iter().find(|a| thread::agent_matches(&lane, a)) else {
+            continue;
+        };
+        if !panes.iter().any(|p| thread::pane_matches(&lane, p)) {
+            continue;
+        }
+        let herdr = view.herdr.on_machine(&machine);
+        let live = herdr
+            .pane_process_info(&lane.pane_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .identities();
+        if !thread::identity_verifies(&lane, agent, &live) {
+            continue;
+        }
+        let parent = parent_token(&lane, pane);
+        if agent.parent() != Some(parent.as_str()) {
+            herdr
+                .pane_set_parent(&lane.pane_id, &parent)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Lineage repair (SPEC-ADE D3); lineage is local.
 pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
     let coordinator = match project.coordinator() {
@@ -4564,26 +4505,6 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The rounds that currently carry `thread`. The durable manifest is the
-/// authority, never branch names or commits; an abandoned round releases all
-/// of its members (SPEC-talk §6.5).
-pub fn carrying_rounds(project: &Project, thread: &str) -> Vec<String> {
-    crate::round::list(project)
-        .into_iter()
-        .filter(|round| round.carries(thread))
-        .map(|round| round.round)
-        .collect()
-}
-
-/// True when the round's merge reached the checkpointed phase: its required
-/// work landed (SPEC-talk §6.5).
-pub fn round_landed(project: &Project, round: &str) -> bool {
-    crate::round::read_merge(project, round)
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.phase == crate::contracts::MergePhase::Checkpointed)
 }
 
 /// A thread with its live state and group, for `thread list`, `thread show`
@@ -4825,25 +4746,25 @@ mod tests {
     }
 
     #[test]
-    fn failed_reviewer_placement_waits_for_round_retry_instead_of_ticker_escalation() {
+    fn failed_reviewer_placement_waits_for_review_retry_instead_of_ticker_recovery() {
         let world = crate::scenarios::World::new();
         let project = crate::project::create(&world.root, "demo", "", vec![]).unwrap();
         let reviewer = thread::allocate(&project, |t| {
             t.role = "reviewer".into();
             t.status = Status::Failed;
-            t.escalation_pending = true;
+            t.recovery_pending = true;
             t.launch_attempts = 0;
         })
         .unwrap();
-        let error = place_prelaunch_escalation(&world.ctx(), &project, &reviewer).unwrap_err();
+        let error = place_prelaunch_recovery(&world.ctx(), &project, &reviewer).unwrap_err();
         assert!(error.to_string().contains("not reachable"), "{error:#}");
         let failed = thread::load(&project, &reviewer.id).unwrap();
         assert_eq!(failed.launch_attempts, 0);
         assert_eq!(failed.status, Status::Failed);
-        assert!(!failed.escalation_pending);
+        assert!(!failed.recovery_pending);
         assert!(failed.error.contains("not reachable"));
         // The next ticker pass cannot place this reviewer ahead of its clock.
-        crate::escalation::tick(&world.ctx(), &project).unwrap();
+        crate::recovery::tick(&world.ctx(), &project).unwrap();
         assert_eq!(
             thread::load(&project, &reviewer.id)
                 .unwrap()
@@ -4889,11 +4810,11 @@ mod tests {
             op: format!("{}-1-1", completed.id),
             thread: completed.id.clone(),
             attempt: 1,
-            round: None,
             recipient: crate::contracts::Recipient::default(),
             created: project::now(),
             payload: crate::contracts::EventPayload {
                 done: Some(crate::contracts::DonePayload {
+                    has_changes: None,
                     sha: String::new(),
                     report_path: "stored".into(),
                     artifact: "hash".into(),
@@ -5257,7 +5178,7 @@ mod tests {
                 recipe: None,
                 recipe_basis: None,
                 task_id: String::new(),
-                review_round: String::new(),
+                review_id: String::new(),
             },
         )
         .unwrap();
@@ -5376,7 +5297,7 @@ mod tests {
                 recipe_basis: None,
                 // The CLI maps `--job` to this stable task id.
                 task_id: stable_task.id.clone(),
-                review_round: String::new(),
+                review_id: String::new(),
             },
         )
         .unwrap();
@@ -5497,7 +5418,7 @@ mod tests {
         assert_eq!(retried.attempt, 2);
         assert_eq!(retried.launch.kind, kind);
         assert_eq!(retried.launch.attempt, 2);
-        assert_eq!(retried.launch.escalations, 0);
+        assert_eq!(retried.launch.work_retries, 0);
         assert_eq!(retried.launch.same_recipe_retries, 1);
         assert_eq!(retried.launch.brief_hash, started.launch.brief_hash);
         assert!(retried.placement_reason.contains("retry on `local`"));
@@ -5576,7 +5497,7 @@ mod tests {
             recipe: None,
             recipe_basis: None,
             task_id: String::new(),
-            review_round: String::new(),
+            review_id: String::new(),
         };
 
         let other = world.home.path().join("other");
@@ -5621,7 +5542,7 @@ mod tests {
                 recipe: None,
                 recipe_basis: None,
                 task_id: String::new(),
-                review_round: String::new(),
+                review_id: String::new(),
             },
         )
         .unwrap_err()
@@ -5700,8 +5621,8 @@ mod tests {
     /// A fixture whose project lists its repository with a box clone and a
     /// local bare remote the lane branch can publish to, so a box start needs
     /// no network.
-    fn box_fixture() -> (crate::round::testkit::Fx, String) {
-        let fx = crate::round::testkit::fixture();
+    fn box_fixture() -> (crate::testkit::Fx, String) {
+        let fx = crate::testkit::fixture();
         let remote = fx.world.home.path().join("remote.git");
         let status = std::process::Command::new("git")
             .args(["init", "--bare", "-q", &remote.to_string_lossy()])
@@ -5709,7 +5630,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let remote = remote.to_string_lossy().into_owned();
-        crate::round::testkit::git(&fx.repo, &["remote", "add", "box", &remote]);
+        crate::testkit::git(&fx.repo, &["remote", "add", "box", &remote]);
         let (mut settings, body) = fx.project.read_project_md().unwrap();
         settings.repos = vec![crate::project::Repo {
             path: fx.repo.to_string_lossy().into_owned(),
@@ -5722,14 +5643,14 @@ mod tests {
         (fx, remote)
     }
 
-    fn write_config(fx: &crate::round::testkit::Fx, text: &str) {
+    fn write_config(fx: &crate::testkit::Fx, text: &str) {
         let cfg = fx.world.home.path().join("cfg");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(cfg.join("config.toml"), text).unwrap();
     }
 
     /// The profile, provisioning and create fakes a box start needs.
-    fn stub_box(fx: &crate::round::testkit::Fx) {
+    fn stub_box(fx: &crate::testkit::Fx) {
         use crate::runner::fake::ok;
         fx.world.runner.on(
             "machine list --json",
@@ -5803,7 +5724,7 @@ mod tests {
             recipe: None,
             recipe_basis: None,
             task_id: String::new(),
-            review_round: String::new(),
+            review_id: String::new(),
         }
     }
 
@@ -5860,11 +5781,11 @@ mod tests {
         );
         local_args.base = Some("main".into());
         let local = start(&fx.world.ctx(), "demo", local_args).unwrap();
-        crate::round::testkit::git(
+        crate::testkit::git(
             &fx.repo,
             &["worktree", "remove", "--force", &local.worktree_path],
         );
-        crate::round::testkit::git(&fx.repo, &["branch", "-D", &local.branch]);
+        crate::testkit::git(&fx.repo, &["branch", "-D", &local.branch]);
         thread::update(&fx.project, &local.id, |t| {
             t.pane_id.clear();
             t.tab_id.clear();
@@ -6309,7 +6230,7 @@ mod tests {
 
     #[test]
     fn cancel_and_resolve_record_an_already_gone_local_worktree_as_removed() {
-        use crate::round::testkit::{fixture, git};
+        use crate::testkit::{fixture, git};
 
         let fx = fixture();
         let repo = fx.repo.to_string_lossy().into_owned();
@@ -6355,53 +6276,10 @@ mod tests {
     }
 
     #[test]
-    fn correction_barrier_reaches_box_before_prompt_delivery() {
-        use crate::contracts::{RoundPhase, RoundRecord};
-        use crate::runner::fake::ok;
-
-        let fx = crate::round::testkit::fixture();
-        let record = thread::allocate(&fx.project, |t| {
-            t.machine = "box".into();
-            t.machine_id = "box-id".into();
-        })
-        .unwrap();
-        let round = RoundRecord {
-            round: "r54".into(),
-            phase: RoundPhase::UnderReview,
-            reviewer: Some(record.id.clone()),
-            reviewer_awaiting_report_after: Some(format!("{}-1-1", record.id)),
-            ..RoundRecord::default()
-        };
-        std::fs::create_dir_all(crate::round::rounds_dir(&fx.project)).unwrap();
-        std::fs::write(
-            crate::round::round_path(&fx.project, "r54"),
-            toml::to_string(&round).unwrap(),
-        )
-        .unwrap();
-        fx.world.runner.on(
-            "machine list --json",
-            ok(r#"[{"id":"box-id","label":"box","target":"box","session":"default","enabled":true}]"#),
-        );
-        fx.world
-            .runner
-            .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
-        sync_box_corrections(&fx.world.ctx(), &fx.project, &record).unwrap();
-        let calls = fx.world.runner.calls.borrow();
-        let sent = calls.iter().find(|cmd| cmd.program == "ssh").unwrap();
-        assert!(sent.args.last().unwrap().contains(".state/corrections"));
-        assert!(
-            sent.stdin
-                .as_ref()
-                .unwrap()
-                .contains(&format!("{}-1-1", record.id))
-        );
-    }
-
-    #[test]
     fn a_gone_box_worktree_is_removed_only_after_the_box_prunes_it() {
         use crate::runner::fake::ok;
 
-        let fx = crate::round::testkit::fixture();
+        let fx = crate::testkit::fixture();
         let (mut settings, body) = fx.project.read_project_md().unwrap();
         settings.repos[0].box_path = Some("/box/repo".into());
         settings.repos[0].publish_url = Some("https://example.invalid/repo.git".into());
@@ -6659,229 +6537,5 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("machine_held"), "{error}");
-    }
-
-    #[test]
-    fn a_box_reviewer_can_publish_its_verdict_and_seal_without_a_manual_coordinator_push() {
-        use crate::contracts::{OpKind, Recipient, Requested};
-        use crate::ops;
-        use crate::round::testkit::git;
-
-        let (fx, remote) = box_fixture();
-        write_config(
-            &fx,
-            &format!(
-                "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the careful checker\"\n[dispatch]\nmachine = \"buildbox\"\n{NATIVE_BOX}"
-            ),
-        );
-        stub_box(&fx);
-        let ctx = fx.world.ctx();
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some("The first round lands the shared types.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        for (id, sha) in [fx.lane(1), fx.lane(2)] {
-            crate::round::admit(&ctx, "demo", "r1", &id).unwrap();
-            fx.seal_done(&id, 1, 1, &sha, &format!("# report {id}\n"));
-        }
-        crate::round::advance(&ctx, "demo").unwrap();
-        let record = crate::round::load(&fx.project, "r1").unwrap();
-        let reviewer = record.reviewer.clone().expect("reviewer bound");
-        let started = thread::load(&fx.project, &reviewer).unwrap();
-        assert_eq!(started.role, "reviewer");
-        assert_eq!(started.machine, "buildbox");
-        assert_eq!(started.machine_id, "buildbox-id");
-        let box_root = fx.world.home.path().join("review box root");
-        let box_project = project::create(&box_root, "demo", "", vec![]).unwrap();
-        let mac_show = crate::round::show(&ctx, "demo", "r1").unwrap();
-        let mut sources = vec![(
-            "/rounds/r1.toml".to_string(),
-            crate::round::round_path(&fx.project, "r1"),
-        )];
-        let mut hashes = vec![record.review_artifact.clone().unwrap()];
-        hashes.extend(
-            record
-                .manifest
-                .members
-                .iter()
-                .map(|m| m.pin.as_ref().unwrap().artifact.clone()),
-        );
-        for hash in hashes {
-            sources.push((
-                format!("/artifacts/{hash}"),
-                crate::events::artifact_path(&fx.project, &hash),
-            ));
-        }
-        for (suffix, source) in sources {
-            let expected = std::fs::read_to_string(source).unwrap();
-            let transfers: Vec<_> = fx
-                .world
-                .runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|call| {
-                    call.program == "ssh"
-                        && call.display().contains("runtime_file_hash_mismatch")
-                        && call.display().contains(&format!("/demo/.state{suffix}"))
-                })
-                .map(|call| call.stdin.clone().unwrap())
-                .collect();
-            assert_eq!(
-                transfers.len(),
-                1,
-                "missing or duplicate box source: {suffix}"
-            );
-            if suffix.starts_with("/artifacts/") {
-                assert_eq!(transfers[0], expected);
-            } // Binding the reviewer adds its id to the Mac manifest after transfer.
-            let dest = box_project.state_dir().join(suffix.trim_start_matches('/'));
-            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-            std::fs::write(&dest, &transfers[0]).unwrap();
-            if suffix.starts_with("/artifacts/") {
-                assert_eq!(
-                    thread::sha256_hex(&std::fs::read(&dest).unwrap()),
-                    suffix.trim_start_matches("/artifacts/")
-                );
-            }
-        }
-        assert!(
-            crate::round::show(
-                &crate::paths::Ctx {
-                    root: box_root,
-                    env: ctx.env,
-                    config_dir: ctx.config_dir.clone(),
-                    runner: ctx.runner,
-                    detached_ticker: false
-                },
-                "demo",
-                "r1"
-            )
-            .unwrap()
-            .contains(&format!(
-                "manifest hash: {}",
-                crate::round::manifest_hash(&record)
-            ))
-        );
-        assert!(mac_show.contains(&format!(
-            "manifest hash: {}",
-            crate::round::manifest_hash(&record)
-        )));
-        let frozen =
-            String::from_utf8(thread::artifact(&fx.project, &started.launch.brief_hash).unwrap())
-                .unwrap();
-        assert!(frozen.contains("/home/agent/.herdr-ade/demo/.state/artifacts/"));
-        assert!(!frozen.contains(&fx.project.state_dir().to_string_lossy().to_string()));
-
-        // advance already publishes the starting commit, before V exists.
-        ops::check_published_ref(
-            ctx.runner,
-            &fx.repo,
-            &started.branch,
-            &remote,
-            &started.base,
-        )
-        .unwrap();
-        let skill = crate::lane::skill_text(&started.role);
-        assert!(skill.contains("`ha done` publishes C on your own reviewer branch"));
-        let brief = String::from_utf8(
-            thread::artifact(&fx.project, record.review_artifact.as_deref().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert!(brief.contains("Follow the reviewer skill's Done instructions"));
-
-        // A separate clone stands in for the box; only herdr/ssh are faked.
-        let box_repo = fx.world.home.path().join("box reviewer's clone");
-        git(
-            &fx.repo,
-            &[
-                "clone",
-                "-q",
-                "-b",
-                &started.branch,
-                &remote,
-                box_repo.to_str().unwrap(),
-            ],
-        );
-        git(&box_repo, &["config", "user.name", "Reviewer"]);
-        git(&box_repo, &["config", "user.email", "reviewer@example.com"]);
-        git(&box_repo, &["config", "commit.gpgsign", "false"]);
-        for member in &record.manifest.members {
-            let sha = &member.pin.as_ref().unwrap().sha;
-            git(&box_repo, &["fetch", "-q", fx.repo.to_str().unwrap(), sha]);
-            git(&box_repo, &["merge", "--no-edit", sha]);
-        }
-        let candidate = git(&box_repo, &["rev-parse", "HEAD"]);
-        let report = format!(".herdr-project/demo-{}/report.md", started.id);
-        std::fs::write(box_repo.join(".git/info/exclude"), ".herdr-project/\n").unwrap();
-        std::fs::create_dir_all(box_repo.join(&report).parent().unwrap()).unwrap();
-        std::fs::write(
-            box_repo.join(&report),
-            format!(
-                "+++\nverdict = \"MERGE\"\nround = \"r1\"\ncandidate = \"{candidate}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll lanes checked.\n",
-                record.manifest_hash.as_deref().unwrap(),
-                record.policy_hash,
-            ),
-        )
-        .unwrap();
-        assert_ne!(started.base, candidate);
-        let error =
-            ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &candidate)
-                .unwrap_err()
-                .to_string();
-        assert!(error.starts_with("published_ref_mismatch:"), "{error}");
-        let box_root = fx.world.home.path().join("box-root");
-        let box_project = project::create(&box_root, "demo", "", vec![]).unwrap();
-        let op = ops::reserve(
-            &box_project,
-            ops::Reservation {
-                thread: &started.id,
-                attempt: started.attempt,
-                kind: OpKind::Done,
-                recipient: Recipient {
-                    pane: "w1:p1".into(),
-                    coordinator_attempt: 1,
-                },
-                round: None,
-                requested: Requested::Done {
-                    sha: candidate.clone(),
-                    report_path: report.clone(),
-                },
-                helper_pid: std::process::id(),
-            },
-        )
-        .unwrap();
-        ops::stage_box_done(
-            &box_project,
-            &op.op,
-            &box_repo,
-            ctx.runner,
-            &crate::contracts::LaneCard {
-                thread: started.id.clone(),
-                attempt: started.attempt,
-                branch: started.branch.clone(),
-                publish_url: remote.clone(),
-                recipient: op.recipient.clone(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        ops::check_published_ref(ctx.runner, &box_repo, &started.branch, &remote, &candidate)
-            .unwrap();
-        assert_eq!(git(&fx.repo, &["rev-parse", &started.branch]), started.base);
-        assert_eq!(
-            git(&fx.repo, &["ls-remote", &remote, "refs/heads/main"]),
-            ""
-        );
-        let event = ops::seal(&box_project, &op.op, |_| Ok(())).unwrap();
-        assert_eq!(event.payload.done.unwrap().sha, candidate);
-        assert_eq!(crate::events::list(&box_project).len(), 1);
     }
 }

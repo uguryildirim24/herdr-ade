@@ -13,7 +13,6 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::MergePhase;
 use crate::herdr::Herdr;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
@@ -172,46 +171,14 @@ fn agent_states(ctx: &Ctx, project: &Project) -> Option<BTreeMap<String, String>
     )
 }
 
-/// `ade_stage`: the newest round's phase, with its birth sentence if it
-/// fits. Also the stage line of `ha overview`.
+/// `ade_stage`: the current pile review. Also the stage line of `ha overview`.
 pub(crate) fn stage(project: &Project) -> String {
-    match crate::round::latest(project).as_ref() {
-        None => "no round is open yet".to_string(),
-        Some(r) => {
-            let n = crate::round::round_number(&r.round);
-            let merge = r.merge.clone();
-            let members = r.manifest.members.len();
-            let done = r
-                .manifest
-                .members
-                .iter()
-                .filter(|m| m.pin.is_some())
-                .count();
-            let phase = match merge.map(|m| m.phase) {
-                Some(MergePhase::Checkpointed) => format!("round {n} has landed"),
-                Some(MergePhase::MergeDiverged) => format!("round {n} stopped and needs a look"),
-                Some(_) => format!("round {n} is being merged"),
-                None if r.phase == crate::contracts::RoundPhase::Abandoned => {
-                    format!("round {n} was abandoned")
-                }
-                None if r.expected_head.is_some() => format!("round {n} is in review"),
-                None if members == 0 => format!("round {n} is open with no lanes yet"),
-                None if done == members => format!("round {n} has all {members} lanes done"),
-                None => format!("round {n} has {} lanes working", members - done),
-            };
-            let with = format!("{phase}. {}", r.plain);
-            if with.chars().count() <= MAX_VALUE_CHARS && check_value(project, &with).is_ok() {
-                with
-            } else {
-                phase
-            }
-        }
-    }
+    crate::review::summary(project)
 }
 
 /// The five templated values, before the check.
 pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
-    let events = crate::round::sealed_events(project).unwrap_or_default();
+    let events = crate::events::checked(project).unwrap_or_default();
     let mut out = Vec::new();
 
     out.push((
@@ -235,7 +202,7 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
             continue;
         }
         let attempt = t.attempt.max(1);
-        match crate::round::latest_event(&events, &t.id, attempt) {
+        match crate::events::latest_event(&events, &t.id, attempt) {
             Some(e) if e.payload.done.is_some() => done += 1,
             Some(e) if e.payload.waiting.is_some() => waiting += 1,
             _ => {
@@ -342,7 +309,7 @@ type InputStamp = Vec<Option<(u64, SystemTime)>>;
 
 fn input_stamp(project: &Project) -> InputStamp {
     let state = project.state_dir();
-    let mut paths: Vec<_> = ["threads", "rounds", "events", "tasks", "asks", "history"]
+    let mut paths: Vec<_> = ["threads", "reviews", "events", "tasks", "asks", "history"]
         .iter()
         .map(|name| state.join(name))
         .collect();
@@ -507,7 +474,6 @@ mod tests {
             op: "t-0001-1-1".into(),
             thread: "t-0001".into(),
             attempt: 1,
-            round: None,
             recipient: Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
@@ -515,6 +481,7 @@ mod tests {
             created: "2026-09-19T00:00:00Z".into(),
             payload: EventPayload {
                 done: Some(DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     report_path: ".reports/t-0001.md".into(),
                     artifact: "def".into(),

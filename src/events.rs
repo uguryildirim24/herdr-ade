@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::contracts::{DeliveryLine, DeliveryState, Event, EventPayload};
 use crate::project::{self, Project};
 
-fn events_dir(project: &Project) -> PathBuf {
+pub(crate) fn dir(project: &Project) -> PathBuf {
     project.record_dir("events")
 }
 
@@ -23,7 +23,7 @@ fn deliveries_dir(project: &Project) -> PathBuf {
 
 pub(crate) fn event_path(project: &Project, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
-    Ok(events_dir(project).join(format!("{id}.toml")))
+    Ok(dir(project).join(format!("{id}.toml")))
 }
 
 fn journal_path(project: &Project, id: &str) -> Result<PathBuf> {
@@ -315,7 +315,7 @@ pub(crate) fn seal_create_if_absent(project: &Project, event: &Event) -> Result<
     let expected = bytes(event)?;
     // Written whole beside the target, then linked into place: a reader never
     // sees a half-written event (the dot name is skipped by every lister).
-    let tmp = events_dir(project).join(format!(".{}.{}.tmp", event.id, std::process::id()));
+    let tmp = dir(project).join(format!(".{}.{}.tmp", event.id, std::process::id()));
     {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(&expected)?;
@@ -438,7 +438,7 @@ pub(crate) fn count_event_reads(f: impl FnOnce()) -> usize {
 /// Load the event ledger once, retaining the unreadable-evidence signal used
 /// by task projections. Missing event directories represent an empty ledger.
 pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
-    let entries = match std::fs::read_dir(events_dir(project)) {
+    let entries = match std::fs::read_dir(dir(project)) {
         Ok(entries) => entries,
         Err(error) => return (Vec::new(), error.kind() == std::io::ErrorKind::NotFound),
     };
@@ -564,6 +564,38 @@ fn sync_parent(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn latest_event<'e>(
+    events: &'e [Event],
+    thread: &str,
+    attempt: u32,
+) -> Option<&'e Event> {
+    events
+        .iter()
+        .filter(|e| e.thread == thread && e.attempt == attempt)
+        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
+}
+
+/// The seal before a follow-up may be followed by a waiting event. Keep
+/// tracking that completion until a newer completion replaces it.
+pub(crate) fn latest_done_event<'e>(
+    events: &'e [Event],
+    thread: &str,
+    attempt: u32,
+) -> Option<&'e Event> {
+    events
+        .iter()
+        .filter(|e| e.thread == thread && e.attempt == attempt && e.payload.done.is_some())
+        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
+}
+
+pub(crate) fn checked(project: &Project) -> Result<Vec<Event>> {
+    let (events, readable) = list_checked(project);
+    if !readable {
+        bail!("event records are unreadable");
+    }
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,7 +610,6 @@ mod tests {
             op: "t-0001-1-1".into(),
             thread: "t-0001".into(),
             attempt: 1,
-            round: None,
             recipient: Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
@@ -586,6 +617,7 @@ mod tests {
             created: "2026-09-18T00:00:00Z".into(),
             payload: EventPayload {
                 done: Some(DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     report_path: ".reports/lane.md".into(),
                     artifact: "def".into(),
@@ -619,7 +651,6 @@ mod tests {
             op: "t-0001-1-1".into(),
             thread: "t-0001".into(),
             attempt: 1,
-            round: None,
             recipient: Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
@@ -627,6 +658,7 @@ mod tests {
             created: "2026-09-19T00:00:00Z".into(),
             payload: EventPayload {
                 done: Some(DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     report_path: ".reports/t-0001.md".into(),
                     artifact: artifact.into(),

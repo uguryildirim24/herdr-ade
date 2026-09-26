@@ -962,7 +962,7 @@ fn report_with_checks(
                         }
                         for pattern in gate.paths.iter().flatten() {
                             let result = crate::gate_paths::validate(pattern).and_then(|()| {
-                                let files = crate::round::repo::Git::new(runner, &repo.path)
+                                let files = crate::repo::Git::new(runner, &repo.path)
                                     .run(&["ls-files", "-z", "--"])?;
                                 Ok(files
                                     .split('\0')
@@ -1567,7 +1567,7 @@ fn finished_worktrees_impl(
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let (candidates, mut errors) = finished_worktree_candidates(ctx, remote);
     // Check existence on the box before any completion probe. A merged
-    // round can retain a resolved member long after its checkout is removed.
+    // review can retain a resolved member long after its checkout is removed.
     // The shell always exits zero after printing each yes/no answer, so a
     // healthy "gone" result cannot enter the command-failure ledger and a
     // transport failure remains distinguishable from a negative answer.
@@ -1629,35 +1629,38 @@ fn finished_worktrees_impl(
     } else {
         BTreeMap::new()
     };
-    // A checked round inventory is per project, not per checkout. The old
-    // path re-read every round (including its manifest) for each candidate.
-    let mut round_done = BTreeSet::new();
-    let mut round_errors = BTreeMap::new();
+    // A checked review inventory is per project, not per checkout. The old
+    // path re-read every review (including its manifest) for each candidate.
+    let mut review_done = BTreeSet::new();
+    let mut review_errors = BTreeMap::new();
     let projects: BTreeMap<_, _> = candidates
         .iter()
         .map(|(project, _)| (project.slug.clone(), project))
         .collect();
     for (slug, project) in projects {
-        match crate::round::checked_list(project) {
-            Ok(rounds) => {
-                for round in rounds {
-                    if round.phase.closed() {
-                        for member in &round.manifest.members {
-                            round_done.insert((slug.clone(), member.thread.clone()));
+        match crate::review::list(project) {
+            Ok(reviews) => {
+                for review in reviews {
+                    if review.fast_forward {
+                        for member in &review.members {
+                            if !review
+                                .verdict
+                                .as_ref()
+                                .is_some_and(|v| v.without.contains_key(&member.thread))
+                            {
+                                review_done.insert((slug.clone(), member.thread.clone()));
+                            }
                         }
                     }
-                    if (round.verdict.is_some() || round.phase.closed())
-                        && let Some(reviewer) = round.reviewer
+                    if (review.phase.closed() || review.fast_forward)
+                        && let Some(reviewer) = review.reviewer
                     {
-                        round_done.insert((slug.clone(), reviewer));
+                        review_done.insert((slug.clone(), reviewer));
                     }
                 }
             }
             Err(error) => {
-                // A corrupt round record must not be treated as a missing
-                // membership: neither a merged branch nor a size cache is
-                // evidence that this checkout is safe to offer for removal.
-                round_errors.insert(slug, format!("{error:#}"));
+                review_errors.insert(slug, format!("{error:#}"));
             }
         }
     }
@@ -1706,14 +1709,14 @@ fn finished_worktrees_impl(
         if !exists {
             continue;
         }
-        if let Some(error) = round_errors.get(&project.slug) {
+        if let Some(error) = review_errors.get(&project.slug) {
             errors.push(format!(
-                "{}: could not inspect round records: {error}",
+                "{}: could not inspect review records: {error}",
                 thread.id
             ));
             continue;
         }
-        let reason = if round_done.contains(&(project.slug.clone(), thread.id.clone()))
+        let reason = if review_done.contains(&(project.slug.clone(), thread.id.clone()))
             && !crate::threads::managed_git_folder(&project, &thread)
         {
             Ok(None)
@@ -3342,7 +3345,7 @@ recipe = "claude_fable_xhigh"
             })
             .unwrap();
         }
-        // Without round completion evidence the old code probed git in each
+        // Without review completion evidence the old code probed git in each
         // absent worktree before asking the box whether the path existed.
         let fake = FakeRunner::new();
         let snapshot = (1..=2)
@@ -3606,145 +3609,6 @@ recipe = "claude_fable_xhigh"
             check.status == "warning"
                 && check.label == "finished worktrees local"
                 && check.detail.contains("unknown; could not check")
-        }));
-    }
-
-    #[test]
-    fn a_finished_worktree_left_on_disk_fails_the_doctor_row() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join(crate::harness::BOX_WORKER_MARKER),
-            "lane worker\n",
-        )
-        .unwrap();
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let worktree = home.path().join("finished-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let thread = crate::thread::allocate(&project, |thread| {
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.status = crate::thread::Status::Resolved;
-            thread.worktree_path = worktree.to_string_lossy().into_owned();
-            thread.repo = "/repo".into();
-            thread.branch = "lane".into();
-        })
-        .unwrap();
-        let rounds = project.state_dir().join("rounds");
-        std::fs::create_dir_all(&rounds).unwrap();
-        let record = crate::contracts::RoundRecord {
-            phase: crate::contracts::RoundPhase::Abandoned,
-            round: "r1".into(),
-            branch: "main".into(),
-            plain: "The work is closed.".into(),
-            policy_hash: "policy".into(),
-            manifest: crate::contracts::AdmissionManifest {
-                revision: 1,
-                members: vec![crate::contracts::ManifestMember {
-                    thread: thread.id,
-                    pin: None,
-                    awaiting_report_after: None,
-                }],
-            },
-            repo: "/repo".into(),
-            abandoned_reason: Some("not needed".into()),
-            ..crate::contracts::RoundRecord::default()
-        };
-        std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on("status --porcelain --ignored --untracked-files=all", ok(""));
-
-        let (text, healthy, checks) = report_with_checks(
-            &env,
-            &root,
-            &config,
-            &SessionFlags::default(),
-            &runner,
-            None,
-        );
-
-        assert!(!healthy, "{text}");
-        assert!(text.contains("[FAIL] finished worktrees local"), "{text}");
-        assert!(text.contains(worktree.to_string_lossy().as_ref()), "{text}");
-        assert!(checks.iter().any(|check| {
-            check.status == "failed"
-                && check.label == "finished worktrees local"
-                && check.detail.contains(worktree.to_string_lossy().as_ref())
-        }));
-    }
-
-    #[test]
-    fn ignored_data_is_listed_separately_from_finished_worktree_leaks() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join(crate::harness::BOX_WORKER_MARKER),
-            "lane worker\n",
-        )
-        .unwrap();
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let worktree = home.path().join("finished-worktree-with-data");
-        std::fs::create_dir_all(worktree.join("camber-runs")).unwrap();
-        std::fs::write(worktree.join("camber-runs/raw.bin"), vec![0; 2048]).unwrap();
-        let thread = crate::thread::allocate(&project, |thread| {
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.status = crate::thread::Status::Resolved;
-            thread.worktree_path = worktree.to_string_lossy().into_owned();
-            thread.repo = "/repo".into();
-            thread.branch = "lane".into();
-        })
-        .unwrap();
-        let rounds = project.state_dir().join("rounds");
-        std::fs::create_dir_all(&rounds).unwrap();
-        let record = crate::contracts::RoundRecord {
-            phase: crate::contracts::RoundPhase::Abandoned,
-            round: "r1".into(),
-            branch: "main".into(),
-            plain: "The work closed.".into(),
-            policy_hash: "policy".into(),
-            manifest: crate::contracts::AdmissionManifest {
-                revision: 1,
-                members: vec![crate::contracts::ManifestMember {
-                    thread: thread.id,
-                    pin: None,
-                    awaiting_report_after: None,
-                }],
-            },
-            repo: "/repo".into(),
-            abandoned_reason: Some("not needed".into()),
-            ..crate::contracts::RoundRecord::default()
-        };
-        std::fs::write(rounds.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on(
-            "status --porcelain --ignored --untracked-files=all",
-            ok("!! camber-runs/raw.bin\n"),
-        );
-
-        let (text, healthy, checks) = report_with_checks(
-            &env,
-            &root,
-            &config,
-            &SessionFlags::default(),
-            &runner,
-            None,
-        );
-
-        assert!(healthy, "{text}");
-        assert!(text.contains("[warn] worktree data kept local"), "{text}");
-        assert!(
-            text.contains("camber-runs") && text.contains("KiB"),
-            "{text}"
-        );
-        assert!(checks.iter().any(|check| {
-            check.status == "warning"
-                && check.label == "worktree data kept local"
-                && check.detail.contains("camber-runs")
         }));
     }
 

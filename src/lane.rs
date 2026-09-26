@@ -56,7 +56,6 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
             attempt,
             kind: OpKind::Done,
             recipient,
-            round: None,
             requested: Requested::Done {
                 sha: sha.to_string(),
                 report_path: report.to_string(),
@@ -140,7 +139,6 @@ fn seal_message(
                 OpKind::Waiting
             },
             recipient,
-            round: None,
             requested: if failed {
                 Requested::Failed {
                     failure: text,
@@ -399,7 +397,6 @@ pub(crate) fn skill_text(role: &str) -> &'static str {
     match role {
         "coordinator" => include_str!("../skill/COORDINATOR.md"),
         "reviewer" => include_str!("../skill/REVIEWER.md"),
-        "pickup" => include_str!("../skill/PICKUP.md"),
         _ => include_str!("../skill/LANE.md"),
     }
 }
@@ -426,7 +423,6 @@ pub(crate) fn skill(ctx: &Ctx, role: &str) -> Result<()> {
             print!("{}", crate::thread::commands_line(&prefix));
             print!("{}", skill_text(role));
         }
-        "pickup" => print!("{}", skill_text(role)),
         _ => bail!("unknown role `{role}`"),
     }
     print_rules(&ctx.config_dir)

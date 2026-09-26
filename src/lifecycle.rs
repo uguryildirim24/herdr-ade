@@ -558,10 +558,10 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         intent
     };
 
-    let open_rounds: Vec<_> = crate::round::list(&project)
+    let open_reviews: Vec<_> = crate::review::list(&project)?
         .into_iter()
         .filter(|record| !record.phase.closed())
-        .map(|record| record.round)
+        .map(|record| record.id)
         .collect();
 
     if coordinator.is_none()
@@ -610,8 +610,8 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
     for record in &threads {
         println!("stopped lane: {}", record.id);
     }
-    for round in open_rounds {
-        println!("cancelled round: {round}");
+    for review in open_reviews {
+        println!("cancelled review: {review}");
     }
 
     let mut owned_repos = Vec::new();

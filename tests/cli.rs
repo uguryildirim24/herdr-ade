@@ -400,27 +400,6 @@ fn ledger_cli_records_folds_prints_a_task_and_closes() {
 }
 
 #[test]
-fn round_show_without_a_round_lists_and_there_is_no_list_alias() {
-    let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("root");
-    let root_arg = root.to_str().unwrap();
-    assert!(
-        hp(home.path(), &["--root", root_arg, "new", "demo"])
-            .status
-            .success()
-    );
-
-    let shown = hp(home.path(), &["--root", root_arg, "round", "show", "demo"]);
-    assert!(
-        shown.status.success(),
-        "{}",
-        String::from_utf8_lossy(&shown.stderr)
-    );
-    let alias = hp(home.path(), &["--root", root_arg, "round", "list", "demo"]);
-    assert!(!alias.status.success());
-}
-
-#[test]
 fn path_like_names_and_slugs_are_refused() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
@@ -460,7 +439,7 @@ fn every_named_verb_returns_a_structured_refusal() {
     let root = home.path().join("missing-root");
     let root_arg = root.to_str().unwrap();
     let cases: &[&[&str]] = &[
-        &["round", "show", "missing", "r1"],
+        &["review", "missing"],
         &["thread", "show", "missing", "t-1"],
         &["ask"],
         &["plan", "show", "missing"],
