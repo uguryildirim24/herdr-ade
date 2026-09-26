@@ -707,7 +707,7 @@ fn clear_lost_connections(entries: &[(Project, Vec<thread::Thread>)], log: &Log)
     }
 }
 
-/// One courier pass per saved machine that has lanes, once per fourth tick.
+/// One courier pass per saved machine with lanes on each ticker tick.
 /// The cadence lives per machine in `Memory`, not per project, and every
 /// project with lanes on that machine shares the one SSH trip.
 #[cfg(test)]
@@ -1056,6 +1056,121 @@ fn connection_error(screen: &str) -> Option<&'static str> {
     }
 }
 
+/// Close only the delivered follow-ups overtaking this exact seal. An unknown
+/// machine/git observation leaves the seal pending, never presumed unchanged.
+pub(crate) fn restore_unchanged_seal(
+    ctx: &Ctx,
+    project: &Project,
+    lane: &thread::Thread,
+) -> Result<()> {
+    let events = crate::events::list(project);
+    let Some(event) = crate::events::latest_done_event(&events, &lane.id, lane.attempt.max(1))
+    else {
+        return Ok(());
+    };
+    let pending: Vec<_> = lane
+        .follow_ups
+        .iter()
+        .filter(|f| {
+            f.attempt == lane.attempt.max(1)
+                && (matches!(
+                    f.state,
+                    thread::FollowUpState::Queued | thread::FollowUpState::Uncertain
+                ) || f.state == thread::FollowUpState::Delivered && f.after_seal == event.id)
+        })
+        .collect();
+    if pending.is_empty()
+        || pending.iter().any(|f| {
+            f.state != thread::FollowUpState::Delivered
+            // The first idle snapshot can predate prompt delivery. Give the
+            // agent a full observation window before accepting idle again.
+            || thread::seconds_since(&f.delivered_at, jiff::Timestamp::now()) < 30
+        })
+    {
+        return Ok(());
+    }
+    let done = event.payload.done.as_ref().expect("latest done");
+    if done.sha.is_empty() || done.artifact.is_empty() || lane.worktree_path.is_empty() {
+        return Ok(());
+    }
+    let folder = &lane.worktree_path;
+    let report = Path::new(&done.report_path);
+    let report = if report.is_absolute() {
+        report.to_path_buf()
+    } else {
+        Path::new(folder).join(report)
+    };
+    let unchanged = if lane.is_remote() {
+        let profile = crate::remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            lane.machine_route(),
+        )?;
+        let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        let script = crate::remote::with_path(
+            &machine.path,
+            &format!(
+                "cd {} && git rev-parse HEAD && git status --porcelain --untracked-files=all && sha256sum -- {}",
+                crate::remote::quote(folder),
+                crate::remote::quote(&report.to_string_lossy())
+            ),
+        );
+        let output = crate::remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &script,
+            None,
+            Duration::from_secs(20),
+        )?;
+        output.success()
+            && output.stdout.lines().next() == Some(done.sha.as_str())
+            && output
+                .stdout
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.split_whitespace().next() == Some(done.artifact.as_str()))
+            && output.stdout.lines().count() == 2
+    } else {
+        let git = |args: &[&str]| -> Result<String> {
+            let output = ctx.runner.run(
+                &crate::runner::Cmd::new("git", Duration::from_secs(20))
+                    .args(["-C", folder])
+                    .args(args.iter().copied()),
+            )?;
+            if !output.success() {
+                bail!("git seal check: {}", output.error_text());
+            }
+            Ok(output.stdout.trim().to_string())
+        };
+        git(&["rev-parse", "HEAD"])? == done.sha
+            && git(&["status", "--porcelain", "--untracked-files=all"])?.is_empty()
+            && std::fs::read(report).is_ok_and(|bytes| thread::sha256_hex(&bytes) == done.artifact)
+    };
+    if unchanged {
+        thread::update_checked(project, &lane.id, |current| {
+            if current.attempt != lane.attempt {
+                bail!("lane changed during seal check");
+            }
+            if current.review_after == event.id {
+                current.review_after.clear();
+            }
+            for follow_up in &mut current.follow_ups {
+                if follow_up.attempt == lane.attempt.max(1)
+                    && follow_up.state == thread::FollowUpState::Delivered
+                    && follow_up.after_seal == event.id
+                    && thread::seconds_since(&follow_up.delivered_at, jiff::Timestamp::now()) >= 30
+                {
+                    follow_up.state = thread::FollowUpState::Closed;
+                    follow_up.closed_at = project::now();
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
@@ -1117,7 +1232,7 @@ fn thread_pass(
         if state != t.last_state {
             live.state_secs = 0;
         }
-        // A remote thread is polled once a minute, so `blocked` at a poll
+        // A remote thread is polled on each ticker tick, so `blocked` at a poll
         // already counts: there is no finer clock to debounce against.
         if t.is_remote() && state == "blocked" {
             live.state_secs = live.state_secs.max(thread::BLOCKED_DEBOUNCE_SECS);
@@ -1478,6 +1593,17 @@ fn thread_pass(
                     .or(Some(error.context(format!("{}: process recovery", t.id))));
             }
             continue;
+        }
+        // A delivered correction may simply acknowledge the existing seal. Only
+        // restore it after the agent has returned to idle and the sealed git
+        // state and report have been checked on the lane's own machine.
+        if !delivered
+            && state == "idle"
+            && let Err(error) = restore_unchanged_seal(ctx, project, &after)
+        {
+            pass.error = pass
+                .error
+                .or(Some(error.context(format!("{}: seal check", t.id))));
         }
         if t.is_remote() || delivered || state != t.last_state || group.token() != t.last_group {
             thread::update(project, &t.id, |t| {
@@ -2356,7 +2482,6 @@ fn tick_slow_with_steps(
             .err()
             .map(|e| e.context("reviews")),
     );
-
     errors.extend(crate::ask::tick(ctx, project).err());
     errors.extend(crate::threads::park_completed(ctx, project).err());
     stop_after_state!("plan nudge");

@@ -1643,7 +1643,13 @@ fn dispatch_with_start(
                 text_file,
             } => {
                 let text = read_text(&text_file)?;
-                match threads::prompt(&ctx, &slug, &id, &text)? {
+                let outcome = threads::prompt(&ctx, &slug, &id, &text)?;
+                let project = Project::load(&ctx.root, &slug)?;
+                let lane = crate::thread::load(&project, &id)?;
+                let events = crate::events::list(&project);
+                let seal = crate::events::latest_done_event(&events, &id, lane.attempt.max(1))
+                    .filter(|event| crate::threads::follow_up_pending_for_seal(&lane, Some(event)));
+                match outcome {
                     threads::PromptOutcome::Queued { attempt } => {
                         crate::output::set_outcome("queued");
                         crate::output::insert("delivery", "queued");
@@ -1661,6 +1667,13 @@ fn dispatch_with_start(
                         crate::output::insert("agent_state", agent_state.clone());
                         println!("sent to {id} (agent was {agent_state})");
                     }
+                }
+                if let Some(event) = seal {
+                    crate::output::insert("held_seal", event.id.clone());
+                    println!(
+                        "{id} sealed {}; this follow-up holds that seal until the lane is idle again. It's restored if nothing changes; a new commit or report needs a new `ha done`.",
+                        event.id
+                    );
                 }
                 Ok(())
             }
