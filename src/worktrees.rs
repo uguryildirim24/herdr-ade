@@ -99,13 +99,19 @@ fn same_repo(left: &str, right: &str) -> bool {
 /// Global disposable paths plus the paths owned by this project's repository
 /// row or, for a harness repository, its config row.
 pub(crate) fn disposable(config_dir: &Path, project: &Project, repo: &str) -> Result<Vec<String>> {
+    let (settings, _) = project.read_project_md()?;
+    disposable_for_rows(config_dir, repo, &settings.repos)
+}
+
+pub(crate) fn disposable_for_rows(
+    config_dir: &Path,
+    repo: &str,
+    rows: &[crate::project::Repo],
+) -> Result<Vec<String>> {
     let document = crate::config::Document::read(config_dir)?;
     let mut paths = document.section::<WorktreeConfig>("worktrees")?.disposable;
-    let (settings, _) = project.read_project_md()?;
     paths.extend(
-        settings
-            .repos
-            .iter()
+        rows.iter()
             .filter(|row| same_repo(&row.path, repo))
             .flat_map(|row| row.disposable.iter().cloned()),
     );
