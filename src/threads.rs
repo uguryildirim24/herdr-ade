@@ -3024,6 +3024,24 @@ pub(crate) fn fail_start(
     class: crate::contracts::FailureClass,
     recover: bool,
 ) -> Result<Thread> {
+    Ok(
+        fail_start_checked(ctx, project, id, reason, class, recover, None)?
+            .expect("unconditional failed start must update the record"),
+    )
+}
+
+/// A snapshot-driven failure must still belong to the same open attempt when
+/// the transition takes the record lock. Another caller may place a new pane
+/// between a fresh Herdr query and this update.
+pub(crate) fn fail_start_checked(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    reason: &str,
+    class: crate::contracts::FailureClass,
+    recover: bool,
+    expected: Option<&Thread>,
+) -> Result<Option<Thread>> {
     let provider_kind = None;
     let (recovery, recovery_error) = if !recover || thread::load(project, id)?.launch_attempts == 0
     {
@@ -3048,7 +3066,19 @@ pub(crate) fn fail_start(
             Err(error) => (None, Some(format!("WAITING: {error:#}"))),
         }
     };
-    let failed = thread::update(project, id, |t| {
+    let mut matched = false;
+    let failed = thread::update_checked(project, id, |t| {
+        if expected.is_some_and(|old| {
+            t.status != Status::Open
+                || t.attempt != old.attempt
+                || t.pane_id != old.pane_id
+                || t.tab_id != old.tab_id
+                || t.workspace_id != old.workspace_id
+                || !t.report_hash.is_empty()
+        }) {
+            return Ok(());
+        }
+        matched = true;
         t.status = Status::Failed;
         t.prompt_pending = false;
         t.startup_wait_started.clear();
@@ -3065,14 +3095,18 @@ pub(crate) fn fail_start(
             t.recovery_pending = true;
         }
         t.last_group = Group::WaitingOnYou.token().to_string();
+        Ok(())
     })?;
+    if !matched {
+        return Ok(None);
+    }
     if !failed.tab_id.is_empty() {
         let view = session_view(ctx, project)
             .context("failed-start cleanup could not reach the session; the attempt stays bound")?;
         clear_thread_tokens(&view.herdr, &failed);
     }
     close_pane(ctx, project, &failed)?;
-    Ok(failed)
+    Ok(Some(failed))
 }
 
 /// Close the thread's pane and tab. A dedicated lane workspace is closed as
