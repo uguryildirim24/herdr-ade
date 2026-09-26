@@ -3156,6 +3156,18 @@ pub(crate) fn fail_start_checked(
         }
         matched = true;
         t.status = Status::Failed;
+        if recovery.is_none() {
+            let reason = crate::steps::short_error(
+                &recovery_error.clone().unwrap_or_else(|| reason.to_string()),
+            );
+            t.start_notices.push(crate::steps::Notice {
+                line: format!(
+                    "FAILED {id}: {reason} — next: ha thread retry {} {id}",
+                    project.slug
+                ),
+                submitted: false,
+            });
+        }
         t.prompt_pending = false;
         t.startup_wait_started.clear();
         t.provider_wait_started.clear();

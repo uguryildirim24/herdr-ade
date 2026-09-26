@@ -423,6 +423,9 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
     );
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.phase, Phase::Complete);
+    assert_eq!(review.notices.len(), 1);
+    assert!(review.notices[0].line.contains("merged"));
+    assert!(review.notices[0].line.contains("pushed"));
     assert!(review.fast_forward && review.push && review.install && review.close && review.prune);
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
     assert_eq!(git(&remote, &["rev-parse", "main"]), candidate);
@@ -631,6 +634,32 @@ fn exclusion_requires_candidate_without_that_lane_and_new_seal_for_next_pile() {
 }
 
 #[test]
+fn dead_reviewer_needs_coordinator_once_after_retries_end() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let reviewer = review.reviewer.clone().unwrap();
+    thread::update(&fx.project, &reviewer, |t| {
+        t.status = Status::Failed;
+        t.recovery_pending = true;
+        t.error = "process gone".into();
+    })
+    .unwrap();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert!(review.notices.is_empty());
+    thread::update(&fx.project, &reviewer, |t| t.recovery_pending = false).unwrap();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(review.notices.len(), 1);
+    assert!(review.notices[0].line.contains("needs you: reviewer"));
+    assert!(
+        review.notices[0]
+            .line
+            .contains("next: ha review retry demo")
+    );
+}
+
+#[test]
 fn reject_does_not_land_and_cancel_releases_unchanged_members() {
     let fx = configured();
     lane(&fx, 1);
@@ -648,6 +677,8 @@ fn reject_does_not_land_and_cancel_releases_unchanged_members() {
     );
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.phase, Phase::Rejected);
+    assert_eq!(review.notices.len(), 1);
+    assert!(review.notices[0].line.contains("rejected"));
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), base);
     assert!(
         pending(
