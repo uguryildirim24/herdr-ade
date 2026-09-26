@@ -2095,6 +2095,7 @@ mod tests {
                         report_path: "old/location".into(),
                         artifact: hash.clone(),
                         attestation: None,
+                        published_ref: None,
                     }),
                     ..EventPayload::default()
                 },
