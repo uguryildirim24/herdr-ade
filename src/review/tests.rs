@@ -545,6 +545,37 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
 }
 
 #[test]
+fn landing_completes_while_a_merged_member_owes_cleanup() {
+    let fx = configured();
+    let (id, sha) = lane(&fx, 1);
+    let record = thread::load(&fx.project, &id).unwrap();
+    let dir = Path::new(&record.thread_dir);
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::File::create(dir.join("large.bin"))
+        .unwrap()
+        .set_len(201 * 1024 * 1024)
+        .unwrap();
+    fx.seal_done(&id, 1, 2, &sha, "[large](large.bin)\n");
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate,
+        without: BTreeMap::new(),
+        gates: vec![],
+    });
+    review.phase = Phase::Landing;
+    save(&fx.project, &review).unwrap();
+    land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(())).unwrap();
+    assert_eq!(review.phase, Phase::Complete);
+    let lane = thread::load(&fx.project, &id).unwrap();
+    assert_eq!(lane.status, Status::Resolved);
+    assert!(lane.cleanup_pending);
+    assert!(!lane.merged_sha.is_empty());
+}
+
+#[test]
 fn moved_tip_refreshes_same_reviewer_once_then_releases_for_fresh_review() {
     let fx = configured();
     lane(&fx, 1);

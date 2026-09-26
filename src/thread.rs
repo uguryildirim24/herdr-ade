@@ -152,6 +152,9 @@ pub(crate) struct Thread {
     pub(crate) final_report_hash: String,
     #[serde(default)]
     pub(crate) final_report_seal: String,
+    /// Relative report destinations absent when the worktree was retired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) missing_report_links: Vec<String>,
     pub(crate) last_report_change: String,
     /// Incomplete report/library copy, kept with the report it describes.
     pub(crate) copy_notes: Vec<String>,
