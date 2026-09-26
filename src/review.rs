@@ -280,11 +280,61 @@ pub(crate) fn lane_done(
     sealed(events, lane).is_some_and(|e| changes(lane, e) == Some(false))
 }
 fn changes(lane: &Thread, event: &crate::contracts::Event) -> Option<bool> {
-    event.payload.done.as_ref()?.has_changes.or_else(|| {
-        (lane.changes_seal == event.id)
-            .then_some(lane.has_changes)
-            .flatten()
-    })
+    let sealed = event.payload.done.as_ref()?;
+    if lane.changes_seal == event.id {
+        lane.has_changes.or(sealed.has_changes)
+    } else {
+        sealed.has_changes
+    }
+}
+
+/// Carry pre-tree-rule cached classifications forward once per machine. Old
+/// seal events are immutable; the matching thread cache is their correction.
+pub(crate) fn reclassify_old_changes(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
+    let marker = ctx.root.join(".change-reclass-v1.json");
+    if marker.exists() {
+        return Ok(());
+    }
+    for slug in project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        let events = crate::events::checked(&project)?;
+        let (lanes, errors) = thread::list_with_errors(&project);
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
+        }
+        for lane in lanes
+            .into_iter()
+            .filter(|lane| lane.has_changes == Some(true))
+        {
+            let Some(event) = events.iter().find(|event| {
+                event.id == lane.changes_seal
+                    && event.thread == lane.id
+                    && event.payload.done.is_some()
+            }) else {
+                continue;
+            };
+            if lane.base.is_empty() || lane.repo.is_empty() {
+                continue;
+            }
+            let sha = &event.payload.done.as_ref().expect("sealed done").sha;
+            let git = Git::new(ctx.runner, &lane.repo);
+            match git.trees_differ(&lane.base, sha) {
+                Ok(false) => {
+                    thread::update(&project, &lane.id, |record| {
+                        if record.changes_seal == event.id && record.has_changes == Some(true) {
+                            record.has_changes = Some(false);
+                        }
+                    })?;
+                }
+                Ok(true) => {}
+                Err(error) => log(&format!(
+                    "one-time change reclassification: {slug}/{} skipped (objects unavailable locally): {error:#}",
+                    lane.id
+                )),
+            }
+        }
+    }
+    project::write_json(&marker, &true)
 }
 
 /// No git here: used by the ticker to decide whether a review can start.

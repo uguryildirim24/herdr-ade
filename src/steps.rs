@@ -158,9 +158,10 @@ fn pile_member(project: &Project, event: &crate::contracts::Event) -> bool {
     thread::load(project, &event.thread).is_ok_and(|lane| {
         lane.role != "reviewer"
             && !lane.repo.is_empty()
-            && done
-                .has_changes
-                .or(lane.has_changes)
+            && (lane.changes_seal == event.id)
+                .then_some(lane.has_changes)
+                .flatten()
+                .or(done.has_changes)
                 .unwrap_or(done.sha != lane.base)
     })
 }
