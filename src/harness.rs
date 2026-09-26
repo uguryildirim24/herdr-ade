@@ -148,7 +148,6 @@ pub(crate) struct InstallOutcome {
     pub(crate) processes: Vec<ProcessProof>,
     pub(crate) tasks: Vec<TaskInstallProof>,
     pub(crate) coordinator_hooks: Vec<String>,
-    #[serde(skip)]
     pub(crate) warnings: Vec<String>,
 }
 
@@ -534,76 +533,6 @@ pub(crate) fn lock(config_dir: &Path) -> Result<InstallLock> {
     }
 }
 
-/// This process's own binary, fingerprinted before any install starts. Once
-/// `local_install` replaces that file, the running image is still the old one;
-/// this snapshot is the only way to see that the file changed underneath us.
-struct Running {
-    /// The canonical path of the running executable.
-    path: PathBuf,
-    /// The SHA-256 of its bytes as this process started.
-    hash: String,
-}
-
-impl Running {
-    fn capture() -> Result<Running> {
-        let current = std::env::current_exe().context("could not find the running executable")?;
-        let path = match std::fs::canonicalize(&current) {
-            Ok(path) => path,
-            Err(error) => {
-                // Linux appends this suffix when a concurrent build unlinks the
-                // running image. Its inode remains readable via /proc/self/exe.
-                #[cfg(target_os = "linux")]
-                if let Some(path) = current.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-                    PathBuf::from(path)
-                } else {
-                    return Err(error)
-                        .with_context(|| format!("could not resolve {}", current.display()));
-                }
-                #[cfg(not(target_os = "linux"))]
-                return Err(error)
-                    .with_context(|| format!("could not resolve {}", current.display()));
-            }
-        };
-        #[cfg(target_os = "linux")]
-        let image = Path::new("/proc/self/exe");
-        #[cfg(not(target_os = "linux"))]
-        let image = path.as_path();
-        let bytes = std::fs::read(image)
-            .with_context(|| format!("could not fingerprint {}", image.display()))?;
-        Ok(Running {
-            path,
-            hash: crate::thread::sha256_hex(&bytes),
-        })
-    }
-}
-
-fn replaced_self(installed: &Path, running: &Running) -> Result<bool> {
-    let same = std::fs::canonicalize(installed).is_ok_and(|path| path == running.path);
-    if !same {
-        return Ok(false);
-    }
-    let bytes = std::fs::read(installed)
-        .with_context(|| format!("could not read {}", installed.display()))?;
-    Ok(crate::thread::sha256_hex(&bytes) != running.hash)
-}
-
-/// Continue the same invocation in the image it just installed. The install
-/// lock is close-on-exec, so the new image starts the transaction again and
-/// completes it with its own code; no shell retry is involved.
-fn reexec_if_replaced(installed: &Path, running: &Running) -> Result<()> {
-    if !replaced_self(installed, running)? {
-        return Ok(());
-    }
-    use std::os::unix::process::CommandExt;
-    let error = std::process::Command::new(installed)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    bail!(
-        "harness_reexec_failed: could not continue installation in {}: {error}",
-        installed.display()
-    )
-}
-
 fn repo_head(ctx: &Ctx, repo: &str) -> Result<String> {
     let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
         "-C",
@@ -651,20 +580,36 @@ fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Result<Vec<P
     }
 
     if !crate::project::list_slugs(&ctx.root).is_empty() {
-        crate::ticker::start_for_install(ctx).context("harness_ticker_failed: local ticker")?;
+        if ctx.detached_ticker {
+            let bin = ctx.env.home.join(".local/bin/herdr-ade");
+            let output = ctx.runner.run(
+                &Cmd::new(bin.to_string_lossy(), INSTALL_TIMEOUT)
+                    .env("HERDR_ADE_INSTALL_TICKER", "1")
+                    .args(["--root", &ctx.root.to_string_lossy(), "ticker", "start"]),
+            )?;
+            if !output.success() {
+                bail!(
+                    "harness_ticker_failed: new ticker start: {}",
+                    output.error_text()
+                );
+            }
+        }
         let ticker: Result<crate::ticker::Info> = {
             let deadline = Instant::now() + PROCESS_WAIT;
             loop {
                 if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
                     && info.pid != 0
-                    && crate::build::same_commit(&info.version, crate::VERSION)
+                    && crate::build::same_commit(
+                        &info.version,
+                        plugin_version.unwrap_or(crate::VERSION),
+                    )
                 {
                     break Ok(info);
                 }
                 if Instant::now() >= deadline {
                     break Err(anyhow::anyhow!(
                         "ticker did not report build {}",
-                        crate::VERSION
+                        plugin_version.unwrap_or(crate::VERSION)
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -697,7 +642,8 @@ fn box_process_script(
          root={root}\n\
          version=\"$($bin --version)\"\n\
          printf 'HERDR_ADE_BOX_BINARY=%s\\n' \"$version\"\n\
-         expected={expected}\n\
+         expected=\"${{version#herdr-ade }}\"\n\
+         expected=\"${{expected%.*}}\"\n\
          seen=\n\
          pid=\n\
          n=0\n\
@@ -730,8 +676,6 @@ fn box_process_script(
         path = remote::quote(&machine.path),
         bin = remote::quote(&machine.ade_bin),
         root = remote::quote(&machine.root),
-        expected =
-            remote::quote(crate::build::commit_version(crate::VERSION).unwrap_or(crate::VERSION)),
     )
 }
 
@@ -999,14 +943,41 @@ fn install_box(
 /// `ha harness install`: build every harness repository after a merge and
 /// install it into `~/.local/bin`, then the same on the saved box.
 pub(crate) fn install(ctx: &Ctx) -> Result<InstallOutcome> {
-    let running = Running::capture()?;
-    install_with_reexec(ctx, |installed| reexec_if_replaced(installed, &running))
+    install_for(ctx, None)
 }
 
-pub(crate) fn install_with_reexec(
-    ctx: &Ctx,
-    mut reexec: impl FnMut(&Path) -> Result<()>,
-) -> Result<InstallOutcome> {
+pub(crate) fn install_for_review(ctx: &Ctx, slug: &str, id: &str) -> Result<InstallOutcome> {
+    install_for(ctx, Some((slug, id)))
+}
+
+fn wait_for_reviews(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let mut landing = Vec::new();
+        for slug in crate::project::list_slugs(&ctx.root) {
+            let project = crate::project::Project::load(&ctx.root, &slug)?;
+            for review in crate::review::list(&project)? {
+                if review.phase == crate::review::Phase::Landing
+                    && current != Some((slug.as_str(), review.id.as_str()))
+                {
+                    landing.push(format!("{slug}/{}", review.id));
+                }
+            }
+        }
+        if landing.is_empty() {
+            return Ok(());
+        }
+        if start.elapsed() >= Duration::from_secs(300) {
+            bail!(
+                "harness_review_landing: still waiting for {}",
+                landing.join(", ")
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcome> {
     let repos = repos(&ctx.config_dir)?;
     if repos.is_empty() {
         bail!(
@@ -1014,6 +985,7 @@ pub(crate) fn install_with_reexec(
             ctx.config_dir.join("config.toml").display()
         );
     }
+    wait_for_reviews(ctx, current)?;
     let _lock = lock(&ctx.config_dir)?;
     let mut fork = false;
     let mut kinds = Vec::new();
@@ -1035,7 +1007,6 @@ pub(crate) fn install_with_reexec(
         }
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin, &commit, source_clean)?;
-            reexec(&ctx.env.home.join(".local/bin").join(bin))?;
         }
         builds.push(InstalledBuild {
             repo: repo.path.clone(),
@@ -1073,12 +1044,16 @@ pub(crate) fn install_with_reexec(
         }
     }
 
-    // Machine resolution belongs to the installer image built above. If that
-    // image replaced this process, `reexec` never returns and the new image
-    // restarts the transaction before any box lookup or box command occurs.
+    // Finish with this invocation's image even if its on-disk binary changed.
     let document = crate::config::Document::read(&ctx.config_dir)?;
     let dispatch = document.decode::<RawConfig>()?.dispatch.machine;
-    let box_machine = install_box(ctx, &dispatch)?;
+    let box_machine = match install_box(ctx, &dispatch) {
+        Ok(machine) => machine,
+        Err(error) => {
+            warnings.push(format!("box pending: {error:#}"));
+            None
+        }
+    };
     let box_target = box_machine
         .as_ref()
         .map(|(profile, _)| profile.target.clone());
@@ -1090,18 +1065,27 @@ pub(crate) fn install_with_reexec(
                 let machine = box_paths
                     .as_ref()
                     .context("machine path declaration is missing")?;
-                let box_commit = box_build(ctx, target, machine, box_path, kind)?;
-                if let Some(head) = &box_commit {
-                    builds.push(InstalledBuild {
-                        repo: repo.path.clone(),
-                        machine: machine.id.clone(),
-                        head: head.clone(),
-                    });
-                }
-                installed_repo.box_installed = true;
-                installed_repo.box_commit = box_commit;
-                if kind == Kind::Plugin {
-                    box_plugin_installed = true;
+                match box_build(ctx, target, machine, box_path, kind) {
+                    Ok(box_commit) => {
+                        if let Some(head) = &box_commit {
+                            builds.push(InstalledBuild {
+                                repo: repo.path.clone(),
+                                machine: machine.id.clone(),
+                                head: head.clone(),
+                            });
+                        }
+                        installed_repo.box_installed = box_commit.is_some();
+                        installed_repo.box_commit = box_commit;
+                        if !installed_repo.box_installed {
+                            warnings.push(format!(
+                                "box pending: {} did not report its installed commit",
+                                repo.path
+                            ));
+                        } else if kind == Kind::Plugin {
+                            box_plugin_installed = true;
+                        }
+                    }
+                    Err(error) => warnings.push(format!("box pending: {error:#}")),
                 }
             }
             (Some(_), None) => warnings.push(format!(
@@ -1111,10 +1095,14 @@ pub(crate) fn install_with_reexec(
             (None, _) => {}
         }
     }
+    let mut box_settings_installed = false;
     if let (Some(target), Some(machine)) = (&box_target, &box_paths) {
-        box_settings(ctx, target, machine)?;
-        if box_plugin_installed {
-            refresh_box_guard(ctx, target, machine)?;
+        match box_settings(ctx, target, machine) {
+            Ok(()) => box_settings_installed = true,
+            Err(error) => warnings.push(format!("box pending: {error:#}")),
+        }
+        if box_plugin_installed && let Err(error) = refresh_box_guard(ctx, target, machine) {
+            warnings.push(format!("box pending: {error:#}"));
         }
     }
     let coordinator_hooks = crate::hook::reinstall_open(ctx)?;
@@ -1134,11 +1122,13 @@ pub(crate) fn install_with_reexec(
     if let Some(machine) = &box_paths {
         expected.push(machine.id.as_str());
     }
-    require_running_tickers(&processes, &expected)?;
+    if let Err(error) = require_running_tickers(&processes, &expected) {
+        warnings.push(format!("ticker pending: {error:#}"));
+    }
     let tasks = record_task_proofs(ctx, &builds, &processes)?;
     Ok(InstallOutcome {
         repositories: installed,
-        box_settings_installed: box_target.is_some(),
+        box_settings_installed,
         box_target,
         live_handoff_required: fork,
         processes,
@@ -1177,6 +1167,7 @@ mod tests {
             .unwrap();
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
+        runner.on("ticker start", ok(""));
         let ctx = Ctx {
             env: &env,
             root,
@@ -1719,28 +1710,5 @@ mod tests {
                 .unwrap()
                 .contains("different commit")
         );
-    }
-
-    #[test]
-    fn the_installer_reexecutes_when_it_replaced_its_own_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("herdr-ade");
-        std::fs::write(&exe, b"old image").unwrap();
-        let running = Running {
-            path: std::fs::canonicalize(&exe).unwrap(),
-            hash: crate::thread::sha256_hex(b"old image"),
-        };
-
-        assert!(!replaced_self(&exe, &running).unwrap());
-
-        // The same invocation must continue in the new image rather than
-        // refusing and asking for a second shell command.
-        std::fs::write(&exe, b"new image").unwrap();
-        assert!(replaced_self(&exe, &running).unwrap());
-
-        // A sibling binary is not this process.
-        let sibling = dir.path().join("herdr-pi");
-        std::fs::write(&sibling, b"new image").unwrap();
-        assert!(!replaced_self(&sibling, &running).unwrap());
     }
 }

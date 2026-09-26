@@ -181,6 +181,9 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
+    if std::env::var_os("HERDR_ADE_INSTALL_TICKER").is_some() {
+        return start_for_install(ctx);
+    }
     // The installer replaces the ticker before releasing its lock. Commands
     // may record pending work during that window; they must not compete with
     // the replacement or refuse the work. After a failed install, the next
@@ -922,6 +925,39 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
     Ok(())
 }
 
+fn connection_error(screen: &str) -> Option<&'static str> {
+    let screen = screen.to_ascii_lowercase();
+    if [
+        "websocket closed",
+        "unable to reach the model provider",
+        "connection lost",
+        "your computer went to sleep",
+        "connection error",
+        "network error",
+        "failed to connect",
+        "provider unavailable",
+        "service unavailable",
+        "stream disconnected",
+        "error communicating with provider",
+        "failed to fetch",
+        "stream error",
+        "connection reset by peer",
+    ]
+    .iter()
+    .any(|text| screen.contains(text))
+    {
+        Some(
+            if screen.contains("provider") || screen.contains("service unavailable") {
+                "provider"
+            } else {
+                "connection"
+            },
+        )
+    } else {
+        None
+    }
+}
+
 fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
@@ -959,9 +995,6 @@ fn thread_pass(
         });
     for t in threads {
         if t.parked {
-            continue;
-        }
-        if t.queued_for_load {
             continue;
         }
         if t.status == thread::Status::Starting && t.startup_wait_started.is_empty() {
@@ -1025,44 +1058,6 @@ fn thread_pass(
             .agent_state
             .as_deref()
             .is_some_and(crate::herdr::ready_state);
-        // A timed-out `agent start` can become ready on a later courier pass.
-        // It must pass the same process check before receiving its brief.
-        if t.is_remote() && t.prompt_pending && ready && t.checked_slice.is_empty() {
-            let check = (|| {
-                let Some(process) = box_agent_process(herdr, t) else {
-                    // Registration may precede exec; keep the brief pending.
-                    return Ok(None);
-                };
-                let machine = crate::remote::declaration_for_route(
-                    ctx.runner,
-                    &ctx.env.herdr_bin(),
-                    &ctx.config_dir,
-                    t.machine_route(),
-                )?;
-                crate::remote::check_agent_slice(ctx.runner, &machine, slug, process.pid).map(Some)
-            })();
-            match check {
-                Ok(Some(slice)) => {
-                    thread::update(project, &t.id, |record| record.checked_slice = slice)?;
-                }
-                Ok(None) => continue,
-                Err(error) => {
-                    if let Err(cleanup) = threads::fail_start(
-                        ctx,
-                        project,
-                        &t.id,
-                        &format!("box_slice_check: {error:#}"),
-                        crate::contracts::FailureClass::Unknown,
-                        false,
-                    ) {
-                        pass.error = pass.error.or(Some(
-                            cleanup.context(format!("{}: box slice failed-start cleanup", t.id)),
-                        ));
-                    }
-                    continue;
-                }
-            }
-        }
         if !t.startup_wait_started.is_empty() {
             if state == "blocked" && !t.trust_answered {
                 // A refused trust check leaves the normal ready-window failure
@@ -1091,11 +1086,64 @@ fn thread_pass(
                 continue;
             }
         }
-        let mut delivered = false;
-        if t.prompt_pending
-            && ready
-            && (!t.is_remote() || !thread::load(project, &t.id)?.checked_slice.is_empty())
+        // A CLI that lost its transport can still have a live, idle session.
+        // Resume that session instead of replacing the process or consuming a
+        // launch retry. Only the CLI's own visible error is evidence of loss.
+        if state == "idle"
+            && t.status == thread::Status::Open
+            && !t.prompt_pending
+            && t.bootstrap == "acknowledged"
+            && !t.connection_waiting
+            && t.report_hash.is_empty()
+            && crate::events::latest_done_event(
+                &crate::events::list(project),
+                &t.id,
+                t.attempt.max(1),
+            )
+            .is_none()
+            && let Ok(screen) = herdr.pane_read_text(&t.pane_id, "visible")
+            && let Some(kind) = connection_error(&screen)
         {
+            let recent: Vec<_> = t
+                .connection_resumes
+                .iter()
+                .filter(|at| thread::seconds_since(at, now) < 3600)
+                .cloned()
+                .collect();
+            if recent.len() >= 3 {
+                thread::update(project, &t.id, |record| {
+                    record.connection_resumes = recent;
+                    record.connection_waiting = true;
+                    record.failure_class = crate::contracts::FailureClass::LostConnection;
+                    record.provider_failure_kind = (kind == "provider").then(|| kind.into());
+                    record.last_group = thread::Group::WaitingOnYou.token().into();
+                })?;
+                crate::inbox::write(
+                    project,
+                    "lane-connection",
+                    &t.id,
+                    "Connection recovery paused after three in-place resumes within an hour; check the lane pane.",
+                    "",
+                )?;
+                continue;
+            }
+            if recent
+                .last()
+                .is_none_or(|at| thread::seconds_since(at, now) >= 60)
+            {
+                // Herdr sends to this exact pane; no new session or attempt.
+                herdr.agent_prompt(&t.pane_id, "The connection dropped. Continue the current task in this session from where you stopped; do not start a new attempt.")?;
+                thread::update(project, &t.id, |record| {
+                    record.connection_resumes = recent;
+                    record.connection_resumes.push(project::now());
+                    record.failure_class = crate::contracts::FailureClass::LostConnection;
+                    record.provider_failure_kind = (kind == "provider").then(|| kind.into());
+                })?;
+                continue;
+            }
+        }
+        let mut delivered = false;
+        if t.prompt_pending && ready {
             // The CLI and ticker can observe the same ready agent. Serialize
             // the first prompt and recheck its attempt before either sends it.
             let lock_path = project.state_dir().join(format!("brief-{}.lock", t.id));
@@ -1205,6 +1253,10 @@ fn thread_pass(
                                 anyhow::bail!("queued follow-up changed during delivery");
                             }
                             thread.follow_ups[index].state = thread::FollowUpState::Delivered;
+                            thread.connection_waiting = false;
+                            thread.connection_resumes.clear();
+                            thread.failure_class = crate::contracts::FailureClass::Unknown;
+                            thread.provider_failure_kind = None;
                             thread.follow_ups[index].delivered_at = project::now();
                             thread.follow_ups[index].after_seal = after_seal;
                             Ok(())
@@ -1341,62 +1393,11 @@ struct LaunchPass<'a> {
     panes: &'a [Pane],
 }
 
-/// Only an agent executable, never a shell, scope launcher, or unrelated
-/// foreground tool, is evidence for the box cgroup check.
-fn box_agent_process(
-    herdr: &Herdr<'_>,
-    thread: &thread::Thread,
-) -> Option<crate::contracts::ProcessIdentity> {
-    let executable = match thread.launch.kind.as_str() {
-        "dsh" => "dst",
-        "cursor" => "cursor-agent",
-        kind => kind,
-    };
-    let info = herdr.pane_process_info(&thread.pane_id).ok()?;
-    let process = info.foreground_processes.iter().find(|process| {
-        if process
-            .argv0
-            .as_deref()
-            .unwrap_or(&process.name)
-            .rsplit('/')
-            .next()
-            == Some(executable)
-        {
-            return true;
-        }
-        // Linux reports shebang-launched pi as node without argv0. Match its
-        // CLI script, not an unrelated node process in the foreground job.
-        thread.launch.kind == "pi"
-            && process.argv.as_ref().is_some_and(|argv| {
-                let [runtime, script, ..] = argv.as_slice() else {
-                    return false;
-                };
-                matches!(runtime.rsplit('/').next(), Some("node" | "bun"))
-                    && (script
-                        .ends_with("/node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
-                        || script.ends_with(
-                            "/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-                        ))
-            })
-    })?;
-    Some(crate::contracts::ProcessIdentity {
-        pid: process.pid,
-        argv0: process
-            .argv0
-            .clone()
-            .unwrap_or_else(|| process.name.clone()),
-    })
-}
-
 /// Start a just-placed attempt in the caller, without a later ticker or
 /// courier pass. The periodic path still owns unfinished startup and retries.
 pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
     let lane = thread::load(project, id)?;
-    if lane.status != thread::Status::Open
-        || !lane.prompt_pending
-        || lane.queued_for_load
-        || install_in_progress(ctx)
-    {
+    if lane.status != thread::Status::Open || !lane.prompt_pending {
         return Ok(());
     }
     let socket = project
@@ -1484,7 +1485,6 @@ fn launch_pass(
 ) -> bool {
     let now = jiff::Timestamp::now();
     let mut pending = Vec::new();
-    let mut machine = None;
     for t in pass.threads {
         if t.status != thread::Status::Open || !t.prompt_pending {
             continue;
@@ -1537,20 +1537,6 @@ fn launch_pass(
             );
             continue;
         }
-        if t.is_remote() && machine.is_none() {
-            match crate::remote::declaration_for_route(
-                pass.ctx.runner,
-                &pass.ctx.env.herdr_bin(),
-                &pass.ctx.config_dir,
-                t.machine_route(),
-            ) {
-                Ok(declaration) => machine = Some(declaration),
-                Err(error) => {
-                    errors.push(error.context(format!("{}: box launch declaration", t.id)));
-                    continue;
-                }
-            }
-        }
         // The CLI and the ticker can race on the same newly placed pane.
         // Claim the launch under the record lock before issuing `agent start`.
         let mut claimed = false;
@@ -1588,9 +1574,6 @@ fn launch_pass(
         .coordinator()
         .filter(|_| !first.is_remote())
         .map(|coordinator| coordinator.pane_id);
-    let exclusive_bin = machine
-        .as_ref()
-        .map(|machine| format!("{}/.state/slices/{}/bin", machine.root, pass.project.slug));
     let starts: Vec<_> = pending
         .iter()
         .map(|t| crate::herdr::AgentStart {
@@ -1598,7 +1581,7 @@ fn launch_pass(
             kind: &t.launch.kind,
             pane: &t.pane_id,
             agent_args: &t.launch.args,
-            launch_bin: exclusive_bin.as_deref(),
+            launch_bin: None,
             parent: parent.as_deref(),
             // `agent start` need not hold the ticker for the whole observation
             // window: subsequent passes watch the pane for the remaining time.
@@ -1615,42 +1598,11 @@ fn launch_pass(
         .unwrap_or_default();
     for (t, outcome) in pending.into_iter().zip(outcomes) {
         let launched = outcome.map_err(anyhow::Error::from).and_then(|agent| {
-            // Herdr acknowledges a start before the interactive shell has
-            // necessarily exec'd the command. Wait briefly for the real
-            // agent process, not the preceding shell/systemd-run process.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let process = loop {
-                let found = if t.is_remote() {
-                    box_agent_process(&herdr, t)
-                } else {
-                    herdr
-                        .pane_process_info(&t.pane_id)
-                        .ok()
-                        .and_then(|info| info.identity(&t.launch.kind))
-                };
-                if found.is_some() || !t.is_remote() || Instant::now() >= deadline {
-                    break found;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            };
-            // A shell can be acknowledged before exec. No PID yet is not a
-            // slice violation; the ready-state pass checks before prompting.
-            let checked_slice = match (&machine, &process) {
-                (Some(machine), Some(process)) => Some(
-                    crate::remote::check_agent_slice(
-                        pass.ctx.runner,
-                        machine,
-                        &pass.project.slug,
-                        process.pid,
-                    )
-                    .map_err(|error| anyhow::anyhow!("box_slice_check: {error:#}"))?,
-                ),
-                _ => None,
-            };
+            let process = herdr
+                .pane_process_info(&t.pane_id)
+                .ok()
+                .and_then(|info| info.identity(&t.launch.kind));
             thread::update(pass.project, &t.id, |record| {
-                if let Some(slice) = &checked_slice {
-                    record.checked_slice = slice.clone();
-                }
                 let mut bound = agent.clone();
                 if bound.workspace_id.is_empty() {
                     bound.workspace_id = record.workspace_id.clone();
@@ -1698,20 +1650,6 @@ fn launch_pass(
                     .err()
                     .map(|e| e.context(format!("{}: launch record", t.id))),
             );
-            if t.is_remote() && error.to_string().contains("box_slice_check:") {
-                let message = format!("{error:#}");
-                errors.extend(
-                    threads::fail_start(
-                        pass.ctx,
-                        pass.project,
-                        &t.id,
-                        &message,
-                        crate::contracts::FailureClass::Unknown,
-                        false,
-                    )
-                    .err(),
-                );
-            }
             errors.push(error.context(format!("{}: launch", t.id)));
         }
     }
@@ -1724,7 +1662,6 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .filter(|t| {
             t.is_remote() == remote
                 && !t.parked
-                && !t.queued_for_load
                 && matches!(t.status, thread::Status::Open | thread::Status::Starting)
         })
         .collect()
@@ -1874,9 +1811,6 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         }
     }
 
-    if let Err(error) = crate::threads::start_queued(ctx, project) {
-        first_error = first_error.or(Some(error.context("queued box start")));
-    }
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
         eprintln!("note: pending cleanup will retry: {error:#}");
     }
@@ -2376,10 +2310,6 @@ mod tests {
         runner.on("machine list --json", ok("[]"));
         runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
         runner.on(
-            "cat /proc/42/cgroup",
-            ok("0::/user.slice/herdr-ade-demo.slice/run.scope\n"),
-        );
-        runner.on(
             "agent start",
             ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
         );
@@ -2440,11 +2370,6 @@ mod tests {
 
         assert!(errors.is_empty(), "{errors:#?}");
         assert_eq!(runner.count("agent start"), 3);
-        assert_eq!(runner.count("cat /proc/42/cgroup"), 3);
-        assert!(runner.calls.borrow().iter().any(|call| {
-            call.display()
-                .contains("--env PATH=/home/agent/.herdr-ade/.state/slices/demo/bin")
-        }));
         for record in thread::list(&fixture.project) {
             assert_eq!(record.launch_attempts, 1, "{} was not submitted", record.id);
         }
@@ -2455,7 +2380,6 @@ mod tests {
         );
         assert_eq!(rebound.identity.pane_id, rebound.pane_id);
         assert_eq!(rebound.identity.cwd, rebound.cwd);
-        assert_eq!(rebound.checked_slice, "herdr-ade-demo.slice");
         assert!(!rebound.identity.pane_id.is_empty());
     }
 
@@ -2486,10 +2410,6 @@ mod tests {
                     Ok(ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#))
                 }
             },
-        );
-        runner.on(
-            "cat /proc/42/cgroup",
-            ok("0::/user.slice/herdr-ade-demo.slice/run.scope\n"),
         );
         runner.on(
             "agent start",
@@ -2549,7 +2469,6 @@ mod tests {
         let saved = thread::load(&fixture.project, "t-0001").unwrap();
         assert_eq!(saved.launch_attempts, 1);
         assert!(saved.startup_recovery_used);
-        assert_eq!(saved.checked_slice, "herdr-ade-demo.slice");
         assert!(!saved.identity.pane_id.is_empty());
         assert!(!saved.startup_wait_started.is_empty());
 
@@ -2581,161 +2500,6 @@ mod tests {
             thread::load(&fixture.project, &saved.id).unwrap().status,
             thread::Status::Failed
         );
-    }
-
-    #[test]
-    fn box_agent_process_finds_shebang_pi_without_argv0() {
-        let fixture = fixture(false);
-        let runner = FakeRunner::new();
-        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":41,"name":"node","argv":["/usr/bin/node","/tmp/unrelated.js"]},{"pid":42,"name":"node","argv":["/usr/bin/node","/home/agent/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"]}]}}}"#));
-        let herdr = Herdr::new("herdr", "", &runner);
-        let record = thread::allocate(&fixture.project, |record| {
-            record.pane_id = "w2:p1".into();
-            record.launch.kind = "pi".into();
-        })
-        .unwrap();
-        assert_eq!(box_agent_process(&herdr, &record).unwrap().pid, 42);
-    }
-
-    #[test]
-    fn box_agent_outside_slice_fails_start_with_observed_cgroup() {
-        let fixture = fixture(false);
-        std::fs::create_dir_all(fixture.root.join("cfg")).unwrap();
-        std::fs::write(
-            fixture.root.join("cfg/config.toml"),
-            crate::remote::TEST_MACHINE,
-        )
-        .unwrap();
-        let runner = FakeRunner::new();
-        runner.on("machine list --json", ok("[]"));
-        runner.on(
-            "agent start",
-            ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
-        );
-        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
-        runner.on("cat /proc/42/cgroup", ok("0::/app.slice/herdr.service\n"));
-        let record = thread::allocate(&fixture.project, |record| {
-            record.status = thread::Status::Open;
-            record.prompt_pending = true;
-            record.machine = "buildbox".into();
-            record.machine_id = "buildbox".into();
-            record.workspace_id = "w2".into();
-            record.tab_id = "w2:t1".into();
-            record.pane_id = "w2:p1".into();
-            record.cwd = "/box/lane".into();
-            record.agent_name = "hp-demo-t-0001".into();
-            record.launch.kind = "claude".into();
-        })
-        .unwrap();
-        let ctx = Ctx {
-            env: &fixture.env,
-            root: fixture.root.clone(),
-            config_dir: fixture.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let herdr = Herdr::new("herdr", "", &runner);
-        let mut errors = Vec::new();
-        launch_pass(
-            &LaunchPass {
-                ctx: &ctx,
-                project: &fixture.project,
-                herdr: &herdr,
-                threads: &[record],
-                agents: &[],
-                panes: &[Pane {
-                    pane_id: "w2:p1".into(),
-                    tab_id: "w2:t1".into(),
-                    workspace_id: "w2".into(),
-                    cwd: "/box/lane".into(),
-                }],
-            },
-            &mut true,
-            false,
-            &mut errors,
-        );
-        let failed = thread::load(&fixture.project, "t-0001").unwrap();
-        assert_eq!(failed.status, thread::Status::Failed);
-        assert!(
-            failed.error.contains("app.slice/herdr.service"),
-            "{}; errors={errors:#?}",
-            failed.error
-        );
-        assert!(failed.checked_slice.is_empty());
-    }
-
-    #[test]
-    fn late_ready_box_agent_outside_slice_fails_before_prompt() {
-        let fixture = fixture(false);
-        std::fs::create_dir_all(fixture.root.join("cfg")).unwrap();
-        std::fs::write(
-            fixture.root.join("cfg/config.toml"),
-            crate::remote::TEST_MACHINE,
-        )
-        .unwrap();
-        let runner = FakeRunner::new();
-        runner.on("machine list --json", ok("[]"));
-        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
-        runner.on("cat /proc/42/cgroup", ok("0::/app.slice/herdr.service\n"));
-        let record = thread::allocate(&fixture.project, |t| {
-            t.status = thread::Status::Starting;
-            t.prompt_pending = true;
-            t.startup_wait_started = project::now();
-            t.machine = "buildbox".into();
-            t.machine_id = "buildbox".into();
-            t.workspace_id = "w2".into();
-            t.tab_id = "w2:t1".into();
-            t.pane_id = "w2:p1".into();
-            t.cwd = "/box/lane".into();
-            t.agent_name = "hp-demo-t-0001".into();
-            t.launch.kind = "claude".into();
-        })
-        .unwrap();
-        let ctx = Ctx {
-            env: &fixture.env,
-            root: fixture.root.clone(),
-            config_dir: fixture.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let herdr = Herdr::new("herdr", "", &runner);
-        let agent = Agent {
-            pane_id: record.pane_id.clone(),
-            tab_id: record.tab_id.clone(),
-            workspace_id: record.workspace_id.clone(),
-            cwd: record.cwd.clone(),
-            name: record.agent_name.clone(),
-            agent_status: "idle".into(),
-            ..Agent::default()
-        };
-        let pass = thread_pass(
-            &LaunchPass {
-                ctx: &ctx,
-                project: &fixture.project,
-                herdr: &herdr,
-                threads: std::slice::from_ref(&record),
-                agents: &[agent],
-                panes: &[Pane {
-                    pane_id: record.pane_id.clone(),
-                    tab_id: record.tab_id.clone(),
-                    workspace_id: record.workspace_id.clone(),
-                    cwd: record.cwd.clone(),
-                }],
-            },
-            "ha",
-            None,
-            true,
-        )
-        .unwrap();
-        assert!(pass.error.is_some()); // This fixture has no live session for cleanup.
-        let failed = thread::load(&fixture.project, "t-0001").unwrap();
-        assert_eq!(failed.status, thread::Status::Failed);
-        assert!(
-            failed.error.contains("app.slice/herdr.service"),
-            "{}",
-            failed.error
-        );
-        assert_eq!(runner.count("agent prompt"), 0);
     }
 
     #[test]
@@ -2881,6 +2645,91 @@ mod tests {
                 .any(|call| call.display().contains("Trust this folder?")
                     && call.display().contains("agent prompt"))
         );
+    }
+
+    #[test]
+    fn idle_connection_error_resumes_in_place_and_stops_after_three_in_an_hour() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("pane read", ok("WebSocket closed\n"));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Open;
+            t.bootstrap = "acknowledged".into();
+            t.launch_attempts = 1;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/repo".into();
+            t.agent_name = "hp-demo-t-0001".into();
+        })
+        .unwrap();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let panes = [Pane {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+        }];
+        let agents = [Agent {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+            name: record.agent_name.clone(),
+            agent_status: "idle".into(),
+            ..Agent::default()
+        }];
+        let poll = || {
+            let current = thread::load(&fixture.project, &record.id).unwrap();
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &fixture.project,
+                    herdr: &herdr,
+                    threads: &[current],
+                    agents: &agents,
+                    panes: &panes,
+                },
+                "ha",
+                None,
+                true,
+            )
+            .unwrap();
+        };
+        poll();
+        assert_eq!(runner.count("agent prompt"), 1);
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert_eq!(saved.launch_attempts, 1);
+        assert_eq!(saved.connection_resumes.len(), 1);
+        // Model three real, spaced-out recoveries without waiting an hour.
+        thread::update(&fixture.project, &record.id, |t| {
+            t.connection_resumes = vec![
+                "2020-01-01T00:00:00Z".into(),
+                "2020-01-01T00:01:00Z".into(),
+                "2020-01-01T00:02:00Z".into(),
+            ];
+        })
+        .unwrap();
+        // The bound uses a rolling hour, not a lifetime count.
+        poll();
+        assert_eq!(runner.count("agent prompt"), 2);
+        thread::update(&fixture.project, &record.id, |t| {
+            t.connection_resumes = vec![project::now(); 3];
+        })
+        .unwrap();
+        poll();
+        let saved = thread::load(&fixture.project, &record.id).unwrap();
+        assert!(saved.connection_waiting);
+        assert_eq!(saved.launch_attempts, 1);
+        assert_eq!(runner.count("agent prompt"), 2);
     }
 
     #[test]

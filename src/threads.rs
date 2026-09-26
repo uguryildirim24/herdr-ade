@@ -312,17 +312,6 @@ fn start_with_ticker(
         crate::task::link_attempt(&project, &args.task_id, &id)?;
     }
 
-    if !machine.is_empty()
-        && let Some(reason) = box_capacity_reason(ctx, &machine)?
-    {
-        thread::update(&project, &id, |t| {
-            t.queued_for_load = true;
-            t.placement_reason = format!("queued for `{machine}`: {reason}");
-        })?;
-        refresh_plan(ctx, &project);
-        return thread::load(&project, &id);
-    }
-
     match place_and_brief(ctx, &project, &view, &id, false) {
         Ok(thread) => {
             refresh_plan(ctx, &project);
@@ -444,14 +433,6 @@ fn resolve_placement(
                                     "machine_held: `{}` is held; run `ha machine release {}` when the fork refresh or resize is done",
                                     profile.label, profile.label
                                 ))
-                            } else if box_capacity_reason(ctx, &profile.label)
-                                .map_err(|error| format!("{error:#}"))?
-                                .is_some()
-                            {
-                                // No login or provisioning SSH while the box
-                                // is busy. Keep the selected machine and let
-                                // the ticker start this attempt when it clears.
-                                Ok(Some(profile))
                             } else {
                                 crate::doctor::recipe_ready_on_box(ctx, &profile, launch)
                                     .map(|_| Some(profile))
@@ -578,66 +559,6 @@ pub(crate) fn box_launch_ready_for(
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
     box_launch_ready(ctx, &profile, launch)
-}
-
-fn box_capacity_reason(ctx: &Ctx, machine: &str) -> Result<Option<String>> {
-    let declaration =
-        remote::declaration_for_route(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
-    Ok(match remote::box_load(ctx.runner, &declaration) {
-        Ok((load, cores)) => remote::load_wait_reason(load, cores, declaration.load_limit),
-        Err(error) => Some(format!("load could not be measured: {error:#}")),
-    })
-}
-
-/// The ticker starts queued work only when its selected machine has room. A
-/// failed placement retains the existing failed-start recovery path; a lost
-/// load probe never consumes a launch attempt or creates a box workspace.
-pub(crate) fn start_queued(ctx: &Ctx, project: &Project) -> Result<()> {
-    for record in thread::list(project)
-        .into_iter()
-        .filter(|t| t.queued_for_load && t.status == Status::Starting)
-    {
-        if let Some(reason) = box_capacity_reason(ctx, record.machine_route())? {
-            thread::update(project, &record.id, |t| {
-                t.placement_reason = format!("queued for `{}`: {reason}", t.machine);
-            })?;
-            continue;
-        }
-        // Clear the queue marker before placement: the normal starting timer
-        // and recovery paths now own this attempt.
-        thread::update(project, &record.id, |t| {
-            t.queued_for_load = false;
-            t.created = project::now();
-        })?;
-        if let Err(error) = box_launch_ready_for(ctx, record.machine_route(), &record.launch) {
-            let message = format!("{error:#}");
-            fail_start(
-                ctx,
-                project,
-                &record.id,
-                &message,
-                crate::contracts::FailureClass::Unknown,
-                false,
-            )?;
-            continue;
-        }
-        let view = require_session(ctx, project)?;
-        if let Err(error) = place_and_brief(ctx, project, &view, &record.id, false) {
-            let message = format!("{error:#}");
-            fail_start(
-                ctx,
-                project,
-                &record.id,
-                &message,
-                crate::contracts::FailureClass::Unknown,
-                false,
-            )?;
-        } else {
-            refresh_plan(ctx, project);
-            ticker::request_remote_poll(&ctx.root, project, record.machine_route())?;
-        }
-    }
-    Ok(())
 }
 
 /// Steps 2 to 5 of starting a thread, also used when recovery must place it.
@@ -881,7 +802,6 @@ fn place_box_worktree(
         t.worktree_path = box_worktree.clone();
         t.thread_dir = dir.clone();
         t.launch.brief_hash = brief_hash.clone();
-        t.checked_slice.clear();
         t.partial = Some("worktree_add".into());
     })?;
 
@@ -889,9 +809,6 @@ fn place_box_worktree(
     // step 3).
     let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
 
-    // Verify the selected executable and user scope before creating a box
-    // worktree. A broken user manager cannot leave a provisioned but idle lane.
-    remote::prepare_project_slice(runner, &machine, &project.slug, &record.launch.kind)?;
     if record.failure_event.is_empty() {
         remote::provision(
             runner,
@@ -3270,17 +3187,13 @@ fn reopen_parked(
                 ),
                 &toml::to_string(&card)?,
             )?;
-            remote::prepare_project_slice(ctx.runner, machine, &project.slug, &record.launch.kind)?;
         }
-        let exclusive_bin = machine
-            .as_ref()
-            .map(|m| format!("{}/.state/slices/{}/bin", m.root, project.slug));
         let agent = herdr.agent_start_opts(&crate::herdr::AgentStart {
             name: &record.agent_name,
             kind: &record.launch.kind,
             pane: &placed.pane_id,
             agent_args: &args,
-            launch_bin: exclusive_bin.as_deref(),
+            launch_bin: None,
             parent: if record.is_remote() {
                 None
             } else {
@@ -3292,14 +3205,6 @@ fn reopen_parked(
             .pane_process_info(&placed.pane_id)
             .ok()
             .and_then(|info| info.identity(&record.launch.kind));
-        if let Some(machine) = &machine {
-            let pid = process
-                .as_ref()
-                .context("reopened box agent process missing")?
-                .pid;
-            placed.checked_slice =
-                remote::check_agent_slice(ctx.runner, machine, &project.slug, pid)?;
-        }
         thread::update_checked(project, &record.id, |t| {
             if !t.parked || t.attempt != record.attempt {
                 bail!("reopen_stale: completion changed during reopen");
@@ -3308,7 +3213,6 @@ fn reopen_parked(
             t.tab_id = placed.tab_id.clone();
             t.pane_id = placed.pane_id.clone();
             t.cwd = placed.cwd.clone();
-            t.checked_slice = placed.checked_slice.clone();
             t.parked = false;
             t.last_group = Group::Working.token().into();
             // A sealed completion proves the old brief was consumed. Even
@@ -3372,26 +3276,9 @@ fn park_one(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     .cloned() else {
         return Ok(());
     };
-    let delivered = crate::events::states(project, &done.id)?
-        .iter()
-        .any(|state| {
-            matches!(
-                state,
-                crate::contracts::DeliveryState::Submitted
-                    | crate::contracts::DeliveryState::Acknowledged
-                    | crate::contracts::DeliveryState::Handled
-            )
-        });
-    let adopted = crate::review::list(project)?.iter().any(|review| {
-        review
-            .members
-            .iter()
-            .any(|m| m.thread == record.id && m.event == done.id)
-            || review.reviewer.as_deref() == Some(&record.id) && review.verdict_event == done.id
-    });
-    if !delivered && !adopted {
-        return Ok(());
-    }
+    // The seal is durable before delivery. Keep its pane from sitting idle
+    // while a coordinator or courier is temporarily unreachable.
+    let _ = done;
     if !record.tab_id.is_empty() {
         close_pane(ctx, project, record)?;
     }
@@ -4558,13 +4445,6 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
             thread: t.clone(),
             group: Group::Parked,
             note: "pane parked until requested".into(),
-        };
-    }
-    if t.queued_for_load {
-        return Row {
-            thread: t.clone(),
-            group: Group::Working,
-            note: t.placement_reason.clone(),
         };
     }
     let Some(view) = view else {
@@ -5836,44 +5716,6 @@ mod tests {
     }
 
     #[test]
-    fn overloaded_box_queues_without_provision_and_ticker_starts_when_load_drops() {
-        use crate::runner::fake::ok;
-        let (fx, _remote) = box_fixture();
-        write_config(&fx, &lane_config());
-        let busy = std::rc::Rc::new(std::cell::Cell::new(true));
-        let flag = busy.clone();
-        fx.world.runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("getconf _NPROCESSORS_ONLN"),
-            move |_| Ok(ok(if flag.get() { "30.0 16\n" } else { "1.0 16\n" })),
-        );
-        stub_box(&fx);
-        let queued = start(
-            &fx.world.ctx(),
-            "demo",
-            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
-        )
-        .unwrap();
-        assert!(queued.queued_for_load);
-        assert_eq!(queued.status, Status::Starting);
-        assert!(queued.placement_reason.contains("30.0"));
-        let visible = rows(&fx.world.ctx(), &fx.project);
-        assert!(visible.iter().any(|row| row.thread.id == queued.id && row.note.contains("queued for `buildbox`")));
-        assert_eq!(fx.world.runner.count("FETCH_HEAD"), 0);
-        start_queued(&fx.world.ctx(), &fx.project).unwrap();
-        assert!(
-            thread::load(&fx.project, &queued.id)
-                .unwrap()
-                .queued_for_load
-        );
-        busy.set(false);
-        start_queued(&fx.world.ctx(), &fx.project).unwrap();
-        let launched = thread::load(&fx.project, &queued.id).unwrap();
-        assert_eq!(launched.status, Status::Open);
-        assert!(!launched.queued_for_load);
-        assert!(launched.worktree_path.contains(".worktrees"));
-    }
-
-    #[test]
     fn box_lanes_share_one_project_workspace_and_take_separate_tabs() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, &lane_config());
@@ -6391,6 +6233,32 @@ mod tests {
         );
         assert!(close_pane(&world.ctx(), &project, &lane).unwrap());
         assert_eq!(world.runner.count("workspace close"), 1);
+    }
+
+    #[test]
+    fn box_lane_close_uses_its_saved_machine() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |t| {
+            t.machine = "oci".into();
+            t.machine_id = "oci".into();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", "/different/cwd")
+        );
+        assert!(close_pane(&world.ctx(), &project, &lane).unwrap());
+        assert!(
+            world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|cmd| { cmd.display().contains("--machine oci workspace close w2") })
+        );
     }
 
     #[test]

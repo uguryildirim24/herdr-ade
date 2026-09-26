@@ -108,6 +108,11 @@ pub(crate) struct Thread {
     pub(crate) failure_class: crate::contracts::FailureClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider_failure_kind: Option<String>,
+    /// In-place connection recoveries during the current rolling hour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) connection_resumes: Vec<String>,
+    #[serde(default)]
+    pub(crate) connection_waiting: bool,
     #[serde(alias = "escalation_pending")]
     pub(crate) recovery_pending: bool,
     pub(crate) kind: Kind,
@@ -119,9 +124,6 @@ pub(crate) struct Thread {
     /// Why placement selected this machine for the current attempt.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) placement_reason: String,
-    /// Placement has not begun; the ticker retries when the box has capacity.
-    #[serde(default)]
-    pub(crate) queued_for_load: bool,
     /// The stable saved-profile id the lane resolved to (SPEC-remote §4.1).
     /// Empty on a local lane; a renamed label does not change it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -197,9 +199,6 @@ pub(crate) struct Thread {
     pub(crate) bootstrap: String,
     pub(crate) plain: String,
     pub(crate) identity: crate::contracts::IdentityBinding,
-    /// Slice verified from the agent process's cgroup after a box launch.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) checked_slice: String,
     #[serde(default)]
     pub(crate) passive: bool,
 }
@@ -975,13 +974,13 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
     match thread.status {
         Status::Resolved => Group::Resolved,
         Status::Failed => Group::WaitingOnYou,
-        Status::Starting if thread.queued_for_load => Group::Working,
         Status::Starting if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Starting if seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS => {
             Group::WaitingOnYou
         }
         Status::Starting => Group::Working,
         Status::Open if thread.parked => Group::Parked,
+        Status::Open if thread.connection_waiting => Group::WaitingOnYou,
         Status::Open if !thread.startup_wait_started.is_empty() => Group::Working,
         Status::Open if thread.is_remote() && thread.last_state.is_empty() => Group::Unknown,
         Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
@@ -1002,10 +1001,12 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     if thread.parked {
         return Group::Parked;
     }
+    if thread.connection_waiting {
+        return Group::WaitingOnYou;
+    }
     // 2
     if thread.status == Status::Starting {
-        return if thread.queued_for_load
-            || !thread.startup_wait_started.is_empty()
+        return if !thread.startup_wait_started.is_empty()
             || seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS
         {
             Group::Working

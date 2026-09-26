@@ -2590,11 +2590,14 @@ fn harness_repo(home: &Path, name: &str, package: &str) -> String {
 }
 
 fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
-    world.runner.on(
-        "rev-parse HEAD",
-        ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"),
+    world.runner.on_fn(
+        |cmd| cmd.program == "git" && cmd.display().contains("rev-parse HEAD"),
+        |_| Ok(ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")),
     );
-    world.runner.on("status --porcelain", ok(""));
+    world.runner.on_fn(
+        |cmd| cmd.program == "git" && cmd.display().contains("status --porcelain"),
+        |_| Ok(ok("")),
+    );
     let dir = world.home.path().join("cfg");
     std::fs::create_dir_all(&dir).unwrap();
     let rows: Vec<String> = repos
@@ -2723,6 +2726,16 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
         ],
     );
     configure_test_box(&with_box);
+    with_box.runner.on_fn(
+        |cmd| {
+            cmd.program == "ssh"
+                && cmd
+                    .args
+                    .last()
+                    .is_some_and(|arg| arg.contains("git fetch --quiet"))
+        },
+        |_| Ok(ok("HERDR_ADE_INSTALLED_HEAD=abc123\n")),
+    );
     with_box.runner.on("cargo build", ok(""));
     with_box.runner.on("cp ", ok(""));
     with_box.runner.on("mv -f", ok(""));
@@ -2830,7 +2843,7 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
 }
 
 #[test]
-fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
+fn harness_install_reports_unavailable_box_without_reexec() {
     let world = World::new();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
     write_harness_config(&world, &[(&plugin, "/home/agent/projects/herdr-ade")]);
@@ -2839,36 +2852,12 @@ fn harness_install_builds_and_reexecs_before_a_failed_box_lookup() {
     world.runner.on("mv -f", ok(""));
     world.runner.on("--version", ok("installed version\n"));
 
-    let reexecs = Rc::new(RefCell::new(Vec::new()));
-    let seen = reexecs.clone();
-    world.runner.on_fn(
-        |cmd| cmd.display().contains("machine list --json"),
-        move |_| {
-            assert!(
-                seen.borrow()
-                    .iter()
-                    .any(|path: &PathBuf| path.ends_with("herdr-ade")),
-                "box lookup ran before the freshly installed harness could re-exec"
-            );
-            Ok(fail(1, "machine list unavailable"))
-        },
-    );
-
-    let error = crate::harness::install_with_reexec(&world.ctx(), |installed| {
-        reexecs.borrow_mut().push(installed.to_path_buf());
-        Ok(())
-    })
-    .unwrap_err()
-    .to_string();
-
-    assert!(error.contains("machine_list_failed"), "{error}");
+    world
+        .runner
+        .on("machine list --json", fail(1, "machine list unavailable"));
+    let outcome = crate::harness::install(&world.ctx()).unwrap();
     assert_eq!(world.runner.count("cargo build"), 1);
-    assert!(
-        reexecs
-            .borrow()
-            .iter()
-            .any(|path| path.ends_with("herdr-ade"))
-    );
+    assert!(outcome.warnings.iter().any(|w| w.contains("box pending")));
 }
 
 #[test]
