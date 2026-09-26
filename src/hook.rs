@@ -24,14 +24,8 @@ fn binding_path(project: &Project) -> PathBuf {
     project.state_dir().join("coordinator-hook.json")
 }
 
-fn binding_failure(project: &Project, path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+fn binding_failure(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
     let detail = format!("hook_binding_unreadable: {}: {error}", path.display());
-    crate::ledger::observe(
-        project,
-        "hook-binding-unreadable",
-        &path.to_string_lossy(),
-        &detail,
-    );
     anyhow::anyhow!(detail)
 }
 
@@ -40,14 +34,11 @@ fn read_binding(project: &Project) -> Result<Option<Binding>> {
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(binding_failure(project, &path, error)),
+        Err(error) => return Err(binding_failure(&path, error)),
     };
     match serde_json::from_slice(&bytes) {
-        Ok(binding) => {
-            crate::ledger::recovered(project, "hook-binding-unreadable", &path.to_string_lossy());
-            Ok(Some(binding))
-        }
-        Err(error) => Err(binding_failure(project, &path, error)),
+        Ok(binding) => Ok(Some(binding)),
+        Err(error) => Err(binding_failure(&path, error)),
     }
 }
 
@@ -653,8 +644,5 @@ mod tests {
         std::fs::write(binding_path(&project), b"not json").unwrap();
         let error = captures(&project, "w1:p1").unwrap_err().to_string();
         assert!(error.contains("hook_binding_unreadable"), "{error}");
-        let digest = crate::coordinator::digest(&ctx, &project, "ha").unwrap().0;
-        assert!(digest.contains("hook-binding-unreadable"), "{digest}");
-        assert!(digest.contains("coordinator-hook.json"), "{digest}");
     }
 }
