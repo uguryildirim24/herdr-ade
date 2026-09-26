@@ -94,7 +94,3 @@ id = "pi-login"
 title = "Pi: open a login pane"
 contexts = ["workspace"]
 command = ["target/release/herdr-pi", "login"]
-
-[[events]]
-on = "pane.agent_status_changed"
-command = ["target/release/herdr-ade", "event", "review-advance"]
