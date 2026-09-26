@@ -1018,11 +1018,7 @@ mod tests {
         ] {
             let parent = step(states);
             let own = derive_state(&fx.project, &parent, &evidence);
-            assert_eq!(
-                with_subtasks(&fx.project, &parent, own),
-                want,
-                "{states:?}"
-            );
+            assert_eq!(with_subtasks(&fx.project, &parent, own), want, "{states:?}");
         }
         // Work linked to the step itself also counts: an open task keeps it
         // from being done, and nothing started keeps it left.
