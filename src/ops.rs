@@ -407,9 +407,7 @@ fn stage_done_inner(
         bail!("lane base is missing; cannot classify changes");
     }
     let git = crate::repo::Git::new(runner, worktree);
-    let has_changes = !git
-        .run(&["rev-list", "--max-count=1", &format!("{base}..{sha}")])?
-        .is_empty();
+    let has_changes = git.trees_differ(&base, sha)?;
     let artifact = write_artifact(project, &first)?;
     advance_staged(project, id, Some(artifact), Some(has_changes))
 }
@@ -797,7 +795,8 @@ mod tests {
         }
         let runner = FakeRunner::new();
         runner
-            .on("rev-list --max-count=1", ok("abc\n"))
+            .on("rev-parse base^{tree}", ok("base-tree\n"))
+            .on("rev-parse abc^{tree}", ok("abc-tree\n"))
             .on("git status --short", ok(""))
             .on("git rev-parse HEAD", ok("abc\n"))
             .on("git ls-tree", ok(""));
@@ -850,7 +849,7 @@ mod tests {
             .on("git -C", ok(""));
         stage_box_done(&project, &op.op, root.path(), &runner, &card).unwrap();
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 7);
         assert_eq!(
             calls[3].args,
             [
@@ -903,7 +902,7 @@ mod tests {
         let (root, project, runner, recipient) = fixture();
         let op = reserved_box_done(&project, root.path(), &recipient);
         stage_done(&project, &op.op, root.path(), &runner).unwrap();
-        assert_eq!(runner.calls.borrow().len(), 4);
+        assert_eq!(runner.calls.borrow().len(), 5);
         assert!(
             runner
                 .calls
