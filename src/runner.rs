@@ -100,8 +100,8 @@ impl Output {
         self.code == Some(0) && !self.timed_out
     }
 
-    /// Decode the `ExitMeaning::Boolean` contract. `None` is a failed probe,
-    /// including timeouts/signals, not a negative answer.
+    /// Decode a boolean probe: zero is yes, one with no diagnostics is no.
+    /// `None` is a failed probe, including timeouts/signals.
     pub(crate) fn boolean_answer(&self) -> Option<bool> {
         if self.timed_out {
             return None;
