@@ -322,6 +322,13 @@ fn files(git: &Git<'_>, base: &str, tip: &str) -> Result<Vec<String>> {
         .map(str::to_owned)
         .collect())
 }
+fn member_files(git: &Git<'_>, base: &str, tip: &str) -> Result<Vec<String>> {
+    Ok(git
+        .run(&["diff", "--name-only", &format!("{base}...{tip}"), "--"])?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
 
 pub(crate) fn start(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<Review>> {
     let project = Project::load(&ctx.root, slug)?;
@@ -409,7 +416,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
             thread::update(project, &lane.id, |t| t.merged_sha = base.clone())?;
             continue;
         }
-        changed.extend(files(&git, &base, &done.sha)?);
+        changed.extend(member_files(&git, &base, &done.sha)?);
         members.push(Member {
             thread: lane.id,
             attempt: event.attempt,
@@ -627,15 +634,17 @@ fn verdict(
         &review.gates,
         &files(git, &review.base, &verdict.candidate)?,
     );
-    let expected: Vec<_> = gates
-        .iter()
-        .map(|g| GateRun {
-            command: g.command.clone(),
-            exit: 0,
+    if verdict.gates.iter().any(|run| run.exit != 0)
+        || gates.iter().any(|gate| {
+            !verdict
+                .gates
+                .iter()
+                .any(|run| run.command == gate.command && run.exit == 0)
         })
-        .collect();
-    if verdict.gates != expected {
-        bail!("verdict must report each path-selected gate, in order, with exit 0");
+    {
+        bail!(
+            "verdict must report each candidate-selected gate with exit 0; all extra gates must pass"
+        );
     }
     Ok(verdict)
 }
@@ -750,9 +759,13 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         if reviewer.status == Status::Resolved && !reviewer.cancellation_reason.is_empty() {
             bail!("reviewer was cancelled; use review retry or review cancel");
         }
-        let Some(event) = sealed(&events, &reviewer)
-            .filter(|e| e.id != review.reviewer_after && e.id != review.checked_event)
-        else {
+        // Recheck a historical refusal caused by the old exact gate-list check.
+        let Some(event) = sealed(&events, &reviewer).filter(|e| {
+            e.id != review.reviewer_after
+                && (e.id != review.checked_event
+                    || review.attention
+                        == "verdict must report each path-selected gate, in order, with exit 0")
+        }) else {
             return Ok(());
         };
         let git = Git::new(ctx.runner, &review.repo);

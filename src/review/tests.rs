@@ -714,6 +714,72 @@ fn moved_tip_refreshes_same_reviewer_once_then_releases_for_fresh_review() {
 }
 
 #[test]
+fn old_fork_with_docs_only_changes_does_not_select_main_code_gates() {
+    let fx = configured();
+    let (mut settings, body) = fx.project.read_project_md().unwrap();
+    settings.repos[0].gates = Some(vec![project::Gate {
+        command: "code-gate".into(),
+        paths: Some(vec!["src/**".into()]),
+        ..Default::default()
+    }]);
+    std::fs::write(
+        fx.project.project_md(),
+        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+    )
+    .unwrap();
+    let (id, _) = lane_unsealed(&fx, 1);
+    let record = thread::load(&fx.project, &id).unwrap();
+    let wt = Path::new(&record.worktree_path);
+    git(wt, &["reset", "--hard", &record.base]);
+    let sha = commit_file(wt, "docs/note.md", "docs", "docs only");
+    commit_file(&fx.repo, "src/new.rs", "new code", "main changes code");
+    fx.seal_done(&id, 1, 1, &sha, "finished\n");
+    let review = prepared(&fx);
+    assert!(review.selected_gates.is_empty());
+}
+
+#[test]
+fn old_gate_refusal_with_extra_passing_gate_lands_on_next_tick() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "code-gate".into(),
+        paths: Some(vec!["src/**".into()]),
+        ..Default::default()
+    }];
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![
+            GateRun {
+                command: "extra".into(),
+                exit: 0,
+            },
+            GateRun {
+                command: "code-gate".into(),
+                exit: 0,
+            },
+        ],
+        1,
+    );
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    review.checked_event = sealed(&crate::events::checked(&fx.project).unwrap(), &reviewer)
+        .unwrap()
+        .id
+        .clone();
+    review.attention = "verdict must report each path-selected gate, in order, with exit 0".into();
+    save(&fx.project, &review).unwrap();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(review.phase, Phase::Complete);
+    assert!(review.attention.is_empty());
+}
+
+#[test]
 fn gates_are_selected_from_pile_and_reviewer_fix_paths_and_failures_refuse() {
     let fx = configured();
     lane(&fx, 1);
@@ -754,7 +820,7 @@ fn gates_are_selected_from_pile_and_reviewer_fix_paths_and_failures_refuse() {
         advance(&fx.world.ctx(), &fx.project, &mut review)
             .unwrap_err()
             .to_string()
-            .contains("path-selected gate")
+            .contains("candidate-selected gate")
     );
     let mut gates = only_code;
     gates.push(GateRun {
