@@ -575,6 +575,7 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
         },
         Command::Plan { command } => match command {
             PlanCommand::Show { slug } => {
+                crate::review::classify_old_seals(ctx, &Project::load(&ctx.root, &slug)?, true)?;
                 let text = plan::show(ctx, &slug, false)?;
                 if crate::output::structured() {
                     let value: serde_json::Value =
@@ -1619,6 +1620,7 @@ fn dispatch_with_start(
             }
             TaskCommand::Show { slug, id } => {
                 let project = Project::load(&ctx.root, &slug)?;
+                crate::review::classify_old_seals(&ctx, &project, true)?;
                 let view = crate::task::view(&project, crate::task::load(&project, &id)?);
                 let attestation = crate::task::attestation(&project, &view.record);
                 let reports: Vec<_> = view
@@ -1660,6 +1662,7 @@ fn dispatch_with_start(
             }
             TaskCommand::List { slug } => {
                 let project = Project::load(&ctx.root, &slug)?;
+                crate::review::classify_old_seals(&ctx, &project, true)?;
                 let (views, errors) = crate::task::views(&project);
                 if let Some(error) = errors.first() {
                     return Err(anyhow::anyhow!("task_unreadable: {error:#}"));
