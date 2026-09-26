@@ -584,6 +584,22 @@ fn provider_readiness_error(error: &str) -> bool {
 /// Complete a provider-blocked placement through the ordinary startup path.
 pub(crate) fn resume_provider_start(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
     let view = require_session(ctx, project)?;
+    let waiting = thread::load(project, id)?;
+    if waiting.is_remote() {
+        // Placement was deferred before its profile could be recorded. The
+        // box pane and lane card must use the saved id, not an empty route.
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            waiting.machine_route(),
+        )?;
+        thread::update(project, id, |t| {
+            t.machine = profile.label.clone();
+            t.machine_id = profile.id.clone();
+            t.launch.machine = profile.label.clone();
+        })?;
+    }
     place_and_brief(ctx, project, &view, id, false)?;
     Ok(())
 }
@@ -6169,6 +6185,7 @@ mod tests {
         );
         let placed = thread::load(&fx.project, &waiting.id).unwrap();
         assert_eq!(placed.status, Status::Open);
+        assert_eq!(placed.machine_id, "buildbox-id");
         assert!(placed.provider_wait_started.is_empty());
         assert_eq!(placed.launch_attempts, 0);
         assert_eq!(placed.attempt, 1);
