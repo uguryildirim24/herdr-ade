@@ -323,6 +323,14 @@ pub(crate) fn reclassify_old_changes(ctx: &Ctx, mut log: impl FnMut(&str)) -> Re
                     thread::update(&project, &lane.id, |record| {
                         if record.changes_seal == event.id && record.has_changes == Some(true) {
                             record.has_changes = Some(false);
+                            // A pre-tree-rule classifier may also have inferred
+                            // a historical landing and install from ancestry.
+                            // Those are not evidence of a changed tree.
+                            if record.merged_review.is_empty() {
+                                record.merged_sha.clear();
+                                record.installed_sha.clear();
+                                record.historical_install_required = false;
+                            }
                         }
                     })?;
                 }

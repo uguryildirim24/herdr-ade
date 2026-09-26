@@ -177,8 +177,15 @@ fn one_time_reclassification_corrects_old_empty_seals_but_keeps_real_changes() {
         t.status = Status::Resolved;
         t.changes_seal = seal.clone();
         t.has_changes = Some(true);
+        t.historical_seal = seal.clone();
+        t.merged_sha = t.base.clone();
+        t.historical_install_required = true;
     })
     .unwrap();
+    assert_eq!(
+        crate::task::view(&fx.project, task.clone()).state,
+        crate::task::State::Merged
+    );
     // Old event payloads can also carry the obsolete classification.
     let path = fx
         .project
@@ -203,6 +210,8 @@ fn one_time_reclassification_corrects_old_empty_seals_but_keeps_real_changes() {
     let record = thread::load(&fx.project, &empty).unwrap();
     assert_eq!(record.has_changes, Some(false));
     assert!(record.merged_sha.is_empty());
+    assert!(record.installed_sha.is_empty());
+    assert!(!record.historical_install_required);
     assert!(lane_done(
         &fx.project,
         &record,
