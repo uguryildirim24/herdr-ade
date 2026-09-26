@@ -1667,68 +1667,6 @@ pub(crate) fn socket_inode(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map_or(0, |meta| meta.ino())
 }
 
-fn coordinator_retry_due(project: &Project) -> Result<bool> {
-    let mut state = steps::load_state(project);
-    if !state.coordinator_relaunch_last.is_empty()
-        && thread::seconds_since(&state.coordinator_relaunch_last, jiff::Timestamp::now()) < 3600
-    {
-        return Ok(false);
-    }
-    state.coordinator_relaunch_last = project::now();
-    steps::save_state(project, &state)?;
-    Ok(true)
-}
-
-fn relaunch_missing_coordinator(
-    ctx: &Ctx,
-    project: &Project,
-    record: &crate::project::Coordinator,
-) -> Result<()> {
-    if !coordinator_retry_due(project)? {
-        return Ok(());
-    }
-    coordinator::open(
-        ctx,
-        &project.slug,
-        &coordinator::OpenOptions {
-            session: crate::paths::SessionFlags {
-                session: None,
-                socket: Some(record.socket.clone().into()),
-            },
-            reprime: false,
-            rebind: false,
-            recipe: None,
-            recipe_basis: None,
-        },
-    )
-}
-
-fn restart_coordinator_agent(
-    project: &Project,
-    herdr: &Herdr,
-    record: &crate::project::Coordinator,
-) -> Result<()> {
-    if !coordinator_retry_due(project)? {
-        return Ok(());
-    }
-    project.update_coordinator(|c| {
-        c.launch_attempts += 1;
-        c.generation += 1;
-        c.prime_sent = false;
-    })?;
-    let launch = &record.launch;
-    herdr.agent_start_opts(&crate::herdr::AgentStart {
-        name: &record.agent_name,
-        kind: &launch.kind,
-        pane: &record.pane_id,
-        agent_args: &launch.args,
-        launch_bin: None,
-        parent: None,
-        ready_timeout_ms: launch.ready_timeout_ms,
-    })?;
-    Ok(())
-}
-
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Option<Seen>> {
@@ -1852,25 +1790,17 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
             && inode != 0
             && record.server_socket_inode != inode
             && !pane_alive;
-        if !pane_alive && agent.is_none() && !record.reopen_requested && !restarted {
-            if record.closed_by_rolf_at.is_empty() {
-                project.update_coordinator(|c| {
-                    if c.closed_by_rolf_at.is_empty() && !c.reopen_requested {
-                        c.closed_by_rolf_at = project::now();
-                    }
-                })?;
-            }
-        } else if record.closed_by_rolf_at.is_empty() && agent.is_none() {
-            let result = if pane_alive {
-                Ok(()) // the slow pass owns process restarts and launch capacity
-            } else if restarted || record.reopen_requested {
-                relaunch_missing_coordinator(ctx, project, &record)
-            } else {
-                Ok(())
-            };
-            if let Err(error) = result {
-                first_error = first_error.or(Some(error.context("coordinator relaunch")));
-            }
+        if !pane_alive
+            && agent.is_none()
+            && !record.reopen_requested
+            && !restarted
+            && record.closed_by_rolf_at.is_empty()
+        {
+            project.update_coordinator(|c| {
+                if c.closed_by_rolf_at.is_empty() && !c.reopen_requested {
+                    c.closed_by_rolf_at = project::now();
+                }
+            })?;
         }
     }
 
@@ -2052,6 +1982,86 @@ fn clean_managed_project_tabs(
         .collect()
 }
 
+/// Nudges only a bound, live, idle coordinator. The state tracks changes
+/// even if a lane starts and finishes between two ticker passes.
+fn plan_nudge(
+    project: &Project,
+    herdr: &Herdr<'_>,
+    agents: &[Agent],
+    state: &mut steps::State,
+) -> Result<()> {
+    let lanes = thread::list(project);
+    let mut lane_ids: Vec<_> = lanes
+        .iter()
+        .filter(|lane| lane.role != "reviewer")
+        .map(|lane| lane.id.clone())
+        .collect();
+    lane_ids.sort();
+    let request = crate::prompt::latest_request_id(project);
+    let mut plan = crate::plan::load(project)?;
+    let revision = plan.as_ref().map_or(0, |p| p.revision);
+    if state.plan_revision != revision
+        || state.plan_lane_ids != lane_ids
+        || state.plan_request != request
+    {
+        state.plan_nudged = false;
+    }
+    state.plan_revision = revision;
+    state.plan_lane_ids = lane_ids;
+    state.plan_request = request;
+
+    if lanes.iter().any(|lane| {
+        lane.role != "reviewer"
+            && matches!(lane.status, thread::Status::Starting | thread::Status::Open)
+    }) {
+        state.plan_nudged = false;
+        return Ok(());
+    }
+    if state.plan_nudged || !crate::ask::open_asks(project).is_empty() {
+        return Ok(());
+    }
+    if crate::review::list(project)?
+        .iter()
+        .any(|review| !review.phase.closed())
+    {
+        return Ok(());
+    }
+    let Some(ref mut plan) = plan else {
+        return Ok(());
+    };
+    crate::plan::project_states(project, plan);
+    let left: Vec<_> = plan
+        .steps
+        .iter()
+        .filter(|step| step.state != crate::contracts::StepState::Done)
+        .collect();
+    let Some(next) = left.first() else {
+        return Ok(());
+    };
+    let Some(coordinator) = project.coordinator() else {
+        return Ok(());
+    };
+    if !coordinator.closed_by_rolf_at.is_empty() || coordinator.prime_pending {
+        return Ok(());
+    }
+    if !agents.iter().any(|agent| {
+        coordinator::agent_matches(&coordinator, agent) && agent.agent_status == "idle"
+    }) {
+        return Ok(());
+    }
+    let line = format!(
+        "{} Nothing is running and {} steps are left. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
+        steps::TICKER_PROMPT_PREFIX,
+        left.len(),
+        next.id,
+        next.text
+    );
+    if steps::deliver_coordinator_prompt(project, herdr, &coordinator.pane_id, &line)? {
+        state.plan_nudged = true;
+    }
+    Ok(())
+}
+
 /// Copies and launches, remote machines, then inbox items,
 /// housekeeping.
 #[cfg(test)]
@@ -2074,30 +2084,7 @@ fn tick_slow_with_steps(
     }
     errors.extend(crate::recovery::tick(ctx, project).err());
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
-    let now = jiff::Timestamp::now();
     let mut may_start = true;
-
-    if !step("coordinator launch") {
-        return (errors, false);
-    }
-    if let Some(record) = project.coordinator()
-        && record.closed_by_rolf_at.is_empty()
-        && (record.prime_pending
-            || !record.last_agent_seen_at.is_empty()
-            || record.reopen_requested)
-        && seen
-            .panes
-            .iter()
-            .any(|p| coordinator::pane_matches(&record, p))
-        && !seen.agents.iter().any(|a| a.pane_id == record.pane_id)
-        && {
-            let last = steps::load_state(project).coordinator_relaunch_last;
-            last.is_empty() || thread::seconds_since(&last, now) >= 3600
-        }
-    {
-        may_start = false;
-        errors.extend(restart_coordinator_agent(project, &herdr, &record).err());
-    }
 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
@@ -2226,6 +2213,8 @@ fn tick_slow_with_steps(
 
     errors.extend(crate::ask::tick(ctx, project).err());
     errors.extend(crate::threads::park_completed(ctx, project).err());
+    stop_after_state!("plan nudge");
+    errors.extend(plan_nudge(project, &herdr, &seen.agents, &mut state).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
@@ -3287,7 +3276,7 @@ mod tests {
             });
         assert!(!completed);
         assert!(errors.is_empty(), "{errors:#?}");
-        assert_eq!(steps, ["recovery", "coordinator launch"]);
+        assert_eq!(steps, ["recovery", "local launches"]);
         assert_eq!(runner.count("agent start"), 0);
     }
 
@@ -3455,6 +3444,186 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    fn nudge_pass(f: &Fixture, runner: &FakeRunner, agents: &[Agent]) {
+        let herdr = Herdr::new(
+            f.env.herdr_bin(),
+            &f.project.coordinator().unwrap().socket,
+            runner,
+        );
+        let mut state = steps::load_state(&f.project);
+        plan_nudge(&f.project, &herdr, agents, &mut state).unwrap();
+        steps::save_state(&f.project, &state).unwrap();
+    }
+
+    fn nudge_setup() -> (Fixture, FakeRunner, Agent) {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("pane read", ok("❯ \n"));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let c = f.project.coordinator().unwrap();
+        let agent = Agent {
+            pane_id: c.pane_id,
+            tab_id: c.tab_id,
+            workspace_id: c.workspace_id,
+            cwd: c.cwd,
+            name: c.agent_name,
+            agent_status: "idle".into(),
+            ..Default::default()
+        };
+        (f, runner, agent)
+    }
+
+    #[test]
+    fn idle_plan_sends_once_and_names_the_next_step() {
+        let (f, runner, agent) = nudge_setup();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        crate::plan::step_add(&ctx, "demo", "First outcome", vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Second outcome", vec![], None).unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        nudge_pass(&f, &runner, &[agent]);
+        assert_eq!(runner.count("agent prompt"), 1);
+        let calls = runner.calls.borrow();
+        assert!(calls.iter().any(|call| {
+            call.display()
+                .contains("2 steps are left. Next: s-1 First outcome")
+        }));
+    }
+
+    #[test]
+    fn a_new_lane_or_plan_revision_or_rolf_message_rearms_the_nudge() {
+        let (f, runner, agent) = nudge_setup();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], None).unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        let lane = thread::allocate(&f.project, |t| {
+            t.role = "worker".into();
+            t.status = thread::Status::Open;
+        })
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 1);
+        thread::update(&f.project, &lane.id, |t| {
+            t.status = thread::Status::Resolved
+        })
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 2);
+        crate::plan::step_add(&ctx, "demo", "Another outcome", vec![], None).unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 3);
+        crate::prompt::record_test_request(&f.project, "q-100", "Keep going").unwrap();
+        nudge_pass(&f, &runner, &[agent]);
+        assert_eq!(runner.count("agent prompt"), 4);
+    }
+
+    #[test]
+    fn plan_nudge_skips_ask_review_running_done_unbound_and_busy() {
+        let (f, runner, mut agent) = nudge_setup();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        // A plan with no unfinished steps cannot prompt.
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        crate::plan::step_add(&ctx, "demo", "Outcome", vec![], None).unwrap();
+        agent.agent_status = "busy".into();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        agent.agent_status = "idle".into();
+        let lane = thread::allocate(&f.project, |t| {
+            t.role = "worker".into();
+            t.status = thread::Status::Open;
+        })
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        thread::update(&f.project, &lane.id, |t| {
+            t.status = thread::Status::Resolved
+        })
+        .unwrap();
+        let ask = crate::ask::ask(
+            &ctx,
+            "demo",
+            crate::ask::NewAsk {
+                question: "Which?".into(),
+                choices: vec!["One".into(), "Two".into()],
+                what: None,
+                means: None,
+                task: None,
+            },
+        )
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 0);
+        crate::ask::withdraw(&ctx, "demo", &ask.id, "No longer needed", "Rolf").unwrap();
+        let review = crate::review::Review {
+            id: "review-1".into(),
+            repo: String::new(),
+            integration: String::new(),
+            base: String::new(),
+            candidate_branch: String::new(),
+            members: vec![],
+            gates: vec![],
+            selected_gates: vec![],
+            reviewer: None,
+            phase: crate::review::Phase::Reviewing,
+            verdict: None,
+            verdict_event: String::new(),
+            reviewer_after: String::new(),
+            checked_event: String::new(),
+            retry_attempt: None,
+            retry_generation: 0,
+            moved: 0,
+            refresh_tip: None,
+            push_remote: None,
+            install_required: false,
+            fast_forward: false,
+            push: false,
+            install: false,
+            close: false,
+            prune: false,
+            attention: String::new(),
+        };
+        std::fs::create_dir_all(crate::review::dir(&f.project)).unwrap();
+        std::fs::write(
+            crate::review::path(&f.project, "review-1"),
+            toml::to_string(&review).unwrap(),
+        )
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 0);
+        std::fs::remove_file(crate::review::path(&f.project, "review-1")).unwrap();
+        // An unbound project does not start a coordinator or get a prompt.
+        let unbound = project::create(&f.root, "unbound", "", vec![]).unwrap();
+        crate::plan::step_add(&ctx, "unbound", "Outcome", vec![], None).unwrap();
+        let herdr = Herdr::new(
+            f.env.herdr_bin(),
+            &f.project.coordinator().unwrap().socket,
+            &runner,
+        );
+        let mut state = steps::State::default();
+        plan_nudge(&unbound, &herdr, &[agent.clone()], &mut state).unwrap();
+        f.project
+            .update_coordinator(|c| c.closed_by_rolf_at = project::now())
+            .unwrap();
+        nudge_pass(&f, &runner, &[agent]);
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(runner.count("agent start"), 0);
     }
 
     #[test]
@@ -4018,7 +4187,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_prompt_pane_retries_at_most_hourly() {
+    fn shell_prompt_pane_never_starts_a_coordinator() {
         let f = fixture(true);
         let runner = FakeRunner::new();
         runner.on("agent list", ok(NO_AGENTS));
@@ -4037,12 +4206,12 @@ mod tests {
         for _ in 0..5 {
             let _ = tick_project(&ctx, &f.project);
         }
-        assert_eq!(runner.count("agent start"), 1); // hourly bound, even after failure
+        assert_eq!(runner.count("agent start"), 0);
         assert_eq!(runner.count("agent prompt"), 0);
     }
 
     #[test]
-    fn dead_coordinator_agent_in_existing_pane_retries_hourly() {
+    fn dead_coordinator_agent_in_existing_pane_is_not_restarted() {
         let f = fixture(false);
         f.project
             .update_coordinator(|c| {
@@ -4066,7 +4235,7 @@ mod tests {
         };
         let _ = tick_project(&ctx, &f.project);
         let _ = tick_project(&ctx, &f.project);
-        assert_eq!(runner.count("agent start"), 1);
+        assert_eq!(runner.count("agent start"), 0);
         assert!(
             f.project
                 .coordinator()
@@ -4095,15 +4264,11 @@ mod tests {
         let _ = tick_project(&ctx, &f.project);
         assert_eq!(f.project.coordinator().unwrap().closed_by_rolf_at, mark);
         assert_eq!(runner.count("workspace create"), 0);
-        assert!(
-            steps::load_state(&f.project)
-                .coordinator_relaunch_last
-                .is_empty()
-        );
+        assert_eq!(runner.count("agent start"), 0);
     }
 
     #[test]
-    fn restarted_server_with_all_panes_gone_relaunches_at_most_hourly() {
+    fn restarted_server_with_all_panes_gone_does_not_start_a_coordinator() {
         let f = fixture(false);
         f.project
             .update_coordinator(|c| {
@@ -4125,15 +4290,10 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        // Even if open fails, the attempt is recorded before launching.
         let _ = tick_project(&ctx, &f.project);
-        let last = steps::load_state(&f.project).coordinator_relaunch_last;
-        assert!(!last.is_empty());
         let _ = tick_project(&ctx, &f.project);
-        assert_eq!(
-            steps::load_state(&f.project).coordinator_relaunch_last,
-            last
-        );
+        assert_eq!(runner.count("agent start"), 0);
+        assert_eq!(runner.count("workspace create"), 0);
         assert_eq!(
             f.project.coordinator().unwrap().launch.recipe_id,
             "recorded-recipe"
@@ -4141,7 +4301,7 @@ mod tests {
     }
 
     #[test]
-    fn restarted_server_with_other_projects_panes_recovers_coordinator() {
+    fn restarted_server_with_other_projects_panes_leaves_coordinator_idle() {
         let f = fixture(false);
         let socket = f.project.coordinator().unwrap().socket;
         let replacement = f._home.path().join("new.sock");
@@ -4168,13 +4328,8 @@ mod tests {
                 .closed_by_rolf_at
                 .is_empty()
         );
-        // The fixture has no coordinator recipe, so open can fail after the
-        // retry is recorded; it must not be mistaken for a manual closure.
-        assert!(
-            !steps::load_state(&f.project)
-                .coordinator_relaunch_last
-                .is_empty()
-        );
+        assert_eq!(runner.count("agent start"), 0);
+        assert_eq!(runner.count("workspace create"), 0);
     }
 
     #[test]

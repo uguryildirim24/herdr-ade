@@ -37,10 +37,14 @@ pub(crate) struct State {
     /// Hash of the unseen inbox item ids last announced.
     pub(crate) announced: String,
     pub(crate) session_item_written: bool,
-    /// Last automatic coordinator relaunch attempt, including failed starts.
-    pub(crate) coordinator_relaunch_last: String,
     /// Coordinator pane whose live lanes were last reconciled by the ticker.
     pub(crate) lanes_parented_to: String,
+    /// One plan nudge per idle stretch. A new lane, plan revision or human
+    /// request re-arms it, even when the lane finished between ticker passes.
+    pub(crate) plan_nudged: bool,
+    pub(crate) plan_revision: u64,
+    pub(crate) plan_lane_ids: Vec<String>,
+    pub(crate) plan_request: String,
 }
 
 pub(crate) fn load_state(project: &Project) -> State {
@@ -245,8 +249,6 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             ),
         )?;
     }
-    // Serialize prompts sent to the coordinator pane.
-    let _writer = crate::prompt::writer_lock(project)?;
     let agent = herdr.agent_list()?.into_iter().find(|agent| {
         agent.pane_id == event.recipient.pane
             && agent.name == coordinator.agent_name
@@ -255,9 +257,6 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     let Some(_agent) = agent else {
         return Ok(());
     };
-    if !crate::prompt::coordinator_prompt_clear(project, &herdr, &event.recipient.pane)? {
-        return Ok(());
-    }
     let mut line = crate::events::typed_line(event)?;
     if !queued.is_empty() {
         line.push_str(&format!(
@@ -265,13 +264,31 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             queued.join("; ")
         ));
     }
-    crate::prompt::mark_automated_prompt(project, &event.recipient.pane, &line)?;
-    herdr.agent_prompt(&event.recipient.pane, &line)?;
-    crate::events::append_delivery(
-        project,
-        &event.id,
-        crate::contracts::DeliveryState::Submitted,
-    )
+    if deliver_coordinator_prompt(project, &herdr, &event.recipient.pane, &line)? {
+        crate::events::append_delivery(
+            project,
+            &event.id,
+            crate::contracts::DeliveryState::Submitted,
+        )?;
+    }
+    Ok(())
+}
+
+/// The same serialized delivery used for event notices and plan nudges.
+/// Returns false when a draft or another prompt still owns the pane.
+pub(crate) fn deliver_coordinator_prompt(
+    project: &Project,
+    herdr: &Herdr<'_>,
+    pane: &str,
+    line: &str,
+) -> Result<bool> {
+    let _writer = crate::prompt::writer_lock(project)?;
+    if !crate::prompt::coordinator_prompt_clear(project, herdr, pane)? {
+        return Ok(false);
+    }
+    crate::prompt::mark_automated_prompt(project, pane, line)?;
+    herdr.agent_prompt(pane, line)?;
+    Ok(true)
 }
 
 fn adopt_report(project: &Project, event: &crate::contracts::Event) -> Result<()> {
