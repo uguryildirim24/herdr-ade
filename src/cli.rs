@@ -529,6 +529,9 @@ enum PlanStepCommand {
         /// Stable task ids to bind to this step
         #[arg(long = "task", value_name = "ID")]
         tasks: Vec<String>,
+        /// Add it as a subtask of this top-level step
+        #[arg(long, value_name = "STEP")]
+        under: Option<String>,
         /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
         expect: Option<u64>,
@@ -1103,17 +1106,24 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                     slug,
                     text,
                     tasks,
+                    under,
                     expect,
                 } => {
-                    let p = plan::step_add(ctx, &slug, &text, tasks, expect)?;
-                    let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
+                    let (p, id) = match under {
+                        Some(under) => plan::subtask_add(ctx, &slug, &under, &text, tasks, expect)?,
+                        None => {
+                            let p = plan::step_add(ctx, &slug, &text, tasks, expect)?;
+                            let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
+                            (p, id)
+                        }
+                    };
                     crate::output::success(
                         None,
                         &serde_json::json!({
                             "operation": "added",
                             "revision": p.revision,
                             "step": id,
-                            "record": p.steps.last(),
+                            "record": plan::all_steps(&p).find(|step| step.id == id),
                             "plan": p,
                         }),
                         &format!("plan revision {}: added {id}\n", p.revision),
@@ -1133,7 +1143,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                             "operation": "edited",
                             "revision": p.revision,
                             "step": id,
-                            "record": p.steps.iter().find(|step| step.id == id),
+                            "record": plan::all_steps(&p).find(|step| step.id == id),
                             "plan": p,
                         }),
                         &format!("plan revision {}: edited {id}\n", p.revision),
@@ -1153,7 +1163,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                             "operation": "linked",
                             "revision": p.revision,
                             "step": id,
-                            "record": p.steps.iter().find(|step| step.id == id),
+                            "record": plan::all_steps(&p).find(|step| step.id == id),
                             "plan": p,
                         }),
                         &format!("plan revision {}: linked {id}\n", p.revision),
@@ -1174,7 +1184,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                             "operation": "unlinked",
                             "revision": p.revision,
                             "step": id,
-                            "record": p.steps.iter().find(|step| step.id == id),
+                            "record": plan::all_steps(&p).find(|step| step.id == id),
                             "plan": p,
                         }),
                         &format!("plan revision {}: unlinked {id}\n", p.revision),
@@ -1214,7 +1224,7 @@ fn run_rounds(ctx: &Ctx, command: Command) -> Result<()> {
                             "revision": p.revision,
                             "step": id,
                             "before": before,
-                            "record": p.steps.iter().find(|step| step.id == id),
+                            "record": plan::all_steps(&p).find(|step| step.id == id),
                             "plan": p,
                         }),
                         &format!("plan revision {}: moved {id}\n", p.revision),
