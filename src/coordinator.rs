@@ -510,7 +510,6 @@ struct ContextCursor {
     lanes: BTreeMap<String, String>,
     reviews: BTreeMap<String, String>,
     inbox: BTreeMap<String, String>,
-    failures: BTreeMap<String, String>,
     relevant_config: BTreeMap<String, String>,
     /// Completion evidence already seen by this coordinator incarnation.
     completed: BTreeMap<String, String>,
@@ -548,15 +547,6 @@ impl ContextCursor {
         let inbox = inbox::unhandled(project)
             .into_iter()
             .map(|item| (item.id, format!("[{}] {}", item.kind, item.summary)))
-            .collect();
-        let failures = crate::ledger::list(project)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| {
-                crate::ledger::disposition(project, entry).ok()
-                    == Some(crate::ledger::Disposition::Current)
-            })
-            .map(|entry| (entry.id.clone(), crate::ledger::summary(&entry)))
             .collect();
         let standing = project
             .read_project_md()
@@ -612,7 +602,6 @@ impl ContextCursor {
             lanes,
             reviews,
             inbox,
-            failures,
             relevant_config,
             completed,
             completion_receipt: true,
@@ -692,7 +681,6 @@ fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> S
         ("Lane", &previous.lanes, &current.lanes),
         ("Review", &previous.reviews, &current.reviews),
         ("Inbox", &previous.inbox, &current.inbox),
-        ("Failure", &previous.failures, &current.failures),
     ] {
         for (id, value) in new {
             if old.get(id) != Some(value) {
@@ -860,8 +848,6 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
         acknowledge_bootstrap(&project)?;
     }
     let prefix = current_prefix(&ctx.root)?;
-    // Capture before the read so a concurrent failure is not marked as seen.
-    let read_at = jiff::Timestamp::now().to_string();
     let current = ContextCursor::capture(ctx, &project);
     let path = project.state_dir().join("context-cursor.json");
     let previous: Option<ContextCursor> = crate::project::read_json(&path);
@@ -884,10 +870,8 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
         std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
     });
     if !peek && owns_read {
-        // An external read is a peek: it cannot consume the coordinator's
-        // delta or failure reminder.
+        // An external read is a peek: it cannot consume the coordinator's delta.
         crate::project::write_json(&path, &current)?;
-        crate::ledger::context_read(&project, &read_at)?;
         inbox::mark_seen(&project, &shown)?;
         if let Some(record) = coordinator {
             inbox::acknowledge_events(&project, &shown, &record.pane_id, record.attempt())?;
@@ -1055,21 +1039,6 @@ fn digest_snapshot(
             }
         }
         overflow_count(&mut out, items.len());
-    }
-
-    let failures: Vec<_> = crate::ledger::list(project)?
-        .into_iter()
-        .filter(|entry| {
-            crate::ledger::disposition(project, entry).ok()
-                == Some(crate::ledger::Disposition::Current)
-        })
-        .collect();
-    if !failures.is_empty() {
-        let _ = writeln!(out, "\n## Current failures");
-        for entry in failures.iter().take(DIGEST_ROWS) {
-            let _ = writeln!(out, "- {}", crate::ledger::summary(entry));
-        }
-        overflow_count(&mut out, failures.len());
     }
 
     let events = crate::events::list(project);
@@ -1337,15 +1306,8 @@ mod tests {
         after
             .inbox
             .insert("i1".into(), "[alert] investigate".into());
-        after.failures.insert("f1".into(), "broken build".into());
         let summary = changes_since(Some(&before), &after);
-        for expected in [
-            "Rolf q-2",
-            "Lane t-0001",
-            "Review review-1",
-            "Inbox i1",
-            "Failure f1",
-        ] {
+        for expected in ["Rolf q-2", "Lane t-0001", "Review review-1", "Inbox i1"] {
             assert!(summary.contains(expected), "{summary}");
         }
         assert!(changes_since(None, &after).contains("First read"));

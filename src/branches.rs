@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::paths::Ctx;
 use crate::project::{self, Project};
-use crate::runner::{Cmd, ExitMeaning, Runner};
+use crate::runner::{Cmd, Runner};
 use crate::thread::{self, Status, Thread};
 
 const TIMEOUT: Duration = Duration::from_secs(40);
@@ -86,19 +86,16 @@ fn harness_ref(name: &str) -> bool {
 }
 
 // A failed compare-and-delete can mean another cleanup already removed the ref.
-// Defer interpreting its exit until the postcondition query; don't record the
-// intermediate answer as a command failure.
+// Interpret its exit only after the postcondition query.
 fn deletion_command(
     runner: &dyn Runner,
     repo: &str,
     args: &[&str],
-) -> Result<(Cmd, crate::runner::Output)> {
+) -> Result<crate::runner::Output> {
     let cmd = Cmd::new("git", TIMEOUT)
         .args(["-C", repo])
-        .args(args.iter().copied())
-        .exit_meaning(ExitMeaning::Deferred);
-    let out = runner.run(&cmd)?;
-    Ok((cmd, out))
+        .args(args.iter().copied());
+    runner.run(&cmd)
 }
 
 fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -> Result<()> {
@@ -108,7 +105,7 @@ fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -
     let name = format!("refs/heads/{branch}");
     // update-ref compares the old value atomically. Unlike branch -D it cannot
     // lose a check/delete race to another cleanup process.
-    let (cmd, out) = deletion_command(runner, repo, &["update-ref", "-d", &name, expected])?;
+    let out = deletion_command(runner, repo, &["update-ref", "-d", &name, expected])?;
     if out.success() {
         return Ok(());
     }
@@ -118,7 +115,6 @@ fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -
             "branch {branch} moved; not removing it"
         ))),
         _ => {
-            crate::ledger::unresolved_deferred(&cmd, &out);
             bail!(
                 "git update-ref -d {name} {expected} in {repo}: {}",
                 out.error_text()
@@ -146,7 +142,7 @@ fn delete_remote(
     }
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
     let deletion = format!(":refs/heads/{branch}");
-    let (cmd, out) = deletion_command(runner, repo, &["push", &lease, url, &deletion])?;
+    let out = deletion_command(runner, repo, &["push", &lease, url, &deletion])?;
     if out.success() {
         return Ok(());
     }
@@ -156,7 +152,6 @@ fn delete_remote(
             "published branch {branch} moved from {expected} to {actual}; not removing it"
         ))),
         _ => {
-            crate::ledger::unresolved_deferred(&cmd, &out);
             bail!(
                 "git push {lease} {url} {deletion} in {repo}: {}",
                 out.error_text()
@@ -771,54 +766,6 @@ mod tests {
     }
 
     #[test]
-    fn deleting_an_already_absent_ref_does_not_record_a_failure() {
-        let (fx, bare) = configured();
-        let repo = fx.repo.to_str().unwrap();
-        let url = bare.path().to_str().unwrap();
-        let expected = run(&fx.repo, &["rev-parse", "main"]);
-        let _scope = crate::ledger::Scope::new(&[&fx.project]);
-        let runner = crate::ledger::RecordingRunner(&crate::runner::RealRunner);
-        delete_local(&runner, repo, "review/absent", &expected).unwrap();
-        delete_remote(&runner, repo, url, "review/absent", &expected).unwrap();
-        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
-    }
-
-    #[test]
-    fn unsuccessful_deletions_record_failure_after_the_ref_stays_put() {
-        use crate::runner::fake::{FakeRunner, fail, ok};
-
-        let (fx, bare) = configured();
-        let repo = fx.repo.to_str().unwrap();
-        let url = bare.path().to_str().unwrap();
-        let expected = run(&fx.repo, &["rev-parse", "main"]);
-        let ref_line = format!("{expected} refs/heads/review/stuck\n");
-        let remote_line = format!("{expected}\trefs/heads/review/stuck\n");
-        let fake = FakeRunner::new();
-        fake.on("worktree list", ok(""))
-            .on("update-ref -d", fail(1, "cannot delete ref"))
-            .on("for-each-ref", ok(&ref_line))
-            .on("ls-remote", ok(&remote_line))
-            .on("push", fail(1, "cannot delete remote ref"));
-        let _scope = crate::ledger::Scope::new(&[&fx.project]);
-        let runner = crate::ledger::RecordingRunner(&fake);
-        assert!(delete_local(&runner, repo, "review/stuck", &expected).is_err());
-        assert!(delete_remote(&runner, repo, url, "review/stuck", &expected).is_err());
-        let failures = crate::ledger::list(&fx.project).unwrap();
-        assert_eq!(failures.len(), 2);
-        assert!(failures.iter().all(|entry| entry.kind == "command-failed"));
-        assert!(
-            failures
-                .iter()
-                .any(|entry| entry.detail.contains("cannot delete ref"))
-        );
-        assert!(
-            failures
-                .iter()
-                .any(|entry| entry.detail.contains("cannot delete remote ref"))
-        );
-    }
-
-    #[test]
     fn compare_and_delete_refuses_a_checked_out_branch() {
         let fx = crate::testkit::fixture();
         let branch = "hp/demo/reviewer";
@@ -854,8 +801,7 @@ mod tests {
         let config_dir = base.config_dir;
         std::thread::scope(|scope| {
             let cleanup = || {
-                let _scope = crate::ledger::Scope::new(&[&fx.project]);
-                let runner = crate::ledger::RecordingRunner(&crate::runner::RealRunner);
+                let runner = crate::runner::RealRunner;
                 let ctx = crate::paths::Ctx {
                     env: &env,
                     root: root.clone(),
@@ -870,7 +816,6 @@ mod tests {
             a.join().unwrap().unwrap();
             b.join().unwrap().unwrap();
         });
-        assert!(crate::ledger::list(&fx.project).unwrap().is_empty());
         assert!(
             !refs(fx.world.ctx().runner, &repo, None)
                 .unwrap()

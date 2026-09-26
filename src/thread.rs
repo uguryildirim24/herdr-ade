@@ -474,33 +474,7 @@ pub(crate) fn update_checked(
     }
     thread.updated = project::now();
     write_record(project, &thread)?;
-    observe_transition(project, &before, &thread);
     Ok(thread)
-}
-
-/// Record transitions, not polls: an unchanged blocked/error state is one
-/// occurrence even if the ticker sees it a hundred times.
-fn observe_transition(project: &Project, before: &Thread, after: &Thread) {
-    // The failure ledger is for harness defects, not provider outages, gone
-    // processes, failed work, or ordinary retries. Unknown startup breakage is
-    // the only thread transition that supplies evidence of a harness failure.
-    if after.status == Status::Failed
-        && before.status != Status::Failed
-        && after.failure_class == crate::contracts::FailureClass::Unknown
-    {
-        crate::ledger::observe(project, "thread-error", &after.id, &after.error);
-        if after.launch_attempts == 0
-            && before.launch_attempts == 0
-            && !after.launch.kind.is_empty()
-        {
-            crate::ledger::observe(
-                project,
-                "launch-not-attempted",
-                &after.id,
-                &format!("launch_attempts = 0: {}", after.error),
-            );
-        }
-    }
 }
 
 /// Allocates the next id under the project lock and writes the first record.
@@ -1824,59 +1798,6 @@ mod tests {
         .unwrap();
         assert_eq!(cancelled.follow_ups[0].state, FollowUpState::Superseded);
         assert_eq!(cancelled.follow_ups[1].state, FollowUpState::Cancelled);
-    }
-
-    #[test]
-    fn only_unknown_harness_breakage_enters_the_failure_ledger() {
-        let root = tempfile::tempdir().unwrap();
-        let p = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let t = allocate(&p, |t| {
-            t.attempt = 1;
-            t.launch.kind = "pi".into();
-        })
-        .unwrap();
-        for _ in 0..3 {
-            update(&p, &t.id, |t| {
-                t.status = Status::Failed;
-                t.error = "login expired".into();
-                t.last_state = "blocked".into();
-            })
-            .unwrap();
-        }
-        let entries = crate::ledger::list(&p).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| e.count == 1));
-        assert!(entries.iter().any(|e| e.kind == "launch-not-attempted"));
-        update(&p, &t.id, |t| {
-            t.attempt += 1;
-            t.launch_attempts = 1;
-        })
-        .unwrap();
-        update(&p, &t.id, |t| t.launch_attempts += 1).unwrap();
-        let entries = crate::ledger::list(&p).unwrap();
-        assert!(!entries.iter().any(|e| e.kind == "retry"));
-    }
-
-    #[test]
-    fn failed_relaunch_does_not_claim_the_previous_launch_never_happened() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let t = allocate(&project, |t| {
-            t.launch.kind = "claude".into();
-            t.launch_attempts = 1;
-            t.status = Status::Open;
-        })
-        .unwrap();
-        update(&project, &t.id, |t| {
-            t.status = Status::Failed;
-            t.attempt = 2;
-            t.launch_attempts = 0;
-            t.error = "the first agent failed after launch".into();
-        })
-        .unwrap();
-        let entries = crate::ledger::list(&project).unwrap();
-        assert!(entries.iter().any(|e| e.kind == "thread-error"));
-        assert!(!entries.iter().any(|e| e.kind == "launch-not-attempted"));
     }
 
     #[test]

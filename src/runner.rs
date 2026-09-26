@@ -8,44 +8,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-/// The caller's contract, not a command-name or diagnostic allowlist.
-/// Ambiguous probes (for example SSH checks) must keep `Required`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExitMeaning {
-    Required,
-    /// The caller checks a postcondition before interpreting a nonzero exit
-    /// (for example a branch removed concurrently). The intermediate exit
-    /// alone is not evidence of failure.
-    Deferred,
-    /// The command answered with its documented JSON result or refusal.
-    Structured,
-    /// Zero means yes; one with empty stderr means no. Every other outcome
-    /// is an error. Only for commands with this precise contract (git ancestry).
-    Boolean,
-    /// `git merge-tree --write-tree`: exit 1 with conflict diagnostics is a
-    /// valid conflict answer. Other nonzero exits are command failures.
-    MergeTree,
-}
-
-impl ExitMeaning {
-    pub(crate) fn answered(self, out: &Output) -> bool {
-        out.success()
-            || (self == Self::Deferred && out.code.is_some() && !out.timed_out)
-            || (self == Self::Structured
-                && out.code.is_some()
-                && !out.timed_out
-                && [&out.stdout, &out.stderr].into_iter().any(|text| {
-                    serde_json::from_str::<serde_json::Value>(text.trim())
-                        .ok()
-                        .is_some_and(|reply| {
-                            reply.get("result").is_some() || reply.get("error").is_some()
-                        })
-                }))
-            || (self == Self::Boolean && out.boolean_answer().is_some())
-            || (self == Self::MergeTree && out.merge_tree_conflict())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Cmd {
     pub(crate) program: String,
@@ -55,10 +17,6 @@ pub(crate) struct Cmd {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) stdin: Option<String>,
     pub(crate) timeout: Duration,
-    pub(crate) exit_meaning: ExitMeaning,
-    /// Stable identity for a recurring check. The literal command remains in
-    /// failure evidence while recovery follows this identity across argv fixes.
-    pub(crate) ledger_subject: Option<String>,
     /// Spawn in its own process group and kill the whole group on timeout.
     pub(crate) own_group: bool,
 }
@@ -73,8 +31,6 @@ impl Cmd {
             cwd: None,
             stdin: None,
             timeout,
-            exit_meaning: ExitMeaning::Required,
-            ledger_subject: None,
             own_group: false,
         }
     }
@@ -110,17 +66,6 @@ impl Cmd {
 
     pub(crate) fn stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
-        self
-    }
-
-    pub(crate) fn exit_meaning(mut self, meaning: ExitMeaning) -> Self {
-        self.exit_meaning = meaning;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ledger_subject(mut self, subject: impl Into<String>) -> Self {
-        self.ledger_subject = Some(subject.into());
         self
     }
 

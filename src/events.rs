@@ -105,14 +105,14 @@ fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSo
 /// What an [`import_box_event`] call did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImportOutcome {
-    /// The event and its artifact were written to the Mac ledger.
+    /// The event and its artifact were written to the Mac event records.
     New,
     /// The exact `(machine, event id, hash)` was already imported; nothing
     /// was rewritten.
     Replay,
 }
 
-/// Imports one box envelope into the Mac's canonical ledger, create-only
+/// Imports one box envelope into the Mac's canonical event records, create-only
 /// (SPEC-remote §4.3). The box's own bytes must hash to `event_hash`; the
 /// artifact must hash to the event's `artifact`. The sealed event bytes remain
 /// historical evidence; file lookup uses the artifact hash. The same event id
@@ -435,8 +435,8 @@ pub(crate) fn count_event_reads(f: impl FnOnce()) -> usize {
     })
 }
 
-/// Load the event ledger once, retaining the unreadable-evidence signal used
-/// by task projections. Missing event directories represent an empty ledger.
+/// Load the event records once, retaining the unreadable-evidence signal used
+/// by task projections. Missing event directories represent an empty set.
 pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
     let entries = match std::fs::read_dir(dir(project)) {
         Ok(entries) => entries,
