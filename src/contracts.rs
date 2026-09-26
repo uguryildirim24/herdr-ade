@@ -280,6 +280,8 @@ pub(crate) struct Op {
     pub(crate) report_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) has_changes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_ref: Option<String>,
 }
 
 /// A coordinator's explicit acceptance of a resolved lane's stored report.
@@ -301,6 +303,9 @@ pub(crate) struct DonePayload {
     pub(crate) artifact: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attestation: Option<Attestation>,
+    /// Immutable box publication; historical seals used the lane branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_ref: Option<String>,
 }
 
 /// Sealed `waiting` payload (SPEC-ADE D5).
@@ -538,6 +543,7 @@ mod tests {
             created: "2026-09-18T00:00:00Z".into(),
             artifact: Some("deadbeef".into()),
             report_hash: None,
+            published_ref: None,
         };
         both(&op);
         both(&Event {
@@ -554,6 +560,7 @@ mod tests {
                     report_path: ".reports/a.md".into(),
                     artifact: "deadbeef".into(),
                     attestation: None,
+                    published_ref: None,
                 }),
                 waiting: None,
                 failed: None,

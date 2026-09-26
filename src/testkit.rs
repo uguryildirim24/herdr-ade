@@ -129,6 +129,7 @@ impl Fx {
                     report_path: format!(".reports/{id}.md"),
                     artifact,
                     attestation: None,
+                    published_ref: None,
                 }),
                 waiting: None,
                 failed: None,

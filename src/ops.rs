@@ -187,6 +187,7 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         artifact: None,
         report_hash: report_hash.map(str::to_owned),
         has_changes: None,
+        published_ref: None,
     };
     write_op(project, &op)?;
     Ok(op)
@@ -397,7 +398,13 @@ fn stage_done_inner(
         {
             bail!("bootstrap_mismatch: done operation does not match the lane card");
         }
-        publish_lane_ref(runner, worktree, &card.branch, &card.publish_url, sha)?;
+        publish_lane_ref(
+            runner,
+            worktree,
+            &seal_ref(&card.branch, sha),
+            &card.publish_url,
+            sha,
+        )?;
     }
     let base = match card {
         Some(card) => card.brief_commit.clone(),
@@ -409,7 +416,19 @@ fn stage_done_inner(
     let git = crate::repo::Git::new(runner, worktree);
     let has_changes = git.trees_differ(&base, sha)?;
     let artifact = write_artifact(project, &first)?;
-    advance_staged(project, id, Some(artifact), Some(has_changes))
+    advance_staged(
+        project,
+        id,
+        Some(artifact),
+        Some(has_changes),
+        card.map(|card| seal_ref(&card.branch, sha)),
+    )
+}
+
+/// Separate namespace avoids a file/directory conflict with the lane branch.
+/// A full commit id makes retries idempotent without ever updating a ref.
+pub(crate) fn seal_ref(branch: &str, sha: &str) -> String {
+    format!("seals/{branch}/{sha}")
 }
 
 fn publish_lane_ref(
@@ -449,7 +468,7 @@ pub(crate) fn stage_waiting(project: &Project, id: &str) -> Result<Op> {
     {
         bail!("op_state_changed: {id} is not a reserved waiting/failure operation");
     }
-    advance_staged(project, id, None, None)
+    advance_staged(project, id, None, None, None)
 }
 
 fn advance_staged(
@@ -457,6 +476,7 @@ fn advance_staged(
     id: &str,
     artifact: Option<String>,
     has_changes: Option<bool>,
+    published_ref: Option<String>,
 ) -> Result<Op> {
     let _lock = project.lock()?;
     let mut current = load(project, id)?;
@@ -471,6 +491,7 @@ fn advance_staged(
     }
     current.artifact = artifact;
     current.has_changes = has_changes;
+    current.published_ref = published_ref;
     current.state = OpState::Staged;
     current.revision = 2;
     write_op(project, &current)?;
@@ -516,6 +537,7 @@ fn event_from_op(op: &Op) -> Result<Event> {
                     .clone()
                     .context("op_payload_invalid: staged done has no artifact")?,
                 attestation: None,
+                published_ref: op.published_ref.clone(),
             }),
             waiting: None,
             failed: None,
@@ -845,7 +867,10 @@ mod tests {
         let card = box_card(&recipient);
         let op = reserved_box_done(&project, root.path(), &recipient);
         runner
-            .on("ls-remote", ok("abc\trefs/heads/hp/demo/t-0088\n"))
+            .on(
+                "ls-remote",
+                ok("abc\trefs/heads/seals/hp/demo/t-0088/abc\n"),
+            )
             .on("git -C", ok(""));
         stage_box_done(&project, &op.op, root.path(), &runner, &card).unwrap();
         let calls = runner.calls.borrow();
@@ -857,7 +882,7 @@ mod tests {
                 root.path().to_str().unwrap(),
                 "push",
                 "/remotes/publish repo.git",
-                "abc:refs/heads/hp/demo/t-0088",
+                "abc:refs/heads/seals/hp/demo/t-0088/abc",
             ]
         );
         assert_eq!(
@@ -867,10 +892,70 @@ mod tests {
                 root.path().to_str().unwrap(),
                 "ls-remote",
                 "/remotes/publish repo.git",
-                "refs/heads/hp/demo/t-0088",
+                "refs/heads/seals/hp/demo/t-0088/abc",
             ]
         );
-        assert_eq!(load(&project, &op.op).unwrap().state, OpState::Staged);
+        let staged = load(&project, &op.op).unwrap();
+        assert_eq!(staged.state, OpState::Staged);
+        assert_eq!(
+            staged.published_ref.as_deref(),
+            Some("seals/hp/demo/t-0088/abc")
+        );
+        let event = seal(&project, &op.op, |_| Ok(())).unwrap();
+        assert_eq!(
+            event.payload.done.unwrap().published_ref,
+            staged.published_ref
+        );
+    }
+
+    #[test]
+    fn divergent_seals_publish_without_rewriting_a_ref() {
+        use std::process::Command;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--bare"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let git = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "a@b.c"]);
+        git(&["config", "user.name", "A"]);
+        git(&["commit", "--allow-empty", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "--allow-empty", "-qm", "first"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "--detach", &base]);
+        git(&["commit", "--allow-empty", "-qm", "second"]);
+        let second = git(&["rev-parse", "HEAD"]);
+        let runner = crate::runner::RealRunner;
+        let url = remote.to_str().unwrap();
+        let branch = "review/pile/t-1";
+        for sha in [&first, &second] {
+            publish_lane_ref(&runner, &repo, &seal_ref(branch, sha), url, sha).unwrap();
+        }
+        for sha in [&first, &second] {
+            check_published_ref(&runner, &repo, &seal_ref(branch, sha), url, sha).unwrap();
+        }
     }
 
     #[test]

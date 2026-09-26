@@ -161,9 +161,8 @@ fn delete_remote(
             "ha thread show <project> <thread> (verify the branch head before cleanup)",
         ));
     }
-    let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
     let deletion = format!(":refs/heads/{branch}");
-    let out = deletion_command(runner, repo, &["push", &lease, url, &deletion])?;
+    let out = deletion_command(runner, repo, &["push", url, &deletion])?;
     if out.success() {
         return Ok(());
     }
@@ -174,10 +173,7 @@ fn delete_remote(
             "ha thread show <project> <thread> (verify the branch head before cleanup)",
         )),
         _ => {
-            bail!(
-                "git push {lease} {url} {deletion} in {repo}: {}",
-                out.error_text()
-            );
+            bail!("git push {url} {deletion} in {repo}: {}", out.error_text());
         }
     }
 }
@@ -321,10 +317,25 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     } else {
         None
     };
+    let has_seal_refs = crate::events::list(project).iter().any(|e| {
+        e.thread == record.id
+            && e.payload
+                .done
+                .as_ref()
+                .is_some_and(|d| d.published_ref.is_some())
+    });
     let expected = record
         .cleanup_reason
         .strip_prefix("retained worktree removal: ")
-        .or(review_pin.as_deref());
+        .or(
+            if has_seal_refs && record.is_remote() && !record.base.is_empty() {
+                Some(record.base.as_str())
+            } else if has_seal_refs {
+                None
+            } else {
+                review_pin.as_deref()
+            },
+        );
     let local = refs(ctx.runner, &record.repo, None)?;
     if let (Some(expected), Some(actual)) = (expected, local.get(&record.branch))
         && actual != expected
@@ -383,6 +394,26 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
             "published branch {} moved beyond its sealed cleanup tip",
             record.branch
         );
+    }
+    // Every immutable seal owns its own publication. Delete all of them,
+    // including superseded reviewer verdicts, before clearing cleanup_pending.
+    if let Some(url) = &url {
+        for event in crate::events::list(project)
+            .into_iter()
+            .filter(|e| e.thread == record.id)
+        {
+            if let Some(done) = event.payload.done
+                && let Some(reference) = done.published_ref
+            {
+                if reference != crate::ops::seal_ref(&record.branch, &done.sha) {
+                    bail!("seal {} has an invalid publication ref", event.id);
+                }
+                if let Some(actual) = local.get(&reference) {
+                    delete_local(ctx.runner, &record.repo, &reference, actual)?;
+                }
+                delete_remote(ctx.runner, &record.repo, url, &reference, &done.sha)?;
+            }
+        }
     }
     for (url, sha) in &record.review_sources {
         delete_remote(ctx.runner, &record.repo, url, &record.branch, sha)?;
@@ -889,6 +920,57 @@ mod tests {
     }
 
     #[test]
+    fn resolved_lane_prunes_both_divergent_seal_refs() {
+        let (fx, bare) = configured();
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let remote = bare.path().to_str().unwrap();
+        let branch = "hp/demo/t-1";
+        let base = run(&fx.repo, &["rev-parse", "HEAD"]);
+        run(&fx.repo, &["branch", branch, &base]);
+        run(&fx.repo, &["push", "-q", remote, branch]);
+        let record = thread::allocate(&fx.project, |t| {
+            t.repo = repo.clone();
+            t.branch = branch.into();
+            t.status = Status::Resolved;
+        })
+        .unwrap();
+        for (n, label) in [(1, "first"), (2, "second")] {
+            run(&fx.repo, &["checkout", "-q", "--detach", &base]);
+            run(&fx.repo, &["commit", "--allow-empty", "-qm", label]);
+            let sha = run(&fx.repo, &["rev-parse", "HEAD"]);
+            let reference = crate::ops::seal_ref(branch, &sha);
+            run(
+                &fx.repo,
+                &[
+                    "push",
+                    "-q",
+                    remote,
+                    &format!("{sha}:refs/heads/{reference}"),
+                ],
+            );
+            let id = fx.seal_done(&record.id, 1, n, &sha, label);
+            let path = fx
+                .project
+                .state_dir()
+                .join("events")
+                .join(format!("{id}.toml"));
+            let mut event = crate::events::load(&fx.project, &id).unwrap();
+            event.payload.done.as_mut().unwrap().published_ref = Some(reference);
+            std::fs::write(path, toml::to_string(&event).unwrap()).unwrap();
+        }
+        let runner = crate::runner::RealRunner;
+        let before = refs(&runner, &repo, Some(remote)).unwrap();
+        assert_eq!(before.len(), 3);
+        resolved_thread(&fx.world.ctx(), &fx.project, &record).unwrap();
+        let after = refs(&runner, &repo, Some(remote)).unwrap();
+        assert!(
+            !after
+                .keys()
+                .any(|name| name == branch || name.starts_with("seals/"))
+        );
+    }
+
+    #[test]
     fn one_time_sweep_only_removes_merged_resolved_lanes() {
         let (fx, bare) = configured();
         let repo = fx.repo.to_string_lossy().into_owned();
@@ -1180,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn leased_cleanup_against_a_fake_remote() {
+    fn checked_cleanup_against_a_fake_remote() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let bare = temp.path().join("remote.git");
@@ -1206,20 +1288,10 @@ mod tests {
         run(&repo, &["push", "-q", url, "hp/demo/t-1"]);
         let moved = delete_remote(&runner, path, url, "hp/demo/t-1", &sha).unwrap_err();
         assert!(crate::refusal::is(&moved));
-        run(
-            &repo,
-            &[
-                "push",
-                "-q",
-                "--force",
-                url,
-                &format!("{sha}:refs/heads/hp/demo/t-1"),
-            ],
-        );
-        run(&repo, &["checkout", "-q", "--detach", &sha]);
-        run(&repo, &["branch", "-f", "hp/demo/t-1", &sha]);
-        delete_remote(&runner, path, url, "hp/demo/t-1", &sha).unwrap();
-        delete_local(&runner, path, "hp/demo/t-1", &sha).unwrap();
+        let moved_sha = run(&repo, &["rev-parse", "HEAD"]);
+        run(&repo, &["checkout", "-q", "--detach", &moved_sha]);
+        delete_remote(&runner, path, url, "hp/demo/t-1", &moved_sha).unwrap();
+        delete_local(&runner, path, "hp/demo/t-1", &moved_sha).unwrap();
         assert!(
             !refs(&runner, path, Some(url))
                 .unwrap()

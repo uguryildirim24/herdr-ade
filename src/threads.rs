@@ -682,11 +682,19 @@ fn stage_box_review(
         remote::quote(&url)
     );
     for member in &record.members {
-        thread::update(project, &member.thread, |t| {
-            t.review_sources.insert(url.clone(), member.sha.clone());
-        })?;
-        let reference = format!("refs/heads/{}", member.branch);
-        git.run(&["push", &url, &format!("{}:{reference}", member.sha)])?;
+        let event = crate::events::load(project, &member.event)?;
+        let published = event
+            .payload
+            .done
+            .as_ref()
+            .and_then(|d| d.published_ref.as_deref());
+        let reference = format!("refs/heads/{}", published.unwrap_or(&member.branch));
+        if published.is_none() {
+            thread::update(project, &member.thread, |t| {
+                t.review_sources.insert(url.clone(), member.sha.clone());
+            })?;
+            git.run(&["push", &url, &format!("{}:{reference}", member.sha)])?;
+        }
         fetch.push(' ');
         fetch.push_str(&remote::quote(&reference));
     }
@@ -2558,6 +2566,7 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
                     coordinator: coordinator_name.clone(),
                     reason: reason.to_string(),
                 }),
+                published_ref: None,
             }),
             ..crate::contracts::EventPayload::default()
         },
@@ -4918,6 +4927,7 @@ mod tests {
                     report_path: "stored".into(),
                     artifact: "hash".into(),
                     attestation: None,
+                    published_ref: None,
                 }),
                 ..crate::contracts::EventPayload::default()
             },
