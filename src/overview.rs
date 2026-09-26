@@ -101,7 +101,7 @@ pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
         let _ = write!(out, " — {goal}");
     }
     let _ = writeln!(out);
-    // ade-rounds: the round stage and the questions waiting on Rolf.
+    // pile reviews: the review stage and the questions waiting on Rolf.
     let _ = writeln!(out, "  stage: {}", crate::board::stage(project));
     let asks = crate::ask::open_asks(project);
     if let Some(newest) = crate::ask::newest_open(project) {
@@ -241,7 +241,7 @@ mod tests {
         .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
         assert!(text.contains("needs you in pane w2:p1"));
-        assert!(text.contains("\n  stage: no round is open yet\n"), "{text}");
+        assert!(text.contains("\n  stage: no pile review yet\n"), "{text}");
         assert!(!text.contains("questions for you"));
     }
 

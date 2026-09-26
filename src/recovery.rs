@@ -14,7 +14,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
         bail!("event_payload_invalid");
     }
     let record = thread::load(project, &event.thread)?;
-    if crate::round::latest_event(&events::list(project), &record.id, event.attempt)
+    if crate::events::latest_event(&events::list(project), &record.id, event.attempt)
         .is_some_and(|latest| latest.id != event.id)
     {
         return Ok(());
@@ -26,7 +26,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
         return Ok(());
     }
     if record.kind == thread::Kind::Adopted {
-        bail!("escalation_adopted: an adopted process cannot be replaced");
+        bail!("recovery_adopted: an adopted process cannot be replaced");
     }
     if failure.class == FailureClass::Unknown {
         thread::update(project, &record.id, |t| {
@@ -46,7 +46,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
         return Ok(());
     }
     let task = std::fs::read_to_string(thread::task_path(project, &record.id))
-        .context("escalation_brief_missing")?;
+        .context("recovery_brief_missing")?;
     // Provider outages and lost connections are infrastructure failures: retry
     // the exact recipe. A gone process restarts the attempt. Only failed work
     // consumes the routing table's same-recipe work retry budget.
@@ -72,7 +72,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
                     || t.pane_id != record.pane_id
                     || t.status == thread::Status::Resolved
                 {
-                    bail!("escalation_stale: lane changed during assessment");
+                    bail!("recovery_stale: lane changed during assessment");
                 }
                 t.failure_event = event.id.clone();
                 t.last_failure = failure.text.clone();
@@ -81,7 +81,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
                 t.attempt = selected.attempt;
                 t.agent = selected.kind.clone();
                 t.launch = selected;
-                t.escalation_pending = true;
+                t.recovery_pending = true;
                 t.status = thread::Status::Failed;
                 t.prompt_pending = false;
                 t.launch_attempts = 0;
@@ -103,7 +103,7 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
             )?;
             thread::update_checked(project, &record.id, |t| {
                 if t.attempt != record.attempt || t.status == thread::Status::Resolved {
-                    bail!("escalation_stale: lane changed during assessment");
+                    bail!("recovery_stale: lane changed during assessment");
                 }
                 t.failure_event = event.id.clone();
                 t.last_failure = failure.text.clone();
@@ -145,9 +145,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     }
     for record in thread::list(project)
         .into_iter()
-        .filter(|t| t.escalation_pending && t.status != thread::Status::Resolved)
+        .filter(|t| t.recovery_pending && t.status != thread::Status::Resolved)
     {
-        if let Err(e) = threads::place_escalation(ctx, project, &record) {
+        if let Err(e) = threads::place_recovery(ctx, project, &record) {
             first.get_or_insert(e);
         }
     }

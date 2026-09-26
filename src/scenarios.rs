@@ -5,10 +5,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::contracts::{
-    AdmissionManifest, DonePayload, Event, EventPayload, ManifestMember, MergeIntent, MergePhase,
-    Recipient, RoundPhase, RoundRecord,
-};
+use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
 use crate::coordinator;
 use crate::paths::{Ctx, Env};
 use crate::project::{self, Project};
@@ -194,11 +191,11 @@ fn record_stored_report(project: &Project, thread_id: &str) {
             op: format!("{thread_id}-{attempt}-done"),
             thread: thread_id.into(),
             attempt,
-            round: Some("r1".into()),
             recipient: Recipient::default(),
             created: project::now(),
             payload: EventPayload {
                 done: Some(DonePayload {
+                    has_changes: None,
                     sha: "lane-sha".into(),
                     report_path: format!(".reports/{thread_id}.md"),
                     artifact,
@@ -209,40 +206,6 @@ fn record_stored_report(project: &Project, thread_id: &str) {
         },
     )
     .unwrap();
-}
-
-fn record_closed_round(project: &Project, thread: &str, repo: &str, phase: RoundPhase) {
-    let dir = project.state_dir().join("rounds");
-    std::fs::create_dir_all(&dir).unwrap();
-    let merge = (phase == RoundPhase::Merged).then(|| MergeIntent {
-        op: "merge-r1".into(),
-        expected_old: "b".into(),
-        candidate: "c".into(),
-        verdict: "v".into(),
-        phase: MergePhase::Checkpointed,
-        merged: Some("v".into()),
-        checkpoint: None,
-        head: Some("h".into()),
-    });
-    let record = RoundRecord {
-        phase,
-        merge,
-        round: "r1".into(),
-        branch: "main".into(),
-        plain: "The work is merged.".into(),
-        policy_hash: "policy".into(),
-        manifest: AdmissionManifest {
-            revision: 1,
-            members: vec![ManifestMember {
-                thread: thread.into(),
-                pin: None,
-                awaiting_report_after: None,
-            }],
-        },
-        repo: repo.into(),
-        ..RoundRecord::default()
-    };
-    std::fs::write(dir.join("r1.toml"), toml::to_string(&record).unwrap()).unwrap();
 }
 
 pub fn agent_json(
@@ -588,6 +551,7 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
         t.launch.kind = "claude".into();
         t.launch.recipe_id = "test_claude".into();
         t.launch.brief_hash = brief_hash.clone();
+        t.launch.same_recipe_retries = 100; // Automatic recovery has long since stopped.
     });
     std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();
     let pending = world.home.path().join("uncommitted-work.txt");
@@ -642,7 +606,7 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
     assert_eq!(t.worktree_path, cwd);
     assert_eq!(std::fs::read_to_string(pending).unwrap(), "keep me");
     assert_eq!(t.launch.recipe_id, "test_claude");
-    assert_eq!(t.launch.same_recipe_retries, 1);
+    assert_eq!(t.launch.same_recipe_retries, 101);
     let dispatch = std::fs::read_to_string(project.state_dir().join("dispatch.jsonl")).unwrap();
     let decision: serde_json::Value =
         serde_json::from_str(dispatch.lines().last().unwrap()).unwrap();
@@ -851,7 +815,7 @@ fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
         ok("?? scratch.txt\n"),
@@ -879,7 +843,7 @@ fn resolving_ignored_data_keeps_the_worktree_but_resolves_the_thread() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
         ok("!! camber-runs/raw.bin\n"),
@@ -920,7 +884,7 @@ fn resolving_disposable_ignored_output_removes_the_worktree() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
         ok("!! target/debug/cache\n"),
@@ -944,7 +908,7 @@ fn resolving_a_lane_with_only_its_stored_report_removes_the_worktree() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     record_stored_report(&project, &t.id);
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
@@ -974,7 +938,7 @@ fn resolve_uses_the_repository_specific_disposable_list() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
         ok("!! runs/pytest-resolve/cache\n"),
@@ -1006,7 +970,7 @@ fn a_nested_worktree_is_kept_inside_a_disposable_folder() {
         thread.repo = "/repo".into();
         thread.branch = "lane".into();
     });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
         ok("!! target/child/output.bin\n"),
@@ -1020,30 +984,6 @@ fn a_nested_worktree_is_kept_inside_a_disposable_folder() {
         thread::load(&project, &t.id).unwrap().status,
         Status::Resolved
     );
-}
-
-#[test]
-fn resolving_a_clean_lane_from_an_abandoned_round_removes_its_worktree() {
-    let world = World::new();
-    let project = world.project("demo", "a.sock");
-    let worktree = world.home.path().join("abandoned-worktree");
-    std::fs::create_dir_all(&worktree).unwrap();
-    let t = world.thread(&project, &worktree, |thread| {
-        thread.repo = "/repo".into();
-        thread.branch = "lane".into();
-    });
-    record_closed_round(&project, &t.id, "/repo", RoundPhase::Abandoned);
-    world
-        .runner
-        .on("status --porcelain --ignored --untracked-files=all", ok(""));
-    world.runner.on("worktree remove", ok(""));
-
-    threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
-
-    let resolved = thread::load(&project, &t.id).unwrap();
-    assert_eq!(resolved.status, Status::Resolved);
-    assert!(resolved.worktree_path.is_empty());
-    assert_eq!(world.runner.count("worktree remove"), 1);
 }
 
 fn configure_test_box(world: &World) {
@@ -1074,7 +1014,7 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
             thread.machine_id = "buildbox-id".into();
         },
     );
-    record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world
         .runner
         .on("for-each-ref --format=%(objectname) %(refname)", ok(""));
@@ -1171,7 +1111,7 @@ fn cancelling_other_ignored_data_keeps_a_box_worktree_but_removes_its_build() {
             thread.machine_id = "buildbox-id".into();
         },
     );
-    record_closed_round(&project, &t.id, &t.repo, RoundPhase::Merged);
+    thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     record_stored_report(&project, &t.id);
     world.runner.on(
         "machine list --json",
@@ -1280,11 +1220,11 @@ fn linked_files_over_cap_or_missing_keep_the_worktree_and_explain_why() {
                 op: "t-0001-1-done".into(),
                 thread: lane.id.clone(),
                 attempt: 1,
-                round: None,
                 recipient: Recipient::default(),
                 created: project::now(),
                 payload: EventPayload {
                     done: Some(DonePayload {
+                        has_changes: None,
                         sha: "sealed".into(),
                         report_path: lane.report_path(),
                         artifact: hash,
@@ -1334,11 +1274,11 @@ fn copy_overrides_do_not_discard_unsealed_or_unavailable_linked_reports() {
                     op: "t-0001-1-done".into(),
                     thread: lane.id.clone(),
                     attempt: 1,
-                    round: None,
                     recipient: Recipient::default(),
                     created: project::now(),
                     payload: EventPayload {
                         done: Some(DonePayload {
+                            has_changes: None,
                             sha: "sealed".into(),
                             report_path: lane.report_path(),
                             artifact: hash.clone(),
@@ -1404,11 +1344,11 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
         op: "t-0001-1-done".into(),
         thread: lane.id.clone(),
         attempt: 1,
-        round: None,
         recipient: Recipient::default(),
         created: project::now(),
         payload: EventPayload {
             done: Some(DonePayload {
+                has_changes: Some(false),
                 sha: "brief-sha".into(),
                 report_path: lane.report_path(),
                 artifact: artifact.clone(),
@@ -1510,7 +1450,7 @@ fn thread_start_is_refused_when_paused() {
         recipe: None,
         recipe_basis: None,
         task_id: String::new(),
-        review_round: String::new(),
+        review_id: String::new(),
     };
     let error = threads::start(&world.ctx(), "demo", args)
         .unwrap_err()
@@ -2024,7 +1964,7 @@ fn a_thread_without_any_listed_repo_is_refused() {
         recipe: None,
         recipe_basis: None,
         task_id: String::new(),
-        review_round: String::new(),
+        review_id: String::new(),
     };
     assert!(
         threads::start(&world.ctx(), "demo", args)
@@ -2124,7 +2064,7 @@ fn launch_without_a_routing_table_names_the_config_fix() {
 }
 
 #[test]
-fn typed_provider_errors_reach_escalation_and_retry_the_same_recipe() {
+fn typed_provider_errors_reach_recovery_and_retry_the_same_recipe() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     for (text, provider_kind) in [
@@ -2155,7 +2095,6 @@ fn typed_provider_errors_reach_escalation_and_retry_the_same_recipe() {
             op: event_id,
             thread: lane.id.clone(),
             attempt: 1,
-            round: None,
             recipient: crate::contracts::Recipient::default(),
             created: project::now(),
             payload: crate::contracts::EventPayload {
@@ -2168,7 +2107,7 @@ fn typed_provider_errors_reach_escalation_and_retry_the_same_recipe() {
             },
         };
 
-        crate::escalation::consume(&world.ctx(), &project, &event).unwrap();
+        crate::recovery::consume(&world.ctx(), &project, &event).unwrap();
 
         let retry = thread::load(&project, &lane.id).unwrap();
         assert_eq!(
@@ -2179,7 +2118,7 @@ fn typed_provider_errors_reach_escalation_and_retry_the_same_recipe() {
         assert_eq!(retry.attempt, 2);
         assert_eq!(retry.launch.recipe_id, "test_claude");
         assert_eq!(retry.launch.same_recipe_retries, 1);
-        assert!(retry.escalation_pending);
+        assert!(retry.recovery_pending);
     }
 }
 
@@ -2204,7 +2143,7 @@ fn provider_retries_do_not_consume_failed_work_retries() {
     )
     .unwrap();
     assert_eq!(provider.recipe_id, "test_claude");
-    assert_eq!(provider.escalations, 0);
+    assert_eq!(provider.work_retries, 0);
     assert_eq!(provider.same_recipe_retries, 1);
 
     let first_work = crate::launch::resolve_failure(
@@ -2215,7 +2154,7 @@ fn provider_retries_do_not_consume_failed_work_retries() {
     )
     .unwrap();
     assert_eq!(first_work.recipe_id, "test_claude");
-    assert_eq!(first_work.escalations, 1);
+    assert_eq!(first_work.work_retries, 1);
     assert_eq!(first_work.same_recipe_retries, 0);
     let error = crate::launch::resolve_failure(
         &world.ctx(),
@@ -2263,9 +2202,9 @@ fn provider_readiness_and_a_gone_process_schedule_same_recipe_restarts() {
     );
     assert_eq!(restarted.attempt, 2);
     assert_eq!(restarted.launch.recipe_id, "test_claude");
-    assert_eq!(restarted.launch.escalations, 0);
+    assert_eq!(restarted.launch.work_retries, 0);
     assert_eq!(restarted.launch.same_recipe_retries, 1);
-    assert!(restarted.escalation_pending);
+    assert!(restarted.recovery_pending);
 
     let provider_launch = crate::launch::resolve_launch(
         &world.ctx(),
@@ -2302,7 +2241,7 @@ fn provider_readiness_and_a_gone_process_schedule_same_recipe_restarts() {
         crate::contracts::FailureClass::Provider
     );
     assert_eq!(provider_retry.launch.recipe_id, "test_claude");
-    assert_eq!(provider_retry.launch.escalations, 0);
+    assert_eq!(provider_retry.launch.work_retries, 0);
     assert_eq!(provider_retry.launch.same_recipe_retries, 1);
 }
 
@@ -2556,16 +2495,7 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
     use crate::runner::fake::{ADE_NEW_VERB_SCENARIOS, FakeRunner};
     assert_eq!(
         ADE_NEW_VERB_SCENARIOS,
-        [
-            "thread_start_parent",
-            "ha_done",
-            "ha_waiting",
-            "round_open",
-            "round_review",
-            "checkpoint",
-            "ask",
-            "say",
-        ]
+        ["thread_start_parent", "ha_done", "ha_waiting", "ask", "say",]
     );
     let runner = FakeRunner::new();
     runner.on_ade_new_verbs();
@@ -2631,46 +2561,6 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
         ]))
         .unwrap();
     assert!(waiting_line.success());
-
-    // round open (SPEC-ADE D6)
-    let round_open = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "workspace",
-            "report-metadata",
-            "w1",
-            "--source",
-            "herdr-ade",
-            "--token",
-            "round=r1",
-            "--token",
-            "branch=main",
-        ]))
-        .unwrap();
-    assert!(round_open.success());
-
-    // round review (SPEC-ADE D6)
-    let review_wt = runner
-        .run(&Cmd::new("git", std::time::Duration::from_secs(1)).args([
-            "worktree",
-            "add",
-            ".worktrees/review",
-            "-b",
-            "review/r1",
-            "main",
-        ]))
-        .unwrap();
-    assert!(review_wt.success());
-
-    // checkpoint (SPEC-ADE D6 / D9)
-    let checkpoint = runner
-        .run(&Cmd::new("git", std::time::Duration::from_secs(1)).args([
-            "update-ref",
-            "refs/heads/main",
-            "H",
-            "V",
-        ]))
-        .unwrap();
-    assert!(checkpoint.success());
 
     // ask / say (SPEC-ADE D17)
     let ask = runner

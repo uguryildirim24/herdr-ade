@@ -508,7 +508,7 @@ struct ContextCursor {
     standing: String,
     messages: BTreeMap<String, String>,
     lanes: BTreeMap<String, String>,
-    rounds: BTreeMap<String, String>,
+    reviews: BTreeMap<String, String>,
     inbox: BTreeMap<String, String>,
     failures: BTreeMap<String, String>,
     relevant_config: BTreeMap<String, String>,
@@ -529,14 +529,10 @@ impl ContextCursor {
                 (thread.id, format!("{} — {stage}", thread.title.trim()))
             })
             .collect();
-        let rounds = crate::round::list(project)
+        let reviews = crate::review::list(project)
+            .unwrap_or_default()
             .into_iter()
-            .map(|round| {
-                (
-                    round.round,
-                    format!("{:?} — {}", round.phase, round.plain.trim()),
-                )
-            })
+            .map(|review| (review.id, format!("{:?}", review.phase)))
             .collect();
         let messages = crate::talk::read(project)
             .lines
@@ -584,15 +580,13 @@ impl ContextCursor {
             .0
             .into_iter()
             .filter(|view| {
-                matches!(
-                    view.state,
-                    crate::task::State::Finished
-                        | crate::task::State::Reviewed
-                        | crate::task::State::Merged
-                        | crate::task::State::Installed
-                        | crate::task::State::Verified
-                        | crate::task::State::Dropped
-                )
+                !view.record.dropped.is_empty()
+                    || matches!(
+                        view.state,
+                        crate::task::State::Finished
+                            | crate::task::State::Merged
+                            | crate::task::State::Installed
+                    )
             })
             .map(|view| {
                 let task = &view.record;
@@ -606,11 +600,7 @@ impl ContextCursor {
                     .max()
                     .unwrap_or("");
                 // Review, merge and install are not new completion notices.
-                let signature = format!(
-                    "{done}:{:?}:{:?}",
-                    task.verified.last().map(|e| &e.at),
-                    task.dropped.last().map(|e| &e.at)
-                );
+                let signature = format!("{done}:{:?}", task.dropped.last().map(|e| &e.at));
                 (task.id.clone(), signature)
             })
             .collect();
@@ -620,7 +610,7 @@ impl ContextCursor {
             standing: crate::thread::sha256_hex(standing.as_bytes()),
             messages,
             lanes,
-            rounds,
+            reviews,
             inbox,
             failures,
             relevant_config,
@@ -700,7 +690,7 @@ fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> S
     for (label, old, new) in [
         ("Rolf", &previous.messages, &current.messages),
         ("Lane", &previous.lanes, &current.lanes),
-        ("Round", &previous.rounds, &current.rounds),
+        ("Review", &previous.reviews, &current.reviews),
         ("Inbox", &previous.inbox, &current.inbox),
         ("Failure", &previous.failures, &current.failures),
     ] {
@@ -820,59 +810,6 @@ fn compact_tasks(
                 }
                 out.push('\n');
             }
-        }
-        "## Open tasks" => {
-            out.push_str(heading);
-            out.push_str("\n\n");
-            let mut waits: BTreeMap<(String, String), usize> = BTreeMap::new();
-            let mut verifying_waits = 0;
-            let mut skip_wait_detail = false;
-            for line in body.lines() {
-                if let Some(id) = line
-                    .strip_prefix("- `")
-                    .and_then(|s| s.split_once('`'))
-                    .map(|(id, _)| id)
-                {
-                    skip_wait_detail = false;
-                    if let Some(view) = views.get(id)
-                        && let Some(wait) = crate::task::active_wait(project, &view.record)
-                    {
-                        let verifying = view.next.starts_with("verify ")
-                            && view.next.ends_with(" acceptance condition(s)");
-                        if verifying {
-                            verifying_waits += 1;
-                            skip_wait_detail = true;
-                        } else if (view.state == crate::task::State::Open
-                            && view.record.attempts.is_empty())
-                            || view.next.starts_with("wait ")
-                        {
-                            *waits
-                                .entry((wait.kind.clone(), wait.target.clone()))
-                                .or_default() += 1;
-                            skip_wait_detail = true;
-                        }
-                    }
-                }
-                if !skip_wait_detail && !line.is_empty() {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            }
-            if verifying_waits > 0 {
-                let _ = writeln!(
-                    out,
-                    "- {verifying_waits} task(s) wait to verify acceptance conditions; list with `ha task list {}`",
-                    project.slug
-                );
-            }
-            for ((kind, target), count) in waits {
-                let _ = writeln!(
-                    out,
-                    "- {count} task(s) wait on {kind}: {target}; list with `ha task list {}`",
-                    project.slug
-                );
-            }
-            out.push('\n');
         }
         _ => {
             out.push_str(heading);
@@ -1149,7 +1086,7 @@ fn digest_snapshot(
                         | crate::thread::Group::Unknown
                 ) || row.thread.lineage_mismatch
                     || !row.thread.copy_notes.is_empty()
-                    || crate::round::latest_event(
+                    || crate::events::latest_event(
                         &events,
                         &row.thread.id,
                         row.thread.attempt.max(1),
@@ -1200,7 +1137,7 @@ fn digest_snapshot(
                 .unwrap_or_default();
             let _ = writeln!(out, "  {}{kind}: {}", t.failure_class.plain(), t.error);
         }
-        let completion = crate::round::latest_event(&events, &t.id, t.attempt.max(1));
+        let completion = crate::events::latest_event(&events, &t.id, t.attempt.max(1));
         if let Some(event) = completion {
             if let Some(done) = &event.payload.done {
                 let report = crate::thread::sealed_report_reference(project, t)
@@ -1275,84 +1212,25 @@ fn digest_snapshot(
             );
         }
     }
-    let rounds = crate::round::checked_list(project)?;
-    let mut active: Vec<_> = rounds
-        .iter()
-        .filter(|round| {
-            !round.phase.closed()
-                && (matches!(
-                    round.phase,
-                    crate::contracts::RoundPhase::Admitting
-                        | crate::contracts::RoundPhase::UnderReview
-                        | crate::contracts::RoundPhase::VerdictIn
-                        | crate::contracts::RoundPhase::Merging
-                        | crate::contracts::RoundPhase::Checkpointing
-                        | crate::contracts::RoundPhase::Diverged
-                ) || !crate::round::current_attention(ctx, project, round).is_empty())
-        })
-        .collect();
-    active.sort_by_key(|r| r.round.trim_start_matches('r').parse::<u64>().unwrap_or(0));
-    if !active.is_empty() {
-        let _ = writeln!(out, "\n## Rounds needing action");
-        overflow_count(&mut out, active.len());
-    }
-    for round in active.iter().take(DIGEST_ROWS) {
+    out.push_str("\n## Pile reviews\n\n");
+    for review in crate::review::list(project)?
+        .into_iter()
+        .filter(|r| !r.phase.closed())
+    {
         let _ = writeln!(
             out,
-            "- {} [{:?}] {} — {}",
-            round.round, round.phase, round.branch, round.plain
+            "- {} [{:?}] {} lanes — reviewer {}{}",
+            review.id,
+            review.phase,
+            review.members.len(),
+            review.reviewer.as_deref().unwrap_or("pending"),
+            if review.attention.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", review.attention)
+            }
         );
-        let _ = writeln!(
-            out,
-            "  members: {}",
-            round
-                .manifest
-                .members
-                .iter()
-                .take(DIGEST_ROWS)
-                .map(|m| {
-                    match &m.pin {
-                        Some(pin) => format!("{}@{}", m.thread, pin.sha),
-                        None => format!("{} (pending)", m.thread),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        overflow_count(&mut out, round.manifest.members.len());
-        let _ = write!(out, "{}", crate::round::gate_summary(round));
-        if let Some(reviewer) = &round.reviewer {
-            let _ = writeln!(out, "  reviewer: {reviewer}");
-        }
-        let attention = crate::round::current_attention(ctx, project, round);
-        if let Some(merge) = &round.merge {
-            if !attention.is_empty() {
-                let _ = writeln!(out, "  {attention}");
-            }
-            let _ = writeln!(
-                out,
-                "  merge {:?}: start={} candidate={} merged={} checkpoint={}; run `round merge {}` to finish or diagnose",
-                merge.phase,
-                merge.expected_old,
-                merge.candidate,
-                merge.merged.as_deref().unwrap_or("none"),
-                merge.head.as_deref().unwrap_or("none"),
-                round.round
-            );
-        } else {
-            if !attention.is_empty() {
-                let _ = writeln!(out, "  {attention}");
-            }
-            if round.reviewer_start_failures > 0 {
-                let _ = writeln!(
-                    out,
-                    "  reviewer start failures: {}",
-                    round.reviewer_start_failures
-                );
-            }
-        }
     }
-
     let _ = writeln!(out, "\n## Recipes\nCommands: {prefix}");
     match crate::launch::parse_launch_config(&ctx.config_dir) {
         Ok(config) => {
@@ -1454,8 +1332,8 @@ mod tests {
         after.messages.insert("q-2".into(), "New request".into());
         after.lanes.insert("t-0001".into(), "Fix — working".into());
         after
-            .rounds
-            .insert("r1".into(), "Admitting — review".into());
+            .reviews
+            .insert("review-1".into(), "Preparing — review".into());
         after
             .inbox
             .insert("i1".into(), "[alert] investigate".into());
@@ -1464,7 +1342,7 @@ mod tests {
         for expected in [
             "Rolf q-2",
             "Lane t-0001",
-            "Round r1",
+            "Review review-1",
             "Inbox i1",
             "Failure f1",
         ] {
@@ -1524,7 +1402,7 @@ mod tests {
         };
         let dir = project.record_dir_for_write("tasks").unwrap();
         std::fs::write(dir.join("job-9999.toml"), toml::to_string(&task).unwrap()).unwrap();
-        let body = "## Facts in force\n\n- `n-1` (historical; t-0001): old fact\n  long continuation\n- `n-2` (request:q-1): current fact\n\n## Recently finished or dropped tasks\n\n- `job-9999` [verified] old task\n";
+        let body = "## Facts in force\n\n- `n-1` (historical; t-0001): old fact\n  long continuation\n- `n-2` (request:q-1): current fact\n\n## Recently finished or dropped tasks\n\n- `job-9999` [installed] old task\n";
         let cursor = ContextCursor::default();
         let filtered = compact_page(&project, body, None, &cursor);
         assert!(!filtered.contains("old fact"), "{filtered}");
@@ -1537,7 +1415,7 @@ mod tests {
     fn completion_rows_only_show_changes_since_read_without_reports() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
-        let body = "# Project\n\n## Recently finished or dropped tasks\n\n- `job-0001` [dropped] Old\n  Final report (`t-0001`): `secret`\n- `job-0002` [dropped] New\n  Final report (`t-0002`): `secret`\n\n---\n";
+        let body = "# Project\n\n## Recently finished or dropped tasks\n\n- `job-0001` [dropped] Old\n  Final report (`t-0001`): `secret`\n- `job-0002` [open] New\n  Final report (`t-0002`): `secret`\n\n---\n";
         let dir = project.record_dir_for_write("tasks").unwrap();
         for (id, title) in [("job-0001", "Old"), ("job-0002", "New")] {
             let task = crate::task::Task {
@@ -1571,7 +1449,7 @@ mod tests {
                 .contains("## Recently finished or dropped tasks")
         );
         let text = compact_page(&project, body, Some(&before), &now);
-        assert!(text.contains("- `job-0002` [dropped] New"), "{text}");
+        assert!(text.contains("- `job-0002` [open] New"), "{text}");
         assert!(!text.contains("job-0001"), "{text}");
         assert!(!text.contains("secret"), "{text}");
         assert!(
@@ -1579,80 +1457,6 @@ mod tests {
                 .contains("## Recently finished or dropped tasks")
         );
         assert!(body.contains("Final report")); // --full keeps the whole list
-    }
-
-    #[test]
-    fn active_holds_collapse_but_resolved_holds_and_actions_remain() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let dir = project.record_dir_for_write("tasks").unwrap();
-        for (id, kind) in [
-            ("job-0001", "event"),
-            ("job-0002", "event"),
-            ("job-0003", "round"),
-        ] {
-            let task = crate::task::Task {
-                id: id.into(),
-                title: id.into(),
-                authority: vec!["request:q-1".into()],
-                acceptance: vec!["Done".into()],
-                repo: Some("/tmp/repo".into()),
-                created: "2020-01-01T00:00:00Z".into(),
-                wait: Some(crate::task::TaskWait {
-                    kind: kind.into(),
-                    target: if kind == "round" { "r1" } else { "release" }.into(),
-                    snapshot: "stale".into(),
-                    since: "2020-01-01T00:00:00Z".into(),
-                }),
-                ..Default::default()
-            };
-            std::fs::write(
-                dir.join(format!("{id}.toml")),
-                toml::to_string(&task).unwrap(),
-            )
-            .unwrap();
-        }
-        let actionable = crate::task::Task {
-            id: "job-0004".into(),
-            title: "Needs repair".into(),
-            authority: vec!["request:q-1".into()],
-            acceptance: vec!["Done".into()],
-            created: "2020-01-01T00:00:00Z".into(),
-            attempts: vec!["t-missing".into()],
-            wait: Some(crate::task::TaskWait {
-                kind: "event".into(),
-                target: "release".into(),
-                snapshot: String::new(),
-                since: "2020-01-01T00:00:00Z".into(),
-            }),
-            ..Default::default()
-        };
-        std::fs::write(
-            dir.join("job-0004.toml"),
-            toml::to_string(&actionable).unwrap(),
-        )
-        .unwrap();
-        let round = crate::contracts::RoundRecord {
-            round: "r1".into(),
-            phase: crate::contracts::RoundPhase::Abandoned,
-            ..Default::default()
-        };
-        std::fs::create_dir_all(crate::round::rounds_dir(&project)).unwrap();
-        std::fs::write(
-            crate::round::round_path(&project, "r1"),
-            toml::to_string(&round).unwrap(),
-        )
-        .unwrap();
-        let body = "## Open tasks\n\n- `job-0001` [open] One — next: start an attempt\n  waits on event: release\n- `job-0002` [open] Two — next: start an attempt\n  waits on event: release\n- `job-0003` [open] Three — next: start an attempt\n  waits on round: r1\n- `job-0004` [unknown] Needs repair — next: repair the missing attempt record\n  waits on event: release\n";
-        let text = compact_page(&project, body, None, &ContextCursor::default());
-        assert!(
-            text.contains("2 task(s) wait on event: release; list with `ha task list demo`"),
-            "{text}"
-        );
-        assert!(!text.contains("job-0001"), "{text}");
-        assert!(!text.contains("job-0002"), "{text}");
-        assert!(text.contains("job-0003"), "{text}");
-        assert!(text.contains("job-0004"), "{text}");
     }
 
     #[test]
@@ -1692,64 +1496,8 @@ mod tests {
     }
 
     #[test]
-    fn merged_round_with_a_removed_member_worktree_does_not_probe_it_in_context() {
-        use crate::contracts::{MergeIntent, MergePhase, RoundPhase};
-        use crate::round::testkit::fixture;
-
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        let (lane, sha) = fx.lane(1);
-        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some("The change landed.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
-        let path = crate::round::rounds_dir(&fx.project).join("r1.toml");
-        let mut round = crate::round::load(&fx.project, "r1").unwrap();
-        round.phase = RoundPhase::Merged;
-        round.merge = Some(MergeIntent {
-            op: "test-merge".into(),
-            expected_old: sha.clone(),
-            candidate: sha.clone(),
-            verdict: sha.clone(),
-            phase: MergePhase::Checkpointed,
-            merged: Some(sha),
-            checkpoint: None,
-            head: None,
-        });
-        std::fs::write(path, toml::to_string(&round).unwrap()).unwrap();
-        let missing = fx.repo.join(".worktrees/removed-lane");
-        crate::thread::update(&fx.project, &lane, |thread| {
-            thread.status = crate::thread::Status::Resolved;
-            thread.worktree_path = missing.to_string_lossy().into_owned();
-            thread.cwd = thread.worktree_path.clone();
-            thread.resolved_reason = "manual".into();
-        })
-        .unwrap();
-        fx.world.runner.calls.borrow_mut().clear();
-
-        crate::project::refresh_page(&fx.project).unwrap();
-        let (text, _) = digest(&ctx, &fx.project, "ha").unwrap();
-        assert!(text.contains("# Project"), "{text}");
-        assert!(
-            fx.world.runner.calls.borrow().iter().all(|call| !call
-                .display()
-                .contains(&missing.to_string_lossy().to_string())),
-            "context probed a resolved round member's removed checkout"
-        );
-    }
-
-    #[test]
     fn answered_wait_is_absent_from_context_and_project_page() {
-        let fx = crate::round::testkit::fixture();
+        let fx = crate::testkit::fixture();
         let lane = fx.thread("Waiting lane");
         let event = fx.seal_waiting(&lane, 1, 1, "Need a choice.");
         crate::project::refresh_page(&fx.project).unwrap();

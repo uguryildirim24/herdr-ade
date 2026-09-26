@@ -38,10 +38,6 @@ pub(crate) enum Entry {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         means: Option<String>,
-        /// The round whose successful merge this line is landing evidence for
-        /// (SPEC-talk §6.1). Omitted on ordinary say entries.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        landed_round: Option<String>,
     },
     Ask {
         id: String,
@@ -883,7 +879,7 @@ fn fresh_request() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::round::testkit::fixture;
+    use crate::testkit::fixture;
 
     #[test]
     fn live_claude_suggestions_and_pi_cursor_are_empty_editors() {
@@ -997,7 +993,6 @@ mod tests {
             Entry::Say {
                 what: "One.".into(),
                 means: None,
-                landed_round: None,
             },
         )
         .unwrap();
@@ -1016,7 +1011,6 @@ mod tests {
             Entry::Say {
                 what: "Two.".into(),
                 means: None,
-                landed_round: None,
             },
         )
         .unwrap();
@@ -1026,7 +1020,6 @@ mod tests {
             Entry::Say {
                 what: "Three.".into(),
                 means: None,
-                landed_round: None,
             },
         )
         .unwrap();
@@ -1053,7 +1046,6 @@ mod tests {
         let big = Entry::Say {
             what: "x".repeat(MAX_ENTRY_BYTES),
             means: None,
-            landed_round: None,
         };
         assert!(
             format!("{:#}", append(&fx.project, None, big).unwrap_err())

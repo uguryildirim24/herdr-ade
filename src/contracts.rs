@@ -2,10 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 /// One executable `[recipes.<id>]` row. Selection lives in `[routing]` and
 /// placement belongs to `[dispatch]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,7 +109,8 @@ pub(crate) struct Launch {
     pub(crate) recipe_id: String,
     /// Number of failed-work recovery selections after the first launch.
     /// Infrastructure retries do not consume the failed-work retry budget.
-    pub(crate) escalations: u32,
+    #[serde(alias = "escalations")]
+    pub(crate) work_retries: u32,
     /// Number of bounded same-recipe retries for provider, connection, and
     /// process failures.
     #[serde(default)]
@@ -134,7 +131,7 @@ pub(crate) struct Launch {
     /// never rereads live config.
     pub(crate) compact_reason: String,
     /// Evidence intentionally left out before dispatch (for example a review
-    /// diff that the agent reads from its checkout). Escalations retain it.
+    /// diff that the agent reads from its checkout). Retries retain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_truncation: Option<serde_json::Value>,
     /// Machine selected for this launch (`local` or its saved-machine label).
@@ -270,8 +267,6 @@ pub(crate) struct Op {
     pub(crate) attempt: u32,
     pub(crate) kind: OpKind,
     pub(crate) recipient: Recipient,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) round: Option<String>,
     pub(crate) helper_pid: u32,
     pub(crate) requested: Requested,
     /// Fixed event id: equal to `op` (SPEC-ADE D5, item 32).
@@ -283,6 +278,8 @@ pub(crate) struct Op {
     /// Report bytes read at reservation; absent in historical operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) report_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) has_changes: Option<bool>,
 }
 
 /// A coordinator's explicit acceptance of a resolved lane's stored report.
@@ -295,6 +292,8 @@ pub(crate) struct Attestation {
 /// Sealed `done` payload (SPEC-ADE D5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct DonePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) has_changes: Option<bool>,
     /// Empty only when an attested historical lane has no git folder left.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) sha: String,
@@ -333,8 +332,6 @@ pub(crate) struct Event {
     pub(crate) op: String,
     pub(crate) thread: String,
     pub(crate) attempt: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) round: Option<String>,
     pub(crate) recipient: Recipient,
     pub(crate) created: String,
     pub(crate) payload: EventPayload,
@@ -364,8 +361,6 @@ pub(crate) struct Ask {
     pub(crate) id: String,
     pub(crate) revision: u32,
     pub(crate) project: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) round: Option<String>,
     pub(crate) question: String,
     pub(crate) choices: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -385,9 +380,6 @@ pub(crate) enum HumanMessage {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         means: Option<String>,
-        /// The merged round this line is landing evidence for (SPEC-talk §6.1).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        landed_round: Option<String>,
     },
     Ask {
         id: String,
@@ -396,292 +388,6 @@ pub(crate) enum HumanMessage {
     Notice {
         id: String,
     },
-}
-
-/// Completion pin projected onto a manifest member from a sealed `done`
-/// event (SPEC-ADE D6, item 33).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct CompletionPin {
-    pub(crate) event: String,
-    pub(crate) attempt: u32,
-    pub(crate) sha: String,
-    pub(crate) artifact: String,
-}
-
-/// One admitted lane in the round manifest (SPEC-ADE D6, item 33).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct ManifestMember {
-    pub(crate) thread: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) pin: Option<CompletionPin>,
-    /// The completion which preceded a follow-up sent to this lane. While
-    /// present, only a later `done` may pin the member again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) awaiting_report_after: Option<String>,
-}
-
-/// Authoritative admitted set. Membership is never inferred from completions
-/// (SPEC-ADE D6, item 33).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct AdmissionManifest {
-    pub(crate) revision: u64,
-    #[serde(default)]
-    pub(crate) members: Vec<ManifestMember>,
-}
-
-/// Lifecycle owned by the round record, not by events or git refs.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RoundPhase {
-    #[default]
-    Admitting,
-    PreparingReview,
-    UnderReview,
-    VerdictIn,
-    Merging,
-    Checkpointing,
-    Merged,
-    Abandoned,
-    Diverged,
-}
-
-impl RoundPhase {
-    pub(crate) fn closed(self) -> bool {
-        matches!(self, Self::Merged | Self::Abandoned)
-    }
-}
-
-/// Planned review outputs retained for historical in-flight records.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ReviewIntent {
-    pub(crate) head: String,
-    pub(crate) branch: String,
-    pub(crate) brief: String,
-    pub(crate) manifest_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) reuse_brief: Option<String>,
-}
-
-/// A gate pinned into a round. The string shape exists only so historical
-/// round records keep loading; newly opened rounds always store `Typed`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub(crate) enum PinnedGate {
-    Legacy(String),
-    Typed(crate::project::Gate),
-}
-
-impl PinnedGate {
-    pub(crate) fn command(&self) -> &str {
-        match self {
-            Self::Legacy(command) => command,
-            Self::Typed(gate) => &gate.command,
-        }
-    }
-
-    pub(crate) fn env(&self) -> Option<&std::collections::BTreeMap<String, String>> {
-        match self {
-            Self::Legacy(_) => None,
-            Self::Typed(gate) => Some(&gate.env),
-        }
-    }
-}
-
-/// Which pinned gate ran and which changed paths selected it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct GateSelection {
-    pub(crate) index: usize,
-    pub(crate) files: Vec<String>,
-}
-
-/// `.state/rounds/r<n>.toml` owns the entire round transaction.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct RoundRecord {
-    #[serde(default)]
-    pub(crate) phase: RoundPhase,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) review_intent: Option<ReviewIntent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) merge: Option<MergeIntent>,
-    /// A multi-round merge is owned by its first round. The original verdicts
-    /// remain pinned while its integration review replaces that round's verdict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) batch: Option<BatchMerge>,
-    /// Accepted reviewer completion. Before a merge intent exists, the latest
-    /// authoritative completion from this reviewer supersedes an older pin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) verdict: Option<CompletionPin>,
-    /// The reviewer completion which preceded a requested correction. While
-    /// present, only a later sealed `done` can become the verdict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) reviewer_awaiting_report_after: Option<String>,
-    /// The validated verdict word for the accepted sealed report.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) verdict_kind: Option<String>,
-    pub(crate) round: String,
-    pub(crate) branch: String,
-    pub(crate) plain: String,
-    /// `None` means the selected repository had no gate policy. An empty
-    /// vector is an explicit gate-free policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) gates: Option<Vec<PinnedGate>>,
-    /// `None` on historical records means every pinned gate ran.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selected_gates: Option<Vec<GateSelection>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) skipped_gates: Vec<usize>,
-    pub(crate) policy_hash: String,
-    pub(crate) manifest: AdmissionManifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) expected_head: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) manifest_hash: Option<String>,
-    /// When `ha round open` wrote the record; orders name views (A3).
-    #[serde(default)]
-    pub(crate) opened: String,
-    /// Repository the integration branch lives in, fixed at open (A3).
-    #[serde(default)]
-    pub(crate) repo: String,
-    /// Manifest revision frozen for the current review.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) frozen_revision: Option<u64>,
-    /// Content-addressed review brief in the project artifact store. The
-    /// checked-out review branch is separately pinned by `expected_head`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) review_artifact: Option<String>,
-    /// The prior review retained while a repair review is running. Its report
-    /// artifact and candidate commit remain one sealed proof.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) previous_verdict: Option<CompletionPin>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) previous_verdict_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) previous_manifest_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) previous_review_branch: Option<String>,
-    /// `review/r<n>`, created from the recorded review base.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) review_branch: Option<String>,
-    /// The reviewer thread whose sealed `done` names candidate C.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) reviewer: Option<String>,
-    /// What `round advance` last announced for this round (a verdict or a
-    /// gone reviewer), so each state is announced once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) announced: Option<String>,
-    /// Current coordinator action, owned by this round rather than the inbox.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) attention: String,
-    /// How many reviewer starts `advance` has tried and failed for this round
-    /// (a refused start or a reviewer whose agent never came up). The retry is
-    /// bounded by `round::MAX_REVIEWER_START_FAILURES` (E3/D1).
-    #[serde(default)]
-    pub(crate) reviewer_start_failures: u32,
-    /// Next automatic retry of a reviewer that failed before any launch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) reviewer_retry_at: Option<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) reviewer_start_error: String,
-    /// REJECT verdicts observed before the round eventually merged. `None`
-    /// means this historical round predates outcome tracking.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) rejections: Option<u32>,
-    /// Human-supplied reason for deliberately ending an unmergeable round.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) abandoned_reason: Option<String>,
-    /// Publication and installation policy pinned at open. Historical rounds
-    /// default to no post-merge effects.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) push_remote: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) published: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) install_required: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) installed: bool,
-    /// The round closed before each member received its durable cleanup mark.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) cleanup_pending: bool,
-}
-
-impl RoundRecord {
-    /// Whether this round currently carries a lane. The manifest preserves
-    /// historical admissions, but abandoning the round releases its members.
-    pub(crate) fn carries(&self, thread: &str) -> bool {
-        self.phase != RoundPhase::Abandoned
-            && self
-                .manifest
-                .members
-                .iter()
-                .any(|member| member.thread == thread)
-    }
-}
-
-/// Durable selection for one integration review and one publication.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct BatchMerge {
-    pub(crate) rounds: Vec<String>,
-    pub(crate) verdicts: Vec<String>,
-    pub(crate) base: String,
-    pub(crate) candidate: String,
-    /// The owner's review at selection time; distinguishes a newly selected
-    /// batch from a review created just before a crash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selection_review_branch: Option<String>,
-    /// Reviewer whose sealed verdict selected the batch. Historical records
-    /// omit this and can recover it from the sealed completion.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selection_reviewer: Option<String>,
-    /// The selected sealed verdict may predate a rejected integration review.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selection_verdict: Option<CompletionPin>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selected_review_branch: Option<String>,
-    /// Set once the integration review revision exists; a prior REJECT on the
-    /// owning round is not a verdict on this selection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) review_branch: Option<String>,
-}
-
-/// Checkpoint intent bound to the merged candidate and sealed payload hash.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct CheckpointIntent {
-    pub(crate) parent: String,
-    pub(crate) op: String,
-    pub(crate) payload_hash: String,
-    /// Content-addressed handoff bundle in project state. Historical rounds
-    /// checkpointed before bundles existed have no artifact.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) artifact: Option<String>,
-}
-
-/// Merge transaction phase (SPEC-ADE D6, item 34).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MergePhase {
-    Intent,
-    Merged,
-    Checkpointed,
-    MergeDiverged,
-}
-
-/// Merge/checkpoint transaction embedded in the owning round record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct MergeIntent {
-    pub(crate) op: String,
-    pub(crate) expected_old: String,
-    pub(crate) candidate: String,
-    pub(crate) verdict: String,
-    pub(crate) phase: MergePhase,
-    /// The commit the integration branch held after merging the candidate: C
-    /// on a fast-forward, otherwise a merge commit whose first parent is the
-    /// moved head. The checkpoint artifact is bound to it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) merged: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) checkpoint: Option<CheckpointIntent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) head: Option<String>,
 }
 
 /// Talk inbound request states (SPEC-ADE D18 item 2, item 35).
@@ -742,7 +448,7 @@ impl StepState {
     }
 }
 
-/// One ordered plan step (SPEC-talk §6.5). `tasks`, `threads` and `rounds` are
+/// One ordered plan step (SPEC-talk §6.5). `tasks` and historical `threads` are
 /// required work, not related discussions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
@@ -755,7 +461,6 @@ pub(crate) struct PlanStep {
     #[serde(default)]
     pub(crate) tasks: Vec<String>,
     pub(crate) threads: Vec<String>,
-    pub(crate) rounds: Vec<String>,
     /// One level of subtasks under a top-level step; a subtask never has its
     /// own. Left out of the record when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -808,14 +513,6 @@ impl AuthorityRef {
     }
 }
 
-/// One JSON object on `talk/journal.jsonl` (SPEC-ADE D18 items 2 and 6).
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct TalkJournalRecord {
-    pub(crate) seq: u64,
-    pub(crate) inbound: TalkInbound,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,6 +546,7 @@ mod tests {
     #[test]
     fn op_and_event_roundtrip() {
         let op = Op {
+            has_changes: None,
             op: "t-0001-1-1".into(),
             revision: 2,
             thread: "t-0001".into(),
@@ -858,7 +556,6 @@ mod tests {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
             },
-            round: Some("r1".into()),
             helper_pid: 4242,
             requested: Requested::Done {
                 sha: "abc".into(),
@@ -876,11 +573,11 @@ mod tests {
             op: op.op.clone(),
             thread: op.thread.clone(),
             attempt: op.attempt,
-            round: op.round.clone(),
             recipient: op.recipient.clone(),
             created: op.created.clone(),
             payload: EventPayload {
                 done: Some(DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     report_path: ".reports/a.md".into(),
                     artifact: "deadbeef".into(),
@@ -895,7 +592,6 @@ mod tests {
             op: "t-0002-1-1".into(),
             thread: "t-0002".into(),
             attempt: 1,
-            round: None,
             recipient: Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
@@ -946,7 +642,6 @@ mod tests {
             id: "a-1".into(),
             revision: 1,
             project: "demo".into(),
-            round: Some("r1".into()),
             question: "keep the experiment running another hour?".into(),
             choices: vec!["keep it running another hour".into(), "stop it now".into()],
             what: Some("A lane is waiting.".into()),
@@ -958,7 +653,6 @@ mod tests {
             id: "s-1".into(),
             what: "A lane is done.".into(),
             means: None,
-            landed_round: None,
         });
         json_roundtrip(&HumanMessage::Ask {
             id: "a-1".into(),
@@ -986,7 +680,6 @@ mod tests {
                     state: StepState::Done,
                     tasks: vec!["job-0001".into()],
                     threads: vec!["t-0041".into()],
-                    rounds: vec![],
                     subtasks: vec![],
                 },
                 PlanStep {
@@ -995,7 +688,6 @@ mod tests {
                     state: StepState::Running,
                     tasks: vec![],
                     threads: vec!["t-0043".into(), "t-0044".into()],
-                    rounds: vec!["r1".into()],
                     subtasks: vec![],
                 },
             ],
@@ -1047,7 +739,7 @@ mod tests {
             brief_hash: String::new(),
             skill_hash: "aa".into(),
             recipe_id: "agy_gemini_flash".into(),
-            escalations: 0,
+            work_retries: 0,
             same_recipe_retries: 0,
             routing_rule: "default".into(),
             recipe_basis: String::new(),
@@ -1056,147 +748,6 @@ mod tests {
             compact_reason: "this task runs on the web research helper".into(),
             source_truncation: None,
             machine: "buildbox".into(),
-        });
-    }
-
-    #[test]
-    fn historical_records_with_removed_routing_fields_still_load() {
-        let json: Launch = serde_json::from_value(serde_json::json!({
-            "recipe_id": "old",
-            "strength": 3,
-            "assessment": {"score": 1},
-            "decision": {"recipe": "old"},
-            "low_confidence": true,
-            "routing_hash": "aa"
-        }))
-        .unwrap();
-        assert_eq!(json.recipe_id, "old");
-
-        let toml: Launch = toml::from_str(
-            r#"recipe_id = "old"
-strength = 3
-assessment = { score = 1 }
-decision = { recipe = "old" }
-low_confidence = true
-routing_hash = "aa"
-"#,
-        )
-        .unwrap();
-        assert_eq!(toml.recipe_id, "old");
-
-        let dispatch: serde_json::Value = serde_json::from_str(
-            r#"{"kind":"pick","assessment":{"score":1},"decision":{"recipe":"old"},"low_confidence":true,"routing_hash":"aa"}"#,
-        )
-        .unwrap();
-        assert_eq!(dispatch["decision"]["recipe"], "old");
-
-        let round: RoundRecord = toml::from_str(
-            r#"round = "r1"
-branch = "main"
-plain = "This round checks old records."
-policy_hash = "old"
-routing_hash = "aa"
-assessment = { score = 1 }
-
-[manifest]
-revision = 1
-members = []
-"#,
-        )
-        .unwrap();
-        assert_eq!(round.round, "r1");
-    }
-
-    #[test]
-    fn round_merge_checkpoint_and_talk_roundtrip() {
-        both(&RoundRecord {
-            round: "r1".into(),
-            branch: "main".into(),
-            plain: "The first round lands the contracts.".into(),
-            gates: Some(vec![PinnedGate::Legacy("cargo test --locked".into())]),
-            policy_hash: "cc".into(),
-            manifest: AdmissionManifest {
-                revision: 2,
-                members: vec![ManifestMember {
-                    thread: "t-0001".into(),
-                    pin: Some(CompletionPin {
-                        event: "t-0001-1-1".into(),
-                        attempt: 1,
-                        sha: "abc".into(),
-                        artifact: "deadbeef".into(),
-                    }),
-                    awaiting_report_after: None,
-                }],
-            },
-            expected_head: Some("bbb".into()),
-            manifest_hash: Some("mh".into()),
-            opened: "2026-09-18T00:00:00Z".into(),
-            repo: "/repo".into(),
-            frozen_revision: Some(2),
-            review_branch: Some("review/r1".into()),
-            reviewer: Some("t-0003".into()),
-            announced: Some("verdict:MERGE".into()),
-            reviewer_start_failures: 0,
-            ..Default::default()
-        });
-        both(&MergeIntent {
-            op: "merge-r1".into(),
-            expected_old: "B".into(),
-            candidate: "C".into(),
-            verdict: "V".into(),
-            merged: None,
-            phase: MergePhase::Merged,
-            checkpoint: Some(CheckpointIntent {
-                parent: "V".into(),
-                op: "merge-r1".into(),
-                payload_hash: "hh".into(),
-                artifact: Some("aa".into()),
-            }),
-            head: None,
-        });
-        json_roundtrip(&TalkJournalRecord {
-            seq: 3,
-            inbound: TalkInbound {
-                request: "req-1".into(),
-                state: TalkRequestState::Queued,
-                recipient: Recipient {
-                    pane: "w1:p1".into(),
-                    coordinator_attempt: 1,
-                },
-            },
-        });
-        json_roundtrip(&TalkJournalRecord {
-            seq: 4,
-            inbound: TalkInbound {
-                request: "req-1".into(),
-                state: TalkRequestState::Uncertain,
-                recipient: Recipient {
-                    pane: "w1:p1".into(),
-                    coordinator_attempt: 1,
-                },
-            },
-        });
-        json_roundtrip(&TalkJournalRecord {
-            seq: 5,
-            inbound: TalkInbound {
-                request: "req-1".into(),
-                state: TalkRequestState::Submitted,
-                recipient: Recipient {
-                    pane: "w1:p1".into(),
-                    coordinator_attempt: 1,
-                },
-            },
-        });
-        json_roundtrip(&TalkJournalRecord {
-            seq: 6,
-            inbound: TalkInbound {
-                request: "req-1".into(),
-                state: TalkRequestState::Accepted,
-                recipient: Recipient {
-                    pane: "w1:p1".into(),
-                    coordinator_attempt: 1,
-                },
-            },
         });
     }
 }

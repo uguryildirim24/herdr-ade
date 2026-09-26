@@ -15,12 +15,7 @@ use anyhow::{Context, Result, bail};
 use crate::contracts::{Plan, PlanStep, StepState, plan_kind_sentence};
 use crate::paths::Ctx;
 use crate::project::{Project, write_atomic};
-use crate::round;
 use crate::thread;
-use crate::threads;
-
-/// At most seven active steps (SPEC-talk §6.5).
-const MAX_STEPS: usize = 7;
 
 pub(crate) fn plan_path(project: &Project) -> PathBuf {
     project.record_file("plan.toml")
@@ -35,7 +30,7 @@ struct PlanLock {
 }
 
 /// The plan writer lock, `<project>/.plan.lock`. Separate from the project
-/// lock so a refresh called from a thread or round mutation cannot deadlock.
+/// lock so a refresh called from a thread or review mutation cannot deadlock.
 fn plan_lock(project: &Project) -> Result<PlanLock> {
     let path = lock_path(project);
     let file = File::options()
@@ -101,8 +96,7 @@ fn check_task_refs(project: &Project, tasks: &[String]) -> Result<()> {
 }
 
 /// The whole candidate card, including preserved text and generated
-/// sentences. Refuses invalid language, duplicate identifiers and excess
-/// steps before anything is written (SPEC-talk §6.5).
+/// sentences. Refuses invalid language and duplicate identifiers before writing.
 fn plan_kind_error(kind: &str) -> String {
     format!(
         "plan_kind: `{kind}` is not a result kind (possible values: {})",
@@ -127,12 +121,6 @@ fn validate(_project: &Project, plan: &Plan) -> Result<()> {
     } else if !plan.what_you_get.is_empty() {
         bail!("plan_result: what_you_get is set without a result kind");
     }
-    if plan.steps.len() > MAX_STEPS {
-        bail!(
-            "plan_steps: at most {MAX_STEPS} steps, got {}",
-            plan.steps.len()
-        );
-    }
     let mut ids = BTreeSet::new();
     for step in &plan.steps {
         if !step_id_ok(&step.id) {
@@ -146,9 +134,6 @@ fn validate(_project: &Project, plan: &Plan) -> Result<()> {
         }
         for t in &step.threads {
             thread::validate_id(t)?;
-        }
-        for r in &step.rounds {
-            round::validate_round_id(r)?;
         }
     }
     validate_subtasks(plan, ids)
@@ -172,9 +157,6 @@ fn validate_subtasks(plan: &Plan, mut ids: BTreeSet<String>) -> Result<()> {
             }
             for t in &sub.threads {
                 thread::validate_id(t)?;
-            }
-            for r in &sub.rounds {
-                round::validate_round_id(r)?;
             }
         }
     }
@@ -522,9 +504,6 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
         if !step.threads.is_empty() {
             refs.push_str(&format!(" threads {}", step.threads.join(", ")));
         }
-        if !step.rounds.is_empty() {
-            refs.push_str(&format!(" rounds {}", step.rounds.join(", ")));
-        }
         out.push_str(&format!(
             "{indent}{:<7} {}  {}{}\n",
             step.state.word(),
@@ -636,7 +615,7 @@ fn with_subtasks(
 }
 
 /// Whether the step itself carries work the leaf rule counts: a live linked
-/// task, a thread or a round. Its leaf state reads `left` both without work
+/// task or a thread. Its leaf state reads `left` both without work
 /// and with work not yet started.
 fn has_own_work(
     project: &Project,
@@ -644,7 +623,6 @@ fn has_own_work(
     evidence: &crate::task::EvidenceSnapshot,
 ) -> bool {
     !step.threads.is_empty()
-        || !step.rounds.is_empty()
         || crate::task::list_with_errors(project)
             .0
             .into_iter()
@@ -673,9 +651,9 @@ fn derive_state(
             task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
         })
         .map(|task| crate::task::view_with_evidence(project, task, evidence))
-        .filter(|view| view.state != crate::task::State::Dropped)
+        .filter(|view| view.record.dropped.is_empty())
         .collect();
-    if linked_tasks.is_empty() && step.threads.is_empty() && step.rounds.is_empty() {
+    if linked_tasks.is_empty() && step.threads.is_empty() {
         return StepState::Left;
     }
     let mut all_satisfied = true;
@@ -689,25 +667,12 @@ fn derive_state(
         }
     }
     for id in &step.threads {
-        let carrying = threads::carrying_rounds(project, id);
-        let exists = thread::load(project, id).is_ok();
-        let satisfied =
-            !carrying.is_empty() && carrying.iter().all(|r| threads::round_landed(project, r));
-        if !satisfied {
-            all_satisfied = false;
-        }
-        if exists || !carrying.is_empty() || satisfied {
-            any_started = true;
-        }
-    }
-    for id in &step.rounds {
-        let exists = round::load(project, id).is_ok();
-        let landed = threads::round_landed(project, id);
-        if !landed {
-            all_satisfied = false;
-        }
-        if exists || landed {
-            any_started = true;
+        match thread::load(project, id) {
+            Ok(lane) => {
+                any_started = true;
+                all_satisfied &= crate::review::lane_done(project, &lane, evidence.events());
+            }
+            Err(_) => all_satisfied = false,
         }
     }
     if all_satisfied {
@@ -722,8 +687,7 @@ fn derive_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::MergePhase;
-    use crate::round::testkit::{Fx, fixture, git};
+    use crate::testkit::{Fx, fixture};
 
     fn goal(fx: &Fx, text: &str) {
         let path = fx.project.project_md();
@@ -739,46 +703,6 @@ mod tests {
 
     fn add(fx: &Fx, text: &str, expect: u64) -> Plan {
         step_add(&fx.world.ctx(), "demo", text, vec![], expect).unwrap()
-    }
-
-    fn open_r1(fx: &Fx, plain: &str) {
-        crate::round::open(
-            &fx.world.ctx(),
-            "demo",
-            crate::round::OpenArgs {
-                round: "r1".into(),
-                branch: "main".into(),
-                plain: Some(plain.to_string()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-    }
-
-    /// Drive a real review and merge, so the plan sees a landed carrying round
-    /// rather than a hand-written merge record.
-    fn land_round(fx: &Fx, round: &str, lanes: &[(String, String)]) {
-        let ctx = fx.world.ctx();
-        let o = crate::round::review(&ctx, "demo", round).unwrap();
-        let wt = o.worktree;
-        for (_, sha) in lanes {
-            git(&wt, &["merge", "-q", "--no-edit", sha]);
-        }
-        let c = git(&wt, &["rev-parse", "HEAD"]);
-        let record = crate::round::load(&fx.project, round).unwrap();
-        let front = format!(
-            "+++\nverdict = \"MERGE\"\nround = \"{round}\"\ncandidate = \"{c}\"\nmanifest_hash = \"{}\"\npolicy_hash = \"{}\"\ngates = []\n+++\n\nAll gates pass.\n",
-            record.manifest_hash.clone().unwrap(),
-            record.policy_hash
-        );
-        let reviewer = fx.thread("Reviewer");
-        fx.seal_done(&reviewer, 1, 1, &c, &front);
-        crate::round::bind_reviewer(&ctx, "demo", round, &reviewer).unwrap();
-        let out = crate::round::merge(&ctx, "demo", round, None).unwrap();
-        assert!(matches!(
-            out,
-            crate::round::MergeOutcome::Checkpointed { .. }
-        ));
     }
 
     #[test]
@@ -895,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn at_most_seven_steps_and_removal_never_reuses_an_identifier() {
+    fn steps_have_no_cap_and_removal_never_reuses_an_identifier() {
         let fx = fixture();
         set(
             &fx.world.ctx(),
@@ -910,16 +834,18 @@ mod tests {
             add(&fx, &format!("Step number {n}."), expect);
             expect += 1;
         }
-        let e = format!(
-            "{:#}",
-            step_add(&fx.world.ctx(), "demo", "One too many.", vec![], expect).unwrap_err()
-        );
-        assert!(e.starts_with("plan_steps"), "{e}");
-        let plan =
-            step_remove(&fx.world.ctx(), "demo", "s-3", "It is not needed.", expect).unwrap();
-        assert_eq!(plan.steps.len(), 6);
+        let plan = add(&fx, "An eighth step.", expect);
+        let plan = step_remove(
+            &fx.world.ctx(),
+            "demo",
+            "s-3",
+            "It is not needed.",
+            plan.revision,
+        )
+        .unwrap();
+        assert_eq!(plan.steps.len(), 7);
         let plan = add(&fx, "A replacement step.", plan.revision);
-        assert!(plan.steps.iter().any(|s| s.id == "s-8"), "{:?}", plan.steps);
+        assert!(plan.steps.iter().any(|s| s.id == "s-9"), "{:?}", plan.steps);
         assert!(!plan.steps.iter().any(|s| s.id == "s-3"));
     }
 
@@ -931,10 +857,6 @@ mod tests {
         assert_eq!(plan.steps[0].id, "s-1");
     }
 
-    fn state(fx: &Fx) -> StepState {
-        load(&fx.project).unwrap().unwrap().steps[0].state
-    }
-
     fn link_historical_threads(fx: &Fx, threads: Vec<String>, expect: u64) -> Plan {
         with_plan(&fx.project, expect, |plan| {
             find_step(plan, "s-1")?.threads = threads;
@@ -942,145 +864,6 @@ mod tests {
         })
         .unwrap()
         .0
-    }
-
-    #[test]
-    fn new_links_use_tasks_and_one_task_can_belong_to_multiple_steps() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        let task = crate::task::Task {
-            id: "job-0001".into(),
-            title: "Ship the checked change.".into(),
-            authority: vec!["request:q-1".into()],
-            acceptance: vec!["The change lands.".into()],
-            created: "2026-09-22T00:00:00Z".into(),
-            ..crate::task::Task::default()
-        };
-        let task_dir = fx.project.state_dir().join("tasks");
-        std::fs::create_dir_all(&task_dir).unwrap();
-        std::fs::write(
-            task_dir.join("job-0001.toml"),
-            toml::to_string(&task).unwrap(),
-        )
-        .unwrap();
-
-        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
-        let first = step_add(
-            &ctx,
-            "demo",
-            "Build the first part.",
-            vec![task.id.clone()],
-            1,
-        )
-        .unwrap();
-        let second = step_add(&ctx, "demo", "Build the second part.", vec![], 2).unwrap();
-        let linked = step_link(&ctx, "demo", "s-2", vec![task.id.clone()], 3).unwrap();
-        assert_eq!(first.steps[0].tasks[0], task.id);
-        assert_eq!(second.steps[1].tasks, Vec::<String>::new());
-        assert_eq!(linked.steps[0].tasks[0], task.id);
-        assert_eq!(linked.steps[1].tasks[0], task.id);
-        assert!(linked.steps.iter().all(|step| step.threads.is_empty()));
-        assert!(linked.steps.iter().all(|step| step.rounds.is_empty()));
-
-        let unlinked = step_unlink(
-            &ctx,
-            "demo",
-            "s-1",
-            vec![task.id.clone()],
-            "The second step owns it.",
-            4,
-        )
-        .unwrap();
-        assert!(unlinked.steps[0].tasks.is_empty());
-        assert_eq!(unlinked.steps[1].tasks, [task.id]);
-    }
-
-    #[test]
-    fn states_follow_required_work_and_reopen_on_rework() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
-        let (lane, sha) = fx.lane(1);
-        add(&fx, "Landed by the lane.", 1);
-        let linked = link_historical_threads(&fx, vec![lane.clone()], 2);
-        // Binding changes refresh the projection in the same committed plan.
-        assert_eq!(linked.revision, 3);
-        assert_eq!(linked.steps[0].state, StepState::Running);
-        assert_eq!(
-            sync(&ctx, "demo").unwrap(),
-            SyncOutcome::Unchanged { revision: 3 }
-        );
-        assert_eq!(state(&fx), StepState::Running);
-
-        // A plain done is not enough; only the merged round completes it.
-        open_r1(&fx, "The first round lands the shared types.");
-        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
-        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
-        let _ = sync(&ctx, "demo").unwrap();
-        assert_eq!(state(&fx), StepState::Running);
-
-        land_round(&fx, "r1", &[(lane.clone(), sha.clone())]);
-        assert!(
-            MergePhase::Checkpointed
-                == crate::round::read_merge(&fx.project, "r1")
-                    .unwrap()
-                    .unwrap()
-                    .phase
-        );
-        let _ = sync(&ctx, "demo").unwrap();
-        assert_eq!(state(&fx), StepState::Done);
-
-        // Adding required rework (a second carrying round) reopens it.
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r2".into(),
-                branch: "main".into(),
-                plain: Some("The second round lands the shared types too.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        // Already-landed work is refused: rework needs a newer attempt, so
-        // restart the lane before admitting it to the carrying round.
-        fx.set_attempt(&lane, 2);
-        crate::round::admit(&ctx, "demo", "r2", &lane).unwrap();
-        let _ = sync(&ctx, "demo").unwrap();
-        assert_eq!(state(&fx), StepState::Running);
-    }
-
-    #[test]
-    fn an_abandoned_round_releases_a_lane_that_lands_in_a_later_round() {
-        let fx = fixture();
-        let ctx = fx.world.ctx();
-        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
-        let (lane, sha) = fx.lane(1);
-        add(&fx, "Land the lane once.", 1);
-        link_historical_threads(&fx, vec![lane.clone()], 2);
-
-        open_r1(&fx, "The first round tries to land the lane.");
-        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
-        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
-        crate::round::cancel(&ctx, "demo", "r1", "the review cannot proceed").unwrap();
-
-        crate::round::open(
-            &ctx,
-            "demo",
-            crate::round::OpenArgs {
-                round: "r2".into(),
-                branch: "main".into(),
-                plain: Some("The later round lands the lane.".into()),
-                repo: Some(fx.repo.to_string_lossy().into_owned()),
-            },
-        )
-        .unwrap();
-        crate::round::admit(&ctx, "demo", "r2", &lane).unwrap();
-        assert_eq!(threads::carrying_rounds(&fx.project, &lane), ["r2"]);
-
-        land_round(&fx, "r2", &[(lane, sha)]);
-        let _ = sync(&ctx, "demo").unwrap();
-        assert_eq!(state(&fx), StepState::Done);
     }
 
     #[test]
@@ -1203,7 +986,7 @@ mod tests {
         add(&fx, "Try it out", 2);
         assert_eq!(
             std::fs::read_to_string(plan_path(&fx.project)).unwrap(),
-            "schema = 1\nrevision = 3\nnext_step = 3\ngoal = \"\"\nkind = \"screen\"\nwhat_you_get = \"A screen you open.\"\ndoes = \"It shows pretend trades.\"\n\n[[steps]]\nid = \"s-1\"\ntext = \"Build the screen\"\nstate = \"left\"\ntasks = []\nthreads = []\nrounds = []\n\n[[steps]]\nid = \"s-2\"\ntext = \"Try it out\"\nstate = \"left\"\ntasks = []\nthreads = []\nrounds = []\n"
+            "schema = 1\nrevision = 3\nnext_step = 3\ngoal = \"\"\nkind = \"screen\"\nwhat_you_get = \"A screen you open.\"\ndoes = \"It shows pretend trades.\"\n\n[[steps]]\nid = \"s-1\"\ntext = \"Build the screen\"\nstate = \"left\"\ntasks = []\nthreads = []\n\n[[steps]]\nid = \"s-2\"\ntext = \"Try it out\"\nstate = \"left\"\ntasks = []\nthreads = []\n"
         );
         assert_eq!(
             show(&ctx, "demo", false).unwrap(),
@@ -1215,7 +998,7 @@ mod tests {
             json["steps"][0],
             serde_json::json!({
                 "id": "s-1", "text": "Build the screen", "state": "left",
-                "tasks": [], "threads": [], "rounds": [],
+                "tasks": [], "threads": [],
             })
         );
     }
@@ -1284,13 +1067,15 @@ mod tests {
         assert_eq!(plan.steps[0].subtasks[1].state, StepState::Left);
         assert_eq!(plan.steps[0].state, StepState::Running);
 
-        open_r1(&fx, "The first round lands the lane.");
-        crate::round::admit(&ctx, "demo", "r1", &lane).unwrap();
         fx.seal_done(&lane, 1, 1, &sha, "# report\n");
         let before = load(&fx.project).unwrap().unwrap().revision;
-        land_round(&fx, "r1", &[(lane, sha)]);
-        // The merge's refresh writes a subtask that moved even when its step
-        // did not.
+        // A historical merged lane with a thread binding completes its subtask.
+        crate::thread::update(&fx.project, &lane, |t| {
+            t.merged_sha = sha.clone();
+        })
+        .unwrap();
+        refresh(&ctx, &fx.project).unwrap();
+        // Refresh writes a subtask that moved even when its step did not.
         let plan = load(&fx.project).unwrap().unwrap();
         assert!(plan.revision > before);
         assert_eq!(plan.steps[0].subtasks[0].state, StepState::Done);
