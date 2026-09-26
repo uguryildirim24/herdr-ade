@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use sha2::{Digest, Sha256};
 
 use crate::paths::Ctx;
 use crate::project::{self, Project};
@@ -74,6 +73,24 @@ fn checked_threads(project: &Project) -> Result<Vec<Thread>> {
         bail!("thread records unreadable: {error:#}");
     }
     Ok(threads)
+}
+
+fn active_refs(root: &Path) -> Result<BTreeSet<(String, String)>> {
+    let mut active = BTreeSet::new();
+    for slug in project::list_slugs(root) {
+        let project = Project::load(root, &slug)?;
+        for record in checked_threads(&project)? {
+            if record.status != Status::Resolved {
+                active.insert((record.repo, record.branch));
+            }
+        }
+        for review in crate::review::list(&project)? {
+            if !review.phase.closed() {
+                active.insert((review.repo, review.candidate_branch));
+            }
+        }
+    }
+    Ok(active)
 }
 
 fn harness_ref(name: &str) -> bool {
@@ -468,12 +485,13 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
         );
     }
     let mut result = Vec::new();
+    let active_refs = active_refs(&ctx.root)?;
     let mut merged_by_repo = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
         let (settings, _) = project.read_project_md()?;
         let threads = checked_threads(&project)?;
-        let reviews = crate::review::list(&project)?;
+
         for row in settings.repos {
             if !Path::new(&row.path).is_dir() {
                 continue;
@@ -510,9 +528,6 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
                         && t.status == Status::Resolved
                         && !t.cleanup_pending
                 });
-                let closed_review = reviews
-                    .iter()
-                    .any(|r| r.repo == row.path && r.phase.closed() && r.candidate_branch == name);
                 let landed = local
                     .get(&name)
                     .into_iter()
@@ -520,12 +535,8 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
                     .all(|sha| merged.contains(sha));
                 // An open thread still owns its ref, even when it has not
                 // diverged from the base yet.
-                let active = threads.iter().any(|t| {
-                    t.repo == row.path && t.branch == name && t.status != Status::Resolved
-                }) || reviews
-                    .iter()
-                    .any(|r| r.repo == row.path && !r.phase.closed() && r.candidate_branch == name);
-                if active || !(resolved || closed_review || landed) {
+                let active = active_refs.contains(&(row.path.clone(), name.clone()));
+                if active || !resolved || !landed {
                     continue;
                 }
                 result.push(Candidate {
@@ -543,72 +554,134 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
     Ok((result, unreachable))
 }
 
-fn fingerprint(plan: &[Candidate]) -> String {
-    let text = format!("{plan:?}");
-    format!("{:x}", Sha256::digest(text.as_bytes()))[..16].to_string()
-}
-
-/// Doctor only offers an exact, short-lived plan. Re-run doctor if any ref or
-/// project status changed since the printed command was built.
-pub(crate) fn doctor(ctx: &Ctx, prune: Option<&str>) -> Result<String> {
-    let (plan, unreachable) = candidates(ctx, prune.is_none())?;
-    let id = fingerprint(&plan);
-    if let Some(requested) = prune {
-        if requested != id || plan.is_empty() {
-            bail!("branch plan changed; run `ha doctor` again");
-        }
-        for item in &plan {
-            if let Some(sha) = &item.local {
-                delete_local(ctx.runner, &item.repo, &item.branch, sha)?;
+/// Sweep only resolved lanes whose tips are ancestors of the configured integration
+/// branch. The marker is written only after every eligible cleanup succeeds;
+/// failures are retried on the next ticker pass.
+pub(crate) fn sweep_once(ctx: &Ctx) -> Result<()> {
+    let marker = ctx.root.join(".branch-sweep-v1.json");
+    if marker.exists() {
+        return Ok(());
+    }
+    let active = active_refs(&ctx.root)?;
+    for slug in project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        let (settings, _) = project.read_project_md()?;
+        let records = checked_threads(&project)?;
+        let mut remote_paths: BTreeMap<String, Vec<&Thread>> = BTreeMap::new();
+        for record in &records {
+            if record.status == Status::Resolved
+                && !record.repo.is_empty()
+                && harness_ref(&record.branch)
+                && record.kind == thread::Kind::Worktree
+                && !record.worktree_path.is_empty()
+                && record.is_remote()
+            {
+                remote_paths
+                    .entry(record.machine_route().to_owned())
+                    .or_default()
+                    .push(record);
             }
-            if let Some((url, sha)) = &item.remote {
-                delete_remote(ctx.runner, &item.repo, url, &item.branch, sha)?;
+        }
+        let mut present = BTreeSet::new();
+        for (route, paths) in remote_paths {
+            let profile = crate::remote::machine_profile(
+                ctx.runner,
+                &ctx.env.herdr_bin(),
+                &ctx.config_dir,
+                &route,
+            )?;
+            let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+            for batch in paths.chunks(100) {
+                let mut script = String::new();
+                for record in batch {
+                    script.push_str(&format!(
+                        "if test -d {}; then printf '%s\\n' {}; fi\n",
+                        crate::remote::quote(&record.worktree_path),
+                        crate::remote::quote(&record.id),
+                    ));
+                }
+                let script = crate::remote::with_path(&machine.path, &script);
+                let output =
+                    crate::remote::ssh(ctx.runner, &profile.target, &script, None, TIMEOUT)?;
+                if !output.success() {
+                    bail!(
+                        "worktree inventory on {}: {}",
+                        profile.label,
+                        output.error_text()
+                    );
+                }
+                present.extend(output.stdout.lines().map(str::to_owned));
             }
         }
-        return Ok(format!(
-            "removed {} leftover harness branches\n",
-            plan.len()
-        ));
+        for record in &records {
+            if record.status != Status::Resolved
+                || record.repo.is_empty()
+                || !harness_ref(&record.branch)
+                || record.kind != thread::Kind::Worktree
+                || record.worktree_path.is_empty()
+                || (record.is_remote() && !present.contains(&record.id))
+                || (!record.is_remote() && !Path::new(&record.worktree_path).exists())
+            {
+                continue;
+            }
+            let Some(row) = settings.repos.iter().find(|row| row.path == record.repo) else {
+                continue;
+            };
+            let base = row.branch.as_deref().unwrap_or("main");
+            let local = refs(ctx.runner, &record.repo, None)?;
+            let url = row.publish_url.as_ref().or(row.push_remote.as_ref());
+            let remote = if let Some(url) = url {
+                refs(ctx.runner, &record.repo, Some(url))?
+            } else {
+                BTreeMap::new()
+            };
+            let local_tip = local.get(&record.branch);
+            let remote_tip = remote.get(&record.branch);
+            let Some(tip) = local_tip.or(remote_tip) else {
+                continue;
+            };
+            if local_tip
+                .zip(remote_tip)
+                .is_some_and(|(local, remote)| local != remote)
+            {
+                continue;
+            }
+            if active.contains(&(record.repo.clone(), record.branch.clone())) {
+                continue;
+            }
+            let cmd = Cmd::new("git", TIMEOUT)
+                .args(["-C", &record.repo, "merge-base", "--is-ancestor", tip, base])
+                .exit_meaning(ExitMeaning::Deferred);
+            let result = ctx.runner.run(&cmd)?;
+            if !result.success() {
+                continue;
+            }
+            let inspection = crate::threads::inspect_worktree_for_removal(ctx, &project, record)?;
+            if !inspection.dirty.is_empty() || !inspection.ignored_data.is_empty() {
+                bail!("{}: worktree keeps changes or data; sweep will retry", record.id);
+            }
+            crate::threads::remove_worktree(ctx, &project, record)?;
+            resolved_thread(ctx, &project, record)?;
+        }
     }
-    let mut text = String::new();
-    for warning in &unreachable {
-        text.push_str(&format!("[warn] branch inventory: {warning}\n"));
+    // Include resolved, merged refs whose worktree was already removed.
+    let (plan, _) = candidates(ctx, false)?;
+    for item in plan {
+        if let Some(sha) = &item.local {
+            delete_local(ctx.runner, &item.repo, &item.branch, sha)?;
+        }
+        if let Some((url, sha)) = &item.remote {
+            delete_remote(ctx.runner, &item.repo, url, &item.branch, sha)?;
+        }
     }
-    if plan.is_empty() {
-        text.push_str(if unreachable.is_empty() {
-            "leftover harness branches: none\n"
-        } else {
-            "leftover harness branches: remote inventory incomplete\n"
-        });
-        return Ok(text);
-    }
-    text.push_str(&format!("leftover harness branches ({}):\n", plan.len()));
-    for item in &plan {
-        text.push_str(&format!("  {}: {}\n", item.repo, item.branch));
-    }
-    if unreachable.is_empty() {
-        text.push_str(&format!(
-            "Remove exactly these: ha doctor --prune-branches {id}\n"
-        ));
-    }
-    Ok(text)
+    project::write_json(&marker, &true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::process::Command;
 
-    struct CountingRunner(Cell<usize>);
-    impl Runner for CountingRunner {
-        fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
-            if cmd.program == "git" && cmd.args.iter().any(|arg| arg == "rev-list") {
-                self.0.set(self.0.get() + 1);
-            }
-            crate::runner::RealRunner.run(cmd)
-        }
-    }
     fn run(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
@@ -623,62 +696,6 @@ mod tests {
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
-    #[test]
-    fn local_refs_and_checked_out_branches_share_a_parallel_batch() {
-        struct Batches(std::cell::RefCell<Vec<usize>>);
-        impl Runner for Batches {
-            fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
-                crate::runner::RealRunner.run(cmd)
-            }
-            fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<crate::runner::Output>> {
-                self.0.borrow_mut().push(commands.len());
-                commands.iter().map(|cmd| self.run(cmd)).collect()
-            }
-        }
-        let (fx, _bare) = configured();
-        let batches = Batches(std::cell::RefCell::new(Vec::new()));
-        let ctx = fx.world.ctx();
-        let ctx = Ctx {
-            runner: &batches,
-            ..ctx
-        };
-        doctor(&ctx, None).unwrap();
-        assert_eq!(*batches.0.borrow(), vec![1, 2]);
-    }
-
-    #[test]
-    fn doctor_bounds_hung_remote_and_keeps_local_inventory() {
-        struct HungRemote;
-        impl Runner for HungRemote {
-            fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
-                if cmd.args.iter().any(|arg| arg == "ls-remote") {
-                    assert!(cmd.own_group);
-                    return crate::runner::RealRunner.run(
-                        &Cmd::new("sh", Duration::from_millis(250))
-                            .args(["-c", "sleep 30 & exit 0"])
-                            .own_group(),
-                    );
-                }
-                crate::runner::RealRunner.run(cmd)
-            }
-        }
-        let (fx, _bare) = configured();
-        let ctx = fx.world.ctx();
-        let ctx = Ctx {
-            runner: &HungRemote,
-            ..ctx
-        };
-        let start = std::time::Instant::now();
-        let result = doctor(&ctx, None).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(
-            result.contains("remote unreachable (timed out)"),
-            "{result}"
-        );
-        assert!(result.contains("remote inventory incomplete"), "{result}");
-        assert!(!result.contains("--prune-branches"));
-    }
-
     #[test]
     fn remote_deletion_marker_is_not_a_branch_tip() {
         let refs = parse_refs(
@@ -708,61 +725,74 @@ mod tests {
     }
 
     #[test]
-    fn resolved_lane_and_doctor_prune_only_eligible_refs() {
+    fn one_time_sweep_only_removes_merged_resolved_lanes() {
         let (fx, bare) = configured();
-        for name in ["hp/demo/t-1", "hp/demo/t-2"] {
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let done_path = fx.world.home.path().join("done-worktree");
+        for (name, status, merged) in [
+            ("hp/demo/done", Status::Resolved, true),
+            ("hp/demo/open", Status::Open, true),
+            ("hp/demo/unmerged", Status::Resolved, false),
+        ] {
             run(&fx.repo, &["branch", name, "main"]);
+            if name == "hp/demo/done" {
+                run(
+                    &fx.repo,
+                    &["worktree", "add", "-q", done_path.to_str().unwrap(), name],
+                );
+            }
+            if !merged {
+                let extra = fx.world.home.path().join("extra");
+                run(
+                    &fx.repo,
+                    &["worktree", "add", "-q", extra.to_str().unwrap(), name],
+                );
+                run(&extra, &["commit", "--allow-empty", "-qm", "not merged"]);
+            }
             run(
                 &fx.repo,
                 &["push", "-q", bare.path().to_str().unwrap(), name],
             );
+            thread::allocate(&fx.project, |t| {
+                t.repo = repo.clone();
+                t.branch = name.into();
+                t.status = status;
+                if name == "hp/demo/done" || !merged {
+                    let path = if merged {
+                        done_path.clone()
+                    } else {
+                        fx.world.home.path().join("extra")
+                    };
+                    t.worktree_path = path.to_string_lossy().into_owned();
+                    t.kind = thread::Kind::Worktree;
+                }
+            })
+            .unwrap();
         }
-        let repo = fx.repo.to_string_lossy().into_owned();
-        let done = thread::allocate(&fx.project, |t| {
-            t.repo = repo.clone();
-            t.branch = "hp/demo/t-1".into();
-            t.status = Status::Resolved;
-        })
-        .unwrap();
-        let _active = thread::allocate(&fx.project, |t| {
-            t.repo = repo.clone();
-            t.branch = "hp/demo/t-2".into();
-            t.status = Status::Open;
-        })
-        .unwrap();
         let ctx = fx.world.ctx();
-        let plan = doctor(&ctx, None).unwrap();
-        assert!(plan.contains("hp/demo/t-1"));
-        assert!(!plan.contains("hp/demo/t-2"));
-        let key = plan.split("--prune-branches ").nth(1).unwrap().trim();
-        assert!(doctor(&ctx, Some("wrong")).is_err());
-        doctor(&ctx, Some(key)).unwrap();
+        sweep_once(&ctx).unwrap();
+        assert!(!done_path.exists());
+        assert!(fx.world.home.path().join("extra").exists());
         assert!(
-            !refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
+            !refs(ctx.runner, &repo, None)
                 .unwrap()
-                .contains_key("hp/demo/t-1")
+                .contains_key("hp/demo/done")
+        );
+        let published = refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap())).unwrap();
+        assert!(!published.contains_key("hp/demo/done"));
+        assert!(published.contains_key("hp/demo/open"));
+        assert!(published.contains_key("hp/demo/unmerged"));
+        assert!(
+            refs(ctx.runner, &repo, None)
+                .unwrap()
+                .contains_key("hp/demo/open")
         );
         assert!(
-            refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
+            refs(ctx.runner, &repo, None)
                 .unwrap()
-                .contains_key("hp/demo/t-2")
+                .contains_key("hp/demo/unmerged")
         );
-        // The normal resolve path uses the same deletion against the fake remote.
-        thread::update(&fx.project, &done.id, |t| t.branch = "hp/demo/t-2".into()).unwrap();
-        let updated = thread::load(&fx.project, &done.id).unwrap();
-        assert!(resolved_thread(&ctx, &fx.project, &updated).is_err());
-        assert!(
-            refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
-                .unwrap()
-                .contains_key("hp/demo/t-2")
-        );
-        thread::update(&fx.project, &_active.id, |t| t.status = Status::Resolved).unwrap();
-        resolved_thread(&ctx, &fx.project, &updated).unwrap();
-        assert!(
-            !refs(ctx.runner, &repo, Some(bare.path().to_str().unwrap()))
-                .unwrap()
-                .contains_key("hp/demo/t-2")
-        );
+        sweep_once(&ctx).unwrap();
     }
 
     #[test]
@@ -829,52 +859,6 @@ mod tests {
             )
             .unwrap()
             .contains_key(name)
-        );
-    }
-
-    #[test]
-    fn inventory_checks_base_history_once_for_many_branches() {
-        let (fx, _bare) = configured();
-        for index in 0..30 {
-            run(&fx.repo, &["branch", &format!("hp/demo/t-{index}"), "main"]);
-        }
-        let runner = CountingRunner(Cell::new(0));
-        let original = fx.world.ctx();
-        let ctx = Ctx {
-            runner: &runner,
-            ..original
-        };
-        let plan = doctor(&ctx, None).unwrap();
-        assert!(plan.contains("hp/demo/t-29"));
-        assert_eq!(runner.0.get(), 1);
-    }
-
-    #[test]
-    fn remote_tip_behind_base_with_no_local_ref_is_still_landed() {
-        let (fx, bare) = configured();
-        let old = run(&fx.repo, &["rev-parse", "main"]);
-        run(
-            &fx.repo,
-            &[
-                "push",
-                "-q",
-                bare.path().to_str().unwrap(),
-                &format!("{old}:refs/heads/hp/demo/t-old"),
-            ],
-        );
-        run(
-            &fx.repo,
-            &["commit", "--allow-empty", "-qm", "advance main"],
-        );
-        assert!(
-            !refs(fx.world.ctx().runner, fx.repo.to_str().unwrap(), None)
-                .unwrap()
-                .contains_key("hp/demo/t-old")
-        );
-        assert!(
-            doctor(&fx.world.ctx(), None)
-                .unwrap()
-                .contains("hp/demo/t-old")
         );
     }
 

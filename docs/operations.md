@@ -9,7 +9,7 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
 - **Files are the record, prompts are wake-ups.** Thread and review records own their state; `context` renders it directly at the start of every turn. The inbox holds only messages such as courier deliveries and machine notices. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pending cleanup. Remote machines are polled once a minute.
 - **Tools are found even under a bare `PATH`.** A Herdr server started outside a login shell gives its plugins a minimal `PATH`; the binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own, so the ticker finds `gh`, `rsync` and friends. `ticker status` and `doctor` show what resolved.
-- **Destructive work is explicit.** The binary prunes finished lane and closed review branches after worktree cleanup, with a lease for published refs. It removes worktrees or merges only in response to the matching command; `doctor` requires an exact preview token to prune older landed branches. Text from reports and command output is never placed in a prompt.
+- **Cleanup follows a landed review.** The binary prunes finished lane and closed review branches after worktree cleanup, with a lease for published refs. A one-time ticker sweep prunes leftovers only for resolved lanes whose tips are merged into main; dirty worktrees are kept. Text from reports and command output is never placed in a prompt.
 
 ## Where things live
 
@@ -41,7 +41,7 @@ Ignored files are disposable only when their path is covered by the editable glo
 disposable = ["target", ".target", "zig-out", ".zig-cache", "node_modules"]
 ```
 
-`doctor` reports resolved worktrees retained for ignored data separately from clean resolved worktrees that were accidentally left behind. It lists remote build folders with no open thread, including their sizes, in the finished-worktree row. An open thread's worktree is never called finished; unreadable thread state makes the row unknown. Closed review worktrees use the same check. It also reports free space on the local machine and every saved remote machine. The failure threshold is editable and defaults to 12 GB:
+`doctor` reports remote build folders with no open thread and free space on the local machine and every saved remote machine. Branch and finished-worktree scans no longer run in doctor; the ticker sweeps landed, resolved leftovers once after install. The failure threshold is editable and defaults to 12 GB:
 
 ```toml
 [doctor]
@@ -76,8 +76,8 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `overview <project> [--history] [--wait]` | Active threads grouped by what needs you. `--history` also shows resolved threads. |
 | `plan show <project>`, `plan set <project>`, `plan step add\|edit\|link\|unlink\|remove\|move <project>`, `plan sync <project>` | The plan card: goal, end result and any number of steps. `plan step add <project> "<text>" --under <step>` adds a subtask one level deep. New links use repeatable `--task`; a task may link to several steps or subtasks. Historical thread and task-side step bindings still load. |
 | `ask <project> "<question>?" --choice "<sentence>" --choice "<sentence>"` | Record a question; return one line with its id first. A normalized duplicate of another open question is refused with the existing id. |
-| `ask withdraw <project> <id> "<reason>"` | Remove an open question from the board, retaining its record and withdrawal reason, actor (`USER`) and time. Answered questions cannot be withdrawn. |
-| `say <project> --what S [--means S]` | One line on the board and in the journal, returning its say id. |
+| `ask withdraw <project> <id> "<reason>"` | Withdraw an open question, retaining its record and withdrawal reason, actor (`USER`) and time. Answered questions cannot be withdrawn. |
+| `say <project> --what S [--means S]` | One line in the journal, returning its say id. |
 | `review <project> [--repo PATH]` | Start or show the repository pile review; this first explicit call opts the project into automatic review. |
 | `review retry <project> [--repo PATH]` | Replace a stuck or dead reviewer in its checkout. |
 | `review cancel <project> [--repo PATH]` | Cancel an unlanded review and return its lanes to the pile. |
@@ -93,7 +93,7 @@ The project keeps a plan card. Reading it never changes a plan, resolves a lane 
 
 - **The plan card** is `<project>/.state/plan.toml`, written under `<project>/.state/plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, one of seven end-result kinds and any number of ordered steps. New bindings name stable tasks in each step, so one task may support several steps. A step's state is projected from those tasks. Historical thread bindings and task-side `plan_step` links still project from current lane/task records. Old round links are ignored. `plan sync` is the manual refresh.
 
-Every message Rolf sends the coordinator is a request with an id in `.state/talk/journal.jsonl`. A prompt-submit hook records text Rolf types into the coordinator pane; `ha say` and `ha ask` publish authored board and journal entries. Harness prompts are automated and never count as Rolf's request. `context` lists the latest request ids.
+Every message Rolf sends the coordinator is a request with an id in `.state/talk/journal.jsonl`. A prompt-submit hook records text Rolf types into the coordinator pane; `ha say` and `ha ask` publish authored journal entries and question notifications. Harness prompts are automated and never count as Rolf's request. `context` lists the latest request ids.
 
 There is no cap on plan steps or open questions. Ask creation, re-asking and answering serialize through `.state/asks/.open.lock`; duplicate open questions remain refused.
 

@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,7 +67,6 @@ impl<'a> Timings<'a> {
             ("readiness", "provider probes, command -v"),
             ("herdr", "workspace list, agent list, tab list"),
             ("builds", "find"),
-            ("worktrees", "parallel git status, find, du"),
         ] {
             if let Some(ms) = facts
                 .get(&format!("doctor_phase_{phase}"))
@@ -589,27 +587,6 @@ fn run_with_trace(
             let _ = writeln!(text, "[FAIL] pi: {detail}");
         }
     }
-    match crate::branches::doctor(ctx, None) {
-        Ok(branches) => {
-            if let Some(timings) = timings {
-                timings.row("branches");
-            }
-            text.push_str(&branches);
-        }
-        Err(error) => {
-            if let Some(timings) = timings {
-                timings.row("branches");
-            }
-            healthy = false;
-            let detail = format!("branch inventory: {error:#}");
-            checks.push(CheckResult {
-                status: "failed".into(),
-                label: "branches".into(),
-                detail: detail.clone(),
-            });
-            let _ = writeln!(text, "[FAIL] {detail}");
-        }
-    }
     if let Some(timings) = timings {
         timings.row("doctor report finalization");
         timings.print(&mut text);
@@ -880,35 +857,6 @@ fn report_with_checks(
     if root.is_dir() {
         let count = project::list_slugs(root).len();
         check(&mut out, Some(true), "root", format!("{count} project(s)"));
-        let ctx = Ctx {
-            env,
-            root: root.to_path_buf(),
-            config_dir: config_dir.to_path_buf(),
-            runner,
-            detached_ticker: false,
-        };
-        let started = Instant::now();
-        let (leftovers, data_kept, errors) = finished_worktrees_impl(&ctx, None, None, timings);
-        if let Some(timings) = timings {
-            timings.command(
-                "local worktree inventory and inspection (includes git)",
-                started.elapsed(),
-            );
-        }
-        check(
-            &mut out,
-            worktree_check_status(&leftovers, &errors),
-            "finished worktrees local",
-            worktree_check_detail(&leftovers, &errors),
-        );
-        if !data_kept.is_empty() {
-            check(
-                &mut out,
-                None,
-                "worktree data kept local",
-                data_kept.join("; "),
-            );
-        }
     } else {
         check(
             &mut out,
@@ -1208,26 +1156,14 @@ fn report_with_checks(
                                 runner,
                                 detached_ticker: false,
                             };
-                            let (mut leftovers, data_kept, mut errors) =
-                                finished_worktrees_with_snapshot(&ctx, &profile, &box_snapshot);
-                            let (builds, build_errors) =
+                            let (builds, errors) =
                                 finished_build_folders_with_snapshot(&ctx, &profile, &box_snapshot);
-                            leftovers.extend(builds);
-                            errors.extend(build_errors);
                             check(
                                 &mut out,
-                                worktree_check_status(&leftovers, &errors),
-                                &format!("finished worktrees {}", profile.label),
-                                worktree_check_detail(&leftovers, &errors),
+                                worktree_check_status(&builds, &errors),
+                                &format!("finished build folders {}", profile.label),
+                                worktree_check_detail(&builds, &errors),
                             );
-                            if !data_kept.is_empty() {
-                                check(
-                                    &mut out,
-                                    None,
-                                    &format!("worktree data kept {}", profile.label),
-                                    data_kept.join("; "),
-                                );
-                            }
                         }
                         Err(error) => check(
                             &mut out,
@@ -1322,21 +1258,18 @@ fn worktree_check_detail(leftovers: &[String], errors: &[String]) -> String {
     match (leftovers.is_empty(), errors.is_empty()) {
         (true, true) => "none whose work is done".into(),
         (false, true) => format!(
-            "remove these finished worktrees or build folders: {}",
+            "remove these finished build folders: {}",
             leftovers.join(", ")
         ),
         (true, false) => format!("unknown; could not check: {}", errors.join("; ")),
         (false, false) => format!(
-            "remove these finished worktrees or build folders: {}; unknown for: {}",
+            "remove these finished build folders: {}; unknown for: {}",
             leftovers.join(", "),
             errors.join("; ")
         ),
     }
 }
 
-/// Finished thread worktrees that still exist on one machine. Completion is
-/// derived from the same records as `thread resolve`; existence is checked on
-/// the machine that owns the checkout.
 fn thread_is_on_machine(
     thread: &crate::thread::Thread,
     profile: &crate::contracts::MachineProfile,
@@ -1349,500 +1282,6 @@ fn thread_is_on_machine(
         }
 }
 
-fn finished_worktree_candidates(
-    ctx: &Ctx,
-    remote: Option<&crate::contracts::MachineProfile>,
-) -> (Vec<(project::Project, crate::thread::Thread)>, Vec<String>) {
-    let mut candidates = Vec::new();
-    let mut errors = Vec::new();
-    for slug in project::list_slugs(&ctx.root) {
-        let Ok(project) = project::Project::load(&ctx.root, &slug) else {
-            continue;
-        };
-        let (threads, unreadable) = crate::thread::list_with_errors(&project);
-        errors.extend(
-            unreadable
-                .into_iter()
-                .map(|error| format!("{slug}: thread state unknown: {error:#}")),
-        );
-        for thread in threads {
-            if thread.status != crate::thread::Status::Resolved
-                || thread.worktree_path.is_empty()
-                || (thread.kind != crate::thread::Kind::Worktree
-                    && !crate::threads::managed_git_folder(&project, &thread))
-            {
-                continue;
-            }
-            let on_machine = match remote {
-                None => !thread.is_remote(),
-                Some(profile) => thread_is_on_machine(&thread, profile),
-            };
-            if !on_machine {
-                continue;
-            }
-            // A resolved local record may intentionally outlive its removed
-            // worktree. Establish absence from the filesystem before any git
-            // completion checks, so every doctor pass does not probe a path
-            // which is already gone.
-            if remote.is_none() {
-                match std::fs::metadata(&thread.worktree_path) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        errors.push(format!(
-                            "{}: could not inspect worktree {}: {error}",
-                            thread.id, thread.worktree_path
-                        ));
-                        continue;
-                    }
-                }
-            }
-            candidates.push((project.clone(), thread));
-        }
-    }
-    (candidates, errors)
-}
-
-fn remote_worktree_script(ctx: &Ctx, profile: &crate::contracts::MachineProfile) -> String {
-    let (candidates, _) = finished_worktree_candidates(ctx, Some(profile));
-    if candidates.is_empty() {
-        return String::new();
-    }
-    // NUL framing is shared with worktrees::inspect_batched. All inspections
-    // run inside this one box script; no follow-up SSH is needed for ignored
-    // sizes, even when a resolved checkout remains on disk.
-    let mut bash = String::from(
-        r#"inspect() {
-  local path=$1 key=$2 record rel root line kib tmpdir
-  local -A roots=()
-  cd "$path" || return 1
-  tmpdir=$(mktemp -d /tmp/herdr-doctor.XXXXXXXX) || return 1
-  trap "rm -rf -- '$tmpdir'" EXIT
-  timeout 4s git status --porcelain --ignored --untracked-files=all -z > "$tmpdir/status" || return 1
-  timeout 3s find . -mindepth 2 -name .git -prune -print0 > "$tmpdir/nested" || return 1
-  printf '\0__HERDR_INSPECT_%s__\0' "$key"
-  cat "$tmpdir/status"
-  printf '\0__HERDR_NESTED__\0'
-  cat "$tmpdir/nested"
-  printf '\0__HERDR_SIZES__\0'
-  while IFS= read -r -d '' record; do
-    if [[ $record == '!! '* ]]; then
-      rel=${record:3}
-      root=${rel%%/*}
-      [[ -z $root ]] || roots["$root"]=1
-    fi
-  done < "$tmpdir/status"
-  while IFS= read -r -d '' record; do
-    rel=${record#./}
-    rel=${rel%/.git}
-    [[ -z $rel ]] || roots["$rel"]=1
-  done < "$tmpdir/nested"
-  for rel in "${!roots[@]}"; do
-    for skip in "${@:3}"; do
-      [[ $rel == "$skip" ]] && continue 2
-    done
-    kib=$(cached_size "$path/$rel" "$key-$rel") || return 1
-    printf '%s\0%s\0' "$rel" "$kib"
-  done
-  printf '\0__HERDR_INSPECT_DONE_%s__\0' "$key"
-}
-export -f inspect
-"#,
-    );
-    let Ok(machine) = crate::remote::machine_declaration(&ctx.config_dir, &profile.label) else {
-        return String::new();
-    };
-    let box_root = machine.root;
-    bash.push_str(&format!(
-        "doctor_size_cache={}; mkdir -p \"$doctor_size_cache\"\ncached_size() {{ local path=$1 key=$2 stamp file cached; stamp=$(stat -c %y -- \"$path\" 2>/dev/null) || return 1; key=$(printf '%s' \"$key\" | sha256sum); key=${{key%% *}}; file=\"$doctor_size_cache/$key\"; if [[ -f $file ]]; then read -r cached < \"$file\"; if [[ $cached == \"$stamp \"* ]]; then printf '%s' \"${{cached#\"$stamp \"}}\"; return; fi; fi; cached=$(timeout 2s du -sk -- \"$path\") || return 1; cached=${{cached%%[[:space:]]*}}; printf '%s %s\\n' \"$stamp\" \"$cached\" > \"$file.tmp.$$\"; mv -f \"$file.tmp.$$\" \"$file\"; printf '%s' \"$cached\"; }}\nexport doctor_size_cache; export -f cached_size\ndoctor_tmp=$(mktemp -d /tmp/herdr-doctor-batch.XXXXXXXX) || exit 1\ntrap 'rm -rf -- \"$doctor_tmp\"' EXIT\ndoctor_jobs=\ndoctor_index=0\n",
-        crate::remote::quote(&format!("{box_root}/.doctor-sizes"))
-    ));
-    for (project, thread) in candidates {
-        let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
-        let path = crate::remote::quote(&thread.worktree_path);
-        // Completion is checked only after the snapshot establishes that the
-        // directory exists. Probing it here runs multiple local Git commands
-        // even for the many resolved box worktrees already removed.
-        let skips = crate::worktrees::disposable(&ctx.config_dir, &project, &thread.repo)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| !entry.contains('/') && !entry.contains('*'))
-            .map(|entry| crate::remote::quote(&entry))
-            .collect::<Vec<_>>()
-            .join(" ");
-        bash.push_str(&format!(
-            "if [ -d {path} ]; then printf 'worktree_{key}\\t1\\n'; ( cached_size {path} {key} | while read -r kib; do printf 'size_{key}\\t%s\\n' \"$kib\"; done; timeout 6s bash -c 'inspect \"$@\"' _ {path} {key} {skips} || printf '\\0__HERDR_INSPECT_FAILED_{key}__\\0' ) > \"$doctor_tmp/$doctor_index\" & doctor_jobs=\"$doctor_jobs $!\"; doctor_index=$((doctor_index+1)); else printf 'worktree_{key}\\t0\\n'; fi\n",
-        ));
-    }
-    // Capture each worker separately: status uses NUL framing and concurrent
-    // writes to stdout would corrupt its records. All workers share one wall
-    // bound; a slow tree cannot consume a separate six seconds per checkout.
-    bash.push_str("for doctor_job in $doctor_jobs; do wait \"$doctor_job\" || :; done\nfor ((doctor_i=0; doctor_i<doctor_index; doctor_i++)); do cat \"$doctor_tmp/$doctor_i\"; printf '\\n'; done\n");
-    format!(
-        "timeout -k 1s 12s bash -c {}; doctor_status=$?; case $doctor_status in 0) ;; 124|137) printf 'doctor_worktrees_timeout\\t1\\n' ;; *) printf 'doctor_worktrees_failed\\t%s\\n' \"$doctor_status\" ;; esac\n",
-        crate::remote::quote(&bash)
-    )
-}
-
-fn finished_worktrees_with_snapshot(
-    ctx: &Ctx,
-    profile: &crate::contracts::MachineProfile,
-    snapshot: &str,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    finished_worktrees_impl(ctx, Some(profile), Some(snapshot), None)
-}
-
-#[cfg(test)]
-fn finished_worktrees(ctx: &Ctx) -> (Vec<String>, Vec<String>, Vec<String>) {
-    finished_worktrees_impl(ctx, None, None, None)
-}
-
-/// Two Git batches per repository replace repeated branch-head, integration
-/// head and ancestry subprocesses for each resolved local checkout. Only the
-/// doctor uses this inventory; explicit cleanup rechecks individual commits.
-fn local_merged_branches(
-    ctx: &Ctx,
-    candidates: &[(project::Project, crate::thread::Thread)],
-) -> BTreeMap<String, BTreeSet<String>> {
-    let repos: BTreeSet<String> = candidates
-        .iter()
-        .filter(|(project, thread)| {
-            !crate::threads::managed_git_folder(project, thread) && !thread.branch.is_empty()
-        })
-        .map(|(_, thread)| thread.repo.clone())
-        .collect();
-    let commands: Vec<_> = repos
-        .iter()
-        .map(|repo| {
-            Cmd::new("git", TOOL_TIMEOUT).args(["-C", repo, "symbolic-ref", "--short", "HEAD"])
-        })
-        .collect();
-    let mut heads = Vec::new();
-    for (repo, answer) in repos.iter().zip(ctx.runner.run_parallel(&commands)) {
-        if let Ok(output) = answer
-            && output.success()
-            && !output.stdout.trim().is_empty()
-        {
-            heads.push((repo.clone(), output.stdout.trim().to_string()));
-        }
-    }
-    let commands: Vec<_> = heads
-        .iter()
-        .map(|(repo, head)| {
-            Cmd::new("git", TOOL_TIMEOUT).args([
-                "-C",
-                repo,
-                "for-each-ref",
-                "--format=%(refname)",
-                "--merged",
-                head,
-                "refs/heads",
-            ])
-        })
-        .collect();
-    let mut merged = BTreeMap::new();
-    for ((repo, _), answer) in heads.into_iter().zip(ctx.runner.run_parallel(&commands)) {
-        if let Ok(output) = answer
-            && output.success()
-        {
-            merged.insert(
-                repo,
-                output
-                    .stdout
-                    .lines()
-                    .filter_map(|name| name.strip_prefix("refs/heads/"))
-                    .map(str::to_string)
-                    .collect(),
-            );
-        }
-    }
-    merged
-}
-
-fn finished_worktrees_impl(
-    ctx: &Ctx,
-    remote: Option<&crate::contracts::MachineProfile>,
-    snapshot: Option<&str>,
-    timings: Option<&Timings<'_>>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let (candidates, mut errors) = finished_worktree_candidates(ctx, remote);
-    // Check existence on the box before any completion probe. A merged
-    // review can retain a resolved member long after its checkout is removed.
-    // The shell always exits zero after printing each yes/no answer, so a
-    // healthy "gone" result is not a failed command, and a
-    // transport failure remains distinguishable from a negative answer.
-    let remote_exists = remote.map(|profile| {
-        if let Some(snapshot) = snapshot {
-            if snapshot.contains("doctor_worktrees_timeout\t1") {
-                errors.push(format!(
-                    "{}: box worktree inspection exceeded 12s",
-                    profile.label
-                ));
-            }
-            if let Some(status) = snapshot
-                .lines()
-                .find_map(|line| line.strip_prefix("doctor_worktrees_failed\t"))
-            {
-                errors.push(format!(
-                    "{}: box worktree inspection failed (exit {status})",
-                    profile.label
-                ));
-            }
-        }
-        let Some(snapshot) = snapshot else {
-            errors.push(format!("{}: box snapshot missing", profile.label));
-            return vec![false; candidates.len()];
-        };
-        let facts: BTreeMap<String, bool> = snapshot
-            .lines()
-            .filter_map(|line| {
-                let (key, exists) = line.split_once('\t')?;
-                let key = key.strip_prefix("worktree_")?;
-                let exists = match exists {
-                    "0" => false,
-                    "1" => true,
-                    _ => return None,
-                };
-                Some((key.to_owned(), exists))
-            })
-            .collect();
-        candidates
-            .iter()
-            .map(|(_, thread)| {
-                let key = crate::thread::sha256_hex(thread.worktree_path.as_bytes());
-                match facts.get(&key) {
-                    Some(exists) => *exists,
-                    None => {
-                        errors.push(format!(
-                            "{}: box worktree existence answer was missing",
-                            thread.worktree_path
-                        ));
-                        false
-                    }
-                }
-            })
-            .collect()
-    });
-
-    let merged = if remote.is_none() {
-        local_merged_branches(ctx, &candidates)
-    } else {
-        BTreeMap::new()
-    };
-    // A checked review inventory is per project, not per checkout. The old
-    // path re-read every review (including its manifest) for each candidate.
-    let mut review_done = BTreeSet::new();
-    let mut review_errors = BTreeMap::new();
-    let projects: BTreeMap<_, _> = candidates
-        .iter()
-        .map(|(project, _)| (project.slug.clone(), project))
-        .collect();
-    for (slug, project) in projects {
-        match crate::review::list(project) {
-            Ok(reviews) => {
-                for review in reviews {
-                    if review.fast_forward {
-                        for member in &review.members {
-                            if !review
-                                .verdict
-                                .as_ref()
-                                .is_some_and(|v| v.without.contains_key(&member.thread))
-                            {
-                                review_done.insert((slug.clone(), member.thread.clone()));
-                            }
-                        }
-                    }
-                    if (review.phase.closed() || review.fast_forward)
-                        && let Some(reviewer) = review.reviewer
-                    {
-                        review_done.insert((slug.clone(), reviewer));
-                    }
-                }
-            }
-            Err(error) => {
-                review_errors.insert(slug, format!("{error:#}"));
-            }
-        }
-    }
-    let local_status: BTreeMap<String, String> = if remote.is_none() {
-        let commands: Vec<_> = candidates
-            .iter()
-            .map(|(_, thread)| {
-                Cmd::new("git", Duration::from_secs(20)).args([
-                    "-C",
-                    thread.repo.as_str(),
-                    "-C",
-                    thread.worktree_path.as_str(),
-                    "status",
-                    "--porcelain",
-                    "--ignored",
-                    "--untracked-files=all",
-                    "-z",
-                ])
-            })
-            .collect();
-        candidates
-            .iter()
-            .zip(ctx.runner.run_parallel(&commands))
-            .filter_map(|((_, thread), answer)| {
-                let output = answer.ok()?;
-                output.success().then(|| {
-                    (
-                        thread.worktree_path.clone(),
-                        // Porcelain -z starts with a space for worktree-only
-                        // changes; trimming shifts its two-byte status field.
-                        output.stdout,
-                    )
-                })
-            })
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
-    let mut leftovers = Vec::new();
-    let mut data_kept = Vec::new();
-    for (index, (project, thread)) in candidates.into_iter().enumerate() {
-        let path = &thread.worktree_path;
-        let exists = remote_exists
-            .as_ref()
-            .map_or_else(|| Path::new(path).is_dir(), |answers| answers[index]);
-        if !exists {
-            continue;
-        }
-        if let Some(error) = review_errors.get(&project.slug) {
-            errors.push(format!(
-                "{}: could not inspect review records: {error}",
-                thread.id
-            ));
-            continue;
-        }
-        let reason = if review_done.contains(&(project.slug.clone(), thread.id.clone()))
-            && !crate::threads::managed_git_folder(&project, &thread)
-        {
-            Ok(None)
-        } else {
-            crate::threads::finished_worktree_reason_with_merged(
-                ctx,
-                &project,
-                &thread,
-                merged.get(&thread.repo),
-            )
-        };
-        match reason {
-            Ok(None) => {}
-            Ok(Some(_)) => continue,
-            Err(error) => {
-                errors.push(format!("{}: {error:#}", thread.id));
-                continue;
-            }
-        }
-        let inspection = if let Some(snapshot) = snapshot
-            && thread.is_remote()
-        {
-            crate::threads::inspect_worktree_from_snapshot(ctx, &project, &thread, snapshot)
-        } else if let Some(status) = local_status.get(path) {
-            let stored = crate::threads::report_artifact_stored(&project, &thread);
-            let repo = if crate::threads::managed_git_folder(&project, &thread) {
-                path.as_str()
-            } else {
-                thread.repo.as_str()
-            };
-            stored.and_then(|stored| {
-                let disposable = crate::worktrees::disposable(&ctx.config_dir, &project, repo)?;
-                crate::worktrees::inspect_local_status(status, path, &disposable, stored)
-            })
-        } else {
-            crate::threads::inspect_worktree_for_removal(ctx, &project, &thread)
-        };
-        let size = if let Some(snapshot) = snapshot {
-            let key = crate::thread::sha256_hex(path.as_bytes());
-            snapshot.lines().find_map(|line| {
-                line.strip_prefix(&format!("size_{key}\t"))
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(|kib| kib * 1024)
-            })
-        } else {
-            cached_local_size(&ctx.root, Path::new(path), timings)
-        };
-        let size = size
-            .map(crate::worktrees::human_size)
-            .unwrap_or_else(|| "size unknown".into());
-        match inspection {
-            Ok(inspection) if !inspection.dirty.is_empty() => {
-                leftovers.push(format!(
-                    "{} ({}; tracked changes: {}; remove exactly this worktree and branch: ha doctor --remove-kept-worktree {}/{})",
-                    path, size, inspection.dirty.join(", "), project.slug, thread.id
-                ));
-            }
-            Ok(inspection) if !inspection.ignored_data.is_empty() => {
-                data_kept.push(format!(
-                    "{} ({}; kept by {}; remove exactly this worktree and branch: ha doctor --remove-kept-worktree {}/{})",
-                    path,
-                    size,
-                    crate::worktrees::describe_data(&inspection.ignored_data),
-                    project.slug, thread.id
-                ));
-            }
-            Ok(_) => leftovers.push(format!(
-                "{} ({}; remove exactly this worktree and branch: ha doctor --remove-kept-worktree {}/{})",
-                path, size, project.slug, thread.id
-            )),
-            Err(error) => errors.push(format!("{}: {error:#}", thread.id)),
-        }
-    }
-    (leftovers, data_kept, errors)
-}
-
-/// Cache only the display size, never status or ownership. The checkout's
-/// directory mtime is the cheap change marker; cleanup always re-inspects.
-fn cached_local_size(root: &Path, path: &Path, timings: Option<&Timings<'_>>) -> Option<u64> {
-    let stamp = std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let key = crate::thread::sha256_hex(path.to_string_lossy().as_bytes());
-    let dir = root.join(".doctor-sizes");
-    let cache = dir.join(key);
-    if let Ok(text) = std::fs::read_to_string(&cache)
-        && let Some((old, kib)) = text.trim().split_once(' ')
-        && old == stamp.to_string()
-        && let Ok(kib) = kib.parse::<u64>()
-    {
-        return Some(kib.saturating_mul(1024));
-    }
-    let started = Instant::now();
-    let output = Command::new("du")
-        .args(["-sk", "--"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if let Some(timings) = timings {
-        timings.command("du (worktree size)", started.elapsed());
-    }
-    if !output.status.success() {
-        return None;
-    }
-    let kib = String::from_utf8(output.stdout)
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let tmp = cache.with_extension(format!("tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, format!("{stamp} {kib}\n")).is_ok() {
-            let _ = std::fs::rename(&tmp, &cache);
-        }
-        let _ = std::fs::remove_file(tmp);
-    }
-    Some(kib * 1024)
-}
-
-/// Rebuildable box output whose owning thread is no longer open. The folder
-/// names come from the same helper that sets `CARGO_TARGET_DIR` at launch.
 fn build_folder_script(root: &str) -> String {
     format!(
         "printf '__HERDR_BUILDS__\\n'; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -print; fi; printf '__HERDR_BUILDS_DONE__\\n'",
@@ -2401,11 +1840,6 @@ for sample in $samples; do
 done
 "#);
     script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_facts\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
-    if let Some((ctx, _)) = &snapshot {
-        script.push_str("doctor_worktree_file=$(mktemp /tmp/herdr-doctor-phase.XXXXXXXX) || exit 1\n( phase_start=$(date +%s%3N); printf 'doctor_active\\tworktrees\\n';\n");
-        script.push_str(&remote_worktree_script(ctx, profile));
-        script.push_str("phase_end=$(date +%s%3N); printf 'doctor_phase_worktrees\\t%s\\n' \"$((phase_end-phase_start))\" ) > \"$doctor_worktree_file\" & doctor_worktree_job=$!\n");
-    }
     script.push_str(
         "printf 'doctor_active\\treadiness (parallel provider probes)\\n'\ndoctor_jobs=\n",
     );
@@ -2447,7 +1881,7 @@ done
         ));
     }
     script.push_str("for doctor_job in $doctor_jobs; do wait \"$doctor_job\"; done\n");
-    if let Some((ctx, _)) = &snapshot {
+    if snapshot.is_some() {
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_readiness\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
 
         for (key, command) in [
@@ -2464,8 +1898,6 @@ done
         script.push_str("printf 'doctor_active\\tbuilds\\n'\n");
         script.push_str(&build_folder_script(&machine_paths.build));
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_builds\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
-        let _ = ctx;
-        script.push_str("wait \"$doctor_worktree_job\" || :; cat \"$doctor_worktree_file\"; rm -f -- \"$doctor_worktree_file\"\n");
     }
     let facts = match crate::remote::ssh(
         runner,
@@ -2700,7 +2132,6 @@ fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
-    use std::io::Write as _;
 
     const ROUTING_CONFIG: &str = r#"[routing]
 default = "pi_codex_sol_high"
@@ -3328,56 +2759,6 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn resolved_box_worktree_absence_is_one_check() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        for number in 1..=2 {
-            crate::thread::allocate(&project, |thread| {
-                thread.kind = crate::thread::Kind::Worktree;
-                thread.status = crate::thread::Status::Resolved;
-                thread.machine = "buildbox".into();
-                thread.machine_id = "box-1".into();
-                thread.worktree_path = format!("/box/worktree-{number}");
-                thread.repo = "/repo".into();
-                thread.branch = format!("lane-{number}");
-            })
-            .unwrap();
-        }
-        // Without review completion evidence the old code probed git in each
-        // absent worktree before asking the box whether the path existed.
-        let fake = FakeRunner::new();
-        let snapshot = (1..=2)
-            .map(|number| {
-                let key = crate::thread::sha256_hex(format!("/box/worktree-{number}").as_bytes());
-                format!("worktree_{key}\t0\n")
-            })
-            .collect::<String>();
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: home.path().join("cfg"),
-            runner: &fake,
-            detached_ticker: false,
-        };
-
-        let profile = crate::contracts::MachineProfile {
-            id: "box-1".into(),
-            label: "buildbox".into(),
-            target: "me@box".into(),
-            session: "default".into(),
-        };
-        let (leftovers, data, errors) = finished_worktrees_with_snapshot(&ctx, &profile, &snapshot);
-
-        assert!(leftovers.is_empty());
-        assert!(data.is_empty());
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(fake.count("ssh"), 0);
-        assert!(fake.calls.borrow().iter().all(|call| call.program != "git"));
-    }
-
-    #[test]
     fn timings_name_checks_and_commands_without_leaking_arguments() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
@@ -3403,7 +2784,7 @@ recipe = "claude_fable_xhigh"
         assert!(result.message.contains("  doctor CLI startup: 2."));
         assert!(result.message.contains("  herdr:"));
         assert!(result.message.contains("    herdr:"));
-        assert!(result.message.contains("  branches:"));
+        assert!(!result.message.contains("  branches:"));
         let timing = Timings::new(&runner);
         timing.concurrent(
             "box buildbox snapshot (ssh remote script)",
@@ -3422,190 +2803,6 @@ recipe = "claude_fable_xhigh"
             detail.contains("    box buildbox builds (find, grouped): 0.250s"),
             "{detail}"
         );
-    }
-
-    #[test]
-    fn an_open_working_thread_is_not_a_finished_worktree() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join(crate::harness::BOX_WORKER_MARKER),
-            "lane worker\n",
-        )
-        .unwrap();
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let worktree = home.path().join("live-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
-        crate::thread::allocate(&project, |thread| {
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.status = crate::thread::Status::Open;
-            thread.last_group = "working".into();
-            thread.worktree_path = worktree.to_string_lossy().into_owned();
-            thread.repo = "/repo".into();
-            thread.branch = "lane".into();
-        })
-        .unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-
-        let (text, healthy, checks) = report_with_checks(
-            &env,
-            &root,
-            &config,
-            &SessionFlags::default(),
-            &runner,
-            None,
-        );
-
-        assert!(healthy, "{text}");
-        assert!(
-            !text.contains(worktree.to_string_lossy().as_ref()),
-            "{text}"
-        );
-        assert!(checks.iter().any(|check| {
-            check.status == "ok"
-                && check.label == "finished worktrees local"
-                && check.detail == "none whose work is done"
-        }));
-    }
-
-    #[test]
-    fn local_worktrees_share_one_branch_inventory_per_repo() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let mut candidates = Vec::new();
-        for branch in ["merged", "diverged"] {
-            let thread = crate::thread::allocate(&project, |thread| {
-                thread.kind = crate::thread::Kind::Worktree;
-                thread.status = crate::thread::Status::Resolved;
-                thread.repo = "/shared/repo".into();
-                thread.branch = branch.into();
-                thread.worktree_path = format!("/shared/repo/.worktrees/{branch}");
-            })
-            .unwrap();
-            candidates.push((project.clone(), thread));
-        }
-        let runner = FakeRunner::new();
-        runner.on("symbolic-ref", ok("main\n"));
-        runner.on("for-each-ref", ok("refs/heads/merged\nrefs/heads/main\n"));
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: home.path().join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let merged = local_merged_branches(&ctx, &candidates);
-        let inventory = merged.get("/shared/repo").unwrap();
-        assert!(inventory.contains("merged"));
-        assert!(!inventory.contains("diverged"));
-        assert!(
-            crate::threads::finished_worktree_reason_with_merged(
-                &ctx,
-                &project,
-                &candidates[0].1,
-                Some(inventory)
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            crate::threads::finished_worktree_reason_with_merged(
-                &ctx,
-                &project,
-                &candidates[1].1,
-                Some(inventory)
-            )
-            .unwrap()
-            .is_some()
-        );
-        assert_eq!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|c| c.program == "git")
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn a_resolved_thread_with_a_gone_worktree_is_not_probed() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let gone = home.path().join("already-removed-worktree");
-        crate::thread::allocate(&project, |thread| {
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.status = crate::thread::Status::Resolved;
-            thread.worktree_path = gone.to_string_lossy().into_owned();
-            thread.repo = "/repo".into();
-            thread.branch = "lane".into();
-        })
-        .unwrap();
-        let fake = FakeRunner::new();
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: home.path().join("cfg"),
-            runner: &fake,
-            detached_ticker: false,
-        };
-
-        let (leftovers, data, errors) = finished_worktrees(&ctx);
-
-        assert!(leftovers.is_empty());
-        assert!(data.is_empty());
-        assert!(errors.is_empty(), "{errors:?}");
-        assert!(
-            fake.calls.borrow().iter().all(|call| call.program != "git"),
-            "a gone worktree must not reach a git probe"
-        );
-    }
-
-    #[test]
-    fn unreadable_thread_state_makes_finished_worktrees_unknown() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join(crate::harness::BOX_WORKER_MARKER),
-            "lane worker\n",
-        )
-        .unwrap();
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        std::fs::create_dir(project.state_dir().join("threads")).unwrap();
-        std::fs::write(
-            project.state_dir().join("threads/t-0001.toml"),
-            "status = [\n",
-        )
-        .unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-
-        let (text, healthy, checks) = report_with_checks(
-            &env,
-            &root,
-            &config,
-            &SessionFlags::default(),
-            &runner,
-            None,
-        );
-
-        assert!(healthy, "{text}");
-        assert!(text.contains("thread state unknown"), "{text}");
-        assert!(checks.iter().any(|check| {
-            check.status == "warning"
-                && check.label == "finished worktrees local"
-                && check.detail.contains("unknown; could not check")
-        }));
     }
 
     #[test]
@@ -3722,305 +2919,28 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn box_snapshot_reuses_the_presence_answer_without_a_second_ssh() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        crate::thread::allocate(&project, |thread| {
-            thread.status = crate::thread::Status::Resolved;
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.machine = "buildbox".into();
-            thread.machine_id = "abc".into();
-            thread.worktree_path = "/home/agent/projects/demo/.worktrees/t-1".into();
-        })
-        .unwrap();
-        let runner = FakeRunner::new();
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: home.path().join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let key = crate::thread::sha256_hex(b"/home/agent/projects/demo/.worktrees/t-1");
-        let (leftovers, data, errors) =
-            finished_worktrees_with_snapshot(&ctx, &box_profile(), &format!("worktree_{key}\t0\n"));
-        assert!(
-            leftovers.is_empty() && data.is_empty() && errors.is_empty(),
-            "{leftovers:?} {data:?} {errors:?}"
-        );
-        assert_eq!(runner.count("ssh"), 0);
-    }
-
-    #[test]
-    fn one_ssh_inspects_present_box_worktrees_and_keeps_dirty_and_ignored_data() {
-        let home = tempfile::tempdir().unwrap();
-        let config = machine_config(&["pi"]);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(config.path().join("config.toml"))
-            .unwrap()
-            .write_all(b"\n[worktrees]\ndisposable = [\"target\"]\n")
-            .unwrap();
-        let repo = home.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "test@example.test"]);
-        git(&["config", "user.name", "Test"]);
-        git(&["commit", "--allow-empty", "-qm", "initial"]);
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let paths = ["/box/t-a", "/box/t-b"];
-        for path in paths {
-            crate::thread::allocate(&project, |thread| {
-                thread.status = crate::thread::Status::Resolved;
-                thread.kind = crate::thread::Kind::Worktree;
-                thread.machine = "buildbox".into();
-                thread.machine_id = "abc".into();
-                thread.repo = repo.to_string_lossy().into_owned();
-                thread.branch = "main".into();
-                thread.worktree_path = path.into();
-            })
-            .unwrap();
+    fn doctor_on_a_test_root_does_not_scan_branches() {
+        struct NoBranchScan;
+        impl Runner for NoBranchScan {
+            fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+                assert!(
+                    !cmd.args.iter().any(|arg| matches!(
+                        arg.as_str(),
+                        "for-each-ref" | "ls-remote" | "merge-base"
+                    )),
+                    "doctor scanned branches: {}",
+                    cmd.display()
+                );
+                crate::runner::RealRunner.run(cmd)
+            }
         }
-        let key_a = crate::thread::sha256_hex(paths[0].as_bytes());
-        let key_b = crate::thread::sha256_hex(paths[1].as_bytes());
-        let snapshot = format!(
-            "{}worktree_{key_a}\t1\n\0__HERDR_INSPECT_{key_a}__\0 M file\0\0__HERDR_NESTED__\0\0__HERDR_SIZES__\0\0__HERDR_INSPECT_DONE_{key_a}__\0\nworktree_{key_b}\t1\n\0__HERDR_INSPECT_{key_b}__\0!! target/file\0!! safe/file\0\0__HERDR_NESTED__\0./target/nested/.git\0\0__HERDR_SIZES__\0safe\03\0target/nested\04\0\0__HERDR_INSPECT_DONE_{key_b}__\0\n",
-            box_facts(),
-        );
-        let runner = FakeRunner::new();
-        runner.on("ssh", ok(&snapshot));
-        runner.on_fn(
-            |cmd| cmd.program == "git",
-            |cmd| crate::runner::RealRunner.run(cmd),
-        );
-        let env = Env::for_test(home.path(), &[]);
+        let fx = crate::testkit::fixture();
+        let original = fx.world.ctx();
         let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: config.path().into(),
-            runner: &runner,
-            detached_ticker: false,
+            runner: &NoBranchScan,
+            ..original
         };
-        let mut captured = String::new();
-        let prior_git = runner
-            .calls
-            .borrow()
-            .iter()
-            .filter(|cmd| cmd.program == "git")
-            .count();
-        box_rows_with_snapshot(
-            &runner,
-            config.path(),
-            &box_profile(),
-            &BTreeMap::new(),
-            12.0,
-            Some((&ctx, &mut captured)),
-        );
-        assert_eq!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|cmd| cmd.program == "git")
-                .count(),
-            prior_git,
-            "box snapshot creation must not probe completion before checking existence"
-        );
-        let (leftovers, data, errors) =
-            finished_worktrees_with_snapshot(&ctx, &box_profile(), &captured);
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(leftovers.len(), 1);
-        assert!(leftovers[0].contains(paths[0]));
-        assert!(leftovers[0].contains("--remove-kept-worktree demo/t-0001"));
-        assert_eq!(
-            data,
-            [format!(
-                "{} (size unknown; kept by safe: 3.0 KiB, target/nested: 4.0 KiB; remove exactly this worktree and branch: ha doctor --remove-kept-worktree demo/t-0002)",
-                paths[1]
-            )]
-        );
-        assert_eq!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|cmd| cmd.program == "ssh")
-                .count(),
-            1
-        );
-        let ssh = runner
-            .calls
-            .borrow()
-            .iter()
-            .find(|cmd| cmd.program == "ssh")
-            .unwrap()
-            .display();
-        assert!(ssh.contains("git status --porcelain --ignored"));
-        assert!(ssh.contains("du -sk"));
-        assert!(ssh.contains("doctor_worktree_file"));
-    }
-
-    #[test]
-    fn batched_shell_preserves_nul_status_nested_and_sizes() {
-        let home = tempfile::tempdir().unwrap();
-        let config = machine_config(&["pi"]);
-        let declaration = config.path().join("config.toml");
-        let machine = std::fs::read_to_string(&declaration).unwrap();
-        std::fs::write(
-            &declaration,
-            machine.replace(
-                "/home/agent/.herdr-ade",
-                &home.path().join("box-root").display().to_string(),
-            ),
-        )
-        .unwrap();
-        let repo = home.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "test@example.test"]);
-        git(&["config", "user.name", "Test"]);
-        std::fs::write(repo.join(".gitignore"), "target/\nsafe/\n").unwrap();
-        git(&["add", ".gitignore"]);
-        git(&["commit", "-qm", "initial"]);
-        std::fs::write(repo.join(".gitignore"), "target/\nsafe/\n# changed\n").unwrap();
-        std::fs::create_dir_all(repo.join("target/nested")).unwrap();
-        std::fs::create_dir_all(repo.join("safe")).unwrap();
-        std::fs::write(repo.join("target/nested/.git"), "gitdir: /nowhere\n").unwrap();
-        std::fs::write(repo.join("safe/keep"), "keep").unwrap();
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        crate::thread::allocate(&project, |thread| {
-            thread.status = crate::thread::Status::Resolved;
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.machine = "buildbox".into();
-            thread.machine_id = "abc".into();
-            thread.repo = repo.to_string_lossy().into_owned();
-            thread.branch = "main".into();
-            thread.worktree_path = repo.to_string_lossy().into_owned();
-        })
-        .unwrap();
-        let missing = home.path().join("gone");
-        crate::thread::allocate(&project, |thread| {
-            thread.status = crate::thread::Status::Resolved;
-            thread.kind = crate::thread::Kind::Worktree;
-            thread.machine = "buildbox".into();
-            thread.machine_id = "abc".into();
-            thread.repo = repo.to_string_lossy().into_owned();
-            thread.branch = "main".into();
-            thread.worktree_path = missing.to_string_lossy().into_owned();
-        })
-        .unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let runner = crate::runner::RealRunner;
-        let ctx = Ctx {
-            env: &env,
-            root,
-            config_dir: config.path().into(),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let script = format!(
-            "{}printf '__HERDR_BUILDS__\\n'\n",
-            remote_worktree_script(&ctx, &box_profile())
-        );
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let text = String::from_utf8(out.stdout).unwrap();
-        let key = crate::thread::sha256_hex(repo.to_string_lossy().as_bytes());
-        assert!(
-            text.lines()
-                .any(|line| line == format!("worktree_{key}\t1"))
-        );
-        let absent = crate::thread::sha256_hex(missing.to_string_lossy().as_bytes());
-        assert!(
-            text.lines()
-                .any(|line| line == format!("worktree_{absent}\t0"))
-        );
-        assert!(text.lines().any(|line| line == "__HERDR_BUILDS__"));
-        let inspection = crate::worktrees::inspect_batched(&text, &key, &[], false).unwrap();
-        assert!(inspection.dirty.iter().any(|path| path == ".gitignore"));
-        assert!(
-            inspection
-                .ignored_data
-                .iter()
-                .any(|data| data.path == "safe" && data.bytes > 0)
-        );
-        assert!(
-            inspection
-                .ignored_data
-                .iter()
-                .any(|data| data.path == "target/nested" && data.bytes > 0)
-        );
-        // The second invocation reads the timestamp-and-size cache. Both
-        // invocations must emit exactly the same NUL-framed numeric sizes.
-        let cached = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "{}printf '__HERDR_BUILDS__\\n'\n",
-                remote_worktree_script(&ctx, &box_profile())
-            ))
-            .output()
-            .unwrap();
-        assert!(
-            cached.status.success(),
-            "{}",
-            String::from_utf8_lossy(&cached.stderr)
-        );
-        let cached = String::from_utf8(cached.stdout).unwrap();
-        let cached_inspection =
-            crate::worktrees::inspect_batched(&cached, &key, &[], false).unwrap();
-        assert_eq!(inspection, cached_inspection);
-        let filtered =
-            crate::worktrees::inspect_batched(&text, &key, &["target".into()], false).unwrap();
-        assert!(
-            !filtered
-                .ignored_data
-                .iter()
-                .any(|data| data.path == "target")
-        );
-        assert!(
-            filtered
-                .ignored_data
-                .iter()
-                .any(|data| data.path == "target/nested" && data.bytes > 0)
-        );
+        let _ = run(&ctx, &SessionFlags::default());
     }
 
     #[test]
@@ -4055,13 +2975,13 @@ recipe = "claude_fable_xhigh"
 
         assert!(!healthy, "{text}");
         assert!(
-            text.contains("[FAIL] finished worktrees buildbox"),
+            text.contains("[FAIL] finished build folders buildbox"),
             "{text}"
         );
         assert!(text.contains("demo-t-0099"), "{text}");
         assert!(checks.iter().any(|check| {
             check.status == "failed"
-                && check.label == "finished worktrees buildbox"
+                && check.label == "finished build folders buildbox"
                 && check.detail.contains("demo-t-0099")
         }));
     }

@@ -972,12 +972,6 @@ mod tests {
         .unwrap();
         assert!(long_input_hold(&fx.project));
         let ctx = fx.world.ctx();
-        let board = crate::board::compute(&ctx, &fx.project);
-        assert!(
-            board
-                .iter()
-                .any(|(key, value)| key == "ade_needs_you" && value.contains("30 minutes"))
-        );
         let context = crate::coordinator::digest(&ctx, &fx.project, "ha")
             .unwrap()
             .0;

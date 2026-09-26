@@ -608,6 +608,9 @@ fn tick_with_steps(
     step: &mut impl FnMut(&str) -> bool,
 ) -> Option<bool> {
     memory.tick += 1;
+    if let Err(error) = crate::branches::sweep_once(ctx) {
+        log.line(&format!("one-time branch sweep: {error:#}"));
+    }
     memory.machine_views.clear();
     let mut reachable = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -1672,14 +1675,6 @@ fn launch_pass(
                 // Registration can precede exec, especially on a remote box.
                 thread::bind_identity(record, &socket, &bound, process);
             })?;
-            if !t.launch.compact_reason.is_empty() {
-                let _ = crate::board::publish_value(
-                    pass.ctx,
-                    pass.project,
-                    "ade_last",
-                    &t.launch.compact_reason,
-                );
-            }
             Ok(())
         });
         if let Err(error) = launched {
@@ -2280,7 +2275,7 @@ fn tick_slow_with_steps(
     stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
     // D5 recovery and delivery (X1 to X5), then reviews, asks and the
-    // board (D6, D17, D18). Each takes the project lock only for its own
+    // asks (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.
     stop_after_state!("ops");
     errors.extend(
@@ -2296,7 +2291,6 @@ fn tick_slow_with_steps(
     );
 
     errors.extend(crate::ask::tick(ctx, project).err());
-    errors.extend(crate::board::refresh_tick(ctx, project).err());
     errors.extend(crate::threads::park_completed(ctx, project).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
@@ -4127,7 +4121,7 @@ mod tests {
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 0);
         assert_eq!(runner.count("agent start"), 0);
-        // The board (workspace tokens) still publishes; the pane is untouched.
+        // The pane remains untouched.
         assert_eq!(runner.count("pane report-metadata"), 0);
     }
 
@@ -4256,12 +4250,6 @@ mod tests {
             steps::load_state(&f.project)
                 .coordinator_relaunch_last
                 .is_empty()
-        );
-        let board = crate::board::compute(&ctx, &f.project);
-        assert!(
-            board
-                .iter()
-                .any(|(key, value)| key == "ade_stage" && value.contains("closed by Rolf"))
         );
     }
 

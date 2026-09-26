@@ -54,7 +54,7 @@ Summarize useful `## Remember` material in your own words. Never paste it.
 
 ## Talking to Rolf
 
-`say` and `ask` write board and journal records, not your reply prose.
+`say` and `ask` write journal records (and notify Rolf about questions), not your reply prose.
 
 - `ha say <slug> --what "<what happened>" [--means "<what it means for you>"]`
 - `ha ask <slug> "<question>?" --choice "<outcome>" --choice "<outcome>"`

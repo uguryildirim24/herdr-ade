@@ -243,9 +243,6 @@ enum Command {
     Doctor {
         #[command(flatten)]
         session: SessionArgs,
-        /// Remove only the exact leftover refs printed by the last doctor run
-        #[arg(long)]
-        prune_branches: Option<String>,
         /// Show wall time per check and duration of outside commands
         #[arg(long)]
         timings: bool,
@@ -301,7 +298,7 @@ enum Command {
         #[command(subcommand)]
         command: PlanCommand,
     },
-    /// Tell Rolf one checked line on the board and in the journal
+    /// Record one checked update in the journal
     Say {
         /// Project slug
         #[arg(value_name = "PROJECT")]
@@ -310,16 +307,6 @@ enum Command {
         what: String,
         #[arg(long)]
         means: Option<String>,
-    },
-    /// Publish the board rows now, or print them
-    Board {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        /// Print one lane's board line (names its machine)
-        #[arg(long, value_name = "THREAD")]
-        thread: Option<String>,
-        #[arg(long)]
-        print: bool,
     },
     /// The background ticker
     Ticker {
@@ -503,7 +490,7 @@ enum AskCommand {
 }
 
 fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
-    use crate::{ask, board, plan};
+    use crate::{ask, plan};
     match command {
         Command::Ask {
             slug,
@@ -745,49 +732,6 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
             let id = ask::say(ctx, &slug, &what, means.as_deref())?;
             crate::output::insert("say", id.clone());
             println!("{id} said");
-            Ok(())
-        }
-        Command::Board {
-            slug,
-            thread,
-            print,
-        } => {
-            let project = Project::load(&ctx.root, &slug)?;
-            if let Some(id) = thread {
-                let lane = crate::thread::load(&project, &id)?;
-                let machine = if lane.is_remote() && !lane.machine.is_empty() {
-                    format!("on machine `{}`", lane.machine)
-                } else {
-                    "on this Mac".to_string()
-                };
-                let since = if lane.is_remote() {
-                    crate::events::remote_state(&project, lane.machine_route()).last_pass
-                } else {
-                    lane.updated.clone()
-                };
-                let age = crate::board::age(&since)
-                    .map(|age| format!("{age} ago"))
-                    .unwrap_or_else(|| "not heard yet".into());
-                println!("{}\t{}\t{}\t{age}", lane.id, lane.last_group, machine);
-                return Ok(());
-            }
-            if print {
-                for (k, v) in board::compute(ctx, &project) {
-                    let verdict = match board::check_value(&project, &v) {
-                        Ok(()) => "ok".to_string(),
-                        Err(e) => format!("refused: {e:#}"),
-                    };
-                    println!("{k}\t{v}\t{verdict}");
-                }
-                println!(
-                    "not understood so far\t{}",
-                    ask::not_understood_count(&project)
-                );
-            } else {
-                for (k, why) in board::refresh(ctx, &project)? {
-                    println!("{k} kept its previous value: {why}");
-                }
-            }
             Ok(())
         }
         _ => unreachable!("run_project_commands only receives project commands"),
@@ -1898,7 +1842,6 @@ fn dispatch_with_start(
         },
         Command::Doctor {
             session,
-            prune_branches,
             timings,
             remove_kept_worktree,
         } => {
@@ -1907,10 +1850,6 @@ fn dispatch_with_start(
                     .split_once('/')
                     .ok_or_else(|| anyhow::anyhow!("expected PROJECT/THREAD"))?;
                 println!("{}", crate::threads::remove_kept_worktree(&ctx, slug, id)?);
-                return Ok(());
-            }
-            if let Some(plan) = prune_branches {
-                println!("{}", crate::branches::doctor(&ctx, Some(&plan))?);
                 return Ok(());
             }
             let result = doctor::run_timed_from(&ctx, &session.into(), timings, cli_started)?;
@@ -1929,10 +1868,9 @@ fn dispatch_with_start(
             }
             Ok(())
         }
-        command @ (Command::Ask { .. }
-        | Command::Plan { .. }
-        | Command::Say { .. }
-        | Command::Board { .. }) => run_project_commands(&ctx, command),
+        command @ (Command::Ask { .. } | Command::Plan { .. } | Command::Say { .. }) => {
+            run_project_commands(&ctx, command)
+        }
         Command::Review {
             slug,
             repo,
