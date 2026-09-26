@@ -434,20 +434,20 @@ fn prompt_text(input: &serde_json::Value) -> Option<&str> {
 /// Records a prompt typed into the coordinator pane and returns the request id
 /// to print, or `None` when a harness line must not be recorded as Rolf's.
 fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<String>> {
-    if crate::talk::is_task_notification_prompt(text)
-        || crate::talk::is_cross_session_prompt(text)
-        || crate::talk::is_idle_notice_prompt(text)
+    if crate::prompt::is_task_notification_prompt(text)
+        || crate::prompt::is_cross_session_prompt(text)
+        || crate::prompt::is_idle_notice_prompt(text)
     {
         return Ok(None);
     }
-    match crate::talk::take_pending_prompt(project, pane, text) {
-        Some(crate::talk::PendingPrompt::Automated) => Ok(None),
+    match crate::prompt::take_pending_prompt(project, pane, text) {
+        Some(crate::prompt::PendingPrompt::Automated) => Ok(None),
         None => {
-            let text = crate::talk::take_automated_parts(project, pane, text);
-            let Some(text) = crate::talk::human_request_text(&text) else {
+            let text = crate::prompt::take_automated_parts(project, pane, text);
+            let Some(text) = crate::prompt::human_request_text(&text) else {
                 return Ok(None);
             };
-            Ok(Some(crate::talk::record_pane_request(project, &text)?))
+            Ok(Some(crate::prompt::record_pane_request(project, &text)?))
         }
     }
 }
@@ -543,40 +543,113 @@ mod tests {
         let nudge = "[herdr-ade ticker: automated, not the user, approves nothing] Continue open work: job-0001: verify 3 acceptance condition(s); job-0005: ...";
         let mixed = format!("e{nudge}");
 
-        crate::talk::mark_automated_prompt(&project, "w1:p1", nudge).unwrap();
+        crate::prompt::mark_automated_prompt(&project, "w1:p1", nudge).unwrap();
         let request = handle_prompt(&project, "w1:p1", &mixed)
             .unwrap()
             .expect("the half-typed word remains Rolf's request");
         assert_eq!(
-            crate::talk::request_text(&project, &request).as_deref(),
+            crate::prompt::request_text(&project, &request).as_deref(),
             Some("e")
         );
 
-        crate::talk::append(
-            &project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-historical-mixed-nudge".into(),
-                text: mixed,
-                answer: None,
-            },
-        )
-        .unwrap();
+        let history = project
+            .record_dir_for_write("talk")
+            .unwrap()
+            .join("journal.jsonl");
+        std::fs::write(history, format!("{}\n", serde_json::json!({"seq":1,"rolf":{"request":"q-historical-mixed-nudge","text":mixed}}))).unwrap();
         assert_eq!(
-            crate::talk::request_text(&project, "q-historical-mixed-nudge").as_deref(),
+            crate::prompt::request_text(&project, "q-historical-mixed-nudge").as_deref(),
             Some("e")
         );
 
         let other = "[herdr-ade ticker: automated, not the user, approves nothing] New inbox items. Run context.";
-        crate::talk::mark_automated_prompt(&project, "w1:p1", nudge).unwrap();
-        crate::talk::mark_automated_prompt(&project, "w1:p1", other).unwrap();
+        crate::prompt::mark_automated_prompt(&project, "w1:p1", nudge).unwrap();
+        crate::prompt::mark_automated_prompt(&project, "w1:p1", other).unwrap();
         let request = handle_prompt(&project, "w1:p1", &format!("hal{nudge}{other}f"))
             .unwrap()
             .expect("words around two marked prompts remain");
         assert_eq!(
-            crate::talk::request_text(&project, &request).as_deref(),
+            crate::prompt::request_text(&project, &request).as_deref(),
             Some("half")
         );
+    }
+
+    #[test]
+    fn rolf_chat_request_and_answered_ask_authorize_tasks() {
+        let fx = crate::testkit::fixture();
+        let project = &fx.project;
+        let request = handle_prompt(project, "w1:p1", "Build the dashboard")
+            .unwrap()
+            .unwrap();
+        let parent = crate::task::add(
+            project,
+            "Build dashboard",
+            vec![format!("request:{request}")],
+            vec!["Dashboard opens".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::prompt::request_text(project, &request).as_deref(),
+            Some("Build the dashboard")
+        );
+        let ask = crate::ask::ask(
+            &fx.world.ctx(),
+            "demo",
+            crate::ask::NewAsk {
+                question: "Use the new dashboard?".into(),
+                choices: vec!["Use it".into(), "Wait".into()],
+                what: None,
+                means: None,
+                task: Some(parent.id),
+            },
+        )
+        .unwrap();
+        crate::ask::answer(&fx.world.ctx(), "demo", &ask.id, ask.revision, 1, "Rolf").unwrap();
+        crate::task::add(
+            project,
+            "Use dashboard",
+            vec![format!("ask:{}@{}", ask.id, ask.revision)],
+            vec!["Dashboard used".into()],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let task = crate::task::add(
+            project,
+            "Another task",
+            vec![format!("request:{request}")],
+            vec!["Answer only while open".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        let linked = crate::ask::ask(
+            &fx.world.ctx(),
+            "demo",
+            crate::ask::NewAsk {
+                question: "Use the alternate dashboard?".into(),
+                choices: vec!["Yes".into(), "No".into()],
+                what: None,
+                means: None,
+                task: Some(task.id.clone()),
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::ask::open_asks(project)
+                .iter()
+                .any(|row| row.id == linked.id)
+        );
+        crate::task::drop_task(project, &task.id, "No longer needed").unwrap();
+        assert!(
+            !crate::ask::open_asks(project)
+                .iter()
+                .any(|row| row.id == linked.id)
+        );
+        assert!(crate::ask::answer(&fx.world.ctx(), "demo", &linked.id, 1, 1, "Rolf").is_err());
     }
 
     #[test]

@@ -3248,16 +3248,7 @@ recipe = "claude_fable_xhigh"
         write_routing_config(&home.path().join("cfg"));
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
-        crate::talk::append(
-            &project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "Keep helper briefs focused.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
+        crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
         let note = crate::note::add(
             &project,
             crate::note::Kind::Memory,

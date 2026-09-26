@@ -93,6 +93,11 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         if event.payload.failed.is_some() {
             continue;
         }
+        // A changed code lane joins the review pile. The reviewer's seal is
+        // the coordinator wake-up for the whole pile, not each member's seal.
+        if pile_member(project, &event) {
+            continue;
+        }
         // A resolved lane is finished: its delivery journal is never replayed.
         if thread::load(project, &event.thread).is_ok_and(|lane| lane.status == Status::Resolved) {
             continue;
@@ -136,7 +141,24 @@ pub(crate) fn deliver_event(
     event: &crate::contracts::Event,
 ) -> Result<()> {
     adopt_report(project, event)?;
+    if pile_member(project, event) {
+        return Ok(());
+    }
     deliver_notice(ctx, project, event)
+}
+
+fn pile_member(project: &Project, event: &crate::contracts::Event) -> bool {
+    let Some(done) = &event.payload.done else {
+        return false;
+    };
+    thread::load(project, &event.thread).is_ok_and(|lane| {
+        lane.role != "reviewer"
+            && !lane.repo.is_empty()
+            && done
+                .has_changes
+                .or(lane.has_changes)
+                .unwrap_or(done.sha != lane.base)
+    })
 }
 
 fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event) -> Result<()> {
@@ -224,7 +246,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
         )?;
     }
     // Serialize prompts sent to the coordinator pane.
-    let _writer = crate::talk::writer_lock(project)?;
+    let _writer = crate::prompt::writer_lock(project)?;
     let agent = herdr.agent_list()?.into_iter().find(|agent| {
         agent.pane_id == event.recipient.pane
             && agent.name == coordinator.agent_name
@@ -233,7 +255,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     let Some(_agent) = agent else {
         return Ok(());
     };
-    if !crate::talk::coordinator_prompt_clear(project, &herdr, &event.recipient.pane)? {
+    if !crate::prompt::coordinator_prompt_clear(project, &herdr, &event.recipient.pane)? {
         return Ok(());
     }
     let mut line = crate::events::typed_line(event)?;
@@ -243,7 +265,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             queued.join("; ")
         ));
     }
-    crate::talk::mark_automated_prompt(project, &event.recipient.pane, &line)?;
+    crate::prompt::mark_automated_prompt(project, &event.recipient.pane, &line)?;
     herdr.agent_prompt(&event.recipient.pane, &line)?;
     crate::events::append_delivery(
         project,
@@ -972,13 +994,21 @@ pub(crate) fn remote_attention(
     }
 
     let mut signals = Vec::new();
+    let sealed = events::list(project);
     for lane in threads {
         // Placement creates the pane before the ticker has launched an
         // agent. A missing agent (or even a reboot) at that boundary is not
         // evidence of a gone process and must not spend recovery retries.
         // Also discard a prior attempt's gone marker so this attempt can be
         // observed independently once its launch begins.
-        if lane.parked || crate::threads::parkable(project, lane) {
+        if lane.parked
+            || crate::threads::parkable(project, lane)
+            || events::latest_event(&sealed, &lane.id, lane.attempt.max(1)).is_some_and(|event| {
+                event.payload.done.is_some()
+                    || event.payload.waiting.is_some()
+                    || event.payload.failed.is_some()
+            })
+        {
             state.blocked.remove(&lane.id);
             state.missing.remove(&lane.id);
             state.gone.remove(&lane.id);
@@ -1065,17 +1095,17 @@ pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Resu
         return Ok(false);
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-    let _writer = crate::talk::writer_lock(project)?;
+    let _writer = crate::prompt::writer_lock(project)?;
     let ready = herdr.agent_list()?.into_iter().any(|agent| {
         agent.pane_id == record.pane_id && agent.name == record.agent_name && agent.ready()
     });
     if !ready {
         return Ok(false);
     }
-    if !crate::talk::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
+    if !crate::prompt::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
         return Ok(false);
     }
-    crate::talk::mark_automated_prompt(project, &record.pane_id, text)?;
+    crate::prompt::mark_automated_prompt(project, &record.pane_id, text)?;
     herdr.agent_prompt(&record.pane_id, text)?;
     Ok(true)
 }
@@ -1459,9 +1489,37 @@ mod tests {
         assert!(digest.contains("done: abc"), "{digest}");
         *screen.borrow_mut() = "────────────────────\n❯ \n────────────────────\n  /home/agent/.herdr-ade/adeherdr > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n  ● main\n  ◯ general-purpose  Verifying excluded files · 20m\n".into();
         deliver_events(&world.ctx(), &project).unwrap();
-        assert_eq!(typed_lines(&world).len(), 2);
+        assert!(typed_lines(&world).is_empty());
+        assert!(events::states(&project, &event.id).unwrap().is_empty());
+        assert!(events::states(&project, &later.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pile_member_seals_do_not_wake_but_review_seal_wakes_once() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.repo = "/repo".into();
+            t.base = "base".into();
+        })
+        .unwrap();
+        let member = sealed_done(&project, &lane.id);
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert!(typed_lines(&world).is_empty());
+        assert!(events::states(&project, &member.id).unwrap().is_empty());
+
+        let reviewer = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.role = "reviewer".into();
+            t.repo = "/repo".into();
+        })
+        .unwrap();
+        let review = sealed_done(&project, &reviewer.id);
+        deliver_events(&world.ctx(), &project).unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
         assert!(
-            events::states(&project, &event.id)
+            events::states(&project, &review.id)
                 .unwrap()
                 .contains(&crate::contracts::DeliveryState::Submitted)
         );

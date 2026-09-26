@@ -2277,14 +2277,10 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
     );
     std::fs::write(&config, text).unwrap();
     let authority = project::create(&world.root, "authority", "", vec![]).unwrap();
-    crate::talk::append(
+    crate::prompt::record_test_request(
         &authority,
-        None,
-        crate::talk::Entry::Rolf {
-            request: "q-choice".into(),
-            text: "Use the chosen coordinator recipe for demo.".into(),
-            answer: None,
-        },
+        "q-choice",
+        "Use the chosen coordinator recipe for demo.",
     )
     .unwrap();
     let project = world.project("demo", "a.sock");
@@ -2387,16 +2383,7 @@ fn open_reopens_a_closed_coordinator_and_a_new_message_requests_reopen() {
     project
         .update_coordinator(|c| c.closed_by_rolf_at = project::now())
         .unwrap();
-    crate::talk::append(
-        &project,
-        None,
-        crate::talk::Entry::Rolf {
-            request: "q-1".into(),
-            text: "Continue".into(),
-            answer: None,
-        },
-    )
-    .unwrap();
+    crate::prompt::record_test_request(&project, "q-1", "Continue").unwrap();
     let record = project.coordinator().unwrap();
     assert!(record.closed_by_rolf_at.is_empty());
     assert!(record.reopen_requested);
@@ -2455,16 +2442,7 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
 fn the_digest_uses_the_complete_fact_from_the_project_page() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
-    crate::talk::append(
-        &project,
-        None,
-        crate::talk::Entry::Rolf {
-            request: "q-1".into(),
-            text: "Keep helper briefs focused.".into(),
-            answer: None,
-        },
-    )
-    .unwrap();
+    crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
     let note = crate::note::add(
         &project,
         crate::note::Kind::Memory,

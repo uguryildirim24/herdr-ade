@@ -192,7 +192,7 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
 /// coordinator recipe choice. The portable, project-qualified form is retained
 /// on the coordinator launch record.
 pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<String> {
-    crate::talk::resolve_request(project, basis)
+    crate::prompt::resolve_request(project, basis)
         .map(|request| request.qualified_basis())
         .map_err(|error| crate::refusal::error(error.to_string()))
 }
@@ -223,7 +223,7 @@ pub fn authorize_explicit_recipe(
     let request = task
         .authority
         .iter()
-        .filter_map(|authority| crate::talk::resolve_request(project, authority).ok())
+        .filter_map(|authority| crate::prompt::resolve_request(project, authority).ok())
         .find(|request| request.text.contains(quote))
         .with_context(
             || "recipe_authority: --basis must quote Rolf's words from a request on this task",

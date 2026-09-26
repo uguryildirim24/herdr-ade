@@ -374,7 +374,6 @@ pub(crate) fn step_remove(
     ctx: &Ctx,
     slug: &str,
     id: &str,
-    _why: &str,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
@@ -824,14 +823,7 @@ mod tests {
             expect += 1;
         }
         let plan = add(&fx, "An eighth step.", expect);
-        let plan = step_remove(
-            &fx.world.ctx(),
-            "demo",
-            "s-3",
-            "It is not needed.",
-            plan.revision,
-        )
-        .unwrap();
+        let plan = step_remove(&fx.world.ctx(), "demo", "s-3", plan.revision).unwrap();
         assert_eq!(plan.steps.len(), 7);
         let plan = add(&fx, "A replacement step.", plan.revision);
         assert!(plan.steps.iter().any(|s| s.id == "s-9"), "{:?}", plan.steps);
@@ -940,11 +932,11 @@ mod tests {
         assert_eq!(json["steps"][0]["subtasks"][1]["id"], "s-4");
         assert!(json["steps"][1].get("subtasks").is_none(), "{json}");
 
-        let plan = step_remove(&ctx, "demo", "s-4", "not needed", None).unwrap();
+        let plan = step_remove(&ctx, "demo", "s-4", None).unwrap();
         assert_eq!(plan.steps[0].subtasks.len(), 1);
         assert_eq!(plan.steps.len(), 2);
         // Removing a step removes its subtasks; no id is reused.
-        let plan = step_remove(&ctx, "demo", "s-1", "not needed", None).unwrap();
+        let plan = step_remove(&ctx, "demo", "s-1", None).unwrap();
         assert_eq!(all_steps(&plan).count(), 1);
         let (_, id) = subtask_add(&ctx, "demo", "s-2", "Open it once", vec![], None).unwrap();
         assert_eq!(id, "s-5");
@@ -1066,7 +1058,7 @@ mod tests {
         assert_eq!(plan.steps[0].subtasks[0].state, StepState::Done);
         assert_eq!(plan.steps[0].state, StepState::Running);
 
-        let plan = step_remove(&ctx, "demo", "s-3", "not needed", None).unwrap();
+        let plan = step_remove(&ctx, "demo", "s-3", None).unwrap();
         assert_eq!(plan.steps[0].state, StepState::Done);
     }
 }

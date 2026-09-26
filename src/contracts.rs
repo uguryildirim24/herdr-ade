@@ -369,43 +369,15 @@ pub(crate) struct Ask {
     pub(crate) means: Option<String>,
     pub(crate) asked: String,
     pub(crate) coordinator_binding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task: Option<String>,
 }
 
 /// The only values `publish()` accepts (SPEC-ADE D17 item 3, item 35).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HumanMessage {
-    Say {
-        id: String,
-        what: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        means: Option<String>,
-    },
-    Ask {
-        id: String,
-        revision: u32,
-    },
-    Notice {
-        id: String,
-    },
-}
-
-/// Talk inbound request states (SPEC-ADE D18 item 2, item 35).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TalkRequestState {
-    Queued,
-    Submitted,
-    Uncertain,
-    Accepted,
-}
-
-/// `inbound { request, state }` on the talk journal (SPEC-ADE D18 item 2).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct TalkInbound {
-    pub(crate) request: String,
-    pub(crate) state: TalkRequestState,
-    pub(crate) recipient: Recipient,
+    Ask { id: String, revision: u32 },
 }
 
 // --------------------------------------------------------------- plan card
@@ -648,18 +620,11 @@ mod tests {
             means: Some("You choose whether it continues.".into()),
             asked: "2026-09-18T00:00:00Z".into(),
             coordinator_binding: "w1:p1".into(),
-        });
-        json_roundtrip(&HumanMessage::Say {
-            id: "s-1".into(),
-            what: "A lane is done.".into(),
-            means: None,
+            task: None,
         });
         json_roundtrip(&HumanMessage::Ask {
             id: "a-1".into(),
             revision: 1,
-        });
-        json_roundtrip(&HumanMessage::Notice {
-            id: "journal_tail".into(),
         });
     }
 

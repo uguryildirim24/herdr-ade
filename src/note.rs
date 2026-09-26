@@ -173,7 +173,9 @@ pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
     use anyhow::Context;
     let reference = AuthorityRef::parse(text).context("invalid authority reference")?;
     match &reference {
-        AuthorityRef::Request(_) => return Ok(crate::talk::resolve_request(project, text)?.basis()),
+        AuthorityRef::Request(_) => {
+            return Ok(crate::prompt::resolve_request(project, text)?.basis());
+        }
         AuthorityRef::Ask { id, revision } => {
             if crate::ask::latest_revision(project, id) != *revision {
                 bail!("ask revision is not current");
@@ -351,16 +353,8 @@ mod tests {
     #[test]
     fn retirement_keeps_history_but_removes_current_fact_and_instruction() {
         let fx = fixture();
-        crate::talk::append(
-            &fx.project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "These are no longer true.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
+        crate::prompt::record_test_request(&fx.project, "q-1", "These are no longer true.")
+            .unwrap();
         for kind in [Kind::Memory, Kind::Instruction] {
             let note = add(
                 &fx.project,
@@ -389,16 +383,8 @@ mod tests {
     #[test]
     fn explicit_replacement_hides_old_note_from_active_rows() {
         let fx = fixture();
-        crate::talk::append(
-            &fx.project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "Use the newer instruction.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
+        crate::prompt::record_test_request(&fx.project, "q-1", "Use the newer instruction.")
+            .unwrap();
         let old = add(&fx.project, Kind::Memory, "Keep this.", "q-1", None, vec![]).unwrap();
         let new = add(
             &fx.project,

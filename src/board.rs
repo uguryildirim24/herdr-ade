@@ -42,11 +42,6 @@ pub(crate) struct BoardState {
     /// state without this map still loads and gets an unaged unavailable row.
     #[serde(default)]
     pub(crate) observed_at: BTreeMap<String, String>,
-    /// The last `say` line or fixed notice for `ade_last`, and when.
-    #[serde(default)]
-    pub(crate) last_say: String,
-    #[serde(default)]
-    pub(crate) last_say_at: String,
 }
 
 fn state_path(project: &Project) -> PathBuf {
@@ -62,14 +57,6 @@ fn save_state(project: &Project, change: impl FnOnce(&mut BoardState)) {
     let mut s = state(project);
     change(&mut s);
     let _ = project::write_json(&state_path(project), &s);
-}
-
-/// Remembers a published `say` line so the next template pass keeps it.
-pub(crate) fn remember_last(project: &Project, line: &str) {
-    save_state(project, |s| {
-        s.last_say = line.to_string();
-        s.last_say_at = project::now();
-    });
 }
 
 /// Gate B for one value: bounded, no control characters, passes the check.
@@ -238,7 +225,7 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
     // waiting event and never inferred from idle.
     out.push((
         "ade_needs_you".to_string(),
-        if crate::talk::long_input_hold(project) {
+        if crate::prompt::long_input_hold(project) {
             "your unfinished input has held automated prompts for over 30 minutes".to_string()
         } else {
             crate::ask::newest_open(project)
@@ -247,8 +234,7 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
         },
     ));
 
-    // ade_last: the last say line or a templated last event with its age.
-    let s = state(project);
+    // ade_last: the last event with its age.
     let last_event = events.last().map(|e| {
         let what = if e.payload.done.is_some() {
             "a lane finished"
@@ -265,13 +251,9 @@ pub(crate) fn compute(ctx: &Ctx, project: &Project) -> Vec<(String, String)> {
         };
         (e.created.clone(), what)
     });
-    let last = match (last_event, s.last_say.is_empty()) {
-        (Some((at, what)), true) => format!("{what} {} ago", age(&at).unwrap_or_default()),
-        (Some((at, what)), false) if at > s.last_say_at => {
-            format!("{what} {} ago", age(&at).unwrap_or_default())
-        }
-        (_, false) => s.last_say.clone(),
-        (None, true) => "nothing has happened yet".to_string(),
+    let last = match last_event {
+        Some((at, what)) => format!("{what} {} ago", age(&at).unwrap_or_default()),
+        None => "nothing has happened yet".to_string(),
     };
     out.push(("ade_last".to_string(), last.replace("  ", " ")));
 

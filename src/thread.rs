@@ -1962,16 +1962,7 @@ mod tests {
     fn brief_carries_the_task_and_only_applicable_current_page_facts() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        crate::talk::append(
-            &project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "Keep helper briefs focused.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
+        crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
         let current = crate::task::add(
             &project,
             "Ship the checked change.",
@@ -2071,16 +2062,7 @@ mod tests {
     fn memory_over_budget_warns_with_the_note_and_size() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        crate::talk::append(
-            &project,
-            None,
-            crate::talk::Entry::Rolf {
-                request: "q-1".into(),
-                text: "Keep helper briefs focused.".into(),
-                answer: None,
-            },
-        )
-        .unwrap();
+        crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
         let note = crate::note::add(
             &project,
             crate::note::Kind::Memory,
