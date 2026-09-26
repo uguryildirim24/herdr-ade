@@ -3438,7 +3438,7 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
         let content = line.trim_end_matches(['\n', '\r']);
         let indent = content.bytes().take_while(|b| *b == b' ').count();
         let marker = content.as_bytes().get(indent).copied();
-        let run = marker.map_or(0, |m| {
+        let run = marker.filter(|m| matches!(m, b'`' | b'~')).map_or(0, |m| {
             content.as_bytes()[indent..]
                 .iter()
                 .take_while(|b| **b == m)
@@ -4791,7 +4791,7 @@ mod tests {
 
     #[test]
     fn pasted_error_and_code_spans_do_not_create_report_links() {
-        let report = "```text\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'yaml' imported from ...\n![x](hidden.png)\n```\n~~~\n[missing]: also-hidden.png\n~~~\n`![inline](inline.png)` and ``[label]: invisible.png``\n![real](visible.png)\n";
+        let report = "Résumé: ![real](visible.png)\n```text\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'yaml' imported from ...\n![x](hidden.png)\n```\n~~~\n[missing]: also-hidden.png\n~~~\n`![inline](inline.png)` and ``[label]: invisible.png``\n";
         let links = report_destinations(report);
         assert_eq!(
             links.into_iter().map(|(_, dest)| dest).collect::<Vec<_>>(),
