@@ -51,7 +51,14 @@ fn withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     let duplicate = run(&ask_args);
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("ask_duplicate: `a-1`"));
-    let withdrawn = run(&["ask", "withdraw", "demo", "a-1", "No longer needed."]);
+    let withdrawn = run(&[
+        "ask",
+        "close",
+        "demo",
+        "a-1",
+        "--withdraw",
+        "No longer needed.",
+    ]);
     assert!(
         withdrawn.status.success(),
         "{}",
@@ -63,11 +70,18 @@ fn withdraw_commands_keep_history_and_ask_output_starts_with_id() {
     assert!(record.contains("by = \"rolf\""));
     assert!(run(&ask_args).status.success());
     assert!(
-        run(&["ask", "answer", "demo", "a-2", "--revision", "1", "1",])
+        run(&["ask", "close", "demo", "a-2", "--choice", "1",])
             .status
             .success()
     );
-    let refused = run(&["ask", "withdraw", "demo", "a-2", "No longer needed."]);
+    let refused = run(&[
+        "ask",
+        "close",
+        "demo",
+        "a-2",
+        "--withdraw",
+        "No longer needed.",
+    ]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("answered ask cannot be withdrawn"));
 }
@@ -249,10 +263,7 @@ fn context_repeats_compactly_and_full_restores_standing_sections() {
         repeat.starts_with("## Since your last context\n\nNothing new."),
         "{repeat}"
     );
-    assert!(
-        repeat.contains("Unchanged; run `ha context demo --full`"),
-        "{repeat}"
-    );
+    assert!(!repeat.contains("# Project"), "{repeat}");
     assert!(!repeat.contains("## Standing instructions in force"));
     let full = String::from_utf8(
         hp(
@@ -351,7 +362,6 @@ fn every_named_verb_returns_a_structured_refusal() {
         &["thread", "show", "missing", "t-1"],
         &["ask"],
         &["plan", "show", "missing"],
-        &["say", "missing", "--what", "This was checked."],
         &["done", "--report", "report.md", "--sha", "deadbeef"],
         &["thread", "resolve", "missing", "t-1"],
         &["context", "missing"],
