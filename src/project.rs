@@ -615,6 +615,9 @@ pub(crate) fn tab_env(
         // Keep the established local-lane argv unchanged.
         env.extend(spec.env.iter().cloned());
     }
+    env.retain(|value| !value.starts_with("GIT_EDITOR=") && !value.starts_with("EDITOR="));
+    env.push("GIT_EDITOR=true".into());
+    env.push("EDITOR=true".into());
     if spec.kind == "dsh" {
         if !env.iter().any(|e| e.starts_with("DSH_PERMISSION_MODE=")) {
             env.push("DSH_PERMISSION_MODE=danger-full-access".into());
