@@ -1,5 +1,5 @@
 //! Prune harness refs only after their lane is resolved or their commit landed.
-//! Remote deletion uses a lease, so a new push cannot be erased by a stale plan.
+//! Remote deletion checks the advertised tip before pushing the deletion.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
@@ -317,13 +317,13 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     } else {
         None
     };
-    let has_seal_refs = crate::events::list(project).iter().any(|e| {
-        e.thread == record.id
-            && e.payload
-                .done
-                .as_ref()
-                .is_some_and(|d| d.published_ref.is_some())
-    });
+    let events = crate::events::list(project);
+    let last_box_seal = events
+        .iter()
+        .filter(|e| e.thread == record.id)
+        .filter_map(|e| e.payload.done.as_ref())
+        .rfind(|d| d.published_ref.is_some());
+    let has_seal_refs = last_box_seal.is_some();
     let expected = record
         .cleanup_reason
         .strip_prefix("retained worktree removal: ")
@@ -358,7 +358,10 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
             crate::threads::box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
         let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
         let refname = crate::remote::quote(&format!("refs/heads/{}", record.branch));
-        let pin = expected.map_or(String::new(), |sha| {
+        // The Mac and published mutable branch stay at the start tip, but
+        // the box checkout advances as the lane commits its sealed result.
+        let box_expected = last_box_seal.map(|done| done.sha.as_str()).or(expected);
+        let pin = box_expected.map_or(String::new(), |sha| {
             format!(
                 "if [ -n \"$old\" ] && [ \"$old\" != {} ]; then echo 'box branch moved beyond its sealed cleanup tip' >&2; exit 1; fi; ",
                 crate::remote::quote(sha)
@@ -398,10 +401,7 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     // Every immutable seal owns its own publication. Delete all of them,
     // including superseded reviewer verdicts, before clearing cleanup_pending.
     if let Some(url) = &url {
-        for event in crate::events::list(project)
-            .into_iter()
-            .filter(|e| e.thread == record.id)
-        {
+        for event in events.into_iter().filter(|e| e.thread == record.id) {
             if let Some(done) = event.payload.done
                 && let Some(reference) = done.published_ref
             {
