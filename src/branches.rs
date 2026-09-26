@@ -509,7 +509,7 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
                 .cloned()
                 .unwrap_or_default();
             let mut names: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
-            names.retain(|name| harness_ref(name) && !in_use.contains(name));
+            names.retain(|name| harness_ref(name) && !round_ref(name) && !in_use.contains(name));
             if names.is_empty() {
                 continue;
             }
@@ -559,11 +559,134 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
     Ok((result, unreachable))
 }
 
-/// Sweep only resolved lanes whose tips are ancestors of the configured integration
-/// branch. The marker is written after eligible cleanup succeeds; retained
-/// worktrees with changes or data are skipped with their branches intact.
+// Round branches predate pile reviews. A pile branch has another path component.
+fn round_ref(name: &str) -> bool {
+    let Some(number) = name.strip_prefix("review/r") else {
+        return false;
+    };
+    let (digits, suffix) = number
+        .split_once('-')
+        .map_or((number, None), |(a, b)| (a, Some(b)));
+    !digits.is_empty()
+        && digits.bytes().all(|c| c.is_ascii_digit())
+        && suffix.is_none_or(|value| !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit()))
+}
+
+fn round_worktrees(runner: &dyn Runner, repo: &str) -> Result<BTreeMap<String, String>> {
+    let text = git(runner, repo, &["worktree", "list", "--porcelain"])?;
+    let mut result = BTreeMap::new();
+    for block in text.split("\n\n") {
+        let path = block
+            .lines()
+            .find_map(|line| line.strip_prefix("worktree "));
+        let branch = block
+            .lines()
+            .find_map(|line| line.strip_prefix("branch refs/heads/"));
+        if let (Some(path), Some(branch)) = (path, branch) {
+            let root = Path::new(repo).join(".worktrees");
+            let path_buf = Path::new(path);
+            let expected = branch.replacen("review/", "review-", 1);
+            let matching_folder = path_buf
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == expected
+                        || name
+                            .strip_prefix(&format!("{expected}-"))
+                            .is_some_and(|suffix| {
+                                !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())
+                            })
+                });
+            if round_ref(branch) && path_buf.parent() == Some(root.as_path()) && matching_folder {
+                result.insert(branch.to_owned(), path.to_owned());
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn sweep_rounds(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
+    let mut rows = BTreeMap::<String, Vec<crate::project::Repo>>::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        let (settings, _) = project.read_project_md()?;
+        for row in settings.repos {
+            rows.entry(row.path.clone()).or_default().push(row);
+        }
+    }
+    for row in crate::harness::repos(&ctx.config_dir)? {
+        rows.entry(row.path.clone()).or_default().push(row);
+    }
+    for (repo, repo_rows) in rows {
+        if !Path::new(&repo).is_dir() {
+            continue;
+        }
+        let base = repo_rows
+            .iter()
+            .find_map(|row| row.branch.as_deref())
+            .unwrap_or("main");
+        let worktrees = round_worktrees(ctx.runner, &repo)?;
+        for (branch, sha) in refs(ctx.runner, &repo, None)? {
+            if !round_ref(&branch) {
+                continue;
+            }
+            let ancestry = ctx.runner.run(&Cmd::new("git", TIMEOUT).args([
+                "-C",
+                &repo,
+                "merge-base",
+                "--is-ancestor",
+                &sha,
+                base,
+            ]))?;
+            if !ancestry.success() {
+                log(&format!(
+                    "one-time branch sweep: {repo} {branch} keeps unmerged commits"
+                ));
+                continue;
+            }
+            if let Some(path) = worktrees.get(&branch) {
+                let disposable =
+                    crate::worktrees::disposable_for_rows(&ctx.config_dir, &repo, &repo_rows)?;
+                let inspection =
+                    crate::worktrees::inspect_local(ctx.runner, &repo, path, &disposable, false)?;
+                if !inspection.dirty.is_empty() {
+                    log(&format!(
+                        "one-time branch sweep: {repo} {branch} keeps uncommitted changes"
+                    ));
+                    continue;
+                }
+                if !inspection.ignored_data.is_empty() {
+                    let folders = inspection
+                        .ignored_data
+                        .iter()
+                        .map(|entry| entry.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    log(&format!(
+                        "one-time branch sweep: {repo} {branch} keeps ignored data: {folders}"
+                    ));
+                    continue;
+                }
+                crate::git::worktree_remove(ctx.runner, &repo, path)?;
+            }
+            // A checkout elsewhere still owns the branch. Only the named round
+            // worktrees are eligible for automatic removal.
+            if checked_out(ctx.runner, &repo)?.contains(&branch) {
+                log(&format!(
+                    "one-time branch sweep: {repo} {branch} keeps another checkout"
+                ));
+                continue;
+            }
+            delete_local(ctx.runner, &repo, &branch, &sha)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sweep merged, resolved lanes and local round leftovers. The v2 marker is
+/// written after cleanup succeeds; retained worktrees and branches stay intact.
 pub(crate) fn sweep_once(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
-    let marker = ctx.root.join(".branch-sweep-v1.json");
+    let marker = ctx.root.join(".branch-sweep-v2.json");
     if marker.exists() {
         return Ok(());
     }
@@ -578,6 +701,7 @@ pub(crate) fn sweep_once(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
             if record.status == Status::Resolved
                 && !record.repo.is_empty()
                 && harness_ref(&record.branch)
+                && !round_ref(&record.branch)
                 && record.kind == thread::Kind::Worktree
                 && !record.worktree_path.is_empty()
                 && record.is_remote()
@@ -623,6 +747,7 @@ pub(crate) fn sweep_once(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
             if record.status != Status::Resolved
                 || record.repo.is_empty()
                 || !harness_ref(&record.branch)
+                || round_ref(&record.branch)
                 || record.kind != thread::Kind::Worktree
                 || record.worktree_path.is_empty()
                 || (record.is_remote() && !present.contains(&record.id))
@@ -670,8 +795,21 @@ pub(crate) fn sweep_once(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
             let inspection = crate::threads::inspect_worktree_for_removal(ctx, &project, record)?;
             if !inspection.dirty.is_empty() || !inspection.ignored_data.is_empty() {
                 if kept.insert((record.repo.clone(), record.branch.clone())) {
+                    let reason = if !inspection.dirty.is_empty() {
+                        "keeps uncommitted changes".to_owned()
+                    } else {
+                        format!(
+                            "keeps ignored data: {}",
+                            inspection
+                                .ignored_data
+                                .iter()
+                                .map(|data| data.path.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
                     log(&format!(
-                        "one-time branch sweep: {} keeps changes or data; worktree and branch kept",
+                        "one-time branch sweep: {} {reason}; worktree and branch kept",
                         record.id
                     ));
                 }
@@ -694,7 +832,13 @@ pub(crate) fn sweep_once(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
             delete_remote(ctx.runner, &item.repo, url, &item.branch, sha)?;
         }
     }
-    project::write_json(&marker, &true)
+    sweep_rounds(ctx, &mut log)?;
+    project::write_json(&marker, &true)?;
+    let old_marker = ctx.root.join(".branch-sweep-v1.json");
+    if old_marker.exists() {
+        std::fs::remove_file(old_marker)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -875,11 +1019,97 @@ mod tests {
             assert!(branches.contains_key("hp/demo/data"));
             assert!(!branches.contains_key("hp/demo/clean"));
         }
-        assert!(ctx.root.join(".branch-sweep-v1.json").exists());
+        assert!(ctx.root.join(".branch-sweep-v2.json").exists());
         assert_eq!(logs.len(), 1);
-        assert!(logs[0].contains("keeps changes or data"));
+        assert!(logs[0].contains("keeps ignored data: kept-data"));
         sweep_once(&ctx, |message| logs.push(message.to_owned())).unwrap();
         assert_eq!(logs.len(), 1);
+    }
+
+    #[test]
+    fn round_sweep_removes_only_merged_local_round_and_clean_worktree() {
+        let (fx, bare) = configured();
+        let repo = fx.repo.to_str().unwrap();
+        let remote = bare.path().to_str().unwrap();
+        let path = fx.repo.join(".worktrees/review-r19");
+        run(&fx.repo, &["branch", "review/r19", "main"]);
+        run(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                path.to_str().unwrap(),
+                "review/r19",
+            ],
+        );
+        run(&fx.repo, &["branch", "review/r20", "main"]);
+        let unmerged = fx.world.home.path().join("unmerged");
+        run(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                unmerged.to_str().unwrap(),
+                "review/r20",
+            ],
+        );
+        run(&unmerged, &["commit", "--allow-empty", "-qm", "new round"]);
+        run(&fx.repo, &["branch", "review/pile/review-1", "main"]);
+        for branch in ["review/r19", "review/r20", "review/pile/review-1"] {
+            run(&fx.repo, &["push", "-q", remote, branch]);
+        }
+        let old = fx.world.ctx().root.join(".branch-sweep-v1.json");
+        std::fs::write(&old, "true").unwrap();
+        let mut logs = Vec::new();
+        sweep_once(&fx.world.ctx(), |line| logs.push(line.to_owned())).unwrap();
+        assert!(!old.exists());
+        assert!(fx.world.ctx().root.join(".branch-sweep-v2.json").exists());
+        assert!(!path.exists());
+        let local = refs(fx.world.ctx().runner, repo, None).unwrap();
+        assert!(!local.contains_key("review/r19"));
+        assert!(local.contains_key("review/r20"));
+        assert!(local.contains_key("review/pile/review-1"));
+        let published = refs(fx.world.ctx().runner, repo, Some(remote)).unwrap();
+        assert!(published.contains_key("review/r19"));
+        assert!(published.contains_key("review/r20"));
+        assert!(published.contains_key("review/pile/review-1"));
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("review/r20 keeps unmerged commits"));
+    }
+
+    #[test]
+    fn round_sweep_keeps_changed_and_data_worktrees() {
+        let (fx, _bare) = configured();
+        let repo = fx.repo.to_str().unwrap();
+        for (branch, file) in [("review/r21", "change"), ("review/r22-2", "data")] {
+            let path = fx
+                .repo
+                .join(".worktrees")
+                .join(branch.replace("review/", "review-"));
+            run(&fx.repo, &["branch", branch, "main"]);
+            run(
+                &fx.repo,
+                &["worktree", "add", "-q", path.to_str().unwrap(), branch],
+            );
+            std::fs::write(path.join(file), "keep").unwrap();
+        }
+        std::fs::write(fx.repo.join(".git/info/exclude"), "data\n").unwrap();
+        let mut logs = Vec::new();
+        sweep_once(&fx.world.ctx(), |line| logs.push(line.to_owned())).unwrap();
+        let local = refs(fx.world.ctx().runner, repo, None).unwrap();
+        assert!(local.contains_key("review/r21"));
+        assert!(local.contains_key("review/r22-2"));
+        assert_eq!(logs.len(), 2);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("review/r21 keeps uncommitted changes"))
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("review/r22-2 keeps ignored data: data"))
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ fn configured() -> Fx {
     .unwrap();
     fx
 }
-fn lane(fx: &Fx, n: u32) -> (String, String) {
+fn lane_unsealed(fx: &Fx, n: u32) -> (String, String) {
     let (id, sha) = fx.lane(n);
     let branch = format!("hp/demo/{id}-work");
     git(&fx.repo, &["branch", "-m", &format!("lane/{n}"), &branch]);
@@ -34,6 +34,10 @@ fn lane(fx: &Fx, n: u32) -> (String, String) {
         t.thread_dir = thread::thread_dir(&t.worktree_path, &fx.project.slug, &id);
     })
     .unwrap();
+    (id, sha)
+}
+fn lane(fx: &Fx, n: u32) -> (String, String) {
+    let (id, sha) = lane_unsealed(fx, n);
     fx.seal_done(&id, 1, 1, &sha, "finished\n");
     (id, sha)
 }
@@ -173,6 +177,92 @@ fn old_no_change_seal_finishes_without_merge_even_when_resolved() {
     assert_eq!(
         crate::task::view(&fx.project, task).state,
         crate::task::State::Finished
+    );
+}
+
+#[test]
+fn empty_commit_seals_as_no_change_without_starting_a_pile() {
+    let fx = configured();
+    let (id, _) = lane_unsealed(&fx, 1);
+    let lane = thread::load(&fx.project, &id).unwrap();
+    let wt = Path::new(&lane.worktree_path);
+    git(wt, &["reset", "--hard", &lane.base]);
+    git(
+        wt,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "Verify release bundle",
+        ],
+    );
+    let sha = git(wt, &["rev-parse", "HEAD"]);
+    assert_ne!(sha, lane.base);
+    let report_path = wt.join(".herdr-project/report.md");
+    std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+    std::fs::write(&report_path, "Verified bundle\n").unwrap();
+    let op = crate::ops::reserve_done(
+        &fx.project,
+        crate::ops::Reservation {
+            thread: &id,
+            attempt: 1,
+            kind: crate::contracts::OpKind::Done,
+            recipient: crate::contracts::Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            requested: crate::contracts::Requested::Done {
+                sha,
+                report_path: ".herdr-project/report.md".into(),
+            },
+            helper_pid: 1,
+        },
+        wt,
+    )
+    .unwrap();
+    let staged = crate::ops::stage_done(&fx.project, &op.op, wt, fx.world.ctx().runner).unwrap();
+    assert_eq!(staged.has_changes, Some(false));
+    let seal = crate::ops::seal(&fx.project, &op.op, |_| Ok(())).unwrap();
+    assert_eq!(seal.payload.done.unwrap().has_changes, Some(false));
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+    assert!(list(&fx.project).unwrap().is_empty());
+    let task = job(&fx, &id);
+    assert_eq!(
+        crate::task::view(&fx.project, task).state,
+        crate::task::State::Finished
+    );
+}
+
+#[test]
+fn old_empty_commit_seal_is_classified_as_no_change() {
+    let fx = configured();
+    let (id, _) = lane_unsealed(&fx, 1);
+    let lane = thread::load(&fx.project, &id).unwrap();
+    let wt = Path::new(&lane.worktree_path);
+    git(wt, &["reset", "--hard", &lane.base]);
+    git(
+        wt,
+        &["commit", "-q", "--allow-empty", "-m", "Verify bundle"],
+    );
+    let sha = git(wt, &["rev-parse", "HEAD"]);
+    fx.seal_done(&id, 1, 1, &sha, "Verified bundle");
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+    assert_eq!(
+        thread::load(&fx.project, &id).unwrap().has_changes,
+        Some(false)
+    );
+    // Reclassify an uncached, resolved historical seal through the other path.
+    thread::update(&fx.project, &id, |t| {
+        t.status = Status::Resolved;
+        t.changes_seal.clear();
+        t.has_changes = None;
+    })
+    .unwrap();
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert_eq!(
+        thread::load(&fx.project, &id).unwrap().has_changes,
+        Some(false)
     );
 }
 

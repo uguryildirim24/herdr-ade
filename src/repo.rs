@@ -50,6 +50,13 @@ impl<'a> Git<'a> {
         crate::git::branch_head(self.runner, &self.repo.to_string_lossy(), branch)
     }
 
+    /// Whether the two commits contain different file trees (empty commits do not count).
+    pub fn trees_differ(&self, base: &str, sha: &str) -> Result<bool> {
+        let base_tree = self.run(&["rev-parse", &format!("{base}^{{tree}}")])?;
+        let sha_tree = self.run(&["rev-parse", &format!("{sha}^{{tree}}")])?;
+        Ok(base_tree != sha_tree)
+    }
+
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
         crate::git::is_ancestor(
             self.runner,
