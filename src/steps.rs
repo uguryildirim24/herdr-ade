@@ -231,7 +231,12 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             .enumerate()
             .filter(|(_, f)| {
                 f.attempt == event.attempt
-                    && (f.state == crate::thread::FollowUpState::Queued || f.after_seal == event.id)
+                    && (matches!(
+                        f.state,
+                        crate::thread::FollowUpState::Queued
+                            | crate::thread::FollowUpState::Uncertain
+                    ) || f.state == crate::thread::FollowUpState::Delivered
+                        && f.after_seal == event.id)
             })
             .map(|(i, f)| {
                 format!(
@@ -250,7 +255,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             event,
             "follow-up-pending",
             &format!(
-                "{} sealed before follow-up {} landed; keep the lane open for its next seal",
+                "{} sealed before follow-up {} landed; hold until idle verification (changed work needs a new seal)",
                 event.thread,
                 queued.join("; ")
             ),
@@ -267,7 +272,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     let mut line = crate::events::typed_line(event)?;
     if !queued.is_empty() {
         line.push_str(&format!(
-            " Follow-up overtook this seal: {}. Keep this lane open until it seals again.",
+            " Follow-up overtook this seal: {}. It can be restored at idle if HEAD, tree and report are unchanged; changed work needs a new seal.",
             queued.join("; ")
         ));
     }
@@ -433,7 +438,7 @@ impl Outage {
     }
 }
 
-const REMOTE_EVERY_TICKS: u64 = 4;
+const REMOTE_EVERY_TICKS: u64 = 1;
 const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
 
 #[derive(Debug, Clone, Default)]
@@ -472,8 +477,8 @@ impl Memory {
         }
     }
 
-    /// Remote machines are polled every fourth tick (about a minute), and not
-    /// at all for eight ticks after a failure.
+    /// Poll each machine on every 15-second tick; a fresh reviewer seal
+    /// should not sit through a minute of courier cadence. Failures back off.
     pub(crate) fn machine_is_due(&mut self, machine: &str) -> bool {
         let tick = self.tick;
         let entry = self.machines.entry(machine.to_string()).or_default();
