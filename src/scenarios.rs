@@ -2405,7 +2405,7 @@ fn open_reopens_a_closed_coordinator_and_a_new_message_requests_reopen() {
 }
 
 #[test]
-fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
+fn ticker_does_not_relaunch_a_gone_coordinator() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     project
@@ -2432,7 +2432,7 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
     );
     ticker::tick_project(&world.ctx(), &project).unwrap();
     assert_eq!(project.coordinator().unwrap().launch.recipe_id, "chosen");
-    assert_eq!(project.coordinator().unwrap().launch.machine, "local");
+    assert_eq!(project.coordinator().unwrap().launch.machine, "oci");
     assert_eq!(
         project.coordinator().unwrap().launch.args,
         ["--model", "recorded"]
@@ -2445,10 +2445,9 @@ fn ticker_relaunches_a_gone_coordinator_with_its_recorded_recipe_once() {
         .filter(|call| call.display().contains("agent start hp-demo-coordinator"))
         .map(Cmd::display)
         .collect::<Vec<_>>();
-    assert_eq!(starts.len(), 1, "{starts:?}");
-    assert!(starts[0].contains("--model recorded"), "{starts:?}");
+    assert!(starts.is_empty(), "{starts:?}");
     ticker::tick_project(&world.ctx(), &project).unwrap();
-    assert_eq!(world.runner.count("agent start hp-demo-coordinator"), 1);
+    assert_eq!(world.runner.count("agent start hp-demo-coordinator"), 0);
 }
 
 #[test]

@@ -741,6 +741,13 @@ pub(crate) fn resolve_request(project: &Project, basis: &str) -> Result<Resolved
     })
 }
 
+/// Latest human request identity, used to re-arm an idle plan nudge.
+pub(crate) fn latest_request_id(project: &Project) -> String {
+    recent_requests(project, 1)
+        .pop()
+        .map_or_else(String::new, |(id, _)| id)
+}
+
 pub(crate) fn recent_requests(project: &Project, limit: usize) -> Vec<(String, String)> {
     let mut found: Vec<_> = historical_requests(project)
         .into_iter()
