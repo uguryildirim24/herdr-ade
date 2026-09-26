@@ -383,12 +383,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
                     lane.id
                 );
             }
-            !git.run(&[
-                "rev-list",
-                "--max-count=1",
-                &format!("{}..{}", lane.base, done.sha),
-            ])?
-            .is_empty()
+            git.trees_differ(&lane.base, &done.sha)?
         };
         // Historical seals stay immutable. Cache their classification on the lane.
         thread::update(project, &lane.id, |t| {
@@ -1156,12 +1151,7 @@ pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: boo
             }
             true
         } else {
-            !git.run(&[
-                "rev-list",
-                "--max-count=1",
-                &format!("{}..{}", lane.base, done.sha),
-            ])?
-            .is_empty()
+            git.trees_differ(&lane.base, &done.sha)?
         };
         let merged = has_changes && git.is_ancestor(&done.sha, &tip)?;
         let harness_repo = harness.iter().any(|r| same_repo(&r.path, &row.path));
