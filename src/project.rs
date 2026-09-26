@@ -139,7 +139,7 @@ pub(crate) struct Gate {
 pub(crate) struct Repo {
     pub(crate) path: String,
     /// The integration branch. When absent, the repository's checked-out
-    /// branch is used at round open.
+    /// branch is used at review start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) branch: Option<String>,
     /// The only remote to which a completed integration branch may be pushed.
@@ -162,41 +162,16 @@ pub(crate) struct Repo {
     /// to the global worktree list and never apply to another repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) disposable: Vec<String>,
-    /// Task milestones this repository requires. An empty list inherits the
-    /// project's list; repositories without an install step simply omit it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) task_states: Vec<String>,
 }
 
 /// `PROJECT.md` front matter. `repos` is last so the TOML tables follow the
 /// plain keys when `new` serializes it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub(crate) struct Settings {
     pub(crate) name: String,
     pub(crate) goal: String,
-    /// Ordered task milestones used when a repository has no override.
-    #[serde(default = "default_task_states")]
-    pub(crate) task_states: Vec<String>,
     pub(crate) repos: Vec<Repo>,
-}
-
-fn default_task_states() -> Vec<String> {
-    ["finished", "reviewed", "merged"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            name: String::new(),
-            goal: String::new(),
-            task_states: default_task_states(),
-            repos: Vec::new(),
-        }
-    }
 }
 
 /// Splits `+++` TOML front matter from the body.
@@ -783,11 +758,11 @@ pub(crate) fn running_stage(
 ) -> String {
     use crate::thread::Status;
     // A sealed completion describes the attempt, not the current lifecycle.
-    // In particular a resolved lane must not keep saying it awaits a round.
+    // In particular a resolved lane must not keep saying it awaits pile review.
     if thread.status == Status::Resolved {
         return "resolved".into();
     }
-    let completion = crate::round::latest_event(events, &thread.id, thread.attempt.max(1));
+    let completion = crate::events::latest_event(events, &thread.id, thread.attempt.max(1));
     if thread.status == Status::Failed {
         let reason = if thread.error.trim().is_empty() {
             completion
@@ -821,7 +796,7 @@ pub(crate) fn running_stage(
             );
         }
         if event.payload.done.is_some() {
-            return "done, waiting for a round".into();
+            return "done, waiting for pile review".into();
         }
     }
     match thread.status {
@@ -889,11 +864,12 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         .into_iter()
         .filter(|thread| thread.status != crate::thread::Status::Resolved)
         .collect();
-    let rounds: Vec<_> = crate::round::list(project)
+    let reviews: Vec<_> = crate::review::list(project)
+        .unwrap_or_default()
         .into_iter()
-        .filter(|round| !round.phase.closed())
+        .filter(|r| !r.phase.closed())
         .collect();
-    if threads.is_empty() && rounds.is_empty() {
+    if threads.is_empty() && reviews.is_empty() {
         out.push_str("None.\n");
     }
     for thread in threads {
@@ -911,7 +887,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
                 ""
             }
         ));
-        if let Some(event) = crate::round::latest_event(events, &thread.id, thread.attempt.max(1))
+        if let Some(event) = crate::events::latest_event(events, &thread.id, thread.attempt.max(1))
             && event.id != thread.answered_waiting_event
             && let Some(waiting) = &event.payload.waiting
         {
@@ -921,12 +897,12 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             ));
         }
     }
-    for round in rounds {
+    for review in reviews {
         out.push_str(&format!(
-            "- Round `{}`: {} ({})\n",
-            round.round,
-            round.plain.trim(),
-            format!("{:?}", round.phase).to_lowercase()
+            "- Review `{}`: {:?} ({} lanes)\n",
+            review.id,
+            review.phase,
+            review.members.len()
         ));
     }
 
@@ -970,13 +946,6 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             one_line(&view.record.title),
             one_line(&view.next)
         ));
-        if let Some(wait) = crate::task::active_wait(project, &view.record) {
-            out.push_str(&format!(
-                "  waits on {}: {}\n",
-                wait.kind,
-                one_line(&wait.target)
-            ));
-        }
     }
     for error in errors {
         out.push_str(&format!("- Unreadable task: {error:#}\n"));
@@ -1047,7 +1016,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
             view.state.word(),
             view.record.title.trim()
         ));
-        if view.state == crate::task::State::Dropped
+        if !view.record.dropped.is_empty()
             && let Some(evidence) = view.record.dropped.last()
         {
             out.push_str(&format!(" — dropped: {}", evidence.reason.trim()));
@@ -1139,7 +1108,6 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
         name: display_name(name, &slug),
         goal: goal.to_string(),
         repos,
-        ..Settings::default()
     };
     let front = toml::to_string(&settings)?;
 
@@ -1184,7 +1152,6 @@ mod tests {
             op: "op".into(),
             thread: lane.id.clone(),
             attempt: 1,
-            round: None,
             recipient: Default::default(),
             created: "2026-01-01T00:00:00Z".into(),
             payload: Default::default(),
@@ -1192,7 +1159,7 @@ mod tests {
         event.payload.done = Some(Default::default());
         assert_eq!(
             running_stage(&lane, &[event.clone()]),
-            "done, waiting for a round"
+            "done, waiting for pile review"
         );
         event.payload.done = None;
         event.payload.failed = Some(crate::contracts::WaitingPayload {
@@ -1235,8 +1202,8 @@ mod tests {
         }
         refresh_page(&project).unwrap();
         let (_, page) = project.read_project_md().unwrap();
-        assert!(page.contains("`job-0000` [dropped]"));
-        assert!(page.contains("`job-0010` [dropped]"));
+        assert!(page.contains("`job-0000` [open]"));
+        assert!(page.contains("`job-0010` [open]"));
     }
 
     #[test]
@@ -1375,7 +1342,6 @@ mod tests {
                 op: "wait-1".into(),
                 thread: lane.id.clone(),
                 attempt: 1,
-                round: None,
                 recipient: crate::contracts::Recipient::default(),
                 created: now(),
                 payload: crate::contracts::EventPayload {
@@ -1445,7 +1411,7 @@ mod tests {
             open.lines().filter(|line| line.contains(&task.id)).count(),
             1
         );
-        assert!(open.contains(" — next: verify 1 acceptance condition(s)"));
+        assert!(open.contains(" — next: start an attempt"));
         assert!(!open.contains("detailed acceptance condition"));
         assert!(page.contains("Keep this task-specific instruction on the current page."));
     }
@@ -1484,7 +1450,6 @@ mod tests {
                 op: format!("{}-1-1", thread.id),
                 thread: thread.id,
                 attempt: 1,
-                round: None,
                 recipient: crate::contracts::Recipient::default(),
                 created: now(),
                 payload: crate::contracts::EventPayload::default(),

@@ -57,7 +57,6 @@ dropped.
   Optional Git branches/files use successful presence queries, not a blanket
   nonzero exemption. Child evidence
   includes argv, exit status, stdout and stderr, but not environment or stdin.
-- Failed reviewer starts in `round advance`, even when advance returns success.
 - Unexpected merge failures, including subprocess errors and conflicts. A
   structurally marked verdict or safety refusal is an outcome, not a failure.
 - Unknown thread startup breakage and failed launches with zero attempts.

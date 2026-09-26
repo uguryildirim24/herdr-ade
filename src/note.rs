@@ -346,7 +346,7 @@ pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::round::testkit::fixture;
+    use crate::testkit::fixture;
 
     #[test]
     fn retirement_keeps_history_but_removes_current_fact_and_instruction() {

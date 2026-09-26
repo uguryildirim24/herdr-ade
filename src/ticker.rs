@@ -161,7 +161,7 @@ fn decide_start(lock: &LockState, my_version: &str) -> StartAction {
 }
 
 /// Ensures a ticker is running without waiting for a running one to stop.
-/// `round advance` must not block while replacing a ticker: the ticker's own
+/// `review` must not block while replacing a ticker: the ticker's own
 /// pass calls `advance`, so waiting here would deadlock against the ticker
 /// waiting on `advance`'s lock. Ordinary thread starts and explicit `ticker
 /// start` calls attempt to replace a stale-version ticker when it can stop.
@@ -1182,7 +1182,7 @@ fn thread_pass(
                     Ok(())
                 })?;
                 let after_seal =
-                    crate::round::latest_done_event(&crate::events::list(project), &t.id, attempt)
+                    crate::events::latest_done_event(&crate::events::list(project), &t.id, attempt)
                         .map(|event| event.id.clone())
                         .unwrap_or_default();
                 match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
@@ -1822,7 +1822,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     // checks agent identity on each machine before touching parent metadata.
     let state = steps::load_state(project);
     if !state.lanes_parented_to.is_empty() && state.lanes_parented_to != record.pane_id {
-        match crate::checkpoint::relink_binding(ctx, project, &record.pane_id) {
+        match crate::threads::relink_binding(ctx, project, &record.pane_id) {
             Ok(()) => {
                 let mut state = steps::load_state(project);
                 state.lanes_parented_to = record.pane_id.clone();
@@ -1902,7 +1902,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     if let Err(error) = crate::threads::tick(project, &herdr, &agents) {
         first_error = first_error.or(Some(error));
     }
-    // The ops pass (A2) and the rounds pass (A3) run in the slow pass,
+    // The ops pass (A2) and the reviews pass (A3) run in the slow pass,
     // outside the project lock (SPEC-ADE item 57).
     let pane_alive = panes.iter().any(|p| coordinator::pane_matches(&record, p));
     let inode = socket_inode(Path::new(&record.socket));
@@ -2148,10 +2148,10 @@ fn tick_slow_with_steps(
 ) -> (Vec<anyhow::Error>, bool) {
     let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
-    if !step("escalation") {
+    if !step("recovery") {
         return (errors, false);
     }
-    errors.extend(crate::escalation::tick(ctx, project).err());
+    errors.extend(crate::recovery::tick(ctx, project).err());
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
     let mut may_start = true;
@@ -2287,7 +2287,7 @@ fn tick_slow_with_steps(
 
     stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
-    // D5 recovery and delivery (X1 to X5), then rounds, asks and the
+    // D5 recovery and delivery (X1 to X5), then reviews, asks and the
     // board (D6, D17, D18). Each takes the project lock only for its own
     // file writes; git and herdr run outside it.
     stop_after_state!("ops");
@@ -2296,12 +2296,15 @@ fn tick_slow_with_steps(
             .err()
             .map(|e| e.context("ops")),
     );
-    stop_after_state!("rounds");
+    stop_after_state!("reviews");
     errors.extend(
-        crate::round::tick(ctx, project)
+        crate::review::tick(ctx, project)
             .err()
-            .map(|e| e.context("rounds")),
+            .map(|e| e.context("reviews")),
     );
+
+    errors.extend(crate::ask::tick(ctx, project).err());
+    errors.extend(crate::board::refresh_tick(ctx, project).err());
     errors.extend(crate::threads::park_completed(ctx, project).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
@@ -3114,7 +3117,7 @@ mod tests {
         );
     }
 
-    /// `ensure` never writes the stop file, so `round advance` cannot deadlock
+    /// `ensure` never writes the stop file, so `review` cannot deadlock
     /// waiting for a running ticker whose own pass waits on its lock.
     #[test]
     fn ensure_leaves_a_running_ticker_alone() {
@@ -3452,14 +3455,14 @@ mod tests {
         let (errors, completed) =
             tick_slow_with_steps(&ctx, &fixture.project, &seen, &mut memory, &mut |name| {
                 steps.push(name.to_string());
-                if name == "escalation" {
+                if name == "recovery" {
                     std::fs::write(stop_path(&fixture.root), b"").unwrap();
                 }
-                !stop_path(&fixture.root).exists() || name == "escalation"
+                !stop_path(&fixture.root).exists() || name == "recovery"
             });
         assert!(!completed);
         assert!(errors.is_empty(), "{errors:#?}");
-        assert_eq!(steps, ["escalation", "coordinator launch"]);
+        assert_eq!(steps, ["recovery", "coordinator launch"]);
         assert_eq!(runner.count("agent start"), 0);
     }
 
@@ -3639,6 +3642,28 @@ mod tests {
             t.workspace_id = "w1".into();
             t.agent = "claude".into();
             t.cwd = f.project.dir().to_string_lossy().into_owned();
+            t.identity.process = Some(crate::contracts::ProcessIdentity {
+                pid: 42,
+                argv0: "claude".into(),
+            });
+        })
+        .unwrap();
+        thread::update(&f.project, &lane.id, |t| {
+            let agent = crate::herdr::Agent {
+                pane_id: t.pane_id.clone(),
+                tab_id: t.tab_id.clone(),
+                workspace_id: t.workspace_id.clone(),
+                ..Default::default()
+            };
+            thread::bind_identity(
+                t,
+                &f.project.coordinator().unwrap().socket,
+                &agent,
+                Some(crate::contracts::ProcessIdentity {
+                    pid: 42,
+                    argv0: "claude".into(),
+                }),
+            );
         })
         .unwrap();
         let mut state = steps::load_state(&f.project);
@@ -3651,8 +3676,9 @@ mod tests {
             })
             .unwrap();
         let runner = FakeRunner::new();
-        runner.on("agent list", ok(r#"{"result":{"agents":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"claude","agent_status":"idle"}]}}"#));
+        runner.on("agent list", ok(&with_cwd(r#"{"result":{"agents":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","cwd":"CWD","agent":"claude","agent_status":"idle"}]}}"#, &f)));
         runner.on("pane list", ok(&with_cwd(r#"{"result":{"panes":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","cwd":"CWD"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"CWD"}]}}"#, &f)));
+        runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
         runner.on("pane report-metadata", ok(r#"{"result":{}}"#));
         let ctx = Ctx {
             env: &f.env,
@@ -3725,11 +3751,11 @@ mod tests {
             op: "done".into(),
             thread: lane.id.clone(),
             attempt: 1,
-            round: None,
             recipient: crate::contracts::Recipient::default(),
             created: project::now(),
             payload: crate::contracts::EventPayload {
                 done: Some(crate::contracts::DonePayload {
+                    has_changes: None,
                     sha: "abc".into(),
                     artifact: "report".into(),
                     report_path: lane.report_path(),
@@ -3865,7 +3891,6 @@ mod tests {
                 op: format!("test-{sequence}"),
                 thread: lane.id.clone(),
                 attempt: 1,
-                round: None,
                 recipient: Recipient::default(),
                 created: format!("2026-09-21T00:00:0{sequence}Z"),
                 payload: EventPayload {
@@ -3876,7 +3901,7 @@ mod tests {
                     ..EventPayload::default()
                 },
             };
-            let dir = crate::round::events_dir(&f.project);
+            let dir = crate::events::dir(&f.project);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join(format!("{}.toml", event.id)),
@@ -4103,6 +4128,7 @@ mod tests {
     fn a_pane_with_other_identity_is_left_alone() {
         let f = fixture(true);
         let runner = FakeRunner::new();
+        runner.on("workspace report-metadata", ok(r#"{"result":{}}"#));
         // Same ids, different working directory: not our pane.
         runner.on(
             "agent list",

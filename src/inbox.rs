@@ -1,4 +1,4 @@
-//! Inbox items hold messages, not projections of thread or round records.
+//! Inbox items hold messages, not projections of thread or review records.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -518,7 +518,6 @@ mod tests {
             op: "t-0001-1-1".into(),
             thread: "t-0001".into(),
             attempt: 1,
-            round: None,
             recipient: crate::contracts::Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 2,

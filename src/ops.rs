@@ -69,12 +69,11 @@ pub(crate) struct Reservation<'a> {
     pub(crate) attempt: u32,
     pub(crate) kind: OpKind,
     pub(crate) recipient: Recipient,
-    pub(crate) round: Option<String>,
     pub(crate) requested: Requested,
     pub(crate) helper_pid: u32,
 }
 
-/// A done's report bytes and the round's correction barriers are part of its
+/// A done's report bytes and the review's correction barriers are part of its
 /// dedup key. Read the report before locking; stage_done still validates the
 /// report, git state and sha before any new event is sealed.
 pub(crate) fn reserve_done(project: &Project, r: Reservation<'_>, worktree: &Path) -> Result<Op> {
@@ -98,7 +97,6 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         attempt,
         kind,
         recipient,
-        round,
         requested,
         helper_pid,
     } = r;
@@ -108,8 +106,8 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         .filter(|op| op.thread == thread && op.attempt == attempt)
         .collect();
     existing.sort_by(|a, b| a.op.cmp(&b.op));
-    // The round record is authoritative for a requested correction. The
-    // barrier can still be present after a fresh done, before round advance;
+    // The lane record is authoritative for a requested correction. The
+    // barrier can still be present after a fresh done, before review;
     // in that case retrying that fresh op must remain idempotent.
     let barriers = if report_hash.is_some() {
         let mut barriers = correction_barriers(project, thread)?;
@@ -134,7 +132,6 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
             && op.kind == kind
             && op.requested == requested
             && op.recipient == recipient
-            && op.round == round
             && report_hash.is_none_or(|hash| {
                 if op.state == OpState::Reserved {
                     op.report_hash.as_deref() == Some(hash)
@@ -182,7 +179,6 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         attempt,
         kind,
         recipient,
-        round,
         helper_pid,
         requested,
         event: id,
@@ -190,6 +186,7 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         created: project::now(),
         artifact: None,
         report_hash: report_hash.map(str::to_owned),
+        has_changes: None,
     };
     write_op(project, &op)?;
     Ok(op)
@@ -206,21 +203,18 @@ pub(crate) struct BoxCorrections {
 }
 
 pub(crate) fn correction_barriers(project: &Project, thread: &str) -> Result<Vec<String>> {
-    Ok(crate::round::checked_list(project)?
+    // Box operations have a lane card, not a Mac thread record. Their
+    // follow-up barrier is supplied by BoxCorrections below.
+    if !crate::thread::threads_dir(project)
+        .join(format!("{thread}.toml"))
+        .exists()
+    {
+        return Ok(Vec::new());
+    }
+    let lane = crate::thread::load(project, thread)?;
+    Ok((!lane.review_after.is_empty())
+        .then_some(lane.review_after)
         .into_iter()
-        .filter(|record| !record.phase.closed())
-        .flat_map(|record| {
-            let mut barriers = Vec::new();
-            if record.reviewer.as_deref() == Some(thread) {
-                barriers.extend(record.reviewer_awaiting_report_after);
-            }
-            for member in record.manifest.members {
-                if member.thread == thread {
-                    barriers.extend(member.awaiting_report_after);
-                }
-            }
-            barriers
-        })
         .collect())
 }
 
@@ -388,8 +382,19 @@ fn stage_done_inner(
         }
         publish_lane_ref(runner, worktree, &card.branch, &card.publish_url, sha)?;
     }
+    let base = match card {
+        Some(card) => card.brief_commit.clone(),
+        None => crate::thread::load(project, &op.thread)?.base,
+    };
+    if base.is_empty() {
+        bail!("lane base is missing; cannot classify changes");
+    }
+    let git = crate::repo::Git::new(runner, worktree);
+    let has_changes = !git
+        .run(&["rev-list", "--max-count=1", &format!("{base}..{sha}")])?
+        .is_empty();
     let artifact = write_artifact(project, &first)?;
-    advance_staged(project, id, Some(artifact))
+    advance_staged(project, id, Some(artifact), Some(has_changes))
 }
 
 fn publish_lane_ref(
@@ -426,10 +431,15 @@ pub(crate) fn stage_waiting(project: &Project, id: &str) -> Result<Op> {
     {
         bail!("op_state_changed: {id} is not a reserved waiting/failure operation");
     }
-    advance_staged(project, id, None)
+    advance_staged(project, id, None, None)
 }
 
-fn advance_staged(project: &Project, id: &str, artifact: Option<String>) -> Result<Op> {
+fn advance_staged(
+    project: &Project,
+    id: &str,
+    artifact: Option<String>,
+    has_changes: Option<bool>,
+) -> Result<Op> {
     let _lock = project.lock()?;
     let mut current = load(project, id)?;
     if current.state == OpState::Staged || current.state == OpState::Sealed {
@@ -442,6 +452,7 @@ fn advance_staged(project: &Project, id: &str, artifact: Option<String>) -> Resu
         bail!("op_state_changed: {id} advanced while staging");
     }
     current.artifact = artifact;
+    current.has_changes = has_changes;
     current.state = OpState::Staged;
     current.revision = 2;
     write_op(project, &current)?;
@@ -479,6 +490,7 @@ fn event_from_op(op: &Op) -> Result<Event> {
     let payload = match (&op.requested, op.kind) {
         (Requested::Done { sha, report_path }, OpKind::Done) => EventPayload {
             done: Some(DonePayload {
+                has_changes: op.has_changes,
                 sha: sha.clone(),
                 report_path: report_path.clone(),
                 artifact: op
@@ -528,7 +540,6 @@ fn event_from_op(op: &Op) -> Result<Event> {
         op: op.op.clone(),
         thread: op.thread.clone(),
         attempt: op.attempt,
-        round: op.round.clone(),
         recipient: op.recipient.clone(),
         created: op.created.clone(),
         payload,
@@ -749,8 +760,22 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Project, FakeRunner, Recipient) {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let threads = crate::thread::threads_dir_for_write(&project).unwrap();
+        for id in ["t-0001", "t-0088"] {
+            let lane = crate::thread::Thread {
+                id: id.into(),
+                base: "base".into(),
+                ..Default::default()
+            };
+            std::fs::write(
+                threads.join(format!("{id}.toml")),
+                toml::to_string(&lane).unwrap(),
+            )
+            .unwrap();
+        }
         let runner = FakeRunner::new();
         runner
+            .on("rev-list --max-count=1", ok("abc\n"))
             .on("git status --short", ok(""))
             .on("git rev-parse HEAD", ok("abc\n"))
             .on("git ls-tree", ok(""));
@@ -770,7 +795,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
-                round: None,
                 requested: Requested::Done {
                     sha: "abc".into(),
                     report_path: "report.md".into(),
@@ -787,6 +811,7 @@ mod tests {
             thread: "t-0088".into(),
             attempt: 1,
             branch: "hp/demo/t-0088".into(),
+            brief_commit: "base".into(),
             publish_url: "/remotes/publish repo.git".into(),
             recipient: recipient.clone(),
             ..Default::default()
@@ -803,7 +828,7 @@ mod tests {
             .on("git -C", ok(""));
         stage_box_done(&project, &op.op, root.path(), &runner, &card).unwrap();
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 6);
         assert_eq!(
             calls[3].args,
             [
@@ -856,7 +881,7 @@ mod tests {
         let (root, project, runner, recipient) = fixture();
         let op = reserved_box_done(&project, root.path(), &recipient);
         stage_done(&project, &op.op, root.path(), &runner).unwrap();
-        assert_eq!(runner.calls.borrow().len(), 3);
+        assert_eq!(runner.calls.borrow().len(), 4);
         assert!(
             runner
                 .calls
@@ -880,7 +905,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
-                round: None,
                 requested: Requested::Done {
                     sha: "abc".into(),
                     report_path: "report.md".into(),
@@ -892,93 +916,6 @@ mod tests {
         .unwrap();
         stage_done(project, &op.op, worktree, runner).unwrap();
         seal(project, &op.op, |_| Ok(())).unwrap()
-    }
-
-    fn correction_round(project: &Project, thread: &str, barrier: &str, reviewer: bool) {
-        use crate::contracts::{ManifestMember, RoundPhase, RoundRecord};
-        let mut record = RoundRecord {
-            round: "r54".into(),
-            phase: RoundPhase::UnderReview,
-            ..RoundRecord::default()
-        };
-        if reviewer {
-            record.reviewer = Some(thread.into());
-            record.reviewer_awaiting_report_after = Some(barrier.into());
-        } else {
-            record.manifest.members.push(ManifestMember {
-                thread: thread.into(),
-                awaiting_report_after: Some(barrier.into()),
-                ..ManifestMember::default()
-            });
-        }
-        std::fs::create_dir_all(crate::round::rounds_dir(project)).unwrap();
-        std::fs::write(
-            crate::round::round_path(project, "r54"),
-            toml::to_string(&record).unwrap(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn r54_late_reviewer_correction_seals_a_new_event_with_the_same_sha_and_report() {
-        let (root, project, runner, recipient) = fixture();
-        let report = root.path().join("report.md");
-        std::fs::write(&report, "+++\nverdict = 'MERGE'\n+++\nfirst\n").unwrap();
-        let first = done_again(&project, root.path(), &runner, &recipient, "t-0088");
-        assert_eq!(
-            done_again(&project, root.path(), &runner, &recipient, "t-0088"),
-            first
-        );
-        // The prompt arrived only after the first verdict. Redoing the same
-        // bytes answers the correction, even before the round accepts it.
-        correction_round(&project, "t-0088", &first.id, true);
-        let second = done_again(&project, root.path(), &runner, &recipient, "t-0088");
-        assert_eq!(second.id, "t-0088-1-2");
-        assert_eq!(second.payload.done.as_ref().unwrap().sha, "abc");
-        assert_eq!(
-            second.payload.done.as_ref().unwrap().artifact,
-            first.payload.done.unwrap().artifact
-        );
-        assert_eq!(
-            done_again(&project, root.path(), &runner, &recipient, "t-0088"),
-            second
-        );
-        // r54 also had an edited report after the duplicate done. That edit
-        // must not continue pointing at the old sealed artifact either.
-        std::fs::write(&report, "+++\nverdict = 'MERGE'\n+++\ncorrected\n").unwrap();
-        let third = done_again(&project, root.path(), &runner, &recipient, "t-0088");
-        assert_eq!(third.id, "t-0088-1-3");
-        assert_ne!(
-            third.payload.done.as_ref().unwrap().artifact,
-            second.payload.done.as_ref().unwrap().artifact
-        );
-        assert_eq!(crate::round::sealed_events(&project).unwrap().len(), 3);
-    }
-
-    #[test]
-    fn box_correction_barrier_seals_again_without_mac_round_records() {
-        let (root, project, runner, recipient) = fixture();
-        std::fs::write(root.path().join("report.md"), "unchanged\n").unwrap();
-        let first = done_again(&project, root.path(), &runner, &recipient, "t-0088");
-        assert!(crate::round::checked_list(&project).unwrap().is_empty());
-        let dir = project.record_dir("corrections");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("t-0088.toml"),
-            toml::to_string(&BoxCorrections {
-                thread: "t-0088".into(),
-                attempt: 1,
-                events: vec![first.id.clone()],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let second = done_again(&project, root.path(), &runner, &recipient, "t-0088");
-        assert_eq!(second.id, "t-0088-1-2");
-        assert_eq!(
-            done_again(&project, root.path(), &runner, &recipient, "t-0088"),
-            second
-        );
     }
 
     #[test]
@@ -993,7 +930,6 @@ mod tests {
                     attempt: 1,
                     kind: OpKind::Done,
                     recipient: recipient.clone(),
-                    round: None,
                     requested: Requested::Done {
                         sha: "abc".into(),
                         report_path: "report.md".into(),
@@ -1038,20 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn lane_correction_barrier_also_requires_a_fresh_done() {
-        let (root, project, runner, recipient) = fixture();
-        std::fs::write(root.path().join("report.md"), "unchanged\n").unwrap();
-        let first = done_again(&project, root.path(), &runner, &recipient, "t-0001");
-        correction_round(&project, "t-0001", &first.id, false);
-        let second = done_again(&project, root.path(), &runner, &recipient, "t-0001");
-        assert_eq!(second.id, "t-0001-1-2");
-        assert_eq!(
-            done_again(&project, root.path(), &runner, &recipient, "t-0001"),
-            second
-        );
-    }
-
-    #[test]
     fn item_32_staged_op_seals_without_helper_memory() {
         let (root, project, runner, recipient) = fixture();
         let report = root.path().join("report.md");
@@ -1063,7 +985,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
-                round: None,
                 requested: Requested::Done {
                     sha: "abc".into(),
                     report_path: "report.md".into(),
@@ -1093,7 +1014,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient: recipient.clone(),
-                round: None,
                 requested: requested.clone(),
                 helper_pid: 1,
             },
@@ -1107,7 +1027,6 @@ mod tests {
                     attempt: 1,
                     kind: OpKind::Waiting,
                     recipient: recipient.clone(),
-                    round: None,
                     requested,
                     helper_pid: 2
                 }
@@ -1123,7 +1042,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
-                round: None,
                 requested: Requested::Waiting {
                     text: "different".into(),
                     class: crate::contracts::FailureClass::Unknown,
@@ -1147,7 +1065,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
-                round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
                     class: crate::contracts::FailureClass::Unknown,
@@ -1175,7 +1092,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
-                round: None,
                 requested: Requested::Waiting {
                     text: "blocked".into(),
                     class: crate::contracts::FailureClass::Unknown,
@@ -1261,7 +1177,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
-                round: None,
                 requested: Requested::Done {
                     sha: "abc".into(),
                     report_path: "report.md".into(),
@@ -1288,7 +1203,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
-                round: None,
                 requested: Requested::Done {
                     sha: "abc".into(),
                     report_path: "report.md".into(),
@@ -1341,6 +1255,7 @@ mod tests {
             pane: "w1:p1".into(),
             coordinator_attempt: 1,
         };
+        crate::thread::allocate(&project, |t| t.base = tracked_sha.clone()).unwrap();
         let tracked_op = reserve(
             &project,
             Reservation {
@@ -1348,7 +1263,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
-                round: None,
                 requested: Requested::Done {
                     sha: tracked_sha,
                     report_path: ".herdr-project/x/report.md".into(),
@@ -1377,7 +1291,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
-                round: None,
                 requested: Requested::Done {
                     sha: clean_sha,
                     report_path: ".herdr-project/x/report.md".into(),
@@ -1420,7 +1333,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
-                round: None,
                 requested: Requested::Done {
                     sha: "abc".into(),
                     report_path: "report.md".into(),
@@ -1447,7 +1359,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
-                round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
                     class: crate::contracts::FailureClass::Unknown,
@@ -1513,7 +1424,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient: recipient.clone(),
-                round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
                     class: crate::contracts::FailureClass::Unknown,
@@ -1531,7 +1441,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
-                round: None,
                 requested: Requested::Waiting {
                     text: "still here".into(),
                     class: crate::contracts::FailureClass::Unknown,
@@ -1594,7 +1503,6 @@ mod tests {
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
-                round: None,
                 requested: Requested::Waiting {
                     text: "wait".into(),
                     class: crate::contracts::FailureClass::Unknown,

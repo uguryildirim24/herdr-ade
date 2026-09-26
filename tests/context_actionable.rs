@@ -137,22 +137,3 @@ fn action_rows_are_bounded_without_raw_storage_pointers() {
     assert!(!text.contains("read threads/"));
     assert!(!text.contains("read inbox/"));
 }
-
-#[test]
-fn reviewing_rounds_show_gate_selection_in_context() {
-    let p = Project::new();
-    p.write(
-        ".state/rounds/r1.toml",
-        "round = \"r1\"\nphase = \"under_review\"\nbranch = \"main\"\nplain = \"Reviewing\"\npolicy_hash = \"fixture\"\n[manifest]\nrevision = 1\nmembers = []\n",
-    );
-    p.write(
-        ".state/rounds/r2.toml",
-        "round = \"r2\"\nphase = \"admitting\"\nbranch = \"main\"\nplain = \"Needs lanes\"\npolicy_hash = \"fixture\"\n[manifest]\nrevision = 1\nmembers = []\n",
-    );
-    let text = p.context(false);
-    let actions = text.split("## Rounds needing action").nth(1).unwrap();
-    assert!(actions.contains("r2 [Admitting]"), "{actions}");
-    assert!(actions.contains("r1 [UnderReview]"), "{actions}");
-    assert!(actions.contains("selected gates: (none)"), "{actions}");
-    assert!(actions.contains("skipped gates: (none)"), "{actions}");
-}

@@ -1,0 +1,163 @@
+use super::*;
+
+#[test]
+fn repository_worktrees_share_one_review_lock() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let lane = thread::load(&fx.project, &id).unwrap();
+    assert!(same_repo(fx.repo.to_str().unwrap(), &lane.worktree_path));
+    let _held = operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap()).unwrap();
+    let identity = repo_identity(&lane.worktree_path);
+    let key = fx
+        .world
+        .ctx()
+        .root
+        .join(".review-locks")
+        .join(thread::sha256_hex(identity.to_string_lossy().as_bytes()));
+    let second = std::fs::File::options().write(true).open(key).unwrap();
+    assert!(second.try_lock().is_err());
+}
+
+#[test]
+fn published_descendant_is_a_successful_push_postcondition() {
+    let fx = configured();
+    let candidate = git(&fx.repo, &["rev-parse", "main"]);
+    commit_file(&fx.repo, "later.txt", "later", "later integration change");
+    let remote = fx.world.home.path().join("published.git");
+    git(
+        &fx.repo,
+        &["init", "--bare", "-q", remote.to_str().unwrap()],
+    );
+    git(&fx.repo, &["push", remote.to_str().unwrap(), "main"]);
+    assert!(
+        remote_contains(
+            &Git::new(fx.world.ctx().runner, &fx.repo),
+            remote.to_str().unwrap(),
+            "refs/heads/main",
+            &candidate
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn actual_start_selects_the_reviewer_recipe_once_and_ignores_unrelated_harness_rows() {
+    let fx = configured();
+    lane(&fx, 1);
+    let config = fx.world.ctx().config_dir.join("config.toml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{original}\n[recipes.pile_reviewer]\nkind = 'claude'\nplain = 'the pile reviewer'\nargs = ['--dangerously-skip-permissions']\n[[routing.rules]]\nworkflow = 'reviewer'\nrecipe = 'pile_reviewer'\n[harness]\nrepos = [{{ path = '/unrelated/harness', gates = [] }}]\n")).unwrap();
+    *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+    fx.world.runner.on("HERDR_ADE_LAUNCH", crate::runner::fake::ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#));
+    // Exercise real allocation and placement without spawning an agent.
+    let _install = crate::harness::lock(&fx.world.ctx().config_dir).unwrap();
+    let review = start(&fx.world.ctx(), "demo", None).unwrap().unwrap();
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    assert_eq!(reviewer.role, "reviewer");
+    assert_eq!(reviewer.launch.recipe_id, "pile_reviewer");
+    assert_eq!(reviewer.review_id, review.id);
+    assert_eq!(
+        reviewer.base,
+        git(&fx.repo, &["rev-parse", &review.candidate_branch])
+    );
+    let brief = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer.id)).unwrap();
+    assert!(brief.contains(&review.members[0].sha));
+    assert!(brief.contains("gate policy") || brief.contains("Gate policy"));
+    assert_eq!(
+        start(&fx.world.ctx(), "demo", None)
+            .unwrap()
+            .unwrap()
+            .reviewer,
+        Some(reviewer.id)
+    );
+    assert_eq!(
+        thread::list(&fx.project)
+            .iter()
+            .filter(|t| t.role == "reviewer")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn automatic_start_waits_for_working_lanes_then_takes_the_whole_pile() {
+    let fx = configured();
+    lane(&fx, 1);
+    let (second, sha) = fx.lane(2);
+    thread::update(&fx.project, &second, |t| {
+        t.base = git(&fx.repo, &["rev-parse", "main"])
+    })
+    .unwrap();
+    project::write_atomic(
+        &fx.project.state_dir().join("reviews-enabled"),
+        b"enabled\n",
+    )
+    .unwrap();
+    let before = fx.world.runner.calls.borrow().len();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_eq!(before, fx.world.runner.calls.borrow().len());
+    assert!(list(&fx.project).unwrap().is_empty());
+    fx.seal_done(&second, 1, 1, &sha, "ready");
+    let reviewer = fx.thread("reviewer allocated before crash");
+    thread::update(&fx.project, &reviewer, |t| {
+        t.role = "reviewer".into();
+        t.review_id = "review-1".into();
+    })
+    .unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    let records = list(&fx.project).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].members.len(), 2);
+    assert_eq!(records[0].reviewer.as_deref(), Some(reviewer.as_str()));
+}
+
+#[test]
+fn conflicts_are_left_for_the_one_reviewer_without_a_dirty_integration_checkout() {
+    let fx = configured();
+    let (a, _) = lane(&fx, 1);
+    let (b, _) = lane(&fx, 2);
+    for (id, text) in [(&a, "first\n"), (&b, "second\n")] {
+        let lane = thread::load(&fx.project, id).unwrap();
+        let sha = commit_file(
+            Path::new(&lane.worktree_path),
+            "README.md",
+            text,
+            "conflicting edit",
+        );
+        fx.seal_done(id, 1, 2, &sha, "ready with conflict");
+    }
+    let review = prepared(&fx);
+    assert_eq!(review.members.len(), 2);
+    assert_eq!(review.phase, Phase::Reviewing);
+    assert_eq!(git(&fx.repo, &["status", "--porcelain"]), "");
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), review.base);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let git = Git::new(fx.world.ctx().runner, &fx.repo);
+    assert!(git.is_ancestor(&review.members[0].sha, &candidate).unwrap());
+    assert!(!git.is_ancestor(&review.members[1].sha, &candidate).unwrap());
+}
+
+#[test]
+fn a_crash_during_cancel_cannot_accept_the_old_merge_verdict() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    review.phase = Phase::Cancelling;
+    review.attention = "cancel requested before crash".into();
+    save(&fx.project, &review).unwrap();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(review.phase, Phase::Cancelled);
+    assert!(!review.fast_forward);
+    assert!(review.close && review.prune);
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), review.base);
+}
