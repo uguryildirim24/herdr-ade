@@ -756,6 +756,10 @@ pub(crate) struct PlanStep {
     pub(crate) tasks: Vec<String>,
     pub(crate) threads: Vec<String>,
     pub(crate) rounds: Vec<String>,
+    /// One level of subtasks under a top-level step; a subtask never has its
+    /// own. Left out of the record when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) subtasks: Vec<PlanStep>,
 }
 
 /// `<project>/.state/plan.toml` (SPEC-talk §6.5).
@@ -983,6 +987,7 @@ mod tests {
                     tasks: vec!["job-0001".into()],
                     threads: vec!["t-0041".into()],
                     rounds: vec![],
+                    subtasks: vec![],
                 },
                 PlanStep {
                     id: "s-2".into(),
@@ -991,6 +996,7 @@ mod tests {
                     tasks: vec![],
                     threads: vec!["t-0043".into(), "t-0044".into()],
                     rounds: vec!["r1".into()],
+                    subtasks: vec![],
                 },
             ],
         };

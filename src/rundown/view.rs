@@ -20,6 +20,36 @@ pub(crate) enum Mark {
 pub(crate) struct Step {
     pub(crate) mark: Mark,
     pub(crate) text: String,
+    /// One level only: a subtask's own list is always empty.
+    pub(crate) subtasks: Vec<Step>,
+}
+
+impl Step {
+    fn from_plan(step: &Value) -> Step {
+        Step {
+            mark: match step["state"].as_str().unwrap_or_default() {
+                "done" => Mark::Done,
+                "running" => Mark::Now,
+                _ => Mark::Later,
+            },
+            text: plain(step["text"].as_str().unwrap_or_default())
+                .trim_end_matches('.')
+                .to_string(),
+            subtasks: list(&step["subtasks"])
+                .iter()
+                .map(Step::from_plan)
+                .map(|sub| Step {
+                    subtasks: Vec::new(),
+                    ..sub
+                })
+                .filter(|sub| !sub.text.is_empty())
+                .collect(),
+        }
+    }
+}
+
+fn list(value: &Value) -> &[Value] {
+    value.as_array().map(Vec::as_slice).unwrap_or_default()
 }
 
 /// One project's rundown.
@@ -52,21 +82,9 @@ impl Card {
                 }
             }
         }
-        let steps = plan["steps"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        let steps = list(&plan["steps"])
             .iter()
-            .map(|step| Step {
-                mark: match step["state"].as_str().unwrap_or_default() {
-                    "done" => Mark::Done,
-                    "running" => Mark::Now,
-                    _ => Mark::Later,
-                },
-                text: plain(step["text"].as_str().unwrap_or_default())
-                    .trim_end_matches('.')
-                    .to_string(),
-            })
+            .map(Step::from_plan)
             .filter(|step| !step.text.is_empty())
             .collect();
         Card {
@@ -264,19 +282,27 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
         body.push(String::new());
         body.push(String::new());
         // A blank line (carrying the joining line) between steps while the
-        // pane has the height; a short pane packs them.
+        // pane has the height; a short pane packs them. Subtasks sit right
+        // under their step, the joining line running past them.
         let fixed = header.len() + body.len() + 3 + usize::from(!note.is_empty());
-        let spaced = height == 0 || fixed + card.steps.len() * 2 - 1 <= height;
+        let subtasks: usize = card.steps.iter().map(|s| s.subtasks.len()).sum();
+        let spaced = height == 0 || fixed + card.steps.len() * 2 - 1 + subtasks <= height;
+        let joint = |step: &Step| {
+            if step.mark == Mark::Done {
+                GREEN.toward(INK, 0.45)
+            } else {
+                FAINT
+            }
+        };
         for (i, step) in card.steps.iter().enumerate() {
             if spaced && i > 0 {
-                let color = if card.steps[i - 1].mark == Mark::Done {
-                    GREEN.toward(INK, 0.45)
-                } else {
-                    FAINT
-                };
-                body.push(format!(" {}│{RESET}", color.fg()));
+                body.push(format!(" {}│{RESET}", joint(&card.steps[i - 1]).fg()));
             }
             body.push(row(step, inner));
+            let joined = spaced && i + 1 < card.steps.len();
+            for sub in &step.subtasks {
+                body.push(sub_row(sub, inner, joined.then_some(joint(step))));
+            }
         }
         body.push(String::new());
     }
@@ -332,28 +358,55 @@ fn shine(title: &str) -> String {
     out
 }
 
+/// The marks, only from glyphs that Rolf's terminal font (JetBrainsMono
+/// Nerd Font Mono) carries dead center in its upright weights: a glyph it
+/// lacks comes from a fallback font and sits off center. Never italic.
+const DONE: char = '✶';
+const NOW: char = '◉';
+const LATER: char = '◌';
+
 /// One step: a coloured box with its mark, then a few words. A finished
-/// step gets a sparkle, the one under way a half-filled circle, and one
-/// still to do an empty dotted circle.
+/// step gets a star, the one under way a filled ring, and one still to do
+/// an empty dotted circle.
 fn row(step: &Step, width: usize) -> String {
     let text = cut(&step.text, width.saturating_sub(5));
     match step.mark {
         Mark::Done => format!(
             "{}  {}{text}{RESET}",
-            tile(GREEN, INK, true, '✦'),
+            tile(GREEN, INK, true, DONE),
             QUIET.fg()
         ),
         Mark::Now => format!(
             "{}  {BOLD}{}{text}{RESET}",
-            tile(AMBER, INK, true, '◐'),
+            tile(AMBER, INK, true, NOW),
             AMBER.fg()
         ),
         Mark::Later => format!(
             "{}  {}{text}{RESET}",
-            tile(TRACK, QUIET, false, '◌'),
+            tile(TRACK, QUIET, false, LATER),
             TEXT.fg()
         ),
     }
+}
+
+/// One subtask, under its step's words: the same mark without its box, so
+/// it reads smaller. `line` carries the joining line down to the next step.
+fn sub_row(sub: &Step, width: usize, line: Option<Rgb>) -> String {
+    let lead = match line {
+        Some(color) => format!(" {}│{RESET}   ", color.fg()),
+        None => " ".repeat(5),
+    };
+    let text = cut(&sub.text, width.saturating_sub(8));
+    let (mark, color, words) = match sub.mark {
+        Mark::Done => (DONE, GREEN, QUIET),
+        Mark::Now => (NOW, AMBER, AMBER),
+        Mark::Later => (LATER, FAINT, TEXT),
+    };
+    format!(
+        "{lead}{}{mark}{RESET}  {}{text}{RESET}",
+        color.fg(),
+        words.fg()
+    )
 }
 
 /// A square box with `mark` in its middle. A cell is about twice as tall as
@@ -462,6 +515,27 @@ mod tests {
         })
     }
 
+    /// One step holding four subtasks in mixed states, between two others.
+    fn with_subtasks() -> Card {
+        Card::from_plan(
+            "Herdr ADE",
+            &json!({"data": {"result": {
+                "goal": "A calm harness for coding agents.",
+                "does": "",
+                "steps": [
+                    {"id": "s-1", "state": "done", "text": "Cut unused parts."},
+                    {"id": "s-2", "state": "running", "text": "Subtasks in the plan", "subtasks": [
+                        {"id": "s-5", "state": "done", "text": "Store them under their step."},
+                        {"id": "s-6", "state": "done", "text": "Add them from the command line"},
+                        {"id": "s-7", "state": "running", "text": "Show them in the tab t-0540 src/rundown"},
+                        {"id": "s-8", "state": "left", "text": "Check how they look on a narrow pane"},
+                    ]},
+                    {"id": "s-3", "state": "left", "text": "One reviewer for the pile"},
+                ],
+            }}}),
+        )
+    }
+
     fn screen(card: &Card, width: usize) -> String {
         render(card, width, 0, "")
             .iter()
@@ -490,8 +564,8 @@ mod tests {
             text.contains("Rolf's job pipeline: bring in the right postings"),
             "{text}"
         );
-        assert!(text.contains("▐✦▌  Tidy the dashboard screens "), "{text}");
-        assert!(text.contains("▐◐▌  Fix how jobs come in"), "{text}");
+        assert!(text.contains("▐✶▌  Tidy the dashboard screens "), "{text}");
+        assert!(text.contains("▐◉▌  Fix how jobs come in"), "{text}");
         assert!(text.contains("▐◌▌  Switch the sorting on"), "{text}");
         assert!(text.contains("█   1 of 3"), "{text}");
         for word in [
@@ -663,5 +737,118 @@ mod tests {
             without_attribution("A lab (for flies) on the connectome"),
             "A lab (for flies) on the connectome"
         );
+    }
+
+    #[test]
+    fn subtasks_sit_under_their_step_with_smaller_marks() {
+        let card = with_subtasks();
+        assert_eq!(card.count(Mark::Done), 1);
+        let text = screen(&card, 80);
+        assert!(text.contains("1 of 3"), "{text}");
+        for line in [
+            "▐◉▌  Subtasks in the plan",
+            " │   ✶  Store them under their step ",
+            " │   ✶  Add them from the command line ",
+            " │   ◉  Show them in the tab ",
+            " │   ◌  Check how they look on a narrow pane ",
+            " │\n",
+            "▐◌▌  One reviewer for the pile",
+        ] {
+            assert!(text.contains(line), "`{line}` missing: {text}");
+        }
+        for word in ["t-0540", "src/", "s-5", "running", "left"] {
+            assert!(!text.contains(word), "`{word}` shows: {text}");
+        }
+        // The last step's subtasks have no line running past them.
+        let last = Card {
+            steps: card.steps[1..2].to_vec(),
+            ..card.clone()
+        };
+        assert!(screen(&last, 80).contains("│        ✶  Store them"));
+        // 11 rows around the list, 5 for steps and joins, 4 for subtasks: a
+        // pane of 19 packs them and drops the joining line, one of 20 fits.
+        let packed: Vec<String> = render(&card, 80, 19, "")
+            .iter()
+            .map(|l| visible(l))
+            .collect();
+        assert!(
+            packed.iter().any(|l| l.contains("One reviewer")),
+            "{packed:#?}"
+        );
+        assert!(!packed.iter().any(|l| l.contains("│   ✶")), "{packed:#?}");
+        let spaced: Vec<String> = render(&card, 80, 23, "")
+            .iter()
+            .map(|l| visible(l))
+            .collect();
+        assert!(
+            spaced.iter().any(|l| l.contains("│    │   ✶")),
+            "{spaced:#?}"
+        );
+        assert!(!spaced.iter().any(|l| l.trim() == "…"), "{spaced:#?}");
+        for width in [29, 31, 40, 80, 90, 160, 200] {
+            let lines: Vec<String> = render(&card, width, 0, "")
+                .iter()
+                .map(|l| visible(l))
+                .collect();
+            assert!(
+                lines.iter().all(|l| l.chars().count() <= width),
+                "{width}: {lines:#?}"
+            );
+            let sub = lines.iter().find(|l| l.contains("Store")).unwrap();
+            assert!(sub.contains("✶  Store"), "{width}: {sub}");
+        }
+    }
+
+    #[test]
+    fn every_mark_is_one_the_terminal_font_centers() {
+        // Glyphs JetBrainsMono Nerd Font Mono (Rolf's Ghostty font) carries
+        // dead center in its cell in the upright weights. A mark outside this
+        // set comes from a fallback font and sits off center.
+        const CENTERED: &str = "✶◉◌◎●○◆◇▪▫";
+        // Drawing, not marks: the frame, box halves, bar and cut ellipsis.
+        const DRAWING: &str = "─│╭╮╰╯▐▌█…";
+        let card = with_subtasks();
+        let mut seen = std::collections::BTreeSet::new();
+        for width in [31, 80] {
+            for line in render(&card, width, 0, "") {
+                assert!(!line.contains("\x1b[3m"), "italic: {line:?}");
+                for c in visible(&line).chars().filter(|c| !c.is_ascii()) {
+                    if !DRAWING.contains(c) {
+                        assert!(CENTERED.contains(c), "`{c}` is not a centered mark");
+                        seen.insert(c);
+                    }
+                }
+            }
+        }
+        assert_eq!(seen.into_iter().collect::<String>(), "◉◌✶");
+    }
+
+    /// The proof captures for the report: `cargo test -- --ignored --nocapture
+    /// rundown_captures`.
+    #[test]
+    #[ignore]
+    fn rundown_captures() {
+        let plain = Card::from_plan(
+            "Herdr ADE",
+            &reply(
+                "A calm harness for coding agents.",
+                "",
+                &[
+                    ("done", "Cut unused parts"),
+                    ("running", "Subtasks in the plan"),
+                    ("left", "One reviewer for the pile"),
+                ],
+            ),
+        );
+        for (name, card, width, height) in [
+            ("no subtasks, 80 x 24", &plain, 80, 24),
+            ("four subtasks, 80 x 30", &with_subtasks(), 80, 30),
+            ("four subtasks, 31 x 30", &with_subtasks(), 31, 30),
+        ] {
+            println!("--- {name}");
+            for line in render(card, width, height, "") {
+                println!("{}", visible(&line));
+            }
+        }
     }
 }
