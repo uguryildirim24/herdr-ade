@@ -555,14 +555,15 @@ fn candidates(ctx: &Ctx, tolerate_unreachable: bool) -> Result<(Vec<Candidate>, 
 }
 
 /// Sweep only resolved lanes whose tips are ancestors of the configured integration
-/// branch. The marker is written only after every eligible cleanup succeeds;
-/// failures are retried on the next ticker pass.
-pub(crate) fn sweep_once(ctx: &Ctx) -> Result<()> {
+/// branch. The marker is written after eligible cleanup succeeds; retained
+/// worktrees with changes or data are skipped with their branches intact.
+pub(crate) fn sweep_once(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
     let marker = ctx.root.join(".branch-sweep-v1.json");
     if marker.exists() {
         return Ok(());
     }
     let active = active_refs(&ctx.root)?;
+    let mut kept = BTreeSet::new();
     for slug in project::list_slugs(&ctx.root) {
         let project = Project::load(&ctx.root, &slug)?;
         let (settings, _) = project.read_project_md()?;
@@ -663,10 +664,13 @@ pub(crate) fn sweep_once(ctx: &Ctx) -> Result<()> {
             }
             let inspection = crate::threads::inspect_worktree_for_removal(ctx, &project, record)?;
             if !inspection.dirty.is_empty() || !inspection.ignored_data.is_empty() {
-                bail!(
-                    "{}: worktree keeps changes or data; sweep will retry",
-                    record.id
-                );
+                if kept.insert((record.repo.clone(), record.branch.clone())) {
+                    log(&format!(
+                        "one-time branch sweep: {} keeps changes or data; worktree and branch kept",
+                        record.id
+                    ));
+                }
+                continue;
             }
             crate::threads::remove_worktree(ctx, &project, record)?;
             resolved_thread(ctx, &project, record)?;
@@ -675,6 +679,9 @@ pub(crate) fn sweep_once(ctx: &Ctx) -> Result<()> {
     // Include resolved, merged refs whose worktree was already removed.
     let (plan, _) = candidates(ctx, false)?;
     for item in plan {
+        if kept.contains(&(item.repo.clone(), item.branch.clone())) {
+            continue;
+        }
         if let Some(sha) = &item.local {
             delete_local(ctx.runner, &item.repo, &item.branch, sha)?;
         }
@@ -778,7 +785,7 @@ mod tests {
             .unwrap();
         }
         let ctx = fx.world.ctx();
-        sweep_once(&ctx).unwrap();
+        sweep_once(&ctx, |_| {}).unwrap();
         assert!(!done_path.exists());
         assert!(fx.world.home.path().join("extra").exists());
         assert!(
@@ -800,7 +807,74 @@ mod tests {
                 .unwrap()
                 .contains_key("hp/demo/unmerged")
         );
-        sweep_once(&ctx).unwrap();
+        sweep_once(&ctx, |_| {}).unwrap();
+    }
+
+    #[test]
+    fn one_time_sweep_skips_retained_data_and_finishes_cleaning() {
+        let (fx, bare) = configured();
+        let repo = fx.repo.to_string_lossy().into_owned();
+        let remote = bare.path().to_str().unwrap();
+        let mut logs = Vec::new();
+        for (name, folder) in [
+            ("hp/demo/data", "data-worktree"),
+            ("hp/demo/clean", "clean-worktree"),
+        ] {
+            let path = fx.world.home.path().join(folder);
+            run(&fx.repo, &["branch", name, "main"]);
+            run(
+                &fx.repo,
+                &["worktree", "add", "-q", path.to_str().unwrap(), name],
+            );
+            run(&fx.repo, &["push", "-q", remote, name]);
+            thread::allocate(&fx.project, |t| {
+                t.repo = repo.clone();
+                t.branch = name.into();
+                t.status = Status::Resolved;
+                t.kind = thread::Kind::Worktree;
+                t.worktree_path = path.to_string_lossy().into_owned();
+            })
+            .unwrap();
+        }
+        std::fs::write(fx.world.home.path().join("data-worktree/kept-data"), "keep").unwrap();
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(fx.repo.join(".git/info/exclude"))
+                .unwrap(),
+            "kept-data"
+        )
+        .unwrap();
+        assert_eq!(
+            run(
+                &fx.world.home.path().join("data-worktree"),
+                &["check-ignore", "kept-data"]
+            ),
+            "kept-data"
+        );
+
+        let ctx = fx.world.ctx();
+        sweep_once(&ctx, |message| logs.push(message.to_owned())).unwrap();
+        assert!(
+            fx.world
+                .home
+                .path()
+                .join("data-worktree/kept-data")
+                .exists()
+        );
+        assert!(!fx.world.home.path().join("clean-worktree").exists());
+        let local = refs(ctx.runner, &repo, None).unwrap();
+        let published = refs(ctx.runner, &repo, Some(remote)).unwrap();
+        for branches in [local, published] {
+            assert!(branches.contains_key("hp/demo/data"));
+            assert!(!branches.contains_key("hp/demo/clean"));
+        }
+        assert!(ctx.root.join(".branch-sweep-v1.json").exists());
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("keeps changes or data"));
+        sweep_once(&ctx, |message| logs.push(message.to_owned())).unwrap();
+        assert_eq!(logs.len(), 1);
     }
 
     #[test]
