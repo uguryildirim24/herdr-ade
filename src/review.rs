@@ -953,12 +953,8 @@ fn land_with_install(
         for id in &ids {
             crate::threads::resolve_automatically(ctx, project, id, "merged");
         }
-        for id in &ids {
-            let t = thread::load(project, id)?;
-            if t.status != Status::Resolved || t.cleanup_pending {
-                bail!("lane cleanup pending: {id}");
-            }
-        }
+        // Cleanup belongs to each merged thread, not to the landing. Its
+        // durable cleanup_pending marker lets the ticker retry independently.
         review.close = true;
         save(project, review)?;
     }
