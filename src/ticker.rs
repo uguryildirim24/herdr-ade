@@ -619,6 +619,7 @@ fn tick_with_steps(
     }
     memory.machine_views.clear();
     let mut reachable = Vec::new();
+    let mut readiness = BTreeMap::new();
     for slug in project::list_slugs(&ctx.root) {
         if !step(&format!("cheap project {slug}")) {
             return None;
@@ -634,6 +635,9 @@ fn tick_with_steps(
             }
             continue;
         }
+        resume_provider_starts(ctx, &project, &mut readiness, |error| {
+            log.line(&format!("{slug}: {error:#}"));
+        });
         match tick_cheap(
             ctx,
             &project,
@@ -856,6 +860,7 @@ pub(crate) fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 #[cfg(test)]
 pub(crate) fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
     memory.machine_views.clear();
+    resume_provider_starts(ctx, project, &mut BTreeMap::new(), |_| {});
     match tick_cheap(ctx, project, true)? {
         Some(seen) => {
             let log = Log {
@@ -871,6 +876,93 @@ pub(crate) fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memor
             }
         }
         None => Ok(false),
+    }
+}
+
+/// Retry placement without using the routing retry or creating duplicate
+/// panes. One readiness result is shared across projects for this pass.
+pub(crate) fn resume_provider_starts(
+    ctx: &Ctx,
+    project: &Project,
+    cache: &mut BTreeMap<(String, String), Result<(), String>>,
+    mut report: impl FnMut(anyhow::Error),
+) {
+    for lane in thread::list(project) {
+        if lane.provider_wait_started.is_empty()
+            || !matches!(lane.status, thread::Status::Starting | thread::Status::Open)
+        {
+            continue;
+        }
+        if thread::seconds_since(&lane.provider_wait_started, jiff::Timestamp::now()) >= 3600 {
+            let reason = format!(
+                "provider_wait_expired: recipe `{}` on `{}` was not ready after one hour; {}",
+                lane.launch.recipe_id,
+                lane.machine_route(),
+                lane.error
+            );
+            if let Err(error) = threads::fail_start(
+                ctx,
+                project,
+                &lane.id,
+                &reason,
+                crate::contracts::FailureClass::Provider,
+                false,
+            ) {
+                report(error);
+            }
+            continue;
+        }
+        let machine = if lane.is_remote() {
+            lane.machine_route()
+        } else {
+            crate::contracts::MACHINE_LOCAL
+        };
+        let key = (machine.to_string(), lane.launch.recipe_id.clone());
+        let ready = cache.entry(key).or_insert_with(|| {
+            let result = if lane.is_remote() {
+                threads::box_launch_ready_for(ctx, machine, &lane.launch)
+            } else {
+                crate::doctor::recipe_ready_local(ctx, &lane.launch)
+            };
+            result.map_err(|error| format!("{error:#}"))
+        });
+        if ready.is_err() {
+            continue;
+        }
+        if lane.status == thread::Status::Open {
+            if let Err(error) = thread::update(project, &lane.id, |t| {
+                t.provider_wait_started.clear();
+                t.error = "provider ready".into();
+            }) {
+                report(error);
+            }
+            continue;
+        }
+        // Keep the timestamp until placement succeeds; a failed provision
+        // must not restart the one-hour provider clock.
+        match threads::resume_provider_start(ctx, project, &lane.id) {
+            Ok(()) => {
+                if let Err(error) = thread::update(project, &lane.id, |t| {
+                    t.provider_wait_started.clear();
+                    t.error = "provider ready".into();
+                }) {
+                    report(error);
+                }
+            }
+            Err(error) => {
+                if let Err(cleanup) = threads::fail_start(
+                    ctx,
+                    project,
+                    &lane.id,
+                    &format!("placement after provider became ready failed: {error:#}"),
+                    crate::contracts::FailureClass::Unknown,
+                    false,
+                ) {
+                    report(cleanup);
+                }
+                report(error);
+            }
+        }
     }
 }
 
@@ -1000,7 +1092,7 @@ fn thread_pass(
             thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
         });
     for t in threads {
-        if t.parked {
+        if t.parked || !t.provider_wait_started.is_empty() {
             continue;
         }
         if t.status == thread::Status::Starting && t.startup_wait_started.is_empty() {
@@ -1524,7 +1616,10 @@ fn launch_pass(
     let now = jiff::Timestamp::now();
     let mut pending = Vec::new();
     for t in pass.threads {
-        if t.status != thread::Status::Open || !t.prompt_pending {
+        if t.status != thread::Status::Open
+            || !t.prompt_pending
+            || !t.provider_wait_started.is_empty()
+        {
             continue;
         }
         // The preceding state pass may have failed this start while the
@@ -1551,7 +1646,7 @@ fn launch_pass(
         // Provider-bridge credentials can expire between placement and start.
         // The adapter's readiness driver, not its agent-kind name, chooses the
         // extra check; command probes were already run during placement.
-        let readiness = if t.launch.kind.is_empty() {
+        let readiness = if t.launch.kind.is_empty() || t.error == "provider ready" {
             Ok(())
         } else {
             crate::adapters::declaration(&pass.ctx.config_dir, &t.launch.kind).and_then(|adapter| {
@@ -1566,13 +1661,25 @@ fn launch_pass(
             })
         };
         if let Err(error) = readiness {
-            let class = crate::pi_ade::failure_class(&error);
             let message = format!("{error:#}");
-            errors.extend(
-                threads::fail_start(pass.ctx, pass.project, &t.id, &message, class, true)
-                    .err()
-                    .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
-            );
+            if message.contains("pi_not_ready") {
+                errors.extend(
+                    thread::update(pass.project, &t.id, |record| {
+                        if record.provider_wait_started.is_empty() {
+                            record.provider_wait_started = project::now();
+                        }
+                        record.error = format!("waiting for provider: {message}");
+                    })
+                    .err(),
+                );
+            } else {
+                let class = crate::pi_ade::failure_class(&error);
+                errors.extend(
+                    threads::fail_start(pass.ctx, pass.project, &t.id, &message, class, true)
+                        .err()
+                        .map(|cleanup| cleanup.context(format!("{}: failed-start cleanup", t.id))),
+                );
+            }
             continue;
         }
         // The CLI and the ticker can race on the same newly placed pane.
@@ -1588,6 +1695,9 @@ fn launch_pass(
                 return Ok(());
             }
             current.launch_attempts += 1;
+            if current.error == "provider ready" {
+                current.error.clear();
+            }
             current.trust_answered = false;
             current.startup_wait_started = project::now();
             claimed = true;
@@ -1692,6 +1802,7 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .filter(|t| {
             t.is_remote() == remote
                 && !t.parked
+                && (t.provider_wait_started.is_empty() || t.status == thread::Status::Open)
                 && matches!(t.status, thread::Status::Open | thread::Status::Starting)
         })
         .collect()
@@ -2262,6 +2373,33 @@ mod tests {
     use super::*;
     use crate::paths::Env;
     use crate::runner::fake::{FakeRunner, fail, ok, timeout};
+
+    #[test]
+    fn provider_wait_expires_after_an_hour_without_spending_a_retry() {
+        use crate::scenarios::World;
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |t| {
+            t.role = "reviewer".into();
+            t.launch.recipe_id = "pi_example".into();
+            t.provider_wait_started = "2020-01-01T00:00:00Z".into();
+            t.error = "waiting for provider: readiness probe timed out".into();
+        })
+        .unwrap();
+        resume_provider_starts(&world.ctx(), &project, &mut BTreeMap::new(), |error| {
+            panic!("{error:#}")
+        });
+        let failed = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert_eq!(failed.launch_attempts, 0);
+        assert_eq!(failed.attempt, 0);
+        assert!(
+            failed.error.contains("provider_wait_expired"),
+            "{}",
+            failed.error
+        );
+        assert!(failed.error.contains("one hour"), "{}", failed.error);
+    }
 
     #[test]
     fn explicit_launch_delivers_brief_without_a_ticker_pass() {
