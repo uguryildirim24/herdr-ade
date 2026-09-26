@@ -1537,7 +1537,9 @@ mod tests {
         refresh_page(&project).unwrap();
         let (_, body) = project.read_project_md().unwrap();
         assert!(
-            body.contains("## Plan\n\n- `s-1` [left] Build the screen\n  - `s-2` [left] Draw the list\n"),
+            body.contains(
+                "## Plan\n\n- `s-1` [left] Build the screen\n  - `s-2` [left] Draw the list\n"
+            ),
             "{body}"
         );
     }
