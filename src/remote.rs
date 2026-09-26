@@ -55,7 +55,7 @@ struct SavedMachine {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct MachineDeclaration {
     pub(crate) id: String,
     pub(crate) label: String,
@@ -73,24 +73,6 @@ pub(crate) struct MachineDeclaration {
     /// list means the machine runs no agent jobs.
     pub(crate) kinds: Option<Vec<String>>,
     pub(crate) repos: Vec<crate::project::Repo>,
-    /// Queue starts above this multiple of online cores (one-minute load).
-    #[serde(default = "default_load_limit")]
-    pub(crate) load_limit: f64,
-    /// Limits for this project's user slice, keyed by project slug.
-    pub(crate) project_caps: BTreeMap<String, ProjectCap>,
-}
-
-fn default_load_limit() -> f64 {
-    1.5
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ProjectCap {
-    /// systemd CPUQuota percentage (100 means one core).
-    pub(crate) cpu_percent: u32,
-    /// systemd MemoryMax, in MiB.
-    pub(crate) memory_mib: u64,
 }
 
 impl MachineDeclaration {
@@ -120,16 +102,6 @@ pub(crate) fn machine_declarations(
         }
         if row.label.is_empty() {
             row.label = id.clone();
-        }
-        if !row.load_limit.is_finite() || row.load_limit <= 0.0 {
-            bail!("machine_declaration_invalid: `{id}` load_limit must be positive and finite");
-        }
-        if row
-            .project_caps
-            .values()
-            .any(|cap| cap.cpu_percent == 0 && cap.memory_mib == 0)
-        {
-            bail!("machine_declaration_invalid: `{id}` empty project cap");
         }
         if row.target.is_empty()
             || row.session.is_empty()
@@ -393,138 +365,6 @@ fn ssh_command(
 /// that saved machine.
 pub(crate) fn with_path(path: &str, script: &str) -> String {
     format!("PATH={}; export PATH\n{script}", quote(path))
-}
-
-/// Read the kernel's one-minute load and online CPU count before a box start.
-/// An unreadable box remains queued rather than being mistaken for a free box.
-pub(crate) fn box_load(runner: &dyn Runner, machine: &MachineDeclaration) -> Result<(f64, u32)> {
-    let script = "read -r load rest </proc/loadavg; cores=$(getconf _NPROCESSORS_ONLN); printf '%s %s\\n' \"$load\" \"$cores\"";
-    let out = ssh(runner, &machine.target, script, None, SSH_TIMEOUT)?;
-    if !out.success() {
-        bail!("load probe on {}: {}", machine.label, out.error_text());
-    }
-    let mut values = out.stdout.split_whitespace();
-    let load: f64 = values.next().context("missing box load")?.parse()?;
-    let cores: u32 = values.next().context("missing box core count")?.parse()?;
-    if !load.is_finite() || cores == 0 {
-        bail!("invalid box load or core count");
-    }
-    Ok((load, cores))
-}
-
-pub(crate) fn load_wait_reason(load: f64, cores: u32, limit: f64) -> Option<String> {
-    (load > limit * f64::from(cores))
-        .then(|| format!("box load {load:.1} exceeds {limit:.1} × {cores} cores"))
-}
-
-/// Each project gets one user slice. Herdr's launch environment restricts
-/// executable lookup to its wrapper directory *at agent start*, after shell
-/// startup files have run. Descendants of the scoped agent stay in the slice.
-pub(crate) fn project_slice(slug: &str) -> Result<String> {
-    if slug.is_empty()
-        || !slug
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        bail!("invalid project slug for systemd slice: {slug}");
-    }
-    // A dash in a slice name creates a parent slice. Keep every project a
-    // direct sibling beneath herdr-ade.slice, even when its slug has dashes.
-    Ok(format!("herdr-ade-{}.slice", slug.replace('-', "_")))
-}
-
-pub(crate) fn prepare_project_slice(
-    runner: &dyn Runner,
-    machine: &MachineDeclaration,
-    slug: &str,
-    kind: &str,
-) -> Result<String> {
-    let slice = project_slice(slug)?;
-    let executable = match kind {
-        "pi" => "pi",
-        "dsh" => "dst",
-        "agy" => "agy",
-        "cursor" => "cursor-agent",
-        "claude" => "claude",
-        "codex" => "codex",
-        "gemini" => "gemini",
-        "opencode" => "opencode",
-        "kimi" => "kimi",
-        "omp" => "omp",
-        _ => bail!("no box slice wrapper for adapter kind `{kind}`"),
-    };
-    let cap = machine.project_caps.get(slug);
-    let mut unit = format!(
-        "# Managed by herdr-ade\n[Unit]\nDescription=Herdr ADE project {slug}\n[Slice]\nCPUWeight=100\nCPUAccounting=yes\nMemoryAccounting=yes\n"
-    );
-    if let Some(cap) = cap {
-        if cap.cpu_percent > 0 {
-            unit.push_str(&format!("CPUQuota={}%\n", cap.cpu_percent));
-        }
-        if cap.memory_mib > 0 {
-            unit.push_str(&format!("MemoryMax={}M\n", cap.memory_mib));
-        }
-    }
-    let folder = format!("{}/.config/systemd/user", machine.home);
-    let bin = format!("{}/.state/slices/{slug}/bin", machine.root);
-    // These are Herdr's interactive command names. Missing executables are
-    // harmless; a selected kind without a matching wrapper is refused below.
-    let names = "pi claude codex gemini cursor-agent devin agy cline omp mastracode opencode copilot kimi kiro-cli droid amp grok hermes kilo qodercli qwen letta maki muse dst";
-    let script = with_path(
-        &machine.path,
-        &format!(
-            "set -e\nmkdir -p {folder} {bin}\nunit={unit_path}\ntmp=\"$unit.tmp-$$\"\nprintf '%s' {contents} > \"$tmp\"\nif [ -f \"$unit\" ] && ! grep -q '^# Managed by herdr-ade$' \"$unit\"; then rm -f \"$tmp\"; echo unmanaged_slice >&2; exit 8; fi\nif ! cmp -s \"$tmp\" \"$unit\"; then mv \"$tmp\" \"$unit\"; systemctl --user daemon-reload; else rm -f \"$tmp\"; fi\ncommand -v systemd-run >/dev/null || {{ echo missing_systemd_run >&2; exit 9; }}\n# Verify the user manager can actually create a scope in this slice.\nsystemd-run --user --scope --same-dir --quiet --collect --slice={slice} -- /bin/true\nfor name in {names}; do\n  real=$(command -v \"$name\" || true)\n  if [ -n \"$real\" ]; then\n    printf '#!/bin/sh\\nPATH=%s exec /usr/bin/systemd-run --user --scope --same-dir --quiet --collect --slice=%s -- %s \"$@\"\\n' {runtime_path} {slice} \"$real\" > {bin}/\"$name\"\n    chmod 755 {bin}/\"$name\"\n  else\n    rm -f {bin}/\"$name\"\n  fi\ndone\ntest -x {bin}/{executable} || {{ echo missing_slice_wrapper >&2; exit 9; }}\n",
-            folder = quote(&folder),
-            bin = quote(&bin),
-            unit_path = quote(&format!("{folder}/{slice}")),
-            contents = quote(&unit),
-            names = names,
-            slice = quote(&slice),
-            runtime_path = quote(&machine.path),
-            executable = quote(executable),
-        ),
-    );
-    let out = ssh(runner, &machine.target, &script, None, SSH_START_TIMEOUT)?;
-    if !out.success() {
-        bail!("project slice on {}: {}", machine.label, out.error_text());
-    }
-    Ok(bin)
-}
-
-/// Verify the actual agent PID, not the pane shell or the wrapper's text.
-/// A missing process or an unreadable cgroup is a failed check, never a pass.
-pub(crate) fn check_agent_slice(
-    runner: &dyn Runner,
-    machine: &MachineDeclaration,
-    slug: &str,
-    pid: u32,
-) -> Result<String> {
-    let slice = project_slice(slug)?;
-    let out = ssh(
-        runner,
-        &machine.target,
-        &format!("cat /proc/{pid}/cgroup"),
-        None,
-        SSH_TIMEOUT,
-    )?;
-    if !out.success() {
-        bail!(
-            "agent pid {pid}: cannot read /proc/{pid}/cgroup: {}",
-            out.error_text()
-        );
-    }
-    verify_agent_slice(&slice, pid, &out.stdout)?;
-    Ok(slice)
-}
-
-fn verify_agent_slice(slice: &str, pid: u32, cgroup: &str) -> Result<()> {
-    if !cgroup.lines().any(|line| {
-        line.split_once("::")
-            .is_some_and(|(_, path)| path.split('/').any(|component| component == slice))
-    }) {
-        bail!("agent pid {pid} outside {slice}: /proc/{pid}/cgroup = {cgroup:?}");
-    }
-    Ok(())
 }
 
 /// One box start's git effect (SPEC-remote §4.2 step 3): the box fetches the
@@ -802,55 +642,6 @@ mod tests {
         );
         let project = std::fs::read_to_string(dir.join("PROJECT.md")).unwrap();
         assert!(project.contains("name = \"demo\""), "{project}");
-    }
-
-    #[test]
-    fn agent_slice_requires_exact_cgroup_component() {
-        let slice = "herdr-ade-demo.slice";
-        assert!(
-            verify_agent_slice(slice, 42, "0::/user.slice/herdr-ade-demo.slice/run.scope\n")
-                .is_ok()
-        );
-        let error = verify_agent_slice(slice, 42, "0::/app.slice/herdr.service\n").unwrap_err();
-        assert!(error.to_string().contains("app.slice/herdr.service"));
-        assert!(verify_agent_slice(slice, 42, "0::/herdr-ade-demo.slice-fake/run.scope").is_err());
-        assert!(verify_agent_slice(slice, 42, "").is_err());
-    }
-
-    #[test]
-    fn project_slice_wrapper_and_cap_use_the_same_project_unit() {
-        let runner = FakeRunner::new();
-        runner.on("ssh", ok(""));
-        let machine = MachineDeclaration {
-            target: "box".into(),
-            home: "/home/agent".into(),
-            root: "/home/agent/.herdr-ade".into(),
-            path: "/usr/bin:/bin".into(),
-            project_caps: BTreeMap::from([(
-                "demo".into(),
-                ProjectCap {
-                    cpu_percent: 400,
-                    memory_mib: 16384,
-                },
-            )]),
-            ..Default::default()
-        };
-        assert_eq!(
-            project_slice("prl-8-53").unwrap(),
-            "herdr-ade-prl_8_53.slice"
-        );
-        let bin = prepare_project_slice(&runner, &machine, "demo", "pi").unwrap();
-        assert!(bin.ends_with("/slices/demo/bin"));
-        let command = runner.calls.borrow().last().unwrap().display();
-        assert!(command.contains("herdr-ade-demo.slice"));
-        assert!(command.contains("CPUQuota=400%"));
-        assert!(command.contains("MemoryMax=16384M"));
-        assert!(command.contains("systemd-run --user --scope --same-dir --quiet --collect"));
-        assert!(command.contains("--slice=herdr-ade-demo.slice -- /bin/true"));
-        assert!(command.contains("PATH=%s exec /usr/bin/systemd-run"));
-        assert!(command.contains("test -x"));
-        assert!(load_wait_reason(24.1, 16, 1.5).is_some());
-        assert_eq!(load_wait_reason(24.0, 16, 1.5), None);
     }
 
     #[test]
