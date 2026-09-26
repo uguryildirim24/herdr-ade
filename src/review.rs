@@ -1148,28 +1148,3 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     }
     first.map_or(Ok(()), Err)
 }
-
-pub(crate) fn summary(project: &Project) -> String {
-    match list(project) {
-        Ok(records) => records
-            .iter()
-            .rev()
-            .find(|r| !r.phase.closed())
-            .or_else(|| records.last())
-            .map(|r| {
-                format!(
-                    "{}: {:?} ({} lanes){}",
-                    r.id,
-                    r.phase,
-                    r.members.len(),
-                    if r.attention.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" — {}", r.attention)
-                    }
-                )
-            })
-            .unwrap_or_else(|| "no pile review yet".into()),
-        Err(error) => format!("review records unreadable: {error}"),
-    }
-}

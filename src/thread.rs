@@ -823,13 +823,24 @@ fn compose_brief(input: &BriefInput) -> String {
     brief
 }
 
-fn render_task(record: &crate::task::Task, rows: &[crate::note::Row]) -> String {
+fn render_task(
+    project: &Project,
+    record: &crate::task::Task,
+    rows: &[crate::note::Row],
+) -> Result<String> {
     let mut out = format!(
-        "## {} — {}\n\nRequests: {}\n\nAcceptance conditions:\n",
+        "## {} — {}\n\nRequests: {}\n",
         record.id,
         record.title.trim(),
         record.authority.join(", ")
     );
+    for basis in &record.authority {
+        if basis.starts_with("request:") {
+            let request = crate::talk::resolve_request(project, basis)?;
+            out.push_str(&format!("\n{basis}:\n{}\n", request.text));
+        }
+    }
+    out.push_str("\nAcceptance conditions:\n");
     for (index, condition) in record.acceptance.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", index + 1, condition.trim()));
     }
@@ -841,7 +852,7 @@ fn render_task(record: &crate::task::Task, rows: &[crate::note::Row]) -> String 
             out.push_str("\n\n");
         }
     }
-    out.trim_end().to_string()
+    Ok(out.trim_end().to_string())
 }
 
 /// Builds a frozen helper brief from the same current records as PROJECT.md.
@@ -865,10 +876,10 @@ pub(crate) fn brief_for(
         .collect::<Vec<_>>()
         .join("\n\n");
     let facts = MemoryUse::from_rows(active.iter());
-    let task = task_record
-        .as_ref()
-        .map(|record| render_task(record, &active))
-        .unwrap_or_else(|| supplied_task.trim().to_string());
+    let task = match task_record.as_ref() {
+        Some(record) => render_task(project, record, &active)?,
+        None => supplied_task.trim().to_string(),
+    };
     let supplied_task = task_record.as_ref().map(|_| supplied_task);
     let (settings, _) = project.read_project_md()?;
     let repo = settings.repos.iter().find(|repo| repo.path == thread.repo);
@@ -2026,6 +2037,10 @@ mod tests {
             "{brief}"
         );
         assert!(brief.contains("Requests: request:q-1"), "{brief}");
+        assert!(
+            brief.contains("request:q-1:\nKeep helper briefs focused."),
+            "{brief}"
+        );
         assert!(
             brief.contains("The command reports the new result."),
             "{brief}"
