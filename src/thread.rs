@@ -89,6 +89,9 @@ pub(crate) struct Thread {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) follow_ups: Vec<FollowUp>,
     pub(crate) launch_attempts: u32,
+    /// A placement blocked by provider readiness; empty outside the one-hour wait.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) provider_wait_started: String,
     /// A historical unsubmitted box start has been reclaimed once. Prevent a
     /// later timed-out start from resetting the bounded launch counter again.
     #[serde(default)]
@@ -988,7 +991,12 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
     match thread.status {
         Status::Resolved => Group::Resolved,
         Status::Failed => Group::WaitingOnYou,
-        Status::Starting if !thread.startup_wait_started.is_empty() => Group::Working,
+        Status::Starting
+            if !thread.startup_wait_started.is_empty()
+                || !thread.provider_wait_started.is_empty() =>
+        {
+            Group::Working
+        }
         Status::Starting if seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS => {
             Group::WaitingOnYou
         }
@@ -1021,6 +1029,7 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     // 2
     if thread.status == Status::Starting {
         return if !thread.startup_wait_started.is_empty()
+            || !thread.provider_wait_started.is_empty()
             || seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS
         {
             Group::Working

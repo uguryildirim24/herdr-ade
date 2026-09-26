@@ -286,7 +286,7 @@ fn start_with_ticker(
     // §4.1, d-0005). `--machine` wins and never falls back; a default box
     // start whose box cannot be used falls back to this Mac.
     let explicit_machine = args.machine.as_deref().filter(|m| !m.is_empty());
-    let placement = match resolve_placement(
+    let (placement, provider_wait) = match resolve_placement(
         ctx,
         explicit_machine,
         role,
@@ -294,7 +294,26 @@ fn start_with_ticker(
         Some(repo.as_str()),
         listed,
     ) {
-        Ok(placement) => placement,
+        Ok(placement) => (placement, None),
+        Err(error) if provider_readiness_error(&format!("{error:#}")) => {
+            // Save an unplaced attempt on its requested machine. No pane or
+            // worktree exists until a later readiness probe succeeds.
+            let default = default_machine(role, &launch.machine, Some(&repo));
+            let machine = explicit_machine
+                .or(default.as_deref())
+                .unwrap_or(crate::contracts::MACHINE_LOCAL);
+            (
+                Placement {
+                    machine: if machine == crate::contracts::MACHINE_LOCAL {
+                        String::new()
+                    } else {
+                        machine.to_string()
+                    },
+                    ..Placement::default()
+                },
+                Some(format!("{error:#}")),
+            )
+        }
         Err(error) => {
             crate::launch::dispatch(
                 &project,
@@ -333,6 +352,10 @@ fn start_with_ticker(
         t.plain = args.plain.trim().to_string();
         t.attempt = 1;
         t.launch = launch.clone();
+        if let Some(reason) = &provider_wait {
+            t.provider_wait_started = project::now();
+            t.error = format!("waiting for provider: {reason}");
+        }
     })?;
     let id = record.id.clone();
     {
@@ -346,6 +369,10 @@ fn start_with_ticker(
     // this first attempt, not only to retries.
     if !args.task_id.is_empty() {
         crate::task::link_attempt(&project, &args.task_id, &id)?;
+    }
+
+    if provider_wait.is_some() {
+        return thread::load(&project, &id);
     }
 
     match place_and_brief(ctx, &project, &view, &id, false) {
@@ -515,9 +542,17 @@ fn resolve_placement(
                     tried,
                 });
             }
-            Err(missing) => tried.push(serde_json::json!({
-                "machine":candidate, "ready":false, "missing":missing
-            })),
+            Err(missing) => {
+                let provider_wait = missing.contains("pi_not_ready");
+                tried.push(serde_json::json!({
+                    "machine":candidate, "ready":false, "missing":missing
+                }));
+                // A transient provider failure does not move a pinned recipe
+                // to a different machine merely because its probe was slow.
+                if provider_wait {
+                    break;
+                }
+            }
         }
     }
     let details = tried
@@ -535,6 +570,22 @@ fn resolve_placement(
         "recipe_unavailable: recipe `{}` cannot run; tried {details}",
         launch.recipe_id
     )
+}
+
+/// Do not mistake an unavailable machine or repository for a provider blip.
+fn provider_readiness_error(error: &str) -> bool {
+    error.contains("recipe_unavailable:")
+        && error.contains("pi_not_ready")
+        && !error.contains("box_repo_")
+        && !error.contains("machine_held:")
+        && !error.contains("machine_kind_unavailable:")
+}
+
+/// Complete a provider-blocked placement through the ordinary startup path.
+pub(crate) fn resume_provider_start(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    let view = require_session(ctx, project)?;
+    place_and_brief(ctx, project, &view, id, false)?;
+    Ok(())
 }
 
 /// Recipe readiness on a box is owned by the doctor probes.
@@ -3082,6 +3133,7 @@ pub(crate) fn fail_start_checked(
         t.status = Status::Failed;
         t.prompt_pending = false;
         t.startup_wait_started.clear();
+        t.provider_wait_started.clear();
         t.error = recovery_error.clone().unwrap_or_else(|| reason.to_string());
         t.failure_class = class;
         t.provider_failure_kind = provider_kind.clone();
@@ -6038,6 +6090,79 @@ mod tests {
             assert_eq!(started.machine, "buildbox");
             assert_eq!(started.machine_id, "buildbox-id");
         }
+    }
+
+    #[test]
+    fn reviewer_waits_for_provider_and_starts_on_next_pass_without_routing_retry() {
+        use crate::runner::fake::{fail, ok};
+        let (fx, _remote) = box_fixture();
+        write_config(
+            &fx,
+            &format!("{ROUTED_BOX_CONFIG}{}", crate::remote::TEST_MACHINE),
+        );
+        let task = "Review this pile.";
+        let config_path = fx.world.home.path().join("cfg/config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let hash = crate::thread::sha256_hex(task.as_bytes());
+        std::fs::write(
+            &config_path,
+            format!("{config}\n[routing.pins]\n\"{hash}\" = \"pi_opencode_deepseek\"\n"),
+        )
+        .unwrap();
+        let ready = std::rc::Rc::new(std::cell::Cell::new(false));
+        let state = ready.clone();
+        fx.world.runner.on_fn(
+            |cmd| {
+                cmd.program == "ssh"
+                    && cmd.display().contains("herdr-pi")
+                    && cmd.display().contains(" check ")
+            },
+            move |_| {
+                if state.get() {
+                    Ok(ok("ok"))
+                } else {
+                    Ok(fail(1, "provider readiness probe timed out"))
+                }
+            },
+        );
+        stub_box(&fx);
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.workflow = Some("reviewer".into());
+        args.task = task.into();
+        let waiting = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(waiting.status, Status::Starting);
+        assert!(!waiting.provider_wait_started.is_empty());
+        assert_eq!(waiting.launch_attempts, 0);
+        assert!(waiting.pane_id.is_empty());
+        let other = thread::allocate(&fx.project, |t| {
+            t.launch = waiting.launch.clone();
+            t.machine = waiting.machine.clone();
+            t.role = "reviewer".into();
+            t.provider_wait_started = waiting.provider_wait_started.clone();
+        })
+        .unwrap();
+        let before = fx.world.runner.count("herdr-pi check");
+        crate::ticker::resume_provider_starts(
+            &fx.world.ctx(),
+            &fx.project,
+            &mut std::collections::BTreeMap::new(),
+            |error| panic!("{error:#}"),
+        );
+        assert_eq!(fx.world.runner.count("herdr-pi check") - before, 1);
+        thread::update(&fx.project, &other.id, |t| t.status = Status::Resolved).unwrap();
+        ready.set(true);
+        crate::ticker::resume_provider_starts(
+            &fx.world.ctx(),
+            &fx.project,
+            &mut std::collections::BTreeMap::new(),
+            |error| panic!("{error:#}"),
+        );
+        let placed = thread::load(&fx.project, &waiting.id).unwrap();
+        assert_eq!(placed.status, Status::Open);
+        assert!(placed.provider_wait_started.is_empty());
+        assert_eq!(placed.launch_attempts, 0);
+        assert_eq!(placed.attempt, 1);
+        assert!(!placed.pane_id.is_empty());
     }
 
     #[test]
