@@ -176,10 +176,10 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Task> {
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(crate::refusal::error(format!(
-                "task_unknown: no task `{id}` in `{}`",
-                project.slug
-            )));
+            return Err(crate::refusal::error(
+                format!("task_unknown: no task `{id}` in `{}`", project.slug),
+                format!("ha task list {}", project.slug),
+            ));
         }
         Err(error) => {
             return Err(error).with_context(|| format!("could not read {}", file.display()));
@@ -314,16 +314,21 @@ pub(crate) fn add(
     replaces: Option<String>,
 ) -> Result<Task> {
     if title.trim().is_empty() {
-        return Err(crate::refusal::error("task_title: a title is required"));
+        return Err(crate::refusal::error(
+            "task_title: a title is required",
+            "ha task add <project> --title \"<title>\" --request <request-id> --acceptance \"<condition>\"",
+        ));
     }
     if authority.is_empty() {
         return Err(crate::refusal::error(
             "task_authority: pass at least one --request request:<id> or ask:<id>@<revision>",
+            "ha task add <project> --title \"<title>\" --request <request-id> --acceptance \"<condition>\"",
         ));
     }
     if acceptance.is_empty() || acceptance.iter().any(|line| line.trim().is_empty()) {
         return Err(crate::refusal::error(
             "task_acceptance: pass at least one non-empty --acceptance condition",
+            "ha task add <project> --title \"<title>\" --request <request-id> --acceptance \"<condition>\"",
         ));
     }
     let title = title.trim().to_string();
@@ -335,7 +340,7 @@ pub(crate) fn add(
         .iter()
         .map(|reference| {
             crate::note::validate_basis(project, reference)
-                .map_err(|error| crate::refusal::error(error.to_string()))
+                .map_err(|error| crate::refusal::error(error.to_string(), format!("ha task add {} --title \"{}\" --request <existing-request-id> --acceptance \"<condition>\"", project.slug, title)))
         })
         .collect::<Result<Vec<_>>>()?;
     let _replacement_lock = replaces
@@ -344,15 +349,17 @@ pub(crate) fn add(
         .transpose()?;
     if let Some(old) = replaces.as_deref() {
         if !crate::note::target_exists(project, old) {
-            return Err(crate::refusal::error(format!(
-                "task_replacement: no note or task `{old}` exists"
-            )));
+            return Err(crate::refusal::error(
+                format!("task_replacement: no note or task `{old}` exists"),
+                "ha task list <project> (choose a current note or task for --replaces)",
+            ));
         }
         let rows = crate::note::rows(project);
         if crate::note::replacement_map(&rows).contains_key(old) {
-            return Err(crate::refusal::error(format!(
-                "task_replacement: `{old}` already has a replacement"
-            )));
+            return Err(crate::refusal::error(
+                format!("task_replacement: `{old}` already has a replacement"),
+                "ha task list <project> (choose a current note or task for --replaces)",
+            ));
         }
     }
     let repo = repo.map(|repo| {
@@ -404,13 +411,17 @@ fn update_deferred(
 
 pub(crate) fn drop_task(project: &Project, id: &str, reason: &str) -> Result<Task> {
     if reason.trim().is_empty() {
-        return Err(crate::refusal::error("task_drop: --reason is required"));
+        return Err(crate::refusal::error(
+            "task_drop: --reason is required",
+            "ha task drop <project> <job> --reason \"<reason>\"",
+        ));
     }
     update(project, id, |task| {
         if !task.dropped.is_empty() {
-            return Err(crate::refusal::error(format!(
-                "task_drop_already: `{id}` is already dropped"
-            )));
+            return Err(crate::refusal::error(
+                format!("task_drop_already: `{id}` is already dropped"),
+                "ha task show <project> <job> (the task is already dropped)",
+            ));
         }
         task.dropped.push(DropEvidence {
             at: project::now(),
@@ -427,13 +438,17 @@ pub(crate) fn withdraw_acceptance(
     reason: &str,
 ) -> Result<Task> {
     if reason.trim().is_empty() {
-        return Err(crate::refusal::error("task_drop: --reason is required"));
+        return Err(crate::refusal::error(
+            "task_drop: --reason is required",
+            "ha task drop <project> <job> --reason \"<reason>\"",
+        ));
     }
     update(project, id, |task| {
         if !task.dropped.is_empty() {
-            return Err(crate::refusal::error(format!(
-                "task_drop_already: `{id}` is already dropped"
-            )));
+            return Err(crate::refusal::error(
+                format!("task_drop_already: `{id}` is already dropped"),
+                "ha task show <project> <job> (the task is already dropped)",
+            ));
         }
         let mut acceptance = acceptance;
         acceptance.sort_unstable();
@@ -442,10 +457,13 @@ pub(crate) fn withdraw_acceptance(
             .iter()
             .any(|index| *index == 0 || *index > task.acceptance.len())
         {
-            return Err(crate::refusal::error(format!(
-                "task_drop_acceptance_range: an acceptance number is outside 1..={}",
-                task.acceptance.len()
-            )));
+            return Err(crate::refusal::error(
+                format!(
+                    "task_drop_acceptance_range: an acceptance number is outside 1..={}",
+                    task.acceptance.len()
+                ),
+                "ha task show <project> <job> (choose an acceptance number shown there)",
+            ));
         }
         let already_withdrawn: BTreeSet<_> = task
             .withdrawn
@@ -456,13 +474,15 @@ pub(crate) fn withdraw_acceptance(
             .iter()
             .find(|index| already_withdrawn.contains(index))
         {
-            return Err(crate::refusal::error(format!(
-                "task_drop_acceptance_already: acceptance {index} is already withdrawn"
-            )));
+            return Err(crate::refusal::error(
+                format!("task_drop_acceptance_already: acceptance {index} is already withdrawn"),
+                "ha task show <project> <job> (choose an acceptance condition not yet withdrawn)",
+            ));
         }
         if already_withdrawn.len() + acceptance.len() == task.acceptance.len() {
             return Err(crate::refusal::error(
                 "task_drop_acceptance_all: this would withdraw every acceptance condition; drop the task instead",
+                "ha task drop <project> <job> --reason \"<reason>\"",
             ));
         }
         let at = project::now();
@@ -486,10 +506,10 @@ pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<
         .with_context(|| format!("task_attempt: no thread `{thread}`"))?;
     for other in list_with_errors(project).0 {
         if other.id != id && other.attempts.iter().any(|attempt| attempt == thread) {
-            return Err(crate::refusal::error(format!(
-                "task_attempt: `{thread}` already belongs to `{}`",
-                other.id
-            )));
+            return Err(crate::refusal::error(
+                format!("task_attempt: `{thread}` already belongs to `{}`", other.id),
+                "ha task show <project> <job> (use the task already linked to this thread)",
+            ));
         }
     }
     let task = update(project, id, |task| {

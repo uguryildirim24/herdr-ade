@@ -955,8 +955,7 @@ fn start_details(
         .or_else(|| existing.map(|task| task.title.clone()))
         .ok_or_else(|| {
             crate::refusal::error(
-                "task_title: --title is required when the lane does not name an existing --job",
-            )
+                "task_title: --title is required when the lane does not name an existing --job", "ha thread start <project> --title \"<title>\" --request <request-id> --acceptance \"<condition>\" --task-file <file>")
         })?;
     let repo = repo.or_else(|| existing.and_then(|task| task.repo.clone()));
     let plain = plain.unwrap_or_else(|| {
@@ -1131,6 +1130,9 @@ pub fn run() -> Result<()> {
 fn record_command_outcome(project: Option<&Project>, result: &Result<()>) {
     match result {
         Err(error) if crate::refusal::is(error) => {
+            if let Some(next) = crate::refusal::next(error) {
+                crate::output::set_next(next);
+            }
             crate::output::set_outcome("refused");
             crate::output::set_failure_class(None);
         }
@@ -1510,6 +1512,7 @@ fn dispatch_with_start(
                     None if requests.is_empty() => {
                         return Err(crate::refusal::error(
                             "task_missing: a lane must pass --job <task>, or create one with --request and --acceptance",
+                            "ha thread start <project> --job <job> --task-file <file>",
                         ));
                     }
                     None => {
@@ -1819,7 +1822,10 @@ fn dispatch_with_start(
                 "",
             )?;
             if !result.healthy {
-                return Err(crate::refusal::error("some checks failed"));
+                return Err(crate::refusal::error(
+                    "some checks failed",
+                    "ha doctor --timings (inspect failed checks, fix them, then rerun)",
+                ));
             }
             Ok(())
         }

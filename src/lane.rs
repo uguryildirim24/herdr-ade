@@ -39,6 +39,7 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     if report.is_empty() || report.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(crate::refusal::error(
             "report_path_invalid: a report path has no spaces or control characters",
+            "ha done --report <path-inside-worktree> --sha <HEAD-sha>",
         ));
     }
     let binding = current_lane(ctx)?;
@@ -119,11 +120,13 @@ fn seal_message(
     if class == FailureClass::Provider && provider_kind.is_none() {
         return Err(crate::refusal::error(
             "provider_kind_missing: a provider failure needs --provider-kind",
+            "ha failed \"<failure>\" --class provider --provider-kind <kind>",
         ));
     }
     if class != FailureClass::Provider && provider_kind.is_some() {
         return Err(crate::refusal::error(
             "provider_kind_without_provider: --provider-kind requires --class provider",
+            "ha failed \"<failure>\" --class provider --provider-kind <kind>",
         ));
     }
     let recipient = binding.recipient()?;
