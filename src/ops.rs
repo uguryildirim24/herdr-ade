@@ -249,17 +249,23 @@ pub(crate) fn check_published_ref(
             .args(["ls-remote", publish_url, &format!("refs/heads/{branch}")]),
     )?;
     if !out.success() {
-        return Err(crate::refusal::error(format!(
-            "published_ref_check_failed: {}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote",
-            out.error_text()
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "published_ref_check_failed: {}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote",
+                out.error_text()
+            ),
+            "ha done --report <report-path> --sha <HEAD-sha>",
+        ));
     }
     let found = out.stdout.split_whitespace().next().unwrap_or("");
     if found != sha {
-        return Err(crate::refusal::error(format!(
-            "published_ref_mismatch: `{branch}` is {} on {publish_url}, not {sha}; retry `ha done`. If it still differs, ask the coordinator to check the remote",
-            if found.is_empty() { "missing" } else { found }
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "published_ref_mismatch: `{branch}` is {} on {publish_url}, not {sha}; retry `ha done`. If it still differs, ask the coordinator to check the remote",
+                if found.is_empty() { "missing" } else { found }
+            ),
+            "ha done --report <report-path> --sha <HEAD-sha>",
+        ));
     }
     Ok(())
 }
@@ -323,7 +329,8 @@ fn stage_done_inner(
     }
     if !status.stdout.trim().is_empty() {
         return Err(crate::refusal::error(
-            "worktree_dirty: ha done requires an empty git status",
+            "worktree_dirty: ha done requires an empty git status; commit or remove the listed changes first",
+            format!("ha done --report {} --sha {sha}", report.display()),
         ));
     }
     let head = runner.run(
@@ -335,10 +342,17 @@ fn stage_done_inner(
         bail!("git_head_failed: {}", head.error_text());
     }
     if head.stdout.trim() != sha {
-        return Err(crate::refusal::error(format!(
-            "sha_mismatch: requested {sha}, HEAD is {}",
-            head.stdout.trim()
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "sha_mismatch: requested {sha}, HEAD is {}",
+                head.stdout.trim()
+            ),
+            format!(
+                "ha done --report {} --sha {}",
+                report.display(),
+                head.stdout.trim()
+            ),
+        ));
     }
     let tracked = runner.run(
         &Cmd::new("git", std::time::Duration::from_secs(20))
@@ -367,9 +381,12 @@ fn stage_done_inner(
             .map(|path| format!("- `{path}`"))
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(crate::refusal::error(format!(
-            "worktree_dirty: commit {sha} tracks paths under .herdr-project/:\n{paths}\nuntrack these paths, commit, then run `ha done` again"
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "worktree_dirty: commit {sha} tracks paths under .herdr-project/:\n{paths}\nuntrack these paths, commit, then run `ha done` again"
+            ),
+            "ha thread show <project> <thread> (commit or remove the listed changes, then retry)",
+        ));
     }
     let second = stable_read(&report)?;
     if first != second {
@@ -410,12 +427,15 @@ fn publish_lane_ref(
             .args(["push", publish_url, &format!("{sha}:refs/heads/{branch}")]),
     ).map_err(|error| crate::refusal::error(format!(
         "lane_publish_failed: {error}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote"
-    )))?;
+    ), "ha done --report <report-path> --sha <HEAD-sha>"))?;
     if !out.success() {
-        return Err(crate::refusal::error(format!(
-            "lane_publish_failed: {}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote",
-            out.error_text()
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "lane_publish_failed: {}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote",
+                out.error_text()
+            ),
+            "ha done --report <report-path> --sha <HEAD-sha>",
+        ));
     }
     check_published_ref(runner, worktree, branch, publish_url, sha)
 }
@@ -680,6 +700,7 @@ fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
     {
         return Err(crate::refusal::error(
             "report_path_invalid: report must stay in the worktree",
+            "ha done --report <path-inside-worktree> --sha <HEAD-sha>",
         ));
     }
     let path = if requested.is_absolute() {
@@ -688,10 +709,10 @@ fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
         worktree.join(requested)
     };
     if !path.is_file() {
-        return Err(crate::refusal::error(format!(
-            "report_missing: {}",
-            path.display()
-        )));
+        return Err(crate::refusal::error(
+            format!("report_missing: {}", path.display()),
+            format!("ha done --report {} --sha <HEAD-sha>", path.display()),
+        ));
     }
     let worktree = std::fs::canonicalize(worktree)
         .with_context(|| format!("could not resolve worktree {}", worktree.display()))?;
@@ -700,6 +721,7 @@ fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
     if !path.starts_with(&worktree) {
         return Err(crate::refusal::error(
             "report_path_invalid: report must stay in the worktree",
+            "ha done --report <path-inside-worktree> --sha <HEAD-sha>",
         ));
     }
     Ok(path)

@@ -173,19 +173,34 @@ pub(crate) fn withdraw(
 ) -> Result<Withdrawal> {
     validate_ask_id(id)?;
     if reason.trim().is_empty() || by.trim().is_empty() {
-        bail!("ask_withdraw: a reason and actor are required");
+        return Err(crate::refusal::error(
+            "ask_withdraw: a reason and actor are required",
+            format!("ha ask close {slug} {id} --withdraw \"<reason>\""),
+        ));
     }
     let project = Project::load(&ctx.root, slug)?;
     let record = {
         let _lock = project.lock()?;
         let _set = ask_set_lock(&project)?;
-        let ask = latest(&project, id)?
-            .with_context(|| format!("ask_unknown: `{id}` has never been asked"))?;
+        let ask = latest(&project, id)?.ok_or_else(|| {
+            crate::refusal::error(
+                format!("ask_unknown: `{id}` has never been asked"),
+                format!("ha context {slug}"),
+            )
+        })?;
         if answer_of(&project, id, ask.revision).is_some() {
-            bail!("ask_closed: `{id}` is already answered; an answered ask cannot be withdrawn");
+            return Err(crate::refusal::error(
+                format!(
+                    "ask_closed: `{id}` is already answered; an answered ask cannot be withdrawn"
+                ),
+                format!("ha context {slug}"),
+            ));
         }
         if is_withdrawn(&project, id, ask.revision) {
-            bail!("ask_withdrawn: `{id}` is already withdrawn");
+            return Err(crate::refusal::error(
+                format!("ask_withdrawn: `{id}` is already withdrawn"),
+                format!("ha context {slug}"),
+            ));
         }
         let record = Withdrawal {
             id: id.to_string(),
@@ -280,11 +295,13 @@ fn refuse_repeated_question(project: &Project, new: &NewAsk) -> Result<()> {
         let answer = answer
             .map(|answer| answer.text)
             .unwrap_or_else(|| "still open".to_string());
-        bail!(
-            "ask_duplicate: `{}` already asks this question; answer: {}",
-            ask.id,
-            answer
-        );
+        return Err(crate::refusal::error(
+            format!(
+                "ask_duplicate: `{}` already asks this question; answer: {}",
+                ask.id, answer
+            ),
+            format!("ha context {}", project.slug),
+        ));
     }
     Ok(())
 }
@@ -340,7 +357,13 @@ pub(crate) struct NewAsk {
 pub(crate) fn ask(ctx: &Ctx, slug: &str, new: NewAsk) -> Result<Ask> {
     let project = Project::load(&ctx.root, slug)?;
     if !(2..=4).contains(&new.choices.len()) {
-        bail!("ask_choice_count: an ask takes two to four choices");
+        return Err(crate::refusal::error(
+            "ask_choice_count: an ask takes two to four choices",
+            format!(
+                "ha ask {} \"<question>\" --choice \"<first>\" --choice \"<second>\"",
+                project.slug
+            ),
+        ));
     }
     if let Some(id) = &new.task {
         crate::task::load(&project, id)?;
@@ -431,10 +454,16 @@ pub(crate) fn answer(
         validate_ask_id(id)?;
         let latest = latest_revision(&project, id);
         if is_withdrawn(&project, id, latest) {
-            bail!("ask_withdrawn: `{id}` is withdrawn; it cannot be answered");
+            return Err(crate::refusal::error(
+                format!("ask_withdrawn: `{id}` is withdrawn; it cannot be answered"),
+                format!("ha context {slug}"),
+            ));
         }
         if latest == 0 {
-            bail!("ask_unknown: `{id}` has never been asked");
+            return Err(crate::refusal::error(
+                format!("ask_unknown: `{id}` has never been asked"),
+                format!("ha context {slug}"),
+            ));
         }
         if revision != latest {
             bail!(
@@ -443,7 +472,10 @@ pub(crate) fn answer(
         }
         let record = open_revision(&project, id, revision)?;
         if answer_of(&project, id, revision).is_some() {
-            bail!("ask_closed: `{id}` revision {revision} is already answered");
+            return Err(crate::refusal::error(
+                format!("ask_closed: `{id}` revision {revision} is already answered"),
+                format!("ha context {slug}"),
+            ));
         }
         let text = match choice {
             0 => NOT_UNDERSTOOD.to_string(),
@@ -485,16 +517,29 @@ pub(crate) fn answer(
 /// unanswered, not withdrawn, and still passing the check.
 pub(crate) fn open_revision(project: &Project, id: &str, revision: u32) -> Result<Ask> {
     let latest = latest_revision(project, id);
-    let record = load_revision(project, id, revision)?
-        .with_context(|| format!("ask_unknown: `{id}` revision {revision} does not exist"))?;
+    let record = load_revision(project, id, revision)?.ok_or_else(|| {
+        crate::refusal::error(
+            format!("ask_unknown: `{id}` revision {revision} does not exist"),
+            format!("ha context {}", project.slug),
+        )
+    })?;
     if revision != latest {
-        bail!("ask_revision_stale: `{id}` is at revision {latest}");
+        return Err(crate::refusal::error(
+            format!("ask_revision_stale: `{id}` is at revision {latest}"),
+            format!("ha context {}", project.slug),
+        ));
     }
     if is_withdrawn(project, id, revision) {
-        bail!("ask_withdrawn: `{id}` revision {revision} is withdrawn");
+        return Err(crate::refusal::error(
+            format!("ask_withdrawn: `{id}` revision {revision} is withdrawn"),
+            format!("ha context {}", project.slug),
+        ));
     }
     if answer_of(project, id, revision).is_some() {
-        bail!("ask_closed: `{id}` revision {revision} is answered");
+        return Err(crate::refusal::error(
+            format!("ask_closed: `{id}` revision {revision} is answered"),
+            format!("ha context {}", project.slug),
+        ));
     }
     if record.task.as_ref().is_some_and(|task| {
         !crate::task::load(project, task).is_ok_and(|task| {
@@ -505,7 +550,10 @@ pub(crate) fn open_revision(project: &Project, id: &str, revision: u32) -> Resul
                 )
         })
     }) {
-        bail!("ask_closed: `{id}` task is closed");
+        return Err(crate::refusal::error(
+            format!("ask_closed: `{id}` task is closed"),
+            format!("ha context {}", project.slug),
+        ));
     }
     Ok(record)
 }

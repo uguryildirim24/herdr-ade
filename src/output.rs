@@ -11,6 +11,7 @@ struct State {
     command: String,
     outcome: String,
     failure_class: Option<String>,
+    next: Option<String>,
     data: BTreeMap<String, serde_json::Value>,
     stdout: String,
     stderr: String,
@@ -28,6 +29,8 @@ struct ResultRecord {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     message: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -49,6 +52,7 @@ pub fn begin(
             command,
             outcome,
             failure_class: None,
+            next: None,
             data,
             stdout: String::new(),
             stderr: String::new(),
@@ -69,6 +73,10 @@ pub fn set_outcome(outcome: impl Into<String>) {
 
 pub fn set_failure_class(class: Option<&str>) {
     STATE.with(|state| state.borrow_mut().failure_class = class.map(str::to_string));
+}
+
+pub fn set_next(next: &str) {
+    STATE.with(|state| state.borrow_mut().next = Some(next.to_string()));
 }
 
 pub fn insert(key: impl Into<String>, value: impl Into<serde_json::Value>) {
@@ -155,6 +163,7 @@ fn render(mut state: State, reason: Option<&str>) -> std::io::Result<()> {
             command: state.command,
             reason: reason.map(str::to_string),
             failure_class: state.failure_class,
+            next: state.next.clone(),
             message: state.stdout,
             data: state.data,
             warnings: state.stderr,
@@ -165,6 +174,13 @@ fn render(mut state: State, reason: Option<&str>) -> std::io::Result<()> {
     } else {
         if let Some(reason) = reason {
             writeln!(std::io::stderr().lock(), "herdr-ade: {reason}")?;
+        }
+        if let Some(next) = &state.next {
+            writeln!(
+                std::io::stderr().lock(),
+                "{}",
+                crate::refusal::next_line(next)
+            )?;
         }
         state.active = false;
         Ok(())

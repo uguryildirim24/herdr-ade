@@ -194,7 +194,7 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
 pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<String> {
     crate::prompt::resolve_request(project, basis)
         .map(|request| request.qualified_basis())
-        .map_err(|error| crate::refusal::error(error.to_string()))
+        .map_err(|error| crate::refusal::error(error.to_string(), format!("ha thread start {} --job <job> --task-file <file> --recipe <recipe> --basis \"<quote from Rolf's request>\"", project.slug)))
 }
 
 /// Validate and record Rolf's one-off recipe choice before a lane is created.
@@ -212,11 +212,13 @@ pub fn authorize_explicit_recipe(
     if quote.is_empty() {
         return Err(crate::refusal::error(
             "recipe_basis_missing: --recipe requires --basis with Rolf's exact words",
+            "ha thread start <project> --job <job> --task-file <file> --recipe <recipe> --basis \"<Rolf quote>\"",
         ));
     }
     if task_id.is_empty() {
         return Err(crate::refusal::error(
             "recipe_task_missing: --recipe requires --job or a task created with --request",
+            "ha thread start <project> --job <job> --task-file <file> --recipe <recipe> --basis \"<Rolf quote>\"",
         ));
     }
     let task = crate::task::load(project, task_id)?;
@@ -225,9 +227,10 @@ pub fn authorize_explicit_recipe(
         .iter()
         .filter_map(|authority| crate::prompt::resolve_request(project, authority).ok())
         .find(|request| request.text.contains(quote))
-        .with_context(
-            || "recipe_authority: --basis must quote Rolf's words from a request on this task",
-        )?;
+        .ok_or_else(|| crate::refusal::error(
+            "recipe_authority: --basis must quote Rolf's words from a request on this task",
+            format!("ha thread start {} --request <id> --acceptance \"<condition>\" --task-file <file> --recipe {recipe_id} --basis \"<Rolf quote>\" (wait for a new request from Rolf that names this recipe)", project.slug),
+        ))?;
     let config = parse_launch_config(&ctx.config_dir)?;
     validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
     let recipe = config
@@ -235,13 +238,27 @@ pub fn authorize_explicit_recipe(
         .get(recipe_id)
         .with_context(|| format!("routing_recipe_unknown: {recipe_id}"))?;
     if !recipe.enabled {
-        bail!("routing_recipe_disabled: {recipe_id}");
+        return Err(crate::refusal::error(
+            format!("routing_recipe_disabled: {recipe_id}"),
+            format!(
+                "ha thread start {} --job {task_id} --task-file <file>",
+                project.slug
+            ),
+        ));
     }
     let work = work_contract(task_text, workflow)?;
     if let Some(capability) = &work.capability
         && !recipe.capabilities.contains(capability)
     {
-        bail!("routing_capability_missing: recipe `{recipe_id}` does not declare `{capability}`");
+        return Err(crate::refusal::error(
+            format!(
+                "routing_capability_missing: recipe `{recipe_id}` does not declare `{capability}`"
+            ),
+            format!(
+                "ha thread start {} --job {task_id} --task-file <file>",
+                project.slug
+            ),
+        ));
     }
     Ok(request.basis())
 }
@@ -327,16 +344,20 @@ pub fn resolve_failure(
     match class {
         FailureClass::Unknown => Err(crate::refusal::error(
             "recovery_unknown: waiting for the coordinator",
+            "wait for the coordinator to classify the failure; a classified failure event clears this refusal",
         )),
         FailureClass::WorkFailed if previous.routing_rule == "explicit" => {
             let config = parse_launch_config(&ctx.config_dir)?;
             validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
             let recovery = previous.work_retries.saturating_add(1);
             if recovery > config.routing.retries {
-                return Err(crate::refusal::error(format!(
-                    "recovery_exhausted: Rolf's one-off recipe allowed {} retries; waiting for the coordinator",
-                    config.routing.retries
-                )));
+                return Err(crate::refusal::error(
+                    format!(
+                        "recovery_exhausted: Rolf's one-off recipe allowed {} retries; waiting for the coordinator",
+                        config.routing.retries
+                    ),
+                    "wait for the coordinator to choose a different recipe or cancel the lane",
+                ));
             }
             let mut same = previous.clone();
             same.work_retries = recovery;
@@ -382,10 +403,13 @@ fn same_recipe_retry(
     let recovery = previous.same_recipe_retries.saturating_add(1);
     let retries = config.routing.retry_limit(&work);
     if automatic && recovery > retries {
-        return Err(crate::refusal::error(format!(
-            "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
-            class.plain()
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
+                class.plain()
+            ),
+            "wait for the coordinator to choose a different recipe or cancel the lane",
+        ));
     }
     let mut same = previous.clone();
     same.same_recipe_retries = recovery;
@@ -400,7 +424,13 @@ fn same_recipe_retry(
 
 fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
     if input.task.trim().is_empty() {
-        bail!("dispatch_brief_missing: supply the full task file");
+        return Err(crate::refusal::error(
+            "dispatch_brief_missing: supply the full task file",
+            format!(
+                "ha thread start {} --job <job> --task-file <complete-task-file>",
+                project.slug
+            ),
+        ));
     }
     let config = parse_launch_config(&ctx.config_dir)?;
     validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
@@ -479,10 +509,22 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         );
     }
     if !recipe.enabled {
-        bail!("routing_recipe_disabled: {}", selected.recipe);
+        return Err(crate::refusal::error(
+            format!("routing_recipe_disabled: {}", selected.recipe),
+            format!(
+                "ha thread start {} --job <job> --task-file <file>",
+                project.slug
+            ),
+        ));
     }
     if parse_launch_config(&ctx.config_dir)?.policy_hash != config.policy_hash {
-        bail!("dispatch_policy_changed: config changed during selection; dispatch again");
+        return Err(crate::refusal::error(
+            "dispatch_policy_changed: config changed during selection; dispatch again",
+            format!(
+                "ha thread start {} --job <job> --task-file <file>",
+                project.slug
+            ),
+        ));
     }
     dispatch(
         project,

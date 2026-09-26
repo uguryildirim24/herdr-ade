@@ -128,9 +128,10 @@ fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -
     }
     match refs(runner, repo, None)?.get(branch) {
         None => Ok(()),
-        Some(actual) if actual != expected => Err(crate::refusal::error(format!(
-            "branch {branch} moved; not removing it"
-        ))),
+        Some(actual) if actual != expected => Err(crate::refusal::error(
+            format!("branch {branch} moved; not removing it"),
+            "ha thread show <project> <thread> (verify the branch head before cleanup)",
+        )),
         _ => {
             bail!(
                 "git update-ref -d {name} {expected} in {repo}: {}",
@@ -152,10 +153,13 @@ fn delete_remote(
         return Ok(());
     }
     if current.get(branch).map(String::as_str) != Some(expected) {
-        return Err(crate::refusal::error(format!(
-            "published branch {branch} moved from {expected} to {}; not removing it",
-            current[branch]
-        )));
+        return Err(crate::refusal::error(
+            format!(
+                "published branch {branch} moved from {expected} to {}; not removing it",
+                current[branch]
+            ),
+            "ha thread show <project> <thread> (verify the branch head before cleanup)",
+        ));
     }
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
     let deletion = format!(":refs/heads/{branch}");
@@ -165,9 +169,10 @@ fn delete_remote(
     }
     match refs(runner, repo, Some(url))?.get(branch) {
         None => Ok(()),
-        Some(actual) if actual != expected => Err(crate::refusal::error(format!(
-            "published branch {branch} moved from {expected} to {actual}; not removing it"
-        ))),
+        Some(actual) if actual != expected => Err(crate::refusal::error(
+            format!("published branch {branch} moved from {expected} to {actual}; not removing it"),
+            "ha thread show <project> <thread> (verify the branch head before cleanup)",
+        )),
         _ => {
             bail!(
                 "git push {lease} {url} {deletion} in {repo}: {}",
