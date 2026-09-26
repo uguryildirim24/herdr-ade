@@ -106,6 +106,207 @@ fn seal_verdict(
         &report,
     );
 }
+#[test]
+fn idle_unchanged_follow_up_restores_reviewer_seal_and_verdict_in_same_pass() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let reviewer = review.reviewer.as_deref().unwrap();
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "REJECT",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    let sealed_event =
+        crate::events::latest_done_event(&crate::events::list(&fx.project), reviewer, 1)
+            .unwrap()
+            .clone();
+    let checkout = thread::load(&fx.project, reviewer).unwrap().worktree_path;
+    let report = thread::artifact(
+        &fx.project,
+        &sealed_event.payload.done.as_ref().unwrap().artifact,
+    )
+    .unwrap();
+    let path = Path::new(&checkout).join(&sealed_event.payload.done.as_ref().unwrap().report_path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, report).unwrap();
+    std::fs::write(
+        fx.repo.join(".git/info/exclude"),
+        ".worktrees/\n.herdr-project/\n.reports/\n",
+    )
+    .unwrap();
+    thread::update(&fx.project, reviewer, |lane| {
+        lane.review_after = sealed_event.id.clone();
+        lane.follow_ups.push(thread::FollowUp {
+            attempt: 1,
+            state: thread::FollowUpState::Delivered,
+            after_seal: sealed_event.id.clone(),
+            delivered_at: "2026-09-18T00:00:00Z".into(),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    assert!(
+        sealed(
+            &crate::events::list(&fx.project),
+            &thread::load(&fx.project, reviewer).unwrap()
+        )
+        .is_none()
+    );
+    crate::ticker::restore_unchanged_seal(
+        &fx.world.ctx(),
+        &fx.project,
+        &thread::load(&fx.project, reviewer).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        sealed(
+            &crate::events::list(&fx.project),
+            &thread::load(&fx.project, reviewer).unwrap()
+        )
+        .is_some()
+    );
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    let advanced = load(&fx.project, &review.id).unwrap();
+    assert_eq!(advanced.verdict_event, sealed_event.id);
+    assert_eq!(advanced.verdict.unwrap().verdict, "REJECT");
+}
+
+#[test]
+fn box_follow_up_restores_only_after_box_checkout_and_report_match() {
+    let fx = configured();
+    let (id, sha) = lane(&fx, 1);
+    let event_id = fx.seal_done(&id, 1, 1, &sha, "report\n");
+    let event = crate::events::latest_done_event(&crate::events::list(&fx.project), &id, 1)
+        .unwrap()
+        .clone();
+    thread::update(&fx.project, &id, |lane| {
+        lane.machine = "box".into();
+        lane.machine_id = "box".into();
+        lane.review_after = event_id.clone();
+        lane.follow_ups.push(thread::FollowUp {
+            attempt: 1,
+            state: thread::FollowUpState::Delivered,
+            after_seal: event_id.clone(),
+            delivered_at: "2026-09-18T00:00:00Z".into(),
+            ..Default::default()
+        });
+    })
+    .unwrap();
+    fx.world
+        .runner
+        .on("machine list --json", crate::runner::fake::ok("[]"));
+    fx.world.runner.on(
+        "ssh",
+        crate::runner::fake::ok(&format!(
+            "{sha}\n{}  report.md\n",
+            event.payload.done.unwrap().artifact
+        )),
+    );
+    crate::ticker::restore_unchanged_seal(
+        &fx.world.ctx(),
+        &fx.project,
+        &thread::load(&fx.project, &id).unwrap(),
+    )
+    .unwrap();
+    let restored = thread::load(&fx.project, &id).unwrap();
+    assert!(restored.review_after.is_empty());
+    assert_eq!(restored.follow_ups[0].state, thread::FollowUpState::Closed);
+}
+
+#[test]
+fn committed_follow_up_keeps_old_reviewer_seal_void() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let reviewer = review.reviewer.as_deref().unwrap();
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "REJECT",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    let sealed_event =
+        crate::events::latest_done_event(&crate::events::list(&fx.project), reviewer, 1)
+            .unwrap()
+            .clone();
+    let checkout = thread::load(&fx.project, reviewer).unwrap().worktree_path;
+    let report = thread::artifact(
+        &fx.project,
+        &sealed_event.payload.done.as_ref().unwrap().artifact,
+    )
+    .unwrap();
+    let path = Path::new(&checkout).join(&sealed_event.payload.done.as_ref().unwrap().report_path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, report).unwrap();
+    std::fs::write(
+        fx.repo.join(".git/info/exclude"),
+        ".worktrees/\n.herdr-project/\n.reports/\n",
+    )
+    .unwrap();
+    thread::update(&fx.project, reviewer, |lane| {
+        lane.review_after = sealed_event.id.clone();
+        lane.follow_ups.push(thread::FollowUp {
+            attempt: 1,
+            state: thread::FollowUpState::Delivered,
+            after_seal: sealed_event.id.clone(),
+            delivered_at: "2026-09-18T00:00:00Z".into(),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    std::fs::write(&path, "changed report").unwrap();
+    crate::ticker::restore_unchanged_seal(
+        &fx.world.ctx(),
+        &fx.project,
+        &thread::load(&fx.project, reviewer).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        thread::load(&fx.project, reviewer).unwrap().review_after,
+        sealed_event.id
+    );
+    std::fs::write(
+        &path,
+        thread::artifact(
+            &fx.project,
+            &sealed_event.payload.done.as_ref().unwrap().artifact,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    commit_file(
+        Path::new(&checkout),
+        "new.txt",
+        "change",
+        "follow-up changed HEAD",
+    );
+    crate::ticker::restore_unchanged_seal(
+        &fx.world.ctx(),
+        &fx.project,
+        &thread::load(&fx.project, reviewer).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        sealed(
+            &crate::events::list(&fx.project),
+            &thread::load(&fx.project, reviewer).unwrap()
+        )
+        .is_none()
+    );
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert!(load(&fx.project, &review.id).unwrap().verdict.is_none());
+}
+
 fn job(fx: &Fx, id: &str) -> crate::task::Task {
     let task = crate::task::Task {
         id: "job-0001".into(),
