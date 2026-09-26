@@ -65,7 +65,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder with its one current page. |
 | `list [--all]` | Projects with status and thread counts by group. |
 | `open <project> [--recipe ID --basis request:<id>] [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. A basis may name another project's request as `request:<project>/<id>`. The binding keeps the chosen recipe and basis when its process relaunches. |
-| `context <project> [--peek]` | The `PROJECT.md` body followed by new messages from Rolf, unhandled inbox items, current failures, work needing action and the compact recipe list. `--peek` records nothing. |
+| `context <project> [--peek]` | The `PROJECT.md` body followed by new messages from Rolf, unhandled inbox items, work needing action and the compact recipe list. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
 | `task add`, `task show`, `task list`, `task drop` | Stable intent and acceptance conditions. State comes from the lane seal and pile review: open, working, finished, merged, installed. A no-change seal finishes immediately. `task drop --acceptance N --reason` withdraws a replaced condition. |
 | `note add <project> <text> --kind memory\|instruction --request <id> [--task <job>] [--replaces <id>]` | The only fact and instruction writer. It may scope the row to a task or explicitly replace an older row. |
@@ -156,7 +156,7 @@ recipe = "claude_fable_xhigh"
 
 A rule may override the global recovery policy with `retries = N`. `ha failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
 
-Each launch record and dispatch-ledger row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. An explicit row also carries `recipe_basis` and `recipe_request`. Historical launch and dispatch records without those fields still load.
+Each launch record and dispatch journal row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. An explicit row also carries `recipe_basis` and `recipe_request`. Historical launch and dispatch records without those fields still load.
 
 ## The allow-list for your coordinator
 

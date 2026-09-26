@@ -106,7 +106,6 @@ impl<'a> Herdr<'a> {
     /// the socket this project recorded.
     pub(crate) fn cmd(&self, timeout: Duration) -> Cmd {
         let cmd = Cmd::new(&self.bin, timeout)
-            .exit_meaning(crate::runner::ExitMeaning::Structured)
             .env("HERDR_SOCKET_PATH", self.socket.to_string_lossy())
             .env_remove("HERDR_SESSION");
         match &self.machine {

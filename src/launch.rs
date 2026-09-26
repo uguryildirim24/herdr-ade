@@ -296,14 +296,14 @@ pub struct ResolveInput<'a> {
     pub previous: Option<&'a Launch>,
     pub failure: Option<&'a str>,
     /// Evidence omitted by an upstream task builder, already disclosed in the
-    /// brief; copied into the launch record and dispatch ledger.
+    /// brief; copied into the launch record and dispatch journal.
     pub source_truncation: Option<&'a Value>,
 }
 
 pub fn resolve_launch(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch> {
     let result = resolve(ctx, project, input);
     if let Err(error) = &result {
-        ledger(
+        dispatch(
             project,
             json!({"kind":"dispatch-refused", "brief_hash":crate::thread::sha256_hex(input.task.as_bytes()),
             "failure":input.failure, "source_truncation":input.source_truncation,
@@ -340,7 +340,7 @@ pub fn resolve_failure(
             }
             let mut same = previous.clone();
             same.work_retries = recovery;
-            ledger(
+            dispatch(
                 project,
                 json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
                     "explicit_retry":recovery, "failure":input.failure,
@@ -372,7 +372,7 @@ fn same_recipe_retry(
     project: &Project,
     input: &ResolveInput<'_>,
     class: crate::contracts::FailureClass,
-    ledger_kind: &str,
+    dispatch_kind: &str,
     automatic: bool,
 ) -> Result<Launch> {
     let previous = input.previous.context("recovery_previous_missing")?;
@@ -389,9 +389,9 @@ fn same_recipe_retry(
     }
     let mut same = previous.clone();
     same.same_recipe_retries = recovery;
-    ledger(
+    dispatch(
         project,
-        json!({"kind":ledger_kind, "class":class, "recipe":same.recipe_id,
+        json!({"kind":dispatch_kind, "class":class, "recipe":same.recipe_id,
             "same_recipe_retry":recovery, "failure":input.failure,
             "policy_hash":config.policy_hash}),
     )?;
@@ -484,7 +484,7 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     if parse_launch_config(&ctx.config_dir)?.policy_hash != config.policy_hash {
         bail!("dispatch_policy_changed: config changed during selection; dispatch again");
     }
-    ledger(
+    dispatch(
         project,
         json!({"kind": if recovery > 0 { "recovery" } else { "pick" },
         "brief_hash": hash, "recipe": selected.recipe, "rule": selected.rule,
@@ -529,8 +529,8 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     })
 }
 
-/// Append-only dispatch ledger. No network call is made while holding its lock.
-pub fn ledger(project: &Project, mut row: Value) -> Result<()> {
+/// Append-only dispatch journal. No network call is made while holding its lock.
+pub fn dispatch(project: &Project, mut row: Value) -> Result<()> {
     let _lock = project.lock()?;
     row["at"] = json!(project::now());
     std::fs::create_dir_all(project.state_dir())?;

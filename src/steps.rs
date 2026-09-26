@@ -723,22 +723,11 @@ pub(crate) fn courier_lookup_failed(error: &anyhow::Error) -> bool {
 /// on it (SPEC-remote §4.3): one multiplexed helper call, the helper reads the
 /// box's own live lists, then one batched `scp` per project over that same
 /// connection, hash checks, receipt checks, and a create-only import into the
-/// Mac's canonical ledger. The box keeps its copies; only the taken cursor
+/// Mac's canonical event records. The box keeps its copies; only the taken cursor
 /// advances, and only after the import is durable. Returns the box's live
 /// facts, so the caller can key lane state and push GONE after a reboot.
 pub(crate) fn courier(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
-    let _scope = crate::ledger::Scope::new(projects);
-    let result = courier_inner(ctx, projects, machine);
-    if let Err(error) = &result {
-        for project in projects {
-            crate::ledger::observe(project, "courier-failed", machine, &format!("{error:#}"));
-        }
-    } else {
-        for project in projects {
-            crate::ledger::recovered(project, "courier-failed", machine);
-        }
-    }
-    result
+    courier_inner(ctx, projects, machine)
 }
 
 fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<CourierOutcome> {
@@ -1057,7 +1046,6 @@ pub(crate) fn remote_attention(
 /// Types one line into the coordinator through the same serialized writer D5
 /// uses (SPEC-remote §4.3). Returns whether it was typed.
 pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Result<bool> {
-    let _scope = crate::ledger::Scope::new(&[project]);
     let Some(record) = project.coordinator() else {
         return Ok(false);
     };
@@ -1990,11 +1978,6 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
         let ctx = courier_ctx(root.path(), &env, &runner);
         let error = courier(&ctx, &[&alpha], "box").unwrap_err().to_string();
         assert!(error.contains("receipt_mismatch"), "{error}");
-        let failures = crate::ledger::list(&alpha).unwrap();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].kind, "courier-failed");
-        assert_eq!(failures[0].subject, "box");
-        assert!(failures[0].detail.contains("receipt_mismatch"));
         assert!(events::list(&alpha).is_empty());
         assert!(
             events::remote_state(&alpha, "1").taken.is_empty(),
@@ -2054,13 +2037,11 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
             "git -C /repo merge-base --is-ancestor",
             crate::runner::fake::fail(1, ""),
         );
-        let _scope = crate::ledger::Scope::new(&[&project]);
-        let runner = crate::ledger::RecordingRunner(&sha_absent);
+        let runner = sha_absent;
         let ctx = courier_ctx(root.path(), &env, &runner);
         let error = verify_published_sha(&ctx, &project, &lane, "abc")
             .unwrap_err()
             .to_string();
         assert!(error.contains("published_sha_missing"), "{error}");
-        assert!(crate::ledger::list(&project).unwrap().is_empty());
     }
 }

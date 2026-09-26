@@ -478,7 +478,7 @@ pub(crate) fn seal(
     let event = event_from_op(&op)?;
     events::seal_create_if_absent(project, &event)?;
     // The receipt records the bytes this sealer hashed (D5); the courier
-    // carries it to the Mac ledger.
+    // carries it to the Mac event records.
     events::write_receipt(project, &event)?;
     op.state = OpState::Sealed;
     op.revision = 3;

@@ -1735,7 +1735,7 @@ pub(crate) fn socket_inode(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map_or(0, |meta| meta.ino())
 }
 
-fn coordinator_retry_due(project: &Project, record: &crate::project::Coordinator) -> Result<bool> {
+fn coordinator_retry_due(project: &Project) -> Result<bool> {
     let mut state = steps::load_state(project);
     if !state.coordinator_relaunch_last.is_empty()
         && thread::seconds_since(&state.coordinator_relaunch_last, jiff::Timestamp::now()) < 3600
@@ -1744,7 +1744,6 @@ fn coordinator_retry_due(project: &Project, record: &crate::project::Coordinator
     }
     state.coordinator_relaunch_last = project::now();
     steps::save_state(project, &state)?;
-    crate::ledger::coordinator_relaunch(project, &record.pane_id)?;
     Ok(true)
 }
 
@@ -1753,7 +1752,7 @@ fn relaunch_missing_coordinator(
     project: &Project,
     record: &crate::project::Coordinator,
 ) -> Result<()> {
-    if !coordinator_retry_due(project, record)? {
+    if !coordinator_retry_due(project)? {
         return Ok(());
     }
     coordinator::open(
@@ -1777,7 +1776,7 @@ fn restart_coordinator_agent(
     herdr: &Herdr,
     record: &crate::project::Coordinator,
 ) -> Result<()> {
-    if !coordinator_retry_due(project, record)? {
+    if !coordinator_retry_due(project)? {
         return Ok(());
     }
     project.update_coordinator(|c| {
@@ -1801,7 +1800,6 @@ fn restart_coordinator_agent(
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Option<Seen>> {
-    let _scope = crate::ledger::Scope::new(&[project]);
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -1942,12 +1940,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
                 Ok(())
             };
             if let Err(error) = result {
-                crate::ledger::observe(
-                    project,
-                    "coordinator-relaunch",
-                    slug,
-                    &format!("{error:#}"),
-                );
+                first_error = first_error.or(Some(error.context("coordinator relaunch")));
             }
         }
     }
@@ -2146,7 +2139,6 @@ fn tick_slow_with_steps(
     memory: &mut Memory,
     step: &mut impl FnMut(&str) -> bool,
 ) -> (Vec<anyhow::Error>, bool) {
-    let _scope = crate::ledger::Scope::new(&[project]);
     let mut errors = Vec::new();
     if !step("recovery") {
         return (errors, false);
@@ -2747,7 +2739,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_block_keeps_the_screen_in_the_record_and_failure_list() {
+    fn startup_block_keeps_the_screen_and_failure_class_on_the_thread() {
         let fixture = fixture(false);
         let runner = FakeRunner::new();
         runner.on(
@@ -2811,7 +2803,6 @@ mod tests {
         assert!(saved.prompt_pending);
         assert!(!saved.startup_wait_started.is_empty());
         assert!(errors.is_empty());
-        assert!(crate::ledger::list(&fixture.project).unwrap().is_empty());
         for _ in 0..2 {
             let blocked = Agent {
                 pane_id: record.pane_id.clone(),
@@ -2841,7 +2832,6 @@ mod tests {
                 thread::load(&fixture.project, &record.id).unwrap().status,
                 thread::Status::Starting
             );
-            assert!(crate::ledger::list(&fixture.project).unwrap().is_empty());
         }
         thread::update(&fixture.project, &record.id, |t| {
             t.startup_wait_started = "2020-01-01T00:00:00Z".into()
@@ -2879,14 +2869,7 @@ mod tests {
             "{}",
             saved.error
         );
-        let failures = crate::ledger::list(&fixture.project).unwrap();
-        assert!(
-            failures
-                .iter()
-                .any(|e| e.kind == "thread-error" && e.detail.contains("Trust this folder?")),
-            "{failures:?}"
-        );
-        assert!(!failures.iter().any(|e| e.kind == "launch-not-attempted"));
+        assert_eq!(saved.failure_class, crate::contracts::FailureClass::Unknown);
         assert!(errors.is_empty());
         assert_eq!(runner.count("agent start"), 1);
         assert_eq!(runner.count("agent prompt"), 1);
@@ -2975,7 +2958,6 @@ mod tests {
                 }
             );
             assert_eq!(saved.last_group, "working");
-            assert!(crate::ledger::list(&fixture.project).unwrap().is_empty());
         }
         let saved = thread::load(&fixture.project, &record.id).unwrap();
         assert!(!saved.prompt_pending);
@@ -4315,8 +4297,6 @@ mod tests {
             steps::load_state(&f.project).coordinator_relaunch_last,
             last
         );
-        let ledger = std::fs::read_to_string(f.project.record_file("ledger.jsonl")).unwrap();
-        assert_eq!(ledger.matches("coordinator_relaunch").count(), 1);
         assert_eq!(
             f.project.coordinator().unwrap().launch.recipe_id,
             "recorded-recipe"

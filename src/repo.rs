@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::runner::{Cmd, ExitMeaning, Output, Runner};
+use crate::runner::{Cmd, Output, Runner};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -89,11 +89,9 @@ impl<'a> Git<'a> {
     /// diagnostics is a conflict; other failures are not. The first
     /// output line on success is the tree object id.
     pub fn merge_tree(&self, into: &str, other: &str) -> Result<String> {
-        let out = self.runner.run(
-            &self
-                .cmd_in(&self.repo, &["merge-tree", "--write-tree", into, other])
-                .exit_meaning(ExitMeaning::MergeTree),
-        )?;
+        let out = self
+            .runner
+            .run(&self.cmd_in(&self.repo, &["merge-tree", "--write-tree", into, other]))?;
         if out.merge_tree_conflict() {
             return Err(crate::refusal::error(format!(
                 "merge_conflict: {other} does not merge cleanly into {into}"

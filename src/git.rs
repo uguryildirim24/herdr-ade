@@ -25,8 +25,6 @@ pub(crate) struct RepoLock {
 fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
     let out = runner.run(
         &Cmd::new("git", timeout)
-            // These calls return answers in stdout, never in failure status.
-            .exit_meaning(crate::runner::ExitMeaning::Required)
             .args(["-C", repo])
             .args(args.iter().copied()),
     )?;
@@ -230,25 +228,21 @@ pub(crate) fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<St
 
 /// A typed ancestry answer: 0 is yes, 1 with empty stderr is no; other exits,
 /// diagnostics on a negative result, signals, timeouts and spawn errors fail.
-/// The runner uses the same contract so a normal no never enters the ledger.
+/// A normal no is a result, not an error.
 pub(crate) fn is_ancestor(
     runner: &dyn Runner,
     repo: &str,
     ancestor: &str,
     descendant: &str,
 ) -> Result<bool> {
-    let out = runner.run(
-        &Cmd::new("git", GIT_TIMEOUT)
-            .args([
-                "-C",
-                repo,
-                "merge-base",
-                "--is-ancestor",
-                ancestor,
-                descendant,
-            ])
-            .exit_meaning(crate::runner::ExitMeaning::Boolean),
-    )?;
+    let out = runner.run(&Cmd::new("git", GIT_TIMEOUT).args([
+        "-C",
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        ancestor,
+        descendant,
+    ]))?;
     out.boolean_answer().with_context(|| {
         format!(
             "`git merge-base --is-ancestor {ancestor} {descendant}` failed: exit={:?}, {}",
@@ -332,25 +326,15 @@ mod tests {
             },
             Output::default(), // signal
         ] {
-            let root = tempfile::tempdir().unwrap();
-            let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
-            let _scope = crate::ledger::Scope::new(&[&project]);
             let fake = FakeRunner::new();
             fake.on("merge-base --is-ancestor", output);
-            let runner = crate::ledger::RecordingRunner(&fake);
+            let runner = fake;
             assert!(is_ancestor(&runner, "/repo", "a", "b").is_err());
-            let rows = crate::ledger::list(&project).unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].kind, "command-failed");
         }
 
-        let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
-        let _scope = crate::ledger::Scope::new(&[&project]);
         let fake = FakeRunner::new();
         fake.on_fn(|_| true, |_| Err(anyhow::anyhow!("could not spawn git")));
-        assert!(is_ancestor(&crate::ledger::RecordingRunner(&fake), "/repo", "a", "b").is_err());
-        assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
+        assert!(is_ancestor(&fake, "/repo", "a", "b").is_err());
     }
 
     #[test]
@@ -380,9 +364,7 @@ mod tests {
     fn absent_branch_is_an_answer_but_a_broken_repository_is_not() {
         let (_dir, repo) = repo_with_commit();
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
-        let _scope = crate::ledger::Scope::new(&[&project]);
-        let runner = crate::ledger::RecordingRunner(&RealRunner);
+        let runner = RealRunner;
         let repo_s = repo.to_string_lossy();
         assert!(
             branch_head(&runner, &repo_s, "cloud-only")
@@ -409,9 +391,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(crate::ledger::list(&project).unwrap().is_empty());
         assert!(branch_head(&runner, &root.path().to_string_lossy(), "main").is_err());
-        assert_eq!(crate::ledger::list(&project).unwrap().len(), 1);
     }
 
     fn repo_with_commit() -> (tempfile::TempDir, PathBuf) {

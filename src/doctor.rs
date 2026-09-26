@@ -1569,7 +1569,7 @@ fn finished_worktrees_impl(
     // Check existence on the box before any completion probe. A merged
     // review can retain a resolved member long after its checkout is removed.
     // The shell always exits zero after printing each yes/no answer, so a
-    // healthy "gone" result cannot enter the command-failure ledger and a
+    // healthy "gone" result is not a failed command, and a
     // transport failure remains distinguishable from a negative answer.
     let remote_exists = remote.map(|profile| {
         if let Some(snapshot) = snapshot {
@@ -3328,7 +3328,7 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn resolved_box_worktree_absence_is_one_check_and_no_ledger_failure() {
+    fn resolved_box_worktree_absence_is_one_check() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         let root = home.path().join("root");
@@ -3354,15 +3354,13 @@ recipe = "claude_fable_xhigh"
                 format!("worktree_{key}\t0\n")
             })
             .collect::<String>();
-        let recording = crate::ledger::RecordingRunner(&fake);
         let ctx = Ctx {
             env: &env,
             root,
             config_dir: home.path().join("cfg"),
-            runner: &recording,
+            runner: &fake,
             detached_ticker: false,
         };
-        let _scope = crate::ledger::Scope::new(&[&project]);
 
         let profile = crate::contracts::MachineProfile {
             id: "box-1".into(),
@@ -3377,8 +3375,6 @@ recipe = "claude_fable_xhigh"
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(fake.count("ssh"), 0);
         assert!(fake.calls.borrow().iter().all(|call| call.program != "git"));
-        assert!(crate::ledger::list(&project).unwrap().is_empty());
-        assert!(!project.state_dir().join("ledger.jsonl").exists());
     }
 
     #[test]

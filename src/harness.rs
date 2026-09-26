@@ -895,18 +895,14 @@ struct InstalledBuild {
 }
 
 fn review_in_build(ctx: &Ctx, repo: &str, review_head: &str, build_head: &str) -> Result<bool> {
-    let out = ctx.runner.run(
-        &Cmd::new("git", VERSION_TIMEOUT)
-            .args([
-                "-C",
-                repo,
-                "merge-base",
-                "--is-ancestor",
-                review_head,
-                build_head,
-            ])
-            .exit_meaning(crate::runner::ExitMeaning::Boolean),
-    )?;
+    let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
+        "-C",
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        review_head,
+        build_head,
+    ]))?;
     out.boolean_answer().context("git ancestry check failed")
 }
 
