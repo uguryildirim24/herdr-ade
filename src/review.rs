@@ -441,7 +441,14 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
                 &profile.label,
                 &lane.repo,
             )?;
-            git.run(&["fetch", &url, &format!("refs/heads/{}", lane.branch)])?;
+            git.run(&[
+                "fetch",
+                &url,
+                &format!(
+                    "refs/heads/{}",
+                    done.published_ref.as_deref().unwrap_or(&lane.branch)
+                ),
+            ])?;
             let fetched = git.run(&["rev-parse", "FETCH_HEAD"])?;
             if fetched != done.sha {
                 bail!("published lane {} moved since its seal", lane.id);
@@ -841,7 +848,15 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 &profile.label,
                 &review.repo,
             )?;
-            git.run(&["fetch", &url, &format!("refs/heads/{}", reviewer.branch)])?;
+            let done = event.payload.done.as_ref().expect("seal");
+            git.run(&[
+                "fetch",
+                &url,
+                &format!(
+                    "refs/heads/{}",
+                    done.published_ref.as_deref().unwrap_or(&reviewer.branch)
+                ),
+            ])?;
             if git.run(&["rev-parse", "FETCH_HEAD"])?
                 != event.payload.done.as_ref().expect("seal").sha
             {

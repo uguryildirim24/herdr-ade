@@ -200,6 +200,7 @@ fn record_stored_report(project: &Project, thread_id: &str) {
                     report_path: format!(".reports/{thread_id}.md"),
                     artifact,
                     attestation: None,
+                    published_ref: None,
                 }),
                 ..EventPayload::default()
             },
@@ -1237,6 +1238,7 @@ fn linked_files_over_cap_are_kept_but_missing_files_are_recorded_and_removed() {
                         report_path: lane.report_path(),
                         artifact: hash,
                         attestation: None,
+                        published_ref: None,
                     }),
                     ..EventPayload::default()
                 },
@@ -1298,6 +1300,7 @@ fn copy_overrides_do_not_discard_unsealed_or_unavailable_linked_reports() {
                             report_path: lane.report_path(),
                             artifact: hash.clone(),
                             attestation: None,
+                            published_ref: None,
                         }),
                         ..EventPayload::default()
                     },
@@ -1368,6 +1371,7 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
                 report_path: lane.report_path(),
                 artifact: artifact.clone(),
                 attestation: None,
+                published_ref: None,
             }),
             ..EventPayload::default()
         },
