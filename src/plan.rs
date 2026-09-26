@@ -584,7 +584,7 @@ pub(crate) fn project_states_with_evidence(
         }
         let mut state = derive_state(project, step, evidence);
         if !step.subtasks.is_empty() {
-            state = with_subtasks(project, step, state, evidence);
+            state = with_subtasks(project, step, state);
         }
         if step.state != state {
             step.state = state;
@@ -597,14 +597,9 @@ pub(crate) fn project_states_with_evidence(
 /// A step with subtasks, on top of its own leaf state `own`: done when every
 /// subtask is done and its own linked work (if any) is done too; running when
 /// any subtask or its own work is running or done; else left.
-fn with_subtasks(
-    project: &Project,
-    step: &PlanStep,
-    own: StepState,
-    evidence: &crate::task::EvidenceSnapshot,
-) -> StepState {
+fn with_subtasks(project: &Project, step: &PlanStep, own: StepState) -> StepState {
     let children = step.subtasks.iter().map(|s| s.state);
-    let own_blocks = own != StepState::Done && has_own_work(project, step, evidence);
+    let own_blocks = own != StepState::Done && has_own_work(project, step);
     if !own_blocks && children.clone().all(|s| s == StepState::Done) {
         StepState::Done
     } else if own != StepState::Left || children.into_iter().any(|s| s != StepState::Left) {
@@ -617,11 +612,7 @@ fn with_subtasks(
 /// Whether the step itself carries work the leaf rule counts: a live linked
 /// task or a thread. Its leaf state reads `left` both without work
 /// and with work not yet started.
-fn has_own_work(
-    project: &Project,
-    step: &PlanStep,
-    _evidence: &crate::task::EvidenceSnapshot,
-) -> bool {
+fn has_own_work(project: &Project, step: &PlanStep) -> bool {
     !step.threads.is_empty()
         || crate::task::list_with_errors(project)
             .0
@@ -1028,7 +1019,7 @@ mod tests {
             let parent = step(states);
             let own = derive_state(&fx.project, &parent, &evidence);
             assert_eq!(
-                with_subtasks(&fx.project, &parent, own, &evidence),
+                with_subtasks(&fx.project, &parent, own),
                 want,
                 "{states:?}"
             );
@@ -1040,10 +1031,10 @@ mod tests {
         parent.tasks = vec!["job-0001".into()];
         let own = derive_state(&fx.project, &parent, &evidence);
         assert_eq!(own, Left);
-        assert_eq!(with_subtasks(&fx.project, &parent, own, &evidence), Running);
+        assert_eq!(with_subtasks(&fx.project, &parent, own), Running);
         let mut parent = step(&[Left]);
         parent.tasks = vec!["job-0001".into()];
-        assert_eq!(with_subtasks(&fx.project, &parent, own, &evidence), Left);
+        assert_eq!(with_subtasks(&fx.project, &parent, own), Left);
     }
 
     #[test]
