@@ -649,8 +649,14 @@ pub(crate) fn sweep_once(ctx: &Ctx) -> Result<()> {
             if active.contains(&(record.repo.clone(), record.branch.clone())) {
                 continue;
             }
-            let cmd = Cmd::new("git", TIMEOUT)
-                .args(["-C", &record.repo, "merge-base", "--is-ancestor", tip, base]);
+            let cmd = Cmd::new("git", TIMEOUT).args([
+                "-C",
+                &record.repo,
+                "merge-base",
+                "--is-ancestor",
+                tip,
+                base,
+            ]);
             let result = ctx.runner.run(&cmd)?;
             if !result.success() {
                 continue;
