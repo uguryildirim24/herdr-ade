@@ -650,15 +650,17 @@ pub(crate) fn sweep_once(ctx: &Ctx) -> Result<()> {
                 continue;
             }
             let cmd = Cmd::new("git", TIMEOUT)
-                .args(["-C", &record.repo, "merge-base", "--is-ancestor", tip, base])
-                .exit_meaning(ExitMeaning::Deferred);
+                .args(["-C", &record.repo, "merge-base", "--is-ancestor", tip, base]);
             let result = ctx.runner.run(&cmd)?;
             if !result.success() {
                 continue;
             }
             let inspection = crate::threads::inspect_worktree_for_removal(ctx, &project, record)?;
             if !inspection.dirty.is_empty() || !inspection.ignored_data.is_empty() {
-                bail!("{}: worktree keeps changes or data; sweep will retry", record.id);
+                bail!(
+                    "{}: worktree keeps changes or data; sweep will retry",
+                    record.id
+                );
             }
             crate::threads::remove_worktree(ctx, &project, record)?;
             resolved_thread(ctx, &project, record)?;
