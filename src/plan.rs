@@ -590,17 +590,20 @@ pub(crate) fn project_states_with_evidence(
     evidence: &crate::task::EvidenceSnapshot,
 ) -> bool {
     let mut changed = false;
+    // Task enumeration parses every record. Reuse one snapshot across the
+    // whole plan rather than repeating it for every step and subtask.
+    let tasks = crate::task::list_with_errors(project).0;
     for step in &mut plan.steps {
         for sub in &mut step.subtasks {
-            let state = derive_state(project, sub, evidence);
+            let state = derive_state_from_tasks(project, sub, evidence, &tasks);
             if sub.state != state {
                 sub.state = state;
                 changed = true;
             }
         }
-        let mut state = derive_state(project, step, evidence);
+        let mut state = derive_state_from_tasks(project, step, evidence, &tasks);
         if !step.subtasks.is_empty() {
-            state = with_subtasks(project, step, state);
+            state = with_subtasks_from_tasks(step, state, &tasks);
         }
         if step.state != state {
             step.state = state;
@@ -613,9 +616,18 @@ pub(crate) fn project_states_with_evidence(
 /// A step with subtasks, on top of its own leaf state `own`: done when every
 /// subtask is done and its own linked work (if any) is done too; running when
 /// any subtask or its own work is running or done; else left.
+#[cfg(test)]
 fn with_subtasks(project: &Project, step: &PlanStep, own: StepState) -> StepState {
+    with_subtasks_from_tasks(step, own, &crate::task::list_with_errors(project).0)
+}
+
+fn with_subtasks_from_tasks(
+    step: &PlanStep,
+    own: StepState,
+    tasks: &[crate::task::Task],
+) -> StepState {
     let children = step.subtasks.iter().map(|s| s.state);
-    let own_blocks = own != StepState::Done && has_own_work(project, step);
+    let own_blocks = own != StepState::Done && has_own_work(step, tasks);
     if !own_blocks && children.clone().all(|s| s == StepState::Done) {
         StepState::Done
     } else if own != StepState::Left || children.into_iter().any(|s| s != StepState::Left) {
@@ -628,33 +640,45 @@ fn with_subtasks(project: &Project, step: &PlanStep, own: StepState) -> StepStat
 /// Whether the step itself carries work the leaf rule counts: a live linked
 /// task or a thread. Its leaf state reads `left` both without work
 /// and with work not yet started.
-fn has_own_work(project: &Project, step: &PlanStep) -> bool {
+fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
     !step.threads.is_empty()
-        || crate::task::list_with_errors(project)
-            .0
-            .into_iter()
-            .any(|task| {
-                task.dropped.is_empty()
-                    && (task.plan_step.as_deref() == Some(step.id.as_str())
-                        || step.tasks.contains(&task.id))
-            })
+        || tasks.iter().any(|task| {
+            task.dropped.is_empty()
+                && (task.plan_step.as_deref() == Some(step.id.as_str())
+                    || step.tasks.contains(&task.id))
+        })
 }
 
 /// Derive each state in the fixed order (SPEC-talk §6.5): `done` when at least
 /// one binding exists and every binding is positively satisfied, else
 /// `running` when any required work has started or partially landed, else
 /// `left`.
+#[cfg(test)]
 fn derive_state(
     project: &Project,
     step: &PlanStep,
     evidence: &crate::task::EvidenceSnapshot,
 ) -> StepState {
-    let linked_tasks: Vec<_> = crate::task::list_with_errors(project)
-        .0
-        .into_iter()
+    derive_state_from_tasks(
+        project,
+        step,
+        evidence,
+        &crate::task::list_with_errors(project).0,
+    )
+}
+
+fn derive_state_from_tasks(
+    project: &Project,
+    step: &PlanStep,
+    evidence: &crate::task::EvidenceSnapshot,
+    tasks: &[crate::task::Task],
+) -> StepState {
+    let linked_tasks: Vec<_> = tasks
+        .iter()
         .filter(|task| {
             task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
         })
+        .cloned()
         .map(|task| crate::task::view_with_evidence(project, task, evidence))
         .filter(|view| view.record.dropped.is_empty())
         .collect();

@@ -107,6 +107,85 @@ fn seal_verdict(
     );
 }
 #[test]
+fn follow_up_after_seal_checks_verdict_now_but_waits_to_land() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let reviewer = review.reviewer.as_deref().unwrap();
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "REJECT",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    let seal = crate::events::latest_done_event(&crate::events::list(&fx.project), reviewer, 1)
+        .unwrap()
+        .id
+        .clone();
+    thread::update(&fx.project, reviewer, |lane| {
+        lane.review_after = seal.clone();
+        lane.follow_ups.push(thread::FollowUp {
+            attempt: 1,
+            state: thread::FollowUpState::Delivered,
+            after_seal: seal.clone(),
+            ..Default::default()
+        });
+    })
+    .unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    let checked = load(&fx.project, &review.id).unwrap();
+    assert_eq!(checked.phase, Phase::Reviewing);
+    assert_eq!(checked.checked_event, seal);
+    assert_eq!(checked.verdict.as_ref().unwrap().verdict, "REJECT");
+    thread::update(&fx.project, reviewer, |lane| {
+        lane.review_after.clear();
+        lane.follow_ups[0].state = thread::FollowUpState::Closed;
+    })
+    .unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_eq!(
+        load(&fx.project, &review.id).unwrap().phase,
+        Phase::Rejected
+    );
+}
+
+#[test]
+fn sealed_reviewer_verdict_is_checked_in_the_arrival_pass_without_a_local_session() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "REJECT",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    // No coordinator socket: the slow project phase cannot run. The review
+    // phase must still consume the seal in this pass, not wait for a later
+    // local session recovery or a second courier poll.
+    fx.project
+        .update_coordinator(|record| record.socket.clear())
+        .unwrap();
+    let ctx = fx.world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+    crate::ticker::tick_for_test(&ctx, &mut memory);
+    let checked = load(&fx.project, &review.id).unwrap();
+    assert_eq!(checked.phase, Phase::Rejected);
+    assert_eq!(
+        checked.verdict_event,
+        format!("{}-1-1", review.reviewer.unwrap())
+    );
+}
+
+#[test]
 fn idle_unchanged_follow_up_restores_reviewer_seal_and_verdict_in_same_pass() {
     let fx = configured();
     lane(&fx, 1);
