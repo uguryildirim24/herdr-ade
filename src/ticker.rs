@@ -658,6 +658,22 @@ fn tick_with_steps(
     for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
         log.line(&format!("{error:#}"));
     }
+    // Courier imports sealed events and their report artifacts together.
+    // Check reviews now, before remote state, launches, or plan work can
+    // delay them. A lost local coordinator socket must not hide a box seal.
+    for slug in project::list_slugs(&ctx.root) {
+        if !step(&format!("reviews {slug}")) {
+            return None;
+        }
+        let Ok(project) = Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        if project.status() == Status::Active
+            && let Err(error) = crate::review::tick(ctx, &project)
+        {
+            log.line(&format!("{slug}: reviews: {error:#}"));
+        }
+    }
     if !step("slow phase") {
         return None;
     }
@@ -2270,7 +2286,7 @@ fn plan_nudge(
         .collect();
     lane_ids.sort();
     let request = crate::prompt::latest_request_id(project);
-    let mut plan = crate::plan::load(project)?;
+    let plan = crate::plan::load(project)?;
     let revision = plan.as_ref().map_or(0, |p| p.revision);
     if state.plan_revision != revision
         || state.plan_lane_ids != lane_ids
@@ -2298,18 +2314,6 @@ fn plan_nudge(
     {
         return Ok(());
     }
-    let Some(ref mut plan) = plan else {
-        return Ok(());
-    };
-    crate::plan::project_states(project, plan);
-    let left: Vec<_> = plan
-        .steps
-        .iter()
-        .filter(|step| step.state != crate::contracts::StepState::Done)
-        .collect();
-    let Some(next) = left.first() else {
-        return Ok(());
-    };
     let Some(coordinator) = project.coordinator() else {
         return Ok(());
     };
@@ -2321,6 +2325,19 @@ fn plan_nudge(
     }) {
         return Ok(());
     }
+    let Some(ref plan) = plan else {
+        return Ok(());
+    };
+    // Transitions refresh the persisted plan. Re-deriving every step just to
+    // decide whether to nudge rereads all task/review evidence each pass.
+    let left: Vec<_> = plan
+        .steps
+        .iter()
+        .filter(|step| step.state != crate::contracts::StepState::Done)
+        .collect();
+    let Some(next) = left.first() else {
+        return Ok(());
+    };
     let line = format!(
         "{} Nothing is running and {} steps are left. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
         steps::TICKER_PROMPT_PREFIX,
@@ -2467,20 +2484,14 @@ fn tick_slow_with_steps(
 
     stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
-    // D5 recovery and delivery (X1 to X5), then reviews, asks and the
-    // asks (D6, D17, D18). Each takes the project lock only for its own
-    // file writes; git and herdr run outside it.
+    // D5 recovery and delivery (X1 to X5), then asks (D6, D17, D18).
+    // Reviews ran immediately after courier import. Each takes the project
+    // lock only for its own file writes.
     stop_after_state!("ops");
     errors.extend(
         crate::ops::tick(ctx, project)
             .err()
             .map(|e| e.context("ops")),
-    );
-    stop_after_state!("reviews");
-    errors.extend(
-        crate::review::tick(ctx, project)
-            .err()
-            .map(|e| e.context("reviews")),
     );
     errors.extend(crate::ask::tick(ctx, project).err());
     errors.extend(crate::threads::park_completed(ctx, project).err());

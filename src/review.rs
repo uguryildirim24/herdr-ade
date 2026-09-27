@@ -868,48 +868,65 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             )?;
             return Ok(());
         }
+        // A follow-up sent after a seal can defer landing, but it must not
+        // defer checking the report. Preserve the checked verdict while the
+        // correction is in flight; a later seal supersedes it, and an empty
+        // correction can release the same seal for landing.
+        let latest =
+            crate::events::latest_done_event(&events, &reviewer.id, reviewer.attempt.max(1));
+        let pending = crate::threads::follow_up_pending_for_seal(&reviewer, latest);
+        if pending {
+            if let Some(event) =
+                latest.filter(|e| e.id != review.reviewer_after && e.id != review.checked_event)
+            {
+                // A local checkout already advanced for the correction has
+                // superseded this report. Wait for its next seal instead.
+                if !reviewer.is_remote()
+                    && !reviewer.worktree_path.is_empty()
+                    && Git::new(ctx.runner, &reviewer.worktree_path)
+                        .run(&["rev-parse", "HEAD"])
+                        .is_ok_and(|head| head != event.payload.done.as_ref().expect("seal").sha)
+                {
+                    return Ok(());
+                }
+                let git = Git::new(ctx.runner, &review.repo);
+                fetch_reviewer(ctx, project, review, &reviewer, event, &git)?;
+                match verdict(project, review, event, &git) {
+                    Ok(checked) => {
+                        review.verdict = Some(checked);
+                        review.checked_event = event.id.clone();
+                        review.attention.clear();
+                        save(project, review)?;
+                    }
+                    Err(error) => {
+                        review.verdict = None;
+                        review.checked_event = event.id.clone();
+                        review.attention = format!("{error:#}");
+                        needs_coordinator(project, review, &review.attention.clone())?;
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(());
+        }
         // Recheck a historical refusal caused by the old exact gate-list check.
         let Some(event) = sealed(&events, &reviewer).filter(|e| {
             e.id != review.reviewer_after
                 && (e.id != review.checked_event
+                    || review.verdict.is_some()
+                        && review.verdict_event.is_empty()
+                        && review.attention.is_empty()
                     || review.attention
                         == "verdict must report each path-selected gate, in order, with exit 0")
         }) else {
             return Ok(());
         };
         let git = Git::new(ctx.runner, &review.repo);
-        if reviewer.is_remote() {
-            let settings = project.read_project_md()?.0;
-            let profile = crate::remote::machine_profile(
-                ctx.runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                reviewer.machine_route(),
-            )?;
-            let (_, url) = crate::threads::box_repo_row(
-                &ctx.config_dir,
-                &settings,
-                &profile.label,
-                &review.repo,
-            )?;
-            let done = event.payload.done.as_ref().expect("seal");
-            git.run(&[
-                "fetch",
-                &url,
-                &format!(
-                    "refs/heads/{}",
-                    done.published_ref.as_deref().unwrap_or(&reviewer.branch)
-                ),
-            ])?;
-            if git.run(&["rev-parse", "FETCH_HEAD"])?
-                != event.payload.done.as_ref().expect("seal").sha
-            {
-                bail!("reviewer publication differs from seal");
-            }
-        }
+        fetch_reviewer(ctx, project, review, &reviewer, event, &git)?;
         let verdict = match verdict(project, review, event, &git) {
             Ok(verdict) => verdict,
             Err(error) => {
+                review.verdict = None;
                 review.checked_event = event.id.clone();
                 review.attention = format!("{error:#}");
                 needs_coordinator(project, review, &review.attention.clone())?;
@@ -960,6 +977,45 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
     }
     land(ctx, project, review)
 }
+fn fetch_reviewer(
+    ctx: &Ctx,
+    project: &Project,
+    review: &Review,
+    reviewer: &Thread,
+    event: &crate::contracts::Event,
+    git: &Git<'_>,
+) -> Result<()> {
+    if !reviewer.is_remote() {
+        return Ok(());
+    }
+    let settings = project.read_project_md()?.0;
+    let profile = crate::remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        reviewer.machine_route(),
+    )?;
+    let (_, url) =
+        crate::threads::box_repo_row(&ctx.config_dir, &settings, &profile.label, &review.repo)?;
+    let done = event
+        .payload
+        .done
+        .as_ref()
+        .context("reviewer has no seal")?;
+    git.run(&[
+        "fetch",
+        &url,
+        &format!(
+            "refs/heads/{}",
+            done.published_ref.as_deref().unwrap_or(&reviewer.branch)
+        ),
+    ])?;
+    if git.run(&["rev-parse", "FETCH_HEAD"])? != done.sha {
+        bail!("reviewer publication differs from seal");
+    }
+    Ok(())
+}
+
 fn remote_contains(git: &Git<'_>, remote: &str, reference: &str, candidate: &str) -> Result<bool> {
     let published = git.run(&["ls-remote", remote, reference])?;
     match published.split_whitespace().next() {
