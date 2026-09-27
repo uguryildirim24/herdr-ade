@@ -1057,8 +1057,8 @@ pub(crate) struct RemoteView<'a> {
 
 /// The D8 amendment for box lanes: the fork has no push across machines, so
 /// the plugin's one serialized writer types `BLOCKED` and `GONE` exactly once
-/// per transition. A boot-id change types GONE for every open box lane; a pane
-/// or agent absent on two consecutive successful passes does the same.
+/// per transition. A boot-id change still marks launched lanes GONE; a pane
+/// absent on two consecutive live snapshots recovers even a pre-launch lane.
 pub(crate) fn remote_attention(
     ctx: &Ctx,
     project: &Project,
@@ -1081,7 +1081,12 @@ pub(crate) fn remote_attention(
     if boot_changed {
         state.gone.clear();
         state.missing.clear();
-        state.pending_gone = threads.iter().map(|lane| lane.id.clone()).collect();
+        state.missing_identity.clear();
+        state.pending_gone = threads
+            .iter()
+            .filter(|lane| lane.launch_attempts > 0)
+            .map(|lane| lane.id.clone())
+            .collect();
     }
     enum Signal {
         Blocked(String),
@@ -1099,11 +1104,8 @@ pub(crate) fn remote_attention(
     let mut signals = Vec::new();
     let sealed = events::list(project);
     for lane in threads {
-        // Placement creates the pane before the ticker has launched an
-        // agent. A missing agent (or even a reboot) at that boundary is not
-        // evidence of a gone process and must not spend recovery retries.
-        // Also discard a prior attempt's gone marker so this attempt can be
-        // observed independently once its launch begins.
+        // A missing agent alone cannot prove a pane is gone. Observe the
+        // pane even before launch; a sealed attempt needs no replacement.
         if lane.parked
             || crate::threads::parkable(project, lane)
             || events::latest_event(&sealed, &lane.id, lane.attempt.max(1)).is_some_and(|event| {
@@ -1114,12 +1116,14 @@ pub(crate) fn remote_attention(
         {
             state.blocked.remove(&lane.id);
             state.missing.remove(&lane.id);
+            state.missing_identity.remove(&lane.id);
             state.gone.remove(&lane.id);
             state.pending_gone.remove(&lane.id);
             continue;
         }
-        if lane.launch_attempts == 0 && lane.startup_wait_started.is_empty() {
+        if lane.pane_id.is_empty() {
             state.missing.remove(&lane.id);
+            state.missing_identity.remove(&lane.id);
             state.gone.remove(&lane.id);
             state.pending_gone.remove(&lane.id);
             continue;
@@ -1133,18 +1137,101 @@ pub(crate) fn remote_attention(
         } else {
             state.blocked.remove(&lane.id);
         }
-        let process_present = live.pane_exists
-            && (live.agent_state.is_some() || lane.prompt_pending || lane.last_state.is_empty());
-        if process_present {
-            state.missing.insert(lane.id.clone(), 0);
-        } else {
-            let count = state.missing.entry(lane.id.clone()).or_insert(0);
-            *count += 1;
+        if live.pane_exists {
+            state.missing.remove(&lane.id);
+            state.missing_identity.remove(&lane.id);
+            if state.pending_gone.contains(&lane.id) && !state.gone.contains(&lane.id) {
+                signals.push(Signal::Gone(lane.id.clone()));
+            }
+            continue;
         }
-        let missing = *state.missing.get(&lane.id).unwrap_or(&0);
-        if (state.pending_gone.contains(&lane.id) || missing >= 2) && !state.gone.contains(&lane.id)
+        let identity = format!(
+            "{}:{}:{}:{}",
+            lane.attempt, lane.workspace_id, lane.tab_id, lane.pane_id
+        );
+        if state.missing_identity.get(&lane.id) != Some(&identity) {
+            state.missing.insert(lane.id.clone(), 0);
+            state.missing_identity.insert(lane.id.clone(), identity);
+        }
+        let count = state.missing.entry(lane.id.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < 2 {
+            continue;
+        }
+        // The courier snapshot may precede a concurrent placement. Re-read
+        // both the record and the box pane list before spending an attempt.
+        let current = match thread::load(project, &lane.id) {
+            Ok(current) => current,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if !matches!(
+            current.status,
+            thread::Status::Open | thread::Status::Starting
+        ) || current.attempt != lane.attempt
+            || current.pane_id != lane.pane_id
+            || current.tab_id != lane.tab_id
+            || current.workspace_id != lane.workspace_id
         {
-            signals.push(Signal::Gone(lane.id.clone()));
+            state.missing.remove(&lane.id);
+            state.missing_identity.remove(&lane.id);
+            continue;
+        }
+        let herdr = crate::herdr::Herdr::new(
+            ctx.env.herdr_bin(),
+            project.coordinator().map(|c| c.socket).unwrap_or_default(),
+            ctx.runner,
+        )
+        .on_machine(lane.machine_route());
+        match herdr.pane_list() {
+            Ok(fresh)
+                if fresh.iter().any(|pane| {
+                    pane.pane_id == current.pane_id
+                        && pane.tab_id == current.tab_id
+                        && pane.workspace_id == current.workspace_id
+                }) =>
+            {
+                state.missing.remove(&lane.id);
+                state.missing_identity.remove(&lane.id);
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                errors.push(anyhow::anyhow!(
+                    "{}: recheck missing box pane: {error}",
+                    lane.id
+                ));
+                *state.missing.get_mut(&lane.id).unwrap() = 1;
+                continue;
+            }
+        }
+        let recover = !current.launch.recipe_id.is_empty();
+        match crate::threads::fail_start_checked(
+            ctx,
+            project,
+            &lane.id,
+            "the box pane is gone without a report",
+            crate::contracts::FailureClass::ProcessGone,
+            recover,
+            Some(&current),
+        ) {
+            Ok(Some(_)) => {
+                state.missing.remove(&lane.id);
+                state.missing_identity.remove(&lane.id);
+                state.pending_gone.remove(&lane.id);
+                // Recovery and its terminal FAILED notice are durable even if
+                // the coordinator is temporarily unavailable.
+                if let Err(error) = type_remote_line(ctx, project, &format!("GONE {}", lane.id)) {
+                    errors.push(error);
+                }
+            }
+            Ok(None) => {
+                state.missing.remove(&lane.id);
+                state.missing_identity.remove(&lane.id);
+            }
+            Err(error) => errors.push(error.context(format!("{}: process recovery", lane.id))),
         }
     }
     for signal in signals {
@@ -1845,7 +1932,7 @@ mod tests {
         stale.gone.insert(lane.id.clone());
         stale.missing.insert(lane.id.clone(), 2);
         events::save_remote_state(&project, "abc", &stale).unwrap();
-        for _ in 0..3 {
+        for _ in 0..1 {
             let errors = remote_attention(
                 &ctx,
                 &project,
@@ -1863,33 +1950,147 @@ mod tests {
         let state = events::remote_state(&project, "abc");
         assert!(!state.gone.contains(&lane.id));
         assert!(!state.pending_gone.contains(&lane.id));
-        assert!(!state.missing.contains_key(&lane.id));
+        assert_eq!(state.missing.get(&lane.id), Some(&1));
         let unchanged = thread::load(&project, &lane.id).unwrap();
         assert_eq!(unchanged.attempt, 2);
         assert_eq!(unchanged.launch.same_recipe_retries, 1);
         assert_eq!(unchanged.status, thread::Status::Starting);
 
-        // After the ticker starts the agent, absence is evidence again.
-        let mut launched = lane;
-        launched.launch_attempts = 1;
-        let _ = remote_attention(
-            &ctx,
-            &project,
-            RemoteView {
-                machine_id: "abc",
-                threads: &[launched],
-                agents: &[],
-                panes: &[],
-                boot_id: "boot-2",
-                now,
-            },
+        // A pane placed after the second snapshot must not spend a retry.
+        runner.on(
+            "--machine abc pane list",
+            crate::runner::fake::ok(
+                "{\"result\":{\"panes\":[{\"pane_id\":\"w9:p9\",\"tab_id\":\"w9:t9\",\"workspace_id\":\"w9\",\"cwd\":\"/box/review\"}]}}",
+            ),
         );
-        assert_eq!(
-            events::remote_state(&project, "abc")
+        assert!(
+            remote_attention(
+                &ctx,
+                &project,
+                RemoteView {
+                    machine_id: "abc",
+                    threads: std::slice::from_ref(&lane),
+                    agents: &[],
+                    panes: &[],
+                    boot_id: "boot-2",
+                    now,
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(thread::load(&project, &lane.id).unwrap().attempt, 2);
+        assert!(
+            !events::remote_state(&project, "abc")
                 .missing
-                .values()
-                .next(),
+                .contains_key(&lane.id)
+        );
+    }
+
+    #[test]
+    fn missing_box_pane_retries_before_launch_then_sends_failed_after_second_loss() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = root.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[routing]\ndefault = \"claude_coordinator_opus\"\nretries = 1\n",
+        )
+        .unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let lane = thread::allocate(&project, |t| {
+            t.role = "reviewer".into();
+            t.machine = "buildbox".into();
+            t.machine_id = "abc".into();
+            t.pane_id = "w9:p9".into();
+            t.workspace_id = "w9".into();
+            t.tab_id = "w9:t9".into();
+            t.cwd = "/box/review".into();
+            t.status = thread::Status::Open;
+            t.attempt = 1;
+            t.launch.attempt = 1;
+            t.launch.recipe_id = "claude_coordinator_opus".into();
+            t.launch.kind = "claude".into();
+            t.prompt_pending = true;
+            t.launch_attempts = 0;
+        })
+        .unwrap();
+        std::fs::write(thread::task_path(&project, &lane.id), "Review this change.").unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on(
+            "agent start --help",
+            crate::runner::fake::ok("[possible values: pi, claude, agy]"),
+        );
+        runner.on(
+            "--machine abc pane list",
+            crate::runner::fake::ok("{\"result\":{\"panes\":[]}}"),
+        );
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().into(),
+            config_dir: cfg,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let snapshot = |record: &thread::Thread| {
+            remote_attention(
+                &ctx,
+                &project,
+                RemoteView {
+                    machine_id: "abc",
+                    threads: std::slice::from_ref(record),
+                    agents: &[],
+                    panes: &[],
+                    boot_id: "boot-1",
+                    now: at("2026-09-19T00:00:00Z"),
+                },
+            )
+        };
+        assert!(snapshot(&lane).is_empty());
+        assert_eq!(thread::load(&project, &lane.id).unwrap().attempt, 1);
+        assert_eq!(
+            events::remote_state(&project, "abc").missing.get(&lane.id),
             Some(&1)
+        );
+        assert_eq!(runner.count("--machine abc pane list"), 0);
+        assert!(snapshot(&lane).is_empty());
+        let retried = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.launch.same_recipe_retries, 1);
+        assert!(retried.recovery_pending);
+        assert_eq!(runner.count("--machine abc pane list"), 1);
+
+        // A stale first-attempt streak cannot count against the new pane.
+        let mut stale = events::remote_state(&project, "abc");
+        stale.missing.insert(lane.id.clone(), 2);
+        stale
+            .missing_identity
+            .insert(lane.id.clone(), "1:w9:w9:t9:w9:p9".into());
+        events::save_remote_state(&project, "abc", &stale).unwrap();
+        let second = thread::update(&project, &lane.id, |t| {
+            t.pane_id = "w10:p1".into();
+            t.tab_id = "w10:t1".into();
+            t.workspace_id = "w10".into();
+            t.status = thread::Status::Open;
+            t.recovery_pending = false;
+            t.launch_attempts = 0;
+        })
+        .unwrap();
+        assert!(snapshot(&second).is_empty());
+        assert_eq!(
+            events::remote_state(&project, "abc").missing.get(&lane.id),
+            Some(&1)
+        );
+        assert_eq!(thread::load(&project, &lane.id).unwrap().attempt, 2);
+        assert!(snapshot(&second).is_empty());
+        let exhausted = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(exhausted.status, thread::Status::Failed);
+        assert!(!exhausted.recovery_pending);
+        assert!(
+            exhausted
+                .start_notices
+                .iter()
+                .any(|n| n.line.starts_with(&format!("FAILED {}:", lane.id)))
         );
     }
 

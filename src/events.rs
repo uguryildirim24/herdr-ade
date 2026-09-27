@@ -250,8 +250,8 @@ pub(crate) fn store_artifact(project: &Project, bytes: &[u8]) -> Result<String> 
 
 /// A box lane's Mac-side courier state, one file per (profile id, project)
 /// (SPEC-remote §4.3). `taken` is the cursor: box event id -> the hash of the
-/// box's bytes. `missing` counts consecutive successful passes with no pane
-/// and no agent; `gone` and `blocked` stop a line being typed twice.
+/// box's bytes. `missing` counts consecutive successful pane-list snapshots
+/// without the lane's pane; `gone` and `blocked` stop a line being typed twice.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub(crate) struct RemoteState {
@@ -259,6 +259,8 @@ pub(crate) struct RemoteState {
     pub(crate) last_pass: String,
     pub(crate) taken: BTreeMap<String, String>,
     pub(crate) missing: BTreeMap<String, u32>,
+    /// Attempt/pane that owns each consecutive absence streak.
+    pub(crate) missing_identity: BTreeMap<String, String>,
     pub(crate) gone: BTreeSet<String>,
     /// Boot-change GONE notices that still owe a coordinator wake-up.
     pub(crate) pending_gone: BTreeSet<String>,

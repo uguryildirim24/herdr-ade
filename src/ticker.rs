@@ -707,6 +707,19 @@ fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail:
     }
 }
 
+fn clear_missing_box_panes(entries: &[(Project, Vec<thread::Thread>)], machine: &str, log: &Log) {
+    for (project, _) in entries {
+        let mut state = crate::events::remote_state(project, machine);
+        if !state.missing.is_empty() || !state.missing_identity.is_empty() {
+            state.missing.clear();
+            state.missing_identity.clear();
+            if let Err(error) = crate::events::save_remote_state(project, machine, &state) {
+                log.line(&format!("{error:#}"));
+            }
+        }
+    }
+}
+
 fn clear_lost_connections(entries: &[(Project, Vec<thread::Thread>)], log: &Log) {
     for (project, threads) in entries {
         for lane in threads {
@@ -792,6 +805,7 @@ fn machine_passes_with_steps(
             let detail = format!("{error:#}");
             errors.push(anyhow::anyhow!("{machine}: {detail}"));
             record_failed_observation(&entries, &detail, log);
+            clear_missing_box_panes(&entries, &machine, log);
             // This is local configuration evidence, not evidence about the
             // connection. Leave no remote view for the slow pass and replace
             // any stale connection classification with unknown.
@@ -800,6 +814,14 @@ fn machine_passes_with_steps(
                 clear_poll_request(project, &machine);
             }
             continue;
+        }
+        // A failed check (or a box server that could not supply both lists)
+        // interrupts a consecutive pane-absence streak.
+        if !outcome
+            .as_ref()
+            .is_ok_and(|view| view.agents.is_some() && view.panes.is_some())
+        {
+            clear_missing_box_panes(&entries, &machine, log);
         }
         let reason = outcome.as_ref().err().map(|e| format!("{e:#}"));
         if let Some(reason) = &reason {
@@ -1298,6 +1320,9 @@ fn thread_pass(
                 }
             }
             if ready {
+                if t.is_remote() && !t.tab_id.is_empty() {
+                    herdr.tab_rename(&t.tab_id, &t.id)?;
+                }
                 thread::update(project, &t.id, |t| {
                     t.startup_wait_started.clear();
                     t.status = thread::Status::Open;
@@ -2193,6 +2218,21 @@ fn remote_pass(
     let state_pass =
         thread_pass(&state_input, &prefix, None, true).map_err(|e| format!("{e:#}"))?;
     errors.extend(state_pass.error);
+    // Inspect the courier snapshot before launching. A vanished pre-launch
+    // pane must not consume an agent start against a terminal that no longer
+    // exists; the recovery transition owns the next placement.
+    errors.extend(steps::remote_attention(
+        ctx,
+        project,
+        steps::RemoteView {
+            machine_id: &view.machine_id,
+            threads: &threads,
+            agents: &agents,
+            panes: &panes,
+            boot_id: &view.boot_id,
+            now: jiff::Timestamp::now(),
+        },
+    ));
     let launched = launch_pass(
         &LaunchPass {
             ctx,
@@ -2211,19 +2251,6 @@ fn remote_pass(
     }
     errors.extend(clean_managed_project_tabs(
         project, machine, &remote, &agents, &panes,
-    ));
-    // The D8 BLOCKED/GONE lines for this machine's box lanes (SPEC-remote §4.3).
-    errors.extend(steps::remote_attention(
-        ctx,
-        project,
-        steps::RemoteView {
-            machine_id: &view.machine_id,
-            threads: &threads,
-            agents: &agents,
-            panes: &panes,
-            boot_id: &view.boot_id,
-            now: jiff::Timestamp::now(),
-        },
     ));
     Ok(())
 }
@@ -3106,6 +3133,70 @@ mod tests {
         assert_eq!(runner.count("agent prompt"), 1);
         assert_eq!(runner.count("agent rename"), 1);
         assert_eq!(saved.identity.agent_name.as_deref(), Some("hp-demo-t-0001"));
+    }
+
+    #[test]
+    fn a_ready_box_agent_replaces_the_starting_tab_title() {
+        let fixture = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("tab rename", ok(r#"{"result":{}}"#));
+        let record = thread::allocate(&fixture.project, |t| {
+            t.status = thread::Status::Starting;
+            t.machine = "box".into();
+            t.machine_id = "abc".into();
+            t.startup_wait_started = project::now();
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/box/lane".into();
+            t.agent_name = "hp-demo-t-0001".into();
+        })
+        .unwrap();
+        let ctx = Ctx {
+            env: &fixture.env,
+            root: fixture.root.clone(),
+            config_dir: fixture.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let pane = Pane {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+        };
+        let agent = Agent {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+            name: record.agent_name.clone(),
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &fixture.project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&record),
+                agents: &[agent],
+                panes: &[pane],
+            },
+            "ha",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            thread::load(&fixture.project, &record.id).unwrap().status,
+            thread::Status::Open
+        );
+        assert!(runner.calls.borrow().iter().any(|c| {
+            c.display()
+                .contains(&format!("tab rename {} {}", record.tab_id, record.id))
+        }));
     }
 
     #[test]
