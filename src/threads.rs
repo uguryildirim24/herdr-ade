@@ -2143,6 +2143,16 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
         .into_iter()
         .filter(|record| record.cleanup_pending)
     {
+        // Safety refusals need an explicit repair. Retrying the identical
+        // branch conflict or missing linked file every pass runs git/SSH
+        // indefinitely and starves fresh seals; keep the pending evidence.
+        if record
+            .cleanup_reason
+            .contains("moved beyond its sealed cleanup tip")
+            || record.cleanup_reason.starts_with("linked_files_not_kept:")
+        {
+            continue;
+        }
         if !record.cancellation_reason.is_empty() {
             if let Err(error) = cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)
             {
