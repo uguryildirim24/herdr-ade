@@ -1667,7 +1667,14 @@ fn dispatch_with_start(
                 };
                 crate::output::insert("machine", machine);
                 crate::output::insert("placement_reason", thread.placement_reason.clone());
-                let note = mac_only_brief_note(&ctx.config_dir, &project, machine, &brief_text);
+                let mut note = mac_only_brief_note(&ctx.config_dir, &project, machine, &brief_text);
+                if thread.prompt_pending && !thread.pane_id.is_empty() {
+                    let pending = "brief pending; the ticker delivers it when the agent registers";
+                    note = Some(match note {
+                        Some(other) => format!("{pending}\n{other}"),
+                        None => pending.to_string(),
+                    });
+                }
                 if let Some(note) = &note {
                     crate::output::insert("note", note.clone());
                 }
