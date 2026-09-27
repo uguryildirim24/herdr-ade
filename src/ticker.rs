@@ -1429,7 +1429,7 @@ fn thread_pass(
                             Ok(())
                         })?;
                     }
-                    Err(error) if error.to_string().contains("agent_not_ready") => {
+                    Err(error) if error.code == "agent_not_ready" => {
                         // Registration can disappear between the list and the
                         // prompt. Keep the brief pending for the next pass.
                     }
