@@ -944,6 +944,99 @@ enum ThreadCommand {
     },
 }
 
+/// A brief is delivered unchanged. This warning only points out Mac paths a
+/// remote lane cannot read; it never affects placement or retry.
+fn mac_only_brief_note(
+    config_dir: &std::path::Path,
+    project: &Project,
+    machine: &str,
+    brief: &str,
+) -> Option<String> {
+    if machine.is_empty() || machine == "local" {
+        return None;
+    }
+    let mut mapped = crate::harness::repos(config_dir).unwrap_or_default();
+    if let Ok(declaration) = crate::remote::machine_declaration(config_dir, machine) {
+        mapped.extend(declaration.repos);
+    }
+    if let Ok((settings, _)) = project.read_project_md() {
+        mapped.extend(
+            settings
+                .repos
+                .into_iter()
+                .filter(|row| row.box_path.is_some()),
+        );
+    }
+    let paths = mac_only_paths(brief, &mapped);
+    if paths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "note: brief names Mac-only paths the lane on {machine} can't read: {}. Paste their text into the brief, or start with --machine local.",
+        paths.join(", ")
+    ))
+}
+
+fn mac_only_paths(brief: &str, mapped: &[crate::project::Repo]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for (index, _) in brief.match_indices('/') {
+        if index > 0
+            && !brief[..index].ends_with(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '`' | '"' | '\'' | '<' | '(' | '[' | '{' | '=' | ':')
+            })
+        {
+            continue;
+        }
+        let tail = &brief[index..];
+        let candidate = tail.starts_with("/private/tmp/")
+            || tail.starts_with("/tmp/")
+            || tail.strip_prefix("/Users/").is_some_and(|rest| {
+                rest.split_once('/')
+                    .is_some_and(|(name, _)| !name.is_empty())
+            });
+        if !candidate {
+            continue;
+        }
+        let end = tail
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '"'
+                            | '\''
+                            | '<'
+                            | '>'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | ','
+                            | ';'
+                    )
+            })
+            .unwrap_or(tail.len());
+        let path = tail[..end].trim_end_matches(['.', ':', '!', '?']);
+        if mapped.iter().any(|row| {
+            row.box_path.is_some()
+                && (path == row.path
+                    || path
+                        .strip_prefix(&row.path)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        }) || paths.iter().any(|previous| previous == path)
+        {
+            continue;
+        }
+        paths.push(path.to_string());
+        if paths.len() == 3 {
+            break;
+        }
+    }
+    paths
+}
+
 fn start_details(
     existing: Option<&crate::task::Task>,
     title: Option<String>,
@@ -1542,6 +1635,7 @@ fn dispatch_with_start(
                         .id
                     }
                 };
+                let brief_text = task.clone();
                 let thread = threads::start(
                     &ctx,
                     &slug,
@@ -1573,13 +1667,29 @@ fn dispatch_with_start(
                 };
                 crate::output::insert("machine", machine);
                 crate::output::insert("placement_reason", thread.placement_reason.clone());
+                let note = mac_only_brief_note(&ctx.config_dir, &project, machine, &brief_text);
+                if let Some(note) = &note {
+                    crate::output::insert("note", note.clone());
+                }
                 let result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
                 println!("{result}");
+                if let Some(note) = note {
+                    println!("{note}");
+                }
                 Ok(())
             }
             ThreadCommand::Retry { slug, id, reason } => {
                 let result = threads::retry(&ctx, &slug, &id, &reason)?;
-                let current = crate::thread::load(&Project::load(&ctx.root, &slug)?, &id)?;
+                let project = Project::load(&ctx.root, &slug)?;
+                let current = crate::thread::load(&project, &id)?;
+                let note = std::fs::read_to_string(crate::thread::task_path(&project, &id))
+                    .ok()
+                    .and_then(|brief| {
+                        mac_only_brief_note(&ctx.config_dir, &project, &current.machine, &brief)
+                    });
+                if let Some(note) = &note {
+                    crate::output::insert("note", note.clone());
+                }
                 let launch = if current.prompt_pending {
                     "startup is still pending; the ticker resumes it"
                 } else {
@@ -1589,7 +1699,7 @@ fn dispatch_with_start(
                     Some("retried"),
                     &result,
                     &format!(
-                        "{} attempt {} is in pane {}; {launch}{}\n",
+                        "{} attempt {} is in pane {}; {launch}{}\n{}",
                         result.thread,
                         result.attempt,
                         result.pane_id,
@@ -1599,7 +1709,8 @@ fn dispatch_with_start(
                             .map(|screen| format!(
                                 "; previous startup screen still showed: {screen}"
                             ))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        note.map(|note| format!("{note}\n")).unwrap_or_default()
                     ),
                     "",
                 )
@@ -1890,6 +2001,48 @@ fn dispatch_with_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_brief_note_skips_mapped_repos_and_local_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(
+            root.path(),
+            "demo",
+            "goal",
+            vec![crate::project::Repo {
+                path: "/home/agent/projects/demo".into(),
+                box_path: Some("/home/ubuntu/projects/demo".into()),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let brief = "Read `/home/agent/projects/demo/src/main.rs` and `/private/tmp/audit.md`.";
+        assert!(mac_only_brief_note(root.path(), &project, "local", brief).is_none());
+        assert_eq!(
+            mac_only_brief_note(root.path(), &project, "oci", brief).unwrap(),
+            "note: brief names Mac-only paths the lane on oci can't read: /private/tmp/audit.md. Paste their text into the brief, or start with --machine local."
+        );
+    }
+
+    #[test]
+    fn mac_brief_paths_are_distinct_and_limited_to_three() {
+        let mapped = [crate::project::Repo {
+            path: "/home/agent/projects/demo".into(),
+            box_path: Some("/box/demo".into()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            mac_only_paths(
+                "`/home/agent/projects/demo/a` `/home/agent/projects/demo-other/a` /tmp/a /tmp/a /private/tmp/b /home/agent/file",
+                &mapped
+            ),
+            [
+                "/home/agent/projects/demo-other/a",
+                "/tmp/a",
+                "/private/tmp/b"
+            ]
+        );
+    }
 
     #[test]
     fn failed_defaults_to_the_work_failed_class() {
