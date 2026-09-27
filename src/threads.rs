@@ -947,25 +947,19 @@ fn place_box_worktree(
             matching.len()
         );
     }
-    let (created, first_tab) = match matching.first() {
-        Some(workspace) => (
-            herdr
-                .tab_create_env(
-                    &workspace.workspace_id,
-                    Path::new(&box_worktree),
-                    &record.id,
-                    false,
-                    &env,
-                )
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
-            false,
-        ),
-        None => (
-            herdr
-                .workspace_create_env(Path::new(&box_worktree), &label, false, &env)
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
-            true,
-        ),
+    let created = match matching.first() {
+        Some(workspace) => herdr
+            .tab_create_env(
+                &workspace.workspace_id,
+                Path::new(&box_worktree),
+                &record.id,
+                false,
+                &env,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
+        None => herdr
+            .workspace_create_env(Path::new(&box_worktree), &label, false, &env)
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
     };
     let cwd = herdr
         .pane_cwd(&created.pane_id)
@@ -984,11 +978,9 @@ fn place_box_worktree(
         t.pane_id = created.pane_id.clone();
         t.partial = Some("lane_card".into());
     })?;
-    if first_tab {
-        herdr
-            .tab_rename(&created.tab_id, &record.id)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    herdr
+        .tab_rename(&created.tab_id, &format!("{} starting…", record.id))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // The box lane nests under its coordinator from its first second: the
     // machine-qualified parent token is written before the ticker starts the
@@ -3129,7 +3121,9 @@ pub(crate) fn fail_start_checked(
     expected: Option<&Thread>,
 ) -> Result<Option<Thread>> {
     let provider_kind = None;
-    let (recovery, recovery_error) = if !recover || thread::load(project, id)?.launch_attempts == 0
+    let record = thread::load(project, id)?;
+    let (recovery, recovery_error) = if !recover
+        || (record.launch_attempts == 0 && !(record.is_remote() && expected.is_some()))
     {
         (None, None)
     } else {
@@ -3155,7 +3149,7 @@ pub(crate) fn fail_start_checked(
     let mut matched = false;
     let failed = thread::update_checked(project, id, |t| {
         if expected.is_some_and(|old| {
-            t.status != Status::Open
+            !matches!(t.status, Status::Open | Status::Starting)
                 || t.attempt != old.attempt
                 || t.pane_id != old.pane_id
                 || t.tab_id != old.tab_id
@@ -3199,12 +3193,17 @@ pub(crate) fn fail_start_checked(
     if !matched {
         return Ok(None);
     }
-    if !failed.tab_id.is_empty() {
-        let view = session_view(ctx, project)
-            .context("failed-start cleanup could not reach the session; the attempt stays bound")?;
-        clear_thread_tokens(&view.herdr, &failed);
+    // A confirmed missing box pane has nothing left to close. Do not make
+    // recovery depend on the Mac coordinator session being reachable.
+    if !(expected.is_some() && failed.is_remote()) {
+        if !failed.tab_id.is_empty() {
+            let view = session_view(ctx, project).context(
+                "failed-start cleanup could not reach the session; the attempt stays bound",
+            )?;
+            clear_thread_tokens(&view.herdr, &failed);
+        }
+        close_pane(ctx, project, &failed)?;
     }
-    close_pane(ctx, project, &failed)?;
     Ok(Some(failed))
 }
 
@@ -6057,7 +6056,7 @@ mod tests {
         }));
         assert!(calls.iter().any(|call| {
             call.display()
-                .contains(&format!("tab rename w1:t2 {}", started.id))
+                .contains(&format!("tab rename w1:t2 {} starting…", started.id))
         }));
         assert_eq!(
             calls
