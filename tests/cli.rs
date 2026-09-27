@@ -165,6 +165,68 @@ fn notes_and_tasks_accept_a_request_from_another_project() {
 }
 
 #[test]
+fn note_add_reports_which_briefs_receive_it() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let run = |args: &[&str]| {
+        let output = hp(home.path(), &[&["--root", root_arg], args].concat());
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&["new", "demo"]);
+    let talk = root.join("demo/.state/talk");
+    std::fs::create_dir_all(&talk).unwrap();
+    std::fs::write(
+        talk.join("journal.jsonl"),
+        "{\"seq\":1,\"at\":\"2026-09-23T00:00:00Z\",\"rolf\":{\"request\":\"q-note\",\"text\":\"Record this decision.\"}}\n",
+    )
+    .unwrap();
+    run(&[
+        "task",
+        "add",
+        "demo",
+        "--title",
+        "Record decision",
+        "--request",
+        "q-note",
+        "--acceptance",
+        "Decision recorded.",
+    ]);
+    run(&[
+        "task",
+        "add",
+        "demo",
+        "--title",
+        "Share decision",
+        "--request",
+        "q-note",
+        "--acceptance",
+        "Decision shared.",
+    ]);
+    let add = [
+        "note",
+        "add",
+        "demo",
+        "Decision recorded.",
+        "--kind",
+        "memory",
+        "--request",
+        "q-note",
+    ];
+    assert_eq!(run(&add), "noted n-0001, in every lane brief\n");
+    assert_eq!(
+        run(&[&add[..], &["--task", "job-0001", "--task", "job-0002"]].concat()),
+        "noted n-0002, in briefs for job-0001, job-0002\n"
+    );
+}
+
+#[test]
 fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("my root");
