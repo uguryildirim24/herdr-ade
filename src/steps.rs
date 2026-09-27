@@ -1187,11 +1187,9 @@ pub(crate) fn remote_attention(
         .on_machine(lane.machine_route());
         match herdr.pane_list() {
             Ok(fresh)
-                if fresh.iter().any(|pane| {
-                    pane.pane_id == current.pane_id
-                        && pane.tab_id == current.tab_id
-                        && pane.workspace_id == current.workspace_id
-                }) =>
+                if fresh
+                    .iter()
+                    .any(|pane| thread::pane_matches(&current, pane)) =>
             {
                 state.missing.remove(&lane.id);
                 state.missing_identity.remove(&lane.id);
