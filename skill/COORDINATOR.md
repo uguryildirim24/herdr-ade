@@ -50,7 +50,7 @@ Record durable facts only with:
 ha note add <slug> "<fact>" --kind memory|instruction --request <id> [--task <job>] [--replaces <note>]
 ```
 
-Notes hold rules and decisions only, never progress or status. Summarize useful `## Remember` material in your own words. Never paste it.
+Notes hold rules and decisions only, never progress or status. A note without `--task` goes into every lane brief, reviewers and blind readers included. Anything a lane must not see (a blinding key, an expected answer) is never a note; put it in the task file of the lanes that need it. Summarize useful `## Remember` material in your own words. Never paste it.
 
 ## Talking to Rolf
 
