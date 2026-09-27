@@ -1429,6 +1429,10 @@ fn thread_pass(
                             Ok(())
                         })?;
                     }
+                    Err(error) if error.to_string().contains("agent_not_ready") => {
+                        // Registration can disappear between the list and the
+                        // prompt. Keep the brief pending for the next pass.
+                    }
                     Err(error) => {
                         pass.error = pass
                             .error
@@ -1693,6 +1697,10 @@ struct LaunchPass<'a> {
 /// Start a just-placed attempt in the caller, without a later ticker or
 /// courier pass. The periodic path still owns unfinished startup and retries.
 pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    launch_thread_with_wait(ctx, project, id, Duration::from_secs(20))
+}
+
+fn launch_thread_with_wait(ctx: &Ctx, project: &Project, id: &str, wait: Duration) -> Result<()> {
     let lane = thread::load(project, id)?;
     if lane.status != thread::Status::Open || !lane.prompt_pending {
         return Ok(());
@@ -1731,7 +1739,7 @@ pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Resul
     );
     // A successful start normally returns a ready agent. Read fresh state and
     // deliver its brief before returning to the coordinator.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
     let prefix = coordinator::current_prefix(&ctx.root)?;
     loop {
         let current = thread::load(project, id)?;
@@ -2565,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_launch_delivers_brief_without_a_ticker_pass() {
+    fn explicit_launch_delivers_brief_when_agent_registers_three_seconds_later() {
         use crate::scenarios::{World, pane_json};
         let world = World::new();
         let project = world.project("demo", "a.sock");
@@ -2579,24 +2587,128 @@ mod tests {
             world.coordinator_pane(&project),
             pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
         );
-        let agents = world.agents.clone();
-        world.runner.on_fn(
+        // The start command returns before herdr's agent list knows the name.
+        // Simulate the registration delay in the list rather than in start.
+        let runner = FakeRunner::new();
+        let launched = std::rc::Rc::new(std::cell::Cell::new(None::<Instant>));
+        let started = launched.clone();
+        runner.on_fn(
             |cmd| cmd.display().contains("agent start hp-demo-t-0001"),
             move |_| {
-                *agents.borrow_mut() = r#"[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":""#
-                    .to_owned()
-                    + &cwd.to_string_lossy()
-                    + r#"","name":"hp-demo-t-0001","agent_status":"idle"}]"#;
+                started.set(Some(Instant::now()));
                 Ok(ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"hp-demo-t-0001"}}}"#))
             },
         );
-        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        launch_thread_now(&world.ctx(), &project, &lane.id).unwrap();
+        let observed = launched.clone();
+        let cwd_for_list = cwd.to_string_lossy().to_string();
+        runner.on_fn(
+            |cmd| cmd.display().contains("agent list"),
+            move |_| {
+                let agents = if observed.get().is_some_and(|at| at.elapsed() >= Duration::from_secs(3)) {
+                    format!(r#"[{{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"{cwd_for_list}","name":"hp-demo-t-0001","agent_status":"idle"}}]"#)
+                } else {
+                    "[]".to_string()
+                };
+                Ok(ok(&format!(r#"{{"result":{{"agents":{agents}}}}}"#)))
+            },
+        );
+        let panes = world.panes.borrow().clone();
+        runner.on(
+            "pane list",
+            ok(&format!(r#"{{"result":{{"panes":{panes}}}}}"#)),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        launch_thread_now(&ctx, &project, &lane.id).unwrap();
         let saved = thread::load(&project, &lane.id).unwrap();
         assert_eq!(saved.launch_attempts, 1);
         assert!(!saved.prompt_pending);
-        assert_eq!(world.runner.count("agent start hp-demo-t-0001"), 1);
+        assert_eq!(runner.count("agent start hp-demo-t-0001"), 1);
+        assert_eq!(runner.count("agent prompt"), 1);
+    }
+
+    #[test]
+    fn late_registration_keeps_brief_pending_until_ticker_sees_named_agent() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |record| {
+            record.prompt_pending = true;
+            record.launch.kind = "claude".into();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        );
+        world.runner.on("agent start hp-demo-t-0001", ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"hp-demo-t-0001"}}}"#));
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        launch_thread_with_wait(&world.ctx(), &project, &lane.id, Duration::from_millis(120))
+            .unwrap();
+        let pending = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(pending.status, thread::Status::Open);
+        assert!(pending.prompt_pending);
+        assert_eq!(world.runner.count("agent prompt"), 0);
+
+        *world.agents.borrow_mut() = format!(
+            r#"[{{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"{}","name":"hp-demo-t-0001","agent_status":"idle"}}]"#,
+            cwd.display()
+        );
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new(world.env.herdr_bin(), &socket, &world.runner);
+        let agents = herdr.agent_list().unwrap();
+        let panes = herdr.pane_list().unwrap();
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx: &world.ctx(),
+                project: &project,
+                herdr: &herdr,
+                threads: &[pending],
+                agents: &agents,
+                panes: &panes,
+            },
+            "ha",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pass.error.is_none());
+        assert!(!thread::load(&project, &lane.id).unwrap().prompt_pending);
         assert_eq!(world.runner.count("agent prompt"), 1);
+    }
+
+    #[test]
+    fn agent_not_ready_during_brief_prompt_is_pending_not_failed() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |t| {
+            t.prompt_pending = true;
+            t.launch_attempts = 1;
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        );
+        *world.agents.borrow_mut() = format!(
+            r#"[{{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"{}","name":"hp-demo-t-0001","agent_status":"idle"}}]"#,
+            cwd.display()
+        );
+        world.runner.on(
+            "agent prompt",
+            ok(r#"{"error":{"code":"agent_not_ready","message":"registration pending"}}"#),
+        );
+        launch_thread_with_wait(&world.ctx(), &project, &lane.id, Duration::from_millis(120))
+            .unwrap();
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Open);
+        assert!(saved.prompt_pending);
     }
 
     fn held(version: &str) -> LockState {
