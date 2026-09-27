@@ -1433,10 +1433,15 @@ fn dispatch_with_start(
                 let project = Project::load(&ctx.root, &slug)?;
                 let note =
                     crate::note::add(&project, kind, &text, &request, replaces.as_deref(), tasks)?;
+                let reach = if note.tasks.is_empty() {
+                    "in every lane brief".to_string()
+                } else {
+                    format!("in briefs for {}", note.tasks.join(", "))
+                };
                 crate::output::success(
                     Some("noted"),
                     &serde_json::json!({ "note": note }),
-                    &format!("noted {}\n", note.id),
+                    &format!("noted {}, {reach}\n", note.id),
                     "",
                 )
             }
