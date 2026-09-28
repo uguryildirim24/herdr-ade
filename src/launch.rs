@@ -194,7 +194,7 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
 pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<String> {
     crate::prompt::resolve_request(project, basis)
         .map(|request| request.qualified_basis())
-        .map_err(|error| crate::refusal::error(error.to_string(), format!("ha thread start {} --job <job> --task-file <file> --recipe <recipe> --basis \"<quote from Rolf's request>\"", project.slug)))
+        .map_err(|error| crate::refusal::error(error.to_string(), format!("ha open {} --recipe <id> --basis request:<id>", project.slug)))
 }
 
 /// Validate a coordinator's one-off lane recipe before creating the lane.
@@ -345,7 +345,7 @@ pub fn resolve_failure(
             if recovery > config.routing.retries {
                 return Err(crate::refusal::error(
                     format!(
-                        "recovery_exhausted: Rolf's one-off recipe allowed {} retries; waiting for the coordinator",
+                        "recovery_exhausted: the explicit lane recipe allowed {} retries; waiting for the coordinator",
                         config.routing.retries
                     ),
                     "wait for the coordinator to choose a different recipe or cancel the lane",
