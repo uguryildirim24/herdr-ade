@@ -192,6 +192,9 @@ pub(crate) struct Thread {
     /// One-time integration check for a sealed historical attempt.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) historical_seal: String,
+    /// Last seal warned about because its repository is no longer configured.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) unconfigured_repo_seal: String,
     pub(crate) merged_sha: String,
     /// Historical seal covered by an installed harness build.
     #[serde(default, skip_serializing_if = "String::is_empty")]
