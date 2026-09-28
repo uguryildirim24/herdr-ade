@@ -438,6 +438,9 @@ pub(crate) struct PlanStep {
     #[serde(default)]
     pub(crate) tasks: Vec<String>,
     pub(crate) threads: Vec<String>,
+    /// Step ids that must finish before bound tasks on this step start.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) after: Vec<String>,
     /// One level of subtasks under a top-level step; a subtask never has its
     /// own. Left out of the record when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -652,6 +655,7 @@ mod tests {
                     state: StepState::Done,
                     tasks: vec!["job-0001".into()],
                     threads: vec!["t-0041".into()],
+                    after: vec![],
                     subtasks: vec![],
                 },
                 PlanStep {
@@ -660,6 +664,7 @@ mod tests {
                     state: StepState::Running,
                     tasks: vec![],
                     threads: vec!["t-0043".into(), "t-0044".into()],
+                    after: vec![],
                     subtasks: vec![],
                 },
             ],

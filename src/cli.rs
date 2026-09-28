@@ -378,6 +378,9 @@ enum PlanStepCommand {
         /// Add it as a subtask of this top-level step
         #[arg(long, value_name = "STEP")]
         under: Option<String>,
+        /// Step ids that must finish first
+        #[arg(long, value_name = "STEP")]
+        after: Vec<String>,
         /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
         expect: Option<u64>,
@@ -402,8 +405,10 @@ enum PlanStepCommand {
         slug: String,
         id: String,
         /// Stable task ids to link to this step
-        #[arg(long = "task", value_name = "ID", required = true)]
+        #[arg(long = "task", value_name = "ID")]
         tasks: Vec<String>,
+        #[arg(long, value_name = "STEP")]
+        after: Vec<String>,
         /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
         expect: Option<u64>,
@@ -415,8 +420,10 @@ enum PlanStepCommand {
         slug: String,
         id: String,
         /// Stable task ids to unlink from this step
-        #[arg(long = "task", value_name = "ID", required = true)]
+        #[arg(long = "task", value_name = "ID")]
         tasks: Vec<String>,
+        #[arg(long, value_name = "STEP")]
+        after: Vec<String>,
         /// Why this step or link is removed
         #[arg(long)]
         why: String,
@@ -568,12 +575,15 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                     text,
                     tasks,
                     under,
+                    after,
                     expect,
                 } => {
                     let (p, id) = match under {
-                        Some(under) => plan::subtask_add(ctx, &slug, &under, &text, tasks, expect)?,
+                        Some(under) => {
+                            plan::subtask_add(ctx, &slug, &under, &text, tasks, after, expect)?
+                        }
                         None => {
-                            let p = plan::step_add(ctx, &slug, &text, tasks, expect)?;
+                            let p = plan::step_add(ctx, &slug, &text, tasks, after, expect)?;
                             let id = p.steps.last().map(|s| s.id.clone()).unwrap_or_default();
                             (p, id)
                         }
@@ -615,9 +625,10 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                     slug,
                     id,
                     tasks,
+                    after,
                     expect,
                 } => {
-                    let p = plan::step_link(ctx, &slug, &id, tasks, expect)?;
+                    let p = plan::step_link(ctx, &slug, &id, tasks, after, expect)?;
                     crate::output::success(
                         None,
                         &serde_json::json!({
@@ -635,10 +646,11 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                     slug,
                     id,
                     tasks,
+                    after,
                     why,
                     expect,
                 } => {
-                    let p = plan::step_unlink(ctx, &slug, &id, tasks, &why, expect)?;
+                    let p = plan::step_unlink(ctx, &slug, &id, tasks, after, &why, expect)?;
                     crate::output::success(
                         None,
                         &serde_json::json!({
