@@ -1245,6 +1245,34 @@ fn thread_pass(
             thread.pane_id.is_empty() || !thread::live_state(thread, agents, panes, now).pane_exists
         });
     for t in threads {
+        if t.status == thread::Status::Failed {
+            let records = thread::list(project);
+            if let Some(agent) = thread::recoverable_agent(t, &records, agents, panes) {
+                thread::update_checked(project, &t.id, |current| {
+                    if current.status == thread::Status::Failed
+                        && current.attempt == t.attempt
+                        && current.pane_id == t.pane_id
+                        && !thread::list(project).iter().any(|other| {
+                            other.id != current.id
+                                && other.status != thread::Status::Resolved
+                                && other.pane_id == current.pane_id
+                        })
+                    {
+                        current.status = thread::Status::Open;
+                        current.error.clear();
+                        current.recovery_pending = false;
+                        current.failure_class = crate::contracts::FailureClass::Unknown;
+                        current.agent_name = agent.name.clone();
+                        current.last_state = agent.agent_status.clone();
+                        current.last_state_change = project::now();
+                        current.last_group = "working".into();
+                        current.startup_wait_started.clear();
+                    }
+                    Ok(())
+                })?;
+            }
+            continue;
+        }
         if t.parked || !t.provider_wait_started.is_empty() {
             continue;
         }
@@ -1977,8 +2005,11 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .filter(|t| {
             t.is_remote() == remote
                 && !t.parked
-                && (t.provider_wait_started.is_empty() || t.status == thread::Status::Open)
-                && matches!(t.status, thread::Status::Open | thread::Status::Starting)
+                && (t.provider_wait_started.is_empty()
+                    || t.status == thread::Status::Open
+                    || !remote && t.status == thread::Status::Failed)
+                && (matches!(t.status, thread::Status::Open | thread::Status::Starting)
+                    || !remote && t.status == thread::Status::Failed)
         })
         .collect()
 }
@@ -4105,6 +4136,78 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn failed_local_lane_reclaims_unnamed_agent_only_in_its_worktree() {
+        let f = fixture(false);
+        let lane = thread::allocate(&f.project, |t| {
+            t.status = thread::Status::Failed;
+            t.attempt = 3;
+            t.launch_attempts = 1;
+            t.error = "agent_not_ready".into();
+            t.launch.kind = "claude".into();
+            t.agent_name = "hp-demo-t-0001".into();
+            t.worktree_path = "/work/lane".into();
+            t.cwd = t.worktree_path.clone();
+            t.pane_id = "w1:p2".into();
+            t.tab_id = "w1:t2".into();
+            t.workspace_id = "w1".into();
+        })
+        .unwrap();
+        assert_eq!(open_threads(&f.project, false).len(), 1);
+        assert!(open_threads(&f.project, true).is_empty());
+        let pane = Pane {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+        };
+        let mut agent = Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: "/elsewhere".into(),
+            agent: "claude".into(),
+            agent_status: "working".into(),
+            ..Default::default()
+        };
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let inspect = |agent: &Agent| {
+            let current = thread::load(&f.project, &lane.id).unwrap();
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &f.project,
+                    herdr: &herdr,
+                    threads: &[current],
+                    agents: std::slice::from_ref(agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+                false,
+            )
+            .unwrap();
+            thread::load(&f.project, &lane.id).unwrap()
+        };
+        assert_eq!(inspect(&agent).status, thread::Status::Failed);
+        agent.cwd = lane.worktree_path.clone();
+        let revived = inspect(&agent);
+        assert_eq!(revived.status, thread::Status::Open);
+        assert_eq!(revived.agent_name, "");
+        assert!(revived.error.is_empty());
+        assert_eq!(revived.attempt, 3);
+        assert_eq!(revived.launch_attempts, 1);
+        assert_eq!(revived.last_group, "working");
     }
 
     fn nudge_pass(f: &Fixture, runner: &FakeRunner, agents: &[Agent]) {
