@@ -1619,6 +1619,37 @@ fn thread_pass(
         } else {
             thread::group(&after, &live, now)
         };
+        // After startup, a sustained blocked state needs a human. Do not
+        // interact with the lane's pane: only the startup trust matcher can
+        // answer its exact dialog. The group transition arms one alert per
+        // blocked spell and a return to working re-arms the next one.
+        if after.status == thread::Status::Open
+            && after.startup_wait_started.is_empty()
+            && state == "blocked"
+            && group == thread::Group::WaitingOnYou
+            && t.last_group != group.token()
+        {
+            let notice = format!(
+                "BLOCKED {} awaits interactive approval in {}; no keys were sent. Answer it there or retry after resolving the permission.",
+                t.id, t.pane_id
+            );
+            let sent = if let Some(coordinator) = project.coordinator() {
+                agents
+                    .iter()
+                    .any(|agent| coordinator::agent_matches(&coordinator, agent) && agent.ready())
+                    && steps::deliver_coordinator_prompt(
+                        project,
+                        herdr,
+                        &coordinator.pane_id,
+                        &notice,
+                    )?
+            } else {
+                false
+            };
+            if !sent {
+                inbox::write(project, "lane-notice", &t.id, &notice, "")?;
+            }
+        }
         // Only absence of the pane proves a local process is gone. Herdr may
         // temporarily omit agent state while the terminal and process still
         // exist (including after an interactive startup timeout); that state
@@ -2389,7 +2420,16 @@ fn plan_nudge(
         .map(|lane| lane.id.clone())
         .collect();
     lane_ids.sort();
-    let request = crate::prompt::latest_request_id(project);
+    let asks = crate::ask::open_asks(project);
+    // Answering an ask re-arms the normal nudge, even without a plan edit.
+    let request = format!(
+        "{}|{}",
+        crate::prompt::latest_request_id(project),
+        asks.iter()
+            .map(|ask| format!("{}:{}", ask.id, ask.revision))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let plan = crate::plan::load(project)?;
     let revision = plan.as_ref().map_or(0, |p| p.revision);
     if state.plan_revision != revision
@@ -2409,7 +2449,7 @@ fn plan_nudge(
         state.plan_nudged = false;
         return Ok(());
     }
-    if state.plan_nudged || !crate::ask::open_asks(project).is_empty() {
+    if state.plan_nudged {
         return Ok(());
     }
     if crate::review::list(project)?
@@ -2445,10 +2485,65 @@ fn plan_nudge(
     if left.is_empty() {
         return Ok(());
     }
+    // An unbound ask has no plan evidence of independence. Every linked ask
+    // must map to at least one step before any step can be suggested.
+    let tasks = if asks.is_empty() {
+        Vec::new()
+    } else {
+        let (tasks, errors) = crate::task::list_with_errors(project);
+        if !errors.is_empty() {
+            return Ok(());
+        }
+        tasks
+    };
+    let mut ask_steps = std::collections::BTreeSet::new();
+    for ask in &asks {
+        let Some(task_id) = &ask.task else {
+            return Ok(());
+        };
+        let bound: Vec<_> = crate::plan::all_steps(plan)
+            .filter(|step| {
+                step.tasks.contains(task_id)
+                    || tasks.iter().any(|task| {
+                        &task.id == task_id && task.plan_step.as_deref() == Some(&step.id)
+                    })
+            })
+            .map(|step| step.id.clone())
+            .collect();
+        if bound.is_empty() {
+            return Ok(());
+        }
+        for id in bound {
+            ask_steps.insert(id.clone());
+            for parent in &plan.steps {
+                if parent.subtasks.iter().any(|sub| sub.id == id) {
+                    ask_steps.insert(parent.id.clone());
+                }
+            }
+        }
+    }
     let next = left
         .iter()
         .filter(|step| step.state == crate::contracts::StepState::Left)
         .find(|step| {
+            if !ask_steps.is_empty() {
+                // Any direct or transitive --after edge to an ask-bound step
+                // makes this step dependent on Rolf's unanswered call.
+                let mut seen = std::collections::BTreeSet::new();
+                let mut pending = vec![step.id.as_str()];
+                while let Some(id) = pending.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    if ask_steps.contains(id) {
+                        return false;
+                    }
+                    let Some(bound) = crate::plan::all_steps(plan).find(|s| s.id == id) else {
+                        return false;
+                    };
+                    pending.extend(bound.after.iter().map(String::as_str));
+                }
+            }
             // Use the same evidence gate as `thread start` for bound tasks.
             let gate = step
                 .tasks
@@ -2473,7 +2568,17 @@ fn plan_nudge(
             }
             true
         });
-    let line = if let Some(next) = next {
+    if !asks.is_empty() && next.is_none() {
+        return Ok(());
+    }
+    let line = if !asks.is_empty() {
+        let next = next.expect("open asks require an independent step");
+        format!(
+            "{} Rolf has an unanswered ask; independent step {} is ready. Start only work that does not require that answer.",
+            steps::TICKER_PROMPT_PREFIX,
+            next.id
+        )
+    } else if let Some(next) = next {
         format!(
             "{} Nothing is running and {} steps are left. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
             steps::TICKER_PROMPT_PREFIX,
@@ -3340,6 +3445,94 @@ mod tests {
         assert!(saved.connection_waiting);
         assert_eq!(saved.launch_attempts, 1);
         assert_eq!(runner.count("agent prompt"), 2);
+    }
+
+    #[test]
+    fn post_start_blocked_lane_alerts_once_and_working_rearms_it_without_keys() {
+        let f = fixture(false);
+        let runner = FakeRunner::new();
+        runner.on("pane read", ok("❯ \n"));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let lane = thread::allocate(&f.project, |t| {
+            t.status = thread::Status::Open;
+            t.pane_id = "w1:p2".into();
+            t.tab_id = "w1:t2".into();
+            t.workspace_id = "w1".into();
+            t.cwd = "/lane".into();
+            t.agent_name = "hp-demo-t-0001".into();
+            t.last_state = "blocked".into();
+            t.last_state_change = "2020-01-01T00:00:00Z".into();
+            t.last_group = "working".into();
+        })
+        .unwrap();
+        let coordinator = f.project.coordinator().unwrap();
+        let coordinator_agent = Agent {
+            pane_id: coordinator.pane_id,
+            tab_id: coordinator.tab_id,
+            workspace_id: coordinator.workspace_id,
+            cwd: coordinator.cwd,
+            name: coordinator.agent_name,
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let mut agent = Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+            name: lane.agent_name.clone(),
+            agent_status: "blocked".into(),
+            ..Agent::default()
+        };
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let herdr = Herdr::new("herdr", "", &runner);
+        let poll = |agent: &Agent| {
+            let current = thread::load(&f.project, &lane.id).unwrap();
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &f.project,
+                    herdr: &herdr,
+                    threads: &[current],
+                    agents: &[agent.clone(), coordinator_agent.clone()],
+                    panes: &[],
+                },
+                "ha",
+                None,
+                false,
+            )
+            .unwrap();
+        };
+        poll(&agent);
+        poll(&agent);
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains(&format!(
+                    "BLOCKED {} awaits interactive approval in w1:p2; no keys were sent",
+                    lane.id
+                )))
+        );
+        assert_eq!(runner.count("pane submit-text"), 0);
+        agent.agent_status = "working".into();
+        poll(&agent);
+        assert_eq!(
+            thread::load(&f.project, &lane.id).unwrap().last_group,
+            "working"
+        );
+        agent.agent_status = "blocked".into();
+        poll(&agent);
+        // The new spell starts a fresh duration, not an instant alert.
+        assert_eq!(runner.count("agent prompt"), 1);
     }
 
     #[test]
@@ -4494,6 +4687,75 @@ mod tests {
         crate::prompt::record_test_request(&f.project, "q-100", "Keep going").unwrap();
         nudge_pass(&f, &runner, &[agent]);
         assert_eq!(runner.count("agent prompt"), 4);
+    }
+
+    #[test]
+    fn an_open_ask_allows_only_independent_steps_and_answer_rearms_normal_nudge() {
+        let (f, runner, agent) = nudge_setup();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        crate::prompt::record_test_request(&f.project, "q-100", "Go").unwrap();
+        let task = crate::task::add(
+            &f.project,
+            "Call for Rolf",
+            vec!["request:q-100".into()],
+            vec!["Decide".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        crate::plan::step_add(
+            &ctx,
+            "demo",
+            "Ask-tied",
+            vec![task.id.clone()],
+            vec![],
+            None,
+        )
+        .unwrap();
+        crate::plan::step_add(&ctx, "demo", "Dependent", vec![], vec!["s-1".into()], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Independent", vec![], vec![], None).unwrap();
+        let ask = crate::ask::ask(
+            &ctx,
+            "demo",
+            crate::ask::NewAsk {
+                question: "Which?".into(),
+                choices: vec!["One".into(), "Two".into()],
+                what: None,
+                means: None,
+                task: Some(task.id),
+            },
+        )
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 1);
+        let prompts = runner.calls.borrow();
+        let line = prompts
+            .iter()
+            .find(|call| call.display().contains("independent step"))
+            .unwrap()
+            .display();
+        assert!(line.contains("independent step s-3 is ready"));
+        assert!(line.contains("Start only work that does not require that answer"));
+        assert!(!line.contains("s-1"));
+        assert!(!line.contains("s-2"));
+        drop(prompts);
+        crate::ask::answer(&ctx, "demo", &ask.id, ask.revision, 1, "Rolf").unwrap();
+        nudge_pass(&f, &runner, &[agent]);
+        assert_eq!(runner.count("agent prompt"), 2);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("Next: s-1 Ask-tied"))
+        );
     }
 
     #[test]
