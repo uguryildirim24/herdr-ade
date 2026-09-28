@@ -159,6 +159,32 @@ fn reviewer_ids(project: &Project) -> Result<std::collections::BTreeSet<String>>
         .iter()
         .filter_map(|review| review.reviewer.clone())
         .collect();
+    // Rounds predate pile reviews. Their reviewer lanes must not become pile
+    // members merely because the old round records are no longer advanced.
+    let rounds = project.state_dir().join("rounds");
+    if rounds.exists() {
+        for entry in std::fs::read_dir(rounds)? {
+            let path = entry?.path();
+            if !path.extension().is_some_and(|ext| ext == "toml") {
+                continue;
+            }
+            #[derive(Deserialize)]
+            struct RoundReviewer {
+                reviewer: Option<String>,
+            }
+            // Historical round files can be malformed; they are never written
+            // by the pile reader, and an unrelated bad file must not stop it.
+            let Some(record) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| toml::from_str::<RoundReviewer>(&text).ok())
+            else {
+                continue;
+            };
+            if let Some(id) = record.reviewer.filter(|id| !id.is_empty()) {
+                ids.insert(id);
+            }
+        }
+    }
     // Allocation can crash before the review record binds its reviewer.
     // Only the review start path writes review_id on a lane.
     for lane in thread::list(project) {
@@ -344,6 +370,15 @@ fn repo_identity(repo: &str) -> PathBuf {
 fn same_repo(a: &str, b: &str) -> bool {
     a == b || repo_identity(a) == repo_identity(b)
 }
+#[derive(Debug)]
+struct UnconfiguredRepo;
+impl std::fmt::Display for UnconfiguredRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("review repository is not configured")
+    }
+}
+impl std::error::Error for UnconfiguredRepo {}
+
 fn repository(ctx: &Ctx, project: &Project, requested: Option<&str>) -> Result<project::Repo> {
     let mut rows = project.read_project_md()?.0.repos;
     let primary = (rows.len() == 1).then(|| rows[0].path.clone());
@@ -356,7 +391,7 @@ fn repository(ctx: &Ctx, project: &Project, requested: Option<&str>) -> Result<p
         Some(repo) => rows
             .into_iter()
             .find(|row| same_repo(&row.path, repo))
-            .context("review repository is not configured"),
+            .ok_or_else(|| UnconfiguredRepo.into()),
         None => {
             let events = crate::events::checked(project)?;
             let reviewers = reviewer_ids(project)?;
@@ -1478,6 +1513,32 @@ pub(crate) fn require_resolvable(project: &Project, id: &str) -> Result<()> {
     }
     Ok(())
 }
+// The lane remains eligible if its repository is configured again. Cache only
+// the warning, not the classification, so repeated reads stay quiet.
+fn lane_repository(
+    ctx: &Ctx,
+    project: &Project,
+    lane: &Thread,
+    seal: &str,
+) -> Result<Option<project::Repo>> {
+    match repository(ctx, project, Some(&lane.repo)) {
+        Ok(row) => Ok(Some(row)),
+        Err(error) if error.is::<UnconfiguredRepo>() => {
+            if lane.unconfigured_repo_seal != seal {
+                eprintln!(
+                    "note: {}/{} seal {} skipped: repository {} is not configured",
+                    project.slug, lane.id, seal, lane.repo
+                );
+                thread::update(project, &lane.id, |t| {
+                    t.unconfigured_repo_seal = seal.to_owned()
+                })?;
+            }
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Classify old seals outside the open pile. The seal id is the cache key: a
 /// later attempt/follow-up can be classified afresh, but idle passes do no git.
 pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: bool) -> Result<()> {
@@ -1502,7 +1563,9 @@ pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: boo
             continue;
         }
         let done = event.payload.done.as_ref().expect("sealed done");
-        let row = repository(ctx, project, Some(&lane.repo))?;
+        let Some(row) = lane_repository(ctx, project, &lane, &event.id)? else {
+            continue;
+        };
         let Some(_lock) = try_operation_lock(ctx, &row.path)? else {
             continue;
         };
@@ -1651,11 +1714,19 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             let Some(_lock) = try_operation_lock(ctx, &repo)? else {
                 continue;
             };
-            if active_for_repo(ctx, &repo)?.is_none()
-                && let Err(error) =
-                    start_locked(ctx, project, repository(ctx, project, Some(&repo))?)
-            {
-                first.get_or_insert(error);
+            if active_for_repo(ctx, &repo)?.is_none() {
+                let mut configured = None;
+                for lane in pending_from(threads.clone(), &repo, &events, &reviewers) {
+                    let seal = sealed(&events, &lane).expect("pending seal");
+                    if let Some(row) = lane_repository(ctx, project, &lane, &seal.id)? {
+                        configured = Some(row);
+                    }
+                }
+                if let Some(row) = configured
+                    && let Err(error) = start_locked(ctx, project, row)
+                {
+                    first.get_or_insert(error);
+                }
             }
         }
     }
