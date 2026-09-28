@@ -1184,7 +1184,7 @@ mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn install_proof_names_the_lock_holder_not_an_installers_child() {
@@ -1716,6 +1716,72 @@ mod tests {
             out.stdout
         );
         assert!(!out.stdout.contains("HERDR_ADE_BOX_TICKER_STALE="));
+    }
+
+    #[test]
+    fn installing_the_same_clean_commit_keeps_every_installed_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        // This checks the install decision, not scheduling external version
+        // probes under load. The old shell probes could fail and silently
+        // turn a skip into an install, making an inode assertion flaky.
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.args == ["--version"],
+            |cmd| {
+                let bin = Path::new(&cmd.program)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                let version = if bin == "herdr" {
+                    "0.9.1".to_string()
+                } else {
+                    let stamp = if cmd.program.contains("/target/release/") {
+                        200
+                    } else {
+                        100
+                    };
+                    format!("0.1.0+abc1234.{stamp}")
+                };
+                Ok(ok(&format!("{bin} {version}\n")))
+            },
+        );
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().join("root"),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let repo = root.path().join("repo");
+        let release = repo.join("target/release");
+        let installed_dir = root.path().join(".local/bin");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::create_dir_all(&installed_dir).unwrap();
+        for bin in ["herdr-ade", "herdr-pi", "herdr-rundown", "herdr"] {
+            write_version_binary(&release.join(bin), "new version", "new stamp");
+            let installed = installed_dir.join(bin);
+            write_version_binary(&installed, "old version", "old stamp");
+            if bin == "herdr" {
+                std::fs::write(install_record(&installed_dir, bin), "abc1234\n").unwrap();
+            }
+            let before = std::fs::metadata(&installed).unwrap().ino();
+            local_install(&ctx, repo.to_str().unwrap(), bin, "abc1234", true).unwrap();
+            assert_eq!(
+                std::fs::metadata(&installed).unwrap().ino(),
+                before,
+                "{bin}"
+            );
+            assert!(
+                std::fs::read_to_string(&installed)
+                    .unwrap()
+                    .contains("old stamp"),
+                "{bin}"
+            );
+        }
+        assert_eq!(runner.count(" --version"), 8);
+        assert_eq!(runner.count("cp "), 0);
     }
 
     #[test]
