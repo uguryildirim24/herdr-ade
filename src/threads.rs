@@ -171,6 +171,7 @@ fn start_with_ticker(
     if args.task.trim().is_empty() {
         bail!("the task is empty");
     }
+    crate::plan::check_prerequisites(&project, &args.task_id)?;
     let (settings, _) = project.read_project_md()?;
     // Without a running ticker nothing launches. The advance path uses the
     // non-blocking ensure; every ordinary start replaces a stale ticker.
@@ -586,6 +587,7 @@ fn provider_readiness_error(error: &str) -> bool {
 
 /// Complete a provider-blocked placement through the ordinary startup path.
 pub(crate) fn resume_provider_start(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    crate::plan::check_attempt_prerequisites(project, id)?;
     let view = require_session(ctx, project)?;
     let waiting = thread::load(project, id)?;
     if waiting.is_remote() {

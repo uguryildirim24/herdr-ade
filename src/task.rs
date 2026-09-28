@@ -535,6 +535,10 @@ impl EvidenceSnapshot {
     pub(crate) fn events(&self) -> &[crate::contracts::Event] {
         &self.events
     }
+
+    pub(crate) fn readable(&self) -> bool {
+        self.readable
+    }
 }
 
 pub(crate) fn view(project: &Project, task: Task) -> View {
