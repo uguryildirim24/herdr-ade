@@ -178,8 +178,8 @@ fn delete_remote(
     }
 }
 
-/// Refuse an explicit retained-worktree removal if its checkout contains
-/// commits not at the published branch tip. No implicit force-push or loss.
+/// Pin the checked-out branch tip for explicit retained-worktree removal.
+/// Box lanes must also match their published tip; local lanes need no publication.
 pub(crate) fn require_published_tip(
     ctx: &Ctx,
     project: &Project,
@@ -188,8 +188,8 @@ pub(crate) fn require_published_tip(
     if record.branch.is_empty() || !harness_ref(&record.branch) {
         bail!("{} has no owned branch", record.id);
     }
-    let (settings, _) = project.read_project_md()?;
-    let (tip, url) = if record.is_remote() {
+    if record.is_remote() {
+        let (settings, _) = project.read_project_md()?;
         let profile = crate::remote::machine_profile(
             ctx.runner,
             &ctx.env.herdr_bin(),
@@ -225,7 +225,18 @@ pub(crate) fn require_published_tip(
                 record.worktree_path
             );
         }
-        (tip.to_string(), Some(url))
+        let tip = tip.to_string();
+        if refs(ctx.runner, &record.repo, Some(&url))?.get(&record.branch) != Some(&tip)
+            || refs(ctx.runner, &record.repo, None)?
+                .get(&record.branch)
+                .is_some_and(|local| local != &tip)
+        {
+            bail!(
+                "branch {} has unpushed commits or has moved since publication",
+                record.branch
+            );
+        }
+        Ok(tip)
     } else {
         let checked_out = git(
             ctx.runner,
@@ -255,30 +266,8 @@ pub(crate) fn require_published_tip(
                 record.worktree_path
             );
         }
-        let url = settings
-            .repos
-            .iter()
-            .find(|row| row.path == record.repo)
-            .and_then(|row| row.publish_url.clone().or_else(|| row.push_remote.clone()));
-        (tip.trim().to_string(), url)
-    };
-    let Some(url) = url else {
-        bail!(
-            "no publication destination for {}; cannot prove commits are pushed",
-            record.branch
-        );
-    };
-    if refs(ctx.runner, &record.repo, Some(&url))?.get(&record.branch) != Some(&tip)
-        || refs(ctx.runner, &record.repo, None)?
-            .get(&record.branch)
-            .is_some_and(|local| local != &tip)
-    {
-        bail!(
-            "branch {} has unpushed commits or has moved since publication",
-            record.branch
-        );
+        Ok(tip.trim().to_string())
     }
-    Ok(tip)
 }
 
 /// Called after a worktree has gone. A failed deletion remains retryable via
@@ -917,6 +906,133 @@ mod tests {
         )
         .unwrap();
         (fx, bare)
+    }
+
+    fn retained_lane(fx: &crate::testkit::Fx, branch: &str) -> Thread {
+        let path = fx.world.home.path().join("retained");
+        run(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        thread::allocate(&fx.project, |t| {
+            t.repo = fx.repo.to_string_lossy().into_owned();
+            t.branch = branch.into();
+            t.worktree_path = path.to_string_lossy().into_owned();
+            t.status = Status::Resolved;
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn local_retained_checkout_needs_no_published_branch() {
+        let (fx, bare) = configured();
+        let mut record = retained_lane(&fx, "hp/demo/local");
+        let tip = run(&fx.repo, &["rev-parse", &record.branch]);
+        let remote = bare.path().to_str().unwrap();
+        assert!(
+            !refs(&crate::runner::RealRunner, &record.repo, Some(remote))
+                .unwrap()
+                .contains_key(&record.branch)
+        );
+        assert_eq!(
+            require_published_tip(&fx.world.ctx(), &fx.project, &record).unwrap(),
+            tip
+        );
+        run(&fx.repo, &["worktree", "remove", &record.worktree_path]);
+        record.cleanup_reason = format!("retained worktree removal: {tip}");
+        resolved_thread(&fx.world.ctx(), &fx.project, &record).unwrap();
+        assert!(
+            !refs(&crate::runner::RealRunner, &record.repo, None)
+                .unwrap()
+                .contains_key(&record.branch)
+        );
+    }
+
+    #[test]
+    fn local_retained_checkout_needs_no_publication_destination() {
+        let fx = crate::testkit::fixture();
+        let record = retained_lane(&fx, "hp/demo/no-remote");
+        assert_eq!(
+            require_published_tip(&fx.world.ctx(), &fx.project, &record).unwrap(),
+            run(&fx.repo, &["rev-parse", &record.branch])
+        );
+    }
+
+    #[test]
+    fn local_retained_checkout_refuses_head_different_from_branch() {
+        let (fx, _bare) = configured();
+        let mut record = retained_lane(&fx, "hp/demo/moved");
+        // A checkout at the recorded path can be replaced by a different repo
+        // with the same branch name; its HEAD must not authorize deleting ours.
+        let other = tempfile::tempdir().unwrap();
+        run(other.path(), &["init", "-q", "-b", &record.branch]);
+        run(other.path(), &["config", "user.name", "Test"]);
+        run(other.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(other.path().join("README"), "different").unwrap();
+        run(other.path(), &["add", "README"]);
+        run(other.path(), &["commit", "-qm", "different"]);
+        record.worktree_path = other.path().to_string_lossy().into_owned();
+        let error = require_published_tip(&fx.world.ctx(), &fx.project, &record)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has moved since the branch check"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn box_retained_checkout_refuses_moved_published_branch() {
+        let (fx, bare) = configured();
+        let branch = "hp/demo/box";
+        let record = thread::allocate(&fx.project, |t| {
+            t.repo = fx.repo.to_string_lossy().into_owned();
+            t.branch = branch.into();
+            t.worktree_path = "/box/retained".into();
+            t.machine = "box".into();
+            t.status = Status::Resolved;
+        })
+        .unwrap();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].box_path = Some("/box/repo".into());
+        settings.repos[0].publish_url = Some(bare.path().to_string_lossy().into_owned());
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        let sealed = run(&fx.repo, &["rev-parse", "HEAD"]);
+        run(&fx.repo, &["branch", branch, &sealed]);
+        run(
+            &fx.repo,
+            &["push", "-q", bare.path().to_str().unwrap(), branch],
+        );
+        let moved = run(&fx.repo, &["commit-tree", "HEAD^{tree}", "-m", "moved"]);
+        fx.world
+            .runner
+            .on("machine list --json", crate::runner::fake::ok("[]"));
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |_| {
+                Ok(crate::runner::fake::ok(&format!(
+                    "refs/heads/{branch}\n{moved}\n{moved}\n"
+                )))
+            },
+        );
+        let error = require_published_tip(&fx.world.ctx(), &fx.project, &record)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unpushed commits or has moved since publication"),
+            "{error}"
+        );
     }
 
     #[test]
