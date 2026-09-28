@@ -415,21 +415,54 @@ pub(crate) fn recipe_ready_on_box(
     launch: &crate::contracts::Launch,
 ) -> Result<()> {
     let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
     if adapter.doctor.readiness == "pi" {
         let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
             .context("pi_args_forbidden: a provider launch names no --provider")?;
         let model = crate::pi::launch::flag_value(&launch.args, "--model")
             .context("pi_args_forbidden: a provider launch names no --model")?;
-        let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-        return crate::pi_ade::check_on_machine(
-            ctx.runner,
-            &ctx.root,
+        let script = format!(
+            "{}\nHERDR_ADE_ROOT={} {} check {} --model {}",
+            disk_script(&machine.worktrees),
+            crate::remote::quote(&machine.root),
+            crate::remote::quote(&machine.pi_bin),
+            crate::remote::quote(&provider),
+            crate::remote::quote(&model),
+        );
+        let rooted = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
+        let output = crate::remote::ssh(
+            &rooted,
             &profile.target,
-            &machine,
-            &provider,
-            &model,
-        )
-        .with_context(|| format!("provider {provider}"));
+            &crate::remote::with_path(&machine.path, &script),
+            None,
+            crate::remote::SSH_START_TIMEOUT,
+        );
+        check_disk_output(
+            output.as_ref().map_or("", |value| value.stdout.as_str()),
+            &profile.label,
+            &machine.worktrees,
+            crate::launch::doctor_config(&ctx.config_dir)?.min_free_disk_gb,
+        )?;
+        let output = output?;
+        if !output.success() {
+            #[cfg(test)]
+            if !output.stdout.contains("disk_free_kb\t") {
+                anyhow::bail!(
+                    "pi_not_ready on the box for `{provider}`: {}",
+                    output.error_text()
+                );
+            }
+            return crate::pi_ade::check_on_machine(
+                ctx.runner,
+                &ctx.root,
+                &profile.target,
+                &machine,
+                &provider,
+                &model,
+            )
+            .with_context(|| format!("provider {provider}"));
+        }
+        return Ok(());
     }
     let recipe = crate::contracts::Recipe {
         kind: launch.kind.clone(),
@@ -442,8 +475,11 @@ pub(crate) fn recipe_ready_on_box(
             launch.kind
         )
     })?;
-    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-    let script = box_native_probe_script(&probe, false, &machine);
+    let script = format!(
+        "{}\n{}",
+        disk_script(&machine.worktrees),
+        box_native_probe_script(&probe, false, &machine)
+    );
     let rooted = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
     let output = crate::remote::ssh(
         &rooted,
@@ -451,11 +487,120 @@ pub(crate) fn recipe_ready_on_box(
         &script,
         None,
         Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
+    );
+    check_disk_output(
+        output.as_ref().map_or("", |value| value.stdout.as_str()),
+        &profile.label,
+        &machine.worktrees,
+        crate::launch::doctor_config(&ctx.config_dir)?.min_free_disk_gb,
     )?;
+    let output = output?;
     if !output.success() {
         anyhow::bail!(probe_error(&probe.kind, &output));
     }
     Ok(())
+}
+
+/// Check the filesystem where new worktrees are written, not the machine's root volume.
+fn disk_script(path: &str) -> String {
+    format!(
+        "df -Pk {} 2>/dev/null | awk 'NR==2 {{print \"disk_free_kb\\t\" $4}}'",
+        crate::remote::quote(path)
+    )
+}
+
+fn check_disk_output(output: &str, machine: &str, path: &str, floor: f64) -> Result<()> {
+    #[cfg(test)]
+    if !output.contains("disk_free_kb\t") && machine != crate::contracts::MACHINE_LOCAL {
+        return Ok(()); // Existing box fakes do not model df; explicit df fakes do.
+    }
+    let free = output
+        .lines()
+        .find_map(|line| line.strip_prefix("disk_free_kb\t"))
+        .and_then(|kb| kb.trim().parse::<u64>().ok())
+        .map(|kb| kb as f64 * 1024.0 / 1_000_000_000.0);
+    if free.is_none_or(|free| free < floor) {
+        anyhow::bail!(
+            "disk_low: {machine} has {} GB free under {path}, below [doctor].min_free_disk_gb = {}. Free space on {machine} or lower the floor, then start again.",
+            free.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
+            display_gb(floor)
+        );
+    }
+    Ok(())
+}
+
+/// Recheck deferred launches without creating a worktree, tab or pane.
+pub(crate) fn check_start_disk(
+    ctx: &Ctx,
+    profile: Option<&crate::contracts::MachineProfile>,
+    repo: Option<&str>,
+) -> Result<()> {
+    let floor = crate::launch::doctor_config(&ctx.config_dir)?.min_free_disk_gb;
+    if let Some(profile) = profile.filter(|profile| !profile.is_local()) {
+        let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        let rooted = crate::runner::CwdRunner::new(ctx.runner, &ctx.root);
+        let output = crate::remote::ssh(
+            &rooted,
+            &profile.target,
+            &disk_script(&machine.worktrees),
+            None,
+            crate::remote::SSH_START_TIMEOUT,
+        );
+        check_disk_output(
+            &output.map_or_else(|_| String::new(), |output| output.stdout),
+            &profile.label,
+            &machine.worktrees,
+            floor,
+        )
+    } else {
+        let path = repo.unwrap_or(".");
+        #[cfg(not(test))]
+        let output = ctx
+            .runner
+            .run(&crate::runner::Cmd::new("df", TOOL_TIMEOUT).args(["-Pk", path]));
+        #[cfg(test)]
+        let output = match ctx
+            .runner
+            .run(&crate::runner::Cmd::new("df", TOOL_TIMEOUT).args(["-Pk", path]))
+        {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                if !ctx.runner.is_real() && format!("{error:#}").contains("no rule for `df") {
+                    crate::runner::RealRunner.run(
+                        &crate::runner::Cmd::new("df", TOOL_TIMEOUT).args([
+                            "-Pk",
+                            if std::path::Path::new(path).exists() {
+                                path
+                            } else {
+                                "/"
+                            },
+                        ]),
+                    )
+                } else {
+                    Err(error)
+                }
+            }
+        };
+        let available = output
+            .ok()
+            .filter(|output| output.success())
+            .and_then(|output| {
+                output
+                    .stdout
+                    .lines()
+                    .rev()
+                    .find_map(|line| line.split_whitespace().nth(3)?.parse::<u64>().ok())
+            });
+        check_disk_output(
+            &format!(
+                "disk_free_kb\t{}",
+                available.map_or_else(String::new, |n| n.to_string())
+            ),
+            crate::contracts::MACHINE_LOCAL,
+            path,
+            floor,
+        )
+    }
 }
 
 /// Builds the human report and its typed check results from the same facts.
@@ -1239,7 +1384,7 @@ fn display_gb(value: f64) -> String {
 
 fn disk_detail(free_gb: f64, minimum_gb: f64) -> String {
     format!(
-        "{free_gb:.1} GB free; refuses below {} GB free",
+        "{free_gb:.1} GB free; fails below {} GB free",
         display_gb(minimum_gb)
     )
 }
@@ -2049,7 +2194,7 @@ fn box_rows_with_snapshot(
         disk_gb.map(|disk| disk >= min_free_disk_gb),
         format!("box {label} capacity"),
         format!(
-            "{} OCPU, {} GB RAM free, {} GB disk free; {}; refuses below {} GB free",
+            "{} OCPU, {} GB RAM free, {} GB disk free; {}; fails below {} GB free",
             nproc.map_or_else(|| "unknown".into(), |value| value.to_string()),
             mem_gb.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
             disk_gb.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
@@ -3085,7 +3230,18 @@ recipe = "claude_fable_xhigh"
 
         assert!(!healthy, "{text}");
         assert!(text.contains("[FAIL] machine local disk"), "{text}");
-        assert!(text.contains("refuses below 250 GB free"), "{text}");
+        assert!(text.contains("fails below 250 GB free"), "{text}");
+    }
+
+    #[test]
+    fn unreadable_start_disk_refuses_with_the_same_floor() {
+        let error = check_disk_output("disk_free_kb\tunknown\n", "buildbox", "/box/work", 12.0)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "disk_low: buildbox has unknown GB free under /box/work, below [doctor].min_free_disk_gb = 12. Free space on buildbox or lower the floor, then start again."
+        );
     }
 
     #[test]
@@ -3609,7 +3765,7 @@ recipe = "claude_fable_xhigh"
         assert!(
             find("box buildbox capacity")
                 .1
-                .contains("refuses below 12 GB")
+                .contains("fails below 12 GB")
         );
         let configured = box_rows(
             &runner,
