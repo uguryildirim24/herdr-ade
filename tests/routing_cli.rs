@@ -27,7 +27,7 @@ fn coordinator_cannot_select_a_role_or_model() {
 }
 
 #[test]
-fn an_exact_recipe_requires_rolfs_quoted_words() {
+fn an_exact_recipe_needs_no_quote_and_basis_is_not_a_lane_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-ade"))
         .args([
             "thread",
@@ -44,8 +44,25 @@ fn an_exact_recipe_requires_rolfs_quoted_words() {
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("--basis"), "{error}");
-    assert!(!error.contains("unexpected argument '--recipe'"), "{error}");
+    assert!(error.contains("could not read brief.md"), "{error}");
+    assert!(!error.contains("--basis"), "{error}");
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-ade"))
+        .args([
+            "thread",
+            "start",
+            "demo",
+            "--task-file",
+            "brief.md",
+            "--recipe",
+            "chosen",
+            "--basis",
+            "old quote",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("unexpected argument '--basis'"), "{error}");
 }
 
 #[test]

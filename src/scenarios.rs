@@ -1472,7 +1472,6 @@ fn thread_start_is_refused_when_paused() {
         plain: "The lane does the work.".into(),
         workflow: None,
         recipe: None,
-        recipe_basis: None,
         task_id: String::new(),
         review_id: String::new(),
     };
@@ -1986,7 +1985,6 @@ fn a_thread_without_any_listed_repo_is_refused() {
         plain: "The lane does the work.".into(),
         workflow: None,
         recipe: None,
-        recipe_basis: None,
         task_id: String::new(),
         review_id: String::new(),
     };
@@ -2063,6 +2061,40 @@ fn open_leaves_a_matching_label_alone_and_a_failed_rename_does_not_block_it() {
     world.runner.on("workspace rename", fail(1, "boom"));
     open_alive(&world, &project).unwrap();
     assert_eq!(world.runner.count("workspace rename"), 1);
+}
+
+#[test]
+fn explicit_lane_recipe_still_checks_validity() {
+    let world = World::new();
+    let config = world.home.path().join("cfg/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[recipes.disabled_choice]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nenabled = false\nplain = \"disabled\"\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let project = world.project("demo", "a.sock");
+    let validate = |recipe, task| {
+        crate::launch::validate_explicit_recipe(
+            &world.ctx(),
+            &project,
+            "job-1",
+            task,
+            "lane",
+            recipe,
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    let unknown = validate("not_configured", "Do the work.");
+    assert!(unknown.contains("routing_recipe_unknown"), "{unknown}");
+    assert!(validate("disabled_choice", "Do the work.").contains("routing_recipe_disabled"));
+    assert!(
+        validate(
+            "test_claude",
+            "+++\ncapability = \"not-declared\"\n+++\nDo the work."
+        )
+        .contains("routing_capability_missing")
+    );
 }
 
 #[test]

@@ -122,10 +122,8 @@ pub struct StartArgs {
     pub plain: String,
     /// Internal flow/skill label; never a coordinator model-selection input.
     pub workflow: Option<String>,
-    /// An exact recipe Rolf named for this one lane.
+    /// An exact recipe the coordinator chose for this one lane.
     pub recipe: Option<String>,
-    /// Verbatim words from a Rolf request attached to `task_id`.
-    pub recipe_basis: Option<String>,
     pub task_id: String,
     /// Internal reviewer identity; empty for every non-reviewer start.
     pub review_id: String,
@@ -163,7 +161,7 @@ fn start_with_ticker(
     let project = Project::load(&ctx.root, slug)?;
     if args.workflow.as_deref() == Some("reviewer") && args.review_id.is_empty() {
         bail!(
-            "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id> --basis \"<Rolf's words>\"."
+            "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id>."
         );
     }
     let status = project.status();
@@ -254,27 +252,16 @@ fn start_with_ticker(
     let listed = settings.repos.iter().find(|row| {
         std::fs::canonicalize(&row.path).is_ok_and(|path| path.to_string_lossy() == repo)
     });
-    let recipe_request = match &args.recipe {
-        Some(recipe) => Some(crate::launch::authorize_explicit_recipe(
+    if let Some(recipe) = &args.recipe {
+        crate::launch::validate_explicit_recipe(
             ctx,
             &project,
             &args.task_id,
             &args.task,
             role,
             recipe,
-            args.recipe_basis.as_deref().unwrap_or_default(),
-        )?),
-        None if args.recipe_basis.is_some() => {
-            return Err(crate::refusal::error(
-                "recipe_basis_without_recipe: --basis is only valid with --recipe",
-                format!(
-                    "ha thread start {} --job <job> --task-file <file> --recipe <recipe> --basis \"<Rolf quote>\"",
-                    project.slug
-                ),
-            ));
-        }
-        None => None,
-    };
+        )?;
+    }
     let mut launch = crate::launch::resolve_launch(
         ctx,
         &project,
@@ -282,8 +269,8 @@ fn start_with_ticker(
             task: &args.task,
             workflow: role,
             recipe: args.recipe.as_deref(),
-            recipe_basis: args.recipe_basis.as_deref().map(str::trim),
-            recipe_request: recipe_request.as_deref(),
+            recipe_basis: None,
+            recipe_request: None,
             source_truncation: source_truncation.as_ref(),
             ..Default::default()
         },
@@ -5439,7 +5426,6 @@ mod tests {
                 plain: "The lane repairs the project.".into(),
                 workflow: None,
                 recipe: None,
-                recipe_basis: None,
                 task_id: String::new(),
                 review_id: String::new(),
             },
@@ -5473,7 +5459,7 @@ mod tests {
     }
 
     #[test]
-    fn ade_start_with_a_job_keeps_the_lead_brief_across_retry() {
+    fn explicit_recipe_without_a_request_quote_keeps_the_lead_brief_across_retry() {
         use crate::runner::fake::ok;
         use crate::scenarios::{World, pane_json};
 
@@ -5510,7 +5496,7 @@ mod tests {
         std::fs::create_dir_all(world.home.path().join("cfg")).unwrap();
         std::fs::write(
             world.home.path().join("cfg/config.toml"),
-            "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n",
+            "[routing]\ndefault = \"test_claude\"\nretries = 1\n\n[recipes.test_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the quick helper\"\n\n[recipes.chosen_claude]\nkind = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\nplain = \"the coordinator's choice\"\n",
         )
         .unwrap();
 
@@ -5552,8 +5538,7 @@ mod tests {
                 task: lead_brief.into(),
                 plain: "The lane does the work.".into(),
                 workflow: None,
-                recipe: None,
-                recipe_basis: None,
+                recipe: Some("chosen_claude".into()),
                 // The CLI maps `--job` to this stable task id.
                 task_id: stable_task.id.clone(),
                 review_id: String::new(),
@@ -5561,6 +5546,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(started.role, "lane");
+        assert_eq!(started.launch.recipe_id, "chosen_claude");
+        assert_eq!(started.launch.routing_rule, "explicit");
+        assert!(started.launch.recipe_basis.is_empty());
+        assert!(started.launch.recipe_request.is_empty());
         assert!(!started.launch.kind.is_empty());
         assert!(!started.launch.brief_hash.is_empty());
         assert_eq!(started.attempt, 1);
@@ -5754,7 +5743,6 @@ mod tests {
             plain: "The lane does the work.".into(),
             workflow: None,
             recipe: None,
-            recipe_basis: None,
             task_id: String::new(),
             review_id: String::new(),
         };
@@ -5799,7 +5787,6 @@ mod tests {
                 plain: String::new(),
                 workflow: None,
                 recipe: None,
-                recipe_basis: None,
                 task_id: String::new(),
                 review_id: String::new(),
             },
@@ -5981,7 +5968,6 @@ mod tests {
             plain: "The lane does the work.".into(),
             workflow: None,
             recipe: None,
-            recipe_basis: None,
             task_id: String::new(),
             review_id: String::new(),
         }
@@ -5997,7 +5983,7 @@ mod tests {
             .to_string();
         assert_eq!(
             error,
-            "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id> --basis \"<Rolf's words>\"."
+            "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id>."
         );
     }
 

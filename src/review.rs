@@ -849,7 +849,6 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     plain: "Check the finished work together and land what is ready".into(),
                     workflow: Some("reviewer".into()),
                     recipe: None,
-                    recipe_basis: None,
                     task_id: String::new(),
                     review_id: review.id.clone(),
                 },
