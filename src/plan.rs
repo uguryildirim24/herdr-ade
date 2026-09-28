@@ -421,7 +421,7 @@ pub(crate) fn step_unlink(
     id: &str,
     tasks: Vec<String>,
     after: Vec<String>,
-    _why: &str,
+    why: &str,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
@@ -431,12 +431,34 @@ pub(crate) fn step_unlink(
             format!("ha plan step unlink {slug} {id} --after <step-id> --why <reason>"),
         ));
     }
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, (removed_tasks, removed_after, changed)) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
+        let removed_tasks: Vec<_> = step
+            .tasks
+            .iter()
+            .filter(|t| tasks.contains(t))
+            .cloned()
+            .collect();
+        let removed_after: Vec<_> = step
+            .after
+            .iter()
+            .filter(|a| after.contains(a))
+            .cloned()
+            .collect();
         step.tasks.retain(|task| !tasks.contains(task));
-        step.after.retain(|id| !after.contains(id));
-        Ok(())
+        step.after.retain(|edge| !after.contains(edge));
+        let changed = !removed_tasks.is_empty() || !removed_after.is_empty();
+        Ok((removed_tasks, removed_after, changed))
     })?;
+    if changed {
+        crate::launch::dispatch(
+            &project,
+            serde_json::json!({
+                "kind": "plan-unlink", "step": id, "after": removed_after,
+                "tasks": removed_tasks, "why": why, "revision": plan.revision,
+            }),
+        )?;
+    }
     Ok(plan)
 }
 
@@ -641,6 +663,13 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
                 } else {
                     prerequisite.state
                 };
+                if let Some(thread) = failed_check(project, prerequisite, &evidence) {
+                    bail!(
+                        "plan_prerequisite: {job} cannot start; step {} waits for {} (check failed: {thread} verdict FAIL). Send the work back with ha thread prompt and get a fresh verdict, or change the plan.",
+                        dependent.id,
+                        id
+                    );
+                }
                 bail!(
                     "plan_prerequisite: {job} cannot start; step {} waits for {} ({}). Finish the bound work and run ha plan sync {}, or change the plan before starting.",
                     dependent.id,
@@ -795,6 +824,65 @@ fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
         })
 }
 
+fn critic_failed(
+    project: &Project,
+    lane: &thread::Thread,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> bool {
+    if lane.role != "critic" {
+        return false;
+    }
+    // Keep a failed verdict blocking even while a follow-up invalidates its
+    // completion; only a later sealed PASS can replace that FAIL.
+    crate::events::latest_done_event(evidence.events(), &lane.id, lane.attempt.max(1))
+        .and_then(|event| event.payload.done.as_ref())
+        .and_then(|done| thread::artifact(project, &done.artifact).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| crate::lane::critic_verdict(&text))
+        .as_deref()
+        == Some("FAIL")
+}
+
+fn task_failed_check(
+    project: &Project,
+    task: &crate::task::Task,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> Option<String> {
+    let id = task.attempts.last()?;
+    let lane = thread::load(project, id).ok()?;
+    critic_failed(project, &lane, evidence).then_some(lane.id)
+}
+
+fn failed_check(
+    project: &Project,
+    step: &PlanStep,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> Option<String> {
+    let tasks = crate::task::list_with_errors(project).0;
+    for task in tasks.iter().filter(|task| {
+        task.dropped.is_empty()
+            && (step.tasks.contains(&task.id) || task.plan_step.as_deref() == Some(&step.id))
+    }) {
+        if let Some(id) = task_failed_check(project, task, evidence) {
+            return Some(id);
+        }
+    }
+    for id in &step.threads {
+        let Ok(lane) = thread::load(project, id) else {
+            continue;
+        };
+        if critic_failed(project, &lane, evidence) {
+            return Some(id.clone());
+        }
+    }
+    for sub in &step.subtasks {
+        if let Some(id) = failed_check(project, sub, evidence) {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Derive each state in the fixed order (SPEC-talk §6.5): `done` when at least
 /// one binding exists and every binding is positively satisfied, else
 /// `running` when any required work has started or partially landed, else
@@ -839,7 +927,9 @@ fn derive_state_from_tasks(
         .all(|id| tasks.iter().any(|task| task.id == *id));
     let mut any_started = false;
     for view in linked_tasks {
-        if !view.terminal_with_evidence(project, evidence) {
+        if !view.terminal_with_evidence(project, evidence)
+            || task_failed_check(project, &view.record, evidence).is_some()
+        {
             all_satisfied = false;
         }
         if view.state != crate::task::State::Open {
@@ -850,7 +940,8 @@ fn derive_state_from_tasks(
         match thread::load(project, id) {
             Ok(lane) => {
                 any_started = true;
-                all_satisfied &= crate::review::lane_done(project, &lane, evidence.events());
+                all_satisfied &= crate::review::lane_done(project, &lane, evidence.events())
+                    && !critic_failed(project, &lane, evidence);
             }
             Err(_) => all_satisfied = false,
         }
@@ -1373,6 +1464,138 @@ mod tests {
         .unwrap();
         check_prerequisites(&fx.project, "job-0002").unwrap();
         check_attempt_prerequisites(&fx.project, &deferred).unwrap();
+    }
+
+    #[test]
+    fn failed_critic_blocks_dependent_until_fresh_pass_and_old_seals_still_count() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        for id in ["job-0001", "job-0002", "job-0003"] {
+            write_task(&fx, id);
+        }
+        step_add(&ctx, "demo", "A", vec!["job-0001".into()], vec![], None).unwrap();
+        step_add(
+            &ctx,
+            "demo",
+            "C",
+            vec!["job-0002".into()],
+            vec!["s-1".into()],
+            None,
+        )
+        .unwrap();
+        step_add(
+            &ctx,
+            "demo",
+            "D",
+            vec!["job-0003".into()],
+            vec!["s-2".into()],
+            None,
+        )
+        .unwrap();
+        let (producer, sha) = fx.lane(1);
+        crate::task::link_attempt(&fx.project, "job-0001", &producer).unwrap();
+        fx.seal_done(&producer, 1, 1, &sha, "# report\n");
+        crate::thread::update(&fx.project, &producer, |t| t.merged_sha = sha.clone()).unwrap();
+        let (critic, sha) = fx.lane(2);
+        crate::thread::update(&fx.project, &critic, |t| t.role = "critic".into()).unwrap();
+        crate::task::link_attempt(&fx.project, "job-0002", &critic).unwrap();
+        let failed_event = fx.seal_done(
+            &critic,
+            1,
+            2,
+            &sha,
+            "+++\nverdict = \"FAIL\"\n+++\nneeds work\n",
+        );
+        crate::thread::update(&fx.project, &critic, |t| t.merged_sha = sha.clone()).unwrap();
+        let shown: serde_json::Value =
+            serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+        assert_eq!(shown["steps"][1]["state"], "running");
+        let error = check_prerequisites(&fx.project, "job-0003")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "plan_prerequisite: job-0003 cannot start; step s-3 waits for s-2 (check failed: {critic} verdict FAIL). Send the work back with ha thread prompt and get a fresh verdict, or change the plan."
+            )
+        );
+        crate::thread::update(&fx.project, &critic, |t| t.review_after = failed_event).unwrap();
+        assert!(
+            check_prerequisites(&fx.project, "job-0003")
+                .unwrap_err()
+                .to_string()
+                .contains("check failed")
+        );
+        fx.seal_done(
+            &critic,
+            1,
+            3,
+            &sha,
+            "+++\nverdict = \"PASS\"\n+++\napproved\n",
+        );
+        check_prerequisites(&fx.project, "job-0003").unwrap();
+        fx.seal_done(&critic, 1, 4, &sha, "# historical report\n");
+        check_prerequisites(&fx.project, "job-0003").unwrap();
+    }
+
+    #[test]
+    fn unlink_journals_only_changes_with_reason_and_revision() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        write_task(&fx, "job-0001");
+        step_add(&ctx, "demo", "A", vec![], vec![], None).unwrap();
+        step_add(
+            &ctx,
+            "demo",
+            "B",
+            vec!["job-0001".into()],
+            vec!["s-1".into()],
+            None,
+        )
+        .unwrap();
+        let journal = fx.project.state_dir().join("dispatch.jsonl");
+        let before = std::fs::read_to_string(&journal)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let plan = step_unlink(
+            &ctx,
+            "demo",
+            "s-2",
+            vec!["job-0001".into()],
+            vec!["s-1".into()],
+            "Rolf released the hold",
+            None,
+        )
+        .unwrap();
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .skip(before)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let row = &records[0];
+        assert_eq!(row["kind"], "plan-unlink");
+        assert_eq!(row["step"], "s-2");
+        assert_eq!(row["after"], serde_json::json!(["s-1"]));
+        assert_eq!(row["tasks"], serde_json::json!(["job-0001"]));
+        assert_eq!(row["why"], "Rolf released the hold");
+        assert_eq!(row["revision"], plan.revision);
+        step_unlink(
+            &ctx,
+            "demo",
+            "s-2",
+            vec!["job-0001".into()],
+            vec!["s-1".into()],
+            "unchanged",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap().lines().count(),
+            before + 1
+        );
     }
 
     #[test]
