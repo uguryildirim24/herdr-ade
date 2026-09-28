@@ -55,6 +55,10 @@ fn recovery_path(root: &Path) -> PathBuf {
     root.join(".ticker.recovery")
 }
 
+fn clean_exit_path(root: &Path) -> PathBuf {
+    root.join(".ticker.clean-exit")
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 struct Progress {
     pid: u32,
@@ -174,15 +178,26 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() || install_in_progress(ctx) {
         return Ok(());
     }
-    ensure_free(root, spawn)
+    ensure_free(
+        root,
+        std::env::var_os("HERDR_ADE_TICKER_SUPERVISOR").is_some(),
+        spawn,
+    )
 }
 
-fn ensure_free(root: &Path, spawn_ticker: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+fn ensure_free(
+    root: &Path,
+    supervised: bool,
+    spawn_ticker: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     if lock_state(root) == LockState::Free {
         // Only the launchd interval records an unattended outage. The lock,
         // not the interval or this snapshot, still decides who runs the loop.
-        if std::env::var_os("HERDR_ADE_TICKER_SUPERVISOR").is_some() {
-            project::write_atomic(&recovery_path(root), b"")?;
+        if supervised {
+            if !clean_exit_path(root).exists() {
+                project::write_atomic(&recovery_path(root), b"")?;
+            }
+            let _ = std::fs::remove_file(clean_exit_path(root));
         }
         let _ = std::fs::remove_file(stop_path(root));
         spawn_ticker(root)?;
@@ -487,6 +502,14 @@ impl Log {
     }
 }
 
+fn mark_clean_exit(root: &Path, log: &Log) {
+    if let Err(error) = project::write_atomic(&clean_exit_path(root), b"") {
+        log.line(&format!(
+            "could not mark intentional ticker exit: {error:#}"
+        ));
+    }
+}
+
 /// The loop. Exits when another ticker holds the lock, when the stop file
 /// appears, or when no project has had a reachable session for five minutes.
 pub(crate) fn run(ctx: &Ctx) -> Result<()> {
@@ -556,6 +579,8 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         "ticker {} started (pid {})",
         info.version, info.pid
     ));
+    // A later unexpected exit must not inherit an earlier intentional exit.
+    let _ = std::fs::remove_file(clean_exit_path(root));
     if recovery_path(root).exists() {
         let _ = std::fs::remove_file(recovery_path(root));
         let notice = format!(
@@ -589,6 +614,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     match tick_with_steps(ctx, &log, &mut memory, &mut step) {
         None => {
             log.line("stop file found; exiting");
+            mark_clean_exit(root, &log);
             return Ok(());
         }
         Some(true) => last_reachable = Instant::now(),
@@ -601,6 +627,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         while Instant::now() < wake {
             if stop_path(root).exists() {
                 log.line("stop file found; exiting");
+                mark_clean_exit(root, &log);
                 return Ok(());
             }
             if wake_path(root).exists() {
@@ -612,11 +639,13 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         match tick_with_steps(ctx, &log, &mut memory, &mut step) {
             None => {
                 log.line("stop file found; exiting");
+                mark_clean_exit(root, &log);
                 return Ok(());
             }
             Some(true) => last_reachable = Instant::now(),
             Some(false) if last_reachable.elapsed() > IDLE_EXIT => {
                 log.line("no project has had a reachable session for five minutes; exiting");
+                mark_clean_exit(root, &log);
                 return Ok(());
             }
             Some(false) => {}
@@ -4031,7 +4060,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path();
         let mut starts = 0;
-        ensure_free(path, |_| {
+        ensure_free(path, false, |_| {
             starts += 1;
             Ok(())
         })
@@ -4044,12 +4073,24 @@ mod tests {
             .open(lock_path(path))
             .unwrap();
         file.lock().unwrap();
-        ensure_free(path, |_| {
+        ensure_free(path, false, |_| {
             starts += 1;
             Ok(())
         })
         .unwrap();
         assert_eq!(starts, 1);
+    }
+
+    #[test]
+    fn supervisor_reports_only_an_unexpected_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        project::write_atomic(&clean_exit_path(path), b"").unwrap();
+        ensure_free(path, true, |_| Ok(())).unwrap();
+        assert!(!clean_exit_path(path).exists());
+        assert!(!recovery_path(path).exists());
+        ensure_free(path, true, |_| Ok(())).unwrap();
+        assert!(recovery_path(path).exists());
     }
 
     #[test]
