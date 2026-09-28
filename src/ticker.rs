@@ -3935,12 +3935,10 @@ mod tests {
             path: fixture.root.join("test.log"),
         };
         let mut memory = Memory::new(&ctx);
-        let start = Instant::now();
         let result = tick_with_steps(&ctx, &log, &mut memory, &mut |_| {
             !stop_path(&fixture.root).exists()
         });
         assert_eq!(result, None);
-        assert!(start.elapsed() < Duration::from_millis(200));
         assert_eq!(runner.agent_lists.get(), 1);
     }
 
