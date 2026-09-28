@@ -18,6 +18,146 @@ pub(crate) const TICKER_PROMPT_PREFIX: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing]";
 pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
 
+/// A transport submission is not a context receipt. Keep the unsighted lines
+/// until the bound coordinator actually asks for its context.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct WakeCursor {
+    binding: String,
+    revision: u64,
+    lines: Vec<String>,
+    submitted_at: u64,
+    primed_binding: String,
+    pending_announced: bool,
+}
+
+fn wake_path(project: &Project) -> std::path::PathBuf {
+    project.state_dir().join("wake-cursor.json")
+}
+
+fn wake_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn wake_binding(project: &Project) -> String {
+    project.coordinator().map_or(String::new(), |c| {
+        format!("{}:{}:{}", c.socket, c.pane_id, c.attempt())
+    })
+}
+
+pub(crate) fn wake_revision(project: &Project) -> u64 {
+    project::read_json::<WakeCursor>(&wake_path(project))
+        .unwrap_or_default()
+        .revision
+}
+
+/// Only the exact bound pane's context read can consume the pending wake.
+pub(crate) fn receipt(project: &Project, observed: u64) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
+    if cursor.revision != observed {
+        return Ok(());
+    }
+    cursor.lines.clear();
+    cursor.revision += 1;
+    cursor.binding = wake_binding(project);
+    cursor.primed_binding.clear();
+    cursor.pending_announced = false;
+    project::write_json(&wake_path(project), &cursor)
+}
+
+fn record_wake(project: &Project, line: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
+    if cursor.lines.is_empty() {
+        cursor.binding = wake_binding(project);
+    }
+    cursor.lines.push(line.into());
+    cursor.revision += 1;
+    cursor.submitted_at = wake_now();
+    cursor.primed_binding.clear();
+    cursor.pending_announced = false;
+    project::write_json(&wake_path(project), &cursor)
+}
+
+fn announce_pending(project: &Project, cursor: &WakeCursor) -> Result<()> {
+    if cursor.pending_announced {
+        return Ok(());
+    }
+    inbox::write(
+        project,
+        "wake_pending",
+        &project.slug,
+        &format!(
+            "wake_pending: {} has unread transitions; resume the bound coordinator with ha open {}.",
+            project.slug, project.slug
+        ),
+        "",
+    )?;
+    let _lock = project.lock()?;
+    let mut latest: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
+    if latest.revision == cursor.revision {
+        latest.pending_announced = true;
+        project::write_json(&wake_path(project), &latest)?;
+    }
+    Ok(())
+}
+
+/// Re-prime once on rebind, or after an idle turn that never read context.
+/// Never re-type an event's original notice on a replacement binding.
+fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
+    let bound = project.coordinator();
+    let binding = wake_binding(project);
+    let cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
+    if cursor.lines.is_empty() || cursor.primed_binding == binding {
+        return Ok(());
+    }
+    let Some(bound) = bound else {
+        announce_pending(project, &cursor)?;
+        return Ok(());
+    };
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &bound.socket, ctx.runner);
+    let agent = herdr
+        .agent_list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| crate::coordinator::agent_matches(&bound, a));
+    let Some(agent) = agent else {
+        announce_pending(project, &cursor)?;
+        return Ok(());
+    };
+    if !agent.ready()
+        || (cursor.binding == binding
+            && (agent.agent_status != "idle"
+                || wake_now().saturating_sub(cursor.submitted_at) < 90))
+    {
+        return Ok(());
+    }
+    let line = format!(
+        "Unread transitions since the last ha context ({}): {}. Run ha context {} to consume them.",
+        cursor.lines.len(),
+        cursor.lines.join(" | "),
+        project.slug
+    );
+    // Do not register this digest as another unread transition.
+    let _writer = crate::prompt::writer_lock(project)?;
+    if !crate::prompt::coordinator_prompt_clear(project, &herdr, &bound.pane_id)? {
+        return Ok(());
+    }
+    crate::prompt::mark_automated_prompt(project, &bound.pane_id, &line)?;
+    herdr.agent_prompt(&bound.pane_id, &line)?;
+    let _lock = project.lock()?;
+    let mut latest: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
+    if latest.revision == cursor.revision && wake_binding(project) == binding {
+        latest.primed_binding = binding;
+        project::write_json(&wake_path(project), &latest)?;
+    }
+    Ok(())
+}
+
 /// A transition-owned wake-up, independent of the lane's eventual status.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub(crate) struct Notice {
@@ -205,6 +345,9 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
             break;
         }
     }
+    if let Err(error) = prime_unread(ctx, project) {
+        first.get_or_insert(error);
+    }
     first.map_or(Ok(()), Err)
 }
 
@@ -371,6 +514,9 @@ pub(crate) fn deliver_coordinator_prompt(
         return Ok(false);
     }
     crate::prompt::mark_automated_prompt(project, pane, line)?;
+    // Store intent before transport: a context read racing the prompt cannot
+    // miss the wake even if the process dies before Herdr answers.
+    record_wake(project, line)?;
     herdr.agent_prompt(pane, line)?;
     Ok(true)
 }
@@ -1463,6 +1609,85 @@ mod tests {
     }
 
     #[test]
+    fn unread_wake_is_digested_once_after_rebind_not_retyped() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+        })
+        .unwrap();
+        let event = sealed_done(&project, &lane.id);
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+        project
+            .update_coordinator(|c| {
+                c.generation += 1;
+                c.pane_id = "w1:p2".into();
+            })
+            .unwrap();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w1", "w1:t1", "w1:p2", &cwd, "hp-demo-coordinator", "idle")
+        );
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 2);
+        assert!(typed_lines(&world)[1].contains("Unread transitions"));
+        assert!(typed_lines(&world)[1].contains("DONE"));
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 2);
+        assert!(
+            crate::events::states(&project, &event.id)
+                .unwrap()
+                .contains(&crate::contracts::DeliveryState::Submitted)
+        );
+    }
+
+    #[test]
+    fn context_started_before_a_wake_cannot_consume_it() {
+        let (world, project) = delivery_world();
+        let observed = wake_revision(&project);
+        let bound = project.coordinator().unwrap();
+        let herdr = Herdr::new(world.env.herdr_bin(), &bound.socket, &world.runner);
+        assert!(
+            deliver_coordinator_prompt(
+                &project,
+                &herdr,
+                &bound.pane_id,
+                "REVIEW review-1 needs attention"
+            )
+            .unwrap()
+        );
+        receipt(&project, observed).unwrap();
+        let cursor: WakeCursor = project::read_json(&wake_path(&project)).unwrap();
+        assert_eq!(cursor.lines.len(), 1);
+    }
+
+    #[test]
+    fn received_wake_is_not_digested_on_rebind() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+        })
+        .unwrap();
+        sealed_done(&project, &lane.id);
+        deliver_events(&world.ctx(), &project).unwrap();
+        receipt(&project, wake_revision(&project)).unwrap();
+        project
+            .update_coordinator(|c| {
+                c.generation += 1;
+                c.pane_id = "w1:p2".into();
+            })
+            .unwrap();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w1", "w1:t1", "w1:p2", &cwd, "hp-demo-coordinator", "idle")
+        );
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    #[test]
     fn seal_reports_a_queued_follow_up_even_if_it_lands_before_delivery() {
         let (world, project) = delivery_world();
         let lane = thread::allocate(&project, |t| {
@@ -1730,6 +1955,7 @@ mod tests {
             close: true,
             prune: true,
             attention: String::new(),
+            no_verdict_since: String::new(),
             notices: vec![Notice {
                 line: "REVIEW review-1 merged t-0001 (abc, pushed)".into(),
                 submitted: false,

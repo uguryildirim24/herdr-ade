@@ -1146,6 +1146,7 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
         acknowledge_bootstrap(&project)?;
     }
     let prefix = current_prefix(&ctx.root)?;
+    let wake_revision = crate::steps::wake_revision(&project);
     let current = ContextCursor::capture(ctx, &project);
     let path = project.state_dir().join("context-cursor.json");
     let previous: Option<ContextCursor> = crate::project::read_json(&path);
@@ -1174,6 +1175,9 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     if !peek && owns_read {
         // An external read is a peek: it cannot consume the coordinator's delta.
         crate::project::write_json(&path, &current)?;
+        if coordinator.is_some() {
+            crate::steps::receipt(&project, wake_revision)?;
+        }
         inbox::mark_seen(&project, &shown)?;
         if let Some(record) = coordinator {
             inbox::acknowledge_events(&project, &shown, &record.pane_id, record.attempt())?;
