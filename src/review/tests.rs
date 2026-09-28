@@ -701,7 +701,22 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
         vec![],
         1,
     );
+    fx.world.runner.calls.borrow_mut().clear();
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    let remote_checks = fx
+        .world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|cmd| {
+            cmd.program == "git"
+                && cmd.args.iter().any(|arg| arg == "ls-remote")
+                && cmd.args.last().is_some_and(|arg| arg == "refs/heads/main")
+        })
+        .map(|cmd| cmd.args.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(remote_checks.len(), 2, "{remote_checks:?}");
     assert_eq!(review.phase, Phase::Complete);
     assert_eq!(review.notices.len(), 1);
     assert!(review.notices[0].line.contains("merged"));
@@ -984,6 +999,107 @@ fn reject_does_not_land_and_cancel_releases_unchanged_members() {
         .len(),
         1
     );
+}
+
+#[test]
+fn no_remote_lands_without_publication_git_calls() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    // The repository row deliberately has an empty configured remote.
+    review.push_remote = Some(String::new());
+    save(&fx.project, &review).unwrap();
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    fx.world.runner.calls.borrow_mut().clear();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
+    assert_eq!(review.phase, Phase::Complete);
+    assert!(!review.notices[0].line.contains("pushed"));
+    let calls = fx.world.runner.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|cmd| cmd.program == "git" && cmd.args.contains(&"rev-parse".into()))
+    );
+    assert!(!calls.iter().any(|cmd| {
+        cmd.program == "git"
+            && cmd
+                .args
+                .iter()
+                .any(|arg| ["ls-remote", "fetch", "push"].contains(&arg.as_str()))
+    }));
+}
+
+#[test]
+fn persisted_landing_without_remote_completes_on_ticker_pass() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    review.push_remote = Some(String::new());
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate: candidate.clone(),
+        without: BTreeMap::new(),
+        gates: vec![],
+    });
+    review.phase = Phase::Landing;
+    save(&fx.project, &review).unwrap();
+    fx.world.runner.calls.borrow_mut().clear();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    let landed = load(&fx.project, &review.id).unwrap();
+    assert_eq!(landed.phase, Phase::Complete);
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
+    let calls = fx.world.runner.calls.borrow();
+    assert!(!calls.iter().any(|cmd| {
+        cmd.program == "git"
+            && cmd
+                .args
+                .iter()
+                .any(|arg| ["ls-remote", "fetch", "push"].contains(&arg.as_str()))
+    }));
+}
+
+#[test]
+fn configured_remote_failure_is_not_treated_as_local_only() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let remote = fx.world.home.path().join("missing-remote.git");
+    review.push_remote = Some(remote.to_string_lossy().into_owned());
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate,
+        without: BTreeMap::new(),
+        gates: vec![],
+    });
+    review.phase = Phase::Landing;
+    fx.world.runner.calls.borrow_mut().clear();
+    let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with(&format!(
+            "`git ls-remote {} refs/heads/main` failed: ",
+            remote.display()
+        )),
+        "{error}"
+    );
+    assert_eq!(fx.world.runner.count("ls-remote"), 1);
+    assert_eq!(review.phase, Phase::Landing);
+    assert!(!review.push);
 }
 
 #[test]
