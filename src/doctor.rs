@@ -1019,6 +1019,24 @@ fn report_with_checks(
         }
     }
 
+    if cfg!(target_os = "macos") {
+        let supervisor_loaded = crate::harness::ticker_supervisor_loaded();
+        check(
+            &mut out,
+            supervisor_loaded.then_some(true),
+            "ticker supervisor",
+            format!(
+                "launchd {} ({})",
+                crate::harness::ticker_agent_label(),
+                if supervisor_loaded {
+                    "loaded"
+                } else {
+                    "not loaded; run `ha harness install`"
+                }
+            ),
+        );
+    }
+
     if let Ok(repos) = crate::harness::repos(config_dir) {
         for repo in repos {
             if repo.box_path.is_some()
