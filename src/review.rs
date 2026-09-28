@@ -150,6 +150,21 @@ pub(crate) fn list(project: &Project) -> Result<Vec<Review>> {
     });
     Ok(records)
 }
+fn reviewer_ids(project: &Project) -> Result<std::collections::BTreeSet<String>> {
+    let reviews = list(project)?;
+    let mut ids: std::collections::BTreeSet<String> = reviews
+        .iter()
+        .filter_map(|review| review.reviewer.clone())
+        .collect();
+    // Allocation can crash before the review record binds its reviewer.
+    // Only the review start path writes review_id on a lane.
+    for lane in thread::list(project) {
+        if reviews.iter().any(|review| review.id == lane.review_id) {
+            ids.insert(lane.id);
+        }
+    }
+    Ok(ids)
+}
 fn queue_notice(review: &mut Review, line: String) {
     if !review.notices.iter().any(|n| n.line == line) {
         review.notices.push(crate::steps::Notice {
@@ -220,7 +235,7 @@ fn repo_identity(repo: &str) -> PathBuf {
     std::fs::canonicalize(&common).unwrap_or(common)
 }
 fn same_repo(a: &str, b: &str) -> bool {
-    repo_identity(a) == repo_identity(b)
+    a == b || repo_identity(a) == repo_identity(b)
 }
 fn repository(ctx: &Ctx, project: &Project, requested: Option<&str>) -> Result<project::Repo> {
     let mut rows = project.read_project_md()?.0.repos;
@@ -237,10 +252,13 @@ fn repository(ctx: &Ctx, project: &Project, requested: Option<&str>) -> Result<p
             .context("review repository is not configured"),
         None => {
             let events = crate::events::checked(project)?;
+            let reviewers = reviewer_ids(project)?;
             let mut repos: std::collections::BTreeSet<_> = thread::list(project)
                 .into_iter()
                 .filter(|t| {
-                    t.status != Status::Resolved && t.role != "reviewer" && t.merged_sha.is_empty()
+                    t.status != Status::Resolved
+                        && !reviewers.contains(&t.id)
+                        && t.merged_sha.is_empty()
                 })
                 .filter(|t| sealed(&events, t).is_some_and(|e| changes(t, e) != Some(false)))
                 .map(|t| t.repo)
@@ -385,12 +403,25 @@ pub(crate) fn reclassify_old_changes(ctx: &Ctx, mut log: impl FnMut(&str)) -> Re
 }
 
 /// No git here: used by the ticker to decide whether a review can start.
-fn pending(project: &Project, repo: &str, events: &[crate::contracts::Event]) -> Vec<Thread> {
-    thread::list(project)
+fn pending(
+    project: &Project,
+    repo: &str,
+    events: &[crate::contracts::Event],
+    reviewers: &std::collections::BTreeSet<String>,
+) -> Vec<Thread> {
+    pending_from(thread::list(project), repo, events, reviewers)
+}
+fn pending_from(
+    lanes: Vec<Thread>,
+    repo: &str,
+    events: &[crate::contracts::Event],
+    reviewers: &std::collections::BTreeSet<String>,
+) -> Vec<Thread> {
+    lanes
         .into_iter()
         .filter(|t| {
             t.status != Status::Resolved
-                && t.role != "reviewer"
+                && !reviewers.contains(&t.id)
                 && same_repo(&t.repo, repo)
                 && t.merged_sha.is_empty()
         })
@@ -440,7 +471,7 @@ pub(crate) fn start(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
 }
 fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Option<Review>> {
     let events = crate::events::checked(project)?;
-    let pile = pending(project, &row.path, &events);
+    let pile = pending(project, &row.path, &events, &reviewer_ids(project)?);
     if pile.is_empty() {
         return Ok(None);
     }
@@ -1345,8 +1376,9 @@ pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: boo
     let harness = crate::harness::repos(&ctx.config_dir)?;
     let tasks = crate::task::list_with_errors(project).0;
     let mut heads: BTreeMap<String, String> = BTreeMap::new();
+    let reviewers = reviewer_ids(project)?;
     for lane in thread::list(project) {
-        if lane.role == "reviewer" || lane.repo.is_empty() || !lane.merged_sha.is_empty() {
+        if reviewers.contains(&lane.id) || lane.repo.is_empty() || !lane.merged_sha.is_empty() {
             continue;
         }
         let Some(event) = sealed(&events, &lane) else {
@@ -1462,18 +1494,19 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     if project.state_dir().join("reviews-enabled").exists() {
         let events = crate::events::checked(project)?;
         let threads = thread::list(project);
+        let reviewers = reviewer_ids(project)?;
         let repos: std::collections::BTreeSet<_> = threads
             .iter()
-            .filter(|t| t.role != "reviewer" && t.status != Status::Resolved)
+            .filter(|t| !reviewers.contains(&t.id) && t.status != Status::Resolved)
             .map(|t| t.repo.clone())
             .collect();
         for repo in repos {
-            if repo.is_empty() || pending(project, &repo, &events).is_empty() {
+            if repo.is_empty() || pending(project, &repo, &events, &reviewers).is_empty() {
                 continue;
             }
             let failed_local = threads.iter().any(|t| {
                 same_repo(&t.repo, &repo)
-                    && t.role != "reviewer"
+                    && !reviewers.contains(&t.id)
                     && t.status == Status::Failed
                     && !t.is_remote()
             });
@@ -1492,7 +1525,7 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             if live_failed
                 || threads.iter().any(|t| {
                     same_repo(&t.repo, &repo)
-                        && t.role != "reviewer"
+                        && !reviewers.contains(&t.id)
                         && matches!(t.status, Status::Starting | Status::Open)
                         && (crate::events::latest_event(&events, &t.id, t.attempt.max(1))
                             .is_none_or(|e| e.payload.done.is_none())
