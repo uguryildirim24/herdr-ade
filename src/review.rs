@@ -1123,7 +1123,11 @@ fn land_with_install(
     }
     defer_members(project, review)?;
     if !review.push {
-        if let Some(remote) = &review.push_remote {
+        if let Some(remote) = review
+            .push_remote
+            .as_deref()
+            .filter(|remote| !remote.is_empty())
+        {
             let target = format!("refs/heads/{}", review.integration);
             if !remote_contains(&git, remote, &target, &candidate)? {
                 git.run(&["push", remote, &format!("{candidate}:{target}")])?;
@@ -1179,7 +1183,11 @@ fn land_with_install(
         .map(|m| m.thread.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let published = if review.push_remote.is_some() {
+    let published = if review
+        .push_remote
+        .as_deref()
+        .is_some_and(|remote| !remote.is_empty())
+    {
         ", pushed"
     } else {
         ""
