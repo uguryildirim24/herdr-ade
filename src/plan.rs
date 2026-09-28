@@ -170,10 +170,17 @@ fn reaches(plan: &Plan, from: &str, target: &str, seen: &mut BTreeSet<String>) -
     if from == target {
         return true;
     }
-    seen.insert(from.to_string())
-        && all_steps(plan)
-            .find(|s| s.id == from)
-            .is_some_and(|s| s.after.iter().any(|id| reaches(plan, id, target, seen)))
+    if !seen.insert(from.to_string()) {
+        return false;
+    }
+    // A parent cannot finish before every child finishes. Treat that as an
+    // implicit edge when checking for prerequisite cycles.
+    all_steps(plan).find(|s| s.id == from).is_some_and(|s| {
+        s.after
+            .iter()
+            .chain(s.subtasks.iter().map(|child| &child.id))
+            .any(|id| reaches(plan, id, target, seen))
+    })
 }
 
 /// Subtasks: step ids unique across both levels, and one level only.
@@ -776,6 +783,7 @@ fn with_subtasks_from_tasks(
 /// and with work not yet started.
 fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
     !step.threads.is_empty()
+        || !step.tasks.is_empty()
         || tasks.iter().any(|task| {
             task.dropped.is_empty()
                 && (task.plan_step.as_deref() == Some(step.id.as_str())
@@ -1235,6 +1243,11 @@ mod tests {
         let own = derive_state(&fx.project, &parent, &evidence);
         assert_eq!(own, Left);
         assert_eq!(with_subtasks(&fx.project, &parent, own), Running);
+        // A missing explicit task is still required work, even if the
+        // children are done. A stale card must not open a dependent step.
+        parent.tasks = vec!["job-9999".into()];
+        assert_eq!(derive_state(&fx.project, &parent, &evidence), Left);
+        assert_eq!(with_subtasks(&fx.project, &parent, Left), Running);
         let mut parent = step(&[Left]);
         parent.tasks = vec!["job-0001".into()];
         assert_eq!(with_subtasks(&fx.project, &parent, own), Left);
@@ -1373,6 +1386,9 @@ mod tests {
         let (_, sub) = subtask_add(&ctx, "demo", "s-1", "part", vec![], vec![], None).unwrap();
         assert!(step_link(&ctx, "demo", "s-1", vec![], vec![sub.clone()], None).is_err());
         assert!(step_link(&ctx, "demo", &sub, vec![], vec!["s-1".into()], None).is_err());
+        // A child waiting on a step that waits on its parent also deadlocks:
+        // the parent's completion implicitly waits on that child.
+        assert!(step_link(&ctx, "demo", &sub, vec![], vec!["s-2".into()], None).is_err());
         step_unlink(
             &ctx,
             "demo",
