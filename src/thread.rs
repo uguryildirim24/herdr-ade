@@ -155,6 +155,14 @@ pub(crate) struct Thread {
     /// A failed check never overwrites the last successful observation.
     pub(crate) observation_error: String,
     pub(crate) last_group: String,
+    /// Last working observation; empty if evidence is unavailable or the lane is not working.
+    pub(crate) progress_pane: String,
+    pub(crate) progress_screen: String,
+    pub(crate) progress_head: String,
+    pub(crate) progress_since: String,
+    pub(crate) stall_notified: bool,
+    pub(crate) no_commit_since: String,
+    pub(crate) no_commit_notified: bool,
     pub(crate) report_hash: String,
     #[serde(default)]
     pub(crate) final_report_hash: String,
