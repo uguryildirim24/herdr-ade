@@ -50,6 +50,16 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     } else {
         &binding.thread.cwd
     };
+    if binding.thread.role == "critic" {
+        let path = Path::new(report);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Path::new(git_folder).join(path)
+        };
+        let text = std::fs::read_to_string(path)?;
+        require_critic_verdict(&text)?;
+    }
     let op = ops::reserve_done(
         &binding.project,
         ops::Reservation {
@@ -396,12 +406,33 @@ struct BootstrapReceipt {
 
 /// The skill text a role is primed with. One source for the printed skill, the
 /// start-time receipt and the staleness check, so they can never disagree.
-pub(crate) fn skill_text(role: &str) -> &'static str {
+pub(crate) fn skill_text(role: &str) -> String {
     match role {
-        "coordinator" => include_str!("../skill/COORDINATOR.md"),
-        "reviewer" => include_str!("../skill/REVIEWER.md"),
-        _ => include_str!("../skill/LANE.md"),
+        "coordinator" => include_str!("../skill/COORDINATOR.md").into(),
+        "reviewer" => include_str!("../skill/REVIEWER.md").into(),
+        "critic" => format!(
+            "{}\n## Critic verdict\n\nStart your report with TOML front matter:\n+++\nverdict = \"PASS\" # or \"FAIL\"\n+++\nA FAIL keeps the check open. Explain what needs correction in the report.\n",
+            include_str!("../skill/LANE.md")
+        ),
+        _ => include_str!("../skill/LANE.md").into(),
     }
+}
+
+fn require_critic_verdict(text: &str) -> Result<()> {
+    if !matches!(critic_verdict(text).as_deref(), Some("PASS" | "FAIL")) {
+        bail!(
+            "critic_verdict_missing: a critic report starts with +++ verdict = \"PASS\" or \"FAIL\" +++; add it and run ha done again."
+        );
+    }
+    Ok(())
+}
+
+/// The same front matter framing as the pile review; older reports without it
+/// have no verdict and retain their historical completion semantics.
+pub(crate) fn critic_verdict(text: &str) -> Option<String> {
+    let front = text.strip_prefix("+++\n")?.split_once("\n+++")?.0;
+    let value: toml::Value = toml::from_str(front).ok()?;
+    Some(value.get("verdict")?.as_str()?.to_string())
 }
 
 /// Prints the selected role skill and runtime-only rules. A lane call also
@@ -507,6 +538,21 @@ fn print_rules(config_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn critic_report_without_verdict_is_refused_before_reserving_a_done() {
+        let fx = crate::testkit::fixture();
+        let error = require_critic_verdict("# no verdict\n")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "critic_verdict_missing: a critic report starts with +++ verdict = \"PASS\" or \"FAIL\" +++; add it and run ha done again."
+        );
+        assert!(crate::events::list(&fx.project).is_empty());
+        assert!(require_critic_verdict("+++\nverdict = \"PASS\"\n+++\nreport").is_ok());
+        assert!(require_critic_verdict("+++\nverdict = \"FAIL\"\n+++\nreport").is_ok());
+    }
 
     #[test]
     fn waiting_text_is_bounded_and_drops_controls() {
