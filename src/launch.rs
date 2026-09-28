@@ -270,6 +270,7 @@ pub fn authorize_explicit_recipe(
 struct TaskContract {
     product: String,
     capability: Option<String>,
+    once: bool,
 }
 
 pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkContract> {
@@ -293,6 +294,7 @@ pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkC
         workflow: workflow.to_string(),
         product: contract.product,
         capability: contract.capability,
+        once: contract.once,
     })
 }
 
@@ -341,6 +343,21 @@ pub fn resolve_failure(
 ) -> Result<Launch> {
     use crate::contracts::FailureClass;
     let previous = input.previous.context("recovery_previous_missing")?;
+    if work_contract(input.task, input.workflow)?.once {
+        return Err(crate::refusal::error(
+            format!(
+                "recovery_exhausted: {} runs once; attempt {} ended ({}) and is not retried automatically. Read its report, then ha thread retry {} <thread> --reason \"<why a new attempt is allowed>\" or ha thread cancel.",
+                job_noun(input.workflow),
+                previous.attempt.max(1),
+                class.plain(),
+                project.slug
+            ),
+            format!(
+                "ha thread retry {} <thread> --reason \"<why a new attempt is allowed>\" or ha thread cancel",
+                project.slug
+            ),
+        ));
+    }
     match class {
         FailureClass::Unknown => Err(crate::refusal::error(
             "recovery_unknown: waiting for the coordinator",
