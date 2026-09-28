@@ -1099,11 +1099,9 @@ pub(crate) fn agent_matches(thread: &Thread, agent: &Agent) -> bool {
     }
 }
 
-/// Live state from one `agent list` and one `pane list`. `recorded` supplies
-/// the duration: the ticker keeps `last_state_change` current; a CLI call uses
-/// it when the live state equals the recorded one and zero otherwise.
-/// A failed local lane may reclaim its original pane even when a wrapper
-/// omitted the agent name. The worktree and kind provide identity evidence.
+/// A failed local lane whose agent missed the startup ready window may
+/// reclaim its original pane even when a wrapper omitted the agent name.
+/// The pane, worktree and kind provide identity evidence.
 pub(crate) fn recoverable_agent<'a>(
     lane: &Thread,
     threads: &[Thread],
@@ -1113,12 +1111,15 @@ pub(crate) fn recoverable_agent<'a>(
     if lane.status != Status::Failed
         || lane.role == "reviewer"
         || lane.is_remote()
+        || lane.parked
+        || lane.recovery_pending
+        || !lane.error.starts_with("agent_not_ready:")
         || lane.worktree_path.is_empty()
         || lane.pane_id.is_empty()
         || threads.iter().any(|other| {
             other.id != lane.id && other.status != Status::Resolved && other.pane_id == lane.pane_id
         })
-        || !panes.iter().any(|pane| pane.pane_id == lane.pane_id)
+        || !panes.iter().any(|pane| pane_matches(lane, pane))
     {
         return None;
     }
@@ -1128,9 +1129,13 @@ pub(crate) fn recoverable_agent<'a>(
             && agent.workspace_id == lane.workspace_id
             && agent.agent == lane.launch.kind
             && agent.cwd == lane.worktree_path
+            && agent.cwd == lane.cwd
     })
 }
 
+/// Live state from one `agent list` and one `pane list`. `recorded` supplies
+/// the duration: the ticker keeps `last_state_change` current; a CLI call uses
+/// it when the live state equals the recorded one and zero otherwise.
 pub(crate) fn live_state(
     thread: &Thread,
     agents: &[Agent],

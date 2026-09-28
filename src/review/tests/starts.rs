@@ -64,6 +64,7 @@ fn ticker_holds_pile_while_a_failed_lane_has_a_live_agent() {
         t.workspace_id = "w1".into();
         t.launch.kind = "claude".into();
         t.agent_name = "old-name".into();
+        t.error = "agent_not_ready: still blocked at the end of its ready window".into();
     })
     .unwrap();
     let record = thread::load(&fx.project, &failed).unwrap();
@@ -85,6 +86,25 @@ fn ticker_holds_pile_while_a_failed_lane_has_a_live_agent() {
     .unwrap();
     tick(&fx.world.ctx(), &fx.project).unwrap();
     assert!(list(&fx.project).unwrap().is_empty());
+
+    // A reused pane with an unrelated agent must not hold the pile forever.
+    *fx.world.agents.borrow_mut() = serde_json::json!([{
+        "pane_id": record.pane_id, "tab_id": record.tab_id,
+        "workspace_id": record.workspace_id, "cwd": "/other/worktree",
+        "name": "", "agent": "claude", "agent_status": "working"
+    }])
+    .to_string();
+    let reviewer = fx.thread("pile reviewer");
+    thread::update(&fx.project, &reviewer, |t| {
+        t.role = "reviewer".into();
+        t.review_id = "review-1".into();
+    })
+    .unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_eq!(
+        list(&fx.project).unwrap()[0].reviewer.as_deref(),
+        Some(reviewer.as_str())
+    );
 }
 
 #[test]
