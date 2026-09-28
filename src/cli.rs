@@ -1094,6 +1094,8 @@ enum MachineCommand {
 enum TickerCommand {
     /// Start the ticker if it is not running (does nothing when there are no projects)
     Start,
+    /// Start only if no ticker holds the lock; never replace a running build
+    Ensure,
     /// Run the ticker loop in the foreground
     Run,
     /// Ask the running ticker to exit and wait for it
@@ -2015,6 +2017,7 @@ fn dispatch_with_start(
         },
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
+            TickerCommand::Ensure => ticker::ensure(&ctx),
             TickerCommand::Run => ticker::run(&ctx),
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
