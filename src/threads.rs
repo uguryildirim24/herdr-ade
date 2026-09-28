@@ -161,6 +161,11 @@ fn start_with_ticker(
     launch_now: bool,
 ) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
+    if args.workflow.as_deref() == Some("reviewer") && args.review_id.is_empty() {
+        bail!(
+            "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id> --basis \"<Rolf's words>\"."
+        );
+    }
     let status = project.status();
     if status != project::Status::Active {
         bail!("`{slug}` is {status}; `thread start` is refused until it is active again");
@@ -5962,6 +5967,20 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_cannot_start_a_reviewer_workflow() {
+        let fx = crate::testkit::fixture();
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.workflow = Some("reviewer".into());
+        let error = start(&fx.world.ctx(), "demo", args)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id> --basis \"<Rolf's words>\"."
+        );
+    }
+
+    #[test]
     fn only_lane_and_reviewer_default_to_the_box() {
         assert_eq!(
             default_machine("lane", "buildbox", Some("/r")),
@@ -5977,12 +5996,11 @@ mod tests {
     }
 
     #[test]
-    fn retry_places_an_unlaunched_reviewer_but_keeps_a_placed_machine() {
+    fn retry_keeps_a_placed_machine_and_dispatches_an_unplaced_lane() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, &lane_config());
         stub_box(&fx);
-        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
-        args.workflow = Some("reviewer".into());
+        let args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
         let started = start(&fx.world.ctx(), "demo", args).unwrap();
         assert_eq!(started.machine, "buildbox");
         // A placed attempt keeps its saved machine when retried.
@@ -6024,8 +6042,7 @@ mod tests {
 
         // A failed start before it acquired any machine or work is dispatched
         // again, using the current routing pick and the box mapping.
-        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
-        args.workflow = Some("reviewer".into());
+        let args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
         let unplaced = start(&fx.world.ctx(), "demo", args).unwrap();
         thread::update(&fx.project, &unplaced.id, |t| {
             t.machine.clear();
@@ -6213,6 +6230,22 @@ mod tests {
             let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
             args.task = task.into();
             args.workflow = role.map(str::to_string);
+            if role == Some("reviewer") {
+                // Only the review path supplies this identity; test routing without
+                // starting an unsupported hand-made reviewer.
+                let picked = crate::launch::resolve_launch(
+                    &fx.world.ctx(),
+                    &fx.project,
+                    &crate::launch::ResolveInput {
+                        task,
+                        workflow: "reviewer",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(picked.recipe_id, "pi_opencode_deepseek");
+                continue;
+            }
             let started = start(&fx.world.ctx(), "demo", args).unwrap();
             assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
             assert_eq!(started.machine, "buildbox");
@@ -6221,7 +6254,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_waits_for_provider_and_starts_on_next_pass_without_routing_retry() {
+    fn lane_waits_for_provider_and_starts_on_next_pass_without_routing_retry() {
         use crate::runner::fake::{fail, ok};
         let (fx, _remote) = box_fixture();
         write_config(
@@ -6255,7 +6288,6 @@ mod tests {
         );
         stub_box(&fx);
         let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
-        args.workflow = Some("reviewer".into());
         args.task = task.into();
         let waiting = start(&fx.world.ctx(), "demo", args).unwrap();
         assert_eq!(waiting.status, Status::Starting);
@@ -6265,7 +6297,7 @@ mod tests {
         let other = thread::allocate(&fx.project, |t| {
             t.launch = waiting.launch.clone();
             t.machine = waiting.machine.clone();
-            t.role = "reviewer".into();
+            t.role = "lane".into();
             t.provider_wait_started = waiting.provider_wait_started.clone();
         })
         .unwrap();
