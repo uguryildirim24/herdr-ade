@@ -931,6 +931,12 @@ pub(crate) fn resume_provider_starts(
         {
             continue;
         }
+        if let Err(error) = crate::plan::check_attempt_prerequisites(project, &lane.id) {
+            if !format!("{error:#}").starts_with("plan_prerequisite:") {
+                report(error);
+            }
+            continue;
+        }
         if thread::seconds_since(&lane.provider_wait_started, jiff::Timestamp::now()) >= 3600 {
             let reason = format!(
                 "provider_wait_expired: recipe `{}` on `{}` was not ready after one hour; {}",
@@ -1849,6 +1855,13 @@ fn launch_pass(
             continue;
         }
         if one_at_a_time && !*may_start {
+            continue;
+        }
+        // A deferred start must satisfy today's plan before agent submission.
+        if let Err(error) = crate::plan::check_attempt_prerequisites(pass.project, &t.id) {
+            if !format!("{error:#}").starts_with("plan_prerequisite:") {
+                errors.push(error.context(format!("{}: plan gate", t.id)));
+            }
             continue;
         }
         // Provider-bridge credentials can expire between placement and start.
@@ -4256,8 +4269,8 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        crate::plan::step_add(&ctx, "demo", "First outcome", vec![], None).unwrap();
-        crate::plan::step_add(&ctx, "demo", "Second outcome", vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "First outcome", vec![], vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Second outcome", vec![], vec![], None).unwrap();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         nudge_pass(&f, &runner, &[agent]);
         assert_eq!(runner.count("agent prompt"), 1);
@@ -4278,7 +4291,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], vec![], None).unwrap();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         let lane = thread::allocate(&f.project, |t| {
             t.role = "worker".into();
@@ -4293,7 +4306,7 @@ mod tests {
         .unwrap();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         assert_eq!(runner.count("agent prompt"), 2);
-        crate::plan::step_add(&ctx, "demo", "Another outcome", vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Another outcome", vec![], vec![], None).unwrap();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         assert_eq!(runner.count("agent prompt"), 3);
         crate::prompt::record_test_request(&f.project, "q-100", "Keep going").unwrap();
@@ -4313,7 +4326,7 @@ mod tests {
         };
         // A plan with no unfinished steps cannot prompt.
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        crate::plan::step_add(&ctx, "demo", "Outcome", vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Outcome", vec![], vec![], None).unwrap();
         agent.agent_status = "busy".into();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         agent.agent_status = "idle".into();
@@ -4382,7 +4395,7 @@ mod tests {
         std::fs::remove_file(crate::review::path(&f.project, "review-1")).unwrap();
         // An unbound project does not start a coordinator or get a prompt.
         let unbound = project::create(&f.root, "unbound", "", vec![]).unwrap();
-        crate::plan::step_add(&ctx, "unbound", "Outcome", vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "unbound", "Outcome", vec![], vec![], None).unwrap();
         let herdr = Herdr::new(
             f.env.herdr_bin(),
             &f.project.coordinator().unwrap().socket,
