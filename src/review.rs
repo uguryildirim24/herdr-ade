@@ -1472,12 +1472,7 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
                 let panes = herdr.pane_list()?;
                 threads.iter().any(|t| {
                     same_repo(&t.repo, &repo)
-                        && t.role != "reviewer"
-                        && t.status == Status::Failed
-                        && !t.is_remote()
-                        && !t.pane_id.is_empty()
-                        && panes.iter().any(|pane| pane.pane_id == t.pane_id)
-                        && agents.iter().any(|agent| agent.pane_id == t.pane_id)
+                        && thread::recoverable_agent(t, &threads, &agents, &panes).is_some()
                 })
             } else {
                 false

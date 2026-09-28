@@ -1259,6 +1259,11 @@ fn thread_pass(
                         })
                     {
                         current.status = thread::Status::Open;
+                        // The ready-window failure cleared the undelivered
+                        // brief. Restore it now that the agent is registered.
+                        if current.bootstrap != "acknowledged" {
+                            current.prompt_pending = true;
+                        }
                         current.error.clear();
                         current.recovery_pending = false;
                         current.failure_class = crate::contracts::FailureClass::Unknown;
@@ -4145,7 +4150,7 @@ mod tests {
             t.status = thread::Status::Failed;
             t.attempt = 3;
             t.launch_attempts = 1;
-            t.error = "agent_not_ready".into();
+            t.error = "agent_not_ready: still blocked at the end of its ready window".into();
             t.launch.kind = "claude".into();
             t.agent_name = "hp-demo-t-0001".into();
             t.worktree_path = "/work/lane".into();
@@ -4205,6 +4210,10 @@ mod tests {
         assert_eq!(revived.status, thread::Status::Open);
         assert_eq!(revived.agent_name, "");
         assert!(revived.error.is_empty());
+        assert!(
+            revived.prompt_pending,
+            "the undelivered brief must be retried"
+        );
         assert_eq!(revived.attempt, 3);
         assert_eq!(revived.launch_attempts, 1);
         assert_eq!(revived.last_group, "working");
