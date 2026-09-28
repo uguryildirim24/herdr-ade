@@ -107,6 +107,73 @@ fn seal_verdict(
     );
 }
 #[test]
+fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let id = review.reviewer.as_deref().unwrap().to_string();
+    thread::update(&fx.project, &id, |t| {
+        t.status = Status::Open;
+        t.workspace_id = "w1".into();
+        t.tab_id = "w1:t2".into();
+        t.pane_id = "w1:p2".into();
+        t.agent_name = "reviewer-test".into();
+    })
+    .unwrap();
+    let reviewer = thread::load(&fx.project, &id).unwrap();
+    review.no_verdict_since = "2020-01-01T00:00:00Z".into();
+    // No matching process: the lane recovery owns this, not the idle warning.
+    watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert!(review.notices.is_empty());
+    *fx.world.agents.borrow_mut() = format!(
+        "[{{\"pane_id\":\"w1:p2\",\"tab_id\":\"w1:t2\",\"workspace_id\":\"w1\",\"name\":\"reviewer-test\",\"cwd\":{:?},\"agent_status\":\"idle\"}}]",
+        reviewer.cwd
+    );
+    review.no_verdict_since = "2020-01-01T00:00:00Z".into();
+    watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    let count = review.notices.len();
+    assert_eq!(count, 1);
+    assert!(review.notices[0].line.contains("No merge was attempted"));
+    watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(review.notices.len(), count);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    thread::update(&fx.project, &id, |t| t.pane_id.clear()).unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_ne!(
+        load(&fx.project, &review.id).unwrap().phase,
+        Phase::Reviewing
+    );
+}
+
+#[test]
+fn working_reviewer_does_not_warn() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    review.no_verdict_since = "2020-01-01T00:00:00Z".into();
+    watch_no_verdict_state(
+        &fx.world.ctx(),
+        &fx.project,
+        &mut review,
+        &reviewer,
+        "working",
+    )
+    .unwrap();
+    assert!(review.notices.is_empty());
+    assert!(review.no_verdict_since.is_empty());
+}
+
+#[test]
 fn follow_up_after_seal_checks_verdict_now_but_waits_to_land() {
     let fx = configured();
     lane(&fx, 1);

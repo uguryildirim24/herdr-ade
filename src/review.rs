@@ -82,6 +82,9 @@ pub(crate) struct Review {
     pub close: bool,
     pub prune: bool,
     pub attention: String,
+    /// First observed idle/blocked stretch with no fresh reviewer seal.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) no_verdict_since: String,
     /// Review-owned wake-ups survive resolution of the reviewer and members.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) notices: Vec<crate::steps::Notice>,
@@ -170,6 +173,115 @@ fn needs_coordinator(project: &Project, review: &mut Review, reason: &str) -> Re
         ),
     );
     save(project, review)
+}
+
+fn watch_no_verdict(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
+    if review.phase != Phase::Reviewing {
+        if !review.no_verdict_since.is_empty() {
+            review.no_verdict_since.clear();
+            review
+                .notices
+                .retain(|n| n.submitted || !n.line.contains("has no verdict since"));
+            save(project, review)?;
+        }
+        return Ok(());
+    }
+    let Some(id) = review.reviewer.as_deref() else {
+        return Ok(());
+    };
+    let lane = thread::load(project, id)?;
+    let events = crate::events::checked(project)?;
+    let fresh = crate::events::latest_done_event(&events, id, lane.attempt.max(1))
+        .is_some_and(|e| e.id != review.reviewer_after && e.id != review.checked_event);
+    if fresh
+        || lane.status != Status::Open
+        || lane.pane_id.is_empty()
+        || lane.prompt_pending
+        || lane.recovery_pending
+        || crate::threads::follow_up_pending_for_seal(
+            &lane,
+            crate::events::latest_done_event(&events, id, lane.attempt.max(1)),
+        )
+    {
+        if !review.no_verdict_since.is_empty() {
+            review.no_verdict_since.clear();
+            if fresh {
+                review
+                    .notices
+                    .retain(|n| n.submitted || !n.line.contains("has no verdict since"));
+            }
+            save(project, review)?;
+        }
+        return Ok(());
+    }
+    // An absent process belongs to the normal lane failure recovery, not
+    // this idle-review warning. A remote observation must be fresh.
+    let state = if lane.is_remote() {
+        if lane.last_observed.is_empty()
+            || !(0..=45).contains(&thread::seconds_since(
+                &lane.last_observed,
+                jiff::Timestamp::now(),
+            ))
+        {
+            return Ok(());
+        }
+        lane.last_state.as_str()
+    } else {
+        let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+        let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+        let agents = herdr.agent_list()?;
+        let Some(agent) = agents.iter().find(|a| thread::agent_matches(&lane, a)) else {
+            return Ok(());
+        };
+        // Keep the borrowed status alive for the rest of this observation.
+        return watch_no_verdict_state(ctx, project, review, &lane, &agent.agent_status);
+    };
+    watch_no_verdict_state(ctx, project, review, &lane, state)
+}
+
+fn watch_no_verdict_state(
+    ctx: &Ctx,
+    project: &Project,
+    review: &mut Review,
+    lane: &Thread,
+    state: &str,
+) -> Result<()> {
+    if state != "idle" && state != "blocked" {
+        if !review.no_verdict_since.is_empty() {
+            review.no_verdict_since.clear();
+            save(project, review)?;
+        }
+        return Ok(());
+    }
+    if review.no_verdict_since.is_empty() {
+        review.no_verdict_since = project::now();
+        save(project, review)?;
+        return Ok(());
+    }
+    let secs = ctx
+        .env
+        .var("HERDR_ADE_REVIEW_IDLE_SECS")
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(600);
+    if thread::seconds_since(&review.no_verdict_since, jiff::Timestamp::now()) >= secs
+        && !review.notices.iter().any(|n| {
+            n.line
+                .contains(&format!("has no verdict since {}", review.no_verdict_since))
+        })
+        && !review
+            .notices
+            .iter()
+            .any(|n| !n.submitted && n.line.contains("needs you"))
+    {
+        let line = format!(
+            "REVIEW {} has no verdict since {} (reviewer {} {}); inspect the pane or run ha review retry {}. No merge was attempted.",
+            review.id, review.no_verdict_since, lane.id, state, project.slug
+        );
+        queue_notice(review, line);
+        save(project, review)?;
+    }
+    Ok(())
 }
 
 fn operation_lock(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
@@ -573,6 +685,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         close: false,
         prune: false,
         attention: String::new(),
+        no_verdict_since: String::new(),
         notices: Vec::new(),
     };
     save(project, &review)?;
@@ -1288,6 +1401,7 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     record.verdict = None;
     record.verdict_event.clear();
     record.checked_event.clear();
+    record.no_verdict_since.clear();
     record.refresh_tip = None;
     record.phase = if record.reviewer.is_some() {
         Phase::Reviewing
@@ -1453,7 +1567,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             continue;
         };
         let mut record = load(project, &old.id)?;
-        if let Err(error) = advance(ctx, project, &mut record) {
+        if let Err(error) = advance(ctx, project, &mut record)
+            .and_then(|()| watch_no_verdict(ctx, project, &mut record))
+        {
             record.attention = format!("{error:#}");
             save(project, &record)?;
             first.get_or_insert(error);

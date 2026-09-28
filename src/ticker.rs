@@ -4564,6 +4564,7 @@ mod tests {
             close: false,
             prune: false,
             attention: String::new(),
+            no_verdict_since: String::new(),
             notices: Vec::new(),
         };
         std::fs::create_dir_all(crate::review::dir(&f.project)).unwrap();
