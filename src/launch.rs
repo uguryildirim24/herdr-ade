@@ -194,7 +194,15 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
 pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<String> {
     crate::prompt::resolve_request(project, basis)
         .map(|request| request.qualified_basis())
-        .map_err(|error| crate::refusal::error(error.to_string(), format!("ha open {} --recipe <id> --basis request:<id>", project.slug)))
+        .map_err(|error| {
+            crate::refusal::error(
+                error.to_string(),
+                format!(
+                    "ha open {} --recipe <id> --basis request:<id>",
+                    project.slug
+                ),
+            )
+        })
 }
 
 /// Validate a coordinator's one-off lane recipe before creating the lane.
