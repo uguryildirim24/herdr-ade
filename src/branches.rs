@@ -328,8 +328,12 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     let local = refs(ctx.runner, &record.repo, None)?;
     // The box's mutable published branch can still be at base while the Mac
     // local ref has advanced to the immutable seal used by the landed review.
-    // Accept that exact review member, not an arbitrary later box seal.
-    let merged_seal = if record.is_remote() && has_seal_refs && !record.merged_review.is_empty() {
+    // Accept that exact review member or fast-forwarded reviewer verdict,
+    // not an arbitrary later box seal.
+    let merged_seal = if record.is_remote()
+        && has_seal_refs
+        && (!record.merged_review.is_empty() || !record.review_id.is_empty())
+    {
         review_pin.as_deref().filter(|pin| {
             events.iter().any(|event| {
                 event.thread == record.id
@@ -1106,9 +1110,13 @@ mod tests {
 
     #[test]
     fn merged_box_cleanup_accepts_review_seal_but_refuses_a_later_local_commit() {
-        for moved in [false, true] {
+        for (reviewer, moved) in [(false, false), (false, true), (true, false), (true, true)] {
             let (fx, bare) = configured();
-            let branch = "hp/demo/t-1";
+            let branch = if reviewer {
+                "hp/demo/t-1-review-pile-review-1"
+            } else {
+                "hp/demo/t-1"
+            };
             let remote = bare.path().to_str().unwrap();
             let base = run(&fx.repo, &["rev-parse", "HEAD"]);
             run(&fx.repo, &["branch", branch, &base]);
@@ -1133,7 +1141,12 @@ mod tests {
                 t.branch = branch.into();
                 t.base = base.clone();
                 t.machine = "buildbox".into();
-                t.merged_review = "review-1".into();
+                if reviewer {
+                    t.role = "reviewer".into();
+                    t.review_id = "review-1".into();
+                } else {
+                    t.merged_review = "review-1".into();
+                }
                 t.status = Status::Resolved;
                 t.cleanup_pending = true;
                 t.cleanup_reason = "branch moved beyond its sealed cleanup tip".into();
@@ -1156,19 +1169,29 @@ mod tests {
                     integration: "main".into(),
                     base: base.clone(),
                     candidate_branch: "review/demo/review-1".into(),
-                    members: vec![crate::review::Member {
-                        thread: record.id.clone(),
-                        attempt: 1,
-                        event: event_id,
-                        sha: seal.clone(),
-                        branch: branch.into(),
-                        artifact: String::new(),
-                    }],
+                    members: if reviewer {
+                        vec![]
+                    } else {
+                        vec![crate::review::Member {
+                            thread: record.id.clone(),
+                            attempt: 1,
+                            event: event_id,
+                            sha: seal.clone(),
+                            branch: branch.into(),
+                            artifact: String::new(),
+                        }]
+                    },
                     gates: vec![],
                     selected_gates: vec![],
-                    reviewer: None,
+                    reviewer: reviewer.then(|| record.id.clone()),
                     phase: crate::review::Phase::Complete,
-                    verdict: None,
+                    verdict: reviewer.then(|| crate::review::Verdict {
+                        verdict: "approve".into(),
+                        review: "review-1".into(),
+                        candidate: seal.clone(),
+                        without: Default::default(),
+                        gates: vec![],
+                    }),
                     verdict_event: String::new(),
                     reviewer_after: String::new(),
                     checked_event: String::new(),
