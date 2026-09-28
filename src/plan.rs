@@ -783,7 +783,11 @@ fn with_subtasks_from_tasks(
 /// and with work not yet started.
 fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
     !step.threads.is_empty()
-        || !step.tasks.is_empty()
+        // A dropped binding is deliberately excluded, but a missing explicit
+        // binding still blocks a parent from completing through its children.
+        || step.tasks.iter().any(|id| {
+            !tasks.iter().any(|task| task.id == *id && !task.dropped.is_empty())
+        })
         || tasks.iter().any(|task| {
             task.dropped.is_empty()
                 && (task.plan_step.as_deref() == Some(step.id.as_str())
@@ -827,11 +831,12 @@ fn derive_state_from_tasks(
     if linked_tasks.is_empty() && step.threads.is_empty() {
         return StepState::Left;
     }
-    let mut all_satisfied = step.tasks.iter().all(|id| {
-        tasks
-            .iter()
-            .any(|task| task.id == *id && task.dropped.is_empty())
-    });
+    // Explicit dropped tasks exist but are excluded from the live bindings.
+    // Only a genuinely missing or unreadable explicit task blocks completion.
+    let mut all_satisfied = step
+        .tasks
+        .iter()
+        .all(|id| tasks.iter().any(|task| task.id == *id));
     let mut any_started = false;
     for view in linked_tasks {
         if !view.terminal_with_evidence(project, evidence) {
@@ -1368,6 +1373,46 @@ mod tests {
         .unwrap();
         check_prerequisites(&fx.project, "job-0002").unwrap();
         check_attempt_prerequisites(&fx.project, &deferred).unwrap();
+    }
+
+    #[test]
+    fn merged_work_with_a_dropped_task_finishes_and_opens_its_dependent() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        for id in ["job-0001", "job-0002", "job-0003", "job-0004"] {
+            write_task(&fx, id);
+        }
+        step_add(
+            &ctx,
+            "demo",
+            "A",
+            vec!["job-0001".into(), "job-0002".into(), "job-0003".into()],
+            vec![],
+            None,
+        )
+        .unwrap();
+        step_add(
+            &ctx,
+            "demo",
+            "B",
+            vec!["job-0004".into()],
+            vec!["s-1".into()],
+            None,
+        )
+        .unwrap();
+        for n in 1..=2 {
+            let (lane, sha) = fx.lane(n);
+            crate::task::link_attempt(&fx.project, &format!("job-{n:04}"), &lane).unwrap();
+            fx.seal_done(&lane, 1, n, &sha, "# report\n");
+            crate::thread::update(&fx.project, &lane, |t| t.merged_sha = sha.clone()).unwrap();
+        }
+        crate::task::drop_task(&fx.project, "job-0003", "No longer needed").unwrap();
+        // Both the display and the launch gate must use the same projection,
+        // even when the persisted card has not yet been synced.
+        let shown: serde_json::Value =
+            serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+        assert_eq!(shown["steps"][0]["state"], "done");
+        check_prerequisites(&fx.project, "job-0004").unwrap();
     }
 
     #[test]
