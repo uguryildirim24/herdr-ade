@@ -53,6 +53,41 @@ fn ticker_skips_locked_pile_then_advances_after_release() {
 }
 
 #[test]
+fn ticker_holds_pile_while_a_failed_lane_has_a_live_agent() {
+    let fx = configured();
+    lane(&fx, 1);
+    let (failed, _) = lane_unsealed(&fx, 2);
+    thread::update(&fx.project, &failed, |t| {
+        t.status = Status::Failed;
+        t.pane_id = "w1:p12".into();
+        t.tab_id = "w1:t12".into();
+        t.workspace_id = "w1".into();
+        t.launch.kind = "claude".into();
+        t.agent_name = "old-name".into();
+    })
+    .unwrap();
+    let record = thread::load(&fx.project, &failed).unwrap();
+    *fx.world.panes.borrow_mut() = serde_json::json!([{
+        "pane_id": record.pane_id, "tab_id": record.tab_id,
+        "workspace_id": record.workspace_id, "cwd": record.cwd
+    }])
+    .to_string();
+    *fx.world.agents.borrow_mut() = serde_json::json!([{
+        "pane_id": record.pane_id, "tab_id": record.tab_id,
+        "workspace_id": record.workspace_id, "cwd": record.worktree_path,
+        "name": "", "agent": "claude", "agent_status": "working"
+    }])
+    .to_string();
+    project::write_atomic(
+        &fx.project.state_dir().join("reviews-enabled"),
+        b"enabled\n",
+    )
+    .unwrap();
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert!(list(&fx.project).unwrap().is_empty());
+}
+
+#[test]
 fn reviewer_placement_leaves_launch_pending_and_releases_the_lock() {
     let fx = configured();
     lane(&fx, 1);

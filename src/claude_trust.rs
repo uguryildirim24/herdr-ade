@@ -1,6 +1,39 @@
 //! Answer only a managed Claude lane's own repository trust dialog. Claude
 //! persists the decision itself; ADE never writes its shared config file.
 use anyhow::Result;
+use std::path::Path;
+
+/// Only a readable, valid Claude config can establish that a folder is untrusted.
+/// Claude trusts descendants of accepted project paths, including worktrees.
+pub(crate) fn check_folder(ctx: &Ctx, kind: &str, remote: bool, folder: &Path) -> Result<()> {
+    if kind != "claude" || remote {
+        return Ok(());
+    }
+    let Ok(bytes) = std::fs::read(ctx.env.home.join(".claude.json")) else {
+        return Ok(());
+    };
+    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(());
+    };
+    let trusted = folder.ancestors().any(|path| {
+        config
+            .get("projects")
+            .and_then(|projects| projects.get(path.to_str()?))
+            .and_then(|project| project.get("hasTrustDialogAccepted"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    if !trusted {
+        return Err(crate::refusal::error(
+            format!(
+                "claude_folder_untrusted: {} is not trusted by Claude Code; the agent would stop on its trust question",
+                folder.display()
+            ),
+            "Run `claude` once in the repository and answer yes to the trust question, or trust it in your Claude settings",
+        ));
+    }
+    Ok(())
+}
 
 use crate::herdr::Herdr;
 use crate::paths::Ctx;
@@ -109,6 +142,33 @@ mod tests {
     use crate::project::{self, Repo};
     use crate::runner::fake::{FakeRunner, ok};
     use crate::thread::Status;
+
+    #[test]
+    fn config_trust_inherits_from_parent_and_only_refuses_claude() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().into(),
+            config_dir: home.path().join("cfg"),
+            runner: &crate::runner::RealRunner,
+            detached_ticker: false,
+        };
+        let repo = home.path().join("repo");
+        let folder = repo.join(".worktrees/t-0001");
+        let config = home.path().join(".claude.json");
+        assert!(check_folder(&ctx, "claude", false, &folder).is_ok());
+        std::fs::write(&config, "not json").unwrap();
+        assert!(check_folder(&ctx, "claude", false, &folder).is_ok());
+        std::fs::write(&config, r#"{"projects":{}}"#).unwrap();
+        let refusal = check_folder(&ctx, "claude", false, &folder).unwrap_err();
+        assert!(format!("{refusal:#}").contains("claude_folder_untrusted"));
+        assert!(format!("{refusal:#}").contains(&folder.display().to_string()));
+        assert!(check_folder(&ctx, "pi", false, &folder).is_ok());
+        assert!(check_folder(&ctx, "claude", true, &folder).is_ok());
+        std::fs::write(&config, serde_json::json!({"projects": {(repo.to_str().unwrap()): {"hasTrustDialogAccepted": true}}}).to_string()).unwrap();
+        assert!(check_folder(&ctx, "claude", false, &folder).is_ok());
+    }
 
     #[test]
     fn only_the_managed_worktree_and_its_live_pane_can_be_trusted() {
