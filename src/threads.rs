@@ -4766,6 +4766,27 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
             note: "pane parked until requested".into(),
         };
     }
+    // Placement was refused before a pane existed. Do not diagnose a missing
+    // process for a start that has never launched, even with no live session.
+    if t.launch_attempts == 0 && !t.provider_wait_started.is_empty() {
+        let provider = crate::pi::launch::flag_value(&t.launch.args, "--provider")
+            .unwrap_or_else(|| t.launch.kind.clone());
+        let reason = if t.error.contains("readiness probe timed out") {
+            format!("readiness probe timed out at {}", t.provider_wait_started)
+        } else {
+            format!(
+                "readiness check failed at {}: {}",
+                t.provider_wait_started, t.error
+            )
+        };
+        return Row {
+            thread: t.clone(),
+            group: recorded,
+            note: format!(
+                "waiting for provider {provider}: {reason}; the start is queued and retries by itself"
+            ),
+        };
+    }
     let Some(view) = view else {
         // Records are still printed; panes are not treated as gone.
         return Row {
@@ -6294,6 +6315,19 @@ mod tests {
         assert!(!waiting.provider_wait_started.is_empty());
         assert_eq!(waiting.launch_attempts, 0);
         assert!(waiting.pane_id.is_empty());
+        let ctx = fx.world.ctx();
+        let view = session_view(&ctx, &fx.project).unwrap();
+        let mut local_wait = waiting.clone();
+        local_wait.machine.clear();
+        let shown = row(&local_wait, Some(&view), jiff::Timestamp::now());
+        assert_eq!(shown.group, Group::Working);
+        assert_eq!(
+            shown.note,
+            format!(
+                "waiting for provider opencode-go: readiness probe timed out at {}; the start is queued and retries by itself",
+                waiting.provider_wait_started
+            )
+        );
         let other = thread::allocate(&fx.project, |t| {
             t.launch = waiting.launch.clone();
             t.machine = waiting.machine.clone();

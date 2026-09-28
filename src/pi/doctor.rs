@@ -16,7 +16,9 @@ use serde_json::Value;
 
 use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, sh};
 
-const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+// A healthy Mac Codex print-mode probe has exceeded 10s; leave room for
+// normal provider latency without treating a real refusal as ready.
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const READINESS_CACHE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Deserialize)]
@@ -1399,6 +1401,28 @@ mod tests {
             text.iter().any(|l| l.contains("[FAIL] trust.json")),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn live_probe_has_measured_headroom_but_still_refuses_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let runner = FakeRunner::new();
+        runner.on(
+            "auth check --provider openai-codex",
+            ok(r#"{"status":"ready"}"#),
+        );
+        runner.on("--print Reply OK.", fail(1, "authentication failed"));
+        let failure = auth_check_model(&runner, &layout, "openai-codex", Some("gpt-6-sol"));
+        assert!(failure.is_err());
+        assert_eq!(failure.unwrap_err().evidence, FailureEvidence::Provider);
+        let calls = runner.calls.borrow();
+        let probe = calls
+            .iter()
+            .find(|cmd| cmd.display().contains("--print Reply OK."))
+            .unwrap();
+        assert_eq!(probe.timeout, LIVE_PROBE_TIMEOUT);
+        assert_eq!(probe.timeout, Duration::from_secs(30));
     }
 
     #[test]
