@@ -44,13 +44,26 @@ fn xml(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn ticker_agent_definition(home: &Path, root: &Path, path: &str) -> String {
-    let bin = home.join(".local/bin/herdr-ade");
+fn ticker_agent_definition(ctx: &Ctx) -> String {
+    let bin = ctx.env.home.join(".local/bin/herdr-ade");
+    let path = format!(
+        "{}:/bin:{}",
+        ctx.env.home.join(".local/bin").display(),
+        ctx.env.var("PATH").unwrap_or_default()
+    );
+    let mut env = format!(
+        "<key>PATH</key><string>{}</string><key>HERDR_ADE_TICKER_SUPERVISOR</key><string>launchd</string>",
+        xml(&path)
+    );
+    for key in ["XDG_CONFIG_HOME", "HERDR_BIN_PATH"] {
+        if let Some(value) = ctx.env.var(key) {
+            env.push_str(&format!("<key>{key}</key><string>{}</string>", xml(value)));
+        }
+    }
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{TICKER_AGENT}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--root</string><string>{}</string><string>ticker</string><string>ensure</string></array>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string><key>HERDR_ADE_TICKER_SUPERVISOR</key><string>launchd</string></dict>\n<key>RunAtLoad</key><true/>\n<key>StartInterval</key><integer>120</integer>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{TICKER_AGENT}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--root</string><string>{}</string><string>ticker</string><string>ensure</string></array>\n<key>EnvironmentVariables</key><dict>{env}</dict>\n<key>RunAtLoad</key><true/>\n<key>StartInterval</key><integer>120</integer>\n</dict></plist>\n",
         xml(&bin.to_string_lossy()),
-        xml(&root.to_string_lossy()),
-        xml(path)
+        xml(&ctx.root.to_string_lossy())
     )
 }
 
@@ -81,11 +94,7 @@ fn agent_bootstrap(loaded: bool, changed: bool) -> bool {
 
 fn install_ticker_agent(ctx: &Ctx) -> Result<()> {
     let path = ticker_agent_path(&ctx.env.home);
-    let definition = ticker_agent_definition(
-        &ctx.env.home,
-        &ctx.root,
-        &format!("/bin:{}", ctx.env.var("PATH").unwrap_or_default()),
-    );
+    let definition = ticker_agent_definition(ctx);
     let domain = format!("gui/{}", unsafe { getuid() });
     let loaded = ticker_agent_loaded(&domain);
     let changed = std::fs::read_to_string(&path).map_or(true, |old| old != definition);
@@ -1411,15 +1420,33 @@ mod tests {
 
     #[test]
     fn agent_runs_idempotent_ensure_not_the_loop_or_keepalive() {
-        let definition = ticker_agent_definition(
-            Path::new("/Users/test"),
-            Path::new("/Users/test/.herdr-ade"),
-            "/bin:/Users/test/.local/bin",
+        let home = Path::new("/Users/test");
+        let env = crate::paths::Env::for_test(
+            home,
+            &[
+                ("PATH", "/usr/bin"),
+                ("XDG_CONFIG_HOME", "/Users/test/config"),
+                ("HERDR_BIN_PATH", "/opt/herdr"),
+            ],
         );
+        let runner = crate::runner::RealRunner;
+        let ctx = Ctx {
+            env: &env,
+            root: home.join(".herdr-ade"),
+            config_dir: env.config_dir(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let definition = ticker_agent_definition(&ctx);
         assert!(definition.contains("<key>StartInterval</key><integer>120</integer>"));
         assert!(definition.contains("<string>ticker</string><string>ensure</string>"));
         assert!(definition.contains("<key>RunAtLoad</key><true/>"));
         assert!(definition.contains("HERDR_ADE_TICKER_SUPERVISOR"));
+        assert!(definition.contains("/Users/test/.local/bin:/bin:/usr/bin"));
+        assert!(
+            definition.contains("<key>XDG_CONFIG_HOME</key><string>/Users/test/config</string>")
+        );
+        assert!(definition.contains("<key>HERDR_BIN_PATH</key><string>/opt/herdr</string>"));
         assert!(!definition.contains("KeepAlive"));
         assert!(!definition.contains("<string>run</string>"));
     }
