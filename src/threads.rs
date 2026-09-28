@@ -4359,16 +4359,16 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
     if !inspection.dirty.is_empty() {
         bail!("worktree_dirty: {}", inspection.dirty.join(", "));
     }
-    // Compare the checked-out tip to its published tip before discarding the
-    // checkout. A retained box branch may have moved since the lane sealed.
-    let published_tip = crate::branches::require_published_tip(ctx, &project, &record)?;
+    // Pin the checked-out branch tip before discarding the checkout. A retained
+    // box branch must also match its published tip.
+    let tip = crate::branches::require_published_tip(ctx, &project, &record)?;
     removal_in_use_gate(ctx, &project, &record)?;
     close_pane(ctx, &project, &record)?;
     // The marker makes ref retirement retryable even if the process dies
-    // between removing the checkout and deleting the published branch.
+    // between removing the checkout and deleting the branch.
     let pinned = thread::update(&project, id, |t| {
         t.cleanup_pending = true;
-        t.cleanup_reason = format!("retained worktree removal: {published_tip}");
+        t.cleanup_reason = format!("retained worktree removal: {tip}");
     })?;
     remove_worktree_force_ignored(ctx, &project, &record)?;
     thread::update(&project, id, |t| t.worktree_path.clear())?;
