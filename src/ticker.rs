@@ -1275,13 +1275,101 @@ pub(crate) fn restore_unchanged_seal(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct ProgressThresholds {
+    stall_minutes: u64,
+    no_commit_minutes: u64,
+}
+
+impl Default for ProgressThresholds {
+    fn default() -> Self {
+        Self {
+            stall_minutes: 20,
+            no_commit_minutes: 90,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProgressNotices {
+    stalled: Option<i64>,
+    no_commit: Option<i64>,
+}
+
+fn reset_progress(record: &mut thread::Thread) {
+    record.progress_since.clear();
+    record.progress_screen.clear();
+    record.progress_head.clear();
+    record.progress_pane.clear();
+    record.stall_notified = false;
+    record.no_commit_since.clear();
+    record.no_commit_notified = false;
+}
+
+fn progress_notices(
+    record: &mut thread::Thread,
+    observation: &steps::LaneProgress,
+    now: jiff::Timestamp,
+    config: &ProgressThresholds,
+) -> ProgressNotices {
+    let mut notices = ProgressNotices::default();
+    if record.progress_since.is_empty()
+        || record.progress_pane != observation.pane
+        || record.progress_screen != observation.screen
+        || record.progress_head != observation.head
+    {
+        record.progress_pane = observation.pane.clone();
+        record.progress_screen = observation.screen.clone();
+        record.progress_since = now.to_string();
+        record.stall_notified = false;
+    } else {
+        let minutes = thread::seconds_since(&record.progress_since, now) / 60;
+        if minutes >= config.stall_minutes as i64 && !record.stall_notified {
+            notices.stalled = Some(minutes);
+            record.stall_notified = true;
+        }
+    }
+    if record.repo.is_empty() {
+        record.no_commit_since.clear();
+        record.no_commit_notified = false;
+    } else if record.no_commit_since.is_empty() || record.progress_head != observation.head {
+        record.no_commit_since = now.to_string();
+        record.no_commit_notified = false;
+    } else {
+        let minutes = thread::seconds_since(&record.no_commit_since, now) / 60;
+        if minutes >= config.no_commit_minutes as i64 && !record.no_commit_notified {
+            notices.no_commit = Some(minutes);
+            record.no_commit_notified = true;
+        }
+    }
+    record.progress_head = observation.head.clone();
+    notices
+}
+
+fn progress_notice_lines(notices: &ProgressNotices, lane: &str, pane: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(minutes) = notices.stalled {
+        lines.push(format!("STALLED {lane} has shown no new output and no new commit for {minutes} min in {pane}; check it, then ha thread prompt, ha thread retry --reason, or cancel."));
+    }
+    if let Some(minutes) = notices.no_commit {
+        lines.push(format!(
+            "{lane} has worked {minutes} min with no commit; check it is still on its task."
+        ));
+    }
+    lines
+}
+
 fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
     hashes: Option<&std::collections::BTreeMap<String, String>>,
     refresh_tokens: bool,
+    box_progress: Option<&std::collections::BTreeMap<(String, String), steps::LaneProgress>>,
 ) -> Result<Pass> {
     let ctx = input.ctx;
+    let thresholds: ProgressThresholds =
+        crate::config::Document::read(&ctx.config_dir)?.section("ticker")?;
     let project = input.project;
     let herdr = input.herdr;
     let threads = input.threads;
@@ -1710,6 +1798,96 @@ fn thread_pass(
                 inbox::write(project, "lane-notice", &t.id, &notice, "")?;
             }
         }
+        // Observation failures do not advance a clock or manufacture a stall.
+        if after.status == thread::Status::Open
+            && group == thread::Group::Working
+            && state == "working"
+            && !delivered
+        {
+            let observation = if t.is_remote() {
+                box_progress
+                    .and_then(|progress| progress.get(&(slug.clone(), t.id.clone())))
+                    .filter(|progress| progress.pane == t.pane_id)
+                    .cloned()
+            } else if live.pane_exists {
+                herdr
+                    .pane_read_text(&t.pane_id, "detection")
+                    .ok()
+                    .and_then(|screen| {
+                        let head = if t.repo.is_empty() {
+                            Some(String::new())
+                        } else {
+                            let folder = if t.worktree_path.is_empty() {
+                                &t.cwd
+                            } else {
+                                &t.worktree_path
+                            };
+                            ctx.runner
+                                .run(
+                                    &crate::runner::Cmd::new("git", Duration::from_secs(5)).args([
+                                        "-C",
+                                        folder,
+                                        "rev-parse",
+                                        &format!("refs/heads/{}", t.branch),
+                                    ]),
+                                )
+                                .ok()
+                                .filter(|out| out.success())
+                                .map(|out| out.stdout.trim().to_string())
+                        }?;
+                        Some(steps::LaneProgress {
+                            pane: t.pane_id.clone(),
+                            screen: thread::sha256_hex(screen.as_bytes()),
+                            head,
+                        })
+                    })
+            } else {
+                None
+            };
+            if let Some(observation) = observation
+                && (t.repo.is_empty() || !observation.head.is_empty())
+            {
+                let mut preview = after.clone();
+                let due = progress_notices(&mut preview, &observation, now, &thresholds);
+                if preview.progress_since != after.progress_since
+                    || preview.progress_screen != after.progress_screen
+                    || preview.progress_pane != after.progress_pane
+                    || preview.progress_head != after.progress_head
+                    || preview.no_commit_since != after.no_commit_since
+                    || due.stalled.is_some()
+                    || due.no_commit.is_some()
+                {
+                    let mut notices = ProgressNotices::default();
+                    thread::update(project, &t.id, |record| {
+                        if record.attempt == t.attempt && record.pane_id == t.pane_id {
+                            notices = progress_notices(record, &observation, now, &thresholds);
+                        }
+                    })?;
+                    for notice in progress_notice_lines(&notices, &t.id, &t.pane_id) {
+                        let sent = if let Some(coordinator) = project.coordinator() {
+                            agents.iter().any(|agent| {
+                                coordinator::agent_matches(&coordinator, agent) && agent.ready()
+                            }) && steps::deliver_coordinator_prompt(
+                                project,
+                                herdr,
+                                &coordinator.pane_id,
+                                &notice,
+                            )?
+                        } else {
+                            false
+                        };
+                        if !sent {
+                            inbox::write(project, "lane-notice", &t.id, &notice, "")?;
+                        }
+                    }
+                }
+            }
+        } else if t.status == thread::Status::Open
+            && (state != "working" || group != thread::Group::Working)
+            && !t.progress_since.is_empty()
+        {
+            thread::update(project, &t.id, reset_progress)?;
+        }
         // Only absence of the pane proves a local process is gone. Herdr may
         // temporarily omit agent state while the terminal and process still
         // exist (including after an interactive startup timeout); that state
@@ -1893,6 +2071,7 @@ fn launch_thread_with_wait(ctx: &Ctx, project: &Project, id: &str, wait: Duratio
             &prefix,
             None,
             false,
+            None,
         )?;
         if let Some(error) = pass.error {
             errors.push(error);
@@ -2258,6 +2437,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         &prefix,
         None,
         refresh_tokens,
+        None,
     )?;
     first_error = first_error.or(pass.error);
     if let Err(error) = crate::threads::tick(project, &herdr, &agents) {
@@ -2383,8 +2563,8 @@ fn remote_pass(
         agents: &agents,
         panes: &panes,
     };
-    let state_pass =
-        thread_pass(&state_input, &prefix, None, true).map_err(|e| format!("{e:#}"))?;
+    let state_pass = thread_pass(&state_input, &prefix, None, true, Some(&view.progress))
+        .map_err(|e| format!("{e:#}"))?;
     errors.extend(state_pass.error);
     // Inspect the courier snapshot before launching. A vanished pre-launch
     // pane must not consume an agent start against a terminal that no longer
@@ -2827,6 +3007,83 @@ fn tick_slow_with_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_notices_are_once_per_spell_and_commit_clock_is_independent() {
+        let now = jiff::Timestamp::now();
+        let config = ProgressThresholds::default();
+        assert_eq!((config.stall_minutes, config.no_commit_minutes), (20, 90));
+        let custom: ProgressThresholds =
+            toml::from_str("stall_minutes = 2\nno_commit_minutes = 4").unwrap();
+        assert_eq!((custom.stall_minutes, custom.no_commit_minutes), (2, 4));
+        let mut lane = thread::Thread {
+            repo: "/repo".into(),
+            ..Default::default()
+        };
+        let mut seen = steps::LaneProgress {
+            pane: "w:p".into(),
+            screen: "a".into(),
+            head: "one".into(),
+        };
+        assert!(
+            progress_notice_lines(
+                &progress_notices(&mut lane, &seen, now, &config),
+                "t-1",
+                "w:p"
+            )
+            .is_empty()
+        );
+        lane.progress_since = (now - jiff::Span::new().minutes(21)).to_string();
+        lane.no_commit_since = (now - jiff::Span::new().minutes(91)).to_string();
+        let lines = progress_notice_lines(
+            &progress_notices(&mut lane, &seen, now, &config),
+            "t-1",
+            "w:p",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "STALLED t-1 has shown no new output and no new commit for 21 min in w:p; check it, then ha thread prompt, ha thread retry --reason, or cancel.",
+                "t-1 has worked 91 min with no commit; check it is still on its task.",
+            ]
+        );
+        assert!(
+            progress_notice_lines(
+                &progress_notices(&mut lane, &seen, now, &config),
+                "t-1",
+                "w:p"
+            )
+            .is_empty()
+        );
+        seen.screen = "b".into();
+        assert!(
+            progress_notices(&mut lane, &seen, now, &config)
+                .stalled
+                .is_none()
+        );
+        assert!(!lane.stall_notified);
+        assert!(lane.no_commit_notified);
+        lane.progress_since = (now - jiff::Span::new().minutes(21)).to_string();
+        assert!(
+            progress_notices(&mut lane, &seen, now, &config)
+                .stalled
+                .is_some()
+        );
+        seen.head = "two".into();
+        progress_notices(&mut lane, &seen, now, &config);
+        assert!(!lane.no_commit_notified);
+        assert!(!lane.stall_notified);
+        reset_progress(&mut lane);
+        assert!(lane.progress_since.is_empty());
+        lane.repo.clear();
+        progress_notices(&mut lane, &seen, now, &config);
+        lane.no_commit_since = (now - jiff::Span::new().minutes(91)).to_string();
+        assert!(
+            progress_notices(&mut lane, &seen, now, &config)
+                .no_commit
+                .is_none()
+        );
+    }
     use crate::paths::Env;
     use crate::runner::fake::{FakeRunner, fail, ok, timeout};
 
@@ -3018,6 +3275,7 @@ mod tests {
             "ha",
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(pass.error.is_none());
@@ -3216,6 +3474,7 @@ mod tests {
         let view = steps::CourierOutcome {
             machine_id: "machine-1".into(),
             boot_id: "boot".into(),
+            progress: Default::default(),
             agents: Some(vec![]),
             panes: Some(vec![Pane {
                 workspace_id: record.workspace_id.clone(),
@@ -3365,6 +3624,7 @@ mod tests {
                 "ha",
                 None,
                 true,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -3398,6 +3658,7 @@ mod tests {
             "ha",
             None,
             true,
+            None,
         )
         .unwrap();
         let saved = thread::load(&fixture.project, &record.id).unwrap();
@@ -3476,6 +3737,7 @@ mod tests {
                 "ha",
                 None,
                 true,
+                None,
             )
             .unwrap();
         };
@@ -3566,6 +3828,7 @@ mod tests {
                 "ha",
                 None,
                 false,
+                None,
             )
             .unwrap();
         };
@@ -3658,6 +3921,7 @@ mod tests {
                 "ha",
                 None,
                 true,
+                None,
             )
             .unwrap();
             let saved = thread::load(&fixture.project, &record.id).unwrap();
@@ -3731,6 +3995,7 @@ mod tests {
             "ha",
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3785,6 +4050,7 @@ mod tests {
             "ha",
             Some(&std::collections::BTreeMap::new()),
             true,
+            None,
         )
         .unwrap();
 
@@ -3836,6 +4102,7 @@ mod tests {
             "ha",
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(pass.error.is_none());
@@ -3872,6 +4139,7 @@ mod tests {
             "ha",
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(pass.error.is_none(), "{:?}", pass.error);
@@ -3934,6 +4202,7 @@ mod tests {
             "ha",
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(pass.error.is_none());
@@ -4632,6 +4901,7 @@ mod tests {
                 "ha",
                 None,
                 false,
+                None,
             )
             .unwrap();
             thread::load(&f.project, &lane.id).unwrap()
@@ -5281,6 +5551,7 @@ mod tests {
                 "ha",
                 None,
                 true,
+                None,
             )
             .unwrap()
         };
@@ -5364,6 +5635,7 @@ mod tests {
                 "ha",
                 None,
                 true,
+                None,
             )
             .unwrap()
         };
