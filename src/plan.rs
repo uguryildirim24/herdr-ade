@@ -136,7 +136,44 @@ fn validate(_project: &Project, plan: &Plan) -> Result<()> {
             thread::validate_id(t)?;
         }
     }
-    validate_subtasks(plan, ids)
+    validate_subtasks(plan, ids)?;
+    for step in all_steps(plan) {
+        for prerequisite in &step.after {
+            if !all_steps(plan).any(|s| &s.id == prerequisite) {
+                bail!("plan_after_unknown: `{prerequisite}` is not a step of this plan");
+            }
+            if prerequisite == &step.id {
+                bail!("plan_after_self: `{}` cannot wait on itself", step.id);
+            }
+            if plan.steps.iter().any(|parent| {
+                (parent.id == step.id && parent.subtasks.iter().any(|s| &s.id == prerequisite))
+                    || (parent.id == *prerequisite
+                        && parent.subtasks.iter().any(|s| s.id == step.id))
+            }) {
+                bail!(
+                    "plan_after_family: `{}` cannot wait on `{prerequisite}`",
+                    step.id
+                );
+            }
+            if reaches(plan, prerequisite, &step.id, &mut BTreeSet::new()) {
+                bail!(
+                    "plan_after_cycle: `{}` and `{prerequisite}` form a cycle",
+                    step.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reaches(plan: &Plan, from: &str, target: &str, seen: &mut BTreeSet<String>) -> bool {
+    if from == target {
+        return true;
+    }
+    seen.insert(from.to_string())
+        && all_steps(plan)
+            .find(|s| s.id == from)
+            .is_some_and(|s| s.after.iter().any(|id| reaches(plan, id, target, seen)))
 }
 
 /// Subtasks: step ids unique across both levels, and one level only.
@@ -236,6 +273,7 @@ pub(crate) fn step_add(
     slug: &str,
     text: &str,
     tasks: Vec<String>,
+    after: Vec<String>,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
@@ -248,6 +286,7 @@ pub(crate) fn step_add(
             text: text.clone(),
             state: StepState::Left,
             tasks: dedup(&tasks),
+            after: dedup(&after),
             ..PlanStep::default()
         });
         Ok(())
@@ -285,6 +324,7 @@ pub(crate) fn subtask_add(
     under: &str,
     text: &str,
     tasks: Vec<String>,
+    after: Vec<String>,
     expect: impl Into<Option<u64>>,
 ) -> Result<(Plan, String)> {
     let project = Project::load(&ctx.root, slug)?;
@@ -311,6 +351,7 @@ pub(crate) fn subtask_add(
             text: text.clone(),
             state: StepState::Left,
             tasks: dedup(&tasks),
+            after: dedup(&after),
             ..PlanStep::default()
         });
         Ok(id)
@@ -339,13 +380,14 @@ pub(crate) fn step_link(
     slug: &str,
     id: &str,
     tasks: Vec<String>,
+    after: Vec<String>,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    if tasks.is_empty() {
+    if tasks.is_empty() && after.is_empty() {
         return Err(crate::refusal::error(
-            "plan_link: at least one --task is required",
-            format!("ha plan step link {slug} {id} --task <job-id>"),
+            "plan_link: at least one --task or --after is required",
+            format!("ha plan step link {slug} {id} --after <step-id>"),
         ));
     }
     check_task_refs(&project, &tasks)?;
@@ -354,6 +396,11 @@ pub(crate) fn step_link(
         for task in &tasks {
             if !step.tasks.contains(task) {
                 step.tasks.push(task.clone());
+            }
+        }
+        for id in &after {
+            if !step.after.contains(id) {
+                step.after.push(id.clone());
             }
         }
         Ok(())
@@ -366,19 +413,21 @@ pub(crate) fn step_unlink(
     slug: &str,
     id: &str,
     tasks: Vec<String>,
+    after: Vec<String>,
     _why: &str,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    if tasks.is_empty() {
+    if tasks.is_empty() && after.is_empty() {
         return Err(crate::refusal::error(
-            "plan_unlink: at least one --task is required",
-            format!("ha plan step unlink {slug} {id} --task <job-id>"),
+            "plan_unlink: at least one --task or --after is required",
+            format!("ha plan step unlink {slug} {id} --after <step-id> --why <reason>"),
         ));
     }
     let (plan, ()) = with_plan(&project, expect, |plan| {
         let step = find_step(plan, id)?;
         step.tasks.retain(|task| !tasks.contains(task));
+        step.after.retain(|id| !after.contains(id));
         Ok(())
     })?;
     Ok(plan)
@@ -392,6 +441,26 @@ pub(crate) fn step_remove(
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
     let (plan, ()) = with_plan(&project, expect, |plan| {
+        let removed: Vec<_> = plan
+            .steps
+            .iter()
+            .filter(|step| step.id == id)
+            .flat_map(|step| step.subtasks.iter().map(|sub| sub.id.as_str()))
+            .chain(std::iter::once(id))
+            .collect();
+        if let Some((dependent, edge)) = all_steps(plan)
+            .filter(|step| !removed.contains(&step.id.as_str()))
+            .find_map(|step| {
+                step.after
+                    .iter()
+                    .find(|edge| removed.contains(&edge.as_str()))
+                    .map(|edge| (step.id.as_str(), edge.as_str()))
+            })
+        {
+            bail!(
+                "plan_after_referenced: step `{edge}` is required by `{dependent}`; unlink it first"
+            );
+        }
         let before = all_steps(plan).count();
         plan.steps.retain(|s| s.id != id);
         for step in &mut plan.steps {
@@ -520,6 +589,9 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
         if !step.threads.is_empty() {
             refs.push_str(&format!(" threads {}", step.threads.join(", ")));
         }
+        if !step.after.is_empty() {
+            refs.push_str(&format!(" after {}", step.after.join(", ")));
+        }
         out.push_str(&format!(
             "{indent}{:<7} {}  {}{}\n",
             step.state.word(),
@@ -529,6 +601,68 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
         ));
     }
     Ok(out)
+}
+
+/// Check current evidence, never the persisted state, before a task launches.
+pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
+    if job.is_empty() {
+        return Ok(());
+    }
+    let Some(mut plan) = load(project)? else {
+        return Ok(());
+    };
+    if !all_steps(&plan).any(|step| !step.after.is_empty()) {
+        return Ok(());
+    }
+    let task = crate::task::load(project, job)?;
+    let (_, errors) = crate::task::list_with_errors(project);
+    let evidence = crate::task::EvidenceSnapshot::load(project);
+    project_states_with_evidence(project, &mut plan, &evidence);
+    let readable = errors.is_empty() && evidence.readable();
+    for dependent in all_steps(&plan).filter(|step| {
+        step.tasks.iter().any(|id| id == job) || task.plan_step.as_deref() == Some(&step.id)
+    }) {
+        for id in &dependent.after {
+            let prerequisite = all_steps(&plan)
+                .find(|step| &step.id == id)
+                .with_context(|| {
+                    format!("plan_after_unknown: `{id}` is not a step of this plan")
+                })?;
+            if prerequisite.state != StepState::Done || !readable {
+                let state = if !readable && prerequisite.state == StepState::Done {
+                    StepState::Running
+                } else {
+                    prerequisite.state
+                };
+                bail!(
+                    "plan_prerequisite: {job} cannot start; step {} waits for {} ({}). Finish the bound work and run ha plan sync {}, or change the plan before starting.",
+                    dependent.id,
+                    id,
+                    state.word(),
+                    project.slug
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Find the stable task of a placed attempt for a deferred launch.
+pub(crate) fn check_attempt_prerequisites(project: &Project, thread_id: &str) -> Result<()> {
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if !errors.is_empty()
+        && load(project)?.is_some_and(|plan| all_steps(&plan).any(|s| !s.after.is_empty()))
+    {
+        bail!(
+            "plan_prerequisite: unreadable task evidence; repair it before launching {thread_id}"
+        );
+    }
+    for task in tasks {
+        if task.attempts.iter().any(|id| id == thread_id) {
+            check_prerequisites(project, &task.id)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -685,7 +819,11 @@ fn derive_state_from_tasks(
     if linked_tasks.is_empty() && step.threads.is_empty() {
         return StepState::Left;
     }
-    let mut all_satisfied = true;
+    let mut all_satisfied = step.tasks.iter().all(|id| {
+        tasks
+            .iter()
+            .any(|task| task.id == *id && task.dropped.is_empty())
+    });
     let mut any_started = false;
     for view in linked_tasks {
         if !view.terminal_with_evidence(project, evidence) {
@@ -731,7 +869,7 @@ mod tests {
     }
 
     fn add(fx: &Fx, text: &str, expect: u64) -> Plan {
-        step_add(&fx.world.ctx(), "demo", text, vec![], expect).unwrap()
+        step_add(&fx.world.ctx(), "demo", text, vec![], vec![], expect).unwrap()
     }
 
     #[test]
@@ -777,7 +915,15 @@ mod tests {
             None,
         )
         .unwrap();
-        let plan = step_add(&fx.world.ctx(), "demo", "Build the screen.", vec![], None).unwrap();
+        let plan = step_add(
+            &fx.world.ctx(),
+            "demo",
+            "Build the screen.",
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.revision, 2);
         let json: serde_json::Value =
             serde_json::from_str(&show(&fx.world.ctx(), "demo", true).unwrap()).unwrap();
@@ -930,30 +1076,48 @@ mod tests {
         set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
         add(&fx, "Build the screen", 1);
         add(&fx, "Try it out", 2);
-        let (plan, id) = subtask_add(&ctx, "demo", "s-1", "Draw the list", vec![], 3).unwrap();
+        let (plan, id) =
+            subtask_add(&ctx, "demo", "s-1", "Draw the list", vec![], vec![], 3).unwrap();
         assert_eq!(id, "s-3");
         assert_eq!(plan.steps[0].subtasks[0].state, StepState::Left);
-        let (_, id) = subtask_add(&ctx, "demo", "s-1", "Colour the marks", vec![], None).unwrap();
+        let (_, id) = subtask_add(
+            &ctx,
+            "demo",
+            "s-1",
+            "Colour the marks",
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_eq!(id, "s-4");
         let e = format!(
             "{:#}",
-            subtask_add(&ctx, "demo", "s-3", "Too deep", vec![], None).unwrap_err()
+            subtask_add(&ctx, "demo", "s-3", "Too deep", vec![], vec![], None).unwrap_err()
         );
         assert!(e.starts_with("plan_step_depth"), "{e}");
         let e = format!(
             "{:#}",
-            subtask_add(&ctx, "demo", "s-9", "Nowhere", vec![], None).unwrap_err()
+            subtask_add(&ctx, "demo", "s-9", "Nowhere", vec![], vec![], None).unwrap_err()
         );
         assert!(e.starts_with("plan_step_unknown"), "{e}");
 
         // Edit, link, unlink and remove take a subtask id like a step id.
         let plan = step_edit(&ctx, "demo", "s-4", "Colour the boxes", None).unwrap();
         assert_eq!(plan.steps[0].subtasks[1].text, "Colour the boxes");
-        let plan = step_link(&ctx, "demo", "s-3", vec!["job-0001".into()], None).unwrap();
+        let plan = step_link(&ctx, "demo", "s-3", vec!["job-0001".into()], vec![], None).unwrap();
         assert_eq!(plan.steps[0].subtasks[0].tasks, ["job-0001"]);
         assert!(plan.steps[0].tasks.is_empty());
-        let plan =
-            step_unlink(&ctx, "demo", "s-3", vec!["job-0001".into()], "moved", None).unwrap();
+        let plan = step_unlink(
+            &ctx,
+            "demo",
+            "s-3",
+            vec!["job-0001".into()],
+            vec![],
+            "moved",
+            None,
+        )
+        .unwrap();
         assert!(plan.steps[0].subtasks[0].tasks.is_empty());
 
         // The card on disk carries them nested, and loads back the same.
@@ -979,7 +1143,8 @@ mod tests {
         // Removing a step removes its subtasks; no id is reused.
         let plan = step_remove(&ctx, "demo", "s-1", None).unwrap();
         assert_eq!(all_steps(&plan).count(), 1);
-        let (_, id) = subtask_add(&ctx, "demo", "s-2", "Open it once", vec![], None).unwrap();
+        let (_, id) =
+            subtask_add(&ctx, "demo", "s-2", "Open it once", vec![], vec![], None).unwrap();
         assert_eq!(id, "s-5");
         assert!(step_edit(&ctx, "demo", "s-3", "Gone", None).is_err());
 
@@ -992,7 +1157,16 @@ mod tests {
             );
         }
         for n in 0..4 {
-            subtask_add(&ctx, "demo", "s-2", &format!("Part {n}"), vec![], None).unwrap();
+            subtask_add(
+                &ctx,
+                "demo",
+                "s-2",
+                &format!("Part {n}"),
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
         }
         let plan = load(&fx.project).unwrap().unwrap();
         assert_eq!(plan.steps.len(), 7);
@@ -1067,14 +1241,160 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual on-disk schema verification; requires the Mac project records"]
+    fn real_plan_records_load_without_changing_counts() {
+        let home = std::env::var("HOME").unwrap();
+        for slug in [
+            "adeherdr",
+            "elicio",
+            "flyonenomics",
+            "prl-8-53",
+            "proprium",
+            "somebody",
+            "venator",
+        ] {
+            let path = std::path::Path::new(&home)
+                .join(".herdr-ade")
+                .join(slug)
+                .join(".state/plan.toml");
+            let text = std::fs::read_to_string(path).unwrap();
+            let plan: Plan = toml::from_str(&text).unwrap();
+            let steps: Vec<_> = all_steps(&plan).collect();
+            println!(
+                "{slug}: {}/{}",
+                steps.iter().filter(|s| s.state == StepState::Done).count(),
+                steps.len()
+            );
+        }
+    }
+
+    #[test]
+    fn prerequisites_gate_bound_tasks_using_current_evidence() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        write_task(&fx, "job-0001");
+        write_task(&fx, "job-0002");
+        step_add(&ctx, "demo", "A", vec!["job-0001".into()], vec![], None).unwrap();
+        step_add(
+            &ctx,
+            "demo",
+            "B",
+            vec!["job-0002".into()],
+            vec!["s-1".into()],
+            None,
+        )
+        .unwrap();
+        let error = check_prerequisites(&fx.project, "job-0002")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "plan_prerequisite: job-0002 cannot start; step s-2 waits for s-1 (left)."
+            ),
+            "{error}"
+        );
+        let rejected = crate::threads::start(
+            &ctx,
+            "demo",
+            crate::threads::StartArgs {
+                title: "B".into(),
+                repo: None,
+                machine: None,
+                base: None,
+                task: "Build B".into(),
+                plain: "Build B".into(),
+                workflow: None,
+                recipe: None,
+                recipe_basis: None,
+                task_id: "job-0002".into(),
+                review_id: String::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(rejected.to_string().starts_with("plan_prerequisite:"));
+        assert!(crate::thread::list(&fx.project).is_empty());
+        // A task appearing on multiple steps must satisfy every edge.
+        step_add(
+            &ctx,
+            "demo",
+            "C",
+            vec!["job-0002".into()],
+            vec!["s-2".into()],
+            None,
+        )
+        .unwrap();
+        check_prerequisites(&fx.project, "job-0001").unwrap();
+        let (lane, sha) = fx.lane(1);
+        crate::task::link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        // A deferred launch is checked against the same current projection.
+        let (deferred, _) = fx.lane(2);
+        crate::task::link_attempt(&fx.project, "job-0002", &deferred).unwrap();
+        assert!(check_attempt_prerequisites(&fx.project, &deferred).is_err());
+        fx.seal_done(&lane, 1, 1, &sha, "# report\n");
+        crate::thread::update(&fx.project, &lane, |t| t.merged_sha = sha.clone()).unwrap();
+        assert_eq!(
+            load(&fx.project).unwrap().unwrap().steps[0].state,
+            StepState::Left
+        );
+        let error = check_prerequisites(&fx.project, "job-0002")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("step s-3 waits for s-2 (running)"),
+            "{error}"
+        );
+        step_unlink(
+            &ctx,
+            "demo",
+            "s-3",
+            vec![],
+            vec!["s-2".into()],
+            "changed",
+            None,
+        )
+        .unwrap();
+        check_prerequisites(&fx.project, "job-0002").unwrap();
+        check_attempt_prerequisites(&fx.project, &deferred).unwrap();
+    }
+
+    #[test]
+    fn invalid_edges_are_refused_and_old_cards_have_no_gate() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        write_task(&fx, "job-0001");
+        step_add(&ctx, "demo", "A", vec!["job-0001".into()], vec![], None).unwrap();
+        check_prerequisites(&fx.project, "job-0001").unwrap();
+        for edge in ["s-1", "s-99"] {
+            assert!(step_link(&ctx, "demo", "s-1", vec![], vec![edge.into()], None).is_err());
+        }
+        step_add(&ctx, "demo", "B", vec![], vec!["s-1".into()], None).unwrap();
+        assert!(step_link(&ctx, "demo", "s-1", vec![], vec!["s-2".into()], None).is_err());
+        assert!(step_remove(&ctx, "demo", "s-1", None).is_err());
+        let (_, sub) = subtask_add(&ctx, "demo", "s-1", "part", vec![], vec![], None).unwrap();
+        assert!(step_link(&ctx, "demo", "s-1", vec![], vec![sub.clone()], None).is_err());
+        assert!(step_link(&ctx, "demo", &sub, vec![], vec!["s-1".into()], None).is_err());
+        step_unlink(
+            &ctx,
+            "demo",
+            "s-2",
+            vec![],
+            vec!["s-1".into()],
+            "changed",
+            None,
+        )
+        .unwrap();
+        assert!(step_remove(&ctx, "demo", "s-1", None).is_ok());
+    }
+
+    #[test]
     fn subtask_states_come_from_their_own_work() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
         let (lane, sha) = fx.lane(1);
         add(&fx, "Land the lane", 1);
-        subtask_add(&ctx, "demo", "s-1", "The lane's part", vec![], 2).unwrap();
-        subtask_add(&ctx, "demo", "s-1", "The rest", vec![], 3).unwrap();
+        subtask_add(&ctx, "demo", "s-1", "The lane's part", vec![], vec![], 2).unwrap();
+        subtask_add(&ctx, "demo", "s-1", "The rest", vec![], vec![], 3).unwrap();
         let plan = with_plan(&fx.project, 4, |plan| {
             find_step(plan, "s-2")?.threads = vec![lane.clone()];
             Ok(())
