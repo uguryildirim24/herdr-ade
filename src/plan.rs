@@ -1414,7 +1414,6 @@ mod tests {
                 plain: "Build B".into(),
                 workflow: None,
                 recipe: None,
-                recipe_basis: None,
                 task_id: "job-0002".into(),
                 review_id: String::new(),
             },

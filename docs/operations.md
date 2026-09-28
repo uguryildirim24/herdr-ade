@@ -124,7 +124,7 @@ No remote machine is declared by default. Copy the neutral example in [`assets/d
 
 Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table and flags an enabled recipe with neither a route nor a command. `context` prints one line per recipe with its plain use, capabilities and the rule or choice that reaches it; command syntax stays in the coordinator skill. Disabled recipes have no route.
 
-The coordinator uses routing by default. When Rolf names the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When Rolf names one for a single lane, the task must cite his request and the start uses `--recipe <id> --basis "<Rolf's exact words>"`. The lane launch record and context keep the recipe, quote and request.
+The coordinator uses routing by default. When Rolf names the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When routing's choice does not fit a lane, the coordinator can start it with any enabled `--recipe <id>`. The lane launch record keeps the recipe with routing rule `explicit`; its basis and request are empty.
 
 The starting table is:
 
@@ -155,7 +155,7 @@ recipe = "claude_fable_xhigh"
 
 A rule may override the global recovery policy with `retries = N`. `ha failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
 
-Each launch record and dispatch journal row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. An explicit row also carries `recipe_basis` and `recipe_request`. Historical launch and dispatch records without those fields still load.
+Each launch record and dispatch journal row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. Coordinator rows also carry `recipe_basis` and `recipe_request`; lane rows leave them empty. Historical launch and dispatch records without those fields still load.
 
 ## The allow-list for your coordinator
 
