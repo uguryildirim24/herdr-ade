@@ -722,6 +722,73 @@ fn old_empty_commit_seal_is_classified_as_no_change() {
 }
 
 #[test]
+fn old_round_reviewer_with_missing_worktree_repo_does_not_break_plan() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let rounds = fx.project.state_dir().join("rounds");
+    std::fs::create_dir_all(&rounds).unwrap();
+    std::fs::write(
+        rounds.join("r19.toml"),
+        format!("round = \"r19\"\nreviewer = \"{id}\"\n[merge]\nphase = \"merged\"\n"),
+    )
+    .unwrap();
+    thread::update(&fx.project, &id, |t| {
+        t.role = "reviewer".into();
+        t.status = Status::Resolved;
+        t.repo = fx
+            .repo
+            .join(".worktrees/review-r19")
+            .to_string_lossy()
+            .into();
+    })
+    .unwrap();
+    assert!(reviewer_ids(&fx.project).unwrap().contains(&id));
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert!(
+        thread::load(&fx.project, &id)
+            .unwrap()
+            .historical_seal
+            .is_empty()
+    );
+    assert!(crate::plan::show(&fx.world.ctx(), "demo", false).is_ok());
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+}
+
+#[test]
+fn unconfigured_lane_repo_warns_once_per_seal_and_can_be_reclassified_later() {
+    let fx = configured();
+    let (id, sha) = lane(&fx, 1);
+    thread::update(&fx.project, &id, |t| {
+        t.status = Status::Resolved;
+        t.repo = "/gone/unconfigured".into();
+    })
+    .unwrap();
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    let skipped = thread::load(&fx.project, &id).unwrap();
+    assert!(!skipped.unconfigured_repo_seal.is_empty());
+    assert!(skipped.historical_seal.is_empty());
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert_eq!(
+        thread::load(&fx.project, &id)
+            .unwrap()
+            .unconfigured_repo_seal,
+        skipped.unconfigured_repo_seal
+    );
+    thread::update(&fx.project, &id, |t| {
+        t.repo = fx.repo.to_string_lossy().into()
+    })
+    .unwrap();
+    git(&fx.repo, &["merge", "--ff-only", &sha]);
+    classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
+    assert!(
+        !thread::load(&fx.project, &id)
+            .unwrap()
+            .historical_seal
+            .is_empty()
+    );
+}
+
+#[test]
 fn hand_started_reviewer_role_lands_as_an_ordinary_member() {
     let fx = configured();
     let (id, sha) = lane(&fx, 1);
