@@ -30,7 +30,11 @@ ha thread start <slug> --job <job-NNNN> --task-file - <<'TASK'
 TASK
 ```
 
-The frozen brief is built from the same records as the project page: the stable task, applicable current instructions and facts, repository, machine, pinned gates and finish paths. Use `--machine local` only for an intentional placement difference. Send a follow-up with `ha thread prompt <slug> <id> --text-file -`. Use `ha overview <slug>` for active work and `--history` when resolved threads matter.
+The frozen brief is built from the same records as the project page: the stable task, applicable current instructions and facts, repository, machine, pinned gates and finish paths. Use `--machine local` only for an intentional placement difference.
+
+Ask for a new refusal, flag, config key or check only when a wrong call risks lost work, leaked secrets, a wrong push or merge, or a killed process. Otherwise default to no new rule; when removing something, say "remove, don't guard".
+
+Send a follow-up with `ha thread prompt <slug> <id> --text-file -`. Use `ha overview <slug>` for active work and `--history` when resolved threads matter.
 
 Review the whole repository pile with one command:
 
