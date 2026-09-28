@@ -4166,13 +4166,8 @@ pub(crate) fn finished_worktree_reason_with_merged(
                 .into(),
         ));
     }
-    if let Some(merged) = merged {
-        return Ok((!merged.contains(&record.branch)).then(|| {
-            format!(
-                "work_not_done: branch `{}` is not merged into the integration branch or is missing",
-                record.branch
-            )
-        }));
+    if merged.is_some_and(|branches| branches.contains(&record.branch)) {
+        return Ok(None);
     }
     let Some(lane_head) = crate::git::branch_head(ctx.runner, &record.repo, &record.branch)? else {
         return Ok(Some(format!(
@@ -4180,6 +4175,18 @@ pub(crate) fn finished_worktree_reason_with_merged(
             record.branch
         )));
     };
+    if !record.base.is_empty()
+        && !crate::repo::Git::new(ctx.runner, &record.repo)
+            .trees_differ(&record.base, &lane_head)?
+    {
+        return Ok(None);
+    }
+    if merged.is_some() {
+        return Ok(Some(format!(
+            "work_not_done: branch `{}` is not merged into the integration branch",
+            record.branch
+        )));
+    }
     let integration = crate::git::symbolic_head(ctx.runner, &record.repo)?;
     let integration_head = crate::git::branch_head(ctx.runner, &record.repo, &integration)?
         .with_context(|| format!("integration branch `{integration}` is missing"))?;
@@ -4343,8 +4350,8 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
     if !removable_folder(&project, &record) || !worktree_exists(ctx, &project, &record)? {
         bail!("{id} has no removable worktree at {}", record.worktree_path);
     }
-    if finished_worktree_reason(ctx, &project, &record)?.is_some() {
-        bail!("{id} is not finished; not removing its worktree");
+    if let Some(reason) = finished_worktree_reason(ctx, &project, &record)? {
+        bail!("{id} is not finished; not removing its worktree: {reason}");
     }
     preserve_report_links(ctx, &project, &record)
         .with_context(|| format!("linked_files_not_kept: cannot discard {id}'s worktree"))?;
@@ -5129,6 +5136,91 @@ mod tests {
         assert_eq!(outcome.sha.as_deref(), Some("abc"));
         let event = crate::events::load(&project, &outcome.event).unwrap();
         assert_eq!(event.payload.done.unwrap().sha, "abc");
+    }
+
+    #[test]
+    fn resolved_empty_commit_branch_is_finished() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let record = Thread {
+            status: Status::Resolved,
+            repo: "/repo".into(),
+            branch: "lane".into(),
+            base: "base".into(),
+            ..worktree_thread()
+        };
+        world.runner.on(
+            "for-each-ref --format=%(refname) %(objectname) refs/heads/lane",
+            crate::runner::fake::ok("refs/heads/lane empty-commit\n"),
+        );
+        world.runner.on(
+            "rev-parse base^{tree}",
+            crate::runner::fake::ok("same-tree\n"),
+        );
+        world.runner.on(
+            "rev-parse empty-commit^{tree}",
+            crate::runner::fake::ok("same-tree\n"),
+        );
+        for merged in [None, Some(BTreeSet::new())] {
+            assert_eq!(
+                finished_worktree_reason_with_merged(
+                    &world.ctx(),
+                    &project,
+                    &record,
+                    merged.as_ref()
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_unmerged_changed_branch_is_not_finished() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let record = Thread {
+            status: Status::Resolved,
+            repo: "/repo".into(),
+            branch: "lane".into(),
+            base: "base".into(),
+            ..worktree_thread()
+        };
+        world.runner.on(
+            "for-each-ref --format=%(refname) %(objectname) refs/heads/lane",
+            crate::runner::fake::ok("refs/heads/lane changed-commit\n"),
+        );
+        world.runner.on(
+            "rev-parse base^{tree}",
+            crate::runner::fake::ok("base-tree\n"),
+        );
+        world.runner.on(
+            "rev-parse changed-commit^{tree}",
+            crate::runner::fake::ok("changed-tree\n"),
+        );
+        world.runner.on(
+            "symbolic-ref --short HEAD",
+            crate::runner::fake::ok("main\n"),
+        );
+        world.runner.on(
+            "for-each-ref --format=%(refname) %(objectname) refs/heads/main",
+            crate::runner::fake::ok("refs/heads/main base\n"),
+        );
+        world.runner.on(
+            "merge-base --is-ancestor changed-commit base",
+            crate::runner::fake::fail(1, ""),
+        );
+        for merged in [None, Some(BTreeSet::new())] {
+            let reason = finished_worktree_reason_with_merged(
+                &world.ctx(),
+                &project,
+                &record,
+                merged.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(reason.starts_with("work_not_done:"), "{reason}");
+        }
     }
 
     #[test]

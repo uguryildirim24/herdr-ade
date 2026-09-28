@@ -24,7 +24,7 @@ This seals a `work_failed` event. The harness follows the matched routing rule's
 
 Run `ha done` only when the task's acceptance is met; if blocked or acceptance is not met, run `ha waiting "<what blocks it>"` instead, because a done seal counts as finished and opens the steps after it.
 
-Commit the finished work and write the report at the path named by your brief.
+Commit changed files and write the report at the path named by your brief. If the task changed no files, no commit is needed: pass the current HEAD to `ha done`.
 Pass that same path to `done`: an absolute path or a path relative to the
 git folder is accepted, but the report must be a file inside that folder.
 
