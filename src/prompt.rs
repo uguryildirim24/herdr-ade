@@ -507,7 +507,7 @@ pub(crate) fn coordinator_prompt_clear(
             }
         }
     }
-    hold_input(project)?;
+    hold_input(project, pane)?;
     Ok(false)
 }
 
@@ -519,16 +519,49 @@ fn clear_input_hold(project: &Project) {
     let _ = std::fs::remove_file(input_hold_path(project));
 }
 
-fn hold_input(project: &Project) -> Result<()> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InputHold {
+    since: i64,
+    pane: String,
+    notified: bool,
+}
+
+fn hold_input(project: &Project, pane: &str) -> Result<()> {
     let path = input_hold_path(project);
-    if !path.exists() {
-        project::write_json(&path, &jiff::Timestamp::now().as_second())?;
+    // Historical hold timestamps are still readable by long_input_hold.
+    let mut hold = project::read_json::<InputHold>(&path).unwrap_or(InputHold {
+        since: project::read_json::<i64>(&path)
+            .unwrap_or_else(|| jiff::Timestamp::now().as_second()),
+        pane: pane.to_owned(),
+        notified: false,
+    });
+    if hold.pane != pane {
+        hold = InputHold {
+            since: jiff::Timestamp::now().as_second(),
+            pane: pane.to_owned(),
+            notified: false,
+        };
     }
-    Ok(())
+    if !hold.notified && jiff::Timestamp::now().as_second() - hold.since >= 30 * 60 {
+        crate::inbox::write(
+            project,
+            "coordinator-draft",
+            pane,
+            &format!(
+                "Automated work is queued behind a draft in {pane}; submit or clear the draft to resume. The draft was not modified."
+            ),
+            "",
+        )?;
+        hold.notified = true;
+    }
+    project::write_json(&path, &hold)
 }
 
 pub(crate) fn long_input_hold(project: &Project) -> bool {
-    project::read_json::<i64>(&input_hold_path(project))
+    let path = input_hold_path(project);
+    project::read_json::<InputHold>(&path)
+        .map(|hold| hold.since)
+        .or_else(|| project::read_json::<i64>(&path))
         .is_some_and(|since| jiff::Timestamp::now().as_second() - since >= 30 * 60)
 }
 
@@ -906,11 +939,25 @@ mod tests {
         )
         .unwrap();
         assert!(long_input_hold(&fx.project));
+        let draft = screen.borrow().clone();
+        for _ in 0..3 {
+            assert!(!coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
+        }
+        assert_eq!(*screen.borrow(), draft);
+        assert_eq!(
+            crate::inbox::unhandled(&fx.project)
+                .iter()
+                .filter(|i| i.kind == "coordinator-draft")
+                .count(),
+            1
+        );
+        *screen.borrow_mut() = "❯ \n".into();
+        assert!(coordinator_prompt_clear(&fx.project, &herdr, "w1:p1").unwrap());
         let ctx = fx.world.ctx();
         let context = crate::coordinator::digest(&ctx, &fx.project, "ha")
             .unwrap()
             .0;
-        assert!(context.contains("over 30 minutes"));
+        assert!(!context.contains("over 30 minutes"));
     }
 
     #[test]
