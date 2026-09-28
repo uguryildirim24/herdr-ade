@@ -25,6 +25,92 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const BOX_WORKER_MARKER: &str = ".lane-worker";
+const TICKER_AGENT: &str = "com.rolfie.herdr-ade-ticker";
+
+pub(crate) fn ticker_agent_label() -> &'static str {
+    TICKER_AGENT
+}
+
+fn ticker_agent_path(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{TICKER_AGENT}.plist"))
+}
+
+fn xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn ticker_agent_definition(home: &Path, root: &Path, path: &str) -> String {
+    let bin = home.join(".local/bin/herdr-ade");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{TICKER_AGENT}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--root</string><string>{}</string><string>ticker</string><string>ensure</string></array>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string><key>HERDR_ADE_TICKER_SUPERVISOR</key><string>launchd</string></dict>\n<key>RunAtLoad</key><true/>\n<key>StartInterval</key><integer>120</integer>\n</dict></plist>\n",
+        xml(&bin.to_string_lossy()),
+        xml(&root.to_string_lossy()),
+        xml(path)
+    )
+}
+
+unsafe extern "C" {
+    fn getuid() -> u32;
+}
+
+fn ticker_agent_loaded(domain: &str) -> bool {
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("{domain}/{TICKER_AGENT}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+pub(crate) fn ticker_supervisor_loaded() -> bool {
+    ticker_agent_loaded(&format!("gui/{}", unsafe { getuid() }))
+}
+
+fn agent_bootout(loaded: bool, changed: bool) -> bool {
+    loaded && changed
+}
+
+fn agent_bootstrap(loaded: bool, changed: bool) -> bool {
+    !loaded || changed
+}
+
+fn install_ticker_agent(ctx: &Ctx) -> Result<()> {
+    let path = ticker_agent_path(&ctx.env.home);
+    let definition = ticker_agent_definition(
+        &ctx.env.home,
+        &ctx.root,
+        &format!("/bin:{}", ctx.env.var("PATH").unwrap_or_default()),
+    );
+    let domain = format!("gui/{}", unsafe { getuid() });
+    let loaded = ticker_agent_loaded(&domain);
+    let changed = std::fs::read_to_string(&path).map_or(true, |old| old != definition);
+    if changed {
+        std::fs::create_dir_all(path.parent().context("agent path has no parent")?)?;
+        crate::project::write_atomic(&path, definition.as_bytes())?;
+    }
+    if agent_bootout(loaded, changed) {
+        let status = std::process::Command::new("/bin/launchctl")
+            .args(["bootout", &format!("{domain}/{TICKER_AGENT}")])
+            .status()?;
+        if !status.success() {
+            bail!("ticker supervisor bootout failed: {status}");
+        }
+    }
+    if agent_bootstrap(loaded, changed) {
+        let status = std::process::Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain, &path.to_string_lossy()])
+            .status()?;
+        if !status.success() {
+            bail!("ticker supervisor bootstrap failed: {status}");
+        }
+    }
+    Ok(())
+}
 
 /// The `[harness]` table of `config.toml`.
 #[derive(Debug, Default, Deserialize)]
@@ -1049,6 +1135,9 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         crate::pi::install::write_guard(&crate::pi::Layout {
             root: ctx.root.join("pi"),
         })?;
+        if cfg!(target_os = "macos") {
+            install_ticker_agent(ctx)?;
+        }
     }
     let mut warnings = Vec::new();
     for (repo, kind) in repos.iter().zip(&kinds) {
@@ -1318,6 +1407,29 @@ mod tests {
             .env("PATH", path)
             .output()
             .unwrap()
+    }
+
+    #[test]
+    fn agent_runs_idempotent_ensure_not_the_loop_or_keepalive() {
+        let definition = ticker_agent_definition(
+            Path::new("/Users/test"),
+            Path::new("/Users/test/.herdr-ade"),
+            "/bin:/Users/test/.local/bin",
+        );
+        assert!(definition.contains("<key>StartInterval</key><integer>120</integer>"));
+        assert!(definition.contains("<string>ticker</string><string>ensure</string>"));
+        assert!(definition.contains("<key>RunAtLoad</key><true/>"));
+        assert!(definition.contains("HERDR_ADE_TICKER_SUPERVISOR"));
+        assert!(!definition.contains("KeepAlive"));
+        assert!(!definition.contains("<string>run</string>"));
+    }
+
+    #[test]
+    fn an_unchanged_loaded_agent_does_not_reload_during_ticker_replacement() {
+        assert!(!agent_bootout(true, false));
+        assert!(!agent_bootstrap(true, false));
+        assert!(agent_bootout(true, true));
+        assert!(agent_bootstrap(true, true));
     }
 
     #[test]

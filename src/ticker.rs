@@ -51,6 +51,10 @@ fn progress_path(root: &Path) -> PathBuf {
     root.join(".ticker.progress")
 }
 
+fn recovery_path(root: &Path) -> PathBuf {
+    root.join(".ticker.recovery")
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 struct Progress {
     pid: u32,
@@ -170,9 +174,18 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() || install_in_progress(ctx) {
         return Ok(());
     }
+    ensure_free(root, spawn)
+}
+
+fn ensure_free(root: &Path, spawn_ticker: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     if lock_state(root) == LockState::Free {
+        // Only the launchd interval records an unattended outage. The lock,
+        // not the interval or this snapshot, still decides who runs the loop.
+        if std::env::var_os("HERDR_ADE_TICKER_SUPERVISOR").is_some() {
+            project::write_atomic(&recovery_path(root), b"")?;
+        }
         let _ = std::fs::remove_file(stop_path(root));
-        spawn(root)?;
+        spawn_ticker(root)?;
     }
     Ok(())
 }
@@ -282,6 +295,7 @@ fn spawn_command(binary: &Path, root: &Path) -> Command {
         "HERDR_PANE_ID",
         "HERDR_TAB_ID",
         "HERDR_WORKSPACE_ID",
+        "HERDR_ADE_TICKER_SUPERVISOR",
     ] {
         command.env_remove(key);
     }
@@ -542,6 +556,23 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         "ticker {} started (pid {})",
         info.version, info.pid
     ));
+    if recovery_path(root).exists() {
+        let _ = std::fs::remove_file(recovery_path(root));
+        let notice = format!(
+            "ticker_unavailable: project transitions are queued; the ticker was restarted by launchd StartInterval at {}.",
+            info.started
+        );
+        log.line(&notice);
+        for slug in project::list_slugs(root) {
+            if let Ok(project) = Project::load(root, &slug)
+                && project.status() == Status::Active
+                && let Err(error) =
+                    inbox::write(&project, "ticker-unavailable", "ticker", &notice, "")
+            {
+                log.line(&format!("{slug}: recovery notice: {error:#}"));
+            }
+        }
+    }
     let mut progress = Progress {
         pid: info.pid,
         started: info.started.clone(),
@@ -3993,6 +4024,32 @@ mod tests {
         ensure(&ctx).unwrap();
         assert!(!stop_path(&root).exists(), "ensure writes no stop file");
         drop(file);
+    }
+
+    #[test]
+    fn ensure_spawns_once_when_free_and_never_contends_with_a_lock_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        let mut starts = 0;
+        ensure_free(path, |_| {
+            starts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(starts, 1);
+        let file = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path(path))
+            .unwrap();
+        file.lock().unwrap();
+        ensure_free(path, |_| {
+            starts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(starts, 1);
     }
 
     #[test]
