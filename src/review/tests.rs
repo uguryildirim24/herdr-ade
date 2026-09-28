@@ -21,6 +21,9 @@ fn configured() -> Fx {
     .unwrap();
     fx
 }
+fn pending(project: &Project, repo: &str, events: &[crate::contracts::Event]) -> Vec<Thread> {
+    super::pending(project, repo, events, &reviewer_ids(project).unwrap())
+}
 fn lane_unsealed(fx: &Fx, n: u32) -> (String, String) {
     let (id, sha) = fx.lane(n);
     let branch = format!("hp/demo/{id}-work");
@@ -712,6 +715,97 @@ fn old_empty_commit_seal_is_classified_as_no_change() {
     assert_eq!(
         thread::load(&fx.project, &id).unwrap().has_changes,
         Some(false)
+    );
+}
+
+// Read-only proof against the named historical records. Run explicitly on the
+// machine that holds them; the normal test suite never depends on another project.
+#[test]
+#[ignore]
+fn proprium_t0028_is_selected_from_its_real_records() {
+    let state = Path::new("/home/agent/.herdr-ade/proprium/.state");
+    let lane: Thread =
+        toml::from_str(&std::fs::read_to_string(state.join("threads/t-0028.toml")).unwrap())
+            .unwrap();
+    let event: crate::contracts::Event =
+        toml::from_str(&std::fs::read_to_string(state.join("events/t-0028-1-1.toml")).unwrap())
+            .unwrap();
+    let reviewers: std::collections::BTreeSet<String> = std::fs::read_dir(state.join("reviews"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "toml")
+        })
+        .filter_map(|path| {
+            let review: Review = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            review.reviewer
+        })
+        .collect();
+    assert_eq!(lane.role, "reviewer");
+    assert!(!reviewers.contains(&lane.id));
+    let id = lane.id.clone();
+    let repo = lane.repo.clone();
+    let pile = pending_from(vec![lane], &repo, &[event], &reviewers);
+    assert_eq!(pile.len(), 1);
+    assert_eq!(pile[0].id, id);
+    println!(
+        "{id} selected into {repo} pile; seal has_changes=true; no review record names it reviewer"
+    );
+}
+
+#[test]
+fn hand_started_reviewer_role_lands_as_an_ordinary_member() {
+    let fx = configured();
+    let (id, sha) = lane(&fx, 1);
+    let task = job(&fx, &id);
+    thread::update(&fx.project, &id, |t| {
+        t.role = "reviewer".into();
+        t.has_changes = None;
+        t.changes_seal.clear();
+    })
+    .unwrap();
+    assert_eq!(reviewer_ids(&fx.project).unwrap().len(), 0);
+    let mut review = prepared(&fx);
+    assert_eq!(review.members.len(), 1);
+    assert_eq!(review.members[0].thread, id);
+    assert_eq!(review.members[0].sha, sha);
+    assert_eq!(
+        thread::load(&fx.project, &id).unwrap().has_changes,
+        Some(true)
+    );
+    let reviewer = review.reviewer.clone().unwrap();
+    assert_ne!(reviewer, id);
+    assert!(reviewer_ids(&fx.project).unwrap().contains(&reviewer));
+    assert!(!reviewer_ids(&fx.project).unwrap().contains(&id));
+    assert!(
+        pending(
+            &fx.project,
+            fx.repo.to_str().unwrap(),
+            &crate::events::list(&fx.project)
+        )
+        .iter()
+        .all(|lane| lane.id != reviewer)
+    );
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(review.phase, Phase::Complete);
+    assert_eq!(
+        thread::load(&fx.project, &id).unwrap().merged_sha,
+        candidate
+    );
+    assert_eq!(
+        crate::task::view(&fx.project, task).state,
+        crate::task::State::Merged
     );
 }
 
