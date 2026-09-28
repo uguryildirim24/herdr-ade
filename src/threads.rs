@@ -470,7 +470,8 @@ fn resolve_placement(
     let mut tried = Vec::new();
     for candidate in candidates {
         let checked = if candidate == crate::contracts::MACHINE_LOCAL {
-            crate::doctor::recipe_ready_local(ctx, launch)
+            crate::doctor::check_start_disk(ctx, None, repo)
+                .and_then(|_| crate::doctor::recipe_ready_local(ctx, launch))
                 .map(|_| None)
                 .map_err(|error| format!("{error:#}"))
         } else {
@@ -488,7 +489,8 @@ fn resolve_placement(
                 ) {
                     Err(error) => Err(format!("{error:#}")),
                     Ok(profile) if profile.is_local() => {
-                        crate::doctor::recipe_ready_local(ctx, launch)
+                        crate::doctor::check_start_disk(ctx, None, repo)
+                            .and_then(|_| crate::doctor::recipe_ready_local(ctx, launch))
                             .map(|_| None)
                             .map_err(|error| format!("{error:#}"))
                     }
@@ -547,6 +549,9 @@ fn resolve_placement(
                 });
             }
             Err(missing) => {
+                if missing.contains("disk_low:") {
+                    bail!("{missing}");
+                }
                 let provider_wait = missing.contains("pi_not_ready");
                 tried.push(serde_json::json!({
                     "machine":candidate, "ready":false, "missing":missing
@@ -6045,6 +6050,48 @@ mod tests {
         assert_eq!(retried.machine, "buildbox");
         assert_eq!(retried.launch.machine, "buildbox");
         assert!(retried.placement_reason.contains("retry: recipe"));
+    }
+
+    #[test]
+    fn box_disk_floor_refuses_before_creating_work_and_recovers() {
+        use crate::runner::fake::ok;
+        let (fx, _remote) = box_fixture();
+        write_config(&fx, &lane_config());
+        let free = std::rc::Rc::new(std::cell::Cell::new(5_u64));
+        let current = free.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh" && cmd.display().contains("disk_free_kb"),
+            move |_| {
+                Ok(ok(&format!(
+                    "disk_free_kb\t{}\n",
+                    current.get() * 1_000_000
+                )))
+            },
+        );
+        stub_box(&fx);
+        let error = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("disk_low: buildbox has 5.1 GB free under /home/agent/projects"),
+            "{error}"
+        );
+        assert!(thread::list(&fx.project).is_empty());
+        assert_eq!(fx.world.runner.count("tab create"), 0);
+        assert_eq!(fx.world.runner.count("workspace create"), 0);
+        free.set(20);
+        let started = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert_eq!(started.machine, "buildbox");
+        assert!(!started.worktree_path.is_empty());
     }
 
     #[test]
