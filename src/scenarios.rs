@@ -2142,6 +2142,115 @@ fn typed_provider_errors_reach_recovery_and_retry_the_same_recipe() {
 }
 
 #[test]
+fn once_only_failure_waits_until_a_reasoned_coordinator_retry() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let task = "+++\nonce = true\n+++\nRelease exactly once.";
+    let brief_hash = thread::store_artifact(&project, task.as_bytes()).unwrap();
+    let mut first = crate::launch::resolve_launch(
+        &world.ctx(),
+        &project,
+        &crate::launch::ResolveInput {
+            task,
+            workflow: "lane",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    first.brief_hash = brief_hash;
+    let lane = world.thread(&project, world.home.path(), |thread| {
+        thread.attempt = 1;
+        thread.launch = first;
+        thread.launch_attempts = 1;
+    });
+    std::fs::write(thread::task_path(&project, &lane.id), task).unwrap();
+    let event = crate::contracts::Event {
+        id: "process-gone-1".into(),
+        op: "process-gone-1".into(),
+        thread: lane.id.clone(),
+        attempt: 1,
+        recipient: crate::contracts::Recipient::default(),
+        created: project::now(),
+        payload: crate::contracts::EventPayload {
+            failed: Some(crate::contracts::WaitingPayload {
+                text: "the process vanished".into(),
+                class: crate::contracts::FailureClass::ProcessGone,
+                provider_kind: None,
+            }),
+            ..Default::default()
+        },
+    };
+    crate::recovery::consume(&world.ctx(), &project, &event).unwrap();
+    let waiting = thread::load(&project, &lane.id).unwrap();
+    assert_eq!(waiting.attempt, 1);
+    assert!(!waiting.recovery_pending);
+    assert!(waiting.error.starts_with(
+        "WAITING: recovery_exhausted: this task runs once; attempt 1 ended (process gone)"
+    ));
+    assert!(
+        waiting
+            .error
+            .contains("ha thread retry demo <thread> --reason")
+    );
+    assert!(
+        !std::fs::read_to_string(project.state_dir().join("dispatch.jsonl"))
+            .unwrap()
+            .contains("\"kind\":\"placement\"")
+    );
+
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd)
+    );
+    world
+        .runner
+        .on("rev-parse --git-path", fail(1, "not a repo"));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world.runner.on(
+        "tab create",
+        ok(&format!(
+            r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","cwd":"{cwd}"}}}}}}"#
+        )),
+    );
+    let reason = "the coordinator verified the release did not occur";
+    threads::retry(&world.ctx(), "demo", &lane.id, reason).unwrap();
+    assert_eq!(thread::load(&project, &lane.id).unwrap().attempt, 2);
+    let dispatch = std::fs::read_to_string(project.state_dir().join("dispatch.jsonl")).unwrap();
+    let decision: serde_json::Value =
+        serde_json::from_str(dispatch.lines().last().unwrap()).unwrap();
+    assert_eq!(decision["kind"], "coordinator-retry");
+    assert_eq!(decision["failure"], reason);
+
+    // Without the marker the same failed event still schedules the next attempt.
+    let normal = "Release with retries.";
+    let first = crate::launch::resolve_launch(
+        &world.ctx(),
+        &project,
+        &crate::launch::ResolveInput {
+            task: normal,
+            workflow: "lane",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let lane = world.thread(&project, world.home.path(), |thread| {
+        thread.attempt = 1;
+        thread.launch = first;
+    });
+    std::fs::write(thread::task_path(&project, &lane.id), normal).unwrap();
+    let mut event = event;
+    event.id = "process-gone-2".into();
+    event.op = event.id.clone();
+    event.thread = lane.id.clone();
+    crate::recovery::consume(&world.ctx(), &project, &event).unwrap();
+    let retried = thread::load(&project, &lane.id).unwrap();
+    assert_eq!(retried.attempt, 2);
+    assert!(retried.recovery_pending);
+}
+
+#[test]
 fn provider_retries_do_not_consume_failed_work_retries() {
     let world = World::new();
     let project = world.project("demo", "a.sock");

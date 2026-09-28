@@ -77,4 +77,4 @@ If a decision is missing, keep that lane out of the accepted pile and ask Rolf. 
 
 ## Recovery
 
-Use `ha review retry <slug> [--repo <path>]` for a stuck or dead reviewer, or `ha review cancel <slug> [--repo <path>]` to return its lanes to the pile. Cancel a lane's active review before requesting changes to that lane. `ha thread retry` remains available after automatic retries are exhausted. Use typed commands, not hand-built Herdr or Git repair steps.
+Use `ha review retry <slug> [--repo <path>]` for a stuck or dead reviewer, or `ha review cancel <slug> [--repo <path>]` to return its lanes to the pile. Cancel a lane's active review before requesting changes to that lane. `ha thread retry` remains available after automatic retries are exhausted. Put `once = true` in a task file's `+++` front matter to block every automatic retry; an explicit `ha thread retry <project> <thread> --reason "<why>"` is still allowed. Use typed commands, not hand-built Herdr or Git repair steps.

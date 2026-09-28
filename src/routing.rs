@@ -31,6 +31,7 @@ pub struct WorkContract {
     pub workflow: String,
     pub product: String,
     pub capability: Option<String>,
+    pub once: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +199,7 @@ mod tests {
             workflow: workflow.into(),
             product: String::new(),
             capability: None,
+            once: false,
         }
     }
 
@@ -264,6 +266,7 @@ mod tests {
             workflow: "lane".into(),
             product: String::new(),
             capability: Some("pictures".into()),
+            once: false,
         };
         assert_eq!(table.select("hash", &work, 0).unwrap().recipe, "rule");
     }
