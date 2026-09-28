@@ -271,13 +271,18 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
             "one lane start per tick; a closed coordinator is not relaunched"
         );
     }
-    // Six lane starts: three each. The absent coordinator stays closed.
+    // Six lane starts: three each. The absent coordinator stays unavailable.
     // Absent agent state in the listed lane panes is still unknown.
     let _ = ticker::tick_project(&ctx, &project);
     let _ = ticker::tick_project(&ctx, &project);
     assert_eq!(world.runner.count("agent start"), 6);
     assert_eq!(world.runner.count("tab close"), 0);
-    assert!(!project.coordinator().unwrap().closed_by_rolf_at.is_empty());
+    assert!(project.coordinator().unwrap().closed_by_rolf_at.is_empty());
+    assert!(
+        inbox::unhandled(&project)
+            .iter()
+            .any(|i| i.summary.contains("coordinator_unavailable"))
+    );
     for id in ["t-0001", &second.id] {
         let t = thread::load(&project, id).unwrap();
         assert_eq!(t.status, Status::Open, "{id}");
