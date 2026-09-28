@@ -17,6 +17,242 @@ use crate::{inbox, ticker};
 
 pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(300);
 
+const RESUME: &str =
+    "Continue the task you were working on; do not repeat work that is already complete.";
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Recovery {
+    pane: String,
+    generation: u32,
+    restarted: bool,
+    fingerprint: String,
+    retry_at: i64,
+    retried: bool,
+    refused: bool,
+    unavailable: bool,
+}
+
+fn recovery_path(project: &Project) -> std::path::PathBuf {
+    project.state_dir().join("coordinator-recovery.json")
+}
+
+fn recovery(project: &Project, record: &Coordinator) -> Recovery {
+    let saved = project::read_json::<Recovery>(&recovery_path(project)).unwrap_or_default();
+    if saved.pane == record.pane_id && saved.generation == record.generation {
+        saved
+    } else {
+        Recovery {
+            pane: record.pane_id.clone(),
+            generation: record.generation,
+            ..Recovery::default()
+        }
+    }
+}
+
+fn save_recovery(project: &Project, state: &Recovery) -> Result<()> {
+    project::write_json(&recovery_path(project), state)
+}
+
+pub(crate) fn paused_by_provider(project: &Project, record: &Coordinator) -> bool {
+    !recovery(project, record).fingerprint.is_empty()
+}
+
+// Claude Code's limit/error wording is not part of the adapter contract. Only
+// a terminal error line in the visible bottom buffer is sufficient evidence;
+// quoted errors in tool output and earlier scrollback are deliberately ignored.
+fn provider_error(screen: &str) -> Option<(String, i64, &'static str)> {
+    let lines: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let last = lines.last()?;
+    let line = if last.starts_with(['❯', '›', '>']) && lines.len() > 1 {
+        lines[lines.len() - 2]
+    } else {
+        last
+    };
+    let lower = line.to_ascii_lowercase();
+    let kind = if lower.starts_with("you've hit your limit")
+        || lower.starts_with("you have hit your limit")
+        || lower.starts_with("usage limit reached")
+    {
+        "limit"
+    } else if lower.starts_with("api error:") || lower.starts_with("api error (") {
+        "api"
+    } else {
+        return None;
+    };
+    let reset = if kind == "limit" {
+        line.split_whitespace()
+            .filter(|token| token.starts_with("20") && token.contains('T'))
+            .find_map(|token| {
+                token
+                    .trim_matches(|c: char| c == ')' || c == ',' || c == '.')
+                    .parse::<jiff::Timestamp>()
+                    .ok()
+            })
+            .map(|t| t.as_second())
+    } else {
+        None
+    };
+    let now = jiff::Timestamp::now().as_second();
+    Some((
+        line.to_owned(),
+        reset.filter(|at| *at > now).unwrap_or(now + 300),
+        kind,
+    ))
+}
+
+/// Recover only the exact binding, never a replacement pane or session.
+pub(crate) fn recover(
+    project: &Project,
+    herdr: &Herdr,
+    record: &Coordinator,
+    agent: Option<&Agent>,
+    pane_alive: bool,
+) -> Result<()> {
+    if !record.closed_by_rolf_at.is_empty() || record.pane_id.is_empty() {
+        return Ok(());
+    }
+    let mut state = recovery(project, record);
+    if !pane_alive {
+        if agent.is_some() {
+            return Ok(());
+        }
+        if !state.unavailable {
+            state.unavailable = true;
+            save_recovery(project, &state)?;
+            inbox::write(
+                project,
+                "coordinator-unavailable",
+                &project.slug,
+                &format!(
+                    "coordinator_unavailable: {} lost its bound process/pane; cannot distinguish intentional close from crash. Run ha open {} to resume.",
+                    project.slug, project.slug
+                ),
+                "",
+            )?;
+        }
+        return Ok(());
+    }
+    if let Some(agent) = agent {
+        if !agent.ready() || record.prime_pending || record.launch.kind != "claude" {
+            return Ok(());
+        }
+        let Ok(screen) = herdr.pane_read_text(&record.pane_id, "visible") else {
+            return Ok(());
+        };
+        let Some((fingerprint, retry_at, kind)) = provider_error(&screen) else {
+            // A completed turn clears the incident; a later failure is new.
+            if !state.fingerprint.is_empty() {
+                state.fingerprint.clear();
+                state.retried = false;
+                state.refused = false;
+                save_recovery(project, &state)?;
+            }
+            return Ok(());
+        };
+        if state.fingerprint != fingerprint && !state.retried {
+            state.fingerprint = fingerprint;
+            state.retry_at = retry_at;
+            save_recovery(project, &state)?;
+            inbox::write(
+                project,
+                "coordinator-provider",
+                &project.slug,
+                &format!(
+                    "Coordinator {} paused by provider until {}; retrying this session once then. If the provider still refuses, check its pane; no new session was started.",
+                    project.slug,
+                    jiff::Timestamp::from_second(retry_at)?
+                ),
+                "",
+            )?;
+        }
+        if jiff::Timestamp::now().as_second() < state.retry_at {
+            return Ok(());
+        }
+        if state.retried {
+            if !state.refused {
+                state.refused = true;
+                save_recovery(project, &state)?;
+                inbox::write(
+                    project,
+                    "coordinator-provider-refusal",
+                    &project.slug,
+                    &format!(
+                        "Coordinator {}: {kind} error persists after one retry; check its pane. No new session was started.",
+                        project.slug
+                    ),
+                    "",
+                )?;
+            }
+            return Ok(());
+        }
+        let _writer = crate::prompt::writer_lock(project)?;
+        if !crate::prompt::coordinator_prompt_clear(project, herdr, &record.pane_id)? {
+            return Ok(());
+        }
+        // Persist before sending: a ticker restart must not duplicate a prompt.
+        state.retried = true;
+        state.retry_at = jiff::Timestamp::now().as_second() + 60;
+        save_recovery(project, &state)?;
+        crate::prompt::mark_automated_prompt(project, &record.pane_id, RESUME)?;
+        herdr.agent_prompt(&record.pane_id, RESUME)?;
+    } else if !record.last_agent_seen_at.is_empty() && !record.prime_pending {
+        // A missing agent list entry alone can be a server handoff. Confirm the
+        // bound pane has no foreground agent process before a bounded restart.
+        let info = match herdr.pane_process_info(&record.pane_id) {
+            Ok(info) => info,
+            Err(_) => return Ok(()),
+        };
+        if info.foreground_processes.iter().any(|p| {
+            p.name == record.launch.kind
+                || p.argv0
+                    .as_deref()
+                    .is_some_and(|s| s.ends_with(&record.launch.kind))
+        }) || state.restarted
+        {
+            return Ok(());
+        }
+        state.restarted = true;
+        state.generation += 1;
+        save_recovery(project, &state)?;
+        project.update_coordinator(|c| {
+            c.generation += 1;
+            c.prime_pending = true;
+            c.prime_sent = false;
+            c.bootstrap.clear();
+            c.last_agent_seen_at.clear();
+            c.launch_attempts += 1;
+        })?;
+        let spec = &record.launch;
+        if let Err(error) = herdr.agent_start_opts(&crate::herdr::AgentStart {
+            name: &record.agent_name,
+            kind: &spec.kind,
+            pane: &record.pane_id,
+            agent_args: &spec.args,
+            launch_bin: None,
+            parent: None,
+            ready_timeout_ms: spec.ready_timeout_ms,
+        }) {
+            inbox::write(
+                project,
+                "coordinator-unavailable",
+                &project.slug,
+                &format!(
+                    "coordinator_unavailable: {} restart in its bound pane was not confirmed ({error}); check the pane or run ha open {} to resume.",
+                    project.slug, project.slug
+                ),
+                "",
+            )?;
+        }
+        // The normal priming path sends exactly one context line when ready.
+    }
+    Ok(())
+}
+
 /// The digest is a work queue, not an archive.
 const DIGEST_ROWS: usize = 20;
 /// How many of Rolf's latest messages the digest prints so an id is findable.
@@ -1339,6 +1575,98 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_errors_only_match_the_terminal_line() {
+        assert!(provider_error("API Error: 500 Internal Server Error\n❯ \n").is_some());
+        assert!(
+            provider_error("You've hit your limit · resets 2099-01-01T00:00:00Z\n❯ \n")
+                .is_some_and(
+                    |(_, at, kind)| at > jiff::Timestamp::now().as_second() && kind == "limit"
+                )
+        );
+        assert!(provider_error("API Error: 500\nassistant response\n❯ \n").is_none());
+        assert!(provider_error("tool: API Error: 500").is_none());
+    }
+
+    #[test]
+    fn limit_waits_for_reset_and_resumes_once_across_polls() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.launch.kind = "claude".into())
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let runner = FakeRunner::new();
+        runner.on(
+            "pane read",
+            ok("You've hit your limit · resets 2099-01-01T00:00:00Z\n❯ \n"),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(
+            recovery(&project, &record).retry_at,
+            "2099-01-01T00:00:00Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_second()
+        );
+        let mut saved = recovery(&project, &record);
+        saved.retry_at = 0; // model the reset boundary without waiting for 2099
+        save_recovery(&project, &saved).unwrap();
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
+    }
+
+    #[test]
+    fn provider_retry_is_durable_and_repeat_refuses() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.launch.kind = "claude".into())
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let runner = FakeRunner::new();
+        runner.on(
+            "pane read",
+            ok("API Error: 500 Internal Server Error\n❯ \n"),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        assert_eq!(runner.count("agent prompt"), 0);
+        let mut saved = recovery(&project, &record);
+        saved.retry_at = 0;
+        save_recovery(&project, &saved).unwrap();
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        let mut saved = recovery(&project, &record);
+        saved.retry_at = 0;
+        save_recovery(&project, &saved).unwrap();
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert!(recovery(&project, &record).refused);
+        assert_eq!(
+            inbox::unhandled(&project)
+                .iter()
+                .filter(|item| item.kind == "coordinator-provider-refusal")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn closed_status_survives_collapsed_standing_notes() {

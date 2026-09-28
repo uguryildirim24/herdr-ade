@@ -2126,7 +2126,13 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
         // binding clears `prime_pending` only on its `ha context` receipt, and
         // a submitted line is never re-sent on a timer (SPEC-ADE D14).
         if record.prime_pending && !record.prime_sent && agent.ready() {
-            let prompt = coordinator::priming_prompt(&prefix, slug);
+            let prompt = if record.launch_attempts > 1 {
+                format!(
+                    "Run `{prefix} context {slug}` and continue the task you were working on; do not repeat completed work."
+                )
+            } else {
+                coordinator::priming_prompt(&prefix, slug)
+            };
             let _writer = crate::prompt::writer_lock(project)?;
             if crate::prompt::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
                 crate::prompt::mark_automated_prompt(project, &record.pane_id, &prompt)?;
@@ -2173,6 +2179,12 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     if pane_alive && inode != 0 && record.server_socket_inode != inode {
         project.update_coordinator(|c| c.server_socket_inode = inode)?;
     }
+    // A reused pane id after a server restart is not the original process.
+    let bound_pane =
+        pane_alive && (record.server_socket_inode == 0 || record.server_socket_inode == inode);
+    if let Err(error) = coordinator::recover(project, &herdr, &record, agent.as_ref(), bound_pane) {
+        first_error = first_error.or(Some(error));
+    }
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(
         coordinator_recorded == 1
@@ -2181,27 +2193,6 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     );
     let recorded_panes = pass.recorded_panes + coordinator_recorded;
     let missing_panes = pass.missing_panes + coordinator_missing;
-
-    if coordinator_recorded == 1 && project.status() == project::Status::Active {
-        // Other projects may already have opened panes on the new server.
-        // Only the bound pane must be absent for this to be a lost binding.
-        let restarted = record.server_socket_inode != 0
-            && inode != 0
-            && record.server_socket_inode != inode
-            && !pane_alive;
-        if !pane_alive
-            && agent.is_none()
-            && !record.reopen_requested
-            && !restarted
-            && record.closed_by_rolf_at.is_empty()
-        {
-            project.update_coordinator(|c| {
-                if c.closed_by_rolf_at.is_empty() && !c.reopen_requested {
-                    c.closed_by_rolf_at = project::now();
-                }
-            })?;
-        }
-    }
 
     // Announce unseen inbox items without typing into the coordinator pane.
     let mut state = steps::load_state(project);
@@ -2430,7 +2421,10 @@ fn plan_nudge(
     let Some(coordinator) = project.coordinator() else {
         return Ok(());
     };
-    if !coordinator.closed_by_rolf_at.is_empty() || coordinator.prime_pending {
+    if !coordinator.closed_by_rolf_at.is_empty()
+        || coordinator.prime_pending
+        || coordinator::paused_by_provider(project, &coordinator)
+    {
         return Ok(());
     }
     if !agents.iter().any(|agent| {
@@ -5185,11 +5179,12 @@ mod tests {
     }
 
     #[test]
-    fn dead_coordinator_agent_in_existing_pane_is_not_restarted() {
+    fn dead_coordinator_agent_in_existing_pane_restarts_once() {
         let f = fixture(false);
         f.project
             .update_coordinator(|c| {
                 c.launch.kind = "claude".into();
+                c.launch_attempts = 1;
                 c.last_agent_seen_at = project::now();
             })
             .unwrap();
@@ -5197,9 +5192,10 @@ mod tests {
         runner.on("agent list", ok(NO_AGENTS));
         runner.on("pane list", ok(&with_cwd(PANE, &f)));
         runner.on(
-            "agent start",
-            fail(1, r#"{"error":{"code":"timeout","message":"no agent"}}"#),
+            "pane process-info",
+            ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
         );
+        runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"/repo"}}}"#));
         let ctx = Ctx {
             env: &f.env,
             root: f.root.clone(),
@@ -5209,18 +5205,58 @@ mod tests {
         };
         let _ = tick_project(&ctx, &f.project);
         let _ = tick_project(&ctx, &f.project);
-        assert_eq!(runner.count("agent start"), 0);
+        assert_eq!(runner.count("agent start"), 1);
+        let record = f.project.coordinator().unwrap();
+        assert_eq!(record.launch_attempts, 2);
+        assert!(record.prime_pending);
+        let ready = FakeRunner::new();
+        ready.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
+        ready.on("pane list", ok(&with_cwd(PANE, &f)));
+        ready.on("pane read", ok("❯ \n"));
+        ready.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            runner: &ready,
+            ..ctx
+        };
+        let _ = tick_project(&ctx, &f.project);
+        let _ = tick_project(&ctx, &f.project);
+        assert_eq!(ready.count("agent prompt"), 1);
         assert!(
-            f.project
-                .coordinator()
-                .unwrap()
-                .closed_by_rolf_at
-                .is_empty()
+            ready
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("context demo"))
         );
     }
 
     #[test]
-    fn closed_coordinator_is_marked_once_and_not_relaunched() {
+    fn intentional_close_never_restarts_a_dead_process() {
+        let f = fixture(false);
+        f.project
+            .update_coordinator(|c| {
+                c.closed_by_rolf_at = project::now();
+                c.last_agent_seen_at = project::now();
+                c.launch.kind = "claude".into();
+            })
+            .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let _ = tick_project(&ctx, &f.project);
+        assert_eq!(runner.count("agent start"), 0);
+        assert_eq!(runner.count("pane process-info"), 0);
+    }
+
+    #[test]
+    fn missing_coordinator_pane_is_unavailable_and_not_relaunched() {
         let f = fixture(false);
         let runner = FakeRunner::new();
         runner.on("agent list", ok(NO_AGENTS));
@@ -5233,10 +5269,21 @@ mod tests {
             detached_ticker: false,
         };
         let _ = tick_project(&ctx, &f.project);
-        let mark = f.project.coordinator().unwrap().closed_by_rolf_at;
-        assert!(!mark.is_empty());
+        assert!(
+            f.project
+                .coordinator()
+                .unwrap()
+                .closed_by_rolf_at
+                .is_empty()
+        );
         let _ = tick_project(&ctx, &f.project);
-        assert_eq!(f.project.coordinator().unwrap().closed_by_rolf_at, mark);
+        assert_eq!(
+            crate::inbox::unhandled(&f.project)
+                .iter()
+                .filter(|i| i.summary.contains("coordinator_unavailable"))
+                .count(),
+            1
+        );
         assert_eq!(runner.count("workspace create"), 0);
         assert_eq!(runner.count("agent start"), 0);
     }
