@@ -840,12 +840,9 @@ enum ThreadCommand {
         /// Instruction set for this lane; the routing table may match it
         #[arg(long, value_name = "FLOW")]
         workflow: Option<String>,
-        /// Exact configured recipe Rolf named for this one lane
-        #[arg(long, value_name = "ID", requires = "basis")]
+        /// Exact configured recipe for this one lane (the coordinator's choice)
+        #[arg(long, value_name = "ID")]
         recipe: Option<String>,
-        /// Verbatim words from Rolf's request for the exact recipe
-        #[arg(long, requires = "recipe")]
-        basis: Option<String>,
         /// Birth sentence; defaults to the stable task's title
         #[arg(long)]
         plain: Option<String>,
@@ -1608,7 +1605,6 @@ fn dispatch_with_start(
                 task_file,
                 workflow,
                 recipe,
-                basis,
                 plain,
                 job,
                 requests,
@@ -1667,7 +1663,6 @@ fn dispatch_with_start(
                         plain,
                         workflow,
                         recipe,
-                        recipe_basis: basis,
                         task_id: task_id.clone(),
                         review_id: String::new(),
                     },
@@ -2128,6 +2123,22 @@ mod tests {
             ])
             .is_ok()
         );
+        let start = [
+            "herdr-ade",
+            "thread",
+            "start",
+            "demo",
+            "--job",
+            "job-0001",
+            "--task-file",
+            "brief.md",
+            "--recipe",
+            "test_claude",
+        ];
+        assert!(Cli::try_parse_from(start).is_ok());
+        let mut with_basis = start.to_vec();
+        with_basis.extend(["--basis", "old quote"]);
+        assert!(Cli::try_parse_from(with_basis).is_err());
     }
 
     #[test]

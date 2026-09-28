@@ -81,8 +81,8 @@ mod tests {
                 "ha thread start demo --repo /one --job job-1 --task-file brief.md",
             ),
             (
-                "recipe_authority: quote Rolf",
-                "ha thread start demo --request q-1 --acceptance \"done\" --task-file brief.md",
+                "routing_recipe_disabled: test_recipe",
+                "ha thread start demo --job job-1 --task-file brief.md",
             ),
             (
                 "report_missing: /work/report.md",

@@ -118,11 +118,10 @@ pub(crate) struct Launch {
     /// `pin`, `default`, `explicit`, `project`, or the ordered `rule[n]` that selected this recipe.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) routing_rule: String,
-    /// Rolf's exact words authorizing a one-off recipe choice. Empty on routed
-    /// and historical launches.
+    /// Coordinator recipe request reference. Empty on lane and historical launches.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) recipe_basis: String,
-    /// The request on the stable task that contains `recipe_basis`.
+    /// The request authorizing the coordinator recipe choice.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) recipe_request: String,
     pub(crate) reason: String,
