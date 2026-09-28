@@ -326,8 +326,26 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
             },
         );
     let local = refs(ctx.runner, &record.repo, None)?;
+    // The box's mutable published branch can still be at base while the Mac
+    // local ref has advanced to the immutable seal used by the landed review.
+    // Accept that exact review member, not an arbitrary later box seal.
+    let merged_seal = if record.is_remote() && has_seal_refs && !record.merged_review.is_empty() {
+        review_pin.as_deref().filter(|pin| {
+            events.iter().any(|event| {
+                event.thread == record.id
+                    && event
+                        .payload
+                        .done
+                        .as_ref()
+                        .is_some_and(|done| done.sha == *pin && done.published_ref.is_some())
+            })
+        })
+    } else {
+        None
+    };
     if let (Some(expected), Some(actual)) = (expected, local.get(&record.branch))
         && actual != expected
+        && merged_seal != Some(actual.as_str())
     {
         bail!(
             "branch {} moved beyond its sealed cleanup tip",
@@ -1084,6 +1102,165 @@ mod tests {
                 .keys()
                 .any(|name| name == branch || name.starts_with("seals/"))
         );
+    }
+
+    #[test]
+    fn merged_box_cleanup_accepts_review_seal_but_refuses_a_later_local_commit() {
+        for moved in [false, true] {
+            let (fx, bare) = configured();
+            let branch = "hp/demo/t-1";
+            let remote = bare.path().to_str().unwrap();
+            let base = run(&fx.repo, &["rev-parse", "HEAD"]);
+            run(&fx.repo, &["branch", branch, &base]);
+            run(&fx.repo, &["push", "-q", remote, branch]);
+            let seal = run(&fx.repo, &["commit-tree", "HEAD^{tree}", "-m", "sealed"]);
+            let reference = crate::ops::seal_ref(branch, &seal);
+            run(
+                &fx.repo,
+                &[
+                    "push",
+                    "-q",
+                    remote,
+                    &format!("{seal}:refs/heads/{reference}"),
+                ],
+            );
+            run(
+                &fx.repo,
+                &["update-ref", &format!("refs/heads/{branch}"), &seal],
+            );
+            let record = thread::allocate(&fx.project, |t| {
+                t.repo = fx.repo.to_string_lossy().into_owned();
+                t.branch = branch.into();
+                t.base = base.clone();
+                t.machine = "buildbox".into();
+                t.merged_review = "review-1".into();
+                t.status = Status::Resolved;
+                t.cleanup_pending = true;
+                t.cleanup_reason = "branch moved beyond its sealed cleanup tip".into();
+            })
+            .unwrap();
+            let event_id = fx.seal_done(&record.id, 1, 1, &seal, "done");
+            let path = fx
+                .project
+                .state_dir()
+                .join("events")
+                .join(format!("{event_id}.toml"));
+            let mut event = crate::events::load(&fx.project, &event_id).unwrap();
+            event.payload.done.as_mut().unwrap().published_ref = Some(reference.clone());
+            std::fs::write(path, toml::to_string(&event).unwrap()).unwrap();
+            crate::review::save(
+                &fx.project,
+                &crate::review::Review {
+                    id: "review-1".into(),
+                    repo: record.repo.clone(),
+                    integration: "main".into(),
+                    base: base.clone(),
+                    candidate_branch: "review/demo/review-1".into(),
+                    members: vec![crate::review::Member {
+                        thread: record.id.clone(),
+                        attempt: 1,
+                        event: event_id,
+                        sha: seal.clone(),
+                        branch: branch.into(),
+                        artifact: String::new(),
+                    }],
+                    gates: vec![],
+                    selected_gates: vec![],
+                    reviewer: None,
+                    phase: crate::review::Phase::Complete,
+                    verdict: None,
+                    verdict_event: String::new(),
+                    reviewer_after: String::new(),
+                    checked_event: String::new(),
+                    retry_attempt: None,
+                    retry_generation: 0,
+                    moved: 0,
+                    refresh_tip: None,
+                    push_remote: None,
+                    install_required: false,
+                    fast_forward: true,
+                    push: true,
+                    install: true,
+                    close: true,
+                    prune: true,
+                    attention: String::new(),
+                    no_verdict_since: String::new(),
+                    notices: vec![],
+                },
+            )
+            .unwrap();
+            let (mut settings, body) = fx.project.read_project_md().unwrap();
+            settings.repos[0].box_path = Some("/box/repo".into());
+            settings.repos[0].publish_url = Some(remote.into());
+            std::fs::write(
+                fx.project.project_md(),
+                format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+            )
+            .unwrap();
+            let config = fx.world.home.path().join("cfg/config.toml");
+            let original = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(config, format!("{original}{}", crate::remote::TEST_MACHINE)).unwrap();
+            fx.world
+                .runner
+                .on("machine list --json", crate::runner::fake::ok("[]"));
+            fx.world.runner.on_fn(
+                |cmd| cmd.program == "ssh",
+                |_| Ok(crate::runner::fake::ok("")),
+            );
+            if moved {
+                let beyond = run(
+                    &fx.repo,
+                    &["commit-tree", "HEAD^{tree}", "-p", &seal, "-m", "beyond"],
+                );
+                run(
+                    &fx.repo,
+                    &["update-ref", &format!("refs/heads/{branch}"), &beyond],
+                );
+                let error = resolved_thread(&fx.world.ctx(), &fx.project, &record).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("moved beyond its sealed cleanup tip"),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    refs(fx.world.ctx().runner, &record.repo, None).unwrap()[branch],
+                    beyond
+                );
+                crate::threads::retry_pending_cleanup(&fx.world.ctx(), &fx.project).unwrap();
+                assert!(
+                    thread::load(&fx.project, &record.id)
+                        .unwrap()
+                        .cleanup_pending
+                );
+                assert_eq!(
+                    refs(fx.world.ctx().runner, &record.repo, None).unwrap()[branch],
+                    beyond
+                );
+                assert!(
+                    refs(fx.world.ctx().runner, &record.repo, Some(remote))
+                        .unwrap()
+                        .contains_key(&reference)
+                );
+            } else {
+                crate::threads::retry_pending_cleanup(&fx.world.ctx(), &fx.project).unwrap();
+                let finished = thread::load(&fx.project, &record.id).unwrap();
+                assert!(!finished.cleanup_pending, "{}", finished.cleanup_reason);
+                assert!(
+                    fx.world
+                        .runner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|cmd| { cmd.program == "ssh" && cmd.display().contains("rm -rf --") })
+                );
+                let local = refs(fx.world.ctx().runner, &record.repo, None).unwrap();
+                let published = refs(fx.world.ctx().runner, &record.repo, Some(remote)).unwrap();
+                assert!(!local.contains_key(branch));
+                assert!(!published.contains_key(branch));
+                assert!(!published.contains_key(&reference));
+            }
+        }
     }
 
     #[test]
