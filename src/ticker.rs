@@ -1864,6 +1864,35 @@ fn launch_pass(
             }
             continue;
         }
+        // Disk can fill after placement. Keep the attempt queued until it recovers.
+        let disk = if t.is_remote() {
+            crate::remote::machine_profile(
+                pass.ctx.runner,
+                &pass.ctx.env.herdr_bin(),
+                &pass.ctx.config_dir,
+                t.machine_route(),
+            )
+            .and_then(|profile| {
+                crate::doctor::check_start_disk(pass.ctx, Some(&profile), Some(&t.repo))
+            })
+        } else {
+            crate::doctor::check_start_disk(pass.ctx, None, Some(&t.repo))
+        };
+        #[cfg(test)]
+        let disk = disk.or_else(|error| {
+            if !pass.ctx.runner.is_real() && format!("{error:#}").contains("no rule for `") {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        });
+        if let Err(error) = disk {
+            let message = format!("{error:#}");
+            errors.extend(
+                thread::update(pass.project, &t.id, |record| record.error = message.clone()).err(),
+            );
+            continue;
+        }
         // Provider-bridge credentials can expire between placement and start.
         // The adapter's readiness driver, not its agent-kind name, chooses the
         // extra check; command probes were already run during placement.
@@ -1916,7 +1945,7 @@ fn launch_pass(
                 return Ok(());
             }
             current.launch_attempts += 1;
-            if current.error == "provider ready" {
+            if current.error == "provider ready" || current.error.starts_with("disk_low:") {
                 current.error.clear();
             }
             current.trust_answered = false;
@@ -2419,16 +2448,64 @@ fn plan_nudge(
         .iter()
         .filter(|step| step.state != crate::contracts::StepState::Done)
         .collect();
-    let Some(next) = left.first() else {
+    if left.is_empty() {
         return Ok(());
+    }
+    let next = left
+        .iter()
+        .filter(|step| step.state == crate::contracts::StepState::Left)
+        .find(|step| {
+            // Use the same evidence gate as `thread start` for bound tasks.
+            let gate = step
+                .tasks
+                .iter()
+                .try_for_each(|job| crate::plan::check_prerequisites(project, job));
+            if gate.is_err() {
+                return false;
+            }
+            let waiting: Vec<_> = step
+                .after
+                .iter()
+                .filter(|id| {
+                    crate::plan::all_steps(plan)
+                        .find(|candidate| &candidate.id == *id)
+                        .is_none_or(|candidate| {
+                            candidate.state != crate::contracts::StepState::Done
+                        })
+                })
+                .collect();
+            if !waiting.is_empty() {
+                return false;
+            }
+            true
+        });
+    let line = if let Some(next) = next {
+        format!(
+            "{} Nothing is running and {} steps are left. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
+            steps::TICKER_PROMPT_PREFIX,
+            left.len(),
+            next.id,
+            next.text
+        )
+    } else {
+        let waiting = left
+            .iter()
+            .map(|step| {
+                if step.state == crate::contracts::StepState::Running {
+                    format!("{} is still running", step.id)
+                } else {
+                    format!("{} waits for {}", step.id, step.after.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "{} Nothing is running and {} steps are left. {}.",
+            steps::TICKER_PROMPT_PREFIX,
+            left.len(),
+            waiting
+        )
     };
-    let line = format!(
-        "{} Nothing is running and {} steps are left. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
-        steps::TICKER_PROMPT_PREFIX,
-        left.len(),
-        next.id,
-        next.text
-    );
     if steps::deliver_coordinator_prompt(project, herdr, &coordinator.pane_id, &line)? {
         state.plan_nudged = true;
     }
@@ -2619,6 +2696,65 @@ mod tests {
             failed.error
         );
         assert!(failed.error.contains("one hour"), "{}", failed.error);
+    }
+
+    #[test]
+    fn deferred_launch_waits_for_disk_then_submits() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |record| {
+            record.prompt_pending = true;
+            record.launch.kind = "claude".into();
+        });
+        let runner = FakeRunner::new();
+        let free = std::rc::Rc::new(std::cell::Cell::new(5_u64));
+        let current = free.clone();
+        runner.on_fn(|cmd| cmd.display().contains("df -Pk"), move |_| {
+            Ok(ok(&format!("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 50000000 0 {} 1% /\n", current.get() * 1_000_000)))
+        });
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#),
+        );
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let herdr = Herdr::new(
+            ctx.env.herdr_bin(),
+            &project.coordinator().unwrap().socket,
+            &runner,
+        );
+        let panes = serde_json::from_str::<Vec<Pane>>(&format!(
+            "[{}]",
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        ))
+        .unwrap();
+        let records = vec![lane.clone()];
+        let pass = LaunchPass {
+            ctx: &ctx,
+            project: &project,
+            herdr: &herdr,
+            threads: &records,
+            agents: &[],
+            panes: &panes,
+        };
+        let mut errors = Vec::new();
+        launch_pass(&pass, &mut true, false, &mut errors);
+        assert_eq!(runner.count("agent start"), 0);
+        assert_eq!(thread::load(&project, &lane.id).unwrap().launch_attempts, 0);
+        assert!(
+            thread::load(&project, &lane.id)
+                .unwrap()
+                .error
+                .starts_with("disk_low:")
+        );
+        free.set(20);
+        launch_pass(&pass, &mut true, false, &mut errors);
+        assert_eq!(runner.count("agent start"), 1);
+        assert_eq!(thread::load(&project, &lane.id).unwrap().launch_attempts, 1);
     }
 
     #[test]
@@ -4279,6 +4415,58 @@ mod tests {
             call.display()
                 .contains("2 steps are left. Next: s-1 First outcome")
         }));
+    }
+
+    #[test]
+    fn idle_nudge_skips_blocked_steps_and_names_waiting_edges() {
+        let (f, runner, agent) = nudge_setup();
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        crate::plan::step_add(&ctx, "demo", "First", vec![], vec![], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Blocked", vec![], vec!["s-1".into()], None).unwrap();
+        crate::plan::step_add(&ctx, "demo", "Free", vec![], vec![], None).unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("Next: s-1 First"))
+        );
+        // Mark the first step running; a free third step remains available.
+        let path = crate::plan::plan_path(&f.project);
+        let mut plan = crate::plan::load(&f.project).unwrap().unwrap();
+        plan.steps[0].state = crate::contracts::StepState::Running;
+        std::fs::write(&path, toml::to_string(&plan).unwrap()).unwrap();
+        let mut state = steps::State::default();
+        let herdr = Herdr::new(
+            f.env.herdr_bin(),
+            &f.project.coordinator().unwrap().socket,
+            &runner,
+        );
+        plan_nudge(&f.project, &herdr, std::slice::from_ref(&agent), &mut state).unwrap();
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("Next: s-3 Free"))
+        );
+        plan.steps[2].state = crate::contracts::StepState::Done;
+        std::fs::write(&path, toml::to_string(&plan).unwrap()).unwrap();
+        plan_nudge(&f.project, &herdr, &[agent], &mut steps::State::default()).unwrap();
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.display().contains("s-2 waits for s-1"))
+        );
     }
 
     #[test]
