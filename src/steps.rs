@@ -797,6 +797,14 @@ pub(crate) struct BootstrapReceipt {
     pub(crate) pane: String,
 }
 
+/// A box lane's detection-source screen and branch head, read in the courier trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaneProgress {
+    pub(crate) pane: String,
+    pub(crate) screen: String,
+    pub(crate) head: String,
+}
+
 /// What one box helper call returned, after the taken cursor it was asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CourierManifest {
@@ -810,6 +818,7 @@ pub(crate) struct CourierManifest {
     pub(crate) envelopes: Vec<BoxEnvelope>,
     pub(crate) receipts: Vec<CompletionReceipt>,
     pub(crate) bootstraps: Vec<BootstrapReceipt>,
+    pub(crate) progress: BTreeMap<(String, String), LaneProgress>,
 }
 
 /// The stable identity a courier pass resolved and the live facts it read, so
@@ -822,6 +831,7 @@ pub(crate) struct CourierOutcome {
     /// sealed events, but changes no lane state.
     pub(crate) agents: Option<Vec<Agent>>,
     pub(crate) panes: Option<Vec<Pane>>,
+    pub(crate) progress: BTreeMap<(String, String), LaneProgress>,
 }
 
 /// The box-local helper: it recovers an interrupted box D5 operation, reads
@@ -851,6 +861,28 @@ else
   printf 'panes\t-\n'
 fi
 [ -d "$root" ] || exit 0
+# Lane cards are already on the box. Read the same short detection buffer
+# herdr uses for status; hash it here instead of shipping screen contents.
+if [ -x "$herdr_bin" ] && [ -n "$a" ]; then
+  for card in "$root"/*/.state/lanes/*.toml; do
+    [ -f "$card" ] || continue
+    slug=${card%/.state/lanes/*}; slug=${slug##*/}
+    lane=${card##*/}; lane=${lane%.toml}
+    pane=$(sed -n 's/^pane_id = "\([^"]*\)"/\1/p' "$card" | head -n1)
+    wt=$(sed -n 's/^box_worktree = "\([^"]*\)"/\1/p' "$card" | head -n1)
+    branch=$(sed -n 's/^branch = "\([^"]*\)"/\1/p' "$card" | head -n1)
+    [ -n "$pane" ] || continue
+    case "$p" in *"\"$pane\""*) ;; *) continue;; esac
+    screen=$("$herdr_bin" --session __SESSION__ pane read "$pane" --source detection --format text 2>/dev/null) || continue
+    screen=$(printf '%s' "$screen" | sha256sum | cut -d' ' -f1)
+    head=-
+    if [ -n "$wt" ]; then
+      [ -n "$branch" ] || continue
+      head=$(git -C "$wt" rev-parse "refs/heads/$branch" 2>/dev/null) || continue
+    fi
+    printf 'progress\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$lane" "$pane" "$screen" "$head"
+  done
+fi
 for dir in "$root"/*/.state/events; do
   [ -d "$dir" ] || continue
   slug=${dir%/.state/events}; slug=${slug##*/}
@@ -919,6 +951,20 @@ fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
                     event_hash: (*event_hash).to_string(),
                     artifact_hash: (*artifact_hash).to_string(),
                 });
+            }
+            ["progress", slug, thread, pane, screen, head] => {
+                manifest.progress.insert(
+                    ((*slug).into(), (*thread).into()),
+                    LaneProgress {
+                        pane: (*pane).into(),
+                        screen: (*screen).into(),
+                        head: if *head == "-" {
+                            String::new()
+                        } else {
+                            (*head).into()
+                        },
+                    },
+                );
             }
             ["bootstrap", slug, thread, brief_hash, pane] => {
                 manifest.bootstraps.push(BootstrapReceipt {
@@ -1165,6 +1211,7 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
         boot_id: manifest.boot_id,
         agents,
         panes,
+        progress: manifest.progress,
     })
 }
 
@@ -2049,6 +2096,7 @@ mod tests {
         let text = "boot\tboot-1\nfree\t1234\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
                     receipt\tdemo\tt-0001-1-1\tabc\tdef\n\
                     bootstrap\tdemo\tt-0001\tabcd\tw1:p2\n\
+                    progress\tdemo\tt-0001\tw1:p2\tscreenhash\theadsha\n\
                     event\tdemo\tt-0001-1-1\t/r/demo/.state/events/t-0001-1-1.toml\tabc\t/r/demo/.state/artifacts/def\tdef\n\
                     event\tdemo\tt-0002-1-1\t/r/demo/.state/events/t-0002-1-1.toml\tabc\t-\t-\n";
         let manifest = parse_courier_manifest(text).unwrap();
@@ -2060,6 +2108,10 @@ mod tests {
         assert_eq!(manifest.receipts[0].artifact_hash, "def");
         assert_eq!(manifest.bootstraps.len(), 1);
         assert_eq!(manifest.bootstraps[0].pane, "w1:p2");
+        assert_eq!(
+            manifest.progress[&("demo".into(), "t-0001".into())].head,
+            "headsha"
+        );
         assert_eq!(manifest.envelopes.len(), 2);
         assert_eq!(manifest.envelopes[0].artifact_hash, "def");
         assert!(manifest.envelopes[1].artifact_path.is_empty());
@@ -2119,6 +2171,83 @@ mod tests {
             "{}",
             fresh.stdout
         );
+    }
+
+    #[test]
+    fn courier_reads_box_lane_progress_in_the_existing_helper_call() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("ade");
+        let bin = home.path().join("bin");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(root.join("demo/.state/lanes")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(git.status.success());
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=t@e",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "initial"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let branch = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "symbolic-ref",
+                "--short",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        let branch = String::from_utf8(branch.stdout).unwrap().trim().to_string();
+        std::fs::write(
+            root.join("demo/.state/lanes/t-1.toml"),
+            format!(
+                "pane_id = \"w:p\"\nbox_worktree = \"{}\"\nbranch = \"{branch}\"\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let fake = bin.join("herdr");
+        std::fs::write(&fake, "#!/bin/sh\ncase \"$*\" in\n  *'agent list'*) echo '{\"result\":{\"agents\":[{\"pane_id\":\"w:p\"}]}}';;\n  *'pane list'*) echo '{\"result\":{\"panes\":[{\"pane_id\":\"w:p\"}]}}';;\n  *'pane read'*) printf 'working';;\nesac\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut machine = test_machine(&root.to_string_lossy());
+        machine.path = format!("{}:/bin:/usr/bin", bin.display());
+        let script = courier_helper(&machine, "default");
+        let out = crate::runner::RealRunner
+            .run(
+                &crate::runner::Cmd::new("sh", Duration::from_secs(120))
+                    .args(["-c", &script])
+                    .stdin(String::new()),
+            )
+            .unwrap();
+        assert!(out.success(), "{}", out.error_text());
+        let manifest = parse_courier_manifest(&out.stdout).unwrap();
+        let progress = &manifest.progress[&("demo".into(), "t-1".into())];
+        assert_eq!(progress.head, sha);
+        assert_eq!(progress.screen, thread::sha256_hex(b"working"));
     }
 
     #[test]
