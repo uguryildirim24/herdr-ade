@@ -1872,10 +1872,12 @@ fn thread_pass(
                                 herdr,
                                 &coordinator.pane_id,
                                 &notice,
-                            )?
+                            )
+                            .unwrap_or(false)
                         } else {
                             false
                         };
+                        // A transport error must not consume the one-shot notice.
                         if !sent {
                             inbox::write(project, "lane-notice", &t.id, &notice, "")?;
                         }
