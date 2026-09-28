@@ -190,16 +190,20 @@ fn needs_coordinator(project: &Project, review: &mut Review, reason: &str) -> Re
     save(project, review)
 }
 
+fn reset_no_verdict(project: &Project, review: &mut Review) -> Result<()> {
+    if !review.no_verdict_since.is_empty() {
+        review.no_verdict_since.clear();
+        review
+            .notices
+            .retain(|n| n.submitted || !n.line.contains("has no verdict since"));
+        save(project, review)?;
+    }
+    Ok(())
+}
+
 fn watch_no_verdict(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
     if review.phase != Phase::Reviewing {
-        if !review.no_verdict_since.is_empty() {
-            review.no_verdict_since.clear();
-            review
-                .notices
-                .retain(|n| n.submitted || !n.line.contains("has no verdict since"));
-            save(project, review)?;
-        }
-        return Ok(());
+        return reset_no_verdict(project, review);
     }
     let Some(id) = review.reviewer.as_deref() else {
         return Ok(());
@@ -218,19 +222,10 @@ fn watch_no_verdict(ctx: &Ctx, project: &Project, review: &mut Review) -> Result
             crate::events::latest_done_event(&events, id, lane.attempt.max(1)),
         )
     {
-        if !review.no_verdict_since.is_empty() {
-            review.no_verdict_since.clear();
-            if fresh {
-                review
-                    .notices
-                    .retain(|n| n.submitted || !n.line.contains("has no verdict since"));
-            }
-            save(project, review)?;
-        }
-        return Ok(());
+        return reset_no_verdict(project, review);
     }
     // An absent process belongs to the normal lane failure recovery, not
-    // this idle-review warning. A remote observation must be fresh.
+    // this idle-review warning. Unknown intervals cannot count toward idle.
     let state = if lane.is_remote() {
         if lane.last_observed.is_empty()
             || !(0..=45).contains(&thread::seconds_since(
@@ -238,7 +233,7 @@ fn watch_no_verdict(ctx: &Ctx, project: &Project, review: &mut Review) -> Result
                 jiff::Timestamp::now(),
             ))
         {
-            return Ok(());
+            return reset_no_verdict(project, review);
         }
         lane.last_state.as_str()
     } else {
@@ -246,7 +241,7 @@ fn watch_no_verdict(ctx: &Ctx, project: &Project, review: &mut Review) -> Result
         let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
         let agents = herdr.agent_list()?;
         let Some(agent) = agents.iter().find(|a| thread::agent_matches(&lane, a)) else {
-            return Ok(());
+            return reset_no_verdict(project, review);
         };
         // Keep the borrowed status alive for the rest of this observation.
         return watch_no_verdict_state(ctx, project, review, &lane, &agent.agent_status);

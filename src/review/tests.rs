@@ -128,10 +128,13 @@ fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
     // No matching process: the lane recovery owns this, not the idle warning.
     watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert!(review.notices.is_empty());
+    assert!(review.no_verdict_since.is_empty());
     *fx.world.agents.borrow_mut() = format!(
         "[{{\"pane_id\":\"w1:p2\",\"tab_id\":\"w1:t2\",\"workspace_id\":\"w1\",\"name\":\"reviewer-test\",\"cwd\":{:?},\"agent_status\":\"idle\"}}]",
         reviewer.cwd
     );
+    watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert!(review.notices.is_empty());
     review.no_verdict_since = "2020-01-01T00:00:00Z".into();
     watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     let count = review.notices.len();
@@ -715,42 +718,6 @@ fn old_empty_commit_seal_is_classified_as_no_change() {
     assert_eq!(
         thread::load(&fx.project, &id).unwrap().has_changes,
         Some(false)
-    );
-}
-
-// Read-only proof against the named historical records. Run explicitly on the
-// machine that holds them; the normal test suite never depends on another project.
-#[test]
-#[ignore]
-fn proprium_t0028_is_selected_from_its_real_records() {
-    let state = Path::new("/home/agent/.herdr-ade/proprium/.state");
-    let lane: Thread =
-        toml::from_str(&std::fs::read_to_string(state.join("threads/t-0028.toml")).unwrap())
-            .unwrap();
-    let event: crate::contracts::Event =
-        toml::from_str(&std::fs::read_to_string(state.join("events/t-0028-1-1.toml")).unwrap())
-            .unwrap();
-    let reviewers: std::collections::BTreeSet<String> = std::fs::read_dir(state.join("reviews"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "toml")
-        })
-        .filter_map(|path| {
-            let review: Review = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-            review.reviewer
-        })
-        .collect();
-    assert_eq!(lane.role, "reviewer");
-    assert!(!reviewers.contains(&lane.id));
-    let id = lane.id.clone();
-    let repo = lane.repo.clone();
-    let pile = pending_from(vec![lane], &repo, &[event], &reviewers);
-    assert_eq!(pile.len(), 1);
-    assert_eq!(pile[0].id, id);
-    println!(
-        "{id} selected into {repo} pile; seal has_changes=true; no review record names it reviewer"
     );
 }
 
