@@ -178,7 +178,7 @@ pub fn context_recipe_lines(config: &LaunchConfig) -> Vec<String> {
                 }
                 reach.push(format!("rule[{index}] {}", trigger.join("; ")));
             }
-            reach.push("Rolf's one-off choice".into());
+            reach.push("coordinator's one-off lane choice".into());
             format!(
                 "- {id} [enabled] {} — capabilities={capabilities}; reach: {}",
                 recipe.plain,
@@ -197,40 +197,15 @@ pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<St
         .map_err(|error| crate::refusal::error(error.to_string(), format!("ha thread start {} --job <job> --task-file <file> --recipe <recipe> --basis \"<quote from Rolf's request>\"", project.slug)))
 }
 
-/// Validate and record Rolf's one-off recipe choice before a lane is created.
-/// The quote must occur verbatim in a request attached to the stable task.
-pub fn authorize_explicit_recipe(
+/// Validate a coordinator's one-off lane recipe before creating the lane.
+pub fn validate_explicit_recipe(
     ctx: &Ctx,
     project: &Project,
     task_id: &str,
     task_text: &str,
     workflow: &str,
     recipe_id: &str,
-    basis: &str,
-) -> Result<String> {
-    let quote = basis.trim();
-    if quote.is_empty() {
-        return Err(crate::refusal::error(
-            "recipe_basis_missing: --recipe requires --basis with Rolf's exact words",
-            "ha thread start <project> --job <job> --task-file <file> --recipe <recipe> --basis \"<Rolf quote>\"",
-        ));
-    }
-    if task_id.is_empty() {
-        return Err(crate::refusal::error(
-            "recipe_task_missing: --recipe requires --job or a task created with --request",
-            "ha thread start <project> --job <job> --task-file <file> --recipe <recipe> --basis \"<Rolf quote>\"",
-        ));
-    }
-    let task = crate::task::load(project, task_id)?;
-    let request = task
-        .authority
-        .iter()
-        .filter_map(|authority| crate::prompt::resolve_request(project, authority).ok())
-        .find(|request| request.text.contains(quote))
-        .ok_or_else(|| crate::refusal::error(
-            "recipe_authority: --basis must quote Rolf's words from a request on this task",
-            format!("ha thread start {} --request <id> --acceptance \"<condition>\" --task-file <file> --recipe {recipe_id} --basis \"<Rolf quote>\" (wait for a new request from Rolf that names this recipe)", project.slug),
-        ))?;
+) -> Result<()> {
     let config = parse_launch_config(&ctx.config_dir)?;
     validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
     let recipe = config
@@ -260,7 +235,7 @@ pub fn authorize_explicit_recipe(
             ),
         ));
     }
-    Ok(request.basis())
+    Ok(())
 }
 
 /// Optional task front matter describes the deliverable or a hard runtime
@@ -303,13 +278,13 @@ pub struct ResolveInput<'a> {
     pub task: &'a str,
     /// Selects skill text and an ordered routing rule.
     pub workflow: &'a str,
-    /// One recipe Rolf named for this lane. Ordinary starts leave this empty.
+    /// One recipe the coordinator chose for this lane. Ordinary starts leave this empty.
     pub recipe: Option<&'a str>,
     /// A recipe selected for the project's coordinator. Unlike a lane's
     /// one-off choice, it is retained on the coordinator binding itself.
     pub project_recipe: Option<&'a str>,
-    /// Rolf's verbatim words and their task-bound request, validated before
-    /// dispatch and persisted on the launch record.
+    /// Coordinator recipe basis and request, persisted on its launch record.
+    /// Lanes leave both empty.
     pub recipe_basis: Option<&'a str>,
     pub recipe_request: Option<&'a str>,
     pub previous: Option<&'a Launch>,
@@ -480,17 +455,6 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
             if input.previous.is_some() {
                 bail!(
                     "recipe_override_recovery: a one-off recipe is chosen only when the lane starts"
-                );
-            }
-            if input
-                .recipe_basis
-                .is_none_or(|basis| basis.trim().is_empty())
-                || input
-                    .recipe_request
-                    .is_none_or(|request| !request.starts_with("request:"))
-            {
-                bail!(
-                    "recipe_authority_missing: a one-off recipe needs Rolf's quoted words and task request"
                 );
             }
             crate::routing::Selection {
@@ -752,7 +716,11 @@ mod tests {
             "{:?}",
             lines
         );
-        assert!(lines[0].contains("Rolf's one-off choice"), "{:?}", lines);
+        assert!(
+            lines[0].contains("coordinator's one-off lane choice"),
+            "{:?}",
+            lines
+        );
         assert!(!lines.iter().any(|line| line.contains("thread start")));
         assert!(lines[1].contains("[disabled]"), "{:?}", lines);
         assert!(!lines[1].contains("reach:"), "{:?}", lines);
