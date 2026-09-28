@@ -1459,17 +1459,42 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             if repo.is_empty() || pending(project, &repo, &events).is_empty() {
                 continue;
             }
-            if threads.iter().any(|t| {
+            let failed_local = threads.iter().any(|t| {
                 same_repo(&t.repo, &repo)
                     && t.role != "reviewer"
-                    && matches!(t.status, Status::Starting | Status::Open)
-                    && (crate::events::latest_event(&events, &t.id, t.attempt.max(1))
-                        .is_none_or(|e| e.payload.done.is_none())
-                        || crate::threads::follow_up_pending_for_seal(
-                            t,
-                            crate::events::latest_done_event(&events, &t.id, t.attempt.max(1)),
-                        ))
-            }) {
+                    && t.status == Status::Failed
+                    && !t.is_remote()
+            });
+            let live_failed = if failed_local {
+                let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+                let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+                let agents = herdr.agent_list()?;
+                let panes = herdr.pane_list()?;
+                threads.iter().any(|t| {
+                    same_repo(&t.repo, &repo)
+                        && t.role != "reviewer"
+                        && t.status == Status::Failed
+                        && !t.is_remote()
+                        && !t.pane_id.is_empty()
+                        && panes.iter().any(|pane| pane.pane_id == t.pane_id)
+                        && agents.iter().any(|agent| agent.pane_id == t.pane_id)
+                })
+            } else {
+                false
+            };
+            if live_failed
+                || threads.iter().any(|t| {
+                    same_repo(&t.repo, &repo)
+                        && t.role != "reviewer"
+                        && matches!(t.status, Status::Starting | Status::Open)
+                        && (crate::events::latest_event(&events, &t.id, t.attempt.max(1))
+                            .is_none_or(|e| e.payload.done.is_none())
+                            || crate::threads::follow_up_pending_for_seal(
+                                t,
+                                crate::events::latest_done_event(&events, &t.id, t.attempt.max(1)),
+                            ))
+                })
+            {
                 continue;
             }
             let Some(_lock) = try_operation_lock(ctx, &repo)? else {

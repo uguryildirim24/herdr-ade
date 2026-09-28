@@ -405,6 +405,9 @@ fn start_with_ticker(
                 Ok(_) => error,
                 Err(cleanup) => error.context(format!("failed-start cleanup: {cleanup:#}")),
             };
+            if crate::refusal::is(&error) {
+                return Err(error);
+            }
             Err(error.context(format!(
                 "thread {id} failed to start; `thread retry {slug} {id} --reason <why>` retries"
             )))
@@ -1155,6 +1158,7 @@ fn place_ade_worktree(
     let branch = thread::branch_name(&project.slug, &record.id, &record.title);
     let task = std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
     let planned = Path::new(&record.repo).join(".worktrees").join(&record.id);
+    crate::claude_trust::check_folder(ctx, &record.launch.kind, record.is_remote(), &planned)?;
     let stub = Thread {
         thread_dir: thread::thread_dir(&planned.to_string_lossy(), &project.slug, &record.id),
         ..record.clone()
@@ -1259,6 +1263,7 @@ fn place_ade_tab(
     } else {
         Path::new(&record.worktree_path).to_path_buf()
     };
+    crate::claude_trust::check_folder(ctx, &record.launch.kind, record.is_remote(), &folder)?;
     let managed = record.kind == Kind::Tab;
     let (folder, brief_hash, base) = if managed {
         let task =
@@ -1839,7 +1844,7 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
             agent.cwd
         );
     }
-    if !record.agent_name.is_empty() && agent.name != record.agent_name {
+    if !record.agent_name.is_empty() && !agent.name.is_empty() && agent.name != record.agent_name {
         bail!(
             "rebind_identity_mismatch: pane {pane_id} has agent `{}`, expected `{}`",
             agent.name,
@@ -4919,6 +4924,33 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebind_accepts_unnamed_agent_but_not_a_different_name() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Failed;
+            t.worktree_path = "/work/lane".into();
+            t.cwd = t.worktree_path.clone();
+            t.agent_name = "recorded".into();
+        })
+        .unwrap();
+        *world.agents.borrow_mut() = r#"[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/work/lane","agent":"claude","agent_status":"working","name":"different"}]"#.into();
+        assert!(
+            format!(
+                "{:#}",
+                rebind(&world.ctx(), "demo", &lane.id, "w1:p2").unwrap_err()
+            )
+            .contains("rebind_identity_mismatch")
+        );
+        let unnamed = world.agents.borrow().replace("different", "");
+        *world.agents.borrow_mut() = unnamed;
+        rebind(&world.ctx(), "demo", &lane.id, "w1:p2").unwrap();
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.status, Status::Open);
+        assert_eq!(saved.agent_name, "");
+    }
 
     #[test]
     fn pasted_error_and_code_spans_do_not_create_report_links() {
