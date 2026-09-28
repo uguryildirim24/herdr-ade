@@ -186,15 +186,19 @@ pub(crate) fn try_operation_lock(ctx: &Ctx, repo: &str) -> Result<Option<std::fs
     }
 }
 fn lock_file(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
-    let root = ctx.root.join(".review-locks");
-    std::fs::create_dir_all(&root)?;
-    let repo = repo_identity(repo);
-    let file = std::fs::File::options()
+    let path = lock_path(ctx, repo);
+    std::fs::create_dir_all(path.parent().expect("lock path has a parent"))?;
+    Ok(std::fs::File::options()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(root.join(thread::sha256_hex(repo.to_string_lossy().as_bytes())))?;
-    Ok(file)
+        .open(path)?)
+}
+fn lock_path(ctx: &Ctx, repo: &str) -> PathBuf {
+    let repo = repo_identity(repo);
+    ctx.root
+        .join(".review-locks")
+        .join(thread::sha256_hex(repo.to_string_lossy().as_bytes()))
 }
 /// Read Git's worktree pointers without invoking Git on idle ticker passes.
 fn repo_identity(repo: &str) -> PathBuf {

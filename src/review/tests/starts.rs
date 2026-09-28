@@ -128,11 +128,59 @@ fn reviewer_placement_leaves_launch_pending_and_releases_the_lock() {
 }
 
 #[test]
+fn historical_lock_holder() {
+    let Ok(path) = std::env::var("HERDR_ADE_TEST_HISTORICAL_LOCK") else {
+        return;
+    };
+    use std::io::{Read, Write};
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.lock().unwrap();
+    println!("historical lock held");
+    std::io::stdout().flush().unwrap();
+    std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+}
+
+#[test]
 fn historical_read_skips_a_locked_repository() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
     let fx = configured();
     let (id, _) = lane(&fx, 1);
     thread::update(&fx.project, &id, |t| t.status = Status::Resolved).unwrap();
-    let held = operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap()).unwrap();
+    // Hold the lock in another process: advisory locks held by this test's
+    // process cannot prove contention consistently across platforms.
+    let lock = lock_file(&fx.world.ctx(), fx.repo.to_str().unwrap()).unwrap();
+    let path = lock_path(&fx.world.ctx(), fx.repo.to_str().unwrap());
+    drop(lock);
+    let mut holder = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "review::tests::starts::historical_lock_holder",
+            "--nocapture",
+        ])
+        .env("HERDR_ADE_TEST_HISTORICAL_LOCK", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(holder.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            output.read_line(&mut line).unwrap() > 0,
+            "lock holder exited before acquiring lock"
+        );
+        if line.contains("historical lock held") {
+            break;
+        }
+    }
+    assert!(
+        try_operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap())
+            .unwrap()
+            .is_none()
+    );
     classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
     assert!(
         thread::load(&fx.project, &id)
@@ -140,7 +188,8 @@ fn historical_read_skips_a_locked_repository() {
             .historical_seal
             .is_empty()
     );
-    drop(held);
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
     classify_old_seals(&fx.world.ctx(), &fx.project, true).unwrap();
     assert!(
         !thread::load(&fx.project, &id)
