@@ -2002,12 +2002,23 @@ fn dispatch_with_start(
         Command::Harness { command } => match command {
             HarnessCommand::Install => {
                 let result = crate::harness::install(&ctx)?;
+                let failed = result.box_failed();
                 crate::output::success(
-                    Some("installed"),
+                    Some(if failed {
+                        "install_failed"
+                    } else {
+                        "installed"
+                    }),
                     &serde_json::json!({ "install": result }),
                     &result.message(),
                     &result.warnings(),
-                )
+                )?;
+                if failed {
+                    bail!(
+                        "harness_box_pending: one or more boxes did not install; see per-box results"
+                    );
+                }
+                Ok(())
             }
         },
         Command::Ticker { command } => match command {

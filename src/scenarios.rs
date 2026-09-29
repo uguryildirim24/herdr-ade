@@ -2989,6 +2989,7 @@ fn harness_install_reports_unavailable_box_without_reexec() {
     let world = World::new();
     let plugin = harness_repo(world.home.path(), "plugin", "herdr-ade");
     write_harness_config(&world, &[(&plugin, "/home/agent/projects/herdr-ade")]);
+    configure_test_box(&world);
     world.runner.on("cargo build", ok(""));
     world.runner.on("cp ", ok(""));
     world.runner.on("mv -f", ok(""));
