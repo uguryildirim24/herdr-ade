@@ -1,6 +1,6 @@
 //! The pinned install (SPEC-pi v2 §3.2).
 //!
-//! Exactly `@earendil-works/pi-coding-agent@0.85.1` into
+//! Exactly `@earendil-works/pi-coding-agent@0.99.1` into
 //! `<ADE root>/pi/npm`, never global, never `pi install`.
 //! Setup is an action Rolf runs; the library refuses a start without the pin.
 
@@ -195,7 +195,7 @@ mod tests {
         assert!(args.contains(&"--prefix".to_string()));
         assert!(args.contains(&"/state/pi/npm".to_string()));
         assert!(args.contains(&"--save-exact".to_string()));
-        assert!(args.contains(&format!("{PI_PACKAGE}@0.85.1")));
+        assert!(args.contains(&format!("{PI_PACKAGE}@0.99.1")));
         assert!(!args.iter().any(|a| a == "-g" || a == "--global"));
         assert!(!args.iter().any(|a| a.contains('^')));
     }
@@ -205,7 +205,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::for_test(dir.path().join("pi"));
         std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
-        std::fs::write(layout.package_json(), r#"{"name":"x","version":"0.85.1"}"#).unwrap();
+        std::fs::write(layout.package_json(), r#"{"name":"x","version":"0.99.1"}"#).unwrap();
         std::fs::write(layout.cli_js(), "// cli").unwrap();
         assert!(is_installed_exactly(&layout));
         std::fs::write(layout.package_json(), r#"{"name":"x","version":"0.86.0"}"#).unwrap();
@@ -224,13 +224,13 @@ mod tests {
                 let package = std::path::Path::new(&prefix)
                     .join("node_modules/@earendil-works/pi-coding-agent");
                 std::fs::create_dir_all(package.join("dist/bundle")).unwrap();
-                std::fs::write(package.join("package.json"), r#"{"version":"0.85.1"}"#).unwrap();
+                std::fs::write(package.join("package.json"), r#"{"version":"0.99.1"}"#).unwrap();
                 std::fs::write(package.join("dist/bundle/cli.js"), "// cli").unwrap();
                 Ok(ok("added 1 package\n"))
             },
         );
         let report = install(&runner, &layout).unwrap();
-        assert_eq!(report.version, "0.85.1");
+        assert_eq!(report.version, "0.99.1");
         assert_eq!(runner.count("npm install"), 1);
     }
 
@@ -270,7 +270,7 @@ mod tests {
                 let package = std::path::Path::new(&prefix)
                     .join("node_modules/@earendil-works/pi-coding-agent");
                 std::fs::create_dir_all(package.join("dist/bundle")).unwrap();
-                std::fs::write(package.join("package.json"), r#"{"version":"0.85.1"}"#).unwrap();
+                std::fs::write(package.join("package.json"), r#"{"version":"0.99.1"}"#).unwrap();
                 std::fs::write(package.join("dist/bundle/cli.js"), "// cli").unwrap();
                 Ok(ok(""))
             },

@@ -29,7 +29,7 @@ mod scenarios;
 /// (SPEC-pi v2 §1, §3.2).
 pub(crate) const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 /// The exact pin. Doctor refuses anything else (SPEC-pi v2 §3.2, §3.9).
-pub(crate) const PI_VERSION: &str = "0.85.1";
+pub(crate) const PI_VERSION: &str = "0.99.1";
 /// The package's `engines` floor (SPEC-pi v2 §1).
 pub(crate) const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
 /// The guard extension's file name (SPEC-pi v2 §3.9).
