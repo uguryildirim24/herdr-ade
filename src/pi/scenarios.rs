@@ -17,11 +17,11 @@ fn world(dir: &Path) -> (Env, Layout) {
     install::write_guard(&layout).unwrap();
     launch::write_wrapper(&layout).unwrap();
     std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
-    std::fs::write(layout.package_json(), r#"{"version":"0.85.1"}"#).unwrap();
+    std::fs::write(layout.package_json(), r#"{"version":"0.99.1"}"#).unwrap();
     std::fs::write(layout.cli_js(), "// cli").unwrap();
     std::fs::write(
         layout.npm().join("package.json"),
-        r#"{"dependencies":{"@earendil-works/pi-coding-agent":"0.85.1"}}"#,
+        r#"{"dependencies":{"@earendil-works/pi-coding-agent":"0.99.1"}}"#,
     )
     .unwrap();
     let env = Env::for_test(dir, &[("HERDR_BIN_PATH", "/h/herdr")]);
@@ -115,7 +115,7 @@ fn scenario_setup_then_check_for_kimi() {
     let runner = FakeRunner::new();
     script_login_shell(&runner, &env);
     runner.on("herdr integration status", ok("pi: current\n"));
-    runner.on("--version", ok("0.85.1\n"));
+    runner.on("--version", ok("0.99.1\n"));
     runner.on(
         "auth check --provider kimi-coding",
         ok(r#"{"status":"ready"}"#),
