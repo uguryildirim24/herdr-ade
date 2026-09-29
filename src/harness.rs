@@ -1067,9 +1067,13 @@ fn install_box(
     ctx: &Ctx,
     label: &str,
 ) -> Result<(crate::contracts::MachineProfile, remote::MachineDeclaration)> {
-    let profile =
-        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, label)?;
-    let declaration = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    let declaration = remote::machine_declaration(&ctx.config_dir, label)?;
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        &declaration.label,
+    )?;
     Ok((profile, declaration))
 }
 
@@ -1303,7 +1307,8 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         for proof in processes.iter().filter(|proof| {
             proof.machine == machine.id
                 && (proof.process == "herdr-ade binary" && proof.state != "installed"
-                    || proof.process == "ticker" && proof.state != "running")
+                    || proof.process == "ticker" && proof.state != "running"
+                    || proof.process == "box binary and ticker" && proof.state != "running")
         }) {
             let error = format!(
                 "{}: {}",
@@ -1518,14 +1523,14 @@ mod tests {
         std::fs::create_dir_all(root.path().join("config")).unwrap();
         std::fs::write(
             root.path().join("config/config.toml"),
-            crate::remote::TEST_MACHINE,
+            crate::remote::TEST_MACHINE.replace("label = \"buildbox\"", "label = \"remote-box\""),
         )
         .unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = FakeRunner::new();
         runner.on(
             "machine list --json",
-            ok(r#"[{"id":"7aaed4e8313e2440","label":"buildbox","target":"saved-box","session":"default","enabled":true}]"#),
+            ok(r#"[{"id":"7aaed4e8313e2440","label":"remote-box","target":"saved-box","session":"default","enabled":true}]"#),
         );
         let ctx = Ctx {
             env: &env,
@@ -1538,10 +1543,10 @@ mod tests {
         let (profile, declaration) = install_box(&ctx, "buildbox").unwrap();
 
         assert_eq!(profile.id, "7aaed4e8313e2440");
-        assert_eq!(profile.label, "buildbox");
+        assert_eq!(profile.label, "remote-box");
         assert_eq!(profile.target, "saved-box");
         assert_eq!(declaration.id, "buildbox");
-        assert_eq!(declaration.label, "buildbox");
+        assert_eq!(declaration.label, "remote-box");
         assert_eq!(declaration.build, "/home/agent/build/lanes");
         assert!(declaration.runs_kind("pi"));
         assert!(!declaration.runs_kind("claude"));

@@ -687,11 +687,22 @@ fn box_repo_candidate(
         .repos
         .into_iter()
         .find(|r| r.path == repo);
-    let row = machine_row.as_ref().or(row);
-    match (
-        row.and_then(|r| r.box_path.clone()),
-        row.and_then(|r| r.publish_url.clone()),
-    ) {
+    let configured = if machine_row.is_some() || row.is_none() {
+        remote::box_repo_for(config_dir, machine, repo)?
+    } else {
+        None
+    };
+    let path = machine_row
+        .as_ref()
+        .and_then(|r| r.box_path.clone())
+        .or_else(|| row.and_then(|r| r.box_path.clone()))
+        .or_else(|| configured.as_ref().and_then(|r| r.box_path.clone()));
+    let url = machine_row
+        .as_ref()
+        .and_then(|r| r.publish_url.clone())
+        .or_else(|| row.and_then(|r| r.publish_url.clone()))
+        .or_else(|| configured.as_ref().and_then(|r| r.publish_url.clone()));
+    match (path, url) {
         (Some(box_path), Some(publish_url)) => Ok((box_path, publish_url)),
         (Some(_), None) => bail!(
             "box_publish_url_missing: `{repo}` has a box_path in PROJECT.md but no `publish_url` in that row; add the URL the box fetches the lane branch from (the remote the branch is pushed to) before the first box start"
@@ -699,14 +710,9 @@ fn box_repo_candidate(
         (None, Some(_)) => bail!(
             "box_path_missing: `{repo}` has a publish_url in PROJECT.md but no `box_path` in that row; add the box clone path before the first box start"
         ),
-        (None, None) => {
-            let map = crate::remote::box_repo_for(config_dir, machine, repo)?.with_context(|| {
-                format!(
-                    "box_repo_unmapped: {repo} has no Mac-to-box row; add one before the first box start"
-                )
-            })?;
-            Ok((map.box_path.unwrap(), map.publish_url.unwrap()))
-        }
+        (None, None) => bail!(
+            "box_repo_unmapped: {repo} has no Mac-to-box row; add one before the first box start"
+        ),
     }
 }
 
@@ -6594,10 +6600,14 @@ mod tests {
     #[test]
     fn machine_repo_mapping_wins_over_generic_project_box_path() {
         let config = tempfile::tempdir().unwrap();
-        std::fs::write(config.path().join("config.toml"), format!(
-            "{}\n[[machines.buildbox.repos]]\npath = '/r'\nbox_path = '/second/r'\npublish_url = 'https://example/second.git'\n",
-            crate::remote::TEST_MACHINE
-        )).unwrap();
+        std::fs::write(
+            config.path().join("config.toml"),
+            format!(
+                "{}\n[[machines.buildbox.repos]]\npath = '/r'\nbox_path = '/second/r'\n",
+                crate::remote::TEST_MACHINE
+            ),
+        )
+        .unwrap();
         let project_row = crate::project::Repo {
             path: "/r".into(),
             box_path: Some("/first/r".into()),
@@ -6606,7 +6616,7 @@ mod tests {
         };
         assert_eq!(
             box_repo_candidate(config.path(), "buildbox", Some("/r"), Some(&project_row)).unwrap(),
-            ("/second/r".into(), "https://example/second.git".into())
+            ("/second/r".into(), "https://example/first.git".into())
         );
     }
 

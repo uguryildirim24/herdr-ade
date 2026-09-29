@@ -274,11 +274,25 @@ pub(crate) fn box_repo_for(
     machine: &str,
     mac_path: &str,
 ) -> Result<Option<crate::project::Repo>> {
-    let mut rows = machine_declaration(config_dir, machine)?.repos;
-    rows.extend(crate::harness::repos(config_dir)?);
-    Ok(rows
+    let machine_row = machine_declaration(config_dir, machine)?
+        .repos
         .into_iter()
-        .find(|row| row.path == mac_path && row.box_path.is_some() && row.publish_url.is_some()))
+        .find(|row| row.path == mac_path);
+    let generic_row = crate::harness::repos(config_dir)?
+        .into_iter()
+        .find(|row| row.path == mac_path);
+    let mut row = machine_row.or_else(|| generic_row.clone());
+    if let Some(ref mut row) = row {
+        row.box_path = row
+            .box_path
+            .take()
+            .or_else(|| generic_row.as_ref()?.box_path.clone());
+        row.publish_url = row
+            .publish_url
+            .take()
+            .or_else(|| generic_row.as_ref()?.publish_url.clone());
+    }
+    Ok(row.filter(|row| row.box_path.is_some() && row.publish_url.is_some()))
 }
 
 pub(crate) fn box_repo_for_route(
@@ -798,6 +812,9 @@ build = "/home/agent/build"
 path = "/usr/bin:/bin"
 ade_bin = "/usr/bin/herdr-ade"
 pi_bin = "/usr/bin/herdr-pi"
+[[machines.buildbox.repos]]
+path = "/Users/agent/projects/herdr"
+box_path = "/srv/buildbox/herdr"
 [[harness.repos]]
 path = "/Users/agent/projects/herdr"
 box_path = "/srv/herdr"
@@ -808,7 +825,11 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
         let row = box_repo_for(config.path(), "buildbox", "/Users/agent/projects/herdr")
             .unwrap()
             .unwrap();
-        assert_eq!(row.box_path.as_deref(), Some("/srv/herdr"));
+        assert_eq!(row.box_path.as_deref(), Some("/srv/buildbox/herdr"));
+        assert_eq!(
+            row.publish_url.as_deref(),
+            Some("https://github.com/uguryildirim24/herdr.git")
+        );
         assert!(
             box_repo_for(config.path(), "buildbox", "/Users/agent/projects/other")
                 .unwrap()
