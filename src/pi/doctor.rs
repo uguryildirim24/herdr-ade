@@ -342,7 +342,7 @@ pub(crate) fn doctor_rows_with(
         Some(range) => rows.push(Row::fail(
             "pin",
             format!(
-                "{range} in {}; the pin is exact 0.85.1",
+                "{range} in {}; the pin is exact 0.99.1",
                 layout.package_json().display()
             ),
         )),
@@ -431,7 +431,7 @@ pub(crate) fn doctor_rows_with(
                 rows.push(Row::fail(
                     "settings skills",
                     format!(
-                        "{} must set \"skills\": [\"!**\"] (pi 0.85.1 has no skills.enabled)",
+                        "{} must set \"skills\": [\"!**\"] (pi 0.99.1 uses skill patterns, not skills.enabled)",
                         layout.settings().display()
                     ),
                 ));
@@ -896,6 +896,13 @@ fn auth_check_uncached(
         .map(Ok)
         .unwrap_or_else(|| probe_model(provider))
         .map_err(|error| unknown_auth(format!("provider readiness setup failed: {error:#}")))?;
+    // GPT-6.1 Sol has no Off thinking level (its catalog maps `off` to
+    // null). Probe it at a supported level instead of refusing a ready lane.
+    let thinking = if model == "gpt-6.1-sol" {
+        "high"
+    } else {
+        "off"
+    };
     let live = runner
         .run(
             &sh::Cmd::new(layout.wrapper().display().to_string(), LIVE_PROBE_TIMEOUT)
@@ -905,7 +912,7 @@ fn auth_check_uncached(
                     "--model",
                     model,
                     "--thinking",
-                    "off",
+                    thinking,
                     "--no-tools",
                     "--no-skills",
                     "--no-extensions",
@@ -1235,7 +1242,7 @@ mod tests {
         };
         runner.on(&format!("{shell} -lic {probe}"), ok(&resolution));
         runner.on("herdr integration status", ok("pi: current\n"));
-        runner.on("--version", ok("0.85.1\n"));
+        runner.on("--version", ok("0.99.1\n"));
         runner.on("--print Reply OK.", ok("OK\n"));
         runner
     }
@@ -1248,11 +1255,11 @@ mod tests {
         install::write_guard(&layout).unwrap();
         crate::pi::launch::write_wrapper(&layout).unwrap();
         std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
-        std::fs::write(layout.package_json(), r#"{"version":"0.85.1"}"#).unwrap();
+        std::fs::write(layout.package_json(), r#"{"version":"0.99.1"}"#).unwrap();
         std::fs::write(layout.cli_js(), "// cli").unwrap();
         std::fs::write(
             layout.npm().join("package.json"),
-            r#"{"dependencies":{"@earendil-works/pi-coding-agent":"0.85.1"}}"#,
+            r#"{"dependencies":{"@earendil-works/pi-coding-agent":"0.99.1"}}"#,
         )
         .unwrap();
         layout
@@ -1278,7 +1285,7 @@ mod tests {
             "{text:?}"
         );
         assert!(
-            text.iter().any(|l| l.contains("[ok  ] pin: 0.85.1")),
+            text.iter().any(|l| l.contains("[ok  ] pin: 0.99.1")),
             "{text:?}"
         );
         assert!(
@@ -1390,7 +1397,7 @@ mod tests {
         let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
         std::fs::write(
             layout.npm().join("package.json"),
-            r#"{"dependencies":{"@earendil-works/pi-coding-agent":"^0.85.1"}}"#,
+            r#"{"dependencies":{"@earendil-works/pi-coding-agent":"^0.99.1"}}"#,
         )
         .unwrap();
         std::fs::write(layout.trust(), "{\"/repo\":true}\n").unwrap();
@@ -1423,6 +1430,28 @@ mod tests {
             .unwrap();
         assert_eq!(probe.timeout, LIVE_PROBE_TIMEOUT);
         assert_eq!(probe.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sol_61_readiness_uses_supported_thinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let runner = FakeRunner::new();
+        runner.on(
+            "auth check --provider openai-codex",
+            ok(r#"{"status":"ready"}"#),
+        );
+        runner.on("--print Reply OK.", ok("OK"));
+        assert!(auth_check_model(&runner, &layout, "openai-codex", Some("gpt-6.1-sol")).is_ok());
+        let calls = runner.calls.borrow();
+        let probe = calls
+            .iter()
+            .find(|cmd| cmd.display().contains("--print Reply OK."))
+            .unwrap();
+        assert_eq!(
+            crate::pi::launch::flag_value(&probe.args, "--thinking").as_deref(),
+            Some("high")
+        );
     }
 
     #[test]

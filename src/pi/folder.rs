@@ -12,7 +12,7 @@ use super::Layout;
 
 /// SPEC-pi v2 §3.3: no trust dialog, no personal skills, one retry.
 ///
-/// Skills: pi 0.85.1 has no `skills.enabled`. The spec's
+/// Skills: pi 0.99.1 has no `skills.enabled`. The spec's
 /// `"skills": { "enabled": false }` is pi's old object form, which it
 /// migrates away on its next settings write and which never stopped
 /// discovery (a `~/.agents/skills` probe still loaded). `skills` is now a
@@ -202,7 +202,7 @@ mod tests {
                 retries_capped: true,
             }
         );
-        // The old object form does not stop discovery in pi 0.85.1.
+        // The old object form does not stop discovery in pi 0.99.1.
         std::fs::write(
             layout.settings(),
             r#"{"defaultProjectTrust":"never","skills":{"enabled":false}}"#,

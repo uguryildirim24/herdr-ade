@@ -54,7 +54,7 @@ herdr-pi check <provider>    # read-only JSON; exit 1 when not ready
 ```
 
 ADE checks this itself before `herdr agent start`. It refuses when the pin is
-not exactly 0.85.1, when `pi` in a login shell is not the wrapper, when
+not exactly 0.99.1, when `pi` in a login shell is not the wrapper, when
 `settings.json` does not say `defaultProjectTrust: "never"`, when the herdr
 extension or the guard is missing, or when the login is not ready.
 
