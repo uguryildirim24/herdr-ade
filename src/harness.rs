@@ -121,13 +121,6 @@ fn install_ticker_agent(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The `[harness]` table of `config.toml`.
-#[derive(Debug, Default, Deserialize)]
-struct RawConfig {
-    #[serde(default)]
-    dispatch: crate::launch::DispatchConfig,
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct HarnessConfig {
     #[serde(default)]
@@ -204,10 +197,7 @@ pub(crate) struct InstalledRepo {
     pub(crate) kind: String,
     pub(crate) binaries: Vec<InstalledBinary>,
     pub(crate) commit: String,
-    pub(crate) box_path: Option<String>,
-    pub(crate) box_installed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) box_commit: Option<String>,
+    pub(crate) boxes: Vec<BoxRepoInstall>,
 }
 
 /// One installed or long-running process checked after installation. `build`
@@ -235,10 +225,25 @@ pub(crate) struct TaskInstallProof {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct BoxRepoInstall {
+    pub(crate) machine: String,
+    pub(crate) path: String,
+    pub(crate) installed: bool,
+    pub(crate) commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct BoxInstall {
+    pub(crate) machine: String,
+    pub(crate) target: String,
+    pub(crate) settings_installed: bool,
+    pub(crate) errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct InstallOutcome {
     pub(crate) repositories: Vec<InstalledRepo>,
-    pub(crate) box_target: Option<String>,
-    pub(crate) box_settings_installed: bool,
+    pub(crate) boxes: Vec<BoxInstall>,
     pub(crate) live_handoff_required: bool,
     pub(crate) processes: Vec<ProcessProof>,
     pub(crate) tasks: Vec<TaskInstallProof>,
@@ -247,6 +252,16 @@ pub(crate) struct InstallOutcome {
 }
 
 impl InstallOutcome {
+    pub(crate) fn box_failed(&self) -> bool {
+        self.boxes
+            .iter()
+            .any(|box_result| !box_result.errors.is_empty())
+            || self
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("box pending"))
+    }
+
     pub(crate) fn message(&self) -> String {
         let mut message = self
             .repositories
@@ -254,6 +269,18 @@ impl InstallOutcome {
             .flat_map(|repo| repo.binaries.iter())
             .map(|binary| format!("{}\n", binary.version))
             .collect::<String>();
+        for box_result in &self.boxes {
+            message.push_str(&format!(
+                "box {} ({}): {}\n",
+                box_result.machine,
+                box_result.target,
+                if box_result.errors.is_empty() {
+                    "installed"
+                } else {
+                    "pending"
+                }
+            ));
+        }
         for hook in &self.coordinator_hooks {
             message.push_str(&format!("coordinator hook rebound: {hook}\n"));
         }
@@ -1038,22 +1065,21 @@ fn refresh_box_guard(ctx: &Ctx, target: &str, machine: &remote::MachineDeclarati
 
 fn install_box(
     ctx: &Ctx,
-    dispatch: &str,
-) -> Result<Option<(crate::contracts::MachineProfile, remote::MachineDeclaration)>> {
-    if dispatch.is_empty() || dispatch == crate::contracts::MACHINE_LOCAL {
-        return Ok(None);
-    }
-    let Some(profile) = remote::optional_machine_profile(
-        ctx.runner,
-        &ctx.env.herdr_bin(),
-        &ctx.config_dir,
-        dispatch,
-    )?
-    else {
-        return Ok(None);
-    };
+    label: &str,
+) -> Result<(crate::contracts::MachineProfile, remote::MachineDeclaration)> {
+    let profile =
+        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, label)?;
     let declaration = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-    Ok(Some((profile, declaration)))
+    Ok((profile, declaration))
+}
+
+fn box_repo_path(machine: &remote::MachineDeclaration, repo: &Repo) -> Option<String> {
+    machine
+        .repos
+        .iter()
+        .find(|row| row.path == repo.path)
+        .and_then(|row| row.box_path.clone())
+        .or_else(|| repo.box_path.clone())
 }
 
 /// `ha harness install`: build every harness repository after a merge and
@@ -1135,9 +1161,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
             kind: kind.name().into(),
             binaries,
             commit,
-            box_path: repo.box_path.clone(),
-            box_installed: false,
-            box_commit: None,
+            boxes: Vec::new(),
         });
     }
     if kinds.contains(&Kind::Plugin) {
@@ -1160,65 +1184,90 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     }
 
     // Finish with this invocation's image even if its on-disk binary changed.
-    let document = crate::config::Document::read(&ctx.config_dir)?;
-    let dispatch = document.decode::<RawConfig>()?.dispatch.machine;
-    let box_machine = match install_box(ctx, &dispatch) {
-        Ok(machine) => machine,
-        Err(error) => {
-            warnings.push(format!("box pending: {error:#}"));
-            None
-        }
-    };
-    let box_target = box_machine
-        .as_ref()
-        .map(|(profile, _)| profile.target.clone());
-    let box_paths = box_machine.map(|(_, declaration)| declaration);
-    let mut box_plugin_installed = false;
-    for ((repo, kind), installed_repo) in repos.iter().zip(kinds).zip(&mut installed) {
-        match (&box_target, &repo.box_path) {
-            (Some(target), Some(box_path)) => {
-                let machine = box_paths
-                    .as_ref()
-                    .context("machine path declaration is missing")?;
-                match box_build(ctx, target, machine, box_path, kind) {
-                    Ok(box_commit) => {
-                        if let Some(head) = &box_commit {
-                            builds.push(InstalledBuild {
-                                repo: repo.path.clone(),
-                                machine: machine.id.clone(),
-                                head: head.clone(),
-                            });
+    let mut boxes = Vec::new();
+    let mut box_paths = Vec::new();
+    for label in remote::declared_machine_labels(&ctx.config_dir)? {
+        let mut result = BoxInstall {
+            machine: label.clone(),
+            target: String::new(),
+            settings_installed: false,
+            errors: Vec::new(),
+        };
+        match install_box(ctx, &label) {
+            Ok((profile, mut machine)) => {
+                let label = profile.label.clone();
+                result.machine = label.clone();
+                result.target = profile.target.clone();
+                machine.target = profile.target.clone();
+                machine.id = profile.id.clone();
+                let mut box_plugin_installed = false;
+                for ((repo, kind), installed_repo) in repos.iter().zip(&kinds).zip(&mut installed) {
+                    if let Some(box_path) = box_repo_path(&machine, repo) {
+                        match box_build(ctx, &profile.target, &machine, &box_path, *kind) {
+                            Ok(Some(head)) => {
+                                builds.push(InstalledBuild {
+                                    repo: repo.path.clone(),
+                                    machine: machine.id.clone(),
+                                    head: head.clone(),
+                                });
+                                installed_repo.boxes.push(BoxRepoInstall {
+                                    machine: label.clone(),
+                                    path: box_path,
+                                    installed: true,
+                                    commit: Some(head),
+                                });
+                                if *kind == Kind::Plugin {
+                                    box_plugin_installed = true;
+                                }
+                            }
+                            Ok(None) => {
+                                result.errors.push(format!(
+                                    "{} did not report its installed commit",
+                                    repo.path
+                                ));
+                                installed_repo.boxes.push(BoxRepoInstall {
+                                    machine: label.clone(),
+                                    path: box_path,
+                                    installed: false,
+                                    commit: None,
+                                });
+                            }
+                            Err(error) => {
+                                result.errors.push(format!("{error:#}"));
+                                installed_repo.boxes.push(BoxRepoInstall {
+                                    machine: label.clone(),
+                                    path: box_path,
+                                    installed: false,
+                                    commit: None,
+                                });
+                            }
                         }
-                        installed_repo.box_installed = box_commit.is_some();
-                        installed_repo.box_commit = box_commit;
-                        if !installed_repo.box_installed {
-                            warnings.push(format!(
-                                "box pending: {} did not report its installed commit",
-                                repo.path
-                            ));
-                        } else if kind == Kind::Plugin {
-                            box_plugin_installed = true;
-                        }
+                    } else {
+                        result
+                            .errors
+                            .push(format!("{} has no box_path on {label}", repo.path));
                     }
-                    Err(error) => warnings.push(format!("box pending: {error:#}")),
                 }
+                match box_settings(ctx, &profile.target, &machine) {
+                    Ok(()) => result.settings_installed = true,
+                    Err(error) => result.errors.push(format!("{error:#}")),
+                }
+                if box_plugin_installed
+                    && let Err(error) = refresh_box_guard(ctx, &profile.target, &machine)
+                {
+                    result.errors.push(format!("{error:#}"));
+                }
+                box_paths.push(machine);
             }
-            (Some(_), None) => warnings.push(format!(
-                "note: {} has no box_path; skipped the box step",
-                repo.path
-            )),
-            (None, _) => {}
+            Err(error) => result.errors.push(format!("{error:#}")),
         }
-    }
-    let mut box_settings_installed = false;
-    if let (Some(target), Some(machine)) = (&box_target, &box_paths) {
-        match box_settings(ctx, target, machine) {
-            Ok(()) => box_settings_installed = true,
-            Err(error) => warnings.push(format!("box pending: {error:#}")),
-        }
-        if box_plugin_installed && let Err(error) = refresh_box_guard(ctx, target, machine) {
-            warnings.push(format!("box pending: {error:#}"));
-        }
+        warnings.extend(
+            result
+                .errors
+                .iter()
+                .map(|error| format!("box pending: {label}: {error}")),
+        );
+        boxes.push(result);
     }
     let coordinator_hooks = crate::hook::reinstall_open(ctx)?;
     let plugin_version = installed
@@ -1227,7 +1276,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         .find(|binary| binary.name == "herdr-ade")
         .map(|binary| binary.version.clone());
     let mut processes = local_process_proofs(ctx, plugin_version.as_deref())?;
-    if let Some(machine) = &box_paths {
+    for machine in &box_paths {
         processes.extend(box_process_proofs(
             ctx,
             machine,
@@ -1238,11 +1287,9 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     if !crate::project::list_slugs(&ctx.root).is_empty() {
         expected.push("local");
     }
-    if let Some(machine) = &box_paths {
-        expected.push(machine.id.as_str());
-    }
+    expected.extend(box_paths.iter().map(|machine| machine.id.as_str()));
     if let Err(error) = require_running_tickers(&processes, &expected) {
-        let box_ticker_pending = box_paths.as_ref().is_some_and(|machine| {
+        let box_ticker_pending = box_paths.iter().any(|machine| {
             !processes.iter().any(|proof| {
                 proof.machine == machine.id && proof.process == "ticker" && proof.state == "running"
             })
@@ -1252,23 +1299,30 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
             if box_ticker_pending { "box" } else { "ticker" }
         ));
     }
-    if let Some(machine) = &box_paths {
+    for machine in &box_paths {
         for proof in processes.iter().filter(|proof| {
             proof.machine == machine.id
-                && proof.process == "herdr-ade binary"
-                && proof.state != "installed"
+                && (proof.process == "herdr-ade binary" && proof.state != "installed"
+                    || proof.process == "ticker" && proof.state != "running")
         }) {
-            warnings.push(format!(
-                "box pending: {}",
+            let error = format!(
+                "{}: {}",
+                proof.process,
                 proof.reason.as_deref().unwrap_or(&proof.state)
-            ));
+            );
+            warnings.push(format!("box pending: {}: {error}", machine.label));
+            if let Some(result) = boxes
+                .iter_mut()
+                .find(|result| result.machine == machine.label)
+            {
+                result.errors.push(error);
+            }
         }
     }
     let tasks = record_task_proofs(ctx, &builds, &processes)?;
     Ok(InstallOutcome {
         repositories: installed,
-        box_settings_installed,
-        box_target,
+        boxes,
         live_handoff_required: fork,
         processes,
         tasks,
@@ -1324,8 +1378,7 @@ mod tests {
         assert_eq!(ticker.state, "running");
         let message = InstallOutcome {
             repositories: vec![],
-            box_target: None,
-            box_settings_installed: false,
+            boxes: vec![],
             live_handoff_required: false,
             processes: proof,
             tasks: vec![],
@@ -1482,7 +1535,7 @@ mod tests {
             detached_ticker: false,
         };
 
-        let (profile, declaration) = install_box(&ctx, "buildbox").unwrap().unwrap();
+        let (profile, declaration) = install_box(&ctx, "buildbox").unwrap();
 
         assert_eq!(profile.id, "example-machine");
         assert_eq!(profile.label, "buildbox");
@@ -1493,6 +1546,110 @@ mod tests {
         assert!(declaration.runs_kind("pi"));
         assert!(!declaration.runs_kind("claude"));
         assert!(!declaration.runs_kind("agy"));
+    }
+
+    #[test]
+    fn install_visits_both_declared_boxes_even_when_first_build_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("RULES.md"), "worker rules").unwrap();
+        let repo = root.path().join("fork");
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"herdr\"\n").unwrap();
+        std::fs::write(repo.join("target/release/herdr"), "binary").unwrap();
+        let config = format!(
+            "[harness]\nrepos = [{{ path = '{}', box_path = '/generic/fork' }}]\n",
+            repo.display()
+        );
+        let machines = ["alpha", "beta"].iter().map(|label| format!(
+            "\n[machines.{label}]\ntarget = '{label}'\nsession = 'default'\nhome = '/home/{label}'\nroot = '/home/{label}/ade'\nworktrees = '/home/{label}/work'\nbuild = '/home/{label}/build'\npath = '/home/{label}/bin:/usr/bin:/bin'\nade_bin = '/home/{label}/bin/herdr-ade'\npi_bin = '/home/{label}/bin/herdr-pi'\nrepos = [{{ path = '{}', box_path = '/home/{label}/fork' }}]\n",
+            repo.display()
+        )).collect::<String>();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("{config}{machines}"),
+        )
+        .unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        for fail_first in [true, false] {
+            let runner = FakeRunner::new();
+            runner.on("machine list --json", ok("[]"));
+            runner.on_fn(
+                |cmd| cmd.program == "git" && cmd.display().contains("rev-parse HEAD"),
+                |_| Ok(ok("abc123\n")),
+            );
+            runner.on_fn(
+                |cmd| cmd.program == "git" && cmd.display().contains("status --porcelain"),
+                |_| Ok(ok("")),
+            );
+            runner.on_fn(|cmd| cmd.program == "cargo", |_| Ok(ok("")));
+            runner.on_fn(
+                |cmd| cmd.program == "cp" || cmd.program == "mv",
+                |cmd| RealRunner.run(cmd),
+            );
+            runner.on_fn(
+                |cmd| cmd.args == ["--version"],
+                |_| Ok(ok("herdr 0.1.0+abc123.1\n")),
+            );
+            runner.on_fn(
+                |cmd| cmd.program == "ssh",
+                move |cmd| {
+                    let display = cmd.display();
+                    if fail_first && display.contains("alpha") && display.contains("git fetch") {
+                        Ok(fail(1, "fetch failed"))
+                    } else if display.contains("HERDR_ADE_BOX_BINARY") {
+                        Ok(ok(&format!(
+                            "HERDR_ADE_BOX_BINARY=herdr-ade {}\nHERDR_ADE_BOX_TICKER=42:{}\n",
+                            crate::VERSION,
+                            crate::VERSION
+                        )))
+                    } else if display.contains("git fetch") {
+                        Ok(ok("HERDR_ADE_INSTALLED_HEAD=abc123\n"))
+                    } else {
+                        Ok(ok(""))
+                    }
+                },
+            );
+            let ctx = Ctx {
+                env: &env,
+                root: root.path().join("root"),
+                config_dir: config_dir.clone(),
+                runner: &runner,
+                detached_ticker: false,
+            };
+            let outcome = install(&ctx).unwrap();
+            assert_eq!(outcome.boxes.len(), 2);
+            assert_eq!(outcome.box_failed(), fail_first);
+            assert_eq!(
+                outcome.boxes[0]
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("fetch failed")),
+                fail_first,
+                "{:?}",
+                outcome.boxes
+            );
+            assert!(outcome.boxes[1].errors.is_empty(), "{:?}", outcome.boxes[1]);
+            if !fail_first {
+                assert!(outcome.boxes[0].errors.is_empty(), "{:?}", outcome.boxes[0]);
+            }
+            assert_eq!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("box pending: alpha")),
+                fail_first
+            );
+            assert!(
+                outcome.repositories[0]
+                    .boxes
+                    .iter()
+                    .any(|r| r.machine == "beta" && r.installed && r.path == "/home/beta/fork")
+            );
+            assert_eq!(runner.count("git fetch"), 2);
+            assert!(outcome.boxes.iter().all(|b| b.settings_installed));
+        }
     }
 
     #[test]
