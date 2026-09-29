@@ -90,40 +90,62 @@ fn configured_machine_declarations(
     document.section("machines")
 }
 
+fn normalize_declaration(id: &str, row: &mut MachineDeclaration) -> Result<()> {
+    if row.id.is_empty() {
+        row.id = id.to_string();
+    }
+    if row.label.is_empty() {
+        row.label = id.to_string();
+    }
+    if row.target.is_empty()
+        || row.session.is_empty()
+        || row.path.is_empty()
+        || row.home.is_empty()
+        || row.root.is_empty()
+        || row.build.is_empty()
+        || row.ade_bin.is_empty()
+        || row.pi_bin.is_empty()
+    {
+        bail!("machine_declaration_invalid: `{id}` is missing target, session, or paths");
+    }
+    Ok(())
+}
+
+/// Configured table keys, including rows whose declarations cannot be used yet.
+pub(crate) fn declared_machine_labels(config_dir: &Path) -> Result<Vec<String>> {
+    Ok(configured_machine_declarations(config_dir)?
+        .into_keys()
+        .collect())
+}
+
 pub(crate) fn machine_declarations(
     config_dir: &Path,
 ) -> Result<BTreeMap<String, MachineDeclaration>> {
-    // Machines are user-specific. An example ships for reference, but is never
-    // installed as a default: a machine must be declared in config.toml.
     let mut rows = configured_machine_declarations(config_dir)?;
     for (id, row) in &mut rows {
-        if row.id.is_empty() {
-            row.id = id.clone();
-        }
-        if row.label.is_empty() {
-            row.label = id.clone();
-        }
-        if row.target.is_empty()
-            || row.session.is_empty()
-            || row.path.is_empty()
-            || row.home.is_empty()
-            || row.root.is_empty()
-            || row.build.is_empty()
-            || row.ade_bin.is_empty()
-            || row.pi_bin.is_empty()
-        {
-            bail!("machine_declaration_invalid: `{id}` is missing target, session, or paths");
-        }
+        normalize_declaration(id, row)?;
     }
     Ok(rows)
 }
 
 pub(crate) fn machine_declaration(config_dir: &Path, machine: &str) -> Result<MachineDeclaration> {
-    machine_declarations(config_dir)?
-        .into_values()
-        .find(|row| row.id == machine || row.label == machine)
+    configured_machine_declarations(config_dir)?
+        .into_iter()
+        .find_map(|(id, mut row)| {
+            if row.id.is_empty() {
+                row.id = id.clone();
+            }
+            if row.label.is_empty() {
+                row.label = id.clone();
+            }
+            (id == machine || row.id == machine || row.label == machine).then_some((id, row))
+        })
         .with_context(|| {
             format!("machine_declaration_missing: `{machine}` has no path declaration")
+        })
+        .and_then(|(id, mut row)| {
+            normalize_declaration(&id, &mut row)?;
+            Ok(row)
         })
 }
 
@@ -233,8 +255,12 @@ pub(crate) fn registered_machine_names(
         .collect::<Result<_>>()?;
     names.extend(
         configured_machine_declarations(config_dir)?
-            .into_values()
-            .map(|row| row.label),
+            .into_iter()
+            .map(
+                |(id, row)| {
+                    if row.label.is_empty() { id } else { row.label }
+                },
+            ),
     );
     names.sort();
     names.dedup();
@@ -248,8 +274,8 @@ pub(crate) fn box_repo_for(
     machine: &str,
     mac_path: &str,
 ) -> Result<Option<crate::project::Repo>> {
-    let mut rows = crate::harness::repos(config_dir)?;
-    rows.extend(machine_declaration(config_dir, machine)?.repos);
+    let mut rows = machine_declaration(config_dir, machine)?.repos;
+    rows.extend(crate::harness::repos(config_dir)?);
     Ok(rows
         .into_iter()
         .find(|row| row.path == mac_path && row.box_path.is_some() && row.publish_url.is_some()))
@@ -734,6 +760,10 @@ publish_url = "https://example.test/repo.git"
         .unwrap();
         let runner = FakeRunner::new();
         runner.on("machine list --json", ok("[]"));
+        assert_eq!(
+            registered_machine_names(&runner, "herdr", config.path()).unwrap(),
+            vec!["lab"]
+        );
         let profile = machine_profile(&runner, "herdr", config.path(), "lab").unwrap();
         assert_eq!(profile.target, "lab.example");
         let declaration = machine_declaration(config.path(), "lab").unwrap();

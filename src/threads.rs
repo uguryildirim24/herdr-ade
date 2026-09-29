@@ -682,6 +682,12 @@ fn box_repo_candidate(
     row: Option<&crate::project::Repo>,
 ) -> Result<(String, String)> {
     let repo = repo.context("box_repo_unmapped: a box lane needs a repository")?;
+    // A machine-specific mapping wins over a project's generic box row.
+    let machine_row = remote::machine_declaration(config_dir, machine)?
+        .repos
+        .into_iter()
+        .find(|r| r.path == repo);
+    let row = machine_row.as_ref().or(row);
     match (
         row.and_then(|r| r.box_path.clone()),
         row.and_then(|r| r.publish_url.clone()),
@@ -6583,6 +6589,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("box_repo_unmapped"), "{e}");
+    }
+
+    #[test]
+    fn machine_repo_mapping_wins_over_generic_project_box_path() {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(config.path().join("config.toml"), format!(
+            "{}\n[[machines.buildbox.repos]]\npath = '/r'\nbox_path = '/second/r'\npublish_url = 'https://example/second.git'\n",
+            crate::remote::TEST_MACHINE
+        )).unwrap();
+        let project_row = crate::project::Repo {
+            path: "/r".into(),
+            box_path: Some("/first/r".into()),
+            publish_url: Some("https://example/first.git".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            box_repo_candidate(config.path(), "buildbox", Some("/r"), Some(&project_row)).unwrap(),
+            ("/second/r".into(), "https://example/second.git".into())
+        );
     }
 
     #[test]
