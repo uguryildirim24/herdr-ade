@@ -1209,11 +1209,7 @@ fn land(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
     let review_id = review.id.clone();
     land_with_install(ctx, project, review, || {
         let installed = crate::harness::install_for_review(ctx, &project.slug, &review_id)?;
-        if installed
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("box pending"))
-        {
+        if installed.box_failed() {
             anyhow::bail!(
                 "box pending: local installation finished; box installation still needs to complete: {}",
                 installed.warnings.join("; ")
