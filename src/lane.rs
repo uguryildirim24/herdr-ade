@@ -283,13 +283,14 @@ fn local_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
             if lane.pane_id != pane || lane.is_remote() {
                 continue;
             }
-            let recorded = std::fs::canonicalize(&lane.cwd).ok();
+            let Ok(recorded) = std::fs::canonicalize(&lane.cwd) else {
+                continue;
+            };
             let managed = crate::threads::managed_git_folder(&project, &lane)
                 .then(|| std::fs::canonicalize(&lane.worktree_path).ok())
                 .flatten();
             if cwd.is_some()
-                && recorded.is_some()
-                && cwd != recorded
+                && cwd.as_ref() != Some(&recorded)
                 && (managed.is_none() || cwd != managed)
             {
                 continue;
@@ -538,6 +539,49 @@ fn print_rules(config_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_binding_ignores_removed_cwds_when_pane_ids_are_reused() {
+        let world = crate::scenarios::World::new();
+        let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+        let removed = world.home.path().join("removed-worktree");
+        std::fs::create_dir_all(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        for status in [thread::Status::Open, thread::Status::Resolved] {
+            thread::allocate(&project, |lane| {
+                lane.pane_id = "w1:p2".into();
+                lane.cwd = removed.to_string_lossy().into_owned();
+                lane.status = status;
+            })
+            .unwrap();
+        }
+        thread::allocate(&project, |lane| {
+            lane.pane_id = "w1:p2".into();
+            lane.cwd = world.home.path().to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let live = thread::allocate(&project, |lane| {
+            lane.pane_id = "w1:p2".into();
+            lane.cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+        })
+        .unwrap();
+
+        let matches = local_lanes(&world.ctx(), "w1:p2").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].thread.id, live.id);
+
+        // Resolution alone does not forbid follow-up sealing from an existing cwd.
+        thread::update(&project, &live.id, |lane| {
+            lane.status = thread::Status::Resolved
+        })
+        .unwrap();
+        let matches = local_lanes(&world.ctx(), "w1:p2").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].thread.id, live.id);
+    }
 
     #[test]
     fn critic_report_without_verdict_is_refused_before_reserving_a_done() {

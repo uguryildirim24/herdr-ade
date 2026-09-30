@@ -1896,10 +1896,8 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
         thread::bind_identity(t, &socket, agent, process.clone());
         Ok(())
     })?;
-    let _ = herdr.pane_set_parent(
-        pane_id,
-        &project.coordinator().map(|c| c.pane_id).unwrap_or_default(),
-    );
+    let coordinator_pane = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
+    let _ = herdr.pane_set_parent(pane_id, &parent_token(&rebound, &coordinator_pane));
     report_thread_tokens(&herdr, &rebound, slug, Group::Working);
     Ok(RebindOutcome {
         thread: id.to_string(),
@@ -4022,12 +4020,10 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         return Ok(());
     }
     // Read the seal, not an earlier rewritten report, for repeatable retries.
-    let sealed = crate::events::list(project)
-        .into_iter()
-        .filter(|e| e.thread == record.id && e.attempt == record.attempt.max(1))
-        .filter_map(|e| e.payload.done.map(|d| (e.created, e.id, d.artifact)))
-        .max_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
-        .map(|(_, _, hash)| hash)
+    let events = crate::events::list(project);
+    let sealed = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
+        .and_then(|event| event.payload.done.as_ref())
+        .map(|done| done.artifact.clone())
         .context("sealed report event is missing")?;
     let bytes = std::fs::read(crate::events::artifact_path(project, &sealed))?;
     if thread::sha256_hex(&bytes) != sealed {
@@ -4093,11 +4089,10 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
 /// removal gate reads the sealed artifact.
 fn imported_report(project: &Project, record: &Thread) -> thread::Copied {
     let attempt = record.attempt.max(1);
-    let hash = crate::events::list(project)
-        .into_iter()
-        .filter(|event| event.thread == record.id && event.attempt == attempt)
-        .find_map(|event| event.payload.done)
-        .map(|done| done.artifact);
+    let events = crate::events::list(project);
+    let hash = crate::events::latest_done_event(&events, &record.id, attempt)
+        .and_then(|event| event.payload.done.as_ref())
+        .map(|done| done.artifact.clone());
     match hash {
         Some(hash) => match std::fs::read(crate::events::artifact_path(project, &hash)) {
             Ok(bytes) if thread::sha256_hex(&bytes) == hash => thread::Copied {
@@ -4984,6 +4979,86 @@ mod tests {
         let saved = thread::load(&project, &lane.id).unwrap();
         assert_eq!(saved.status, Status::Open);
         assert_eq!(saved.agent_name, "");
+    }
+
+    #[test]
+    fn rebind_uses_the_rebound_lanes_machine_qualified_parent() {
+        for machine in ["", "buildbox"] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = thread::allocate(&project, |t| {
+                t.status = Status::Failed;
+                t.machine = machine.into();
+                t.cwd = "/work/lane".into();
+            })
+            .unwrap();
+            *world.agents.borrow_mut() = r#"[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/work/lane","agent":"pi","agent_status":"working"}]"#.into();
+
+            rebind(&world.ctx(), "demo", &lane.id, "w1:p2").unwrap();
+
+            let expected = if machine.is_empty() {
+                "parent=w1:p1"
+            } else {
+                "parent=Local:w1:p1"
+            };
+            assert!(world.runner.calls.borrow().iter().any(|cmd| {
+                cmd.display().contains("pane report-metadata w1:p2")
+                    && cmd.args.iter().any(|arg| arg == expected)
+                    && (machine.is_empty() || cmd.display().contains("--machine buildbox"))
+            }));
+        }
+    }
+
+    #[test]
+    fn box_final_copy_uses_latest_done_by_creation_then_id_in_current_attempt() {
+        use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
+
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |t| {
+            t.machine = "box".into();
+            t.attempt = 2;
+        })
+        .unwrap();
+        let latest_hash = thread::store_artifact(&project, b"corrected report").unwrap();
+        let earlier_hash = thread::store_artifact(&project, b"earlier report").unwrap();
+        for (id, attempt, created, artifact) in [
+            ("1", 2, "2026-09-30T10:00:00Z", &earlier_hash),
+            ("2", 2, "2026-09-30T11:00:00Z", &earlier_hash),
+            ("3", 2, "2026-09-30T11:00:00Z", &latest_hash),
+            ("4", 2, "2026-09-30T09:00:00Z", &earlier_hash),
+            ("5", 1, "2026-09-30T12:00:00Z", &earlier_hash),
+        ] {
+            let event = Event {
+                id: format!("{}-{attempt}-{id}", lane.id),
+                op: format!("{}-{attempt}-{id}", lane.id),
+                thread: lane.id.clone(),
+                attempt,
+                recipient: Recipient::default(),
+                created: created.into(),
+                payload: EventPayload {
+                    done: Some(DonePayload {
+                        artifact: artifact.clone(),
+                        sha: "abc".into(),
+                        report_path: "report.md".into(),
+                        has_changes: None,
+                        attestation: None,
+                        published_ref: None,
+                    }),
+                    ..EventPayload::default()
+                },
+            };
+            crate::events::seal_create_if_absent(&project, &event).unwrap();
+        }
+        let copied = final_copy(&world.ctx(), &project, &lane);
+        assert_eq!(copied.outcome, CopyOutcome::Complete);
+        assert_eq!(copied.report_hash.as_deref(), Some(latest_hash.as_str()));
+
+        // A missing newest artifact must block removal, not fall back to an old seal.
+        std::fs::remove_file(crate::events::artifact_path(&project, &latest_hash)).unwrap();
+        let copied = final_copy(&world.ctx(), &project, &lane);
+        assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
+        assert!(copied.report_hash.is_none());
     }
 
     #[test]
