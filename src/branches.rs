@@ -1,5 +1,5 @@
 //! Prune harness refs only after their lane is resolved or their commit landed.
-//! Remote deletion checks the advertised tip before pushing the deletion.
+//! Remote deletion checks the advertised tip and atomically leases the deletion.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
@@ -162,7 +162,8 @@ fn delete_remote(
         ));
     }
     let deletion = format!(":refs/heads/{branch}");
-    let out = deletion_command(runner, repo, &["push", url, &deletion])?;
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
+    let out = deletion_command(runner, repo, &["push", &lease, url, &deletion])?;
     if out.success() {
         return Ok(());
     }
@@ -173,7 +174,10 @@ fn delete_remote(
             "ha thread show <project> <thread> (verify the branch head before cleanup)",
         )),
         _ => {
-            bail!("git push {url} {deletion} in {repo}: {}", out.error_text());
+            bail!(
+                "git push {lease} {url} {deletion} in {repo}: {}",
+                out.error_text()
+            );
         }
     }
 }
@@ -1836,6 +1840,80 @@ mod tests {
             )
             .unwrap()
             .contains_key(name)
+        );
+    }
+
+    #[test]
+    fn remote_deletion_leases_tip_that_moves_after_check() {
+        use crate::runner::fake::{FakeRunner, fail, ok};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let runner = FakeRunner::new();
+        let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let moved = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tip = Rc::new(Cell::new(expected));
+        let advertised = tip.clone();
+        runner.on_fn(
+            |cmd| cmd.display().contains("ls-remote --heads"),
+            move |_| {
+                Ok(ok(&format!(
+                    "{}\trefs/heads/hp/demo/t-1\n",
+                    advertised.get()
+                )))
+            },
+        );
+        let pushed = tip.clone();
+        runner.on_fn(
+            |cmd| cmd.args.iter().any(|arg| arg == "push"),
+            move |cmd| {
+                // New work arrives after ls-remote but before the server
+                // processes the push. Only a lease protects that new tip.
+                pushed.set(moved);
+                if cmd.args.iter().any(|arg| {
+                    arg == &format!("--force-with-lease=refs/heads/hp/demo/t-1:{expected}")
+                }) {
+                    Ok(fail(1, "stale info"))
+                } else {
+                    pushed.set("");
+                    Ok(ok(""))
+                }
+            },
+        );
+
+        let error = delete_remote(
+            &runner,
+            "/repo",
+            "https://example.com/repo.git",
+            "hp/demo/t-1",
+            expected,
+        )
+        .unwrap_err();
+
+        assert!(crate::refusal::is(&error));
+        assert!(
+            error.to_string().contains(&format!(
+                "moved from {expected} to {moved}; not removing it"
+            )),
+            "{error:#}"
+        );
+        assert_eq!(tip.get(), moved);
+        assert_eq!(runner.count("ls-remote --heads"), 2);
+        let calls = runner.calls.borrow();
+        let push = calls
+            .iter()
+            .find(|cmd| cmd.args.iter().any(|arg| arg == "push"))
+            .unwrap();
+        assert_eq!(
+            push.args,
+            [
+                "-C",
+                "/repo",
+                "push",
+                &format!("--force-with-lease=refs/heads/hp/demo/t-1:{expected}"),
+                "https://example.com/repo.git",
+                ":refs/heads/hp/demo/t-1",
+            ]
         );
     }
 

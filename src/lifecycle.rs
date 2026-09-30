@@ -317,6 +317,17 @@ fn github_name(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+fn checkout_github_name(ctx: &Ctx, path: &str) -> Result<String> {
+    let out = ctx.runner.run(
+        &Cmd::new("git", Duration::from_secs(40)).args(["-C", path, "remote", "get-url", "origin"]),
+    )?;
+    if !out.success() {
+        bail!("could not resolve origin: {}", out.error_text());
+    }
+    github_name(&out.stdout)
+        .ok_or_else(|| anyhow::anyhow!("origin is not a GitHub repo: {}", out.stdout.trim()))
+}
+
 fn github_names(repos: &[Repo], threads: &[thread::Thread]) -> BTreeSet<String> {
     repos
         .iter()
@@ -669,11 +680,41 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         }
     }
 
-    let github_candidates = github_names(&owned_repos, &threads);
-    let other_github: BTreeSet<_> = others
+    let mut github_candidates = github_names(&owned_repos, &threads);
+    if delete_github && github_candidates.is_empty() {
+        // Historical rows may not record a publish URL. Resolve only origin,
+        // never gh's default remote (which may instead be upstream).
+        for repo in &owned_repos {
+            match checkout_github_name(ctx, &repo.path) {
+                Ok(name) => {
+                    github_candidates.insert(name);
+                }
+                Err(error) => {
+                    println!("kept GitHub repo for {}: {error:#}", repo.path);
+                }
+            }
+        }
+    }
+    let mut other_github: BTreeSet<_> = others
         .iter()
         .flat_map(|owner| github_names(&owner.repos, &owner.threads))
         .collect();
+    if delete_github {
+        for owner in &others {
+            other_github.extend(
+                owner
+                    .threads
+                    .iter()
+                    .filter_map(|record| github_name(&record.origin)),
+            );
+            other_github.extend(
+                owner
+                    .repos
+                    .iter()
+                    .filter_map(|repo| checkout_github_name(ctx, &repo.path).ok()),
+            );
+        }
+    }
     let github: BTreeSet<_> = github_candidates
         .difference(&other_github)
         .cloned()
@@ -688,6 +729,7 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
                 println!("already removed GitHub repo: {name}");
                 continue;
             }
+            println!("removing GitHub repo: {name}");
             let out = ctx.runner.run(
                 &Cmd::new("gh", Duration::from_secs(60)).args(["repo", "delete", name, "--yes"]),
             )?;
@@ -700,39 +742,6 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
                 toml::to_string(&delete_intent)?.as_bytes(),
             )?;
             println!("removed GitHub repo: {name}");
-        }
-        // Historical repository rows may have no publish URL. `gh` resolves
-        // the repository from its checkout, before that checkout is trashed.
-        // Do not use that fallback when a known identity was kept as shared.
-        if github_candidates.is_empty() {
-            for repo in &owned_repos {
-                if !Path::new(&repo.path).exists() {
-                    continue;
-                }
-                let completed = format!("github-path:{}", repo.path);
-                if delete_intent.completed.contains(&completed) {
-                    println!("already removed GitHub repo for: {}", repo.path);
-                    continue;
-                }
-                let out = ctx.runner.run(
-                    &Cmd::new("gh", Duration::from_secs(60))
-                        .args(["repo", "delete", "--yes"])
-                        .cwd(&repo.path),
-                )?;
-                if !out.success() {
-                    bail!(
-                        "could not delete the GitHub repo for {}: {}",
-                        repo.path,
-                        out.error_text()
-                    );
-                }
-                delete_intent.completed.insert(completed);
-                crate::project::write_atomic(
-                    &intent_path,
-                    toml::to_string(&delete_intent)?.as_bytes(),
-                )?;
-                println!("removed GitHub repo for: {}", repo.path);
-            }
         }
     } else if github.is_empty() {
         println!("GitHub repositories remain; pass --github to remove project-owned copies.");
@@ -969,6 +978,148 @@ mod tests {
                     .iter()
                     .any(|arg| arg == &expected_first_repo.display().to_string())
         }));
+    }
+
+    #[test]
+    fn delete_fallback_names_origin_not_upstream_and_records_identity() {
+        let world = World::new();
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let project = crate::project::create(
+            &world.root,
+            "demo",
+            "",
+            vec![Repo {
+                path: repo.display().to_string(),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("remote get-url"),
+            |cmd| {
+                Ok(ok(if cmd.args.last().unwrap() == "origin" {
+                    "git@github.com:acme/demo.git\n"
+                } else {
+                    "https://github.com/another/upstream.git\n"
+                }))
+            },
+        );
+        world.runner.on("gh repo delete", ok(""));
+        world.runner.on("/usr/bin/trash", ok(""));
+
+        delete(&world.ctx(), "demo", true, false).unwrap();
+
+        assert_eq!(world.runner.count("remote get-url origin"), 1);
+        assert_eq!(world.runner.count("gh repo delete"), 1);
+        let calls = world.runner.calls.borrow();
+        let deletion = calls.iter().find(|cmd| cmd.program == "gh").unwrap();
+        assert_eq!(deletion.args, ["repo", "delete", "acme/demo", "--yes"]);
+        let intent: DeleteIntent = toml::from_str(
+            &std::fs::read_to_string(project.state_dir().join("delete.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            intent.completed,
+            BTreeSet::from(["github:acme/demo".into()])
+        );
+    }
+
+    #[test]
+    fn delete_fallback_keeps_names_another_project_resolves() {
+        for source in ["publish", "origin", "thread"] {
+            let world = World::new();
+            let first_repo = world.home.path().join("first-repo");
+            let second_repo = world.home.path().join("second-repo");
+            for path in [&first_repo, &second_repo] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            crate::project::create(
+                &world.root,
+                "first",
+                "",
+                vec![Repo {
+                    path: first_repo.display().to_string(),
+                    ..Repo::default()
+                }],
+            )
+            .unwrap();
+            let second = crate::project::create(
+                &world.root,
+                "second",
+                "",
+                vec![Repo {
+                    path: second_repo.display().to_string(),
+                    publish_url: (source == "publish")
+                        .then(|| "https://github.com/acme/shared.git".into()),
+                    ..Repo::default()
+                }],
+            )
+            .unwrap();
+            if source == "thread" {
+                thread::allocate(&second, |record| {
+                    record.repo = second_repo.display().to_string();
+                    record.origin = "ssh://git@github.com/acme/shared.git".into();
+                })
+                .unwrap();
+            }
+            world.runner.on(
+                &format!("-C {} remote get-url origin", first_repo.display()),
+                ok("git@github.com:acme/shared.git\n"),
+            );
+            world.runner.on(
+                &format!("-C {} remote get-url origin", second_repo.display()),
+                if source == "origin" {
+                    ok("https://github.com/acme/shared.git\n")
+                } else {
+                    crate::runner::fake::fail(2, "no origin")
+                },
+            );
+            world.runner.on("/usr/bin/trash", ok(""));
+
+            delete(&world.ctx(), "first", true, false).unwrap();
+
+            assert_eq!(world.runner.count("gh repo delete"), 0, "{source}");
+        }
+    }
+
+    #[test]
+    fn delete_fallback_keeps_unresolvable_origins_and_continues() {
+        let world = World::new();
+        let mut repos = Vec::new();
+        for name in ["missing", "not-github", "spawn-error", "valid"] {
+            let path = world.home.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            repos.push(Repo {
+                path: path.display().to_string(),
+                ..Repo::default()
+            });
+            let query = format!("-C {} remote get-url origin", path.display());
+            if name == "spawn-error" {
+                world.runner.on_fn(
+                    move |cmd| cmd.display().contains(&query),
+                    |_| Err(anyhow::anyhow!("could not run git")),
+                );
+            } else {
+                world.runner.on(
+                    &query,
+                    match name {
+                        "missing" => crate::runner::fake::fail(2, "No such remote 'origin'"),
+                        "not-github" => ok("https://example.com/acme/keep.git\n"),
+                        _ => ok("https://github.com/acme/delete.git\n"),
+                    },
+                );
+            }
+        }
+        crate::project::create(&world.root, "demo", "", repos).unwrap();
+        world.runner.on("gh repo delete acme/delete --yes", ok(""));
+        world.runner.on("/usr/bin/trash", ok(""));
+
+        delete(&world.ctx(), "demo", true, false).unwrap();
+
+        assert_eq!(world.runner.count("remote get-url origin"), 4);
+        assert_eq!(world.runner.count("gh repo delete"), 1);
+        assert_eq!(world.runner.count("gh repo delete acme/delete --yes"), 1);
     }
 
     #[test]
