@@ -1,0 +1,19 @@
+# Example only: copy a row into ~/.config/herdr-ade/config.toml and replace
+# these paths with your own. No remote machine is enabled by default.
+[machines.buildbox]
+label = "buildbox"
+target = "buildbox.example"
+session = "default"
+home = "/home/agent"
+root = "/home/agent/.herdr-ade"
+worktrees = "/home/agent/projects"
+build = "/home/agent/build/lanes"
+path = "/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ade_bin = "/home/agent/.local/bin/herdr-ade"
+pi_bin = "/home/agent/.local/bin/herdr-pi"
+kinds = ["pi"]
+
+[[machines.buildbox.repos]]
+path = "/home/agent/projects/example"
+box_path = "/home/agent/projects/example"
+publish_url = "https://github.com/example/example.git"
