@@ -232,6 +232,10 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
 /// replace a ticker while installing. A stalled step leaves its stop request
 /// active, so the next start can launch the installed build.
 pub(crate) fn start_for_install(ctx: &Ctx) -> Result<()> {
+    if project::list_slugs(&ctx.root).is_empty() {
+        println!("HERDR_ADE_TICKER_NO_PROJECTS=1");
+        return Ok(());
+    }
     start_for_install_with_wait(ctx, INSTALL_REPLACE_WAIT)
 }
 
