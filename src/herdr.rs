@@ -633,7 +633,7 @@ impl<'a> Herdr<'a> {
             .map(|_| ())
     }
 
-    /// Submits a first prompt and requires herdr to observe that it started.
+    /// Submits a prompt and requires herdr to observe working or blocked activity.
     pub(crate) fn agent_prompt_wait_started(
         &self,
         target: &str,

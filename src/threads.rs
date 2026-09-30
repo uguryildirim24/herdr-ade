@@ -2303,23 +2303,50 @@ fn latest_waiting_event_id(
         .map(|event| event.id.clone())
 }
 
-pub(crate) fn record_answered_wait(
+/// Commit transport success and the answered wait as one lifecycle update.
+/// A new attempt cannot borrow the old answer, but delivery history remains.
+pub(crate) fn record_follow_up_delivery(
     project: &Project,
-    thread_id: &str,
-    attempt: u32,
-    waiting: &str,
+    id: &str,
+    index: usize,
+    follow_up: &FollowUp,
+    after_seal: &str,
 ) -> Result<()> {
-    if waiting.is_empty() {
-        return Ok(());
-    }
-    thread::update_checked(project, thread_id, |thread| {
-        if thread.attempt.max(1) != attempt {
-            bail!("prompt_attempt_changed: {thread_id} moved past attempt {attempt}");
+    thread::update_checked(project, id, |thread| {
+        let saved = thread
+            .follow_ups
+            .get_mut(index)
+            .context("queued follow-up disappeared during delivery")?;
+        if saved.attempt != follow_up.attempt
+            || saved.text != follow_up.text
+            || saved.state != FollowUpState::Uncertain
+        {
+            bail!("queued follow-up changed during delivery");
         }
-        thread.answered_waiting_event = waiting.to_string();
+        saved.state = FollowUpState::Delivered;
+        saved.delivered_at = project::now();
+        saved.after_seal = after_seal.to_string();
+        if thread.attempt.max(1) == follow_up.attempt {
+            if !follow_up.waiting_event.is_empty() {
+                thread.answered_waiting_event = follow_up.waiting_event.clone();
+            }
+            thread.connection_waiting = false;
+            thread.connection_resumes.clear();
+            thread.failure_class = crate::contracts::FailureClass::Unknown;
+            thread.provider_failure_kind = None;
+        }
         Ok(())
     })?;
     Ok(())
+}
+
+/// Herdr's PTY/activity errors may follow submission. Only these explicit
+/// refusals prove no prompt was written and permit another delivery attempt.
+pub(crate) fn prompt_refused_before_submission(error: &crate::herdr::HerdrError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "agent_not_ready" | "agent_blocked" | "agent_not_found" | "empty_agent_prompt"
+    )
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
@@ -2455,38 +2482,67 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         return Err(error);
     }
     sync_box_corrections(ctx, &project, &record)?;
-    // Herdr rejects `agent prompt` for every blocked pane. An adapter-owned
-    // error screen is different from an approval dialog: submit through the
-    // pane so the adapter's input hook clears its block. A blocked lane with
-    // no durable error still refuses in `prompt_state` above.
-    if state == "blocked" {
-        herdr
-            .pane_submit_text(&record.pane_id, text)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        thread::update(&project, id, |t| t.error.clear())?;
-    } else {
-        herdr
-            .agent_prompt(&record.pane_id, text)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
     let attempt = record.attempt.max(1);
-    let waiting = latest_waiting_event_id(&events_before_send, id, attempt).unwrap_or_default();
-    record_answered_wait(&project, id, attempt, &waiting)?;
+    let follow_up = FollowUp {
+        attempt,
+        text: text.to_string(),
+        state: FollowUpState::Uncertain,
+        waiting_event: latest_waiting_event_id(&events_before_send, id, attempt)
+            .unwrap_or_default(),
+        queued_at: project::now(),
+        ..FollowUp::default()
+    };
+    let _prompt_lock = thread::prompt_lock(&project, id)?;
+    let mut queued = false;
+    let staged = thread::update_checked(&project, id, |thread| {
+        if thread.status != Status::Open
+            || thread.attempt.max(1) != attempt
+            || thread.pane_id != record.pane_id
+        {
+            bail!("prompt_attempt_changed: {id} changed during prompt preparation");
+        }
+        queued = thread.prompt_pending || awaiting_bootstrap(thread) || awaiting_follow_up(thread);
+        let mut saved = follow_up.clone();
+        if queued {
+            saved.state = FollowUpState::Queued;
+        }
+        thread.follow_ups.push(saved);
+        Ok(())
+    })?;
+    if queued {
+        return Ok(PromptOutcome::Queued { attempt });
+    }
+    let index = staged.follow_ups.len() - 1;
     let after_seal = crate::events::latest_done_event(&events_before_send, id, attempt)
         .map(|event| event.id.clone())
         .unwrap_or_default();
-    thread::update(&project, id, |thread| {
-        thread.follow_ups.push(FollowUp {
-            attempt,
-            text: text.to_string(),
-            state: FollowUpState::Delivered,
-            waiting_event: waiting.clone(),
-            queued_at: project::now(),
-            delivered_at: project::now(),
-            after_seal,
-            ..FollowUp::default()
-        });
-    })?;
+    // Adapter-owned error screens recover through their pane input hook.
+    let result = if state == "blocked" {
+        herdr.pane_submit_text(&record.pane_id, text)
+    } else {
+        let timeout = if record.launch.ready_timeout_ms == 0 {
+            crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
+        } else {
+            record.launch.ready_timeout_ms
+        };
+        herdr.agent_prompt_wait_started(&record.pane_id, text, timeout)
+    };
+    if let Err(error) = result {
+        if prompt_refused_before_submission(&error) {
+            thread::update(&project, id, |thread| {
+                thread.follow_ups[index].state = FollowUpState::Queued;
+            })?;
+        }
+        return Err(anyhow::anyhow!("{error}"));
+    }
+    record_follow_up_delivery(&project, id, index, &follow_up, &after_seal)?;
+    if state == "blocked" {
+        thread::update(&project, id, |t| {
+            if t.attempt.max(1) == attempt {
+                t.error.clear();
+            }
+        })?;
+    }
     Ok(PromptOutcome::Sent {
         attempt,
         agent_state: state,
@@ -5307,6 +5363,72 @@ mod tests {
             "working"
         );
         assert_eq!(prompt_state(&t, &[agent("idle")], false).unwrap(), "idle");
+    }
+
+    #[test]
+    fn successful_follow_up_keeps_its_delivery_receipt_when_the_attempt_changes() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, agent_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.attempt = 2;
+            t.prompt_pending = false;
+            t.bootstrap = "acknowledged".into();
+            t.launch.kind = "pi".into();
+        });
+        thread::update(&project, &lane.id, |t| t.bootstrap = "acknowledged".into()).unwrap();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w2", "w2:t1", "w2:p1", &lane.cwd, &lane.agent_name, "idle")
+        );
+        crate::events::seal_create_if_absent(
+            &project,
+            &crate::contracts::Event {
+                id: "waiting-2".into(),
+                op: "waiting-2".into(),
+                thread: lane.id.clone(),
+                attempt: 2,
+                recipient: crate::contracts::Recipient::default(),
+                created: project::now(),
+                payload: crate::contracts::EventPayload {
+                    waiting: Some(crate::contracts::WaitingPayload {
+                        text: "Choose a correction".into(),
+                        ..crate::contracts::WaitingPayload::default()
+                    }),
+                    ..crate::contracts::EventPayload::default()
+                },
+            },
+        )
+        .unwrap();
+        let sending_project = project.clone();
+        let sending_id = lane.id.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("agent prompt"),
+            move |_| {
+                let current = thread::load(&sending_project, &sending_id).unwrap();
+                assert_eq!(current.follow_ups[0].state, FollowUpState::Uncertain);
+                assert_eq!(current.follow_ups[0].waiting_event, "waiting-2");
+                // Model a replacement after submission but before its successful
+                // response reaches ADE. Only the old delivery belongs to attempt 2.
+                thread::update(&sending_project, &sending_id, |t| {
+                    t.attempt = 3;
+                    t.connection_waiting = true;
+                })
+                .unwrap();
+                Ok(ok(r#"{"result":{}}"#))
+            },
+        );
+        assert!(matches!(
+            prompt(&world.ctx(), "demo", &lane.id, "the accepted correction").unwrap(),
+            PromptOutcome::Sent { attempt: 2, .. }
+        ));
+        let current = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(current.attempt, 3);
+        assert_eq!(current.follow_ups[0].state, FollowUpState::Delivered);
+        assert!(!current.follow_ups[0].delivered_at.is_empty());
+        assert!(current.answered_waiting_event.is_empty());
+        assert!(current.connection_waiting);
     }
 
     #[test]
