@@ -21,11 +21,13 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep both landing and its retry queue bounded, rather than draining a pile.
 pub(crate) const CLEANUP_BATCH_SIZE: usize = 2;
 
+type CleanupLists = Option<(Vec<Agent>, Vec<Pane>)>;
+
 /// One cleanup slice's live lists. Reused across members and the in-use/close
 /// checks; per-pane process checks still run at the point of removal.
 #[derive(Default)]
 pub(crate) struct CleanupViews {
-    lists: BTreeMap<(String, String), Option<(Vec<Agent>, Vec<Pane>)>>,
+    lists: BTreeMap<(String, String), CleanupLists>,
 }
 
 impl CleanupViews {
@@ -4548,8 +4550,9 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
     // Pin the checked-out branch tip before discarding the checkout. A retained
     // box branch must also match its published tip or verified immutable seal.
     let tip = crate::branches::require_published_tip(ctx, &project, &record)?;
-    removal_in_use_gate(ctx, &project, &record, &mut CleanupViews::default())?;
-    close_pane(ctx, &project, &record)?;
+    let mut views = CleanupViews::default();
+    removal_in_use_gate(ctx, &project, &record, &mut views)?;
+    close_pane_with_views(ctx, &project, &record, &mut views)?;
     // The marker makes ref retirement retryable even if the process dies
     // between removing the checkout and deleting the branch.
     let pinned = thread::update(&project, id, |t| {
@@ -7144,6 +7147,8 @@ mod tests {
         use crate::scenarios::{World, agent_json, pane_json};
         let world = World::new();
         let project = world.project("demo", "a.sock");
+        // Box snapshots must not depend on a live local coordinator session.
+        std::fs::remove_file(project.coordinator().unwrap().socket).unwrap();
         let first = Thread {
             id: "t-0001".into(),
             machine: "oci".into(),

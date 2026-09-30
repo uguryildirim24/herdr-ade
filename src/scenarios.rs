@@ -1926,6 +1926,49 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
 }
 
 #[test]
+fn unreachable_box_does_not_freeze_another_projects_due_work_during_backoff() {
+    let (world, offline) = remote_world();
+    let before = toml::to_string(&thread::load(&offline, "t-0001").unwrap()).unwrap();
+    world.runner.on_fn(
+        |cmd| cmd.program == "ssh",
+        |_| Ok(fail(255, "ssh: connect to host box: Operation timed out")),
+    );
+    let other = world.project("other", "b.sock");
+    let coordinator = other.coordinator().unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{}]",
+        agent_json(
+            "w1",
+            "w1:t1",
+            "w1:p1",
+            &coordinator.cwd,
+            &coordinator.agent_name,
+            "idle"
+        )
+    );
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&other));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    world.runner.on("pane read", ok("❯ "));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    for _ in 0..2 {
+        other
+            .update_coordinator(|c| {
+                c.prime_pending = true;
+                c.prime_sent = false;
+            })
+            .unwrap();
+        assert!(ticker::tick_for_test(&ctx, &mut memory));
+        assert!(other.coordinator().unwrap().prime_sent);
+        assert_eq!(
+            toml::to_string(&thread::load(&offline, "t-0001").unwrap()).unwrap(),
+            before
+        );
+    }
+    assert_eq!(world.runner.count("ssh"), 1);
+}
+
+#[test]
 fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ticks() {
     let (world, project) = remote_world();
     let failing = World {

@@ -3,7 +3,7 @@
 //! Everything it does is "check on an interval, compare with last time, act".
 //! It exits on request through a stop file, never through signals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -702,15 +702,27 @@ fn tick_with_steps(
     for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
         log.line(&format!("{error:#}"));
     }
-    if memory.machine_views.values().any(|view| {
-        view.as_ref()
-            .err()
-            .is_some_and(|error| crate::remote::is_unreachable(error))
-    }) || memory
-        .machines
-        .values()
-        .any(|machine| crate::remote::is_unreachable(&machine.outage.last_error))
-    {
+    // An offline box defers its projects, not unrelated projects whose
+    // machines answered. Retain this decision during courier backoff too.
+    let mut deferred: BTreeSet<String> = projects
+        .iter()
+        .filter(|project| {
+            thread::list(project).iter().any(|lane| {
+                lane.is_remote()
+                    && !lane.parked
+                    && (matches!(lane.status, thread::Status::Open | thread::Status::Starting)
+                        || lane.recovery_pending)
+                    && memory
+                        .machines
+                        .get(lane.machine_route())
+                        .is_some_and(|machine| {
+                            crate::remote::is_unreachable(&machine.outage.last_error)
+                        })
+            })
+        })
+        .map(|project| project.slug.clone())
+        .collect();
+    if !projects.is_empty() && deferred.len() == projects.len() {
         return Some(true);
     }
     if let Err(error) = crate::review::reclassify_old_changes(ctx, |message| log.line(message)) {
@@ -736,10 +748,14 @@ fn tick_with_steps(
             }
             continue;
         }
+        if deferred.contains(&slug) {
+            continue;
+        }
         if !resume_provider_starts(ctx, &project, &mut readiness, |error| {
             log.line(&format!("{slug}: {error:#}"));
         }) {
-            return Some(true);
+            deferred.insert(slug);
+            continue;
         }
         match tick_cheap(
             ctx,
@@ -762,6 +778,7 @@ fn tick_with_steps(
             continue;
         };
         if project.status() == Status::Active
+            && !deferred.contains(&slug)
             && let Err(error) = crate::review::tick(ctx, &project)
         {
             log.line(&format!("{slug}: reviews: {error:#}"));
@@ -782,7 +799,7 @@ fn tick_with_steps(
             return None;
         }
     }
-    Some(!reachable.is_empty())
+    Some(!reachable.is_empty() || !deferred.is_empty())
 }
 
 fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail: &str, log: &Log) {
