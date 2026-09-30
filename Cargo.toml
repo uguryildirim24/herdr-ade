@@ -1,0 +1,32 @@
+[package]
+name = "herdr-ade"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Projects for herdr: a coordinator conversation, parallel worker threads, shared memory and an overview"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jiff = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.9"
+
+# The thin pi binary (SPEC-pi v2 §3): setup, login instructions, doctor and
+# check. It compiles `src/pi/` through a path attribute; the package keeps
+# one library-in-the-binary shape and no separate library target.
+[[bin]]
+name = "herdr-pi"
+path = "src/bin/herdr-pi.rs"
+
+# The Rundown tab (W132): one project's plan card as a plain to-do list, opened
+# by `ha open` as the `rundown` plugin pane. Compiles `src/rundown/view.rs`.
+[[bin]]
+name = "herdr-rundown"
+path = "src/bin/herdr-rundown.rs"
+
+[dev-dependencies]
+tempfile = "3"
